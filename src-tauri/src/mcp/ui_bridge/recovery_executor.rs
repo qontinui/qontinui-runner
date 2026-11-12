@@ -23,8 +23,9 @@ use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
 
+use super::ai_analyze::ATTEMPT_SUCCEEDED;
 use super::diagnostics::{extract_error_code, CanonicalCode};
-use super::request::ui_bridge_request_sync;
+use super::request::{action_outcome, ui_bridge_request_sync, ActionOutcome};
 
 /// The single canonical recovery type (plan D6). Mirrors the SDK
 /// `RecoverySuggestion = { suggestion, command?, confidence, retryable,
@@ -61,7 +62,11 @@ pub struct RecoverySuggestion {
 pub struct RecoveryOutcome {
     /// `true` when either the structured command-retry path or the LLM
     /// fallback ultimately made the ORIGINAL action succeed, re-verified by an
-    /// independent retry ([`original_action_now_succeeds`]).
+    /// independent retry — exactly when [`RecoveryOutcome::retry_outcome`] is
+    /// [`RetryOutcome::Succeeded`]. In production both are set in one place,
+    /// [`RecoveryOutcome::record_retry`], so they agree. Both fields are `pub`,
+    /// though, so the route's gate (`elements::recovery_is_genuine`) checks
+    /// `retry_outcome` as well rather than trusting that.
     ///
     /// NOT the frontend's `attemptSucceeded` (the `ai_recovery_attempt`
     /// payload, which decides `/ai/recovery/attempt`'s HTTP status in
@@ -70,6 +75,11 @@ pub struct RecoveryOutcome {
     /// They legitimately disagree — pinned by
     /// `scoped_attempt_success_does_not_imply_recovered`.
     pub recovered: bool,
+    /// What the LAST retry of the original action said, read strictly (wire
+    /// `retryOutcome`): `succeeded`, `failed`, `indeterminate`, or
+    /// `not_retried` when no retry ran. Always on the wire — see
+    /// [`RetryOutcome`] for why "no retry" is a value and not an absence.
+    pub retry_outcome: RetryOutcome,
     /// Which path produced the (attempted) recovery.
     pub via: RecoveryVia,
     /// The recovery command that was chosen and executed, if any.
@@ -93,6 +103,68 @@ pub enum RecoveryVia {
     /// No recovery path applied (no suggestions and LLM fallback also failed
     /// or was unavailable).
     None,
+}
+
+/// What retrying the ORIGINAL action said — [`RecoveryOutcome::retry_outcome`],
+/// wire `retryOutcome`, snake_case like [`RecoveryVia`].
+///
+/// Three of the four values are the arms of the ONE strict action reader,
+/// [`action_outcome`]: `succeeded`, `failed`, `indeterminate`. The fourth,
+/// `not_retried`, is for a recovery that never reached a retry. It is a value
+/// of its own rather than an omitted or `null` field ON PURPOSE: this enum
+/// exists because an absent `success` used to read as success, and a reader
+/// that treated a missing `retryOutcome` the same way would turn "never
+/// retried" back into "recovered". Only `succeeded` sets
+/// [`RecoveryOutcome::recovered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryOutcome {
+    /// The retry's reply carried `success: true`: the original action now
+    /// succeeds. The only arm that recovers.
+    Succeeded,
+    /// The retry's reply carried `success: false`: still failing.
+    Failed,
+    /// The retry's reply carried no boolean `success` (a malformed reply, a
+    /// relay frame with no `result`, a proxy's own JSON), or the retry got no
+    /// reply at all (a transport `Err`: a timeout, an open circuit breaker, a
+    /// frontend that never became ready). The runner cannot tell whether the
+    /// action ran, so this is never a recovery.
+    Indeterminate,
+    /// No retry of the original action ran: no executable recovery command
+    /// was chosen or its dispatch failed, and the LLM fallback was off or
+    /// failed before it could retry.
+    NotRetried,
+}
+
+impl RecoveryOutcome {
+    /// The outcome before any recovery step has run: not recovered, nothing
+    /// retried.
+    fn not_recovered(error_code: Option<String>) -> Self {
+        Self {
+            recovered: false,
+            retry_outcome: RetryOutcome::NotRetried,
+            via: RecoveryVia::None,
+            command_chosen: None,
+            error_code,
+            result: None,
+        }
+    }
+
+    /// Record one retry of the ORIGINAL action, read through
+    /// [`original_action_retry_outcome`]. The ONE place `recovered` and
+    /// `retry_outcome` are set, so `recovered` is always
+    /// `retry_outcome == Succeeded`. On success `via` names the tier that got
+    /// there and `result` carries the retry's reply; any other verdict leaves
+    /// both alone. Returns `recovered`.
+    fn record_retry(&mut self, retry: Result<serde_json::Value, String>, via: RecoveryVia) -> bool {
+        self.retry_outcome = original_action_retry_outcome(&retry);
+        self.recovered = self.retry_outcome == RetryOutcome::Succeeded;
+        if self.recovered {
+            self.via = via;
+            self.result = retry.ok();
+        }
+        self.recovered
+    }
 }
 
 /// Select the recovery suggestion to execute from a failure response's
@@ -328,21 +400,70 @@ async fn execute_recovery_command(
     }
 }
 
-/// The OUTER recovery verdict, shared by both tiers: given the result of
-/// retrying the ORIGINAL action, `Some(result)` iff it now succeeds. This — not
-/// whether a recovery step (or the frontend's scoped attempt) answered — is
-/// what sets [`RecoveryOutcome::recovered`].
-fn original_action_now_succeeds(
-    retry: Result<serde_json::Value, String>,
-) -> Option<serde_json::Value> {
-    retry.ok().filter(is_ipc_success)
+/// The OUTER recovery verdict, shared by both tiers: what retrying the
+/// ORIGINAL action said, read through the ONE strict action reader
+/// [`action_outcome`]. `success: true` is [`RetryOutcome::Succeeded`],
+/// `success: false` is [`RetryOutcome::Failed`], and a reply with no boolean
+/// `success` — or no reply at all, a transport `Err` — is
+/// [`RetryOutcome::Indeterminate`]. This, not whether a recovery step (or the
+/// frontend's scoped attempt) answered, is what sets
+/// [`RecoveryOutcome::recovered`], through [`RecoveryOutcome::record_retry`].
+///
+/// It was `retry.ok().filter(is_ipc_success)`, and `is_ipc_success` read an
+/// ABSENT `success` as success, so a retry whose reply carried no verdict at
+/// all (`{"clicked": true}`) was reported `recovered: true` and the action
+/// route answered HTTP 200 for it.
+fn original_action_retry_outcome(retry: &Result<serde_json::Value, String>) -> RetryOutcome {
+    match retry {
+        Ok(reply) => match action_outcome(reply) {
+            ActionOutcome::Succeeded => RetryOutcome::Succeeded,
+            ActionOutcome::Failed(_) => RetryOutcome::Failed,
+            ActionOutcome::Indeterminate => RetryOutcome::Indeterminate,
+        },
+        Err(_) => RetryOutcome::Indeterminate,
+    }
 }
 
-/// True when an IPC response (or original-action result) represents success.
-fn is_ipc_success(data: &serde_json::Value) -> bool {
-    // Absent `success` is treated as success (matches `wrap_ipc_result`'s
-    // healthy-response rule). An explicit `false` is failure.
-    data.get("success").and_then(|v| v.as_bool()) != Some(false)
+/// Read the frontend's reply to the scoped recovery attempt
+/// (`ai_recovery_attempt`): `Ok` iff it says [`ATTEMPT_SUCCEEDED`] is `true`.
+///
+/// Deliberately NOT [`action_outcome`]. The scoped attempt's SUCCESS reply
+/// carries no `success` key: the frontend answers the envelope's
+/// `success: verdict.attemptSucceeded` with
+/// `data: { attemptSucceeded: true, ...attempted }`
+/// (`src/hooks/ui-bridge-events/useAISearchEvents.ts`, case
+/// `ai_recovery_attempt`), and the dispatcher forwards that bare `data`
+/// whenever the envelope's `success` is not `false`
+/// ([`super::request::extract_response_data`]). Read strictly, every
+/// successful attempt would be indeterminate, so `Err`, and the retry that
+/// only `Ok` reaches would never run. The verdict lives in the field the
+/// runner already names, [`ATTEMPT_SUCCEEDED`], which
+/// `ai_analyze::as_recovery_failure` reads too.
+///
+/// - an explicit `success: false` is `Err`, whatever else the body says (the
+///   dispatcher stamps the envelope's refusal — `RECOVERY_UNSCOPED`,
+///   `RECOVERY_TARGET_MISSING`, `RECOVERY_FAILED` — onto `data`);
+/// - an `attemptSucceeded` that is `false`, missing, or not a boolean is
+///   `Err`: an absent verdict is not a success here either;
+/// - only `attemptSucceeded: true` is `Ok`.
+///
+/// `Ok` means only that the scoped executor ACTED on the addressed element.
+/// Whether the original action now succeeds is the retry's question
+/// ([`original_action_retry_outcome`]).
+fn scoped_attempt_verdict(reply: serde_json::Value) -> Result<serde_json::Value, String> {
+    let refused = reply.get("success").and_then(|v| v.as_bool()) == Some(false);
+    let attempt_succeeded = reply.get(ATTEMPT_SUCCEEDED).and_then(|v| v.as_bool());
+    if !refused && attempt_succeeded == Some(true) {
+        return Ok(reply);
+    }
+    if let Some(error) = reply.get("error").and_then(|v| v.as_str()) {
+        return Err(error.to_string());
+    }
+    Err(if !refused && attempt_succeeded.is_none() {
+        format!("INDETERMINATE: scoped recovery reply carried no boolean `{ATTEMPT_SUCCEEDED}`")
+    } else {
+        "LLM recovery failed".to_string()
+    })
 }
 
 /// Run the LLM-driven recovery fallback via the runner's *existing*
@@ -361,16 +482,8 @@ async fn llm_fallback(
     let payload = serde_json::json!({
         "params": { "instruction": instruction, "elementId": element_id }
     });
-    let resp = ui_bridge_request_sync(state, "ai_recovery_attempt", payload).await?;
-    if is_ipc_success(&resp) {
-        Ok(resp)
-    } else {
-        Err(resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("LLM recovery failed")
-            .to_string())
-    }
+    let reply = ui_bridge_request_sync(state, "ai_recovery_attempt", payload).await?;
+    scoped_attempt_verdict(reply)
 }
 
 /// Attempt automatic recovery for a failed UI Bridge action.
@@ -383,12 +496,22 @@ async fn llm_fallback(
 /// Decision tree:
 /// 1. Parse the canonical error code + `suggestedActions`.
 /// 2. Pick the best retryable command (`select_suggestion`). If one exists:
-///    execute it, then retry the original action once. On success → done
-///    (`StructuredCommand`).
-/// 3. Otherwise (or if the retry still fails) → LLM fallback IPC. On success
-///    → done (`LlmFallback`).
-/// 4. Otherwise → `RecoveryVia::None`, `recovered: false` (caller surfaces
-///    the original error).
+///    execute it, then retry the original action once. A retry whose reply
+///    reads `success: true` → done (`StructuredCommand`).
+/// 3. Otherwise (or if the retry read `failed` or `indeterminate`) → LLM
+///    fallback IPC (opt-in); if its scoped attempt acted, retry the original
+///    action again. `success: true` → done (`LlmFallback`). An
+///    `indeterminate` Tier-1 retry may already have run the action, so on this
+///    opt-in path a non-idempotent action can run twice, as it already could
+///    after a transport `Err`. Whether the ladder should stop there instead is
+///    not decided here: `attempt_recovery` cannot yet be entered by a test (no
+///    `ApiState` fixture), so a change to its control flow would land unpinned.
+/// 4. Otherwise → `RecoveryVia::None`, `recovered: false`, `retryOutcome`
+///    saying what the last retry read (or `not_retried`); the caller surfaces
+///    the original error.
+///
+/// Every retry is read strictly ([`original_action_retry_outcome`]): a reply
+/// with no boolean `success` is `indeterminate`, never a recovery.
 ///
 /// Telemetry is emitted exactly once per call regardless of branch.
 pub async fn attempt_recovery(
@@ -402,13 +525,7 @@ pub async fn attempt_recovery(
     let suggestions = parse_suggested_actions(failure);
 
     let mut chosen_command: Option<String> = None;
-    let mut outcome = RecoveryOutcome {
-        recovered: false,
-        via: RecoveryVia::None,
-        command_chosen: None,
-        error_code: error_code.map(|c| c.as_str().to_string()),
-        result: None,
-    };
+    let mut outcome = RecoveryOutcome::not_recovered(error_code.map(|c| c.as_str().to_string()));
 
     // ── Tier 1: structured suggestedActions command + single retry ───────
     if let Some(sel) = select_suggestion(&suggestions) {
@@ -421,26 +538,26 @@ pub async fn attempt_recovery(
         match execute_recovery_command(state, &command, element_id).await {
             Ok(_) => {
                 // Retry the original action exactly once.
-                match original_action_now_succeeds(
-                    ui_bridge_request_sync(state, "execute_action", original_action.clone()).await,
-                ) {
-                    Some(retry) => {
-                        outcome.recovered = true;
-                        outcome.via = RecoveryVia::StructuredCommand;
-                        outcome.command_chosen = chosen_command.clone();
-                        outcome.result = Some(retry);
-                        emit_telemetry(state, &error_code, &chosen_command, true, task_run_id)
-                            .await;
-                        return outcome;
-                    }
-                    None => {
-                        warn!(
-                            "recovery_executor: original action still failed after '{}'; \
-                             degrading to LLM fallback",
-                            command
-                        );
-                    }
+                let retry =
+                    ui_bridge_request_sync(state, "execute_action", original_action.clone()).await;
+                if outcome.record_retry(retry, RecoveryVia::StructuredCommand) {
+                    outcome.command_chosen = chosen_command.clone();
+                    emit_telemetry(
+                        state,
+                        &error_code,
+                        &chosen_command,
+                        true,
+                        outcome.retry_outcome,
+                        task_run_id,
+                    )
+                    .await;
+                    return outcome;
                 }
+                warn!(
+                    "recovery_executor: original action not recovered after '{}' \
+                     (retry read {:?}); degrading to LLM fallback",
+                    command, outcome.retry_outcome
+                );
             }
             Err(e) => {
                 warn!(
@@ -467,7 +584,15 @@ pub async fn attempt_recovery(
             LLM_RECOVERY_ENV, error_code
         );
         outcome.via = RecoveryVia::None;
-        emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
+        emit_telemetry(
+            state,
+            &error_code,
+            &chosen_command,
+            false,
+            outcome.retry_outcome,
+            task_run_id,
+        )
+        .await;
         return outcome;
     }
 
@@ -477,45 +602,63 @@ pub async fn attempt_recovery(
         .map(|s| format!("recover from: {}", s))
         .unwrap_or_else(|| "recover from error state".to_string());
     match llm_fallback(state, &instruction, element_id).await {
-        Ok(resp) => {
+        Ok(_) => {
             // `recovered` is NOT "the recovery IPC answered". It is "the
             // original action now succeeds" — the same bar Tier 1 clears
             // above. Hardcoding it true reported success for an LLM step that
             // had touched an unrelated element and left the addressed action
             // just as broken as before.
-            let retry = original_action_now_succeeds(
-                ui_bridge_request_sync(state, "execute_action", original_action.clone()).await,
-            );
-            match retry {
-                Some(retry) => {
-                    outcome.recovered = true;
-                    outcome.via = RecoveryVia::LlmFallback;
-                    outcome.result = Some(retry);
-                    emit_telemetry(state, &error_code, &chosen_command, true, task_run_id).await;
-                }
-                None => {
-                    warn!(
-                        "recovery_executor: LLM fallback ran but the original action still \
-                         fails — reporting recovered:false ({:?})",
-                        resp.get("error")
-                    );
-                    outcome.via = RecoveryVia::None;
-                    emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
-                }
+            let retry =
+                ui_bridge_request_sync(state, "execute_action", original_action.clone()).await;
+            if outcome.record_retry(retry, RecoveryVia::LlmFallback) {
+                emit_telemetry(
+                    state,
+                    &error_code,
+                    &chosen_command,
+                    true,
+                    outcome.retry_outcome,
+                    task_run_id,
+                )
+                .await;
+            } else {
+                warn!(
+                    "recovery_executor: LLM fallback ran but the original action is not \
+                     recovered (retry read {:?}) — reporting recovered:false",
+                    outcome.retry_outcome
+                );
+                outcome.via = RecoveryVia::None;
+                emit_telemetry(
+                    state,
+                    &error_code,
+                    &chosen_command,
+                    false,
+                    outcome.retry_outcome,
+                    task_run_id,
+                )
+                .await;
             }
         }
         Err(e) => {
             warn!("recovery_executor: LLM fallback also failed: {}", e);
             outcome.via = RecoveryVia::None;
-            emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
+            emit_telemetry(
+                state,
+                &error_code,
+                &chosen_command,
+                false,
+                outcome.retry_outcome,
+                task_run_id,
+            )
+            .await;
         }
     }
     outcome
 }
 
-/// Emit `(errorCode, recovery_command_chosen, recovery_succeeded)` through the
-/// runner's existing structured-event surface. Fire-and-forget PG write keyed
-/// off `task_run_id` — matches `execute_action`'s telemetry pattern exactly
+/// Emit `(errorCode, recovery_command_chosen, recovery_succeeded,
+/// retryOutcome)` through the runner's existing structured-event surface.
+/// Fire-and-forget PG write keyed off `task_run_id` — matches
+/// `execute_action`'s telemetry pattern exactly
 /// (no new transport). When `task_run_id` is absent the tuple is still logged
 /// at info level (always observable) but not persisted (consistent with the
 /// existing event-persistence gate).
@@ -524,12 +667,13 @@ async fn emit_telemetry(
     error_code: &Option<CanonicalCode>,
     command_chosen: &Option<String>,
     succeeded: bool,
+    retry_outcome: RetryOutcome,
     task_run_id: Option<i64>,
 ) {
     let code_str = error_code.map(|c| c.as_str().to_string());
     info!(
-        "recovery_telemetry: errorCode={:?} command={:?} succeeded={}",
-        code_str, command_chosen, succeeded
+        "recovery_telemetry: errorCode={:?} command={:?} succeeded={} retryOutcome={:?}",
+        code_str, command_chosen, succeeded, retry_outcome
     );
 
     let Some(tr_id) = task_run_id else {
@@ -540,6 +684,7 @@ async fn emit_telemetry(
         "errorCode": code_str,
         "recoveryCommandChosen": command_chosen,
         "recoverySucceeded": succeeded,
+        "retryOutcome": retry_outcome,
     })
     .to_string();
 
@@ -734,6 +879,7 @@ mod tests {
             "blur",
             "scrollIntoView",
             "hover",
+            "unhover",
             "discover",
         ] {
             assert!(
@@ -802,9 +948,12 @@ mod tests {
     /// Plan 2026-08-23-single-source-derived-facts item 8: the inner and outer
     /// verdicts answer different questions and MAY disagree — by design. A
     /// scoped attempt that acted on the addressed element (frontend
-    /// `attemptSucceeded: true`, so `/ai/recovery/attempt` answers 200) while
-    /// the original action still fails on retry is inner-true / outer-false.
-    /// Pinned so nobody "fixes" it by unifying the two values.
+    /// `attemptSucceeded: true`, so `/ai/recovery/attempt` answers 200) says
+    /// nothing about the ORIGINAL action. That is the retry's verdict alone,
+    /// in all three of its arms: `failed` and `indeterminate` (no boolean
+    /// `success`, or no reply at all) are inner-true / outer-false, and only
+    /// `succeeded` recovers. Pinned so nobody "fixes" it by unifying the two
+    /// values.
     #[test]
     fn scoped_attempt_success_does_not_imply_recovered() {
         // Inner: the frontend's happy-path payload for the scoped attempt.
@@ -821,22 +970,162 @@ mod tests {
             json!(true)
         );
 
-        // Outer: the independent retry of the ORIGINAL action still fails.
-        let retry_still_failing = Ok(json!({ "success": false, "error": "still disabled" }));
+        // Outer arm 1, FAILED: the retry of the ORIGINAL action still fails.
+        let mut failed = RecoveryOutcome::not_recovered(None);
         assert!(
-            original_action_now_succeeds(retry_still_failing).is_none(),
+            !failed.record_retry(
+                Ok(json!({ "success": false, "error": "still disabled" })),
+                RecoveryVia::LlmFallback,
+            ),
             "the original action is still broken, so RecoveryOutcome.recovered stays false"
         );
+        assert_eq!(failed.retry_outcome, RetryOutcome::Failed);
+        assert_eq!(failed.via, RecoveryVia::None);
+        assert!(failed.result.is_none());
 
-        // And the outer verdict does go true when the retry succeeds.
-        assert!(original_action_now_succeeds(Ok(json!({ "success": true }))).is_some());
-        assert!(original_action_now_succeeds(Err("ipc timeout".into())).is_none());
+        // Outer arm 2, INDETERMINATE: a retry reply with no boolean `success`,
+        // or no reply at all, recovers nothing either.
+        for retry in [
+            Ok(json!({ "clicked": true })),
+            Ok(json!({ "success": "true" })),
+            Ok(json!(null)),
+            Err("ipc timeout".to_string()),
+        ] {
+            let mut indeterminate = RecoveryOutcome::not_recovered(None);
+            assert!(
+                !indeterminate.record_retry(retry.clone(), RecoveryVia::LlmFallback),
+                "a retry that says nothing is not a recovery: {retry:?}"
+            );
+            assert_eq!(
+                indeterminate.retry_outcome,
+                RetryOutcome::Indeterminate,
+                "{retry:?}"
+            );
+            assert_eq!(indeterminate.via, RecoveryVia::None, "{retry:?}");
+            assert!(indeterminate.result.is_none(), "{retry:?}");
+        }
+
+        // Outer arm 3, SUCCEEDED: `success: true`, and only that, recovers.
+        let reply = json!({ "success": true, "elementId": "btn-1" });
+        let mut succeeded = RecoveryOutcome::not_recovered(None);
+        assert!(
+            succeeded.record_retry(Ok(reply.clone()), RecoveryVia::LlmFallback),
+            "the original action now succeeds, so the recovery counts"
+        );
+        assert_eq!(succeeded.retry_outcome, RetryOutcome::Succeeded);
+        assert_eq!(succeeded.via, RecoveryVia::LlmFallback);
+        assert_eq!(succeeded.result, Some(reply));
     }
 
+    /// `llm_fallback` reads the scoped attempt's reply on `attemptSucceeded`,
+    /// NOT through the strict `success` reader. The frontend's happy-path reply
+    /// reaches the runner as the bare `data`, which carries no `success` key,
+    /// so a strict read would call every successful attempt indeterminate and
+    /// the retry of the original action — reached only on `Ok` — would never
+    /// run.
     #[test]
-    fn is_ipc_success_semantics() {
-        assert!(is_ipc_success(&json!({ "success": true })));
-        assert!(is_ipc_success(&json!({ "clicked": true }))); // absent == success
-        assert!(!is_ipc_success(&json!({ "success": false })));
+    fn a_successful_scoped_attempt_reads_ok_and_so_reaches_the_retry() {
+        let attempt = json!({ "attemptSucceeded": true, "elementId": "btn-1" });
+        assert_eq!(
+            action_outcome(&attempt),
+            ActionOutcome::Indeterminate,
+            "the happy-path reply carries no `success`: why the strict reader is the wrong one here"
+        );
+        assert_eq!(scoped_attempt_verdict(attempt.clone()), Ok(attempt));
+    }
+
+    /// The scoped reader is not permissive the other way either: an explicit
+    /// refusal, an attempt that did not act, and a reply with no boolean
+    /// `attemptSucceeded` are all `Err`, so no retry follows any of them.
+    #[test]
+    fn a_refused_failed_or_silent_scoped_attempt_reads_err() {
+        let unscoped = "RECOVERY_UNSCOPED: ai_recovery_attempt requires params.elementId";
+        assert_eq!(
+            scoped_attempt_verdict(json!({
+                "success": false,
+                "error": unscoped,
+                "attemptSucceeded": false,
+            })),
+            Err(unscoped.to_string()),
+            "the dispatcher stamps the envelope's refusal onto `data`; its text is the error"
+        );
+        assert!(
+            scoped_attempt_verdict(json!({ "success": false, "attemptSucceeded": true })).is_err(),
+            "an explicit `success: false` wins over a contradictory `attemptSucceeded`"
+        );
+        assert_eq!(
+            scoped_attempt_verdict(json!({ "attemptSucceeded": false })),
+            Err("LLM recovery failed".to_string()),
+            "the attempt ran and did not act on the addressed element"
+        );
+        for silent in [
+            json!({}),
+            json!({ "elementId": "btn-1" }),
+            json!({ "attemptSucceeded": "true" }),
+            json!({ "success": true }),
+        ] {
+            let err = scoped_attempt_verdict(silent.clone())
+                .expect_err("a reply with no boolean `attemptSucceeded` is no verdict");
+            assert!(err.starts_with("INDETERMINATE:"), "{silent}: {err}");
+        }
+    }
+
+    /// THE defect this replaces: `is_ipc_success` read an ABSENT `success` as
+    /// success, and its own test pinned exactly that (`{"clicked": true}`
+    /// asserted to be a success), so a retried action whose reply carried no
+    /// verdict was reported `recovered: true` and the action route answered
+    /// HTTP 200. Read strictly the reply is INDETERMINATE: nothing recovered,
+    /// `retryOutcome: "indeterminate"` on the wire, the route's
+    /// `recovery_is_genuine` gate shut even with a command chosen, and
+    /// `as_action_failure` surfacing the ORIGINAL failure with that trail.
+    #[test]
+    fn a_retry_reply_without_a_boolean_success_is_indeterminate_and_recovers_nothing() {
+        let reply = json!({ "clicked": true });
+        assert_eq!(action_outcome(&reply), ActionOutcome::Indeterminate);
+
+        let mut outcome = RecoveryOutcome::not_recovered(Some("UB-ELEM-NOT-VISIBLE".to_string()));
+        outcome.command_chosen = Some("scroll_into_view".to_string());
+        assert!(
+            !outcome.record_retry(Ok(reply), RecoveryVia::StructuredCommand),
+            "a retry reply with no boolean `success` is not a recovery"
+        );
+        assert!(!outcome.recovered);
+        assert_eq!(outcome.retry_outcome, RetryOutcome::Indeterminate);
+        assert_eq!(outcome.via, RecoveryVia::None);
+        assert!(outcome.result.is_none());
+        assert!(
+            !super::super::elements::recovery_is_genuine(&outcome),
+            "an indeterminate retry is no recovery, command chosen or not"
+        );
+
+        // What the route does with it: the original failure, carrying the trail.
+        let trail = serde_json::to_value(&outcome).expect("serialize RecoveryOutcome");
+        assert_eq!(trail["recovered"], json!(false));
+        assert_eq!(trail["retryOutcome"], json!("indeterminate"));
+        let original_failure = super::super::request::wrap_ipc_result(Ok(json!({
+            "success": false,
+            "error": "Element is not visible",
+        })));
+        let (status, axum::Json(body)) =
+            super::super::elements::as_action_failure(original_failure, "click", "btn-1", trail)
+                .expect_err("the original failure is surfaced, not a success");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_value(&body).expect("serialize the error body");
+        assert_eq!(wire["success"], json!(false), "{wire}");
+        assert_eq!(
+            wire.pointer("/error_detail/context/recovery/retryOutcome"),
+            Some(&json!("indeterminate")),
+            "{wire}"
+        );
+    }
+
+    /// A recovery that never reached a retry says so with a VALUE, so no
+    /// reader can take a missing `retryOutcome` for a successful one.
+    #[test]
+    fn an_outcome_with_no_retry_serializes_not_retried() {
+        let wire = serde_json::to_value(RecoveryOutcome::not_recovered(None))
+            .expect("serialize RecoveryOutcome");
+        assert_eq!(wire["recovered"], json!(false));
+        assert_eq!(wire["retryOutcome"], json!("not_retried"));
     }
 }

@@ -52,8 +52,21 @@ pub(crate) const LOG_TAIL_CAP_BYTES: usize = 32 * 1024;
 const RESULT_RETRY_SECS: &[u64] = &[2, 4, 8, 16, 32];
 
 /// Decide whether a pending batch should flush. Pure, unit-tested.
-pub(crate) fn should_flush(pending_lines: usize, elapsed_since_last: Duration) -> bool {
-    pending_lines > 0 && (pending_lines >= FLUSH_MAX_LINES || elapsed_since_last >= FLUSH_INTERVAL)
+///
+/// `backing_off` is true while the last POST failed: the batch-size trigger
+/// is then suspended and only [`FLUSH_INTERVAL`] re-arms a POST. Without it a
+/// backlog past [`FLUSH_MAX_LINES`] re-POSTs once per received line, and each
+/// failed POST can cost a 10 s timeout or a device-JWT re-mint wait, so a
+/// chatty step against an unreachable coord kept `finish()` (and with it the
+/// result POST) waiting for hours.
+pub(crate) fn should_flush(
+    pending_lines: usize,
+    elapsed_since_last: Duration,
+    backing_off: bool,
+) -> bool {
+    pending_lines > 0
+        && ((!backing_off && pending_lines >= FLUSH_MAX_LINES)
+            || elapsed_since_last >= FLUSH_INTERVAL)
 }
 
 /// Coord's terminal dispatch-ledger states (mirrors `ci_dispatch::is_terminal`
@@ -174,11 +187,8 @@ impl ProgressSink {
     }
 
     /// TEST-ONLY sink with no coord: the tail ring records every line and the
-    /// flusher only drains the channel. A dead-port [`ProgressSink::start`]
-    /// attempts a POST per line once [`FLUSH_MAX_LINES`] are pending, and
-    /// with no device JWT each attempt waits out the re-mint window, so a
-    /// test pushing tens of thousands of lines could not `finish()` in any
-    /// useful time.
+    /// flusher only drains the channel, so a test's `finish()` never waits
+    /// on a dead-port POST, its retry, or a device-JWT re-mint.
     #[cfg(test)]
     pub(crate) fn tail_only() -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -230,14 +240,12 @@ impl LinePusher {
     }
 }
 
-/// Flusher: accumulate lines; POST a batch every [`FLUSH_INTERVAL`] or
-/// [`FLUSH_MAX_LINES`]; on POST failure keep the lines queued (bounded,
-/// drop-oldest) and retry on the next tick — the `forward_stream` retry-
-/// queue discipline. Exits after the channel closes and a final drain pass.
+/// Flusher for a live dispatch: [`run_flusher`] driven by the progress-route
+/// POST.
 async fn flusher_loop(
     coord_base: String,
     dispatch_id: String,
-    mut rx: mpsc::UnboundedReceiver<String>,
+    rx: mpsc::UnboundedReceiver<String>,
     cancel: CancellationToken,
 ) {
     let url = format!(
@@ -249,70 +257,96 @@ async fn flusher_loop(
         .timeout(Duration::from_secs(10))
         .build()
         .ok();
+    let client = Arc::new(client);
+    let url = Arc::new(url);
+    let id = Arc::new(dispatch_id);
+    let post = {
+        let id = id.clone();
+        move |batch: Vec<String>, seq: u64| {
+            let (client, url, id, cancel) =
+                (client.clone(), url.clone(), id.clone(), cancel.clone());
+            async move { post_batch(&client, &url, &batch, seq, &id, &cancel).await }
+        }
+    };
+    run_flusher(rx, &id, post).await;
+}
 
-    /// One authenticated batch POST. `true` = coord accepted the batch
-    /// (drop it from the queue) — including the terminal-state case, where
-    /// coord accepted nothing but never will (re-sending is pointless), so
-    /// the token is cancelled and the lines are surrendered.
-    async fn post_batch(
-        client: &Option<reqwest::Client>,
-        url: &str,
-        batch: &[String],
-        seq: u64,
-        dispatch_id: &str,
-        cancel: &CancellationToken,
-    ) -> bool {
-        let Some(client) = client else { return false };
-        let Some(bearer) = device_bearer().await else {
-            debug!("ci_node: no device JWT for progress POST (dispatch {dispatch_id})");
-            return false;
-        };
-        let body = ProgressBody {
-            lines: batch,
-            progress_seq: seq,
-        };
-        // coord-auth-exempt(device-jwt-required): resolves the device JWT through
-        // `coord_mcp::read_usable_device_jwt` + `await_device_jwt_remint`, which can
-        // AWAIT a re-mint. The synchronous helper cannot, so routing this through it
-        // would drop progress lines during a token rotation.
-        match client
-            .post(url)
-            .bearer_auth(bearer)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(text) = resp.text().await {
-                    if let Some(state) = parse_response_state(&text) {
-                        if is_terminal_dispatch_state(&state) && !cancel.is_cancelled() {
-                            warn!(
-                                "ci_node: coord reports dispatch {dispatch_id} already terminal \
-                                 ({state}) — cancelling the local build"
-                            );
-                            cancel.cancel();
-                        }
+/// One authenticated batch POST. `true` = coord accepted the batch
+/// (drop it from the queue) — including the terminal-state case, where
+/// coord accepted nothing but never will (re-sending is pointless), so
+/// the token is cancelled and the lines are surrendered.
+async fn post_batch(
+    client: &Option<reqwest::Client>,
+    url: &str,
+    batch: &[String],
+    seq: u64,
+    dispatch_id: &str,
+    cancel: &CancellationToken,
+) -> bool {
+    let Some(client) = client else { return false };
+    let Some(bearer) = device_bearer().await else {
+        debug!("ci_node: no device JWT for progress POST (dispatch {dispatch_id})");
+        return false;
+    };
+    let body = ProgressBody {
+        lines: batch,
+        progress_seq: seq,
+    };
+    // coord-auth-exempt(device-jwt-required): resolves the device JWT through
+    // `coord_mcp::read_usable_device_jwt` + `await_device_jwt_remint`, which can
+    // AWAIT a re-mint. The synchronous helper cannot, so routing this through it
+    // would drop progress lines during a token rotation.
+    match client
+        .post(url)
+        .bearer_auth(bearer)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(text) = resp.text().await {
+                if let Some(state) = parse_response_state(&text) {
+                    if is_terminal_dispatch_state(&state) && !cancel.is_cancelled() {
+                        warn!(
+                            "ci_node: coord reports dispatch {dispatch_id} already terminal \
+                             ({state}) — cancelling the local build"
+                        );
+                        cancel.cancel();
                     }
                 }
-                true
             }
-            Ok(resp) => {
-                debug!(
-                    "ci_node: progress POST for dispatch {dispatch_id} returned {}",
-                    resp.status()
-                );
-                false
-            }
-            Err(e) => {
-                debug!("ci_node: progress POST for dispatch {dispatch_id} failed: {e}");
-                false
-            }
+            true
+        }
+        Ok(resp) => {
+            debug!(
+                "ci_node: progress POST for dispatch {dispatch_id} returned {}",
+                resp.status()
+            );
+            false
+        }
+        Err(e) => {
+            debug!("ci_node: progress POST for dispatch {dispatch_id} failed: {e}");
+            false
         }
     }
+}
+
+/// Flusher: accumulate lines; POST a batch every [`FLUSH_INTERVAL`] or
+/// [`FLUSH_MAX_LINES`]; on POST failure keep the lines queued (bounded,
+/// drop-oldest) and retry once [`FLUSH_INTERVAL`] has passed — never once per
+/// newly received line (see [`should_flush`]). The `forward_stream` retry-
+/// queue discipline. Exits after the channel closes and a final drain pass.
+/// `post` returns `true` when the batch is settled (drop it from the queue).
+async fn run_flusher<P, F>(mut rx: mpsc::UnboundedReceiver<String>, dispatch_id: &str, mut post: P)
+where
+    P: FnMut(Vec<String>, u64) -> F,
+    F: std::future::Future<Output = bool>,
+{
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut seq: u64 = 0;
     let mut last_flush = tokio::time::Instant::now();
     let mut open = true;
+    let mut backing_off = false;
 
     while open || !pending.is_empty() {
         if open {
@@ -336,13 +370,16 @@ async fn flusher_loop(
             }
         }
         let closing = !open;
-        if should_flush(pending.len(), last_flush.elapsed()) || (closing && !pending.is_empty()) {
+        if should_flush(pending.len(), last_flush.elapsed(), backing_off)
+            || (closing && !pending.is_empty())
+        {
             // Up to 500 lines per POST — bigger than the 50-line trigger so
             // a backlog built up during a coord blip drains quickly.
             let batch: Vec<String> = pending.iter().take(500).cloned().collect();
             seq += 1;
-            let ok = post_batch(&client, &url, &batch, seq, &dispatch_id, &cancel).await;
+            let ok = post(batch.clone(), seq).await;
             last_flush = tokio::time::Instant::now();
+            backing_off = !ok;
             if ok {
                 for _ in 0..batch.len() {
                     pending.pop_front();
@@ -358,7 +395,7 @@ async fn flusher_loop(
                     // The retry re-sends the same seq (duplicates tolerated;
                     // seq is informational on coord's side).
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    if post_batch(&client, &url, &batch, seq, &dispatch_id, &cancel).await {
+                    if post(batch.clone(), seq).await {
                         for _ in 0..batch.len() {
                             pending.pop_front();
                         }
@@ -658,18 +695,100 @@ mod tests {
     #[test]
     fn flush_trigger_logic() {
         assert!(
-            !should_flush(0, Duration::from_secs(60)),
+            !should_flush(0, Duration::from_secs(60), false),
             "no lines → no flush"
         );
         assert!(
-            !should_flush(1, Duration::from_millis(100)),
+            !should_flush(1, Duration::from_millis(100), false),
             "young + few → wait"
         );
         assert!(
-            should_flush(FLUSH_MAX_LINES, Duration::from_millis(0)),
+            should_flush(FLUSH_MAX_LINES, Duration::from_millis(0), false),
             "batch full → flush"
         );
-        assert!(should_flush(1, FLUSH_INTERVAL), "interval elapsed → flush");
+        assert!(
+            should_flush(1, FLUSH_INTERVAL, false),
+            "interval elapsed → flush"
+        );
+        assert!(
+            !should_flush(FLUSH_MAX_LINES * 10, Duration::from_millis(100), true),
+            "backing off after a failed POST → a full batch waits for the interval"
+        );
+        assert!(
+            should_flush(FLUSH_MAX_LINES * 10, FLUSH_INTERVAL, true),
+            "backing off → the interval re-arms the retry"
+        );
+    }
+
+    /// A coord that refuses every progress POST must not be re-POSTed once
+    /// per received line: a step pushing thousands of lines would then make
+    /// thousands of failing POSTs (each up to a 10 s timeout or a device-JWT
+    /// re-mint wait) before `finish()` returned. The old size trigger did
+    /// exactly that once the retry queue passed `FLUSH_MAX_LINES`.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_coord_is_retried_per_interval_not_per_line() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        for i in 0..5_000 {
+            tx.send(format!("line {i}")).unwrap();
+        }
+        drop(tx);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        run_flusher(rx, "test-dispatch", move |_batch, _seq| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { false }
+        })
+        .await;
+        let n = attempts.load(Ordering::SeqCst);
+        assert!(
+            n <= 4,
+            "a refusing coord must be retried per FLUSH_INTERVAL, not per line: {n} POSTs"
+        );
+    }
+
+    /// The back-off must not cost delivery once coord answers again: while
+    /// the step is still writing (channel open), the FLUSH_INTERVAL retry
+    /// delivers every line queued during the failure, in order.
+    #[tokio::test(start_paused = true)]
+    async fn lines_queued_during_a_failure_are_delivered_by_the_interval_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (c, d) = (calls.clone(), delivered.clone());
+        let flusher = tokio::spawn(async move {
+            run_flusher(rx, "test-dispatch", move |batch, _seq| {
+                let first = c.fetch_add(1, Ordering::SeqCst) == 0;
+                if !first {
+                    d.lock().unwrap().extend(batch);
+                }
+                async move { !first }
+            })
+            .await;
+        });
+        for i in 0..1_200 {
+            tx.send(format!("line {i}")).unwrap();
+        }
+        // Paused clock: this sleep lets the flusher take every line, fail its
+        // first POST, then retry on each FLUSH_INTERVAL deadline (all earlier
+        // than ours) — 500 lines per POST, so three retries — all before the
+        // channel closes.
+        tokio::time::sleep(FLUSH_INTERVAL * 5).await;
+        {
+            let got = delivered.lock().unwrap();
+            assert_eq!(
+                got.len(),
+                1_200,
+                "the interval retry delivers the backlog while the step still writes \
+                 ({} POSTs)",
+                calls.load(Ordering::SeqCst)
+            );
+            assert_eq!(got.first().map(String::as_str), Some("line 0"));
+            assert_eq!(got.last().map(String::as_str), Some("line 1199"));
+        }
+        drop(tx);
+        flusher.await.unwrap();
     }
 
     #[test]

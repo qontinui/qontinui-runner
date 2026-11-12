@@ -1,5 +1,5 @@
 {
-  "description": "Specs Viewer/Editor page — a three-panel layout for viewing, editing, and managing project specifications of all types (page specs, architecture, API, data, dependency, constraint). The left panel shows a hierarchical spec tree grouped by application. The center panel shows spec details with inline editing, a tabbed view (Assertions / Issues / Triage) for page specs, and specialized views for other spec types. The right panel provides AI chat for spec review, gap analysis, creation, and workflow building. A connection bar below the header provides buttons to load bundled specs, load/save files, discover specs from running apps via UI Bridge, toggle edit mode, trigger AI eval, run spec sync, check drift, and compile the runtime state machine. The page header offers three view modes: Editor (default), Contracts, and Experimentation.",
+  "description": "Specs Viewer/Editor page — a three-panel layout for viewing, editing, and managing project specifications of all types (page specs, architecture, API, data, dependency, constraint). The left panel shows a hierarchical spec tree grouped by application. The center panel shows spec details with inline editing, a tabbed view (Assertions / Issues / Triage) for page specs, and specialized views for other spec types. The right panel provides AI chat for spec review, gap analysis, creation, and workflow building. A connection bar below the header provides buttons to load bundled specs, load/save files, discover specs from running apps via UI Bridge, toggle edit mode, trigger AI eval, run spec sync, check drift, and compile the runtime state machine. The page header offers two view modes: Editor (default) and Experimentation.",
   "groups": [
     {
       "assertions": [
@@ -59,24 +59,6 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 3 for state Page Structure and View Modes",
-          "enabled": true,
-          "id": "page-structure-elem-3",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {
-              "role": "button",
-              "textContent": "Contracts"
-            },
-            "label": "Required element for Page Structure and View Modes",
-            "type": "search"
-          }
-        },
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
           "description": "Required element 4 for state Page Structure and View Modes",
           "enabled": true,
           "id": "page-structure-elem-4",
@@ -91,28 +73,10 @@
             "label": "Required element for Page Structure and View Modes",
             "type": "search"
           }
-        },
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 5 for state Page Structure and View Modes",
-          "enabled": true,
-          "id": "page-structure-elem-5",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {
-              "role": "button",
-              "textContent": "Contracts"
-            },
-            "label": "Required element for Page Structure and View Modes",
-            "type": "search"
-          }
         }
       ],
       "category": "element-presence",
-      "description": "The Specs page header contains a ShieldCheck icon, the 'Specs' title, a mode badge ('viewer' or 'editor'), and three view-mode toggle buttons on the right: Editor (default), Contracts, and Experimentation. The initial view mode is 'Editor'. Each button activates its mode and the selected button gets a highlighted background.",
+      "description": "The Specs page header contains a ShieldCheck icon, the 'Specs' title, a mode badge ('viewer' or 'editor'), and two view-mode toggle buttons on the right: Editor (default) and Experimentation. The initial view mode is 'Editor'. Each button activates its mode and the selected button gets a highlighted background.",
       "id": "page-structure",
       "name": "Page Structure and View Modes",
       "source": "migrated"
@@ -1310,14 +1274,13 @@
       "sync",
       "drift",
       "compile-state-machine",
-      "contracts",
       "experimentation"
     ]
   },
   "stateMachine": {
     "states": [
       {
-        "description": "The Specs page header contains a ShieldCheck icon, the 'Specs' title, a mode badge ('viewer' or 'editor'), and three view-mode toggle buttons on the right: Editor (default), Contracts, and Experimentation. The initial view mode is 'Editor'. Each button activates its mode and the selected button gets a highlighted background.",
+        "description": "The Specs page header contains a ShieldCheck icon, the 'Specs' title, a mode badge ('viewer' or 'editor'), and two view-mode toggle buttons on the right: Editor (default) and Experimentation. The initial view mode is 'Editor'. Each button activates its mode and the selected button gets a highlighted background.",
         "elements": [
           {
             "role": "heading",
@@ -1332,15 +1295,7 @@
           },
           {
             "role": "button",
-            "textContent": "Contracts"
-          },
-          {
-            "role": "button",
             "textContent": "Experimentation"
-          },
-          {
-            "role": "button",
-            "textContent": "Contracts"
           }
         ],
         "id": "page-structure",

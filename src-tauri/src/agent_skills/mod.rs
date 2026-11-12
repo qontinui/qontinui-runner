@@ -523,6 +523,12 @@ impl AgentSkillRegistry {
             .or_else(|| self.builtin.iter().find(|s| s.name == name))
     }
 
+    /// The embedded default named `name`, whatever overrides it — its files are
+    /// the paths the vendoring repository's history can add.
+    pub fn builtin(&self, name: &str) -> Option<&ResolvedSkill> {
+        self.builtin.iter().find(|b| b.name == name)
+    }
+
     /// How many defaults are embedded in this binary.
     pub fn builtin_count(&self) -> usize {
         self.builtin.len()

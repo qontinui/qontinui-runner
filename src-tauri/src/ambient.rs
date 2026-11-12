@@ -176,6 +176,9 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_CENSUS_CHUNK_ROWS",
     "QONTINUI_CENSUS_CHUNK_SECS",
     "QONTINUI_CENSUS_POST_TIMEOUT_SECS",
+    // Read through `ci_node::cgroup::CGROUP_ROOT_ENV`, by `ci_node` and by the
+    // slice telemetry's CPU attribution (`fleet::slice_telemetry::cpu`).
+    "QONTINUI_CI_CGROUP_ROOT",
     "QONTINUI_CLAUDE_BIN",
     "QONTINUI_CLAUDE_HOOK_SETTINGS",
     "QONTINUI_CODE_GRAPH_ROOTS",
@@ -2419,6 +2422,12 @@ mod tests {
             "the ambient Claude config (`~/.claude.json`) a child with no account reads",
         ),
         (
+            "claude_cli_update.rs",
+            1,
+            "Claude Code's own `~/.claude/settings.json`, read only for the user's \
+             `autoUpdatesChannel` — not runner state",
+        ),
+        (
             "claude_session/trust_gate.rs",
             1,
             "the ambient Claude config (`~/.claude.json`) a child with no account reads",
@@ -2434,8 +2443,9 @@ mod tests {
             "commands/terminal.rs",
             1,
             "`claude_default_config_home`: the default Claude account home (`~/.claude`), read \
-             only so a resume never types it as `CLAUDE_CONFIG_DIR` — Claude Code's, not runner \
-             state",
+             so a resume never types it as `CLAUDE_CONFIG_DIR`, and so the graceful-exit probe's \
+             registry read can find a first session's record in its `sessions/` — Claude \
+             Code's, not runner state",
         ),
         (
             "wrappers/clients.rs",

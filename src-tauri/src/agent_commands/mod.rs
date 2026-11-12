@@ -410,6 +410,13 @@ impl AgentCommandRegistry {
             .or_else(|| self.builtin.iter().find(|c| c.name == name))
     }
 
+    /// True iff `name` is a builtin command — one this binary embeds, so the
+    /// repository that vendors it can add the same path upstream. An
+    /// account-only command is not, and `provision_guard` never withholds it.
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.builtin.iter().any(|b| b.name == name)
+    }
+
     /// How many defaults are embedded in this binary.
     pub fn builtin_count(&self) -> usize {
         self.builtin.len()

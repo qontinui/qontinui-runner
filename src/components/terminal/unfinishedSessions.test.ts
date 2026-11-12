@@ -41,6 +41,12 @@ describe("isUnfinished", () => {
     expect(isUnfinished(s({ closeReason: "terminal-only-idle" }))).toBe(false);
     expect(isUnfinished(s({ closeReason: "poll-dead" }))).toBe(true);
   });
+  it("keeps a launch-failed row resumable: the CLI never ran, so nothing was lost", () => {
+    expect(NON_RESTORABLE_CLOSE_REASONS.has("launch-failed")).toBe(false);
+    expect(isUnfinished(s({ closeReason: "launch-failed" }))).toBe(true);
+    // The same row with a reason that IS final is not offered.
+    expect(isUnfinished(s({ closeReason: "never-started" }))).toBe(false);
+  });
 });
 
 describe("unfinishedReadState", () => {

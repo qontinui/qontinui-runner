@@ -63,10 +63,12 @@
 //! Every carrier also sets `env.DISABLE_AUTOUPDATER = "1"` (Phase 82): a
 //! runner-spawned session must not have Claude Code swap its own binary under
 //! the live sessions sharing it (`claude.exe: Text file busy`, observed
-//! 2026-10-29). The cost is that a box running only runner-hosted sessions
-//! stays on its installed Claude Code (plugins included — the variable also
-//! stops their background updates) until someone runs `claude update`, which
-//! the variable does not refuse. It narrows the hazard rather than closing it:
+//! 2026-10-29). Without more, a box running only runner-hosted sessions would
+//! stay on its installed Claude Code (plugins included — the variable also
+//! stops their background updates) until someone ran `claude update`; the
+//! runner-owned updater (`crate::claude_cli_update`) installs each newly
+//! published release once instead, unless the user switched it off on the AI
+//! settings page or opted out in their own environment. It narrows the hazard rather than closing it:
 //! a `claude` started OUTSIDE the runner still auto-updates and can still swap
 //! the binary under runner sessions.
 //!

@@ -10,7 +10,7 @@
 
 import { resolvePort } from "@/lib/runner-api";
 import { describeThrown } from "@/lib/utils";
-import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
+import { fetchVisibleLiveClaudeSessionIds } from "./liveClaudeSessions";
 import type { PastSession } from "./usePastSessions";
 
 /**
@@ -19,6 +19,10 @@ import type { PastSession } from "./usePastSessions";
  * copy: `unfinishedSessions.test.ts` reads the Rust constant and fails when the
  * two disagree, so a reason added there cannot leave this list offering a
  * Resume for a session the runner deliberately does not restore.
+ *
+ * `launch-failed` is deliberately ABSENT, like `poll-dead`: the Claude CLI
+ * never started in that pane, so the conversation is exactly as it was and the
+ * session stays resumable.
  */
 export const NON_RESTORABLE_CLOSE_REASONS: ReadonlySet<string> = new Set([
   "no-terminal",
@@ -129,12 +133,13 @@ export async function resumeUnfinished(
   ids: readonly string[],
   fetchImpl: typeof fetch = fetch,
   port: number = resolvePort(),
-  liveSessionIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+  liveSessionIds: () => Promise<ReadonlySet<string> | null> = fetchVisibleLiveClaudeSessionIds,
 ): Promise<ResumeVerdict[]> {
   // The door's own check only sees an id on a process command line, and an id
   // changed in-process (`/clear`, the `/resume` picker) is not there. Claude's
   // live registry reports the current id, so ask it first, as a roster resume
-  // does. An unreadable registry leaves the decision to the door.
+  // does. Every session it can SEE live is refused, even when another dir
+  // could not be listed; an unreadable registry leaves the decision to the door.
   const live = await liveSessionIds();
   const running = ids.filter((id) => live?.has(id));
   const toResume = ids.filter((id) => !running.includes(id));

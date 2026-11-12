@@ -651,7 +651,7 @@ pub async fn ui_bridge_batch_actions_handler(
 /// Includes both `camelCase` and `snake_case` aliases for the multi-token
 /// names because the SDK accepts either (e.g. `scrollIntoView` vs
 /// `scroll_into_view`, see `recovery_executor::execute_recovery_command`).
-const SUPPORTED_ACTION_NAMES: &[&str] = &[
+pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "click",
     // Reveal a hover-gated control (`pointer-events:none` until `:hover`/
     // `group-hover`) then click it, in one dispatch. Handled SDK-side by
@@ -669,6 +669,11 @@ const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "focus",
     "blur",
     "hover",
+    // Release a forced hover (`hover` puts the target into its CSS `:hover`
+    // appearance via `[data-ui-bridge-hover]` twin rules). Added SDK-side in
+    // `@qontinui/ui-bridge` the next minor after 0.35 (plan
+    // 2026-10-22-ui-bridge-hover-forces-the-css-hover-state); forwarded as-is.
+    "unhover",
     "scroll",
     "scrollIntoView",
     "scroll_into_view",
@@ -932,6 +937,10 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
                 // this, hover-revealed toolbar buttons (which advertise `click`
                 // but not `hoverClick`) would be rejected here pre-IPC.
                 || (action == "hoverClick" && list.iter().any(|s| s == "click"))
+                // `unhover` releases what `hover` forced, so it is allowed
+                // wherever `hover` is advertised even when the element's
+                // action list predates the SDK's `unhover`.
+                || (action == "unhover" && list.iter().any(|s| s == "hover"))
         }
         // Unknown supported list (fetch failed or element didn't advertise
         // any) — assume yes, so we don't manufacture false ACTION_NOT_SUPPORTED.
@@ -940,14 +949,21 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
 }
 
 /// True only for a recovery that actually did something and worked: a command
-/// was chosen AND the original action succeeded on the retry.
+/// was chosen AND the original action's retry read `succeeded`.
 ///
 /// `recovered:true` with `command_chosen:None` is the shape the LLM fallback
 /// used to produce — it asserted a recovery while admitting no recovery step
 /// was selected. That is not a recovery, so the caller must see the ORIGINAL
 /// failure, not a synthesized verdict about it.
+///
+/// `retry_outcome` is read beside `recovered` instead of trusting the two to
+/// agree. `RecoveryOutcome::record_retry` keeps them in step in production,
+/// but both are `pub` fields that a struct literal can set apart, and a
+/// `recovered: true` beside an `indeterminate` retry must not answer HTTP 200.
 pub(crate) fn recovery_is_genuine(recovery: &super::recovery_executor::RecoveryOutcome) -> bool {
-    recovery.recovered && recovery.command_chosen.is_some()
+    recovery.recovered
+        && recovery.retry_outcome == super::recovery_executor::RetryOutcome::Succeeded
+        && recovery.command_chosen.is_some()
 }
 
 /// Alias for the `execute_action` handler's own return type — the value that
@@ -2064,6 +2080,7 @@ async fn execute_action_dispatch(
                 result = Ok(Json(ok));
             } else {
                 warn!(
+                    retry_outcome = ?recovery.retry_outcome,
                     "execute_action: RecoveryExecutor could not recover element {} \
                      (code={:?}, recovered={}, command={:?}) — surfacing the original failure",
                     id, recovery.error_code, recovery.recovered, recovery.command_chosen
@@ -4010,6 +4027,99 @@ pub async fn ui_bridge_find_handler(
 // Convenience endpoints — app-agnostic DOM interaction helpers
 // =========================================================================
 
+/// The script `page/find-by-text` evaluates: the visible `tag` elements whose
+/// trimmed text equals `text` case-sensitively (`exact`), or else contains it
+/// case-insensitively, as a JSON array. Both caller values enter the script
+/// only as single-quoted string data, `\` and `'` escaped, so neither can close
+/// its literal and splice code. That is the invariant the unguarded fallback
+/// of `evaluate_js_expression` (helpers.rs) relies on.
+fn find_by_text_js(text: &str, tag: &str, exact: bool) -> String {
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_tag = tag.replace('\\', "\\\\").replace('\'', "\\'");
+    let match_expr = if exact {
+        format!("el.textContent.trim() === '{}'", escaped_text)
+    } else {
+        format!(
+            "el.textContent.trim().toLowerCase().includes('{}')",
+            escaped_text.to_lowercase()
+        )
+    };
+
+    format!(
+        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
+            .filter(el => el.offsetParent !== null && {match_expr})
+            .map((el, i) => ({{
+                index: i,
+                tag: el.tagName,
+                text: el.textContent.trim().slice(0, 100),
+                id: el.id || null,
+                disabled: el.disabled || false,
+                visible: el.offsetParent !== null,
+                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
+            }})))"#,
+        tag = escaped_tag,
+        match_expr = match_expr
+    )
+}
+
+#[cfg(test)]
+mod find_by_text_js_tests {
+    use super::find_by_text_js;
+
+    /// A caller's `tag` enters the script as escaped string data, exactly as
+    /// `text` does. A tag that tries to close its `querySelectorAll('...')`
+    /// literal and call `fetch` stays inside the literal. So does one that
+    /// puts a backslash before that quote, which only the backslash doubling
+    /// catches: without it, `\'` becomes `\\'`, an escaped backslash and then
+    /// a quote that closes the literal. And so does a trailing backslash that
+    /// would otherwise escape the closing quote.
+    #[test]
+    fn a_hostile_tag_stays_inside_its_string_literal() {
+        for exact in [true, false] {
+            let js = find_by_text_js(
+                "Submit",
+                "*'),fetch('/x'),document.querySelectorAll('*",
+                exact,
+            );
+            assert!(
+                js.contains(
+                    r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
+                ),
+                "the tag must sit escaped inside its literal, got: {js}"
+            );
+            assert!(
+                !js.contains("'),fetch('"),
+                "the tag must not close its literal and splice a call, got: {js}"
+            );
+
+            // The absence check is anchored at the literal's opening quote:
+            // the bare `\\'),fetch(` also occurs inside the correctly escaped
+            // `*\\\'),fetch(`.
+            let js = find_by_text_js(
+                "Submit",
+                r"*\'),fetch('/x'),document.querySelectorAll('*",
+                exact,
+            );
+            assert!(
+                js.contains(
+                    r"querySelectorAll('*\\\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
+                ),
+                "a backslash before the quote must be escaped too, got: {js}"
+            );
+            assert!(
+                !js.contains(r"querySelectorAll('*\\'),fetch("),
+                "a backslash before the quote must not let the quote close its literal, got: {js}"
+            );
+
+            let js = find_by_text_js("Submit", r"button\", exact);
+            assert!(
+                js.contains(r"querySelectorAll('button\\')"),
+                "a trailing backslash in the tag must be escaped, got: {js}"
+            );
+        }
+    }
+}
+
 /// Find elements by visible text content.
 /// POST /ui-bridge/control/page/find-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true }
@@ -4028,31 +4138,7 @@ pub async fn ui_bridge_find_by_text_handler(
         ));
     }
 
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let match_expr = if exact {
-        format!("el.textContent.trim() === '{}'", escaped_text)
-    } else {
-        format!(
-            "el.textContent.trim().toLowerCase().includes('{}')",
-            escaped_text.to_lowercase()
-        )
-    };
-
-    let js = format!(
-        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
-            .filter(el => el.offsetParent !== null && {match_expr})
-            .map((el, i) => ({{
-                index: i,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                id: el.id || null,
-                disabled: el.disabled || false,
-                visible: el.offsetParent !== null,
-                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
-            }})))"#,
-        tag = tag,
-        match_expr = match_expr
-    );
+    let js = find_by_text_js(text, tag, exact);
 
     // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
@@ -6489,6 +6575,13 @@ mod is_builtin_action_tests {
     }
 
     #[test]
+    fn unhover_is_a_supported_action_name() {
+        // Added SDK-side with forced hover; without it the route 400s
+        // before IPC and the forced hover can never be released.
+        assert!(is_builtin_action("unhover"));
+    }
+
+    #[test]
     fn unknown_action_is_not_builtin() {
         assert!(!is_builtin_action("press"));
         assert!(!is_builtin_action("slap"));
@@ -6634,7 +6727,7 @@ mod action_not_supported_tests {
         recovery_is_genuine, ActionResult, Json, StatusCode, UiBridgeError,
     };
     use crate::mcp::types::ApiResponse;
-    use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
+    use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia, RetryOutcome};
     use serde_json::json;
 
     #[test]
@@ -6697,6 +6790,18 @@ mod action_not_supported_tests {
         ]);
         assert!(!is_action_advertised("setValue", &supported));
         assert!(!is_action_advertised("submit", &supported));
+    }
+
+    #[test]
+    fn is_action_advertised_allows_unhover_where_hover_is_listed() {
+        let supported = Some(vec!["click".to_string(), "hover".to_string()]);
+        assert!(is_action_advertised("unhover", &supported));
+    }
+
+    #[test]
+    fn is_action_advertised_rejects_unhover_without_hover() {
+        let supported = Some(vec!["click".to_string(), "focus".to_string()]);
+        assert!(!is_action_advertised("unhover", &supported));
     }
 
     #[test]
@@ -7066,6 +7171,11 @@ mod action_not_supported_tests {
     fn only_a_command_backed_recovery_counts_as_recovered() {
         let mk = |recovered: bool, cmd: Option<&str>| RecoveryOutcome {
             recovered,
+            retry_outcome: if recovered {
+                RetryOutcome::Succeeded
+            } else {
+                RetryOutcome::Failed
+            },
             via: RecoveryVia::LlmFallback,
             command_chosen: cmd.map(str::to_string),
             error_code: None,
@@ -7078,6 +7188,32 @@ mod action_not_supported_tests {
         );
         assert!(!recovery_is_genuine(&mk(false, Some("scroll_into_view"))));
         assert!(!recovery_is_genuine(&mk(false, None)));
+    }
+
+    /// `recovered` alone is not trusted. A `recovered: true` beside a retry
+    /// that did not read `succeeded` (the two fields set apart, as a struct
+    /// literal can) is not a recovery, so the route surfaces the original
+    /// failure instead of answering HTTP 200.
+    #[test]
+    fn recovered_beside_a_retry_that_did_not_succeed_is_not_a_recovery() {
+        for retry_outcome in [
+            RetryOutcome::Failed,
+            RetryOutcome::Indeterminate,
+            RetryOutcome::NotRetried,
+        ] {
+            let outcome = RecoveryOutcome {
+                recovered: true,
+                retry_outcome,
+                via: RecoveryVia::StructuredCommand,
+                command_chosen: Some("scroll_into_view".to_string()),
+                error_code: None,
+                result: None,
+            };
+            assert!(
+                !recovery_is_genuine(&outcome),
+                "recovered:true beside retryOutcome {retry_outcome:?} must not count as a recovery"
+            );
+        }
     }
 
     /// THE iteration-9 defect: a genuine post-dispatch FAILURE was relabelled
@@ -7096,6 +7232,7 @@ mod action_not_supported_tests {
         ));
         let recovery = serde_json::to_value(RecoveryOutcome {
             recovered: false,
+            retry_outcome: RetryOutcome::NotRetried,
             via: RecoveryVia::None,
             command_chosen: None,
             error_code: None,
@@ -7319,7 +7456,10 @@ mod type_action_param_validation_tests {
     //! The handler-side wiring (`api_error_detailed(msg, detail)` + HTTP
     //! 400) is too IPC-coupled for a pure unit test, so the helper-level
     //! tests act as the regression guard for the envelope shape.
-    use super::{api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError};
+    use super::{
+        api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError,
+        SUPPORTED_ACTION_NAMES,
+    };
     use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
     use serde_json::{json, Map};
 
@@ -7425,31 +7565,7 @@ mod type_action_param_validation_tests {
         // 400 for them. Pass-through verified for every other action
         // name in the supported list.
         let params = Some(json!({ "value": "foo" }));
-        for action in &[
-            "setValue",
-            "select",
-            "click",
-            "doubleClick",
-            "double_click",
-            "double",
-            "right",
-            "middle",
-            "sendKeys",
-            "clear",
-            "focus",
-            "blur",
-            "hover",
-            "scroll",
-            "scrollIntoView",
-            "scroll_into_view",
-            "check",
-            "uncheck",
-            "toggle",
-            "drag",
-            "submit",
-            "reset",
-            "autocomplete",
-        ] {
+        for action in SUPPORTED_ACTION_NAMES.iter().filter(|a| **a != "type") {
             assert_eq!(
                 validate_type_action_params(action, &params, &empty_extra()),
                 Ok(()),

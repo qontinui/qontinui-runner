@@ -288,7 +288,13 @@ pub(crate) fn remove_retired_agents(
             continue;
         }
         let path = dst_dir.join(name);
-        if let Some(reason) = keep.reason(name) {
+        // A RootVersioned keep says "do not CREATE this" — it is never a reason
+        // to keep something on disk (a dangling symlink at a retired name
+        // would otherwise be recorded as kept by the repository).
+        let keep_reason = keep
+            .reason(name)
+            .filter(|r| **r != crate::capability_manifest::SkipReason::RootVersioned);
+        if let Some(reason) = keep_reason {
             if std::fs::symlink_metadata(&path).is_ok() {
                 tracing::info!(
                     "fleet_agents: keeping retired {} as it is on disk — {}",

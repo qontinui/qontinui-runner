@@ -78,7 +78,8 @@ jobs:
   detect:
     name: Dispatch pair-follow for a stripped schemas declaration
     if: github.event_name == 'pull_request'
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMAS_PAIR_FOLLOW || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMAS_PAIR_FOLLOW || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -307,7 +308,8 @@ jobs:
     name: Pair-follow verdict
     needs: [plan, compute, push]
     if: always() && github.event_name != 'pull_request'
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMAS_PAIR_FOLLOW || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMAS_PAIR_FOLLOW || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
       - name: Red on UNKNOWN or a failed leg

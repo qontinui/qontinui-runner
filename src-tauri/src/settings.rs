@@ -226,6 +226,16 @@ pub struct ClaudeCliSettings {
     /// of sitting idle at the input box. Manual migrations honor it too.
     #[serde(default = "default_auto_continue_after_migration")]
     pub auto_continue_after_migration: bool,
+    /// Let the runner install Claude Code CLI updates on this machine
+    /// (`crate::claude_cli_update`): one runner-side updater installs a newly
+    /// published release once, when it is newer than the installed one. Every
+    /// runner-spawned `claude` runs with `DISABLE_AUTOUPDATER=1` either way
+    /// (`session::claude_hook::export_auto_updater_off`), so `false` means
+    /// nothing updates runner-hosted sessions until `claude update` is run by
+    /// hand. A `DISABLE_AUTOUPDATER` / `DISABLE_UPDATES` in the user's own
+    /// environment when the runner starts always wins over `true`.
+    #[serde(default = "default_runner_manages_cli_updates")]
+    pub runner_manages_cli_updates: bool,
 }
 
 fn default_auto_migrate_on_token_exhaustion() -> bool {
@@ -233,6 +243,10 @@ fn default_auto_migrate_on_token_exhaustion() -> bool {
 }
 
 fn default_auto_continue_after_migration() -> bool {
+    true
+}
+
+fn default_runner_manages_cli_updates() -> bool {
     true
 }
 
@@ -247,6 +261,7 @@ impl Default for ClaudeCliSettings {
             account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
+            runner_manages_cli_updates: default_runner_manages_cli_updates(),
         }
     }
 }

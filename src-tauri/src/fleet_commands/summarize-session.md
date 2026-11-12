@@ -34,8 +34,9 @@ would be the same mistake in the other direction.
 > copy of this file at `src-tauri/src/fleet_commands/summarize-session.md` and
 > `provision_fleet_commands_into` writes it into a spawned session's working
 > directory unless the destination already exists AND is tracked in the
-> enclosing repo (`provision_guard.rs`: `dst.exists() && contains(rel)`). That
-> is false in an allocated worktree of every repo EXCEPT this one, which tracks
+> enclosing repo (`provision_guard.rs`: `dst.exists() && contains(rel)`), or is
+> absent in a checkout that versions the bundled commands (`RootVersioned`). Both
+> are false in an allocated worktree of every repo EXCEPT this one, which tracks
 > its own copy at `.claude/commands/` — so THIS copy wins exactly where it is
 > tracked, and the bundled copy wins everywhere else, which is the majority
 > case. The two must therefore say the same thing: a session reading the

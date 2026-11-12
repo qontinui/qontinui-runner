@@ -582,12 +582,17 @@ pub fn identity_argv(
 /// The identity straddle, fail-open at every step. Returns the exit code to
 /// propagate. Mirrors `identity_shim.cmd`:
 /// resolve real → guard passthrough → settings/user-chose scan → best-effort
-/// confirmation POST → exec real with the composed argv.
+/// confirmation POST → exec real with the composed argv. A give-up — nothing
+/// launchable resolved, or the resolved tool would not start — is reported to
+/// the runner as a launch failure, as the bash shim does (see
+/// [`post_launch_failure`]).
 fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let own_dirs = own_shim_dirs();
     let real = resolve_real_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
+    // Nor does it report a launch failure: a nested `claude` must never mark
+    // its parent's pane, which may be running fine.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
         return exec_real(&real, tool.program(), args);
     }
@@ -668,6 +673,22 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
         }
     }
 
+    // Nothing launchable resolved within the wait: report the launch failure
+    // BEFORE the by-name fall-through below, as the bash shim does.
+    if real.is_none() {
+        let waited = resolve_wait_from(
+            env::var(RESOLVE_WAIT_ENV).ok().as_deref(),
+            IDENTITY_RESOLVE_WAIT,
+        );
+        let path_var = env::var_os("PATH").unwrap_or_default();
+        let stub = scan_path_in(tool.program(), &own_dirs, &path_var, Want::Placeholder).is_some();
+        post_launch_failure(
+            tool.program(),
+            EVENT_RESOLVE_FAILED,
+            &resolve_failed_detail(waited.as_secs(), stub, !settings.is_empty(), user_chose),
+        );
+    }
+
     let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
     let delivered_file = std::env::var(POLICY_DELIVERED_FILE_ENV).ok();
     let env_remove: &[&str] = if keeps_policy_delivered_sha(tool, args, delivered_file.as_deref()) {
@@ -675,12 +696,105 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     } else {
         &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV]
     };
-    let code = exec_real_child_env(&real, tool.program(), &final_args, env_remove);
+    let code = match run_real_child_env(&real, tool.program(), &final_args, env_remove) {
+        Ok(code) => code,
+        Err(error) => {
+            // The RESOLVED tool could not be started at all (removed under us,
+            // not executable, ETXTBSY). A by-name dispatch that fails was
+            // already reported as `resolve-failed` above.
+            if real.is_some() {
+                post_launch_failure(
+                    tool.program(),
+                    EVENT_EXEC_FAILED,
+                    &exec_failed_detail(127, &error, !settings.is_empty(), user_chose),
+                );
+            }
+            Some(127) // command-not-found surrogate; never panic
+        }
+    };
     // Explicit, not incidental: the minted config holds a live device credential
     // and is deleted HERE — after the child that read it has exited. Dropping it
     // any earlier would delete the file before `claude` reads it at launch.
     drop(minted_config);
     code
+}
+
+/// The identity shim's launch-failure beacon events — the same `event` values
+/// the bash shim posts (plan `2026-11-10-migration-holds-for-missing-claude-cli`,
+/// Phase 2): no launchable real tool resolved within the wait, or the resolved
+/// one could not be started. The runner records them per terminal so a pane
+/// whose CLI never launched closes `launch-failed` rather than as a death.
+const EVENT_RESOLVE_FAILED: &str = "resolve-failed";
+const EVENT_EXEC_FAILED: &str = "exec-failed";
+
+/// Read/write bound for a launch-failure POST. Longer than the `invoked`
+/// beacon's [`BEACON_TIMEOUT`]: the launch has already failed, so there is no
+/// exec left to delay, and the runner must hold the record before this process
+/// exits. Still bounded, so a wedged loopback cannot hang the pane.
+const LAUNCH_FAILURE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// POST one launch-failure event to the runner's `/control/shim-beacon`.
+/// Fail-open: no port, a refused connection or a timeout are all swallowed,
+/// and the session row then keeps its old close reason — UNKNOWN, never a
+/// guess.
+fn post_launch_failure(provider: &str, event: &str, detail: &str) {
+    let Some(port) = env::var(PORT_ENV)
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+    else {
+        return;
+    };
+    let terminal_id = env::var(TERMINAL_ID_ENV).unwrap_or_default();
+    let _ = http_post_with_timeouts(
+        port,
+        "/control/shim-beacon",
+        &launch_failure_beacon_body(&terminal_id, provider, event, detail),
+        &[],
+        CONNECT_TIMEOUT,
+        LAUNCH_FAILURE_TIMEOUT,
+    );
+}
+
+/// JSON body for a launch-failure `/control/shim-beacon` POST: the bash shim's
+/// `terminal_id` / `tool` / `event` / `detail` shape, plus `"surface":"exe"` as
+/// on [`shim_beacon_body`]. Pure — every input is a parameter — so the literal
+/// body is unit-testable.
+fn launch_failure_beacon_body(
+    terminal_id: &str,
+    provider: &str,
+    event: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "{{\"terminal_id\":\"{}\",\"tool\":\"{}\",\"event\":\"{}\",\"surface\":\"exe\",\"detail\":\"{}\"}}",
+        json_escape(terminal_id),
+        json_escape(provider),
+        json_escape(event),
+        json_escape(detail)
+    )
+}
+
+/// The `resolve-failed` detail, in the bash shim's key=value shape. The
+/// runner's `launch-failed` decider reads `settings` (this stub delivers the
+/// SessionStart hook) and `user_session_id` (the argv chose its own session).
+fn resolve_failed_detail(waited_secs: u64, stub: bool, settings: bool, user_chose: bool) -> String {
+    format!("waited={waited_secs} stub={stub} settings={settings} user_session_id={user_chose}")
+}
+
+/// The `exec-failed` detail. Unlike bash's `exec`, this stub spawns the real
+/// tool once with no retry (`waited=0`) and has no exec status of its own:
+/// `status` is the exit code it reports in place of one, and `error` names the
+/// spawn error's kind.
+fn exec_failed_detail(
+    status: i32,
+    error: &std::io::Error,
+    settings: bool,
+    user_chose: bool,
+) -> String {
+    format!(
+        "status={status} waited=0 error={:?} settings={settings} user_session_id={user_chose}",
+        error.kind()
+    )
 }
 
 /// JSON body for the `/control/shim-beacon` diagnostic POST. Same fields the
@@ -1282,6 +1396,19 @@ fn exec_real_child_env(
     args: &[String],
     env_remove: &[&str],
 ) -> Option<i32> {
+    // A spawn failure fails open to the command-not-found surrogate.
+    run_real_child_env(real, name, args, env_remove).unwrap_or(Some(127))
+}
+
+/// [`exec_real_child_env`] that reports a SPAWN failure as `Err` instead of
+/// folding it into the surrogate code, so the identity straddle can tell "the
+/// real tool could not be started" from "it ran and exited 127".
+fn run_real_child_env(
+    real: &Option<PathBuf>,
+    name: &str,
+    args: &[String],
+    env_remove: &[&str],
+) -> std::io::Result<Option<i32>> {
     let mut cmd = match real {
         Some(p) => Command::new(p),
         // No resolved real tool: dispatch by name and let the OS PATH find it.
@@ -1291,7 +1418,7 @@ fn exec_real_child_env(
         // Already a nested invocation (the guard is set) and still nothing
         // outside our dirs: dispatching by name could only find a shim of ours
         // again — a chain of re-entries. Command-not-found, loudly, instead.
-        None if env::var(GUARD_ENV).ok().as_deref() == Some("1") => return Some(127),
+        None if env::var(GUARD_ENV).ok().as_deref() == Some("1") => return Ok(Some(127)),
         None => {
             let mut c = Command::new(name);
             c.env(RESOLVE_WAIT_ENV, "0");
@@ -1306,10 +1433,7 @@ fn exec_real_child_env(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    match cmd.status() {
-        Ok(st) => st.code(),
-        Err(_) => Some(127), // command-not-found surrogate; never panic
-    }
+    cmd.status().map(|st| st.code())
 }
 
 // ===========================================================================
@@ -2368,6 +2492,51 @@ mod tests {
         assert!(body2.contains(
             "\"detail\":\"user_session_id=true settings=false mcp_config=false pinned=false\""
         ));
+    }
+
+    /// The launch-failure POST bodies (plan
+    /// `2026-11-10-migration-holds-for-missing-claude-cli`, Phase 2): the bash
+    /// shim's literal shape plus `"surface":"exe"`, with the two flags the
+    /// runner's `launch-failed` decider reads, every value escaped.
+    #[test]
+    fn launch_failure_beacon_body_is_the_bash_shape_plus_surface() {
+        assert_eq!(
+            launch_failure_beacon_body(
+                "term-1",
+                "claude",
+                EVENT_RESOLVE_FAILED,
+                &resolve_failed_detail(10, false, true, true),
+            ),
+            r#"{"terminal_id":"term-1","tool":"claude","event":"resolve-failed","surface":"exe","detail":"waited=10 stub=false settings=true user_session_id=true"}"#
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            launch_failure_beacon_body(
+                "term-1",
+                "claude",
+                EVENT_EXEC_FAILED,
+                &exec_failed_detail(127, &denied, false, true),
+            ),
+            r#"{"terminal_id":"term-1","tool":"claude","event":"exec-failed","surface":"exe","detail":"status=127 waited=0 error=PermissionDenied settings=false user_session_id=true"}"#
+        );
+        assert_eq!(
+            launch_failure_beacon_body("t\"1", "claude", EVENT_RESOLVE_FAILED, "a\\b"),
+            r#"{"terminal_id":"t\"1","tool":"claude","event":"resolve-failed","surface":"exe","detail":"a\\b"}"#
+        );
+    }
+
+    /// `exec-failed` is reported only for a tool that could not be STARTED, so
+    /// the spawn must surface as `Err` rather than as the surrogate 127 a child
+    /// can also exit with. The surrogate is still what the stub returns.
+    #[test]
+    fn launch_failure_of_the_real_tool_is_a_spawn_error_not_an_exit_code() {
+        let gone = Some(PathBuf::from("/definitely/not/a/dir/qzx/claude"));
+        let spawned = run_real_child_env(&gone, "claude", &[], &[]);
+        assert!(
+            spawned.is_err(),
+            "a missing binary must not read as an exit: {spawned:?}"
+        );
+        assert_eq!(exec_real_child_env(&gone, "claude", &[], &[]), Some(127));
     }
 
     #[test]

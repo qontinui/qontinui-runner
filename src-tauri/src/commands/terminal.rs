@@ -1391,6 +1391,7 @@ pub fn terminal_session_record_open(
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
+        last_alive_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
@@ -1640,6 +1641,11 @@ fn mark_awaiting_account_unless_live(
 /// directory cannot be resolved. A resume under it must type NO
 /// `CLAUDE_CONFIG_DIR` (see `discovery::is_default_config_home`), so every
 /// frontend resume normalises against THIS path rather than guessing `$HOME`.
+///
+/// Its second caller is the graceful-exit probe's registry read
+/// (`terminal::graceful_exit`'s `default_config_home`), which reads this home's
+/// `sessions/` dir even before discovery counts it (no `projects/` yet), so a
+/// first npm-installed session there is seen.
 #[tauri::command]
 pub fn claude_default_config_home() -> Option<String> {
     dirs::home_dir().and_then(|h| h.join(".claude").to_str().map(|p| p.replace('\\', "/")))
@@ -1700,6 +1706,11 @@ pub fn terminal_session_record_close(
 /// manager's shutdown latch, so a `pty-exit` that arrives after
 /// [`TerminalManager::close_all`] began leaves its row as it was (plan
 /// `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
+///
+/// The named terminal's spawn time goes along for the `launch-failed` close
+/// rule (plan `2026-11-10-migration-holds-for-missing-claude-cli`, D3), read
+/// from an EXACT terminal-id match only. A terminal this manager no longer
+/// holds reads `None`, which keeps the reason as sent.
 pub(crate) fn record_close_for(
     terminal_manager: &TerminalManager,
     store: &SessionLifecycleStore,
@@ -1707,11 +1718,15 @@ pub(crate) fn record_close_for(
     terminal_id: Option<&str>,
     reason: &str,
 ) -> CloseOutcome {
+    let terminal_created_at_ms = terminal_id
+        .and_then(|t| terminal_manager.get(t))
+        .and_then(|session| i64::try_from(session.info().created_at).ok());
     store.record_close_gated(
         terminal_manager.is_shutting_down(),
         claude_session_id,
         terminal_id,
         reason,
+        terminal_created_at_ms,
     )
 }
 
@@ -2240,6 +2255,18 @@ pub fn terminal_report_bridge_registration_failure(
 /// Returns one row per live PROCESS. Several live processes may report the
 /// same `sessionId` (22 of 80 did), each with its own name; collapsing that is
 /// the caller's decision.
+///
+/// `data` is `{ sessions, unlistable, unreadableRecords }`. The two trailing
+/// lists name what the read could NOT see: `sessions/` dirs that exist and
+/// cannot be listed, and unreadable or unparseable records named for live pids
+/// whose image could host Claude Code. While either is non-empty, a session
+/// MISSING from `sessions` may still be live. The read still succeeds then,
+/// because its two kinds of caller need different things from it: the
+/// unattended restore paths treat an incomplete read as indeterminate
+/// (`fetchLiveClaudeSessionIds` returns `null`, and nothing is respawned),
+/// while an operator's click refuses a session the partial read DOES show
+/// live, and the window-name hook keeps updating. Failing the whole read would
+/// hand the click paths `null`, which they read as "go ahead".
 #[tauri::command]
 pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
@@ -2255,12 +2282,33 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
     // A read begun now (never the memo): a session absent here is respawned.
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
-    let sessions =
-        crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
+    let read = crate::session::claude_session_registry::read_live_sessions(
+        &config_dirs,
+        &live_pids,
+        &crate::session::claude_session_registry::may_host_claude(&snapshot),
+    );
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": sessions })),
+        data: Some(live_sessions_payload(read)),
+    })
+}
+
+/// The `data` of [`terminal_claude_session_list_live`]: the rows, plus what
+/// the read could not see (see that command's docs for why both travel).
+fn live_sessions_payload(
+    read: crate::session::claude_session_registry::LiveSessions,
+) -> serde_json::Value {
+    let unlistable: Vec<String> = read.unlistable.iter().map(ToString::to_string).collect();
+    let unreadable_records: Vec<String> = read
+        .unreadable_records
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    serde_json::json!({
+        "sessions": read.sessions,
+        "unlistable": unlistable,
+        "unreadableRecords": unreadable_records,
     })
 }
 
@@ -3069,6 +3117,7 @@ async fn poll_and_record_session<F>(
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
+                last_alive_at: None,
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
@@ -3170,6 +3219,7 @@ pub(crate) fn record_pinned_session_open(
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
+        last_alive_at: None,
         gate_id,
         gate_consuming_device_id,
         gate_bound_boot_ms,
@@ -3333,6 +3383,42 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    /// The live-session payload carries what the read could not see beside
+    /// the rows — the keys `fetchLiveClaudeSessionRead`
+    /// (`src/components/terminal/liveClaudeSessions.ts`) reads to tell a
+    /// partial read from a complete one.
+    #[test]
+    fn the_live_session_payload_names_what_the_read_could_not_see() {
+        use crate::session::claude_activity::UnlistableSessionsDir;
+        use crate::session::claude_session_registry::{LiveSessions, UnreadableRecord};
+
+        let complete = live_sessions_payload(LiveSessions::default());
+        assert_eq!(
+            complete,
+            serde_json::json!({ "sessions": [], "unlistable": [], "unreadableRecords": [] })
+        );
+
+        let partial = live_sessions_payload(LiveSessions {
+            sessions: Vec::new(),
+            unlistable: vec![UnlistableSessionsDir {
+                sessions_dir: std::path::PathBuf::from("/h/.claude-a/sessions"),
+                error: "Permission denied".to_string(),
+            }],
+            unreadable_records: vec![UnreadableRecord {
+                path: std::path::PathBuf::from("/h/.claude/sessions/7.json"),
+                error: "does not parse".to_string(),
+            }],
+        });
+        assert_eq!(
+            partial["unlistable"],
+            serde_json::json!(["/h/.claude-a/sessions (Permission denied)"])
+        );
+        assert_eq!(
+            partial["unreadableRecords"],
+            serde_json::json!(["/h/.claude/sessions/7.json (does not parse)"])
+        );
+    }
+
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.
     /// A typed fact flattened into a success-envelope string is exactly the
@@ -3479,6 +3565,40 @@ mod tests {
         assert!(matches!(user, CloseOutcome::Closed { .. }), "{user:?}");
     }
 
+    /// A `pty-exit` close of a terminal this manager no longer holds has no
+    /// spawn time to read, so D3 condition 2 ("no CLI started in this pane")
+    /// cannot be read either: even a pane whose shim reported a resume-shaped
+    /// launch failure keeps `pty-exit`, because a cause is never asserted on
+    /// weaker evidence than its rule names.
+    #[test]
+    fn record_close_for_keeps_pty_exit_when_the_terminal_is_gone() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let tag = uuid::Uuid::new_v4();
+        let (id, term) = (format!("sess-gone-{tag}"), format!("term-gone-{tag}"));
+        let mut r = restore_candidate_record(&id);
+        r.terminal_id = term.clone();
+        // Hook-stamped long before any pane this manager could hold.
+        r.last_session_start_at = Some(1);
+        store.record_open(r);
+        crate::terminal::launch_failure::registry().record_beacon(
+            Some(term.as_str()),
+            "resolve-failed",
+            "waited=10 stub=false settings=true user_session_id=true",
+            chrono::Utc::now().timestamp_millis() - 5_000,
+        );
+        let tm = TerminalManager::new();
+        assert!(tm.get(&term).is_none(), "the pane is gone from the manager");
+
+        let out = record_close_for(&tm, &store, &id, Some(term.as_str()), "pty-exit");
+        assert!(matches!(out, CloseOutcome::Closed { .. }), "{out:?}");
+        assert_eq!(
+            store.get(&id).unwrap().close_reason.as_deref(),
+            Some("pty-exit")
+        );
+    }
+
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),
@@ -3517,6 +3637,7 @@ mod tests {
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
+            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,

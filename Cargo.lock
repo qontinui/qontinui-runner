@@ -6682,6 +6682,7 @@ dependencies = [
  "rustls",
  "schemars 1.2.1",
  "scopeguard",
+ "semver",
  "sentry",
  "serde",
  "serde_jcs",
@@ -6779,7 +6780,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-version = "6.0.0"
+version = "6.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

@@ -1382,10 +1382,38 @@
     {
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
-      "symbol": "continuation_fallback_workdir",
-      "excerpt": ".ok_or_else(|| \"no QONTINUI_ROOT or canonical checkout resolved\".to_string());",
-      "count": 2,
-      "disposition": "unreviewed"
+      "symbol": "overlay_absent_statement",
+      "excerpt": "const SIBLING: &str = \"qontinui-claude-config\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The sibling repository NAME the agent_definitions row's sibling_checkout_absent statement carries as its discriminator. It is rendered only after the overlay was found absent, together with what serves instead (the built-in copy, the repository's own tracked definitions, a named write failure, or unsupported), so it is the statement of a fallback, never a path the runner resolves. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_runtime.rs",
+      "symbol": "provision_agent_definitions",
+      "excerpt": "\"agent_runtime: no qontinui-root resolved; skipping .claude/agents \\",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3)."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_runtime.rs",
+      "symbol": "provision_agent_definitions",
+      "excerpt": "\"no qontinui-root resolved ({why}), so \\",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3)."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_runtime.rs",
+      "symbol": "provision_agent_definitions",
+      "excerpt": "<root>/qontinui-claude-config/.claude/agents cannot be located — {state}\"",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3)."
     },
     {
       "class": "repo_layout",
@@ -1395,32 +1423,6 @@
       "count": 1,
       "disposition": "fallback_correct",
       "note": "The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only after a root resolved. A missing dir makes read_dir fail and the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6)."
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions_with_root",
-      "excerpt": "\"agent_runtime: no qontinui-root resolved; skipping .claude/agents \\",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6)."
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions_with_root",
-      "excerpt": "\"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6)."
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "run_condition_check_terminal",
-      "excerpt": "let reason = \"no QONTINUI_ROOT resolved — nowhere to run the check from\";",
-      "count": 1,
-      "disposition": "unreviewed"
     },
     {
       "class": "repo_layout",
@@ -1457,14 +1459,6 @@
       "count": 1,
       "disposition": "unreviewed",
       "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_worktree/disk_survey.rs",
-      "symbol": "survey",
-      "excerpt": "\"the workspace root could not be resolved (set QONTINUI_ROOT, or the \\",
-      "count": 1,
-      "disposition": "unreviewed"
     },
     {
       "class": "repo_layout",
@@ -1615,14 +1609,6 @@
       "file": "src/check_executor/command_builder.rs",
       "symbol": "build_devtools_command",
       "excerpt": "Ok((\"qontinui-devtools\".to_string(), args))",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/ci_node/admission.rs",
-      "symbol": "start_build",
-      "excerpt": "\"QONTINUI_ROOT not resolvable on this device\".to_string(),",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1833,30 +1819,6 @@
     },
     {
       "class": "repo_layout",
-      "file": "src/fleet.rs",
-      "symbol": "publish_tree_state",
-      "excerpt": "\"fleet::tree_publisher: no qontinui-root directory found (set \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/fleet.rs",
-      "symbol": "publish_tree_state",
-      "excerpt": "QONTINUI_ROOT to override). Skipping.\"",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/fleet.rs",
-      "symbol": "spawn_skill_parity_pass_if_due",
-      "excerpt": "located — set QONTINUI_ROOT or the runner's paths.workspace_root\"",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
       "file": "src/fleet_commands.rs",
       "symbol": "const FLEET_COMMANDS",
       "excerpt": "(\"ui-bridge\", UI_BRIDGE),",
@@ -1986,19 +1948,21 @@
     {
       "class": "repo_layout",
       "file": "src/workspace_paths.rs",
-      "symbol": "persist_resolved_workspace_root",
-      "excerpt": "`paths.workspace_root` was left unset. Set $QONTINUI_ROOT (or the \\",
+      "symbol": "runner_workspace_root",
+      "excerpt": "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)\",",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "dev_only_surface",
+      "capability": "workspace_root",
+      "note": "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
     },
     {
       "class": "repo_layout",
       "file": "src/workspace_paths.rs",
-      "symbol": "runner_workspace_root",
-      "excerpt": "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)\",",
+      "symbol": "session_workspace_root",
+      "excerpt": "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (session_workspace_root)\",",
       "count": 1,
-      "disposition": "unreviewed",
-      "capability": "workspace_root"
+      "disposition": "dev_only_surface",
+      "note": "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
     },
     {
       "class": "supervisor_dependency",
