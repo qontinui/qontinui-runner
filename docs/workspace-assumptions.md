@@ -289,6 +289,9 @@ _No hits._
 | `src/execution_core/unified_tools.rs` | `execute_shell_command` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/fleet.rs` | `build_host_capabilities` | `caps.push("shell:powershell".to_string());` | 1 | unreviewed |
 | `src/fleet.rs` | `powershell_on_path` | `binary_on_path("pwsh") \|\| binary_on_path("powershell")` | 1 | unreviewed |
+| `src/fleet/computer/services.rs` | `sc` | `cfg(windows)-only fn 'sc' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows service watcher's 'sc query'/'sc qc' probe, inside 'mod windows' and called only from cfg(windows) code. On Linux the systemd collector in the same file watches the units; other non-Windows targets report no service scan (units unknown, nothing deleted). |
+| `src/fleet/computer/wsl_guest.rs` | `collect` | `cfg(windows)-only fn 'collect' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Probes the WSL2 guests of a Windows host; its only caller (fleet/computer/mod.rs) is cfg(windows). A WSL guest exists only under a Windows host, and a Linux box reports itself through the host collector. |
+| `src/fleet/computer/wsl_guest.rs` | `running` | `cfg(windows)-only fn 'running' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Lists running WSL distros for 'collect' ('wsl --list --running'); Windows-only by nature, reached only through the cfg(windows) caller of 'collect'. |
 | `src/fleet/resource_sample.rs` | `attach_wsl_disk` | `cfg(windows)-only fn 'attach_wsl_disk' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `decode_utf16le` | `cfg(windows)-only fn 'decode_utf16le' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `resolve_wsl_distro` | `cfg(windows)-only fn 'resolve_wsl_distro' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
