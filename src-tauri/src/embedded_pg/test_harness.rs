@@ -6,12 +6,12 @@
 //!
 //! # Why
 //!
-//! Until this existed, every database test in the runner was `#[ignore]`d and
-//! reached its database through `DATABASE_URL` with a silent localhost
-//! fallback, so no CI lane ran any of them and SQL verified by hand was
-//! retained nowhere. The harness boots the runner's OWN bundled server — the
-//! end user's production database — inside the test process, so a Postgres
-//! test runs wherever tests run: both CI legs, `cargo-guard.sh test`, nextest.
+//! Until this existed, the runner's `DATABASE_URL`-backed tests were
+//! `#[ignore]`d, most behind a silent localhost fallback, so no CI lane ran them
+//! and SQL verified by hand was retained nowhere. The harness boots the
+//! runner's OWN bundled server — the end user's production database — inside
+//! the test process, so a Postgres test runs wherever tests run: both CI legs,
+//! `cargo-guard.sh test`, nextest.
 //!
 //! # Entry points
 //!
@@ -59,8 +59,9 @@
 //! | how the test process ends | Linux / macOS | Windows |
 //! |---|---|---|
 //! | every test passed (`main` returns) | `atexit`: `pg_ctl stop -m immediate`, then the root is removed | the same |
-//! | a test failed (libtest calls `process::exit`) | the same `atexit` | `ExitProcess` skips `atexit`: the kill-on-close job kills the postmaster, and the root waits for the next sweep |
+//! | a test failed (libtest calls `process::exit`) | the same `atexit` | `process::exit` is `ExitProcess`, and whether the C runtime runs `atexit` handlers then is not established here (the failing-child self-test logs which happened): either way the postmaster dies — stopped by `atexit` if it runs, killed by the kill-on-close job if not — and a root `atexit` did not remove waits for the next sweep |
 //! | killed or crashed | the postmaster is orphaned; the next boot's sweep kills it and removes the root | the job kills the postmaster; the next sweep removes the root |
+//! | any of these, on an external server ([`EXTERNAL_URL_ENV`]) | `atexit`, where it runs, drops this process's `qtpl_<nonce>*` and `qtest_<nonce>_*` databases; a killed or crashed process leaves them, and a later boot only reports them | the same, and a failed test process leaves them too if `atexit` did not run |
 //!
 //! The sweep runs at every boot: a `run-*` root whose recorded owner pid is gone
 //! has its postmaster killed — after checking that the pid really is that
@@ -69,6 +70,10 @@
 //! container sharing the target directory, a second WSL distro) is presumed
 //! live until its record is [`FOREIGN_OWNER_GRACE`] old, because its pid names
 //! nothing here.
+//!
+//! Nothing sweeps an external server. Its boot names the harness databases there
+//! that belong to no nonce it knows ([`foreign_harness_databases`]) and drops
+//! none: a concurrent test process's databases look exactly like a killed one's.
 //!
 //! On Windows the harness also clears the inherit flag on the process's std
 //! handles before it starts anything: `pg_ctl` and the postmaster inherit every
@@ -82,7 +87,8 @@
 //! bundled server's `bytea` transform cannot emulate. One line naming that
 //! server goes to the stderr handle, each test still gets a fresh database there
 //! (cloned from a per-process template), and the URL's own database only ever
-//! hosts the harness's `CREATE`/`DROP DATABASE`. No test reads `DATABASE_URL`.
+//! hosts the harness's `CREATE`/`DROP DATABASE`. No harness-backed test reads
+//! `DATABASE_URL`.
 //!
 //! # A harness that cannot boot FAILS the test
 //!
@@ -123,8 +129,9 @@ pub const HARNESS_DIR_ENV: &str = "QONTINUI_TEST_PG_DIR";
 /// Runs every harness database on this EXTERNAL server instead of the bundled
 /// cluster: a `postgres://` or `postgresql://` URL whose role may create
 /// databases, on PostgreSQL 13 or newer (`DROP DATABASE … WITH (FORCE)`),
-/// reachable without TLS. A name nothing else exports, on purpose: no test reads
-/// `DATABASE_URL`, which a hosting runner passes to every test binary it runs.
+/// reachable without TLS. A name nothing else exports, on purpose: no
+/// harness-backed test reads `DATABASE_URL`, which is set on a developer box and
+/// in DB-gated CI.
 pub const EXTERNAL_URL_ENV: &str = "QONTINUI_TEST_PG_URL";
 
 /// `max_connections` of every harness cluster. Set explicitly rather than left
@@ -172,9 +179,22 @@ const INSTALL_DIR: &str = "pg-install";
 const PASSWORD_FILE: &str = "pg-pass";
 /// The server log `postgresql_embedded`'s `start()` points `pg_ctl -l` at.
 const START_LOG: &str = "start.log";
-/// Per-command timeout for `initdb` and `pg_ctl start`. Generous on purpose: a
-/// cold `initdb` on a saturated box takes tens of seconds, and a timeout here
-/// fails every database test in the binary.
+/// The per-command timeout handed to `postgresql_embedded` for `initdb` and
+/// `pg_ctl`, which today bounds NOTHING: the crate reads `Settings::timeout`
+/// only in the `execute_command` its `tokio` feature compiles in, this crate
+/// builds it without that feature, and the blocking `execute_command` it gets
+/// ignores the timeout.
+///
+/// What does hold: `pg_ctl` runs with `--wait` and no `--timeout`, so it gives
+/// up after its own default wait (60 s unless `PGCTLTIMEOUT` sets another), but
+/// `initdb` has no bound at all. In CI a hung `initdb` runs until the Run Rust
+/// tests step's `timeout-minutes` ends the whole leg. Locally it hangs the boot
+/// while that boot holds the harness directory's EXCLUSIVE cache lock, so every
+/// test process sharing the directory waits behind it.
+///
+/// Kept, and passed, so the bound is real the moment that feature is enabled.
+/// Generous for that day: a cold `initdb` on a saturated box takes tens of
+/// seconds, and a timeout here fails every database test in the binary.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// `pg_ctl start` attempts, each on a fresh port, before a bind collision is a
 /// boot failure. The port comes from binding port 0 and releasing it, so another
@@ -730,7 +750,7 @@ async fn boot_embedded() -> Result<Server, String> {
     let booting = Instant::now();
     keep_std_handles_out_of_children();
     let dir = harness_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| {
+    create_private_dir_all(&dir).map_err(|e| {
         format!(
             "could not create the harness directory {}: {e}",
             dir.display()
@@ -970,7 +990,8 @@ async fn build_template(
     for line in collect_stale_templates(dir, key) {
         say(line);
     }
-    std::fs::create_dir_all(template_dir).map_err(|e| {
+    // Private: it holds the cluster's superuser password (`pg-pass`).
+    create_private_dir(template_dir).map_err(|e| {
         format!(
             "could not create the template cache {}: {e}",
             template_dir.display()
@@ -1015,12 +1036,13 @@ async fn build_template(
 /// so every copy starts without crash recovery.
 ///
 /// Built from this module's own `Settings` rather than through
-/// [`super::bootstrap`]: bootstrap's 60 s command timeout is too tight for a
-/// cold `initdb` on a saturated box, its failure paths deliberately leave a
-/// started postmaster running (right for a production peer that may have
-/// attached, wrong for a private build directory), and its attach path has no
-/// business here. On every failure below, the dropped `PostgreSQL` stops the
-/// cluster this build started, which is ours to stop.
+/// [`super::bootstrap`]: bootstrap's failure paths deliberately leave a started
+/// postmaster running (right for a production peer that may have attached,
+/// wrong for a private build directory), and its attach path has no business
+/// here. Its 60 s command timeout is no reason either way: like
+/// [`COMMAND_TIMEOUT`], it bounds nothing while `postgresql_embedded` is built
+/// without its `tokio` feature. On every failure below, the dropped
+/// `PostgreSQL` stops the cluster this build started, which is ours to stop.
 async fn build_template_cluster(
     template_dir: &Path,
     defaults: &BundledDefaults,
@@ -1174,6 +1196,10 @@ async fn boot_external(raw: String) -> Result<Server, String> {
     let maintenance = connect(&raw)
         .await
         .map_err(|e| format!("connecting to {server_name} failed: {e}"))?;
+    let foreign = foreign_harness_databases(&maintenance, &nonce).await;
+    if let Some(line) = describe_foreign_databases(&server_name, &foreign) {
+        say(line);
+    }
     let pgvector: bool = maintenance
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector')",
@@ -1244,6 +1270,73 @@ async fn boot_external(raw: String) -> Result<Server, String> {
         _postmaster: None,
         _exit_guard: None,
     })
+}
+
+/// How many leftover database names [`describe_foreign_databases`] spells out.
+const FOREIGN_DATABASES_NAMED: usize = 10;
+
+/// The harness databases on a server that belong to no nonce this process
+/// knows: every `qtpl_%` and `qtest_%` database but its own, sorted. The only
+/// nonce a process can know is its own, so each of these is a concurrent test
+/// process's or one a killed process left behind, and nothing here tells which.
+async fn foreign_harness_databases(
+    client: &tokio_postgres::Client,
+    nonce: &str,
+) -> Result<Vec<String>, String> {
+    let (templates, clones) = ("qtpl\\_%", "qtest\\_%");
+    let (own_templates, own_clones) = (format!("qtpl\\_{nonce}%"), format!("qtest\\_{nonce}\\_%"));
+    let rows = client
+        .query(
+            "SELECT datname FROM pg_database \
+             WHERE (datname LIKE $1 OR datname LIKE $2) \
+               AND datname NOT LIKE $3 AND datname NOT LIKE $4 \
+             ORDER BY datname",
+            &[&templates, &clones, &own_templates, &own_clones],
+        )
+        .await
+        .map_err(|e| describe_pg_error(&e))?;
+    rows.iter()
+        .map(|row| {
+            row.try_get::<_, String>(0)
+                .map_err(|e| describe_pg_error(&e))
+        })
+        .collect()
+}
+
+/// The one stderr line an external boot gives [`foreign_harness_databases`]'
+/// answer: none when there is nothing to report. It only REPORTS: dropping
+/// another process's databases could pull them from under a running test.
+fn describe_foreign_databases(
+    server_name: &str,
+    found: &Result<Vec<String>, String>,
+) -> Option<String> {
+    match found {
+        Ok(names) if names.is_empty() => None,
+        Ok(names) => {
+            let named = names
+                .iter()
+                .take(FOREIGN_DATABASES_NAMED)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = names.len().saturating_sub(FOREIGN_DATABASES_NAMED);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "{} harness database(s) on {server_name} belong to no nonce this process knows: \
+                 another test process's, or left by one killed before its teardown ran. The \
+                 harness drops none of them; remove the stale ones by hand: {named}{more}",
+                names.len()
+            ))
+        }
+        Err(e) => Some(format!(
+            "could not list the harness databases already on {server_name}, so any a killed \
+             test process left there go unreported: {e}"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,14 +1422,17 @@ async fn terminate_sessions(client: &tokio_postgres::Client, database: &str) {
 
 /// Make `database` a template nothing can connect to, and wait until nothing is.
 ///
-/// `IS_TEMPLATE` needs a superuser, so it is set only on the bundled cluster; an
-/// external role can still clone the database it owns.
+/// `IS_TEMPLATE` is set only when `mark_template` is, which is on the bundled
+/// cluster. On an external server the harness drops its templates at exit, and
+/// `DROP DATABASE` refuses a database marked a template; leaving the mark off
+/// costs nothing there, because `CREATE DATABASE … TEMPLATE` lets a database's
+/// owner copy it whether or not it is marked.
 async fn seal_template(
     client: &tokio_postgres::Client,
     database: &str,
-    superuser: bool,
+    mark_template: bool,
 ) -> Result<(), String> {
-    let options = if superuser {
+    let options = if mark_template {
         "ALLOW_CONNECTIONS false IS_TEMPLATE true"
     } else {
         "ALLOW_CONNECTIONS false"
@@ -1487,7 +1583,8 @@ fn env_nonblank(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// [`HARNESS_DIR_ENV`], else `<cargo target dir>/qontinui-test-pg`.
+/// [`HARNESS_DIR_ENV`], else `qontinui-test-pg` in the directory
+/// [`cargo_target_dir_of`] finds for this test binary.
 fn harness_dir() -> Result<PathBuf, String> {
     if let Some(dir) = env_nonblank(HARNESS_DIR_ENV) {
         return Ok(PathBuf::from(dir));
@@ -1509,11 +1606,17 @@ fn harness_dir() -> Result<PathBuf, String> {
         })
 }
 
-/// The cargo target directory a test binary lives in: its nearest ancestor
-/// holding cargo's `CACHEDIR.TAG` (`<target>/<profile>/deps/<binary>`, or
-/// `<target>/<triple>/<profile>/deps/<binary>` when cross-compiling). Found from
-/// the binary rather than `CARGO_TARGET_TMPDIR`, which cargo sets for
-/// integration tests only — this module serves every test binary.
+/// Where a test binary's harness directory goes: the binary's nearest ancestor
+/// holding a cargo `CACHEDIR.TAG`. For `<target>/<profile>/deps/<binary>` that
+/// is `<target>`. A build with `--target <triple>` — a cross build, or the
+/// host's own triple named explicitly — puts the binary in
+/// `<target>/<triple>/<profile>/deps/`, and cargo tags `<target>/<triple>/` as
+/// well when it creates it, so the harness lands in
+/// `<target>/<triple>/qontinui-test-pg`. That is intended: the template cache
+/// holds the extracted bundled PostgreSQL, which `postgresql_embedded` bundles
+/// for the target triple, and the cache key does not name the triple. Found
+/// from the binary rather than `CARGO_TARGET_TMPDIR`, which cargo sets for
+/// integration tests and benches only — this module serves every test binary.
 fn cargo_target_dir_of(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
         .skip(1)
@@ -1992,14 +2095,29 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create `path`, private (0700 on Unix); fails if it exists.
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    private_dir_builder().create(path)
+}
+
+/// Create `path` and every parent it lacks, each new one private (0700 on
+/// Unix); an existing directory is left as it is, and `path` existing as a file
+/// fails, as with `create_dir_all`. The harness directory is created this way:
+/// it holds every template cache, and with it each cluster's superuser
+/// password (`tpl-*/pg-pass`, which `postgresql_embedded` writes with the
+/// default file mode).
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    private_dir_builder().recursive(true).create(path)
+}
+
+fn private_dir_builder() -> std::fs::DirBuilder {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(path)
+    builder
 }
 
 /// The end of a server log, on one line, for a boot error.
@@ -2090,8 +2208,10 @@ static ATEXIT_REGISTERED: std::sync::Once = std::sync::Once::new();
 extern "C" {
     /// The C runtime's exit-handler registration (glibc / libSystem on Unix,
     /// the UCRT on Windows MSVC). Its handlers run when `main` returns and on
-    /// `std::process::exit` on Unix; on Windows `process::exit` is
-    /// `ExitProcess`, which skips them — the module doc says what covers that.
+    /// `std::process::exit` on Unix. On Windows `process::exit` is
+    /// `ExitProcess`, and whether the UCRT runs them then is not established
+    /// here: the failing-child self-test logs which happened, and the module
+    /// doc says what covers either outcome.
     fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
 }
 
@@ -2654,8 +2774,14 @@ mod tests {
     }
 
     /// A test process with a FAILING test leaves no postmaster behind either,
-    /// and the root it may leave (on Windows, where libtest's `process::exit`
-    /// is `ExitProcess` and skips `atexit`) is removed by the next boot's sweep.
+    /// and any root it leaves is removed by the next boot's sweep.
+    ///
+    /// libtest ends such a process with `std::process::exit`. On Unix that runs
+    /// `atexit`, so the teardown summary must appear. On Windows it is
+    /// `ExitProcess`, and whether the UCRT runs `atexit` handlers then is not
+    /// established here, so this test only RECORDS it — one line straight to the
+    /// stderr handle, which reaches CI's log — and asserts what holds either way:
+    /// the postmaster dies and the root does not outlive the sweep.
     #[test]
     fn a_test_process_that_fails_leaves_no_postmaster_and_its_root_is_swept() {
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -2671,6 +2797,25 @@ mod tests {
             "the child failed for some other reason:\n{}",
             run.output
         );
+        let tore_down = run.output.contains("teardown:");
+        if cfg!(windows) {
+            say(format!(
+                "failing-child self-test: after libtest's process::exit (ExitProcess) the \
+                 child's exit-time teardown summary {}",
+                if tore_down {
+                    "APPEARED, so the atexit handler ran"
+                } else {
+                    "did NOT appear, so the atexit handler did not run"
+                }
+            ));
+        } else {
+            assert!(
+                tore_down,
+                "the failing child printed no teardown summary, so atexit did not run on \
+                 process::exit:\n{}",
+                run.output
+            );
+        }
         let facts = read_child_report(&report, &run);
         assert!(
             wait_for(|| !postmaster_alive(&facts), DEATH_WAIT),
@@ -2843,6 +2988,130 @@ mod tests {
         let exe = deps.join("qontinui_runner_lib-0123abcd");
         assert_eq!(cargo_target_dir_of(&exe), Some(target.clone()));
         assert_eq!(cargo_target_dir_of(scratch.path()), None);
+
+        // `--target <triple>`: the binary is under `<target>/<triple>/`, which
+        // cargo tags as well when it creates it, so the harness lives per
+        // triple. Untagged, the triple directory is passed over for `<target>`.
+        let triple = target.join("x86_64-unknown-linux-gnu");
+        let cross_exe = triple
+            .join("debug")
+            .join("deps")
+            .join("qontinui_runner_lib-0123abcd");
+        std::fs::create_dir_all(cross_exe.parent().expect("deps")).expect("cross deps");
+        assert_eq!(cargo_target_dir_of(&cross_exe), Some(target.clone()));
+        std::fs::write(triple.join("CACHEDIR.TAG"), b"Signature").expect("triple tag");
+        assert_eq!(cargo_target_dir_of(&cross_exe), Some(triple));
+    }
+
+    /// The harness directory is created private, with its missing parents, and
+    /// creating it again changes nothing; a file where it goes is an error.
+    #[cfg(unix)]
+    #[test]
+    fn the_harness_directory_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path().join("parent").join("qontinui-test-pg");
+        create_private_dir_all(&dir).expect("create the harness directory");
+        create_private_dir_all(&dir).expect("create it again");
+        for created in [dir.as_path(), dir.parent().expect("its parent")] {
+            let mode = std::fs::metadata(created)
+                .expect("created directory")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "{} was created {mode:o}, not private",
+                created.display()
+            );
+        }
+        let file = scratch.path().join("a-file");
+        std::fs::write(&file, b"not a directory").expect("plant a file");
+        assert!(
+            create_private_dir_all(&file).is_err(),
+            "a file where the harness directory goes must be an error"
+        );
+    }
+
+    /// An external boot's report names every harness database of another nonce
+    /// and none of this process's own. It runs on whichever server the harness
+    /// booted: this process's clones carry its nonce on either. On the bundled
+    /// cluster nothing else is there, so the planted two are all it may find; an
+    /// external server can also hold a concurrent or killed process's, so there
+    /// it requires only that the planted are listed and none of this process's.
+    #[tokio::test]
+    async fn the_leftover_report_names_only_other_nonces_databases() {
+        let own = fresh_database().await;
+        let client = connect_to(&own).await;
+        let nonce = process_nonce();
+        let other = if nonce == "0badc0de" {
+            "0badc0df"
+        } else {
+            "0badc0de"
+        };
+        let planted = [format!("qtest_{other}_1"), format!("qtpl_{other}")];
+        for name in &planted {
+            // From `template0`, which nothing connects to: a session open on the
+            // default `template1` would refuse the copy.
+            client
+                .batch_execute(&format!("CREATE DATABASE \"{name}\" TEMPLATE template0"))
+                .await
+                .unwrap_or_else(|e| panic!("plant {name}: {e}"));
+        }
+        let found = foreign_harness_databases(&client, nonce).await;
+        for name in &planted {
+            let _ = client
+                .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .await;
+        }
+        let found = found.expect("list the harness databases");
+        assert!(
+            own.name().starts_with(&format!("qtest_{nonce}_")),
+            "this process's own clone {} must carry its nonce for this test to mean anything",
+            own.name()
+        );
+        let (own_template, own_clone) = (format!("qtpl_{nonce}"), format!("qtest_{nonce}_"));
+        assert!(
+            planted.iter().all(|name| found.contains(name))
+                && !found
+                    .iter()
+                    .any(|name| name.starts_with(&own_template) || name.starts_with(&own_clone)),
+            "every planted database of another nonce is foreign and none of this process's \
+             own is (its clone {}): {found:?}",
+            own.name()
+        );
+        if own.server.is_embedded() {
+            assert_eq!(
+                found,
+                planted.to_vec(),
+                "nothing but the planted databases is foreign on this process's own cluster"
+            );
+            let line = describe_foreign_databases("the server", &Ok(found))
+                .expect("a report when there are leftovers");
+            assert!(
+                planted.iter().all(|name| line.contains(name.as_str()))
+                    && line.starts_with("2 harness database(s) on the server"),
+                "the report must count and name them: {line}"
+            );
+        }
+        assert_eq!(
+            describe_foreign_databases("the server", &Ok(Vec::new())),
+            None
+        );
+        let many: Vec<String> = (0..FOREIGN_DATABASES_NAMED + 2)
+            .map(|i| format!("qtest_{other}_{i}"))
+            .collect();
+        let line = describe_foreign_databases("the server", &Ok(many.clone()))
+            .expect("a report when there are leftovers");
+        assert!(
+            line.contains(&many[FOREIGN_DATABASES_NAMED - 1])
+                && !line.contains(&many[FOREIGN_DATABASES_NAMED])
+                && line.ends_with(" and 2 more"),
+            "past {FOREIGN_DATABASES_NAMED} names the report counts the rest: {line}"
+        );
+        let line = describe_foreign_databases("the server", &Err("refused".to_string()))
+            .expect("a failed listing is reported, not taken for none");
+        assert!(line.contains("refused"), "the failure is named: {line}");
     }
 
     // ---- the template cache: who may collect it, and when ----

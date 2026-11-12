@@ -721,9 +721,13 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
         password_file: data_root.join("pg-pass"),
         host: "127.0.0.1".to_string(),
         temporary: false, // persist the cluster across launches
-        // The crate's default per-command timeout (initdb / pg_ctl) is 5s,
-        // which flakes under CI contention and on slow end-user disks — first
-        // initdb on a cold machine can legitimately take tens of seconds.
+        // Read only by `postgresql_embedded`'s `tokio` feature, which the
+        // runner does not enable: without it the crate runs initdb and pg_ctl
+        // to completion with no timeout of its own (pg_ctl's `--wait` gives up
+        // after its own 60 s, or `PGCTLTIMEOUT`; initdb has no bound), so this
+        // bounds nothing today. It is 60 s rather than the crate's 5 s default
+        // for the day that feature is on: a first initdb on a cold machine can
+        // take tens of seconds.
         timeout: Some(std::time::Duration::from_secs(60)),
         ..Settings::default()
     };

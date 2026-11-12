@@ -1547,8 +1547,8 @@ mod test_seam_tests {
 
     /// A test `PgDb`'s database carries what `PgDb::new` self-provisions — not
     /// only the schema file's tables. Every relation probed here is absent from
-    /// `schema.pg.sql.generated` (the re-homed machine-local tables exist there
-    /// only as `coord.*`), so each is present only because the template was
+    /// `schema.pg.sql.generated` (none of the re-homed machine-local tables is
+    /// there as `project.*`), so each is present only because the template was
     /// provisioned by `PgDb::new`.
     #[tokio::test]
     async fn a_test_pgdb_carries_the_self_provisioned_tables() {
