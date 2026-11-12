@@ -52,6 +52,7 @@ import {
   planMaximizeZone,
   planToggleMaximizeZone,
   buildMaximizeResult,
+  buildZoneViewState,
 } from "./zone-grid/maximizeActions";
 import {
   applyWorkModeRequest,
@@ -100,7 +101,7 @@ import {
   recordedZoneLedgerFor,
   type SessionOrigin,
 } from "./sessionRecordArgs";
-import { useRecordedZoneBackstop } from "./useRecordedZoneBackstop";
+import { useRecordedZoneBackstop, zoneSyncRestoreComplete } from "./useRecordedZoneBackstop";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
 import {
   getActiveProjectHint,
@@ -259,6 +260,7 @@ function TerminalPageInner({
     setMaximizedZone: zoneLayout.setMaximizedZone,
     layoutId: zoneLayout.layoutId,
     workMode: zoneLayout.workMode,
+    pageId,
   });
   useEffect(() => {
     zoneMaximizeRef.current = {
@@ -267,6 +269,7 @@ function TerminalPageInner({
       setMaximizedZone: zoneLayout.setMaximizedZone,
       layoutId: zoneLayout.layoutId,
       workMode: zoneLayout.workMode,
+      pageId,
     };
   }, [
     zoneLayout.maximizedZone,
@@ -274,6 +277,7 @@ function TerminalPageInner({
     zoneLayout.setMaximizedZone,
     zoneLayout.layoutId,
     zoneLayout.workMode,
+    pageId,
   ]);
 
   // Plan `2026-10-11-runner-terminal-tmux-work-mode`, Phase 4 — the work-mode
@@ -530,15 +534,25 @@ function TerminalPageInner({
         id: "get-zone-view-state",
         label: "Get Zone View State",
         description:
-          "Return { maximizedZone, zoneCount, layoutId } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot.",
-        // `read` — a query.
+          "Return { maximizedZone, zoneCount, layoutId, pageId, assignments, workMode } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot. `pageId` is the terminal page this view shows (a terminal created with that `page_id` mounts here); `assignments` is the grid's zone map, zone index → terminal id; `workMode` is 'grid' or 'tmux' (in tmux one viewport is not a grid).",
+        // `read` — a query. It is the eval-free door to the page id and the
+        // zone map: a page-evaluate read of the persisted keys is refused by
+        // the webview CSP (`script-src 'self'`), so the session-info oracle
+        // (`scripts/uibridge-session-info.test.mjs`) builds its fixtures from
+        // this envelope. `assignments` is read from `assignmentsRef` at
+        // invocation — the map `recordSessionOpen` resolves zones from — not
+        // duplicated into `zoneMaximizeRef`.
         effect: "read",
         signature: GET_ZONE_VIEW_STATE_SIGNATURE,
-        handler: () => ({
-          maximizedZone: zoneMaximizeRef.current.maximizedZone,
-          zoneCount: zoneMaximizeRef.current.zoneCount,
-          layoutId: zoneMaximizeRef.current.layoutId,
-        }),
+        handler: () =>
+          buildZoneViewState({
+            maximizedZone: zoneMaximizeRef.current.maximizedZone,
+            zoneCount: zoneMaximizeRef.current.zoneCount,
+            layoutId: zoneMaximizeRef.current.layoutId,
+            pageId: zoneMaximizeRef.current.pageId,
+            assignments: assignmentsRef.current,
+            workMode: zoneMaximizeRef.current.workMode,
+          }),
       },
       // ── tmux work mode, drivable and assertable ──
       //
@@ -930,16 +944,6 @@ function TerminalPageInner({
   // The registry record was already written backend-side — this is UI-only.
   useSessionBoundEvents({ tabs, updateTab });
 
-  // Zone re-resolution backstop (`useRecordedZoneBackstop`): keeps each
-  // session's durable recorded zone in step with its zone in the grid, and
-  // stands down in tmux work mode, whose one viewport is not a grid.
-  useRecordedZoneBackstop({
-    workMode: zoneLayout.workMode,
-    assignments: zoneLayout.assignments,
-    tabs,
-    pageId,
-    recordedZones,
-  });
   const {
     labelsAndTags,
     eventHistory,
@@ -1106,6 +1110,19 @@ function TerminalPageInner({
         focusedZone: zoneLayout.gridView.focusedZone,
       },
     });
+
+  // Zone re-resolution backstop (`useRecordedZoneBackstop`): keeps each
+  // session's durable recorded zone in step with its zone in the grid, and
+  // stands down in tmux work mode, whose one viewport is not a grid. It waits
+  // for this page's restore before syncing a session it never wrote.
+  useRecordedZoneBackstop({
+    workMode: zoneLayout.workMode,
+    assignments: zoneLayout.assignments,
+    tabs,
+    pageId,
+    recordedZones,
+    restoreComplete: zoneSyncRestoreComplete(restoreCompletePages, restoreDeferredPages, pageId),
+  });
 
   // Operator-clickable retry for a restored tab whose resume verification
   // failed (Phase 3, #548): re-run the same type-and-verify path. The durable

@@ -3610,6 +3610,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_session_set_finished,
             commands::terminal::terminal_session_record_open,
             commands::terminal::terminal_session_rebind_terminal,
+            commands::terminal::terminal_session_sync_zone,
             commands::terminal::terminal_set_title,
             commands::terminal::terminal_set_visibility,
             commands::terminal::terminal_write,
