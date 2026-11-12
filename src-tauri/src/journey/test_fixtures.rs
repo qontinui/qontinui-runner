@@ -449,7 +449,23 @@ fn with_field(
 
 /// Each non-count field the verdict reads beside an identity is read: an
 /// answer that differs from another in that one field alone, as a grouped read
-/// that got the field wrong would, never agrees with it.
+/// that got the field wrong would, never agrees with it. Nine such fields are
+/// varied here, once each:
+///
+/// - a graph node's `unconfirmedDestination`, and its open `frontier` entry's
+///   `affordanceFingerprint`, `affordanceRole`, `declaredEffect` and `reason`;
+/// - a graph edge's `outcome`;
+/// - a dead end's `backOnly`;
+/// - an unexplored node's `unconfirmedDestination` and `unsettledByGraph`.
+///
+/// The tenth, a reached node's distance, is varied by
+/// [`the_verdict_tells_apart_answers_that_list_as_many_different_things`],
+/// with the identities themselves: a graph node's key, an edge's trigger, a
+/// reached node, and the `steps` answer's distance and path. No self-test
+/// varies the rest of what the verdict reads: the answer's `status`, its
+/// `unknown` code and its unmeasured dimensions; an edge's ends; whether any
+/// arrival's destination is unknown; and which nodes are listed as dead ends,
+/// as unexplored, or as prior knowledge, settled or not.
 #[test]
 fn the_verdict_reads_each_non_count_field_it_names() {
     let c = answer_ctx();
@@ -459,7 +475,9 @@ fn the_verdict_reads_each_non_count_field_it_names() {
     );
     let graph = answer_graph(&c, &graph_of(rows.clone(), open.clone()));
     // X has no way out and an affordance nobody activated, so it is unexplored.
-    let dead_ends = answer_dead_ends(&c, &graph_of(rows, open));
+    let unexplored = answer_dead_ends(&c, &graph_of(rows.clone(), open));
+    // With nothing left open at X, it is a dead end, and not a back-only one.
+    let dead_end = answer_dead_ends(&c, &graph_of(rows, vec![]));
     let x = key("x");
     for (what, answer, listing, id_field, pointer, to) in [
         (
@@ -503,8 +521,24 @@ fn the_verdict_reads_each_non_count_field_it_names() {
             json!(true),
         ),
         (
+            "a graph edge, by its outcome",
+            &graph,
+            "edges",
+            "toKey",
+            "/outcome",
+            json!("no_change"),
+        ),
+        (
+            "a dead end, back-only or not",
+            &dead_end,
+            "deadEnds",
+            "nodeKey",
+            "/backOnly",
+            json!(true),
+        ),
+        (
             "an unexplored node, its destination confirmed or not",
-            &dead_ends,
+            &unexplored,
             "unexplored",
             "nodeKey",
             "/unconfirmedDestination",
@@ -512,7 +546,7 @@ fn the_verdict_reads_each_non_count_field_it_names() {
         ),
         (
             "an unexplored node, unsettled by the graph or not",
-            &dead_ends,
+            &unexplored,
             "unexplored",
             "nodeKey",
             "/unsettledByGraph",
