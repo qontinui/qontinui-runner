@@ -926,6 +926,25 @@ describe("spawn admission", () => {
     );
     assert.equal(classifyTerminalSpawn({ status: 503, json: { error: "x" } }).kind, "error");
   });
+  test("a 503 whose body names the resource guard is admission even with no code", () => {
+    const c = classifyTerminalSpawn({
+      status: 503,
+      json: { error: "resource_guard:critical:thread_count: 31950 >= 30000" },
+    });
+    assert.equal(c.kind, "admission");
+    assert.equal(c.retry, true);
+  });
+  test("an exhausted retry names who refused: spawn admission, or the trust gate's dial", () => {
+    const exhausted = (classification) =>
+      planSpawnRetry({ classification, attempt: 9, elapsedMs: 119_000 }).reason;
+    assert.match(exhausted(classifyTerminalSpawn(guard503)), /spawn admission kept refusing/);
+    const dial = classifyTerminalSpawn({
+      status: 503,
+      json: { error: "trust gate: tenant dial unread", code: "SPAWN_BLOCKED_DIAL_UNREAD" },
+    });
+    assert.match(exhausted(dial), /trust gate \(tenant dial unread\) kept refusing/);
+    assert.doesNotMatch(exhausted(dial), /spawn admission/);
+  });
   test("roster 400, not-logged-in 409 and any other 500 are not retried", () => {
     assert.equal(
       classifyTerminalSpawn({

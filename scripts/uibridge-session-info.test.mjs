@@ -128,6 +128,7 @@ import {
   planMenuAnswer,
   planRosterSeed,
   planSpawnRetry,
+  spawnRefuser,
   refusedGateIn,
   resolvePowerShellInterpreter,
   resolveTargetRunnerPid,
@@ -975,7 +976,7 @@ async function postTerminalWithAdmission(body) {
     });
     if (!next.retry) return { ok: false, kind: c.kind, error: next.reason };
     note(
-      `POST /terminals refused by spawn admission (${c.detail}; threads verdict ` +
+      `POST /terminals refused by ${spawnRefuser(c.kind)} (${c.detail}; threads verdict ` +
         `${verdict ?? "unread"}) — retrying in ${next.delayMs}ms`,
     );
     await sleep(next.delayMs);

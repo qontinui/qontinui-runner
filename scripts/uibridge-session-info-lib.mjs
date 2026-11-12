@@ -1150,6 +1150,13 @@ export function classifyTerminalSpawn(res) {
   };
 }
 
+/** Who a retryable spawn refusal came from, in words, keyed on its kind. */
+export function spawnRefuser(kind) {
+  return kind === "dial-unread"
+    ? "the runner's trust gate (tenant dial unread)"
+    : "the runner's spawn admission";
+}
+
 /**
  * The next step after a refused spawn. Pure. `admissionVerdict` is `/health`
  * `spawnAdmission.threads.verdict` as last read (reported, never trusted to
@@ -1183,7 +1190,7 @@ export function planSpawnRetry({
     return {
       retry: false,
       reason:
-        `the runner's spawn admission kept refusing for ${Math.round(elapsedMs / 1000)}s ` +
+        `${spawnRefuser(classification.kind)} kept refusing for ${Math.round(elapsedMs / 1000)}s ` +
         `(${attempt + 1} attempt(s), budget ${Math.round(budgetMs / 1000)}s): ${classification.detail}` +
         ` — /health spawnAdmission.threads.verdict=${admissionVerdict ?? "unread"}`,
     };
