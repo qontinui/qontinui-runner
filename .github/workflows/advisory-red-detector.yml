@@ -83,9 +83,7 @@ permissions:
 # interpolating only `github.event_name` / `github.ref` and collapsing every
 # other expression to "" (qontinui-coord ci_observer.rs resolve_group_template),
 # and run_is_reaper_at_risk never matches an empty group, so no push run here is
-# modelled as reapable by a land. (KNOWN coord gap: the budget-cancel candidate
-# scan in stuck_pr_watcher.rs compares groups with `=`, so every "" group
-# matches every other one and suppresses its auto re-run; fix belongs in coord.)
+# modelled as reapable by a land.
 # RESIDUAL: two pushes seconds apart can have
 # their runs CREATED out of order, so the older head's run cancels the newer
 # head's; the next push (or a close+reopen) heals it.

@@ -140,9 +140,6 @@ permissions:
 # so the older head's run cancels the newer head's; the next push heals it.
 #
 # The group is one expression, so coord models it as "" (never reaper-at-risk).
-# KNOWN coord gap: the budget-cancel candidate scan in stuck_pr_watcher.rs
-# compares groups with `=`, so every "" group matches every other one and
-# suppresses its auto re-run; the fix belongs in coord.
 #
 # `github.workflow` is in the key so the group cannot collide with another
 # workflow's group (concurrency groups are repo-wide). Do NOT add a `paths:`
