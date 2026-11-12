@@ -64,10 +64,16 @@
 //!
 //! The sweep runs at every boot: a `run-*` root whose recorded owner pid is gone
 //! has its postmaster killed — after checking that the pid really is that
-//! root's postmaster — and is removed. On Windows the harness also clears the
-//! inherit flag on the process's std handles before it starts anything: `pg_ctl`
-//! and the postmaster inherit every inheritable handle, and a postmaster holding
-//! CI's `| tee` pipe would hold the step open until its timeout.
+//! root's postmaster — and is removed. A pid is judged only in the PID
+//! namespace that recorded it: a root whose owner recorded another one (a
+//! container sharing the target directory, a second WSL distro) is presumed
+//! live until its record is [`FOREIGN_OWNER_GRACE`] old, because its pid names
+//! nothing here.
+//!
+//! On Windows the harness also clears the inherit flag on the process's std
+//! handles before it starts anything: `pg_ctl` and the postmaster inherit every
+//! inheritable handle, and a postmaster holding CI's `| tee` pipe would hold the
+//! step open until its timeout.
 //!
 //! # Opt-in external server
 //!
@@ -181,6 +187,12 @@ const STOP_WAIT: Duration = Duration::from_secs(45);
 /// A `run-*` root with no readable owner record is left alone this long: it may
 /// be a live process's root, caught between its `mkdir` and its record's write.
 const OWNERLESS_GRACE: Duration = Duration::from_secs(600);
+/// A `run-*` root whose owner recorded a different PID namespace is left alone
+/// until its record is this old: its pid cannot be checked from here, so the
+/// root is presumed live for longer than any test process runs. Not
+/// [`OWNERLESS_GRACE`], which outlasts only the moment between a root's `mkdir`
+/// and its record's write, not a whole run.
+const FOREIGN_OWNER_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a template may keep sessions open after it is sealed before boot
 /// fails; stragglers are terminated after [`TEMPLATE_STRAGGLER_GRACE`].
 const TEMPLATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -766,14 +778,7 @@ async fn boot_embedded() -> Result<Server, String> {
             cluster.postmaster_pid = Some(pid);
         }
     });
-    write_owner(
-        &entered.root,
-        &Owner {
-            pid: std::process::id(),
-            template: key.clone(),
-            postmaster: Some(pid),
-        },
-    )?;
+    write_owner(&entered.root, &Owner::this_process(&key, Some(pid)))?;
     let exit_guard = crate::process_helpers::ChildTreeGuard::attach_pid(pid);
     let exit_guard_note = if !cfg!(windows) {
         "atexit; a killed process's cluster is reaped by the next boot's sweep"
@@ -1612,33 +1617,47 @@ fn create_run_root(dir: &Path, key: &str) -> Result<PathBuf, String> {
         )
     })?;
     let _ = OWN_ROOT.set(root.clone());
-    write_owner(
-        &root,
-        &Owner {
-            pid: std::process::id(),
-            template: key.to_string(),
-            postmaster: None,
-        },
-    )?;
+    write_owner(&root, &Owner::this_process(key, None))?;
     Ok(root)
 }
 
-/// Who owns a per-process root: the process, the template cache it was copied
-/// from (so a stale cache in use is not collected), and its postmaster.
+/// Who owns a per-process root: the process — its pid, and the PID namespace
+/// that pid means something in — the template cache it was copied from (so a
+/// stale cache in use is not collected), and its postmaster.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Owner {
     pid: u32,
+    /// [`own_pid_namespace`] of the owner; `None` off Linux.
+    pid_ns: Option<String>,
     template: String,
     postmaster: Option<u32>,
 }
 
 impl Owner {
+    /// This process, as the owner of a root copied from `template`.
+    fn this_process(template: &str, postmaster: Option<u32>) -> Self {
+        Self {
+            pid: std::process::id(),
+            pid_ns: own_pid_namespace().map(str::to_owned),
+            template: template.to_string(),
+            postmaster,
+        }
+    }
+
     fn render(&self) -> String {
+        let pid_ns = self
+            .pid_ns
+            .as_ref()
+            .map(|ns| format!("pid_ns={ns}\n"))
+            .unwrap_or_default();
         let postmaster = self
             .postmaster
             .map(|pid| format!("postmaster={pid}\n"))
             .unwrap_or_default();
-        format!("pid={}\ntemplate={}\n{postmaster}", self.pid, self.template)
+        format!(
+            "pid={}\n{pid_ns}template={}\n{postmaster}",
+            self.pid, self.template
+        )
     }
 
     fn parse(text: &str) -> Option<Self> {
@@ -1650,10 +1669,56 @@ impl Owner {
         }
         Some(Self {
             pid: fields.get("pid")?.parse().ok()?,
+            pid_ns: fields
+                .get("pid_ns")
+                .filter(|ns| !ns.is_empty())
+                .map(|ns| (*ns).to_string()),
             template: (*fields.get("template")?).to_string(),
             postmaster: fields.get("postmaster").and_then(|pid| pid.parse().ok()),
         })
     }
+}
+
+/// This process's PID namespace — the target of `/proc/self/ns/pid`, such as
+/// `pid:[4026531836]` — on Linux. `None` elsewhere, and where it cannot be read.
+///
+/// A pid means something only inside its namespace. A container sharing the
+/// target directory, or a second WSL distro, runs its tests in another one,
+/// where a live process's pid is absent from this namespace's process table or
+/// names an unrelated process.
+fn own_pid_namespace() -> Option<&'static str> {
+    static NAMESPACE: OnceLock<Option<String>> = OnceLock::new();
+    NAMESPACE
+        .get_or_init(|| {
+            if !cfg!(target_os = "linux") {
+                return None;
+            }
+            std::fs::read_link("/proc/self/ns/pid")
+                .ok()
+                .and_then(|link| link.to_str().map(str::to_owned))
+        })
+        .as_deref()
+}
+
+/// Whether the process that owns `root` may still be running — so the root, and
+/// the template cache it was copied from, must be left alone.
+///
+/// The recorded pid is judged only when the record names the same PID namespace
+/// as this process — off Linux, where no process records one, none on both
+/// sides. A record from another namespace, or one that names none where this
+/// process has one (a Windows process's, read by a WSL process through a
+/// shared target directory), cannot be checked from here: its root is presumed
+/// live until the record is [`FOREIGN_OWNER_GRACE`] old.
+fn owner_may_be_live(root: &Path, owner: &Owner) -> bool {
+    if OWN_ROOT.get().is_some_and(|own| own == root) {
+        return true;
+    }
+    if owner.pid_ns.as_deref() != own_pid_namespace() {
+        return !modified_before(&root.join(OWNER_FILE), FOREIGN_OWNER_GRACE);
+    }
+    // A record naming THIS process's pid is a dead predecessor's: this
+    // process's own root is matched above.
+    owner.pid != std::process::id() && crate::runner_breadcrumb::pid_is_live(owner.pid)
 }
 
 fn write_owner(root: &Path, owner: &Owner) -> Result<(), String> {
@@ -1674,8 +1739,9 @@ fn is_run_root(path: &Path) -> bool {
             .is_some_and(|name| name.starts_with(RUN_PREFIX))
 }
 
-/// Stop and remove every `run-*` root whose owner process is gone. Returns one
-/// line per root it acted on. Never takes this process's own root.
+/// Stop and remove every `run-*` root whose owner process is gone
+/// ([`owner_may_be_live`]). Returns one line per root it acted on. Never takes
+/// this process's own root.
 fn sweep_dead_roots(dir: &Path) -> Vec<String> {
     let mut report = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1687,11 +1753,7 @@ fn sweep_dead_roots(dir: &Path) -> Vec<String> {
         }
         let owner = read_owner(&root);
         let dead = match &owner {
-            // A record naming THIS process's pid is a dead predecessor's: this
-            // process's own root is skipped above.
-            Some(owner) => {
-                owner.pid == std::process::id() || !crate::runner_breadcrumb::pid_is_live(owner.pid)
-            }
+            Some(owner) => !owner_may_be_live(&root, owner),
             None => modified_before(&root, OWNERLESS_GRACE),
         };
         if !dead {
@@ -1732,8 +1794,7 @@ fn collect_stale_templates(dir: &Path, keep: &str) -> Vec<String> {
     let in_use: Vec<String> = paths
         .iter()
         .filter(|path| is_run_root(path))
-        .filter_map(|root| read_owner(root))
-        .filter(|owner| crate::runner_breadcrumb::pid_is_live(owner.pid))
+        .filter_map(|root| read_owner(root).filter(|owner| owner_may_be_live(root, owner)))
         .map(|owner| owner.template)
         .collect();
     let mut report = Vec::new();
@@ -2704,15 +2765,21 @@ mod tests {
     fn owner_records_round_trip() {
         let bare = Owner {
             pid: 4242,
+            pid_ns: None,
             template: "0123456789abcdef".to_string(),
             postmaster: None,
         };
         assert_eq!(Owner::parse(&bare.render()), Some(bare.clone()));
         let started = Owner {
+            pid_ns: Some("pid:[4026531836]".to_string()),
             postmaster: Some(777),
             ..bare
         };
         assert_eq!(Owner::parse(&started.render()), Some(started));
+        assert_eq!(
+            Owner::parse(&Owner::this_process("k", None).render()),
+            Some(Owner::this_process("k", None)),
+        );
         assert_eq!(Owner::parse(""), None);
         assert_eq!(Owner::parse("pid=not-a-pid\ntemplate=x\n"), None);
     }
@@ -2915,8 +2982,7 @@ mod tests {
             &root,
             &Owner {
                 pid: a_live_pid_not_ours(),
-                template: "in-use".to_string(),
-                postmaster: None,
+                ..Owner::this_process("in-use", None)
             },
         )
         .expect("record its owner");
@@ -2949,5 +3015,81 @@ mod tests {
         }
         assert_eq!(report.len(), 3, "one line per removed cache: {report:#?}");
         assert!(root.is_dir(), "a template collection removed a root");
+    }
+
+    /// A pid means something only in the PID namespace that recorded it. A root
+    /// whose owner recorded ANOTHER namespace — a container sharing the target
+    /// directory, a second WSL distro — is neither swept as dead nor stops
+    /// keeping its cache, however dead its pid looks from here, until its record
+    /// is [`FOREIGN_OWNER_GRACE`] old. A record that names no namespace counts as
+    /// another one wherever this process has one.
+    ///
+    /// Every record here names THIS process's pid, which in this process's own
+    /// namespace marks a dead predecessor's root (its own root is never in a
+    /// scratch directory) — which is exactly how a live process in another
+    /// namespace can look from this one.
+    #[test]
+    fn a_root_owned_from_another_pid_namespace_is_presumed_live() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path();
+        let here = own_pid_namespace().map(str::to_owned);
+        let elsewhere = Some("pid:[0]".to_string());
+        assert_ne!(here, elsewhere, "pid:[0] is never a real namespace");
+        let now = SystemTime::now();
+        let past_grace = now - FOREIGN_OWNER_GRACE - Duration::from_secs(3600);
+        let unused_long_ago = now - TEMPLATE_IDLE_LIMIT - Duration::from_secs(3600);
+        // A root named `name`, owned in `pid_ns` and recorded at `recorded`, and
+        // the idle cache it was copied from, which only a live root keeps.
+        let plant = |name: &str, pid_ns: &Option<String>, recorded: SystemTime| {
+            let root = dir.join(format!("{RUN_PREFIX}{name}"));
+            std::fs::create_dir(&root).expect("plant a root");
+            let owner = Owner {
+                pid_ns: pid_ns.clone(),
+                ..Owner::this_process(name, None)
+            };
+            write_owner(&root, &owner).expect("record its owner");
+            set_mtime(&root.join(OWNER_FILE), recorded);
+            let cache = dir.join(format!("{TEMPLATE_PREFIX}{name}"));
+            std::fs::create_dir(&cache).expect("plant its cache");
+            for marker in [READY_FILE, LAST_USED_FILE] {
+                std::fs::write(cache.join(marker), "planted\n").expect("plant a marker");
+                set_mtime(&cache.join(marker), unused_long_ago);
+            }
+            (root, cache)
+        };
+        let same = plant("same", &here, now);
+        let foreign = plant("foreign", &elsewhere, now);
+        let foreign_long_ago = plant("foreign-long-ago", &elsewhere, past_grace);
+        let unnamed = plant("unnamed", &None, now);
+        let unnamed_is_foreign = here.is_some();
+
+        let collected = collect_stale_templates(dir, "building");
+        let swept = sweep_dead_roots(dir);
+
+        let outcome = format!("collected {collected:#?}\nswept {swept:#?}");
+        for ((root, cache), live, why) in [
+            (&same, false, "its pid is this process's, in this namespace"),
+            (&foreign, true, "its owner recorded another PID namespace"),
+            (
+                &foreign_long_ago,
+                false,
+                "its other-namespace record is older than FOREIGN_OWNER_GRACE",
+            ),
+            (
+                &unnamed,
+                unnamed_is_foreign,
+                "its record names no PID namespace",
+            ),
+        ] {
+            for (path, what) in [(root, "root"), (cache, "cache")] {
+                assert_eq!(
+                    path.exists(),
+                    live,
+                    "the {what} {} must {} because {why}\n{outcome}",
+                    path.display(),
+                    if live { "survive" } else { "go" }
+                );
+            }
+        }
     }
 }
