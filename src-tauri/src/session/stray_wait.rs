@@ -2109,21 +2109,33 @@ mod live {
         }
         let mut out = Vec::new();
         let mut table = table;
+        // One set of facts for every pass: the holder walk is the costly read, and a
+        // record past its budget records nothing, so every stray would outlive the
+        // pane. A deadline well inside that budget bounds the resampling too.
+        let facts = LiveFacts::new();
+        let deadline = Instant::now() + super::RECORD_BUDGET / 2;
         // A shell sampled between two of its loop's steps (see [`BETWEEN_STEPS`]) is
         // judged again on a fresh table, bounded: a stray left out here is never
         // ended, because the close ends only what it recorded.
         for pass in 0..=BETWEEN_STEPS_RESAMPLES {
+            let mut under: Option<HashSet<u32>> = None;
             if pass > 0 {
+                if Instant::now() >= deadline {
+                    break;
+                }
                 std::thread::sleep(BETWEEN_STEPS_GAP);
                 let Some(fresh) = read_table() else {
                     break;
                 };
                 table = fresh;
+                // Still under one of the claudes: a reused pid elsewhere is not ours.
+                under = Some(claudes.iter().flat_map(|&c| subtree(&table, c)).collect());
             }
-            let facts = LiveFacts::new();
             let mut between = Vec::new();
             for (pid, argv) in shells {
-                if table.get(&pid).map(|(_, a)| a) != Some(&argv) {
+                if table.get(&pid).map(|(_, a)| a) != Some(&argv)
+                    || under.as_ref().is_some_and(|u| !u.contains(&pid))
+                {
                     continue;
                 }
                 let verdict = stray_verdict(&table, pid, &facts, idle_min);
