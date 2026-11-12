@@ -143,7 +143,10 @@ mod tests {
             // to the one bounded tail reader, `file_tail::read_tail_lossy` (plan
             // 2026-11-11-runner-glibc-arena-retention-and-whole-log-tail); the
             // other 1 was slack, 416 measured before the change, 414 after.
-            baseline: 414,
+            // 414 -> 413: `execute_element_action` (step_executor ui_bridge) lost its
+            // only slice when the snapshot target root moved to a parsed port
+            // (`action_wire::snapshot_target_root`).
+            baseline: 413,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
