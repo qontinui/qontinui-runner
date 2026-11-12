@@ -10565,11 +10565,9 @@ mod sdk_element_fallback_source_guard {
         let start = SRC
             .find("async fn handle_element_action(")
             .expect("handle_element_action present");
-        let end = SRC[start..]
-            .find("\nasync fn ")
-            .expect("another handler follows")
-            + start;
-        &SRC[start..end]
+        let rest = SRC.get(start..).expect("`find` returns a char boundary");
+        let end = rest.find("\nasync fn ").expect("another handler follows");
+        rest.get(..end).expect("`find` returns a char boundary")
     }
 
     #[test]

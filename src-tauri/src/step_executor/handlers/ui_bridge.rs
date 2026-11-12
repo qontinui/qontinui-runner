@@ -2850,12 +2850,16 @@ mod element_action_step_source_guard {
             .find("async fn execute_element_action(")
             .expect("execute_element_action present");
         // Structural end: the next method of the impl block.
-        let end = SRC[start + 1..]
+        let rest = SRC.get(start..).expect("`find` returns a char boundary");
+        // Search past the item's first byte (ASCII `a`) so the match is never
+        // the item itself.
+        let end = rest
+            .get(1..)
+            .expect("the found item starts with an ASCII byte")
             .find("\n    async fn ")
             .expect("another method follows")
-            + start
             + 1;
-        &SRC[start..end]
+        rest.get(..end).expect("`find` returns a char boundary")
     }
 
     #[test]

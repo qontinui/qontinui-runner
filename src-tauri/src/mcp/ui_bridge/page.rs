@@ -5090,8 +5090,9 @@ mod navigate_and_wait_window_guard {
         let start = SRC
             .find("async fn ui_bridge_navigate_and_wait_handler_dispatch(")
             .expect("handler present");
-        let end = SRC[start..].find("\n/// ").expect("next item") + start;
-        let handler = &SRC[start..end];
+        let rest = SRC.get(start..).expect("`find` returns a char boundary");
+        let end = rest.find("\n/// ").expect("next item");
+        let handler = rest.get(..end).expect("`find` returns a char boundary");
         for (request_type, base_arg) in [
             (
                 "\"discover\"",
