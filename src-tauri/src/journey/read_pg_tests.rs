@@ -30,6 +30,18 @@
 //! three since queries, and (e) when `(e.invalidated_at IS NOT NULL)` left that
 //! query's `GROUP BY`. (a), (f) and (g) went red under all three; (d), which
 //! asserts only stability and order, under none.
+//!
+//! (f)'s verdict (`test_fixtures::verdict`) reads each conclusion by identity,
+//! and was seen to need to. When the full since read handed every affordance
+//! row back under another `targetFingerprint`, (f) failed on the graph answer's
+//! edges alone; the verdict it replaced, which compared the graph's nodes by
+//! their number and read no edge, passed it. An older group never adds a node
+//! or an edge — the filter excludes it first — so a wrong representative shows
+//! in (f) only through the doubt it leaves: a representative naming its
+//! `fromNode` as its `toNode` failed (f) on the graph answer's unknown
+//! destinations, but one doing so only for `changed` groups left (f) green
+//! (every prior-knowledge candidate here is unsettled already), and (a), (b),
+//! (e) and (g) caught it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
