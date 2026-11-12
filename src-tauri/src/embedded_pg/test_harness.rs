@@ -35,9 +35,14 @@
 //!   extracted bundled install plus a cleanly shut-down data directory whose
 //!   `qontinui_template` database holds the transformed schema. The key hashes
 //!   the bundled PostgreSQL release, the `postgresql_embedded` release, the
-//!   rendered schema SQL and [`HARNESS_VERSION`]. Built once under an exclusive
-//!   lock on `.lock`; read under a shared one, which also keeps a stale cache
-//!   from being collected while a process copies it.
+//!   rendered schema SQL and [`HARNESS_VERSION`]. Built under an exclusive lock
+//!   on `.lock`, and entered by its builder before that lock is released
+//!   ([`enter_or_build`]); entered by every other process under a shared one,
+//!   which keeps a collection from removing it mid-copy. Every entry marks it
+//!   used. Worktrees on branches whose schemas differ share one target
+//!   directory, so caches of several keys coexist: a build collects another
+//!   key's cache only once no live root was copied from it and it has gone
+//!   unused for [`TEMPLATE_IDLE_LIMIT`].
 //! - **Process** (`run-<pid>-<nonce>/`): a copy of the cached data directory,
 //!   started on a free loopback port. No live cluster is shared between
 //!   processes, so only its owner ever stops it.
@@ -145,6 +150,13 @@ const DEFAULT_DIR_NAME: &str = "qontinui-test-pg";
 const LOCK_FILE: &str = ".lock";
 /// Written last by a template build: its presence is what makes a cache usable.
 const READY_FILE: &str = "READY";
+/// Rewritten by every process that enters a template cache: its mtime is when
+/// the cache was last used ([`last_used`]).
+const LAST_USED_FILE: &str = "last_used";
+/// How long a template cache no live root was copied from is kept after its
+/// last use. A day outlasts any branch switch a developer would come back from,
+/// so alternating between two schemas never rebuilds either cache.
+const TEMPLATE_IDLE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// The per-process root's record of who owns it (see [`Owner`]).
 const OWNER_FILE: &str = "owner";
 const RUN_PREFIX: &str = "run-";
@@ -722,45 +734,13 @@ async fn boot_embedded() -> Result<Server, String> {
     let template_dir = dir.join(format!("{TEMPLATE_PREFIX}{key}"));
     let stats = Arc::new(Stats::new(Some(MAX_CONNECTIONS)));
     let cache_lock = open_lock(&dir)?;
-
-    // Copy under a SHARED lock (a template build or a stale-cache collection
-    // holds it exclusively); build, when the cache is missing, under an
-    // EXCLUSIVE one. A lock cannot be upgraded in place, so the build releases
-    // and re-takes it, and the next pass copies what it built.
-    let mut built: Option<Duration> = None;
-    let mut entered: Option<Entered> = None;
-    for _ in 0..3 {
-        cache_lock
-            .lock_shared()
-            .map_err(|e| format!("could not take the cache lock in {}: {e}", dir.display()))?;
-        if template_dir.join(READY_FILE).is_file() {
-            let attempt = enter_template(&dir, &template_dir, &key, &stats);
-            let _ = cache_lock.unlock();
-            entered = Some(attempt?);
-            break;
-        }
-        let _ = cache_lock.unlock();
-        cache_lock
-            .lock()
-            .map_err(|e| format!("could not take the cache lock in {}: {e}", dir.display()))?;
-        let outcome = if template_dir.join(READY_FILE).is_file() {
-            Ok(None)
-        } else {
-            build_template(&dir, &template_dir, &key, &defaults)
-                .await
-                .map(Some)
-        };
-        let _ = cache_lock.unlock();
-        if let Some(took) = outcome? {
-            built = Some(took);
-        }
-    }
-    let entered = entered.ok_or_else(|| {
-        format!(
-            "the template cache {} never became ready",
-            template_dir.display()
-        )
-    })?;
+    let (entered, built) = enter_or_build(
+        &cache_lock,
+        &template_dir,
+        || build_template(&dir, &template_dir, &key, &defaults),
+        || enter_template(&dir, &template_dir, &key, &stats),
+    )
+    .await?;
 
     let data_dir = entered.root.join(DATA_DIR);
     let password_file = template_dir.join(PASSWORD_FILE);
@@ -846,6 +826,78 @@ async fn boot_embedded() -> Result<Server, String> {
     })
 }
 
+/// Enter the template cache in `template_dir` — `enter` copies it into this
+/// process's root — building it first with `build` when it is missing. Returns
+/// what `enter` returned and, when this call built the cache, how long that
+/// took.
+///
+/// A READY cache is entered under the SHARED cache lock: a collection holds the
+/// lock exclusively, so none can remove the cache mid-copy. A missing one is
+/// built AND entered under the EXCLUSIVE lock, which is not let go of in
+/// between. A lock cannot be downgraded in place, and in the gap a release
+/// would open, another key's build could collect the new cache before any live
+/// root names it: two processes whose schemas differ, sharing one harness
+/// directory, then removed each other's cache in turn until neither became
+/// ready.
+///
+/// Either way the cache is marked used ([`LAST_USED_FILE`]) as it is entered,
+/// under the same lock.
+async fn enter_or_build<T, Built>(
+    cache_lock: &std::fs::File,
+    template_dir: &Path,
+    build: impl FnOnce() -> Built,
+    enter: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<Duration>), String>
+where
+    Built: Future<Output = Result<Duration, String>>,
+{
+    let lock_failed = |e: std::io::Error| {
+        format!(
+            "could not take the cache lock for {}: {e}",
+            template_dir.display()
+        )
+    };
+    cache_lock.lock_shared().map_err(lock_failed)?;
+    if template_dir.join(READY_FILE).is_file() {
+        touch_last_used(template_dir);
+        let entered = enter();
+        let _ = cache_lock.unlock();
+        return entered.map(|entered| (entered, None));
+    }
+    let _ = cache_lock.unlock();
+    cache_lock.lock().map_err(lock_failed)?;
+    let outcome = async move {
+        // Another process may have built it while this one waited.
+        let built = if template_dir.join(READY_FILE).is_file() {
+            None
+        } else {
+            Some(build().await?)
+        };
+        touch_last_used(template_dir);
+        enter().map(|entered| (entered, built))
+    }
+    .await;
+    let _ = cache_lock.unlock();
+    outcome
+}
+
+/// Mark a template cache used now. [`LAST_USED_FILE`]'s mtime is what
+/// [`collect_stale_templates`] ages a cache by; its content says the same to a
+/// reader. Best effort: a cache that cannot be marked is still entered, and the
+/// root copied from it still keeps it from collection while it lives.
+fn touch_last_used(template_dir: &Path) {
+    let path = template_dir.join(LAST_USED_FILE);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    if let Err(e) = std::fs::write(&path, format!("used_unix={now}\n")) {
+        say(format!(
+            "could not mark the template cache used ({}): {e}",
+            path.display()
+        ));
+    }
+}
+
 /// A per-process root holding a fresh copy of the template's data directory.
 struct Entered {
     root: PathBuf,
@@ -854,8 +906,10 @@ struct Entered {
 }
 
 /// Create this process's root and copy the cached data directory into it. Runs
-/// under the shared cache lock. The root is handed to the exit-time teardown
-/// before anything is copied, so a failure from here on still removes it.
+/// under the cache lock ([`enter_or_build`]): shared, or exclusive straight
+/// after this process built the cache. The root is handed to the exit-time
+/// teardown before anything is copied, so a failure from here on still removes
+/// it.
 fn enter_template(
     dir: &Path,
     template_dir: &Path,
@@ -1659,8 +1713,17 @@ fn sweep_dead_roots(dir: &Path) -> Vec<String> {
     report
 }
 
-/// Remove every template cache other than `keep` that no live root was copied
-/// from. Runs under the exclusive cache lock, so no process is copying one.
+/// Remove the template caches other than `keep` that are garbage. Runs under the
+/// exclusive cache lock, inside a build, so no process is building or copying
+/// one:
+///
+/// - a cache with no READY is a crashed build's: it goes at once, with any
+///   postmaster that build left running in it;
+/// - a READY cache goes only when no live root was copied from it AND it has
+///   gone unused for [`TEMPLATE_IDLE_LIMIT`] ([`last_used`]). Collecting every
+///   cache but the builder's own made two processes whose schemas differ remove
+///   each other's cache in turn, and made alternating branches rebuild on every
+///   switch.
 fn collect_stale_templates(dir: &Path, keep: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -1685,19 +1748,41 @@ fn collect_stale_templates(dir: &Path, keep: &str) -> Vec<String> {
         if key == keep || in_use.iter().any(|used| used == key) || !path.is_dir() {
             continue;
         }
+        let why = if !path.join(READY_FILE).is_file() {
+            "incomplete: a crashed build's".to_string()
+        } else {
+            match last_used(&path).and_then(|at| at.elapsed().ok()) {
+                Some(idle) if idle > TEMPLATE_IDLE_LIMIT => {
+                    format!("unused for {} h", idle.as_secs() / 3600)
+                }
+                // Used within the limit, or its age cannot be read: kept.
+                _ => continue,
+            }
+        };
         let stopped = reap_postmaster(&path, None);
         report.push(match remove_dir_all_retrying(&path) {
             Ok(()) => format!(
-                "removed the stale template cache {} ({stopped})",
+                "removed the stale template cache {} ({why}; {stopped})",
                 path.display()
             ),
             Err(e) => format!(
-                "could not remove the stale template cache {}: {e}",
+                "could not remove the stale template cache {} ({why}): {e}",
                 path.display()
             ),
         });
     }
     report
+}
+
+/// When a template cache was last entered: its [`LAST_USED_FILE`]'s mtime, or
+/// — on a cache no process has marked, which only a harness predating the
+/// marker leaves — its READY marker's. `None` when neither can be read.
+fn last_used(template_dir: &Path) -> Option<SystemTime> {
+    [LAST_USED_FILE, READY_FILE].into_iter().find_map(|marker| {
+        std::fs::metadata(template_dir.join(marker))
+            .and_then(|meta| meta.modified())
+            .ok()
+    })
 }
 
 fn modified_before(path: &Path, age: Duration) -> bool {
@@ -2691,5 +2776,178 @@ mod tests {
         let exe = deps.join("qontinui_runner_lib-0123abcd");
         assert_eq!(cargo_target_dir_of(&exe), Some(target.clone()));
         assert_eq!(cargo_target_dir_of(scratch.path()), None);
+    }
+
+    // ---- the template cache: who may collect it, and when ----
+
+    fn set_mtime(path: &Path, at: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(at))
+            .unwrap_or_else(|e| panic!("set the mtime of {}: {e}", path.display()));
+    }
+
+    /// A live process that is not this one — this test process's parent, the
+    /// test runner — to own a root that must count as live.
+    fn a_live_pid_not_ours() -> u32 {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        let own = Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::Some(&[own]), true);
+        let parent = system
+            .process(own)
+            .and_then(sysinfo::Process::parent)
+            .map(Pid::as_u32)
+            .expect("this test process has a parent");
+        assert!(
+            crate::runner_breadcrumb::pid_is_live(parent),
+            "the parent {parent} of this test process is not live"
+        );
+        parent
+    }
+
+    /// The builder of a cache enters it before letting go of the EXCLUSIVE
+    /// lock: another key's build collects under that lock, and in a gap between
+    /// the build and the entry it would find the new cache with no live root
+    /// naming it. So while the builder enters, another descriptor on the lock —
+    /// another process's — cannot take even a shared lock. A READY cache is
+    /// entered under a SHARED lock, which other readers share. Both entries
+    /// mark the cache used, and both leave the lock free.
+    #[tokio::test]
+    async fn a_built_template_is_entered_before_the_cache_lock_is_released() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let template_dir = scratch.path().join(format!("{TEMPLATE_PREFIX}race"));
+        let lock = open_lock(scratch.path()).expect("the cache lock");
+        let other = open_lock(scratch.path()).expect("another descriptor on the cache lock");
+        let reader_shares_the_lock = || match other.try_lock_shared() {
+            Ok(()) => {
+                let _ = other.unlock();
+                true
+            }
+            Err(_) => false,
+        };
+        let building: &Path = &template_dir;
+
+        let (shared, built) = enter_or_build(
+            &lock,
+            building,
+            move || async move {
+                std::fs::create_dir(building).map_err(|e| e.to_string())?;
+                std::fs::write(building.join(READY_FILE), "built by the test\n")
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(Duration::from_millis(1))
+            },
+            || Ok(reader_shares_the_lock()),
+        )
+        .await
+        .expect("build and enter the missing cache");
+        assert!(
+            built.is_some(),
+            "the cache was missing, so this call built it"
+        );
+        assert!(
+            !shared,
+            "the builder entered its cache after letting go of the exclusive lock: another \
+             key's build could have collected the cache in between"
+        );
+        assert!(
+            template_dir.join(LAST_USED_FILE).is_file(),
+            "entering the cache it built did not mark it used"
+        );
+
+        std::fs::remove_file(template_dir.join(LAST_USED_FILE)).expect("clear the marker");
+        let (shared, built) = enter_or_build(
+            &lock,
+            &template_dir,
+            || async { Err::<Duration, _>("a READY cache is never rebuilt".to_string()) },
+            || Ok(reader_shares_the_lock()),
+        )
+        .await
+        .expect("enter the READY cache");
+        assert!(built.is_none(), "a READY cache was rebuilt");
+        assert!(
+            shared,
+            "a READY cache must be entered under the SHARED lock, which readers share"
+        );
+        assert!(
+            template_dir.join(LAST_USED_FILE).is_file(),
+            "entering a READY cache did not mark it used"
+        );
+        assert!(
+            other.try_lock().is_ok(),
+            "enter_or_build left the cache lock held"
+        );
+        let _ = other.unlock();
+    }
+
+    /// Caches of two keys coexist: a build collects another key's cache only
+    /// when it is a crashed build's, or when no live root was copied from it
+    /// AND it has gone unused for a day. Collecting every cache but the
+    /// builder's own let two processes whose schemas differ remove each other's
+    /// cache in turn, and made alternating branches rebuild on every switch.
+    #[test]
+    fn a_build_collects_only_another_keys_crashed_or_long_unused_cache() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path();
+        let long_ago = SystemTime::now() - TEMPLATE_IDLE_LIMIT - Duration::from_secs(3600);
+        let cache = |key: &str, ready: bool, used: Option<SystemTime>| {
+            let path = dir.join(format!("{TEMPLATE_PREFIX}{key}"));
+            std::fs::create_dir(&path).expect("plant a cache");
+            if ready {
+                std::fs::write(path.join(READY_FILE), "planted\n").expect("plant READY");
+                set_mtime(&path.join(READY_FILE), long_ago);
+            }
+            if let Some(at) = used {
+                std::fs::write(path.join(LAST_USED_FILE), "planted\n").expect("plant the marker");
+                set_mtime(&path.join(LAST_USED_FILE), at);
+            }
+            path
+        };
+        let recent = cache("recent", true, Some(SystemTime::now()));
+        let in_use = cache("in-use", true, Some(long_ago));
+        let idle = cache("idle", true, Some(long_ago));
+        let never_marked = cache("never-marked", true, None);
+        let crashed = cache("crashed", false, None);
+        let root = dir.join(format!("{RUN_PREFIX}live"));
+        std::fs::create_dir(&root).expect("plant a live process's root");
+        write_owner(
+            &root,
+            &Owner {
+                pid: a_live_pid_not_ours(),
+                template: "in-use".to_string(),
+                postmaster: None,
+            },
+        )
+        .expect("record its owner");
+
+        let report = collect_stale_templates(dir, "building");
+
+        for (kept, why) in [
+            (&recent, "it was used within the day"),
+            (&in_use, "a live root was copied from it"),
+        ] {
+            assert!(
+                kept.is_dir(),
+                "{} was collected although {why}: {report:#?}",
+                kept.display()
+            );
+        }
+        for (gone, why) in [
+            (&idle, "it went unused for over a day"),
+            (
+                &never_marked,
+                "it was READY over a day ago and never marked used",
+            ),
+            (&crashed, "it is a crashed build's"),
+        ] {
+            assert!(
+                !gone.exists(),
+                "{} survived although {why}: {report:#?}",
+                gone.display()
+            );
+        }
+        assert_eq!(report.len(), 3, "one line per removed cache: {report:#?}");
+        assert!(root.is_dir(), "a template collection removed a root");
     }
 }
