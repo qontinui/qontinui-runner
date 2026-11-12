@@ -776,8 +776,9 @@ fn a_restore_stamp_from_this_boot_is_came_back_by_stamp_and_an_earlier_boots_is_
 /// demotes the unconfirmed tier). Only the landed one is recorded back, and the
 /// died one stays unobserved after its row is pruned.
 ///
-/// Mutation: `restore_landed` returns `true` (any stamp from this boot latches
-/// `came_back_by: stamp`, the pre-review behaviour).
+/// Mutation: `session_lifecycle_store::boot_restore_landed` returns `true`
+/// (any stamp from this boot latches `came_back_by: stamp`, the pre-review
+/// behaviour).
 #[test]
 fn an_attempted_boot_restore_is_not_came_back_until_it_lands() {
     let dir = tempfile::tempdir().unwrap();
