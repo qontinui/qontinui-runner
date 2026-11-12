@@ -401,8 +401,9 @@ fn evaluate_snapshot_assertion(
 /// - "htmlId": exact match against element.identifier.htmlId
 /// - "type": the named type's family against element.type, case-insensitive
 ///   (`input` also matches a `textbox`, `select` a `combobox` or `listbox`)
-/// - "role": substring match of any member of the named role's family against
-///   element.type or element.state.role, case-insensitive
+/// - "role": case-insensitive substring match against the role names the
+///   element answers to — element.state.role, element.type, the role the type
+///   implies, and `select` / `input` for those kinds' families
 /// - "label": substring match against element.label
 fn element_matches_criteria(
     element: &serde_json::Value,
@@ -458,32 +459,27 @@ fn element_matches_criteria(
                 crate::mcp::ui_bridge::element_kind::answers_to_named_type(el_type, expected)
             }
             "role" => {
-                // Check element.type first (AutoRegister maps role/tag to type),
-                // then fall back to state.role for elements that set it explicitly.
-                //
-                // Substring match against every member of the named role's
-                // family: `@qontinui/ui-bridge` 0.46 re-kinded role="combobox"
-                // `select` -> `combobox` and role="textbox"/contenteditable
-                // `input` -> `textbox`, so `{role: "select"}` must still find a
-                // combobox and `{role: "textbox"}` a native input. A name in no
-                // family is its own one-member family, i.e. the plain substring
-                // match this always was.
-                let el_type = element
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let state_role = element
-                    .get("state")
-                    .and_then(|s| s.get("role"))
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                crate::mcp::ui_bridge::element_kind::named_type_family(expected)
-                    .iter()
-                    .any(|named| {
-                        el_type.contains(named.as_str()) || state_role.contains(named.as_str())
-                    })
+                // A declared ROLE matches by EQUALITY, as every SDK role matcher
+                // does — never by the named-type family (`listbox` is not
+                // `combobox`). The names an element answers to are its
+                // `state.role`, its type, the role its type implies, and the
+                // one-way `select` / `input` reach for the kinds the pre-0.46
+                // registry typed that way (`element_kind::role_names_answered`).
+                // This matcher has always been a case-insensitive SUBSTRING
+                // match, and stays one over those names.
+                let expected = expected.to_lowercase();
+                if expected.is_empty() {
+                    true
+                } else {
+                    let el_type = element.get("type").and_then(|t| t.as_str());
+                    let state_role = element
+                        .get("state")
+                        .and_then(|s| s.get("role"))
+                        .and_then(|r| r.as_str());
+                    crate::mcp::ui_bridge::element_kind::role_names_answered(state_role, el_type)
+                        .iter()
+                        .any(|name| name.contains(&expected))
+                }
             }
             "label" => {
                 let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");
@@ -2810,35 +2806,40 @@ mod tests {
     }
 
     #[test]
-    fn a_named_role_finds_the_kind_ui_bridge_0_46_moved_it_to() {
+    fn a_declared_role_and_type_find_the_kinds_ui_bridge_0_46_moved() {
         use serde_json::json;
-        // `@qontinui/ui-bridge` 0.46 types role="combobox" `combobox` (was
-        // `select`) and role="textbox"/contenteditable `textbox` (was `input`).
+        // 0.46 types role="combobox" `combobox` and role="textbox" `textbox`;
+        // the 0.38 registry typed them `select` and `input`.
         let combobox = json!({"id": "c", "type": "combobox"});
+        let listbox = json!({"id": "l", "type": "listbox"});
+        let native_select = json!({"id": "s", "type": "select"});
         let textbox = json!({"id": "t", "type": "textbox"});
         let native_input = json!({"id": "i", "type": "input"});
+        let textarea = json!({"id": "a", "type": "textarea"});
+        let role = |el: &serde_json::Value, named: &str| {
+            element_matches_criteria(el, &criteria(&[("role", named)]))
+        };
+        let kind = |el: &serde_json::Value, named: &str| {
+            element_matches_criteria(el, &criteria(&[("type", named)]))
+        };
+        // ROLE — positive: equality with the type / the implied role, and the
+        // one-way reach of the kind names `select` and `input`.
+        assert!(role(&combobox, "combobox") && role(&combobox, "Select"));
+        assert!(role(&native_select, "combobox"));
+        assert!(role(&listbox, "listbox") && role(&listbox, "select"));
+        assert!(role(&native_input, "textbox") && role(&textarea, "textbox"));
+        assert!(role(&textbox, "input") && role(&textbox, "textbox"));
+        // ROLE — negative: a family is not a role.
+        assert!(!role(&combobox, "listbox"));
+        assert!(!role(&native_select, "listbox"));
+        assert!(!role(&listbox, "combobox"));
+        assert!(!role(&textarea, "input"));
+        // TYPE keeps the family, both directions.
         for named in ["select", "combobox", "listbox", "Select"] {
-            assert!(
-                element_matches_criteria(&combobox, &criteria(&[("role", named)])),
-                "role {named}"
-            );
-            assert!(
-                element_matches_criteria(&combobox, &criteria(&[("type", named)])),
-                "type {named}"
-            );
+            assert!(kind(&combobox, named), "type {named}");
         }
-        for named in ["input", "textbox"] {
-            for el in [&textbox, &native_input] {
-                assert!(
-                    element_matches_criteria(el, &criteria(&[("role", named)])),
-                    "role {named} on {el}"
-                );
-                assert!(
-                    element_matches_criteria(el, &criteria(&[("type", named)])),
-                    "type {named} on {el}"
-                );
-            }
-        }
+        assert!(kind(&textbox, "input") && kind(&native_input, "textbox"));
+        assert!(!kind(&textarea, "input"));
     }
 
     #[test]

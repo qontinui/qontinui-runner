@@ -361,10 +361,11 @@ fn element_is_interactive(element: &serde_json::Value) -> bool {
 /// contenteditable element, or a `combobox` / `searchbox` / `textbox` role.
 ///
 /// `textbox` is in the `type` arm because `@qontinui/ui-bridge` 0.46 kinds an
-/// ARIA textbox and a contenteditable `textbox` where the registry used to say
-/// `input` — and a contenteditable `<div>` carries no implicit ARIA role, so
-/// without it the row would fall through every arm and fold what the user
-/// typed into its fingerprint.
+/// ARIA textbox and a role-less contenteditable `textbox` (the 0.38 registry
+/// said `input` for the first and `custom` for the second, its auto-register
+/// hook `generic`) — and a contenteditable `<div>` carries no implicit ARIA
+/// role, so without it the row would fall through every arm and fold what the
+/// user typed into its fingerprint.
 pub(crate) fn is_input_like(element: &serde_json::Value) -> bool {
     let lower = |key: &str| {
         element
@@ -677,9 +678,9 @@ mod tests {
             journey_element_fingerprint(&searchbox("a")),
             journey_element_fingerprint(&searchbox("b"))
         );
-        // `@qontinui/ui-bridge` 0.46 kinds a contenteditable `textbox` (the
-        // registry said `input`), and a contenteditable `<div>` has no implied
-        // ARIA role to fall back on.
+        // `@qontinui/ui-bridge` 0.46 kinds a role-less contenteditable
+        // `textbox` (the 0.38 registry said `custom`), and a contenteditable
+        // `<div>` has no implied ARIA role to fall back on.
         let editable = |v: &str| json!({"id": "n", "type": "textbox", "tagName": "div", "text": v});
         assert_eq!(
             journey_element_fingerprint(&editable("draft one")),

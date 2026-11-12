@@ -15,10 +15,12 @@
  * answered `ACTION_NOT_SUPPORTED`. 0.46 reads every producer's verbs from one
  * table (`core/element-kind.ts`).
  *
- * The exact list asserted here is the literal `TEXT_INPUT_ACTIONS_0_46` in the
- * Rust test `a_0_46_text_input_passes_the_pre_ipc_gate_for_set_value`
- * (`elements.rs`), which proves the gate accepts `setValue` against it. Change
- * both together.
+ * The exact list asserted here is `autoRegisteredTextInput` in
+ * `servedActions.0.46.json`, which the Rust test
+ * `a_0_46_text_input_passes_the_pre_ipc_gate_for_set_value` (`elements.rs`)
+ * reads with `include_str!` to prove the gate accepts `setValue` against it —
+ * so the SDK serving a different list fails here, and editing the fixture to
+ * follow it re-runs the Rust gate on the new list.
  */
 
 import { act, createElement, useEffect, type ReactNode } from "react";
@@ -34,27 +36,7 @@ import {
 import { isInteractiveElementRow } from "@/hooks/sdk-ui-bridge/utils";
 import { serializeElement } from "@/hooks/ui-bridge-events/utils";
 import { RUNNER_AUTO_REGISTER_OPTIONS } from "./autoRegisterOptions";
-
-/** `TEXT_INPUT_ACTIONS_0_46` in `src-tauri/src/mcp/ui_bridge/elements.rs`. */
-const TEXT_INPUT_ACTIONS_0_46 = [
-  "click",
-  "hoverClick",
-  "doubleClick",
-  "rightClick",
-  "middleClick",
-  "type",
-  "sendKeys",
-  "clear",
-  "focus",
-  "blur",
-  "hover",
-  "unhover",
-  "scroll",
-  "scrollIntoView",
-  "setValue",
-  "drag",
-  "autocomplete",
-];
+import servedActions from "./servedActions.0.46.json";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -132,8 +114,20 @@ describe("an auto-registered text input, as the runner mounts the SDK", () => {
     // What the runner's `get_element` IPC reply carries — the list the pre-IPC
     // gate reads.
     const served = serializeElement(registered!).actions;
-    expect(served).toEqual(TEXT_INPUT_ACTIONS_0_46);
+    expect(served).toEqual(servedActions.autoRegisteredTextInput);
     for (const verb of ["setValue", "sendKeys", "type"]) expect(served).toContain(verb);
+  });
+
+  it("serves an auto-registered button the every-element verbs", async () => {
+    // The Rust vocabulary reads this list to prove `press` on a 0.46 button
+    // suggests `click`, not `sendKeys` (`action_vocabulary.rs`, D4).
+    mount(createElement("button", { type: "button" }, "Save draft"));
+    await flushScan();
+
+    const button = container.querySelector("button");
+    const registered = registry?.getAllElements().find((el) => el.element === button);
+    expect(registered, "the scanner registered the button").toBeDefined();
+    expect(serializeElement(registered!).actions).toEqual(servedActions.autoRegisteredButton);
   });
 
   it("serves a media row the every-element verbs, not an empty list", async () => {

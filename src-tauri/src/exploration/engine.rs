@@ -198,7 +198,7 @@ impl ExplorationEngine {
             let before_cap_id = builder.last_capture_id().unwrap_or("unknown").to_string();
 
             // Click the element
-            if let Err(e) = execute_action(sdk_conn, &el_id, "click").await {
+            if let Err(e) = execute_action(sdk_conn, &el_id, EXPLORATION_VERB).await {
                 debug!("Click failed for {}: {}", el_id, e);
                 continue;
             }
@@ -233,7 +233,7 @@ impl ExplorationEngine {
 
             // Record transition
             builder.add_transition(
-                "click".to_string(),
+                EXPLORATION_VERB.to_string(),
                 el_fp_hash,
                 before_cap_id,
                 after_cap_id,
@@ -283,7 +283,7 @@ impl ExplorationEngine {
                 let back_element = find_back_navigation(&new_elements);
                 if let Some((back_id, back_label)) = back_element {
                     debug!("Navigating back via \"{}\"", back_label);
-                    let _ = execute_action(sdk_conn, &back_id, "click").await;
+                    let _ = execute_action(sdk_conn, &back_id, EXPLORATION_VERB).await;
                     tokio::time::sleep(tokio::time::Duration::from_millis(config.settle_delay_ms))
                         .await;
 
@@ -444,16 +444,22 @@ async fn execute_action(
 // Element Filtering
 // =============================================================================
 
-/// Whether `el` is a control the explorer may click: it advertises at least
-/// one built-in action and is not a content or media row
-/// ([`crate::mcp::ui_bridge::element_kind::is_content_or_media_row`] — the
-/// SDK's own `interactive_only` classification).
+/// The verb the explorer dispatches on every element it explores.
+const EXPLORATION_VERB: &str = "click";
+
+/// Whether the explorer may queue `el`: a control (not a content or media row,
+/// [`crate::mcp::ui_bridge::element_kind::is_content_or_media_row`] — the SDK's
+/// own `interactive_only` classification) that ADVERTISES the verb the
+/// explorer sends. The element-action door refuses a verb an element does not
+/// advertise, so a row declaring `actions: []` (a terminal proxy pane) or one
+/// without `click` would only be refused. The frontend explorer applies the
+/// same rule (`hooks/sdk-ui-bridge/utils.ts` `advertisesExplorationClick`).
 fn is_explorable_control(el: &Value) -> bool {
-    let has_actions = el
+    let advertises_verb = el
         .get("actions")
         .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
-    has_actions && !crate::mcp::ui_bridge::element_kind::is_content_or_media_row(el)
+        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(EXPLORATION_VERB)));
+    advertises_verb && !crate::mcp::ui_bridge::element_kind::is_content_or_media_row(el)
 }
 
 /// Filter elements to those eligible for exploration clicks.
@@ -660,6 +666,29 @@ mod tests {
             row("logo", "image", "media", "Logo"),
             row("plot", "canvas", "media", "Plot"),
             row("intro", "generic", "content", "Intro"),
+        ];
+        let explorable = filter_explorable(
+            &elements,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &FingerprintConfig::default(),
+            &[],
+        );
+        let ids: Vec<&str> = explorable.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["btn"]);
+    }
+
+    #[test]
+    fn a_control_that_does_not_advertise_click_is_not_explored() {
+        let mut proxy = row("proxy", "textarea", "interactive", "Terminal");
+        proxy["actions"] = json!([]);
+        let mut focus_only = row("pane", "textarea", "interactive", "Pane");
+        focus_only["actions"] = json!(["focus", "blur"]);
+        let elements = vec![
+            proxy,
+            focus_only,
+            row("btn", "button", "interactive", "Open"),
         ];
         let explorable = filter_explorable(
             &elements,

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::database::pg::PgDb;
-use crate::mcp::ui_bridge::element_kind::answers_to_named_type;
+use crate::mcp::ui_bridge::element_kind::{answers_to_named_role, answers_to_named_type};
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -186,11 +186,12 @@ pub fn analyze_element_coverage(
         }
     }
 
-    // Identify interactive elements from snapshot. The list NAMES types, so
-    // each entry answers for its family (`input` also for a `textbox`,
-    // `select` for a `combobox` / `listbox`): `@qontinui/ui-bridge` 0.46 moved
-    // role="textbox" / contenteditable and role="combobox" / "listbox" off
-    // `input` / `select`, and they are no less interactive for it.
+    // Identify interactive elements from snapshot. Each entry is a ROLE-style
+    // name, matched by `element_kind::answers_to_named_role`: the element's
+    // `state.role`, its type, or the role its type implies must equal it, and
+    // the kind names `input` / `select` also reach the kinds the pre-0.46
+    // registry typed that way (`textbox`; `combobox` / `listbox`), which are
+    // no less interactive for having been re-kinded.
     let interactive_types = [
         "button", "input", "select", "textarea", "a", "link", "checkbox", "radio", "switch",
         "slider", "tab", "menuitem",
@@ -206,7 +207,7 @@ pub fn analyze_element_coverage(
                 .and_then(|r| r.as_str());
             interactive_types
                 .iter()
-                .any(|t| answers_to_named_type(el_type, t) || answers_to_named_type(el_role, t))
+                .any(|t| answers_to_named_role(t, el_role, el_type))
         })
         .collect();
 
@@ -670,18 +671,17 @@ fn element_matches_spec_criteria(
         }
 
         let matches = match key.as_str() {
-            // A criterion NAMES a role or type, so it matches the name's
-            // family (`element_kind::answers_to_named_type`): `{role:
-            // "select"}` still finds a 0.46 `combobox`, `{type: "input"}` a
-            // `textbox`.
+            // A declared ROLE matches by equality with `state.role`, the type,
+            // or the role the type implies, plus the one-way `select` / `input`
+            // reach (`element_kind::answers_to_named_role`) — never by family:
+            // `{role: "listbox"}` does not find a combobox trigger.
             "role" => {
                 let el_type = element.get("type").and_then(|t| t.as_str());
                 let el_role = element
                     .get("state")
                     .and_then(|s| s.get("role"))
                     .and_then(|r| r.as_str());
-                answers_to_named_type(el_type, value_str)
-                    || answers_to_named_type(el_role, value_str)
+                answers_to_named_role(value_str, el_role, el_type)
             }
             "textContent" | "text" => {
                 let text = element
@@ -696,6 +696,9 @@ fn element_matches_spec_criteria(
                 let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");
                 label.to_lowercase().contains(&value_str.to_lowercase())
             }
+            // A declared TYPE matches the name's family
+            // (`element_kind::answers_to_named_type`): `{type: "input"}` finds a
+            // 0.46 `textbox`, `{type: "select"}` a `combobox` or `listbox`.
             "type" => {
                 answers_to_named_type(element.get("type").and_then(|t| t.as_str()), value_str)
             }
@@ -937,33 +940,39 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_named_role_or_type_finds_the_kind_ui_bridge_0_46_moved_it_to() {
-        // 0.46 types role="combobox" `combobox` (was `select`) and
-        // role="textbox"/contenteditable `textbox` (was `input`).
+    fn a_declared_type_reaches_its_family_and_a_declared_role_does_not() {
+        // 0.46 types role="combobox" `combobox` and role="textbox" `textbox`,
+        // where the 0.38 registry said `select` and `input`.
         let combobox = json!({"id": "c", "type": "combobox"});
+        let listbox = json!({"id": "l", "type": "listbox"});
         let textbox = json!({"id": "t", "type": "textbox"});
-        for key in ["role", "type"] {
-            assert!(element_matches_spec_criteria(
-                &combobox,
-                &json!({ key: "select" })
-            ));
-            assert!(element_matches_spec_criteria(
-                &combobox,
-                &json!({ key: "listbox" })
-            ));
-            assert!(element_matches_spec_criteria(
-                &textbox,
-                &json!({ key: "input" })
-            ));
-            assert!(element_matches_spec_criteria(
-                &json!({"id": "i", "type": "input"}),
-                &json!({ key: "textbox" })
-            ));
-            assert!(!element_matches_spec_criteria(
-                &json!({"id": "x", "type": "checkbox"}),
-                &json!({ key: "input" })
-            ));
-        }
+        let native_input = json!({"id": "i", "type": "input"});
+        let textarea = json!({"id": "a", "type": "textarea"});
+        let matches = |el: &serde_json::Value, key: &str, named: &str| {
+            element_matches_spec_criteria(el, &json!({ key: named }))
+        };
+        // TYPE: the family, both ways.
+        assert!(matches(&combobox, "type", "select"));
+        assert!(matches(&combobox, "type", "listbox"));
+        assert!(matches(&textbox, "type", "input"));
+        assert!(matches(&native_input, "type", "textbox"));
+        assert!(!matches(&textarea, "type", "input"));
+        // ROLE positive: equality with the type or the implied role, and the
+        // one-way reach of the kind names.
+        assert!(matches(&combobox, "role", "combobox"));
+        assert!(matches(&combobox, "role", "select"));
+        assert!(matches(&listbox, "role", "select"));
+        assert!(matches(&textbox, "role", "input"));
+        assert!(matches(&native_input, "role", "textbox"));
+        assert!(matches(&textarea, "role", "textbox"));
+        // ROLE negative: a family is not a role.
+        assert!(!matches(&combobox, "role", "listbox"));
+        assert!(!matches(&listbox, "role", "combobox"));
+        assert!(!matches(
+            &json!({"id": "x", "type": "checkbox"}),
+            "role",
+            "input"
+        ));
     }
 
     #[test]

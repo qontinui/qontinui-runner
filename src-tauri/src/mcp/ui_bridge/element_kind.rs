@@ -3,26 +3,38 @@
 //! (0.46.0, plan
 //! `2026-11-09-an-elements-advertised-verbs-depend-on-which-path-found-it`).
 //!
-//! Two rules a runner reader of a serialized element (a snapshot, discover or
+//! Three rules a runner reader of a serialized element (a snapshot, discover or
 //! find row) has to apply the way the SDK does:
 //!
-//! - **A named type matches its family.** A criterion, query or filter that
-//!   NAMES a type (`input`, `select`, …) answers for the kinds the SDK keeps
+//! - **A named TYPE matches its family.** A criterion, query or filter that
+//!   names a type (`input`, `select`, …) answers for the kinds the SDK keeps
 //!   apart but people name interchangeably (`input`↔`textbox`,
-//!   `select`↔`combobox`↔`listbox`). The rule is implemented ONCE, in
-//!   [`qontinui_spec_check::named_type`], because the spec-check matcher needs
-//!   it too and that crate cannot depend on this one; it is re-exported here so
-//!   the runner's own readers import it from the module that names the rule.
+//!   `select`↔`combobox`↔`listbox`) — [`answers_to_named_type`].
+//! - **A named ROLE matches by equality** with the element's observed ARIA
+//!   role, its kind, or the role its kind implies, plus a one-way reach for
+//!   the two kind names `select` / `input` — [`answers_to_named_role`] and,
+//!   for a substring matcher, [`role_names_answered`]. Families do not apply:
+//!   `listbox` is not `combobox`.
+//!
+//!   Both are implemented ONCE, in [`qontinui_spec_check::named_type`],
+//!   because the spec-check matcher needs them too and that crate cannot
+//!   depend on this one; they are re-exported here so the runner's own
+//!   readers import them from the module that names the rules.
 //! - **"Has actions" does not mean "is a control".** Since 0.46 every kind
 //!   advertises the verbs every element takes (`EVERY_ELEMENT`: `click`,
 //!   `sendKeys`, `scroll`, …) — a media row included, because a canvas takes
 //!   keyboard input — so a non-empty `actions` list no longer tells an image
-//!   from a button. Only a content row still carries `actions: []`. A reader
-//!   that wants the page's interactive affordances therefore excludes content
-//!   and media rows by CLASSIFICATION ([`is_content_or_media_row`]), exactly as
-//!   the SDK's own `core/find-filter.ts` `interactive_only` predicate does.
+//!   from a button. `actions: []` is carried by content rows and by any
+//!   registration that declares it (the terminal proxy pane in
+//!   `TerminalBridgeProxies.tsx` does; any `useUIElement` caller can). A
+//!   reader that wants the page's interactive affordances therefore excludes
+//!   content and media rows by CLASSIFICATION ([`is_content_or_media_row`]),
+//!   exactly as the SDK's own `core/find-filter.ts` `interactive_only`
+//!   predicate does.
 
-pub(crate) use qontinui_spec_check::named_type::{answers_to_named_type, named_type_family};
+pub(crate) use qontinui_spec_check::named_type::{
+    answers_to_named_role, answers_to_named_type, role_names_answered,
+};
 
 /// Whether a serialized element row is a content or a media row — the SDK's
 /// `isContentRow(el) || isMediaRow(el)` in `core/find-filter.ts`: a `category`
@@ -37,6 +49,31 @@ pub(crate) use qontinui_spec_check::named_type::{answers_to_named_type, named_ty
 pub(crate) fn is_content_or_media_row(element: &serde_json::Value) -> bool {
     let field = |key: &str| element.get(key).and_then(|v| v.as_str());
     matches!(field("category"), Some("content" | "media")) || field("kind") == Some("content")
+}
+
+/// The `actions` `@qontinui/ui-bridge` 0.46.0 serves for runner elements,
+/// MEASURED by the frontend tests against the real SDK mounted the way
+/// `App.tsx` mounts it (`src/lib/ui-bridge/autoRegisterVerbs.dom.test.tsx`,
+/// `src/components/terminal/sessionAddressability.test.ts`) and read by the
+/// Rust tests from the same file — so the SDK serving a different list fails
+/// there, and a fixture edited to follow it re-runs every Rust test that reads
+/// it (the pre-IPC gate in `elements.rs`, the vocabulary in
+/// `action_vocabulary.rs`) on the new list.
+#[cfg(test)]
+pub(crate) const SERVED_ACTIONS_0_46_JSON: &str =
+    include_str!("../../../../src/lib/ui-bridge/servedActions.0.46.json");
+
+/// One named list from [`SERVED_ACTIONS_0_46_JSON`].
+#[cfg(test)]
+pub(crate) fn served_actions_0_46(name: &str) -> Vec<String> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(SERVED_ACTIONS_0_46_JSON).expect("served-actions fixture parses");
+    fixture[name]
+        .as_array()
+        .unwrap_or_else(|| panic!("fixture list {name}"))
+        .iter()
+        .map(|v| v.as_str().expect("verb").to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -94,8 +131,13 @@ mod tests {
     }
 
     #[test]
-    fn the_named_type_family_is_reachable_from_here() {
+    fn the_named_type_and_role_rules_are_reachable_from_here() {
         assert!(answers_to_named_type(Some("textbox"), "input"));
-        assert_eq!(named_type_family("select").len(), 3);
+        assert!(answers_to_named_role("select", None, Some("combobox")));
+        assert!(!answers_to_named_role("listbox", None, Some("combobox")));
+        assert_eq!(
+            role_names_answered(None, Some("textarea")),
+            vec!["textarea", "textbox"]
+        );
     }
 }
