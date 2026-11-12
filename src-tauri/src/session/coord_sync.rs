@@ -1153,8 +1153,10 @@ const BEST_EFFORT_MAX_ATTEMPTS: u32 = 3;
 /// Extracted in Phase 3 from the arms that each spelled `status.is_client_error()`
 /// inline. Phase 3 added a SECOND consumer of exactly this rule — the loopback
 /// coord-write forwarders, which must spool a transport failure but must NOT
-/// spool a 4xx (that would replay a guaranteed failure three times and then
-/// drop it silently). Two copies of one retry policy is the pair that drifts,
+/// spool a 4xx (that would replay a guaranteed failure once and drop it
+/// silently on that first refusal; the one exception is a register-gate 404
+/// `work_unit_not_found` with a recorded bootstrap, which
+/// `gate_registration_outcome` upserts and registers again). Two copies of one retry policy is the pair that drifts,
 /// so both call this.
 fn write_failure_outcome(status: StatusCode, message: String) -> PushOutcome {
     match classify_coord_write_status(status.as_u16()) {

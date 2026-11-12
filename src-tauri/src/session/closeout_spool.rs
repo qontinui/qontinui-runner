@@ -16,8 +16,11 @@
 //!
 //! ONLY the transport class. A `400`/`403`/`404`/`422` is coord *reaching a
 //! verdict on the content*; spooling it would replay a guaranteed failure
-//! `coord_sync::BEST_EFFORT_MAX_ATTEMPTS` times and then Ack-drop it,
-//! turning a visible immediate failure into an invisible delayed one. The split
+//! once and Ack-drop it on that first refusal (the `PermanentFailure` arm
+//! spends no retry budget), turning a visible immediate failure into an
+//! invisible delayed one. The one exception is a register-gate 404
+//! `work_unit_not_found` with a recorded bootstrap, which the drain upserts and
+//! registers again (see `plan_gate_registration_spool` in `mcp_api.rs`). The split
 //! is [`classify_coord_write_status`], which both halves call so they cannot
 //! drift: `coord_sync`'s drain maps it to `PermanentFailure` vs `Transport`,
 //! and the forwarders map it to "return coord's verdict" vs "spool".
@@ -44,9 +47,11 @@ use super::SessionEventKind;
 /// The runner-only hint key a caller may put in a register-gate request body to
 /// seed Phase 2's lazy `work_unit_not_found` bootstrap.
 ///
-/// Coord's `UnitGateRequest` is NOT `deny_unknown_fields`, so this key would be
-/// silently ignored upstream — but the forwarder STRIPS it before forwarding
-/// anyway, so nothing coord does not model ever crosses the wire. It survives
+/// Coord's `UnitGateRequest` is `deny_unknown_fields` behind `StrictJson`
+/// (qontinui-coord#1899), so coord REFUSES this key with
+/// `400 unknown_body_field`. The forwarder must therefore strip it before
+/// forwarding (`plan_gate_registration_spool` in `mcp_api.rs`), and the
+/// drain's replay allowlist never sends it. It survives
 /// only into the spooled outbox payload, where the drain sends it to
 /// `POST /coord/work-units/upsert` after (and only after) coord answers 404
 /// `work_unit_not_found`.
@@ -327,8 +332,9 @@ pub struct GateRegistrationInput {
 /// Structural, not stylistic, and worth keeping straight because the two
 /// predicates in this file mirror two different doors. `register_unit_gate`
 /// (`qontinui-coord/crates/coord/src/api/gate_routes.rs`) takes
-/// `Json<UnitGateRequest>`, so a body that fails to deserialize is refused by
-/// axum's extractor BEFORE the handler ever runs — 422. `post_finding_agent`
+/// `StrictJson<UnitGateRequest>`, so a body that fails to deserialize is refused
+/// by the extractor BEFORE the handler ever runs — 422 (`StrictJson` keeps 422
+/// for a serde failure). `post_finding_agent`
 /// takes `raw_body: Bytes` and hand-parses, so every refusal it makes is
 /// `bad_request()` — 400. Neither code was chosen locally.
 ///
@@ -387,8 +393,8 @@ pub fn parse_gate_registration_body(raw: &[u8]) -> Option<GateRegistrationInput>
 /// doors call); without any of them the replay is a guaranteed **400**, and the
 /// same delayed-silent-failure argument as above applies with extra force,
 /// because [`classify_coord_write_status`] files 400 as `Permanent`: such a
-/// spool is Ack-dropped after its retries, so a write already lost once is lost
-/// again with nobody reading the error.
+/// spool is Ack-dropped on its first replay, so a write already lost once is
+/// lost again with nobody reading the error.
 ///
 /// 400, not 422, for EVERY refusal on this door: `findings::post_finding_agent`
 /// takes `raw_body: axum::body::Bytes` and hand-parses it, so it never reaches
@@ -576,7 +582,7 @@ mod tests {
         let input = parse_gate_registration_body(
             br#"{
                 "predicate": {"kind": "pr_merged", "repo": "qontinui/qontinui-runner",
-                              "number": 1},
+                              "pr_number": 1},
                 "phase_name": "Phase 3",
                 "clearance_audience": "operator",
                 "work_unit_upsert": {"title": "Closeout has no durable store",
@@ -607,7 +613,10 @@ mod tests {
             json!("2026-08-28-closeout-store")
         );
         assert_eq!(row.payload["phase_name"], json!("Phase 3"));
-        assert_eq!(row.payload["predicate"]["kind"], json!("pr_merged"));
+        assert_eq!(
+            row.payload["predicate"],
+            json!({"kind": "pr_merged", "repo": "qontinui/qontinui-runner", "pr_number": 1})
+        );
         assert_eq!(row.payload["clearance_audience"], json!("operator"));
         // The bootstrap survives, so Phase 2's lazy 404 recovery can fire.
         assert_eq!(
