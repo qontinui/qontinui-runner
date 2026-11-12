@@ -87,7 +87,7 @@ When "Diagnostic Evaluation" is the exit strategy, the loop stops when all asser
       title: "Diagnostic Configuration",
       content: `The teal-bordered panel has four controls:
 
-- **Assertions (JSON array)** — UI Bridge assertion objects that define what "correct" looks like. Example: \`[{"type": "visible", "role": "tab", "name": "Transitions"}]\`
+- **Assertions (JSON array)** — UI Bridge assertion objects that define what "correct" looks like. Each one is posted on its own to \`POST /ui-bridge/control/assert\`: \`query\`, \`queryType\` (\`css\` default, \`text\`, \`textContains\`), \`assertion\` (\`exists\`, \`notExists\`, \`count\`, \`isVisible\`, \`hasText\`, \`hasClass\`, \`hasAttribute\`), and \`expected\` / \`attribute\` where the assertion needs them. Example: \`[{"query": "Transitions", "queryType": "text", "assertion": "isVisible"}]\`
 - **Capture DOM snapshot** — Whether to capture a truncated DOM snapshot for the AI triage context
 - **Max chars** — How many characters of the snapshot to include (default 8000)
 - **Model override** — Which AI model to use for the triage call
@@ -101,16 +101,16 @@ The assertions are the "spec" for your expected page state. The AI triage only r
       },
       estimatedDuration: 1,
       details: `**Assertion format:**
-Each assertion is a JSON object matching the UI Bridge assertion schema:
+Each assertion is one request body for the target runner's \`POST /ui-bridge/control/assert\`:
 \`\`\`json
 [
-  { "type": "visible", "role": "tab", "name": "Transitions" },
-  { "type": "count", "role": "row", "min": 1 },
-  { "type": "hasText", "selector": ".status", "text": "Ready" }
+  { "query": "Transitions", "queryType": "text", "assertion": "isVisible" },
+  { "query": "[role=row]", "assertion": "count", "expected": 3 },
+  { "query": ".status", "assertion": "hasText", "expected": "Ready" }
 ]
 \`\`\`
 
-The runner sends these to the target runner's UI Bridge endpoint, which evaluates them against the live DOM.`,
+The runner posts each one on its own and evaluates it against the live DOM. An assertion the endpoint refuses (an unknown field shape, an unknown \`assertion\`) comes back as a failed result carrying an \`error\` that names the refusal.`,
     },
 
     // =========================================================================

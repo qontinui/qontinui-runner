@@ -143,7 +143,7 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             format!(
-                r#"(() => {{ var els = {}; var texts = Array.from(els).map(el => el.textContent.trim()); var found = texts.some(t => t.includes({})); return JSON.stringify({{ found: els.length, texts: texts.slice(0, 3), passed: found }}); }})()"#,
+                r#"var els = {}; var texts = Array.from(els).map(el => el.textContent.trim()); var found = texts.some(t => t.includes({})); return JSON.stringify({{ found: els.length, texts: texts.slice(0, 3), passed: found }})"#,
                 query_js,
                 js_string_literal(expected_text)
             )
@@ -155,7 +155,7 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             format!(
-                r#"(() => {{ var els = {}; var found = Array.from(els).some(el => el.classList.contains({})); var classes = Array.from(els).slice(0, 3).map(el => Array.from(el.classList).join(' ')); return JSON.stringify({{ found: els.length, classes: classes, passed: found }}); }})()"#,
+                r#"var els = {}; var found = Array.from(els).some(el => el.classList.contains({})); var classes = Array.from(els).slice(0, 3).map(el => Array.from(el.classList).join(' ')); return JSON.stringify({{ found: els.length, classes: classes, passed: found }})"#,
                 query_js,
                 js_string_literal(expected_class)
             )
@@ -173,7 +173,7 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
                 format!("el.hasAttribute({})", js_string_literal(attr))
             };
             format!(
-                r#"(() => {{ var els = {}; var found = Array.from(els).some(el => {}); return JSON.stringify({{ found: els.length, passed: found }}); }})()"#,
+                r#"var els = {}; var found = Array.from(els).some(el => {}); return JSON.stringify({{ found: els.length, passed: found }})"#,
                 query_js, check
             )
         }
@@ -185,6 +185,11 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
         }
     };
 
+    // Every arm is a statement list ending in a top-level `return`: this
+    // wrapper's value is what the page hands back. An arm that wraps itself in
+    // its own IIFE computes the result and discards it, so the page returns
+    // `undefined` and the route reports `passed: false` for an element that
+    // matches (coord finding edfbb26a: hasText, hasClass and hasAttribute).
     Ok(format!("(() => {{ {assertion_js} }})()"))
 }
 
@@ -2236,5 +2241,96 @@ mod structured_assert_script_tests {
             r#"el.getAttribute("title") === "#,
             ");",
         );
+    }
+}
+
+#[cfg(test)]
+mod structured_assert_result_tests {
+    //! The assert route returns the value of its outer
+    //! `(() => { … })()` wrapper. Each arm must therefore END in a top-level
+    //! `return`; an arm that is itself an IIFE has its result discarded, the
+    //! page returns `undefined`, and the route reports `passed: false` even
+    //! when the element matches. Coord finding edfbb26a: hasText, hasClass and
+    //! hasAttribute were each such an IIFE, so they could never pass.
+
+    use super::{build_structured_assert_expression, StructuredAssertRequest};
+    use serde_json::json;
+
+    const WRAPPER_OPEN: &str = "(() => { ";
+    const WRAPPER_CLOSE: &str = " })()";
+
+    /// Every assertion the route accepts, as a caller would send it.
+    fn every_assertion() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("exists", json!({ "query": ".x", "assertion": "exists" })),
+            (
+                "notExists",
+                json!({ "query": ".x", "assertion": "notExists" }),
+            ),
+            (
+                "count",
+                json!({ "query": ".x", "assertion": "count", "expected": 2 }),
+            ),
+            (
+                "isVisible",
+                json!({ "query": ".x", "assertion": "isVisible" }),
+            ),
+            (
+                "hasText",
+                json!({ "query": ".x", "assertion": "hasText", "expected": "Save" }),
+            ),
+            (
+                "hasClass",
+                json!({ "query": ".x", "assertion": "hasClass", "expected": "active" }),
+            ),
+            (
+                "hasAttribute",
+                json!({ "query": ".x", "assertion": "hasAttribute", "attribute": "title" }),
+            ),
+            (
+                "hasAttribute with a value",
+                json!({ "query": ".x", "assertion": "hasAttribute", "attribute": "title", "expected": "Tip" }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_assertion_arm_returns_its_result_from_the_outer_wrapper() {
+        let mut failures = Vec::new();
+        for (name, body) in every_assertion() {
+            let request: StructuredAssertRequest =
+                serde_json::from_value(body).expect("the request body deserializes");
+            let script = build_structured_assert_expression(&request)
+                .expect("a known query type and assertion");
+            let Some(arm) = script
+                .strip_prefix(WRAPPER_OPEN)
+                .and_then(|rest| rest.strip_suffix(WRAPPER_CLOSE))
+            else {
+                failures.push(format!(
+                    "{name}: not wrapped in `(() => {{ … }})()`: {script}"
+                ));
+                continue;
+            };
+            // An arm that opens with `(` is an expression statement, typically
+            // its own IIFE, whose value the wrapper throws away.
+            if arm.trim_start().starts_with('(') {
+                failures.push(format!(
+                    "{name}: the arm is an expression whose value is discarded: {arm}"
+                ));
+            }
+            // The arm's last statement is the `return` the wrapper hands back.
+            let last_statement = arm
+                .trim_end()
+                .trim_end_matches(';')
+                .rsplit("; ")
+                .next()
+                .unwrap_or("");
+            if !last_statement.starts_with("return JSON.stringify(") {
+                failures.push(format!(
+                    "{name}: the arm does not end in `return JSON.stringify(…)`: {arm}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
