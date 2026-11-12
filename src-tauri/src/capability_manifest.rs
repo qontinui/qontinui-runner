@@ -1057,6 +1057,10 @@ pub enum SkipReason {
     /// would land somewhere other than its lexical path. A provisioner never
     /// writes through a symlink. The detail names the link.
     Symlinked(String),
+    /// A destination component could not be examined (a metadata error other
+    /// than "absent"), so the unit was skipped rather than written blind. NOT a
+    /// stand-down: a fault, so it warns and reaches the device-level reading.
+    Unexaminable(String),
 }
 
 impl SkipReason {
@@ -1074,6 +1078,7 @@ impl SkipReason {
             SkipReason::TreeProbeUnanswered => "tree_probe_unanswered",
             SkipReason::CanonicalSource(_) => "canonical_source",
             SkipReason::Symlinked(_) => "symlinked",
+            SkipReason::Unexaminable(_) => "unexaminable",
         }
     }
 
@@ -1108,6 +1113,9 @@ impl SkipReason {
             SkipReason::Symlinked(why) => {
                 format!("not written: the destination is reached through a symlink — {why}")
             }
+            SkipReason::Unexaminable(why) => format!(
+                "not written: the destination could not be examined, so the unit was skipped — {why}"
+            ),
         }
     }
 }
@@ -3818,6 +3826,10 @@ mod tests {
             "canonical_source"
         );
         assert_eq!(SkipReason::Symlinked(String::new()).wire(), "symlinked");
+        assert_eq!(
+            SkipReason::Unexaminable(String::new()).wire(),
+            "unexaminable"
+        );
         assert_eq!(
             TrackedProbeState::UnansweredInRepo.wire(),
             "unanswered_in_repo"

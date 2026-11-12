@@ -488,8 +488,8 @@ impl KeepDecisions {
 /// Pure with respect to the process: `root` is an argument, so a test injects
 /// one.
 pub(crate) fn stand_down(claude_dir: &Path, kind: &str, root: Option<&Path>) -> Option<SkipReason> {
-    if let Some(why) = redirected_asset_dir(&claude_dir.join(kind)) {
-        return Some(SkipReason::Symlinked(why));
+    if let Some(reason) = redirected_asset_dir(&claude_dir.join(kind)) {
+        return Some(reason);
     }
     let Some(root) = root else {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -553,13 +553,13 @@ fn canonicalize_through_ancestors(path: &Path) -> Option<PathBuf> {
 /// workspace root: never write through a symlink. A per-file symlink into a
 /// canonical checkout is invisible to [`TrackedPaths`], which asks the SESSION
 /// repo, and `std::fs::write` onto a file's own target truncates it.
-pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
+pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<SkipReason> {
     let Ok(relative) = path.strip_prefix(base) else {
-        return Some(format!(
+        return Some(SkipReason::Unexaminable(format!(
             "{} is not below {}, so it cannot be proven free of symlinks",
             path.display(),
             base.display()
-        ));
+        )));
     };
     let mut current = base.to_path_buf();
     for component in relative.components() {
@@ -569,7 +569,10 @@ pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
                 let target = std::fs::read_link(&current)
                     .map(|t| format!(" -> {}", t.display()))
                     .unwrap_or_default();
-                return Some(format!("{}{target} is a symlink", current.display()));
+                return Some(SkipReason::Symlinked(format!(
+                    "{}{target} is a symlink",
+                    current.display()
+                )));
             }
             Ok(_) => {}
             // Absent: nothing to write through yet.
@@ -577,7 +580,10 @@ pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
             // Any other failure means the component could not be examined, so
             // the unit is skipped (fail closed) rather than written blind.
             Err(e) => {
-                return Some(format!("{} could not be examined: {e}", current.display()));
+                return Some(SkipReason::Unexaminable(format!(
+                    "{} could not be examined: {e}",
+                    current.display()
+                )));
             }
         }
     }
@@ -587,7 +593,7 @@ pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
 /// [`symlink_below`] for a whole asset kind: `dir` is `<cwd>/.claude/<kind>`,
 /// and both `.claude` and `<kind>` are examined. `Some(why)` means the kind
 /// stands down — even `create_dir_all` would build inside the link's target.
-pub(crate) fn redirected_asset_dir(dir: &Path) -> Option<String> {
+pub(crate) fn redirected_asset_dir(dir: &Path) -> Option<SkipReason> {
     let cwd = dir.parent()?.parent()?;
     symlink_below(cwd, dir)
 }
@@ -1243,8 +1249,19 @@ mod tests {
         };
         #[cfg(windows)]
         let bad = base.join("a*b").join("child.md");
-        let why = symlink_below(&base, &bad).expect("an unexaminable path must fail closed");
-        assert!(why.contains("could not be examined"), "{why}");
+        let reason = symlink_below(&base, &bad).expect("an unexaminable path must fail closed");
+        assert_eq!(reason.wire(), "unexaminable", "{reason:?}");
+        // Not a stand-down: a pass skipped wholesale for it warns and is
+        // recorded as the device-level reading.
+        let mut report = crate::capability_manifest::ProvisionReport::whole_pass_skip(
+            "fleet_commands",
+            "dest",
+            ["a.md".to_string()],
+            &reason,
+        );
+        assert!(!report.is_stood_down() && report.warns());
+        report.skip("b.md", SkipReason::Symlinked("x".to_string()));
+        assert!(!report.is_stood_down());
     }
 
     /// Fail-soft: a directory that does not exist yields an empty set rather

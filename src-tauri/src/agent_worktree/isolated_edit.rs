@@ -1906,6 +1906,10 @@ mod tests {
                 .find(|r| r.capability == capability)
                 .unwrap_or_else(|| panic!("a {capability} report"));
             assert_eq!(report.written, 0, "{capability} wrote through the link");
+            assert!(
+                !report.skipped.is_empty(),
+                "{capability}: nothing was recorded as skipped"
+            );
             assert!(report
                 .skipped
                 .iter()

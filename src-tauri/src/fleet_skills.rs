@@ -227,21 +227,26 @@ fn collect_text_files(
 pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
     provision_fleet_skills_for_session_with_root(
         workdir,
-        crate::workspace_paths::workspace_root().as_deref(),
+        crate::workspace_paths::workspace_root_readonly().as_deref(),
     );
 }
 
 /// [`provision_fleet_skills_for_session`] with the workspace root injected —
-/// the test seam. `workspace_root()` rather than `require_workspace_root()`:
+/// the test seam. `workspace_root_readonly()` rather than `require_workspace_root()`:
 /// the stand-down only compares paths and writes nothing, and a `None` root
 /// fails open to the symlink arm alone.
 fn provision_fleet_skills_for_session_with_root(workdir: &str, root: Option<&Path>) {
     let claude_dir = Path::new(workdir).join(".claude");
     if let Some(reason) = crate::provision_guard::stand_down(&claude_dir, "skills", root) {
-        info!(
+        let line = format!(
             "fleet_skills: standing down for {workdir} — {}",
             reason.describe()
         );
+        if matches!(reason, capability_manifest::SkipReason::Unexaminable(_)) {
+            warn!("{line}");
+        } else {
+            info!("{line}");
+        }
         record_whole_pass_skip(workdir, &reason);
         return;
     }
@@ -657,13 +662,17 @@ pub(crate) fn provision_fleet_skills_into(
             // checkout is invisible to `TrackedPaths`, and `std::fs::write`
             // onto it truncates its target. Before `create_dir_all`, which
             // would build inside the link's target.
-            if let Some(why) = crate::provision_guard::symlink_below(skills_dir, &dst) {
-                let reason = capability_manifest::SkipReason::Symlinked(why);
-                info!(
+            if let Some(reason) = crate::provision_guard::symlink_below(skills_dir, &dst) {
+                let line = format!(
                     "fleet_skills: skipping {} — {}",
                     dst.display(),
                     reason.describe()
                 );
+                if matches!(reason, capability_manifest::SkipReason::Unexaminable(_)) {
+                    warn!("{line}");
+                } else {
+                    info!("{line}");
+                }
                 out.skip(relative.display().to_string(), reason);
                 continue;
             }
