@@ -93,6 +93,7 @@ const outcome: LedgerOutcome = {
   outcome: "missing",
   reason: "no-attempt",
   laterClosed: null,
+  restoreOwed: false,
   resumeDir: "D:/repo/sub",
   resumeCommand:
     'cd "D:/repo/sub" && CLAUDE_CONFIG_DIR="C:/claude/.claude-gmail" claude --resume aaaa-1111',

@@ -80,6 +80,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::session::awaiting_restore::{OwedRestores, RestoreView};
 use crate::session::close_reason::CloseReason;
 use crate::session::ledger_aftermath::{AftermathInputs, AftermathView, Close};
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, NAME_SOURCE_DERIVED};
@@ -918,6 +919,17 @@ pub struct LedgerOutcome {
     /// For a `back` session whose row closed after it came back: when, why,
     /// and whether that close was deliberate. `None` for every other outcome.
     pub later_closed: Option<LaterClosed>,
+    /// For every outcome that is NOT back: is a restore in THIS process still
+    /// owed to it ([`crate::session::awaiting_restore`], plan
+    /// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D3)?
+    /// `Some(true)` while the live store's restore set holds it unfinished and
+    /// unclosed since this boot (a restore may still bring it back: "waiting");
+    /// `Some(false)` when no restore in this process will (it closed since the
+    /// boot, finished, or left the restore set); `None` when that cannot be
+    /// read (no lifecycle store, or a boot not yet classified), never collapsed
+    /// into either. Always `None` on a `back` outcome: the question is not
+    /// asked of a session that came back.
+    pub restore_owed: Option<bool>,
     /// The directory a resume opens in ([`resume_dir_of`]) — the same one the
     /// copy line `cd`s into and the one-click resume launches in.
     pub resume_dir: Option<String>,
@@ -1235,6 +1247,7 @@ fn outcome_of(
         outcome: outcome.to_string(),
         reason: reason.map(str::to_string),
         later_closed: None,
+        restore_owed: None,
         resume_dir: resume_dir_of(entry.working_dir.as_deref(), entry.worktree_path.as_deref())
             .map(|d| d.trim().replace('\\', "/")),
         resume_command: ledger_resume_command(entry),
@@ -1305,12 +1318,14 @@ pub fn registry_now(store: &SessionLifecycleStore) -> RegistryNow {
 }
 
 /// Everything the report reads about what happened AFTER the capture: the
-/// registry as it stands now, and the aftermath record of what this boot (and
-/// the boots before it) observed.
+/// registry as it stands now, the aftermath record of what this boot (and the
+/// boots before it) observed, and which sessions this process's restore still
+/// owes. The default reads nothing, so every `restoreOwed` is `null`.
 #[derive(Debug, Clone, Default)]
 pub struct AfterRestart {
     pub registry: RegistryNow,
     pub aftermath: AftermathInputs,
+    pub restore_owed: OwedRestores,
 }
 
 /// One generation's buckets and verdict.
@@ -1344,11 +1359,15 @@ fn closed_reason(close: &Close) -> String {
 /// `closed:<reason>` when its row closed, `record-gone` when neither the
 /// registry nor any record still has it, and otherwise `no-attempt` /
 /// `not-restorable` / `restorability-unknown`.
+///
+/// Every outcome that is not back carries `restore_owed`, read from `owed`
+/// (this process's restore set over the live store).
 fn classify(
     prior: &SessionLedger,
     back: &[String],
     now: &RegistryNow,
     aftermath: &AftermathView<'_>,
+    owed: &OwedRestores,
     restore_stamps_available: bool,
 ) -> Classified {
     let back_now: HashSet<String> = back.iter().map(|s| s.to_ascii_lowercase()).collect();
@@ -1383,14 +1402,19 @@ fn classify(
                 })
                 .map(|c| LaterClosed::of(&c));
             returned.push(outcome);
-        } else if is_finished {
-            finished.push(outcome_of(e, OUTCOME_FINISHED, None, true));
+            continue;
+        }
+        let not_back = |outcome: &str, reason: Option<&str>, finished: bool| LedgerOutcome {
+            restore_owed: owed.of(&id),
+            ..outcome_of(e, outcome, reason, finished)
+        };
+        if is_finished {
+            finished.push(not_back(OUTCOME_FINISHED, None, true));
         } else if let Some(c) = close
             .as_ref()
             .filter(|c| c.is_deliberate() && c.at_ms.is_some_and(|at| at >= prior.captured_at_ms))
         {
-            closed_since.push(outcome_of(
-                e,
+            closed_since.push(not_back(
                 OUTCOME_CLOSED_SINCE,
                 Some(&closed_reason(c)),
                 false,
@@ -1412,7 +1436,7 @@ fn classify(
                 }
                 .to_string(),
             };
-            missing.push(outcome_of(e, OUTCOME_MISSING, Some(&reason), false));
+            missing.push(not_back(OUTCOME_MISSING, Some(&reason), false));
         }
     }
 
@@ -1532,6 +1556,7 @@ pub fn diff(
         back,
         &now.registry,
         &now.aftermath.this_boot_view(),
+        &now.restore_owed,
         restore_stamps_available,
     );
 
@@ -1548,19 +1573,41 @@ pub fn diff(
         .iter()
         .filter(|m| m.reason.as_deref() == Some(MISSING_RECORD_GONE))
         .count();
+    // Of the misses: how many a restore in THIS process still owes (D3), how
+    // many it will not restore, and how many could not be told. The three sum
+    // to the misses; an unreadable one is named rather than folded into
+    // either side.
+    let owed = missing
+        .iter()
+        .filter(|m| m.restore_owed == Some(true))
+        .count();
+    let lost = missing
+        .iter()
+        .filter(|m| m.restore_owed == Some(false))
+        .count();
+    let owed_unread = missing.len() - owed - lost;
+    let unread_clause = if owed_unread == 0 {
+        String::new()
+    } else {
+        format!(", and for {owed_unread} that could not be read")
+    };
     // The headline counts only the sessions EXPECTED back — the same "N of M"
     // the strip shows. Finished and closed-on-purpose sessions are not
     // expected, so they are named separately rather than inflating M.
     let mut note = format!(
         "{} of {} sessions open before the last shutdown came back ({} later closed); {} did \
-         not; {} of those name a worktree that may hold uncommitted work, and {} could not be \
-         given a resume line because the account root they ran under is unknown (a --resume \
-         under the wrong CLAUDE_CONFIG_DIR fails as though the session never existed); {} \
-         finished and {} closed since the restart without coming back are not expected back.",
+         not — {} still owed a restore by this boot, {} will not be restored by it{}; {} of \
+         those name a worktree that may hold uncommitted work, and {} could not be given a \
+         resume line because the account root they ran under is unknown (a --resume under the \
+         wrong CLAUDE_CONFIG_DIR fails as though the session never existed); {} finished and {} \
+         closed since the restart without coming back are not expected back.",
         returned.len(),
         returned.len() + missing.len(),
         later_closed,
         missing.len(),
+        owed,
+        lost,
+        unread_clause,
         with_wip,
         unresumable,
         finished.len(),
@@ -1644,6 +1691,7 @@ pub fn generation_report(
         back,
         &now.registry,
         &now.aftermath.generation_view(&file, this_boot),
+        &now.restore_owed,
         restore_stamps_available,
     );
     LedgerGeneration {
@@ -1719,10 +1767,11 @@ pub fn report(
             sessions: Vec::new(),
         };
         // Nothing was read from the registry: an absent row is UNKNOWN here,
-        // never "gone".
+        // never "gone". Nor from the restore set: every `restoreOwed` is null.
         let unread = AfterRestart {
             registry: RegistryNow::default(),
             aftermath,
+            restore_owed: OwedRestores::read(None, &RestoreView::current()),
         };
         let mut report = diff(prior, &[], &unread, empty, false);
         report.status = "unavailable".to_string();
@@ -1749,6 +1798,9 @@ pub fn report(
     let after = AfterRestart {
         registry: registry_now(store),
         aftermath,
+        // The same restore set, under the same boot classification, that
+        // `terminal_session_list_open` and page placement read (D3).
+        restore_owed: OwedRestores::read(Some(store), &RestoreView::current()),
     };
     // Both inputs `back` rests on must be readable for a miss count to be a
     // claim rather than an upper bound.
@@ -1885,7 +1937,8 @@ mod tests {
 
     /// Nothing observed after the restart: no registry read, no aftermath
     /// record, and a poll tick that needed no process read — so a miss is a
-    /// claim, as the tests below assume unless they say otherwise.
+    /// claim, as the tests below assume unless they say otherwise. No restore
+    /// set was read either, so every `restoreOwed` is null.
     fn none() -> AfterRestart {
         AfterRestart {
             registry: RegistryNow::default(),
@@ -1893,6 +1946,7 @@ mod tests {
                 process: crate::session::ledger_aftermath::ProcessEvidence::NotNeeded,
                 ..AftermathInputs::default()
             },
+            restore_owed: OwedRestores::default(),
         }
     }
 
@@ -2061,6 +2115,27 @@ mod tests {
         assert_eq!(report.returned.len(), 1);
         assert!(report.missing.is_empty());
         assert_eq!(report.verdict, VERDICT_MATCH);
+    }
+
+    /// With no restore set read (no lifecycle store: [`report`]'s unavailable
+    /// arm reads [`OwedRestores`] from `None`), a miss's `restoreOwed` is
+    /// `null`, and the note says it could not be read instead of counting it
+    /// owed or lost. Mutation: `OwedRestores::of` answering `false` for an
+    /// unread set.
+    #[test]
+    fn with_no_restore_set_read_a_miss_is_neither_owed_nor_lost() {
+        let prior = ledger(vec![entry("gone", Some(true), Some("C:/claude/.claude-x"))]);
+        let report = diff(Some(&prior), &[], &none(), ledger(Vec::new()), true);
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].restore_owed, None);
+        assert!(
+            report.note.contains(
+                "1 did not — 0 still owed a restore by this boot, 0 will not be restored by it, \
+                 and for 1 that could not be read;"
+            ),
+            "{}",
+            report.note
+        );
     }
 
     /// An UNPROBEABLE record must not be told its conversation could not have

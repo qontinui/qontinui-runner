@@ -57,6 +57,7 @@
 //! has fully absorbed the old surface.
 
 pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
+pub mod awaiting_restore; // Is a row still OWED a restore by this process? One tri-state predicate shared by page placement and the since-restart ledger's restoreOwed (plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing, Phase 4 / D3)
 pub mod classify_child_shadow; // `classify_child` in SHADOW beside the finished_close census: logs would-admit/refuse, decides nothing (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a)
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;

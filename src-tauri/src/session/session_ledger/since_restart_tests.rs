@@ -204,15 +204,37 @@ impl Restart {
         self.report_after(live_panes, ProcessRead::Held(held.to_vec()))
     }
 
+    /// The boot facts this restart's restore set is read under: classified,
+    /// booted at `boot_at_ms`, and a crash recovery (no shutdown marker).
+    fn restore_view(&self) -> RestoreView {
+        RestoreView {
+            prior_marker_at: None,
+            boot_was_clean: false,
+            booted_at_ms: Some(self.boot_at_ms),
+        }
+    }
+
     /// [`Self::report`] after a poll tick whose live-session read was
     /// `process`.
     fn report_after(&self, live_panes: &[&str], process: ProcessRead) -> LedgerReport {
+        self.report_under(live_panes, process, &self.restore_view())
+    }
+
+    /// [`Self::report_after`] with `restoreOwed` read under `view`, as
+    /// [`report`] reads it under [`RestoreView::current`].
+    fn report_under(
+        &self,
+        live_panes: &[&str],
+        process: ProcessRead,
+        view: &RestoreView,
+    ) -> LedgerReport {
         self.poll_tick(&[], process);
         let live: HashSet<String> = live_panes.iter().map(|t| t.to_string()).collect();
         let back = observed_back(&self.store, Some(self.boot_at_ms), Some(&live));
         let now_state = AfterRestart {
             registry: registry_now(&self.store),
             aftermath: self.aftermath.inputs(chrono::Utc::now().timestamp_millis()),
+            restore_owed: OwedRestores::read(Some(&self.store), view),
         };
         let current = capture(
             &self.store,
@@ -678,10 +700,20 @@ fn since_restart_a_pruned_session_no_record_has_is_record_gone_and_the_verdict_u
     assert_eq!(report.generations[0].verdict, VERDICT_UNKNOWN);
 }
 
-/// The note's numbers are the buckets' sizes.
+/// The note's numbers are the buckets' sizes, and its split of the misses is
+/// their `restoreOwed` (2 owed and 1 lost, so the two cannot be swapped
+/// unseen). Mutation: the note's owed and lost counts swapped.
 #[test]
 fn since_restart_the_notes_numbers_equal_the_buckets() {
-    let restart = Restart::new(&["back", "back-closed", "missed", "finished", "closed"]);
+    let restart = Restart::new(&[
+        "back",
+        "back-closed",
+        "missed",
+        "missed-too",
+        "lost",
+        "finished",
+        "closed",
+    ]);
     restart.poll_saw_alive("back");
     restart.poll_saw_alive("back-closed");
     restart
@@ -692,6 +724,7 @@ fn since_restart_the_notes_numbers_equal_the_buckets() {
         .set_finished("finished", true, None)
         .expect("a known session");
     restart.store.record_close("closed", CloseReason::Explicit);
+    restart.store.record_close("lost", CloseReason::NoTerminal);
 
     let report = restart.report(&["term-back", UNRELATED_LIVE_PANE], &[]);
 
@@ -706,16 +739,153 @@ fn since_restart_the_notes_numbers_equal_the_buckets() {
         report.finished.len(),
         report.closed_since.len(),
     );
-    assert_eq!((back, later, missing, finished, closed), (2, 1, 1, 1, 1));
+    let owed_count = |owed: Option<bool>| {
+        report
+            .missing
+            .iter()
+            .filter(|m| m.restore_owed == owed)
+            .count()
+    };
+    let (owed, lost) = (owed_count(Some(true)), owed_count(Some(false)));
+    assert_eq!(
+        (back, later, missing, owed, lost, finished, closed),
+        (2, 1, 3, 2, 1, 1, 1)
+    );
     let headline = format!(
         "{back} of {} sessions open before the last shutdown came back ({later} later closed); \
-         {missing} did not;",
+         {missing} did not — {owed} still owed a restore by this boot, {lost} will not be \
+         restored by it;",
         back + missing
     );
     assert!(report.note.starts_with(&headline), "{}", report.note);
+    assert!(
+        !report.note.contains("could not be read"),
+        "every miss was read: {}",
+        report.note
+    );
     let tail = format!(
         "{finished} finished and {closed} closed since the restart without coming back are not \
          expected back."
     );
     assert!(report.note.contains(&tail), "{}", report.note);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: owed or lost, decided by one awaiting-restore predicate
+// ---------------------------------------------------------------------------
+
+/// `restoreOwed` per outcome, on the top-level report and on this boot's
+/// generation:
+///
+/// - an open row nothing brought back is still owed (the control: a fix
+///   cannot pass by answering `false` for everything);
+/// - a miss whose row closed `no-terminal` (it left the restore set) or
+///   `pty-exit` (it stays in the set, for the next boot) since the boot is not;
+/// - a `closed-since` row and a finished row are not;
+/// - a back row is not asked: `null`, even though its row is in the restore
+///   set and unfinished.
+///
+/// Mutations: `classify` serving `None` for every not-back outcome (the owed
+/// control); `classify` reading `restore_owed` for back outcomes too (`back`
+/// reads `true`).
+#[test]
+fn since_restart_restore_owed_says_which_sessions_this_boot_still_owes_a_restore() {
+    let restart = Restart::new(&[
+        "back",
+        "owed",
+        "no-terminal",
+        "pty-exit",
+        "closed-on-purpose",
+        "finished",
+    ]);
+    restart.poll_saw_alive("back");
+    restart
+        .store
+        .record_close("no-terminal", CloseReason::NoTerminal);
+    restart.store.record_close("pty-exit", CloseReason::PtyExit);
+    restart
+        .store
+        .record_close("closed-on-purpose", CloseReason::Explicit);
+    restart
+        .store
+        .set_finished("finished", true, None)
+        .expect("a known session");
+
+    let report = restart.report(&["term-back", UNRELATED_LIVE_PANE], &[]);
+
+    for (returned, missing, closed_since, finished) in [
+        (
+            &report.returned,
+            &report.missing,
+            &report.closed_since,
+            &report.finished,
+        ),
+        (
+            &report.generations[0].returned,
+            &report.generations[0].missing,
+            &report.generations[0].closed_since,
+            &report.generations[0].finished,
+        ),
+    ] {
+        assert_eq!(ids(returned), vec!["back"]);
+        assert_eq!(ids(missing), vec!["no-terminal", "owed", "pty-exit"]);
+        assert_eq!(ids(closed_since), vec!["closed-on-purpose"]);
+        assert_eq!(ids(finished), vec!["finished"]);
+        let owed = |bucket: &[LedgerOutcome], id: &str| {
+            bucket
+                .iter()
+                .find(|o| o.claude_session_id == id)
+                .unwrap_or_else(|| panic!("{id} in its bucket"))
+                .restore_owed
+        };
+        assert_eq!(owed(missing, "owed"), Some(true), "the control");
+        assert_eq!(owed(missing, "no-terminal"), Some(false));
+        assert_eq!(
+            owed(missing, "pty-exit"),
+            Some(false),
+            "closed by this process: no restore in it brings the row back"
+        );
+        assert_eq!(owed(closed_since, "closed-on-purpose"), Some(false));
+        assert_eq!(owed(finished, "finished"), Some(false));
+        assert_eq!(owed(returned, "back"), None, "a back session is not asked");
+    }
+}
+
+/// Before the boot is classified, no miss's `restoreOwed` can be told: every
+/// not-back outcome serves `null` (never `false`, which the strip would count
+/// as "didn't come back"), and the note names the unread misses rather than
+/// folding them into either side. Mutation: the note's unread clause dropped.
+#[test]
+fn since_restart_restore_owed_is_null_before_the_boot_is_classified() {
+    let restart = Restart::new(&["owed", "no-terminal", "finished"]);
+    restart
+        .store
+        .record_close("no-terminal", CloseReason::NoTerminal);
+    restart
+        .store
+        .set_finished("finished", true, None)
+        .expect("a known session");
+    let unclassified = RestoreView {
+        booted_at_ms: None,
+        ..restart.restore_view()
+    };
+
+    let report = restart.report_under(
+        &[UNRELATED_LIVE_PANE],
+        ProcessRead::Held(Vec::new()),
+        &unclassified,
+    );
+
+    assert_eq!(ids(&report.missing), vec!["no-terminal", "owed"]);
+    for outcome in report.missing.iter().chain(&report.finished) {
+        assert_eq!(outcome.restore_owed, None, "{}", outcome.claude_session_id);
+    }
+    assert!(
+        report.note.contains(
+            "2 did not — 0 still owed a restore by this boot, 0 will not be restored by it, \
+             and for 2 that could not be read;"
+        ),
+        "{}",
+        report.note
+    );
 }

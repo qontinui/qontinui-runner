@@ -51,6 +51,7 @@
     "provider",
     "reason",
     "restorable",
+    "restoreOwed",
     "resumeAccount",
     "resumeCommand",
     "resumeDir",

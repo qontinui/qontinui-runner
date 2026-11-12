@@ -184,6 +184,16 @@ export interface LedgerOutcome {
   /** Set only for `back`: it came back, then its row was closed. */
   laterClosed: LaterClosed | null;
   /**
+   * For every outcome that is NOT `back`: is a restore in THIS runner process
+   * still owed to it? `true` while its row is in this process's restore set,
+   * unfinished and not closed since the boot (a restore may still bring it
+   * back, so it is "waiting"); `false` when no restore in this process will
+   * (it closed since the boot, finished, or left the restore set); `null` when
+   * that cannot be read (no lifecycle store, or the boot not yet classified) —
+   * UNKNOWN, never either side. Always `null` on a `back` outcome.
+   */
+  restoreOwed: boolean | null;
+  /**
    * The directory a resume opens in — the recorded `workingDir` (Claude Code
    * scopes sessions by the exact launch dir), else the worktree root. THE rule,
    * computed once in Rust (`session_ledger::resume_dir_of`) for the copy line

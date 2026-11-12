@@ -35,7 +35,11 @@
 //! - A row THIS process closed (a pane that exited since boot) is never
 //!   awaiting restore — no restore in this process brings it back — so it does
 //!   not count, although the restorable set keeps it for a while for the NEXT
-//!   boot.
+//!   boot. Which rows are still owed is ONE predicate,
+//!   [`crate::session::awaiting_restore::restore_still_owed`], shared with the
+//!   since-restart ledger's `restoreOwed`. Before the boot is classified it
+//!   cannot tell, and placement then counts the row (nothing is known to have
+//!   been closed by this process).
 //! - A prior-boot row the boot restore declines (a page no window owns, a
 //!   deselected or failed restore) keeps counting, for the life of the process,
 //!   until the store prunes it.
@@ -53,6 +57,7 @@ use std::sync::Arc;
 
 use super::types::TerminalInfo;
 use super::TerminalManager;
+use crate::session::awaiting_restore::{restore_still_owed, RestoreView};
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 
 /// The page every unpaged placement prefers while it has room.
@@ -118,38 +123,6 @@ pub(crate) fn lifecycle_store(app: &tauri::AppHandle) -> Option<Arc<SessionLifec
         .map(|s| s.inner().clone())
 }
 
-/// The boot facts the loads are read under: the restorable set's two
-/// admission inputs, and the instant this process booted.
-#[derive(Debug, Clone, Copy)]
-struct RestoreView {
-    prior_marker_at: Option<i64>,
-    boot_was_clean: bool,
-    /// `None` before the boot is classified; nothing is then known to have
-    /// been closed by this process.
-    booted_at_ms: Option<i64>,
-}
-
-impl RestoreView {
-    /// This process's view — the same classification
-    /// `terminal_session_list_open` reads the restore set under.
-    fn current() -> Self {
-        let (prior_marker_at, boot_was_clean) =
-            crate::session::shutdown_marker::restore_admission_inputs();
-        Self {
-            prior_marker_at,
-            boot_was_clean,
-            booted_at_ms: crate::session::shutdown_marker::boot_classification()
-                .map(|c| c.booted_at_ms),
-        }
-    }
-
-    /// Whether `row` was closed by this process — an exit since boot, which
-    /// no restore in this process will bring back.
-    fn closed_since_boot(&self, row: &TerminalSessionRecord) -> bool {
-        matches!((row.closed_at, self.booted_at_ms), (Some(closed), Some(boot)) if closed >= boot)
-    }
-}
-
 /// A recorded page id as the webview reads it: blank means `"default"`
 /// (`useTerminalPages.ts`, `t.pageId || t.page_id || "default"`).
 fn normalized_page(page_id: &str) -> &str {
@@ -193,21 +166,21 @@ fn page_loads_under(
     store: Option<&SessionLifecycleStore>,
     view: RestoreView,
 ) -> Vec<(String, usize)> {
-    let restorable = store
-        .map(|s| s.restorable_records(view.prior_marker_at, view.boot_was_clean))
-        .unwrap_or_default();
+    let restorable = store.map(|s| view.restore_set(s)).unwrap_or_default();
     loads_from(&tm.list(), &awaiting_restore(restorable, view))
 }
 
-/// The restorable rows a restore in THIS process may still bring back: the
-/// set minus the rows this process closed (see the module doc).
+/// The restorable rows a restore in THIS process may still bring back
+/// ([`restore_still_owed`]). A row it cannot judge (the boot is not classified
+/// yet) is counted, as before the predicate was shared: nothing is then known
+/// to have been closed by this process (see the module doc).
 fn awaiting_restore(
     restorable: Vec<TerminalSessionRecord>,
     view: RestoreView,
 ) -> Vec<TerminalSessionRecord> {
     restorable
         .into_iter()
-        .filter(|row| !view.closed_since_boot(row))
+        .filter(|row| restore_still_owed(row, &view).unwrap_or(true))
         .collect()
 }
 
