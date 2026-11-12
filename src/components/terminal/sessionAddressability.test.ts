@@ -93,18 +93,25 @@ afterEach(() => {
 
 const noop = () => {};
 
-/** The verbs the old override listed: every one must still be served. */
+/**
+ * The verbs the last override listed (main's 6e43e5f20: the SDK 0.38.0 inferred
+ * input set): every one must still be served. Pinned here independently of the
+ * served-list fixture, so a fixture regenerated together with a narrowed
+ * measurement cannot drop one of them unnoticed.
+ */
 const FORMER_OVERRIDE = [
   "focus",
   "blur",
   "hover",
+  "unhover",
   "scroll",
   "scrollIntoView",
   "click",
   "hoverClick",
   "type",
-  "clear",
   "sendKeys",
+  "clear",
+  "setValue",
 ];
 
 describe("text inputs advertise sendKeys", () => {
