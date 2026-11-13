@@ -160,6 +160,23 @@ pub fn record_page_restore_progress(window: &str, progress: PageRestoreProgress)
     }
 }
 
+/// Drop a closed window's report. Its pages move to another window, which
+/// restores them itself; a stale report would keep, say, a page it deferred
+/// reading as still to restore for the life of the process.
+pub fn forget_page_restore_progress(window: &str) {
+    if let Ok(mut m) = PAGE_RESTORE_PROGRESS.lock() {
+        m.remove(window);
+    }
+}
+
+/// Test-only reset of the process-global window reports.
+#[cfg(test)]
+pub(crate) fn reset_page_restore_progress_for_test() {
+    if let Ok(mut m) = PAGE_RESTORE_PROGRESS.lock() {
+        m.clear();
+    }
+}
+
 /// Which pages' boot restore has run in THIS process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PagesRestored {
@@ -174,21 +191,30 @@ pub enum PagesRestored {
 }
 
 impl PagesRestored {
-    /// This process's state: the windows' reports when any has reported, else
-    /// what the boot-restore latch says.
+    /// This process's state: the windows' reports, read under the boot-restore
+    /// latch ([`Self::from_parts`]). A poisoned registry cannot be read.
     pub fn current() -> Self {
-        let reports = PAGE_RESTORE_PROGRESS
-            .lock()
-            .ok()
-            .filter(|m| !m.is_empty())
-            .map(|m| {
-                m.values()
-                    .fold(PageRestoreProgress::default(), |acc, p| acc.merge(p))
-            });
-        match (reports, boot_restore_phase()) {
-            (Some(progress), _) => Self::Reported(progress),
-            (None, BootRestorePhase::NotYetRun | BootRestorePhase::Withheld) => Self::NoneYet,
-            (None, BootRestorePhase::Ran) => Self::Unknown,
+        match PAGE_RESTORE_PROGRESS.lock() {
+            Ok(reports) => Self::from_parts(reports.values(), boot_restore_phase()),
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    /// The windows' `reports` merged when any window has reported, else what
+    /// the boot-restore latch `phase` says.
+    fn from_parts<'a>(
+        reports: impl Iterator<Item = &'a PageRestoreProgress>,
+        phase: BootRestorePhase,
+    ) -> Self {
+        let mut reports = reports.peekable();
+        if reports.peek().is_some() {
+            return Self::Reported(
+                reports.fold(PageRestoreProgress::default(), |acc, p| acc.merge(p)),
+            );
+        }
+        match phase {
+            BootRestorePhase::NotYetRun | BootRestorePhase::Withheld => Self::NoneYet,
+            BootRestorePhase::Ran => Self::Unknown,
         }
     }
 

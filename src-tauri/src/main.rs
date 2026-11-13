@@ -6915,6 +6915,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 if !is_main_window {
+                    // Its pages move to another window, which restores them.
+                    crate::session::awaiting_restore::forget_page_restore_progress(&win_label);
                     // FINDING 10 — this `return` is UNCONDITIONAL, and the
                     // `&& handle_window_close(...)` it replaces was not.
                     //
