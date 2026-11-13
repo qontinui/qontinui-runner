@@ -13,8 +13,8 @@
  *   `type` and `class` are kept raw here by choice, as developer-authored
  *   structure; that is wider than the SDK's own attribute-record scrub
  *   (`scrubRecord`), which redacts every value inside a boundary. The SDK's
- *   control attributes (`data-bridge-redact`, `data-bridge-invisible`) stay
- *   raw so a reader can see where a boundary starts.
+ *   control markers (`data-bridge-redact`, `data-bridge-invisible`) stay
+ *   raw; `data-bridge-redact` is what shows where a boundary starts.
  * - CONTENT axis (`verdict.content`, a `data-bridge-redact` boundary only):
  *   `title`, `aria-label`.
  * - VALUE axis (`verdict.value`, boundary OR password input — the gate the
@@ -98,9 +98,8 @@ export function serializeDomTreeAttrs(el: Element): Record<string, string> {
     }
   }
 
-  // The SDK's verdict accepts any Element at runtime (it walks
-  // `parentElement` and reads attributes);
-  // SVG nodes inside a boundary must be scrubbed too.
+  // The SDK's verdict accepts any Element at runtime (it walks `parentElement`
+  // and reads attributes); SVG nodes inside a boundary must be scrubbed too.
   const verdict = verdictOf(el as HTMLElement);
   if (!verdict.value && !verdict.content) return raw;
 
