@@ -593,9 +593,11 @@ const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
  * `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D3) and
  * its page has not restored. A session no restore owes is never waiting.
  *
- * - While the coord drain defers restore and some row is waiting: "Restore
- *   deferred by drain — N waiting". With nothing owed, the deferred form falls
- *   through to the ordinary ones.
+ * - While some waiting row's OWN page is drain-deferred (`waiting-drain`):
+ *   "Restore deferred by drain — N waiting", plus "· W waiting on pages not
+ *   opened yet" for waiting rows on pages neither deferred nor restored. A
+ *   deferred page whose rows no restore owes, or a deferred page other than the
+ *   waiting rows' own, does not select this form.
  * - Otherwise nothing until the FIRST page's restore has settled (never on the
  *   boot census latch, which runs before any restore). Restore is lazy per
  *   page, so waiting for EVERY page would hide the strip for as long as the
@@ -613,14 +615,22 @@ export function stripModel(report: LedgerReport | null, ctx: RowContext): StripM
   if (!gen) return null;
   const generationFile = gen.file;
   const missingRows = gen.missing.map((o) => buildRow(o, ctx));
-  const waiting = missingRows.filter(isWaiting).length;
-  if (ctx.progress.deferredPages.size > 0 && waiting > 0) {
-    return {
-      kind: "deferred",
-      generationFile,
-      waiting,
-      text: `Restore deferred by drain — ${waiting} ${plural(waiting, "session", "sessions")} waiting`,
-    };
+  // The strip names the SAME cause as each row: a waiting row is deferred by
+  // the drain only when its own page is in the deferred set (`waiting-drain`),
+  // never because some other page is. Until 2026-11-13 the deferred form keyed
+  // on "any page deferred" while the rows keyed on their own page, so the strip
+  // could say "deferred by drain" over rows reading "page not opened".
+  const drainWaiting = missingRows.filter((r) => r.state === "waiting-drain").length;
+  const pageWaiting = missingRows.filter((r) => r.state === "waiting-page").length;
+  const waiting = drainWaiting + pageWaiting;
+  const pageWaitingPart = (n: number) =>
+    `${n} waiting on ${plural(n, "a page", "pages")} not opened yet`;
+  if (drainWaiting > 0) {
+    const parts = [
+      `Restore deferred by drain — ${drainWaiting} ${plural(drainWaiting, "session", "sessions")} waiting`,
+    ];
+    if (pageWaiting > 0) parts.push(pageWaitingPart(pageWaiting));
+    return { kind: "deferred", generationFile, waiting, text: parts.join(" · ") };
   }
   const expected = [...gen.returned, ...gen.missing];
   if (expected.length === 0) return null;
@@ -649,8 +659,7 @@ export function stripModel(report: LedgerReport | null, ctx: RowContext): StripM
     `${back} of ${total} ${plural(total, "session", "sessions")} from before the restart came back${laterClosedPart}`,
   ];
   if (k > 0) parts.push(`${upperBound ? "up to " : ""}${k} didn't come back`);
-  if (waiting > 0)
-    parts.push(`${waiting} waiting on ${plural(waiting, "a page", "pages")} not opened yet`);
+  if (pageWaiting > 0) parts.push(pageWaitingPart(pageWaiting));
   return {
     kind: "some-missing",
     generationFile,

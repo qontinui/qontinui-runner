@@ -1086,3 +1086,70 @@ describe("stable UI-Bridge ids", () => {
     expect(PAST).toContain("data-ui-bridge-id={pastSessionFinishId(session.claudeSessionId)}");
   });
 });
+
+// Found by the 2026-11-13 since-restart E2E on a temp runner: with one page
+// drain-deferred, the strip said "Restore deferred by drain" while every row
+// read "waiting: page not opened". The strip and the rows must name the same
+// cause, per row: deferred-by-drain when that row's page is in the deferred
+// set, "page not opened" only when its page is neither deferred nor restored.
+describe("the strip and the rows name the same waiting cause", () => {
+  /** p1 restored; p2 and p3 are in the layout. */
+  const ctx3 = (deferred: string[]) => {
+    const c = ctx({ complete: ["p1"], deferred });
+    return { ...c, progress: { ...c.progress, knownPageIds: ["p1", "p2", "p3"] } };
+  };
+
+  it("a row on the deferred page reads deferred by drain, and so does the strip", () => {
+    const o = owed("held", true, { pageId: "p2" });
+    const c = ctx3(["p2"]);
+    expect(buildRow(o, c)).toMatchObject({
+      state: "waiting-drain",
+      label: "waiting: restore deferred by drain",
+    });
+    const r = report([generation("g", { returned: [back("a")], missing: [o] })]);
+    expect(stripModel(r, c)).toMatchObject({
+      kind: "deferred",
+      waiting: 1,
+      text: "Restore deferred by drain — 1 session waiting",
+    });
+  });
+
+  it("a deferred page OTHER than the row's does not make the strip say drain", () => {
+    const o = owed("unopened", true, { pageId: "p3" });
+    const c = ctx3(["p2"]);
+    expect(buildRow(o, c)).toMatchObject({
+      state: "waiting-page",
+      label: "waiting: page not opened",
+    });
+    const r = report([generation("g", { returned: [back("a")], missing: [o] })]);
+    expect(stripModel(r, c)).toMatchObject({
+      kind: "some-missing",
+      waiting: 1,
+      text: "1 of 2 sessions from before the restart came back · 1 waiting on a page not opened yet",
+    });
+  });
+
+  it("rows on a deferred page and on an unopened page: the strip names both causes", () => {
+    const held = owed("held", true, { pageId: "p2" });
+    const unopened = owed("unopened", true, { pageId: "p3" });
+    const c = ctx3(["p2"]);
+    expect(buildRow(held, c).state).toBe("waiting-drain");
+    expect(buildRow(unopened, c).state).toBe("waiting-page");
+    const r = report([generation("g", { missing: [held, unopened] })]);
+    expect(stripModel(r, c)).toMatchObject({
+      kind: "deferred",
+      waiting: 2,
+      text: "Restore deferred by drain — 1 session waiting · 1 waiting on a page not opened yet",
+    });
+  });
+
+  it("a row on a page neither deferred nor restored reads page not opened", () => {
+    const o = owed("unopened", true, { pageId: "p3" });
+    expect(buildRow(o, ctx3([])).state).toBe("waiting-page");
+  });
+
+  it("a row on a restored page that is not deferred is not waiting", () => {
+    const o = owed("settled", true, { pageId: "p1" });
+    expect(buildRow(o, ctx3([])).state).not.toMatch(/^waiting/);
+  });
+});
