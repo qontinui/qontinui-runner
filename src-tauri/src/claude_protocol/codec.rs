@@ -326,21 +326,21 @@ mod tests {
         );
     }
 
-    /// The deny twin: Claude Code's `behavior: "deny"` + `message`, plus the
-    /// `allowed: false` mirror of the allow shape.
+    /// The deny twin, in the SDK's nested shape: `behavior: "deny"` +
+    /// `message`, the request id inside `response`.
     #[test]
     fn test_encode_decode_roundtrip_control_response_deny() {
         use super::super::types::OutgoingControlResponse;
 
-        let deny = OutgoingControlResponse::deny_tool("req_tool_deny", "no");
+        let deny = OutgoingControlResponse::deny_tool_use("req_tool_deny", "no");
         let encoded = encode_message(&deny).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(encoded.trim()).unwrap();
         assert_eq!(parsed["type"], "control_response");
-        assert_eq!(parsed["request_id"], "req_tool_deny");
-        assert_eq!(parsed["response"]["behavior"], "deny");
-        assert_eq!(parsed["response"]["message"], "no");
-        assert_eq!(parsed["response"]["allowed"], false);
+        assert_eq!(parsed["response"]["subtype"], "success");
+        assert_eq!(parsed["response"]["request_id"], "req_tool_deny");
+        assert_eq!(parsed["response"]["response"]["behavior"], "deny");
+        assert_eq!(parsed["response"]["response"]["message"], "no");
     }
 
     /// Verify streaming text delta accumulation pattern.
