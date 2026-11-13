@@ -2258,9 +2258,13 @@ pub async fn session_ledger_report(
 /// ([`crate::session::awaiting_restore::PagesRestored`]). Keyed by window
 /// label, as each window restores the pages it shows.
 ///
-/// It trusts the local webview, its only caller, for WHICH pages it names;
-/// it bounds only the size: blank ids are skipped and each list keeps at most
-/// [`MAX_REPORTED_PAGES`] ids.
+/// It trusts the local webview, its only caller, for WHICH pages it names, and
+/// bounds only the shape ([`PageRestoreProgress::from_report`]: an oversized
+/// report is recorded as unreadable). A report from a window that is no longer
+/// open (one queued before a `destroy()`) is dropped, so it cannot re-pin a
+/// closed window's deferrals.
+///
+/// [`PageRestoreProgress::from_report`]: crate::session::awaiting_restore::PageRestoreProgress::from_report
 #[tauri::command]
 pub fn terminal_report_restore_progress(
     window: tauri::Window,
@@ -2268,25 +2272,19 @@ pub fn terminal_report_restore_progress(
     deferred_pages: Vec<String>,
     known_page_ids: Vec<String>,
 ) {
-    let pages = |ids: Vec<String>| {
-        ids.into_iter()
-            .filter(|id| !id.trim().is_empty())
-            .take(MAX_REPORTED_PAGES)
-            .collect()
-    };
+    let label = window.label();
+    if window.app_handle().get_webview_window(label).is_none() {
+        return;
+    }
     crate::session::awaiting_restore::record_page_restore_progress(
-        window.label(),
-        crate::session::awaiting_restore::PageRestoreProgress {
-            complete: pages(complete_pages),
-            deferred: pages(deferred_pages),
-            known: pages(known_page_ids),
-        },
+        label,
+        crate::session::awaiting_restore::PageRestoreProgress::from_report(
+            complete_pages,
+            deferred_pages,
+            known_page_ids,
+        ),
     );
 }
-
-/// The most page ids [`terminal_report_restore_progress`] keeps per list. A
-/// layout holds a handful of pages; this only caps a runaway caller.
-const MAX_REPORTED_PAGES: usize = 1024;
 
 /// The operator's "Capture now": capture the current roster with reason
 /// [`crate::session::session_ledger::REASON_OPERATOR`] through the SAME
