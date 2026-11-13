@@ -429,7 +429,9 @@ pub fn sweep_empty_pop_out_windows(
         }
     }
 
-    // Pass 1 — LIVE but empty pop-outs.
+    // Pass 1 — LIVE but empty pop-outs. A window whose destroy failed stays
+    // open, so its restore-progress reports must keep counting.
+    let mut still_open: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for record in assignments.pop_out_records() {
         let label = &record.label;
         if assignments.has_assigned_sessions(label) || record.bound_page.is_some() {
@@ -444,6 +446,7 @@ pub fn sweep_empty_pop_out_windows(
         if let Some(win) = app.get_webview_window(label) {
             if let Err(e) = win.destroy() {
                 tracing::warn!(window = %label, error = %e, "sweep_empty_pop_out_windows: destroy failed");
+                still_open.insert(label.clone());
             }
         }
         swept.push(label.clone());
@@ -458,7 +461,7 @@ pub fn sweep_empty_pop_out_windows(
     set.extend(pruned);
     // `destroy()` fires no `CloseRequested`, so `handle_window_close` never
     // runs for these: drop their restore-progress reports here.
-    for label in &set {
+    for label in set.iter().filter(|l| !still_open.contains(*l)) {
         crate::session::awaiting_restore::forget_page_restore_progress(label);
     }
     set.into_iter().collect()
@@ -548,12 +551,21 @@ pub fn auto_close_owner_window_if_empty(
     // still reported it `[vis]` after a successful close()). destroy() forces the
     // teardown; the central `CloseRequested` handler still fires (and emits
     // `window-closed`) before the window is gone.
-    if let Some(win) = app.get_webview_window(&owner) {
-        if let Err(e) = win.destroy() {
-            tracing::warn!(window = %owner, error = %e, "auto_close_owner_window_if_empty: destroy failed");
-        }
+    // Its restore-progress reports stop counting only once it is really going:
+    // a window whose destroy failed stays open.
+    let destroyed = match app.get_webview_window(&owner) {
+        Some(win) => match win.destroy() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(window = %owner, error = %e, "auto_close_owner_window_if_empty: destroy failed");
+                false
+            }
+        },
+        None => true,
+    };
+    if destroyed {
+        crate::session::awaiting_restore::forget_page_restore_progress(&owner);
     }
-    crate::session::awaiting_restore::forget_page_restore_progress(&owner);
     let pruned = assignments.prune_empty_pop_outs();
     tracing::info!(
         window = %owner,
@@ -867,6 +879,8 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
                 "handle_window_close: destroy failed — the label stays held by a live webview; \
                  the next pop-out open will skip past it"
             );
+            // The window stays open: its restore-progress reports count again.
+            crate::session::awaiting_restore::reopen_page_restore_progress(label);
         }
     }
 
@@ -1284,5 +1298,32 @@ mod tests {
         assert_eq!(snapshot_geometry(false, false, (177, 177), (15, 37)), None);
         assert_eq!(snapshot_geometry(false, true, (0, 0), (160, 28)), None);
         assert!(snapshot_geometry(false, false, (100, 100), (200, 150)).is_some());
+    }
+
+    /// A pop-out label is reused after its window closed, and a closed label's
+    /// restore-progress reports are refused until it is reopened. So the one
+    /// pop-out builder must reopen the label BEFORE `build()`: after it, the new
+    /// window's first report could arrive while the label is still refused.
+    /// Mutations: the reopen call removed; moved after `.build()`.
+    #[test]
+    fn build_pop_out_webview_reopens_the_label_before_building() {
+        let src = include_str!("terminal_windows.rs");
+        let start = src
+            .find(concat!("fn build_pop_out", "_webview("))
+            .expect("build_pop_out_webview is defined here");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("the fn ends")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reopen = code
+            .find(concat!("reopen_page_restore", "_progress(label)"))
+            .expect("build_pop_out_webview reopens the label");
+        let build = code
+            .find(".build()")
+            .expect("build_pop_out_webview builds the window");
+        assert!(reopen < build, "the label is reopened before .build()");
     }
 }
