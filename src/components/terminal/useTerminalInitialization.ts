@@ -1675,9 +1675,21 @@ export function useTerminalInitialization({
   // would be reported deferred — and its rows owed — for as long as the window
   // lives, with no tab left to restore them into.
   const drainHeldPages = useRef<Set<string>>(new Set());
-  // Pages removed from the layout while this hook lived. Page ids are minted
-  // unique, so a removed id never comes back.
+  // Pages removed from the layout while this hook lived. NOT permanent: an id
+  // can come back ("default" through `loadPages`/reconcile, an explicit id
+  // through `openPage`), so a run consults it only while the page is still
+  // absent from the persisted layout, and drops it once the page is back.
   const removedPages = useRef<Set<string>>(new Set());
+  // Is `id` removed and still out of the layout? A removed id found back in
+  // the persisted layout is forgotten, so the page is tracked as any other.
+  const pageGone = useCallback((id: string): boolean => {
+    if (!removedPages.current.has(id)) return false;
+    if (loadKnownPageIds().includes(id)) {
+      removedPages.current.delete(id);
+      return false;
+    }
+    return true;
+  }, []);
   // Each page's newest restore run. A re-run can start before an earlier run's
   // drain timer fires, and that timer must not release the hold the newer run
   // still needs.
@@ -1708,14 +1720,21 @@ export function useTerminalInitialization({
       console.warn("[TerminalPage] terminal_report_restore_progress failed:", err);
     });
   }, []);
-  // Prune a removed page from the drain hold and re-publish, so neither the
-  // strip nor the backend's `restoreOwed` keeps counting a page that is gone.
+  // Prune a removed page from BOTH published sets and re-publish, so neither
+  // the strip nor the backend's `restoreOwed` keeps counting a page that is
+  // gone. Both, because a deferred page is in `complete` too (its restore gate
+  // opens): pruned from `deferred` alone, the backend's `has_run` would read it
+  // as restored. Pruned from both, its rows fall to the orphan arm, which reads
+  // "not run" until a non-deferred page has completed and "ran" once one has
+  // (that restore adopts orphans).
   useEffect(() => {
     const onRemoved = (e: Event) => {
       const pageId = (e as CustomEvent<{ pageId?: string }>).detail?.pageId;
       if (!pageId) return;
       removedPages.current.add(pageId);
-      if (drainHeldPages.current.delete(pageId)) publishRestorePages();
+      const held = drainHeldPages.current.delete(pageId);
+      const complete = restoreCompletePages.current.delete(pageId);
+      if (held || complete) publishRestorePages();
     };
     window.addEventListener(TERMINAL_PAGE_REMOVED_EVENT, onRemoved);
     return () => window.removeEventListener(TERMINAL_PAGE_REMOVED_EVENT, onRemoved);
@@ -1820,7 +1839,7 @@ export function useTerminalInitialization({
     const thisRun = (newestRestoreRun.current.get(initPageId) ?? 0) + 1;
     newestRestoreRun.current.set(initPageId, thisRun);
     const openRestoreGate = () => {
-      restoreCompletePages.current.add(initPageId);
+      if (!pageGone(initPageId)) restoreCompletePages.current.add(initPageId);
       if (newestRestoreRun.current.get(initPageId) === thisRun) setRestoreSettled(true);
     };
     // What a merging run may place into: its own page's grid as it is now. The
@@ -1948,7 +1967,7 @@ export function useTerminalInitialization({
           deferredRetryPages.current.add(initPageId);
           drainDeferredPages.current.add(initPageId);
           // A run still in flight when its page was removed must not hold it again.
-          if (!removedPages.current.has(initPageId)) drainHeldPages.current.add(initPageId);
+          if (!pageGone(initPageId)) drainHeldPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
           console.warn(
@@ -2533,6 +2552,7 @@ export function useTerminalInitialization({
     terminalRefs,
     noteNeedsAccount,
     publishRestorePages,
+    pageGone,
   ]);
 
   // Auto-save session layout for persistence across app restarts

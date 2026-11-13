@@ -48,7 +48,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { useZoneLayout, zoneLayoutStorageKey } from "./useZoneLayout";
 import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
 import { useTerminalInitialization } from "./useTerminalInitialization";
-import { TERMINAL_PAGE_REMOVED_EVENT } from "./useTerminalPages";
+import { PAGES_STORAGE_KEY, TERMINAL_PAGE_REMOVED_EVENT } from "./useTerminalPages";
 
 const PAGE = "hold-test";
 const NOOP = () => {};
@@ -515,15 +515,18 @@ describe("restore runs and the trim hold", () => {
   }, 30_000);
 
   // A drain-held page's owed sessions never got a pane, so `removePage`
-  // (which closes only live terminals) closes none of them: the hold must be
-  // pruned when the page leaves the layout, or it is reported owed forever.
-  it("stops reporting a drain-deferred page once the page is removed", async () => {
-    const reports: string[][] = [];
+  // (which closes only live terminals) closes none of them: the page must be
+  // pruned when it leaves the layout, or it is reported owed forever.
+  type Progress = { complete: string[]; deferred: string[] };
+  function captureProgress(): Progress[] {
+    const reports: Progress[] = [];
     fake.invoke = async (cmd, args) => {
       if (cmd === "terminal_report_restore_progress") {
-        reports.push([
-          ...((args as { deferredPages?: string[] } | undefined)?.deferredPages ?? []),
-        ]);
+        const a = args as { completePages?: string[]; deferredPages?: string[] } | undefined;
+        reports.push({
+          complete: [...(a?.completePages ?? [])],
+          deferred: [...(a?.deferredPages ?? [])],
+        });
         return { success: true, data: null };
       }
       await settle(5);
@@ -532,17 +535,65 @@ describe("restore runs and the trim hold", () => {
       }
       return { success: true, data: { settled: true, held: [] } };
     };
+    return reports;
+  }
+  const removePage = (pageId: string) =>
+    window.dispatchEvent(new CustomEvent(TERMINAL_PAGE_REMOVED_EVENT, { detail: { pageId } }));
+  const deferredReport = (reports: Progress[]) => () =>
+    reports.some((r) => r.deferred.includes(PAGE));
+
+  it("stops reporting a drain-deferred page once the page is removed", async () => {
+    const reports = captureProgress();
     mount();
-    await until("the first deferral report", () => reports.some((r) => r.includes(PAGE)));
+    await until("the first deferral report", deferredReport(reports));
+    // A deferred page is reported complete too (its restore gate opened).
+    // Wait for a quiet moment in which the latest report says so, so the
+    // removal below is taken from that state.
+    await until("a settled report with the page complete and deferred", () => {
+      const last = reports.at(-1);
+      return !!last && last.complete.includes(PAGE) && last.deferred.includes(PAGE);
+    });
+    await settle(300);
+    const last = reports.at(-1);
+    expect(last?.complete).toContain(PAGE);
+    expect(last?.deferred).toContain(PAGE);
     const reportsBefore = reports.length;
-    window.dispatchEvent(
-      new CustomEvent(TERMINAL_PAGE_REMOVED_EVENT, { detail: { pageId: PAGE } }),
-    );
-    await until("a report after the removal", () => reports.length > reportsBefore);
-    expect(reports.at(-1)).not.toContain(PAGE);
+    // The listener publishes synchronously, so this report is the removal's.
+    removePage(PAGE);
+    expect(reports.length).toBeGreaterThan(reportsBefore);
+    const atRemoval = reports[reportsBefore];
+    // In neither set: pruned from `deferred` alone, the backend would read the
+    // page as restored.
+    expect(atRemoval?.deferred).not.toContain(PAGE);
+    expect(atRemoval?.complete).not.toContain(PAGE);
     // A retry still in flight for the removed page does not hold it again.
     await renderUntil("a later retry", api, () => reconnectRuns >= 3);
     await settle(100);
-    for (const r of reports.slice(reportsBefore)) expect(r).not.toContain(PAGE);
+    for (const r of reports.slice(reportsBefore)) {
+      expect(r.deferred).not.toContain(PAGE);
+      expect(r.complete).not.toContain(PAGE);
+    }
+  }, 30_000);
+
+  // A removed id can come back ("default" through reconcile, an explicit id
+  // through `openPage`); once it is in the layout again it is tracked again.
+  it("reports a re-added page as deferred again when the drain defers it", async () => {
+    const reports = captureProgress();
+    mount();
+    await until("the first deferral report", deferredReport(reports));
+    removePage(PAGE);
+    await settle(100);
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      { id: "default", name: "Terminal", createdAt: 0 },
+      { id: PAGE, name: "Page 2", createdAt: 1 },
+    ]);
+    try {
+      const reportsBefore = reports.length;
+      await renderUntil("the re-added page deferred again", api, () =>
+        reports.slice(reportsBefore).some((r) => r.deferred.includes(PAGE)),
+      );
+    } finally {
+      instanceStorage.removeItem?.(PAGES_STORAGE_KEY);
+    }
   }, 30_000);
 });
