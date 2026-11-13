@@ -546,9 +546,13 @@ pub fn run_reconcile<I: TranscriptIndex>(
                 //    page must not get its old zone back. A spawn that does not
                 //    know the zone records the sentinel (the identity seam in
                 //    `terminal/session.rs`, a backend spawn with no hint), so 0
-                //    is a real zone here. A row written before the seam recorded
-                //    the sentinel still carries a placeholder 0, which reads as
-                //    zone 0 until the webview's zone backstop rewrites it.
+                //    is a real zone here. A row a pre-sentinel build wrote still
+                //    carries its placeholder 0 and reads as zone 0: the webview's
+                //    zone backstop (`planZoneReemits`) seeds a session it has not
+                //    ledgered from its first observation WITHOUT emitting, so it
+                //    rewrites that row only after a zone move. That lasts only
+                //    through the upgrade; every row written since records the
+                //    sentinel for an unknown zone.
                 // 2. The session's own zone, while its row is on the pane's
                 //    page. A respawn (account migration, restore, holder
                 //    adoption) reopens "on the same grid page/zone"
