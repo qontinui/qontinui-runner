@@ -2069,7 +2069,14 @@ pub(crate) async fn publish_once() {
 pub(crate) fn sample_ack_problems(body: &str) -> Option<Vec<String>> {
     let v = serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .filter(serde_json::Value::is_object)?;
+        .filter(serde_json::Value::is_object)
+        // An object carrying none of the documented counts is not the
+        // documented shape: UNKNOWN, not "everything was stored".
+        .filter(|v| {
+            ["received", "accepted", "persisted", "rejected"]
+                .iter()
+                .any(|k| v.get(*k).is_some())
+        })?;
     let num = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
     let strs = |k: &str| -> Vec<String> {
         v.get(k)
@@ -2129,14 +2136,32 @@ pub(crate) fn sample_ack_problems(body: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// The change key of a problem list: the text with its digits removed, so a
-/// value coord echoes ("psi_cpu_some 140 is outside its domain", "persisted 3
-/// of 5") does not make the same steady loss read as a new one every push.
-/// PURE.
+/// The change key of a problem list: every whitespace-separated token that is
+/// a NUMBER (as `f64` parses it, after trimming punctuation — so `140`,
+/// `100.5`, `101`, `-3`, `NaN`, `inf`) becomes `#`, so a value coord echoes
+/// ("psi_cpu_some 140 is outside its domain", "persisted 3 of 5") does not make
+/// the same steady loss read as a new one every push. Field names are kept
+/// whole: `load_5m` and `load_15m`, or `avg10` and `avg60`, stay distinct
+/// because neither token parses as a number. PURE.
 pub(crate) fn ack_problems_key(problems: &[String]) -> Vec<String> {
+    let token_key = |t: &str| -> String {
+        let core =
+            t.trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '+' | '.')));
+        let core = core.trim_end_matches('.');
+        if !core.is_empty() && core.parse::<f64>().is_ok() {
+            t.replacen(core, "#", 1)
+        } else {
+            t.to_string()
+        }
+    };
     problems
         .iter()
-        .map(|p| p.chars().filter(|c| !c.is_ascii_digit()).collect())
+        .map(|p| {
+            p.split_whitespace()
+                .map(token_key)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .collect()
 }
 
@@ -2225,6 +2250,33 @@ mod tests {
             ack_problems_key(&a),
             ack_problems_key(&c),
             "a different field is a new loss"
+        );
+        // Field names differing only in digits stay distinct; a value's
+        // formatting (101 vs 100.5, NaN, a sign) does not.
+        let key = |s: &str| ack_problems_key(&[s.to_string()]);
+        assert_ne!(
+            key("psi_memory_some_avg10 140 is outside its domain"),
+            key("psi_memory_some_avg60 140 is outside its domain")
+        );
+        assert_ne!(key("load_5m 9 is outside"), key("load_15m 9 is outside"));
+        assert_eq!(
+            key("psi_cpu_some 100.5 is outside"),
+            key("psi_cpu_some 101 is outside")
+        );
+        assert_eq!(
+            key("psi_cpu_some NaN is outside"),
+            key("psi_cpu_some -3 is outside")
+        );
+        assert_eq!(key("… and 5 more"), key("… and 12 more"));
+        assert_eq!(
+            key("did NOT store field(s) [\"gpus_v2\"]"),
+            key("did NOT store field(s) [\"gpus_v2\"]")
+        );
+        assert_ne!(key("field(s) [\"gpus_v2\"]"), key("field(s) [\"gpus_v3\"]"));
+        assert_eq!(
+            sample_ack_problems("{}"),
+            None,
+            "no documented key is UNKNOWN"
         );
     }
 
