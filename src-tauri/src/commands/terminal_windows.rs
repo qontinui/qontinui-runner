@@ -1308,11 +1308,10 @@ mod tests {
     #[test]
     fn build_pop_out_webview_reopens_the_label_before_building() {
         let src = include_str!("terminal_windows.rs");
-        let start = src
-            .find(concat!("fn build_pop_out", "_webview("))
+        let (_, from_fn) = src
+            .split_once(concat!("fn build_pop_out", "_webview("))
             .expect("build_pop_out_webview is defined here");
-        let body = &src[start..];
-        let body = &body[..body.find("\n}\n").expect("the fn ends")];
+        let (body, _) = from_fn.split_once("\n}\n").expect("the fn ends");
         let code: String = body
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
