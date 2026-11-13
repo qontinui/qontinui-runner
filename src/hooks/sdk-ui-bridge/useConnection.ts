@@ -7,7 +7,7 @@
 
 import { useState, useCallback, useEffect } from "react";
 import type { ConnectionStatus } from "./types";
-import type { SdkAppInfo } from "./types";
+import type { SdkAppInfo, SdkConnectionInfo } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { describeThrown } from "@/lib/utils";
 
@@ -136,7 +136,11 @@ export function useConnection(
         const statusResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/status`);
         const statusJson = await statusResp.json();
         if (statusJson.success && statusJson.data) {
-          const data = statusJson.data;
+          const data = statusJson.data as {
+            connected: boolean;
+            app?: SdkAppInfo;
+            allConnections?: SdkConnectionInfo[];
+          };
           // Rebuild connections map from server
           const newConnections = new Map<string, SdkAppInfo>();
           for (const conn of data.allConnections || []) {
@@ -215,12 +219,7 @@ export function useConnection(
           connected: boolean;
           app?: SdkAppInfo;
           url?: string;
-          allConnections?: Array<{
-            url: string;
-            app: SdkAppInfo;
-            connectedAt: number;
-            isActive: boolean;
-          }>;
+          allConnections?: SdkConnectionInfo[];
         };
 
         if (data.connected && data.app) {
