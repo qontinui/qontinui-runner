@@ -22962,10 +22962,13 @@ mod unspawned_door_tests {
         assert_eq!(added.len(), 1, "{added:?}");
         assert_eq!(added[0].worktree_path, fresh);
         assert_eq!(added[0].parent_sha, sha);
-        let placed = format!("{:?}", added[0].provenance);
-        assert!(
-            placed.contains("FreshWorktree") && placed.contains(&*canonical.to_string_lossy()),
-            "{placed}"
+        // Structural, not a substring of the Debug render: on Windows `{:?}`
+        // escapes each `\` as `\\`, so a raw path never occurs in it.
+        assert_eq!(
+            added[0].provenance,
+            TreeProvenance::FreshWorktree {
+                canonical: canonical.clone()
+            }
         );
         assert!(fresh.join("README.md").exists(), "the added row is on disk");
         assert!(
