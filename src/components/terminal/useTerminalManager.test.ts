@@ -8,7 +8,7 @@
  * where race-safety + idempotency live.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
 import {
   applyBypassMark,
@@ -19,6 +19,7 @@ import {
   backfillClaudeSessionIds,
   resolveSpawnWorkingDir,
   reconcileTabsWithBackend,
+  closeTabAndRecord,
   RESYNC_CREATE_GRACE_MS,
   workerTabFromRecord,
   findWorkerRecord,
@@ -394,7 +395,11 @@ describe("reconcileTabsWithBackend", () => {
 
   it("adds a backend terminal that has no local tab (missed terminal-created)", () => {
     const tabs = [tab("a", old)];
-    const next = reconcileTabsWithBackend(tabs, [createdEvent("a", "p"), createdEvent("b", "p")], NOW);
+    const next = reconcileTabsWithBackend(
+      tabs,
+      [createdEvent("a", "p"), createdEvent("b", "p")],
+      NOW,
+    );
     expect(next.map((t) => t.id)).toEqual(["a", "b"]);
   });
 
@@ -427,7 +432,11 @@ describe("reconcileTabsWithBackend", () => {
 
   it("preserves per-tab state on surviving tabs", () => {
     const tabs = [tab("a", { ...old, claudeSessionId: "sid", taskRunId: "run-1" })];
-    const next = reconcileTabsWithBackend(tabs, [createdEvent("a", "p"), createdEvent("b", "p")], NOW);
+    const next = reconcileTabsWithBackend(
+      tabs,
+      [createdEvent("a", "p"), createdEvent("b", "p")],
+      NOW,
+    );
     expect(next[0]).toBe(tabs[0]);
     expect(next[0].claudeSessionId).toBe("sid");
     expect(next[0].taskRunId).toBe("run-1");
@@ -584,5 +593,54 @@ describe("Conductor worker tabs", () => {
     const now = RESYNC_CREATE_GRACE_MS * 10;
     const next = reconcileTabsWithBackend([worker, stalePty], [], now);
     expect(next.map((t) => t.id)).toEqual(["trid-1"]);
+  });
+});
+
+// A UI tab close must record an `explicit` close for the Claude session the tab
+// ran — even when React defers the `setTabs` updater, which it does whenever
+// another update is already queued (found by the 2026-11-13 since-restart E2E:
+// a UI Bridge tab close left the session's row open on every build).
+describe("closeTabAndRecord", () => {
+  const tabs = [tab("t1", { claudeSessionId: "11111111-1111-4111-8111-111111111111" }), tab("t2")];
+
+  it("records an explicit close although the setTabs updater has not run yet", () => {
+    const deferred: Array<(prev: TerminalTab[]) => TerminalTab[]> = [];
+    const recordClose = vi.fn();
+    closeTabAndRecord("t1", {
+      tabs,
+      sessionBacked: false,
+      setTabs: (u) => deferred.push(u),
+      onRemoved: () => {},
+      recordClose,
+    });
+    expect(recordClose).toHaveBeenCalledTimes(1);
+    expect(recordClose.mock.calls[0][0]).toMatchObject({
+      claudeSessionId: "11111111-1111-4111-8111-111111111111",
+      terminalId: "t1",
+      reason: "explicit",
+    });
+    // The updater still removes the tab when React runs it.
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0](tabs).map((t) => t.id)).toEqual(["t2"]);
+  });
+
+  it("records nothing for a tab with no Claude session, or a worker view", () => {
+    const recordClose = vi.fn();
+    const steps = { tabs, setTabs: () => {}, onRemoved: () => {}, recordClose };
+    closeTabAndRecord("t2", { ...steps, sessionBacked: false });
+    closeTabAndRecord("t1", { ...steps, sessionBacked: true });
+    expect(recordClose).not.toHaveBeenCalled();
+  });
+
+  it("hands onRemoved the lists before and after the removal", () => {
+    const onRemoved = vi.fn();
+    closeTabAndRecord("t1", {
+      tabs,
+      sessionBacked: false,
+      setTabs: (u) => void u(tabs),
+      onRemoved,
+      recordClose: () => {},
+    });
+    expect(onRemoved).toHaveBeenCalledWith(tabs, [tabs[1]]);
   });
 });

@@ -48,10 +48,7 @@ export function renameTabIn(tabs: TerminalTab[], id: string, title: string): Ter
  * name is immutable — and returns the SAME array when nothing changed so
  * callers do not churn renders.
  */
-export function applySpawnNames(
-  tabs: TerminalTab[],
-  names: Record<string, string>,
-): TerminalTab[] {
+export function applySpawnNames(tabs: TerminalTab[], names: Record<string, string>): TerminalTab[] {
   let changed = false;
   const next = tabs.map((t) => {
     if (t.spawnName) return t;
@@ -260,6 +257,43 @@ export function buildSessionCloseRecord(
     terminalId: closing.id,
     reason,
   });
+}
+
+/** What closing a tab needs from its caller, so the order is testable without React. */
+export interface TabCloseSteps {
+  /** The tab list as the handler sees it now (`tabsRef.current`). */
+  tabs: TerminalTab[];
+  /** A Conductor worker view: no close record (its worker keeps running). */
+  sessionBacked: boolean;
+  /** React's `setTabs`. Its updater may run LATER than this call. */
+  setTabs: (updater: (prev: TerminalTab[]) => TerminalTab[]) => void;
+  /** Called from inside the updater with the lists before and after the removal. */
+  onRemoved: (prev: TerminalTab[], next: TerminalTab[]) => void;
+  /** Sends the durable close (`terminal_session_record_close`). */
+  recordClose: (args: SessionCloseArgs) => void;
+}
+
+/**
+ * Close tab `id`: remove it from the list and record an `explicit` close for the
+ * Claude session it ran.
+ *
+ * The record is built from `steps.tabs` BEFORE `setTabs`, never inside the
+ * updater. React runs an updater synchronously only when the component has no
+ * other update queued; otherwise it runs at the next render, after this
+ * handler has returned. The record used to be assigned inside the updater and
+ * read right after `setTabs`, so a close with any update pending (measured
+ * 2026-11-13 on a temp runner, a UI Bridge tab close) found it still `null`
+ * and recorded nothing: the session's row stayed open and the since-restart
+ * ledger could never see a deliberate close.
+ */
+export function closeTabAndRecord(id: string, steps: TabCloseSteps): void {
+  const record = steps.sessionBacked ? null : buildSessionCloseRecord(steps.tabs, id);
+  steps.setTabs((prev) => {
+    const next = prev.filter((t) => t.id !== id);
+    steps.onRemoved(prev, next);
+    return next;
+  });
+  if (record) steps.recordClose(record);
 }
 
 /**
@@ -1613,11 +1647,6 @@ export function useTerminalManager(
 
   const closeTerminal = useCallback(
     (id: string) => {
-      // Capture the closing tab's Claude session id (read-only) so we can record
-      // an EXPLICIT durable close after the state update. We read it out of the
-      // updater's `prev` without mutating inside the updater (StrictMode double-
-      // invokes updaters in dev).
-      let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
       // A Conductor worker's tab is a VIEW: closing it hides the cell and
       // nothing more. The Conductor owns the worker's lifetime, and its durable
       // record must stay open so the next restore brings the cell back while
@@ -1639,26 +1668,26 @@ export function useTerminalManager(
           }),
         );
       }
-      // Update React state immediately so the UI is responsive.
-      // The Rust-side close (process kill + thread join) runs in the background.
-      setTabs((prev) => {
-        closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
-        const next = prev.filter((t) => t.id !== id);
-        setActiveId((currentActive) => {
-          if (currentActive !== id) return currentActive;
-          const closedIndex = prev.findIndex((t) => t.id === id);
-          return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
-        });
-        return next;
+      // Update React state immediately so the UI is responsive, and record the
+      // durable session CLOSE for an explicit user close (only when the tab was
+      // running a Claude session; fire-and-forget). The Rust-side close
+      // (process kill + thread join) runs in the background below.
+      closeTabAndRecord(id, {
+        tabs: tabsRef.current,
+        sessionBacked,
+        setTabs,
+        onRemoved: (prev, next) =>
+          setActiveId((currentActive) => {
+            if (currentActive !== id) return currentActive;
+            const closedIndex = prev.findIndex((t) => t.id === id);
+            return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
+          }),
+        recordClose: (record) => {
+          invoke<CommandResponse>("terminal_session_record_close", record).catch(() => {
+            // Best-effort — the live close still proceeds below.
+          });
+        },
       });
-
-      // Record the durable session CLOSE for an explicit user close (only when
-      // the tab was running a Claude session). Fire-and-forget.
-      if (closeRecord) {
-        invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
-          // Best-effort — the live close still proceeds below.
-        });
-      }
 
       // Only invoke Rust close for terminal tabs (plan tabs and worker views
       // have no PTY)
