@@ -94,13 +94,16 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 
 /// Write every embedded subagent definition into `dst_dir`, returning a
 /// [`ProvisionReport`] describing what landed. Creates `dst_dir` if absent;
-/// overwrites existing files (idempotent) EXCEPT those `keep` names: a
+/// overwrites existing files (idempotent) EXCEPT a destination that is a
+/// symlink (never written through) and those `keep` names: a
 /// definition the enclosing git repository tracks (or one that exists when the
 /// tracked-file probe could not answer inside a repository) is left alone and
 /// reported as skipped, exactly as [`crate::fleet_commands`] and
 /// [`crate::fleet_skills`] do. In a `qontinui-claude-config` checkout
 /// `.claude/agents/*.md` IS tracked content, and overwriting it with this
-/// binary's render dirtied every such worktree.
+/// binary's render dirtied every such worktree. The provisioner also folds
+/// [`foreign_destination_reason`] into `keep` before either layer writes, so an
+/// existing UNTRACKED file that is not a copy this runner shipped is kept too.
 ///
 /// Only `*.md` at the top level is written — the same filter the checkout copy
 /// applies, so the two layers cannot disagree about what counts as a definition.
@@ -146,10 +149,23 @@ pub(crate) fn provision_fleet_agents_into(
             out.skip(unit, reason.clone());
             continue;
         }
+        // Never write THROUGH a symlink: `fs::write` follows it and would
+        // replace whatever file it points at, which this pass does not own.
+        let dst = dst_dir.join(name);
+        if is_symlink(&dst) {
+            let reason = symlink_destination_reason(&dst);
+            tracing::info!(
+                "fleet_agents: not writing {} — {}",
+                dst.display(),
+                reason.describe()
+            );
+            out.skip(unit, reason);
+            continue;
+        }
         // Per-file rather than `?`: one unwritable definition must not cost the
         // session the others, and it must be NAMED rather than aborting the
         // pass at whatever point it happened to reach.
-        match std::fs::write(dst_dir.join(name), file.contents()) {
+        match std::fs::write(&dst, file.contents()) {
             Ok(()) => out.record_written(),
             Err(e) => out.skip(unit, SkipReason::WriteFailed(e.to_string())),
         }
@@ -366,6 +382,179 @@ pub(crate) fn remove_retired_agents(
     }
 }
 
+/// Every blob each BUNDLED definition has shipped as, one line per file in
+/// [`RETIRED_AGENTS`]' shape: the file name, then the blob ids, space-separated.
+/// A line lists the bundle's own history in this repository (every branch) and
+/// its source's history on `qontinui-claude-config` main, because a workdir can
+/// hold a copy an older binary's floor wrote or an older checkout overlay
+/// copied.
+///
+/// It is how the provisioner tells ITS OWN copy from an operator's file at the
+/// same name ([`foreign_destination_reason`]): a destination whose bytes are one
+/// of these blobs is refreshed, any other existing file is kept. A blob missing
+/// here would freeze a stale copy in place rather than clobber anything, and
+/// [`tests::every_bundled_definition_is_in_the_shipped_table`] fails the build
+/// when the bundle's current blob is not listed, so a re-sync must add its line.
+pub(crate) const SHIPPED_AGENTS: &[&str] = &[
+    "code-reviewer.md 519fd1ab38bc53a7514bbbe20f60ae01957abcb0 624b3b339ebc4ae13850c124e3992d162b788e49 6b6e6f08312a2e5a581c139415a81b3c5d5ce3f4 959d627662996f8bde590a13a6c84ad22f3a8529 b28243932fb683f13285c11a6f190c69b89d2949 d895a90a12c5480816fed332958bc009a9ae88ad",
+    "debugging-specialist.md 1d1851df238088b5d0b646470bdc0a54b48d9593 4197dd492b8e9ead49ae1486e49ea670122ee7bf a9e6b6e25535c13ad85e50dccafa4b2178e1e20e d10848df68d3731545f0f740ef8979d2e7fd5a7c f8d86dae7e6e5b1bcd9e995678f30f3c01ed6e06",
+    "merge-specialist.md 2c2c6b8f16c8c6d802031bd633a07a2bb1c39c06 34d940fae8d8dea82c2edb6f71d935b49d67927e 61496d273875945aa0d978c6c1acf3bf8d087e56 647e942b3b9e31ac2ce85c24202d4ad3db75e8b9 cbced9b9855b4f21dc3310872ad1a6ec54640b82 ce8ecbe3210ce14497b5a57d47fd6a3dff78c2cd d22a06aa0b0313d77091d910313cf30d11995bff e094d49328098d0198a210b4901a224904081f78 e5ce959417a0ea4fd89c3d5c3ed4739f22181312 f35d49a5fddc93fbf6d3090106c6b3d0a5e6069f",
+    "repo-auditor.md 45954e716979d2d6e6c6ecc7d1616db1ff19f58e 5781f39d5c0a2f7abe9455b661fd72cde6784a8e 64764a4119d9277a1ce58a09ad7e683cd2111367 6e3b88232bd59f0569aa8ab459d8f6396a025b1e a877ff7aa55ec01b3a29ed08250aa0f32b85c7c6 aba1edddfec2c7f0806685ba9cc184f2439b0df3 e5ec73ffb9ab0389102e6f737ac10ea288f9571d",
+];
+
+/// How long the overlay checkout's object store may take to say whether it holds
+/// a blob before the answer is taken as "no" (and the file kept).
+const BLOB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why the existing destination `dst` (definition `name`) must be KEPT rather
+/// than overwritten, or `None` when this pass may write it: it is absent, or its
+/// bytes are a copy this runner ships or shipped.
+///
+/// The tracked-file guard ([`KeepDecisions::decide`]) keeps only what a
+/// repository tracks, so before this an operator's own UNTRACKED file at a
+/// bundled or overlay name (`~/.claude/agents/code-reviewer.md` for a terminal
+/// opened at `$HOME`, a gitignored `.claude/agents/*.md`) was silently replaced.
+/// A copy counts as this runner's when its bytes, as they are or with CRLF
+/// folded to LF, are
+/// - the bundled body, or a blob [`SHIPPED_AGENTS`] or `retired` lists for it;
+/// - byte-equal to the overlay checkout's current copy (`overlay_src`); or
+/// - a blob the overlay checkout's object store holds, i.e. a version of that
+///   checkout's definition (bounded by [`BLOB_PROBE_TIMEOUT`]; no answer reads
+///   as "not ours", the safe side).
+///
+/// A symlink is never written through, whatever it points at, and anything that
+/// cannot be inspected or read is kept: overwriting needs a positive answer.
+pub(crate) fn foreign_destination_reason(
+    dst: &Path,
+    name: &str,
+    overlay_src: Option<&Path>,
+    retired: &[&str],
+) -> Option<SkipReason> {
+    foreign_destination_reason_with(dst, name, overlay_src, retired, SHIPPED_AGENTS)
+}
+
+/// [`foreign_destination_reason`] with the shipped-blob table passed in, so a
+/// test can name a blob it computed itself.
+fn foreign_destination_reason_with(
+    dst: &Path,
+    name: &str,
+    overlay_src: Option<&Path>,
+    retired: &[&str],
+    shipped_table: &[&str],
+) -> Option<SkipReason> {
+    let meta = match std::fs::symlink_metadata(dst) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(SkipReason::Rejected(format!(
+                "kept: the existing destination could not be inspected ({e}), so it was not \
+                 overwritten"
+            )))
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Some(symlink_destination_reason(dst));
+    }
+    if !meta.is_file() {
+        return Some(SkipReason::Rejected(
+            "kept: the destination exists and is not a regular file".to_string(),
+        ));
+    }
+    let bytes = match std::fs::read(dst) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Some(SkipReason::Rejected(format!(
+                "kept: the existing destination could not be read ({e}), so it was not \
+                 overwritten"
+            )))
+        }
+    };
+    let folded = fold_crlf(&bytes);
+    let bundled = FLEET_AGENTS
+        .files()
+        .find(|f| f.path().file_name().is_some_and(|n| n == name))
+        .map(|f| f.contents());
+    if bundled.is_some_and(|b| b == bytes.as_slice() || b == folded.as_slice()) {
+        return None;
+    }
+    let shipped: Vec<&str> = shipped_table
+        .iter()
+        .chain(retired)
+        .map(|line| parse_retired_line(line))
+        .filter(|(n, _)| *n == name)
+        .flat_map(|(_, blobs)| blobs)
+        .collect();
+    let own = match shipped_blob(&bytes, &shipped) {
+        Ok(_) => return None,
+        Err(own) => own,
+    };
+    if let Some(src_dir) = overlay_src {
+        if let Ok(source) = std::fs::read(src_dir.join(name)) {
+            if source == bytes || fold_crlf(&source) == folded {
+                return None;
+            }
+        }
+        let folded_blob = crate::provenance::git_blob_id(&folded);
+        if checkout_holds_blob(src_dir, &own) || checkout_holds_blob(src_dir, &folded_blob) {
+            return None;
+        }
+    }
+    Some(SkipReason::Rejected(format!(
+        "kept: an operator-authored file not written by this runner (blob {own} is not one it \
+         ships or shipped)"
+    )))
+}
+
+/// The skip reason for a destination that is a symbolic link: this runner never
+/// writes THROUGH one, since the write would land on whatever it points at.
+pub(crate) fn symlink_destination_reason(dst: &Path) -> SkipReason {
+    let target = std::fs::read_link(dst)
+        .map(|t| t.display().to_string())
+        .unwrap_or_else(|e| format!("<unreadable link: {e}>"));
+    SkipReason::Rejected(format!(
+        "kept: the destination is a symbolic link (to {target}); this runner never writes \
+         through one"
+    ))
+}
+
+/// True when `dst` is a symbolic link (dangling or not).
+pub(crate) fn is_symlink(dst: &Path) -> bool {
+    std::fs::symlink_metadata(dst).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// True when the git repository holding `dir` has object `blob`. Bounded by
+/// [`BLOB_PROBE_TIMEOUT`]; anything but a clean "yes" (no repository, git
+/// missing, a timeout) is `false`.
+fn checkout_holds_blob(dir: &Path, blob: &str) -> bool {
+    use std::process::Stdio;
+    let Ok(mut child) = crate::process_helpers::no_window("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{blob}^{{blob}}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + BLOB_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
 /// The blob in `shipped` that `bytes` is, as they are or with CRLF folded to
 /// LF; otherwise `Err` carrying the bytes' own blob id, for the record.
 fn shipped_blob(bytes: &[u8], shipped: &[&str]) -> Result<String, String> {
@@ -453,6 +642,136 @@ mod tests {
             b"CLOBBERED",
             "re-provisioning must overwrite a modified def, not leave it"
         );
+    }
+
+    /// The bundle's current blob of every definition is in [`SHIPPED_AGENTS`],
+    /// so a refreshed copy is recognised as this runner's on the next pass. A
+    /// re-sync that changes a body must add the new blob to its line.
+    #[test]
+    fn every_bundled_definition_is_in_the_shipped_table() {
+        for file in FLEET_AGENTS.files() {
+            let name = file.path().file_name().unwrap().to_string_lossy();
+            if !name.ends_with(".md") {
+                continue;
+            }
+            let blob = crate::provenance::git_blob_id(file.contents());
+            let listed = SHIPPED_AGENTS
+                .iter()
+                .map(|l| parse_retired_line(l))
+                .any(|(n, blobs)| n == name && blobs.contains(&blob.as_str()));
+            assert!(
+                listed,
+                "{name}'s bundled blob {blob} is missing from SHIPPED_AGENTS; add it to its line"
+            );
+        }
+    }
+
+    /// An existing file at a bundled name whose bytes this runner never shipped
+    /// is an operator's, and is kept; one whose bytes are a shipped blob (as
+    /// written or with CRLF folded) is ours and may be refreshed; an absent one
+    /// is written.
+    #[test]
+    fn an_existing_destination_is_ours_only_when_its_blob_shipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("code-reviewer.md");
+        assert_eq!(
+            foreign_destination_reason_with(&dst, "code-reviewer.md", None, &[], &[]),
+            None,
+            "an absent destination is written"
+        );
+
+        let custom = b"---\nname: code-reviewer\n---\nmy own reviewer\n";
+        std::fs::write(&dst, custom).unwrap();
+        let reason = foreign_destination_reason_with(&dst, "code-reviewer.md", None, &[], &[])
+            .expect("an unknown file is kept");
+        assert!(
+            matches!(&reason, SkipReason::Rejected(why) if why.contains("operator-authored")),
+            "{reason:?}"
+        );
+
+        let line = format!(
+            "code-reviewer.md {}",
+            crate::provenance::git_blob_id(custom)
+        );
+        assert_eq!(
+            foreign_destination_reason_with(&dst, "code-reviewer.md", None, &[], &[&line]),
+            None,
+            "a shipped blob is refreshed"
+        );
+        std::fs::write(
+            &dst,
+            b"---\r\nname: code-reviewer\r\n---\r\nmy own reviewer\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_destination_reason_with(&dst, "code-reviewer.md", None, &[], &[&line]),
+            None,
+            "an autocrlf copy of a shipped blob is still ours"
+        );
+        let bundled = FLEET_AGENTS
+            .get_file("code-reviewer.md")
+            .expect("bundled")
+            .contents();
+        std::fs::write(&dst, bundled).unwrap();
+        assert_eq!(
+            foreign_destination_reason(&dst, "code-reviewer.md", None, &[]),
+            None,
+            "the bundled body itself is ours"
+        );
+    }
+
+    /// The current overlay source's bytes are ours too: they are what the
+    /// overlay would copy.
+    #[test]
+    fn an_exact_copy_of_the_overlay_source_is_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("local-agent.md"), b"# overlay body\n").unwrap();
+        let dst = tmp.path().join("local-agent.md");
+        std::fs::write(&dst, b"# overlay body\n").unwrap();
+        assert_eq!(
+            foreign_destination_reason(&dst, "local-agent.md", Some(&src), &[]),
+            None
+        );
+        std::fs::write(&dst, b"# an operator edit\n").unwrap();
+        assert!(foreign_destination_reason(&dst, "local-agent.md", Some(&src), &[]).is_some());
+    }
+
+    /// The floor writer never writes THROUGH a destination symlink, even with
+    /// nothing kept: the file the link points at keeps its bytes, and the name
+    /// is skipped with a reason.
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_never_writes_through_a_destination_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("operator-source.md");
+        std::fs::write(&target, b"OPERATOR SOURCE").unwrap();
+        let dst = tmp.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(&target, dst.join("code-reviewer.md")).unwrap();
+
+        let report = provision_fleet_agents_into(&dst, &KeepDecisions::default()).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"OPERATOR SOURCE");
+        assert!(std::fs::symlink_metadata(dst.join("code-reviewer.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            report.skipped.iter().any(|u| u.unit == "code-reviewer.md"
+                && matches!(&u.reason, SkipReason::Rejected(why) if why.contains("symbolic link"))),
+            "{:?}",
+            report.skipped
+        );
+        assert_eq!(report.written, embedded_agent_count() - 1);
+        assert!(foreign_destination_reason(
+            &dst.join("code-reviewer.md"),
+            "code-reviewer.md",
+            None,
+            &[]
+        )
+        .is_some());
     }
 
     #[test]

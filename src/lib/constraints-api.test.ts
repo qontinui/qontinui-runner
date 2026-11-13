@@ -17,19 +17,28 @@ import { saveConstraintConfig } from "./constraints-api";
 describe("saveConstraintConfig", () => {
   beforeEach(() => tracedFetch.mockReset());
 
-  it("throws the JSON body's `error` on a 422 refusal", async () => {
+  it("throws the JSON body's `error` on the workspace_root_unresolved 422", async () => {
     tracedFetch.mockResolvedValue(
       new Response(
         JSON.stringify({
-          error: "project_path is outside every allowed root",
-          code: "PROJECT_PATH_REFUSED",
-          hint: "pass a path inside the workspace",
+          success: false,
+          error: "the workspace root did not resolve",
+          code: "workspace_root_unresolved",
+          hint: { code: "workspace_root_unresolved", next_action: "set QONTINUI_ROOT" },
         }),
         { status: 422, headers: { "Content-Type": "application/json" } },
       ),
     );
-    await expect(saveConstraintConfig("x = 1", "/etc")).rejects.toThrow(
-      "Failed to save constraint config: project_path is outside every allowed root",
+    await expect(saveConstraintConfig("x = 1")).rejects.toThrow(
+      "Failed to save constraint config: the workspace root did not resolve",
+    );
+  });
+
+  it("falls back to the raw text when the JSON `error` is empty", async () => {
+    const body = JSON.stringify({ success: false, error: "", code: "workspace_root_unresolved" });
+    tracedFetch.mockResolvedValue(new Response(body, { status: 422 }));
+    await expect(saveConstraintConfig("x = 1")).rejects.toThrow(
+      `Failed to save constraint config: ${body}`,
     );
   });
 

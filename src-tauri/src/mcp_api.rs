@@ -24622,7 +24622,15 @@ mod provision_probe_tests {
         }
         std::fs::create_dir_all(repo.join(".git")).expect("create .git");
         let scratch_c = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
-        if enclosing_git_work_tree(&scratch_c).is_some() {
+        if let Some(work_tree) = enclosing_git_work_tree(&scratch_c) {
+            eprintln!(
+                "SKIPPED a_session_repo_is_vetted_read_only_and_its_rung_is_echoed: the \
+                 tempdir {} is inside the git work tree {}, so a scratch cwd there is \
+                 itself a checkout and the refusal arms this test exercises cannot be \
+                 reached; point TMPDIR outside any repository to run it",
+                scratch_c.display(),
+                work_tree.display()
+            );
             return;
         }
 

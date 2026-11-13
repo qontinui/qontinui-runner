@@ -67,10 +67,13 @@ export async function fetchConstraintConfig(projectPath?: string): Promise<ReadC
 }
 
 /**
- * The message of a failed save. The backend answers a refusal (e.g. the 422 for
- * an unsafe `project_path`) with JSON `{error, code, hint}`; its `error` is the
- * message. Anything else — a non-JSON body, or JSON without a string `error` —
- * falls back to the raw text.
+ * The message of a failed save. The backend's one typed refusal here is the 422
+ * for a save with no `project_path` when the workspace root does not resolve:
+ * the `ApiResponse` envelope `{success: false, error, code:
+ * "workspace_root_unresolved", hint}`, where `hint` is the shared Refusal
+ * envelope (an object). Its `error` is the message. Anything else — a non-JSON
+ * body, JSON without a string `error`, or an empty `error` — falls back to the
+ * raw text.
  */
 async function saveErrorMessage(response: Response): Promise<string> {
   const text = await response.text();
@@ -79,7 +82,8 @@ async function saveErrorMessage(response: Response): Promise<string> {
     if (
       body !== null &&
       typeof body === "object" &&
-      typeof (body as { error?: unknown }).error === "string"
+      typeof (body as { error?: unknown }).error === "string" &&
+      (body as { error: string }).error !== ""
     ) {
       return (body as { error: string }).error;
     }

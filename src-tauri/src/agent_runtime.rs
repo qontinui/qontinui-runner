@@ -11087,14 +11087,14 @@ fn overlay_absent_statement(
     if written > 0 {
         let absent = SiblingCheckoutAbsent::new(SIBLING, SiblingFallback::EmbeddedCopy);
         format!(
-            "{absent} Embedded default(s) written: {written}; tracked definition(s) kept: \
+            "{absent} Embedded default(s) written: {written}; existing definition(s) kept: \
              {kept}.{failure}"
         )
     } else if kept > 0 {
         format!(
-            "{headline} The {kept} agent definition(s) this repository tracks, or may track, \
-             were kept, and serve the capability in place of the copy built into the \
-             application.{failure}"
+            "{headline} The {kept} existing agent definition(s) on disk (tracked, or possibly \
+             tracked, by this repository, or not written by this runner) were kept, and \
+             serve the capability in place of the copy built into the application.{failure}"
         )
     } else if !failure.is_empty() {
         format!(
@@ -11209,11 +11209,40 @@ fn provision_agent_definitions_layers(
     // Retired names are candidates too, so a retired copy the repository tracks
     // is kept by the retirement pass below exactly as the layers keep theirs.
     candidates.extend(crate::fleet_agents::retired_agent_names(retired));
-    let keep = crate::provision_guard::KeepDecisions::decide(
+    let mut keep = crate::provision_guard::KeepDecisions::decide(
         &tracked,
         &dst_dir,
         candidates.iter().map(String::as_str),
     );
+    // AN OPERATOR'S UNTRACKED FILE IS KEPT TOO, in both layers. The tracked-file
+    // guard keeps only what a repository tracks, so an operator-authored
+    // `~/.claude/agents/code-reviewer.md` (a terminal opened at `$HOME`) or a
+    // gitignored `.claude/agents/*.md` at a bundled or overlay name used to be
+    // replaced silently. Decided here, once, before either layer writes, so the
+    // floor's refresh cannot turn an overlay copy into "ours" or the reverse:
+    // an existing destination is written only when its bytes are a copy this
+    // runner ships or shipped (`fleet_agents::foreign_destination_reason`), and
+    // never through a symlink. Retired names are the retirement pass's to judge
+    // by blob, as before. When the overlay source IS the destination, matching
+    // it proves nothing, so the source arm is withheld there.
+    let retired_names = crate::fleet_agents::retired_agent_names(retired);
+    let overlay_src = src_dir
+        .as_deref()
+        .ok()
+        .filter(|src| src.is_dir() && !same_directory(src, &dst_dir));
+    for name in candidates.iter().filter(|n| !retired_names.contains(n)) {
+        if keep.reason(name).is_some() {
+            continue;
+        }
+        if let Some(reason) = crate::fleet_agents::foreign_destination_reason(
+            &dst_dir.join(name),
+            name,
+            overlay_src,
+            retired,
+        ) {
+            keep.keep_also(name, reason);
+        }
+    }
 
     // FLOOR FIRST: write the defs bundled into this binary, so a device with no
     // qontinui-claude-config checkout gets a working subagent set instead of
@@ -11253,6 +11282,7 @@ fn provision_agent_definitions_layers(
                 s.reason,
                 capability_manifest::SkipReason::GitTracked
                     | capability_manifest::SkipReason::ProbeUnknownInRepo
+                    | capability_manifest::SkipReason::Rejected(_)
             )
         })
         .count();
@@ -11332,7 +11362,9 @@ fn provision_agent_definitions_layers(
 struct FloorOutcome<'a> {
     /// Definitions the floor wrote.
     written: usize,
-    /// Definitions it kept because the destination is, or may be, tracked.
+    /// Definitions it kept as found on disk: the destination is, or may be,
+    /// tracked, or it is an operator's file (or a symlink) this runner did not
+    /// write.
     kept: usize,
     /// The first write failure it hit, if any.
     write_failure: Option<&'a str>,
@@ -11386,18 +11418,20 @@ fn overlay_checkout_agent_definitions(
             src_dir.display(),
             dst_dir.display()
         );
-        return Ok(ProvisionReport::unresolved(
+        // The checkout DID answer: its definitions are what the session
+        // resolves, read where they stand. So the rung is the checkout's, with
+        // nothing to write and nothing expected, rather than `unresolved`.
+        return Ok(ProvisionReport::new(
             "agent_definitions",
             0,
-            dst_dir.display().to_string(),
-            format!(
-                "overlay not run: the source {} is the destination directory itself, so \
-                 nothing was copied and the checkout's own definitions are served in place \
-                 (a copy onto itself would truncate them)",
-                src_dir.display()
-            ),
+            capability_manifest::Rung::OperatorCheckout,
         )
-        .with_destination(dst_dir.display().to_string()));
+        .with_destination(dst_dir.display().to_string())
+        .with_detail(format!(
+            "served in place: the destination is the overlay checkout itself ({}), so \
+             nothing was copied (a copy onto itself would truncate the definitions)",
+            src_dir.display()
+        )));
     }
     std::fs::create_dir_all(dst_dir).map_err(|e| {
         anyhow::anyhow!(
@@ -11460,8 +11494,21 @@ fn overlay_checkout_agent_definitions(
             report.skip(unit, reason.clone());
             continue;
         }
-        // Per file as well as per directory: a destination that is a symlink
-        // or hard link to its own source would be truncated by the copy too.
+        // Never copy THROUGH a symlink: `fs::copy` follows it and would replace
+        // whatever it points at (its own source included). `keep` already holds
+        // a symlink decided before the floor ran; this re-check is per write.
+        if crate::fleet_agents::is_symlink(&dst) {
+            let reason = crate::fleet_agents::symlink_destination_reason(&dst);
+            info!(
+                "agent_runtime: not overlaying onto {} — {}",
+                dst.display(),
+                reason.describe()
+            );
+            report.skip(unit, reason);
+            continue;
+        }
+        // Per file as well as per directory: a destination that is a hard link
+        // to its own source would be truncated by the copy too.
         if same_file(&path, &dst) {
             info!(
                 "agent_runtime: not overlaying {} onto {} — they are the same file",
@@ -11517,28 +11564,26 @@ fn overlay_checkout_agent_definitions(
 }
 
 /// True when `a` and `b` name the same existing directory, through any
-/// symlink. Compared by canonical path, and on unix also by device + inode so a
-/// bind mount or a path canonicalize spells differently still matches. A path
-/// that does not exist is never "the same" as one that does.
+/// symlink. See [`same_fs_object`]. A path that does not exist is never "the
+/// same" as one that does.
 fn same_directory(a: &Path, b: &Path) -> bool {
     same_fs_object(a, b)
 }
 
 /// True when `a` and `b` resolve to the same existing file (symlink or hard
-/// link included). See [`same_directory`].
+/// link included). See [`same_fs_object`].
 fn same_file(a: &Path, b: &Path) -> bool {
     same_fs_object(a, b)
 }
 
+/// One filesystem object behind both paths, on every platform: the `same-file`
+/// crate compares device + inode on unix and volume serial + file index on
+/// Windows (directories included), so a hard link, a bind mount or a path
+/// `canonicalize` spells differently still matches. The canonical-path compare
+/// is the fallback when either handle cannot be opened.
 fn same_fs_object(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
-            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
-                return true;
-            }
-        }
+    if let Ok(same) = same_file::is_same_file(a, b) {
+        return same;
     }
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
@@ -15965,15 +16010,20 @@ mod tests {
             "the overlay must never truncate its own source"
         );
         assert_eq!(report.written, 0, "nothing is claimed as written");
-        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        // The checkout answered: its definitions are served where they stand.
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout
+        );
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         assert!(
-            report.skipped.iter().any(|u| matches!(
-                &u.reason,
-                crate::capability_manifest::SkipReason::Unresolved(why)
-                    if why.contains("destination directory itself")
-            )),
-            "the skip names why: {:?}",
-            report.skipped
+            report
+                .detail
+                .as_deref()
+                .is_some_and(|d| d
+                    .contains("served in place: the destination is the overlay checkout itself")),
+            "the detail names why: {:?}",
+            report.detail
         );
     }
 
@@ -15999,7 +16049,102 @@ mod tests {
             "a symlinked .claude must not turn the overlay into a self-copy"
         );
         assert_eq!(report.written, 0);
-        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout
+        );
+    }
+
+    /// A1: an operator's own UNTRACKED `code-reviewer.md` in a cwd outside any
+    /// repository (a terminal opened at `$HOME`) is kept byte for byte, while
+    /// the absent bundled definitions beside it are still written.
+    #[test]
+    fn provision_agent_defs_keeps_an_operators_untracked_definition() {
+        let root = tempfile::tempdir().unwrap(); // no qontinui-claude-config
+        let home = tempfile::tempdir().unwrap();
+        crate::provision_guard::test_support::assert_not_in_any_repo(home.path());
+        let agents = home.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let custom = b"---\nname: code-reviewer\n---\nthe operator's own reviewer\n";
+        std::fs::write(agents.join("code-reviewer.md"), custom).unwrap();
+
+        let _ = provision_agent_definitions_from_root(root.path(), &home.path().to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(agents.join("code-reviewer.md")).unwrap(),
+            custom,
+            "an operator-authored definition must never be overwritten"
+        );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(agents.join(&name).is_file(), "{name} should be written");
+        }
+    }
+
+    /// A1: a destination whose bytes are a copy this runner shipped is still
+    /// refreshed. Here the stale copy is an older version of the overlay
+    /// checkout's definition (a blob its object store holds), and the overlay
+    /// replaces it with the current one.
+    #[test]
+    fn provision_agent_defs_refreshes_a_copy_this_runner_shipped() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("qontinui-claude-config");
+        let src = checkout.join(".claude").join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        crate::provision_guard::test_support::git_init(&checkout);
+        let old = b"# local-agent, version 1\n";
+        std::fs::write(src.join("local-agent.md"), old).unwrap();
+        crate::provision_guard::test_support::git_add(
+            &checkout,
+            Path::new(".claude/agents/local-agent.md"),
+        );
+        let new = b"# local-agent, version 2\n";
+        std::fs::write(src.join("local-agent.md"), new).unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("local-agent.md"), old).unwrap();
+        // Beside it, a body this runner never shipped at a bundled name.
+        let reviewer = "code-reviewer.md";
+        std::fs::write(dst.join(reviewer), b"stale but unknown").unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(dst.join("local-agent.md")).unwrap(),
+            new,
+            "a shipped (older checkout) copy is refreshed"
+        );
+        assert_eq!(
+            std::fs::read(dst.join(reviewer)).unwrap(),
+            b"stale but unknown",
+            "an unknown body at a bundled name is kept"
+        );
+        assert_eq!(report.written, 1, "{:?}", report.skipped);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    }
+
+    /// A4: a destination symlink at a bundled name is never written through:
+    /// the file it points at keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_never_write_through_a_destination_symlink() {
+        let root = tempfile::tempdir().unwrap(); // no qontinui-claude-config
+        let wt = tempfile::tempdir().unwrap();
+        let target = wt.path().join("elsewhere.md");
+        std::fs::write(&target, b"SOURCE FILE").unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(&target, dst.join("code-reviewer.md")).unwrap();
+
+        let _ = provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"SOURCE FILE");
+        assert!(std::fs::symlink_metadata(dst.join("code-reviewer.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     /// Per file: a destination that is a symlink to its own source is skipped
@@ -16095,7 +16240,7 @@ mod tests {
     /// every spawn — by the embedded floor (this binary's render) and then by the
     /// PRIMARY checkout's copy, which sits at a different commit. A tracked,
     /// existing definition must be kept by BOTH layers and reported as such; an
-    /// untracked one is still refreshed from the checkout.
+    /// untracked copy the overlay shipped is still refreshed from the checkout.
     #[test]
     fn provision_agent_defs_keep_tracked_definitions_in_both_layers() {
         use crate::provision_guard::test_support::{git_add, git_init};
@@ -16109,6 +16254,13 @@ mod tests {
             .join("agents");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("merge-specialist.md"), "# PRIMARY copy").unwrap();
+        // The checkout once held loose.md as "# stale loose" (its object store
+        // has that blob), so a worktree copy with those bytes is one the overlay
+        // wrote, and is refreshed. An operator's own bytes would be kept.
+        let primary = root.path().join("qontinui-claude-config");
+        git_init(&primary);
+        std::fs::write(src.join("loose.md"), "# stale loose").unwrap();
+        git_add(&primary, Path::new(".claude/agents/loose.md"));
         std::fs::write(src.join("loose.md"), "# PRIMARY loose").unwrap();
 
         // The session worktree: a repo tracking its own definitions.
@@ -16122,7 +16274,8 @@ mod tests {
         std::fs::write(&tracked_floor, "# WORKTREE's own reviewer").unwrap();
         git_add(wt.path(), &tracked_overlay);
         git_add(wt.path(), &tracked_floor);
-        // Present but untracked: still the checkout's to refresh.
+        // Present but untracked, and a copy the overlay shipped: still the
+        // checkout's to refresh.
         std::fs::write(dst.join("loose.md"), "# stale loose").unwrap();
         assert!(
             crate::fleet_agents::embedded_agent_names()
@@ -16147,7 +16300,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dst.join("loose.md")).unwrap(),
             "# PRIMARY loose",
-            "an untracked definition is still refreshed from the checkout"
+            "an untracked copy the overlay shipped is still refreshed from the checkout"
         );
         let kept: Vec<_> = report
             .skipped
