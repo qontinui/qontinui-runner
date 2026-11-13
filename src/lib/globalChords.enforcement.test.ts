@@ -242,6 +242,10 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/terminal/FilePathLinkProvider.ts":
     "xterm link provider: Ctrl/Cmd must be held for a path to be clickable. Not a " +
     "chord — a hover/click modifier, with no key field read at all.",
+  "components/terminal/StructuredSessionCell.tsx":
+    "steering textarea: Enter sends, Shift+Enter newlines. The file landed on main " +
+    "after this branch opened (`15cf2c860`, 2026-09-16); ELEMENT-scoped `onKeyDown` " +
+    "on the textarea, so it claims no global chord and needs no KNOWN_KEY_CLAIMS row.",
   "components/terminal/TerminalFindBar.tsx":
     "F3 / Shift+F3 pick the find direction. Shift-only, and `matchesChord` cannot " +
     "express a shift-only chord — see keyClaimScan.ts::CONTROL_TAGS.",
@@ -252,10 +256,6 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
     "Alt+←/→ reorders the FOCUSED page tab — the non-drag alternative WCAG 2.5.7 " +
     "requires for drag-to-reorder. An ELEMENT-scoped `onKeyDown` on the tab button, " +
     "inventoried in KNOWN_KEY_CLAIMS.",
-  "components/terminal/WorkerSessionCell.tsx":
-    "steering textarea: Enter sends, Shift+Enter newlines. The file landed on main " +
-    "after this branch opened (`15cf2c860`, 2026-09-16); ELEMENT-scoped `onKeyDown` " +
-    "on the textarea, so it claims no global chord and needs no KNOWN_KEY_CLAIMS row.",
   "components/terminal/ZoneControlPanel.tsx": "textarea: Enter submits, Shift+Enter newlines",
   "components/terminal/ZoneGrid.tsx":
     "Ctrl/Cmd+CLICK multi-selects a zone. A pointer modifier, not a key chord.",

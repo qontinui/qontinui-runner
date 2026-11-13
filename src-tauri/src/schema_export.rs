@@ -34,8 +34,8 @@ use serde_json::{Map, Value};
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, agent_commands as qac, agent_text_units as qatu, ai_workflows as qaw,
-        app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
-        constraints as qc, discovery as qdc, execution as qe, findings as qfn,
+        app_events as qae, apps as qap, cli_session as qcs, completeness_verdict as qcv,
+        config as qcfg, constraints as qc, discovery as qdc, execution as qe, findings as qfn,
         functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht,
         image_slot as qis, ir as qir, journey as qj, mcp_config as qmc, memory as qmem,
         orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
@@ -522,6 +522,16 @@ pub fn export_all_schemas() -> Value {
     add!("TerminalInfo", qtm::TerminalInfo);
     add!("TerminalOutputEvent", qtm::TerminalOutputEvent);
     add!("TerminalExitEvent", qtm::TerminalExitEvent);
+
+    // ── qontinui-types: cli_session ──
+    // The per-CLI profile manifest (served by `GET /terminals/cli-profiles` and
+    // the `terminal_cli_profiles` Tauri command), the session-failure taxonomy,
+    // and the tri-state both use. Their nested fact enums are inlined per type;
+    // `CapabilityState` is top-level because the runner's `model_catalog`
+    // shares it.
+    add!("CapabilityState", qcs::CapabilityState);
+    add!("CliProfile", qcs::CliProfile);
+    add!("SessionFailure", qcs::SessionFailure);
 
     // ── runner-local: findings (Tauri `finding_detected` / `finding_resolved`
     // payloads). Distinct from `qontinui_types::verification::Finding`
@@ -1107,8 +1117,12 @@ mod tests {
         // verifier that alone filled them, plan
         // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
         // Phase 6) = 620.
-        // The codegen's "Processing N top-level types" line should read 620 here.
-        assert_eq!(obj.len(), 620, "Expected 620 schema entries");
+        // + the 3 cli_session types (CapabilityState, CliProfile,
+        // SessionFailure — plan
+        // 2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy
+        // Phase 4) = 623.
+        // The codegen's "Processing N top-level types" line should read 623 here.
+        assert_eq!(obj.len(), 623, "Expected 623 schema entries");
         // Nothing in the product fills those four any more, so registering
         // one again would export a verdict DTO that has no producer.
         for removed in [

@@ -472,7 +472,7 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
         .names
         .keys()
         .copied()
-        .filter(|p| pt::is_countable_claude(*p, &snap))
+        .filter(|p| pt::is_countable_ai_cli(*p, &snap))
         .collect();
     holder_from_command_lines(pt::command_lines_for_pids(&pids).await, id)
 }
@@ -510,7 +510,7 @@ async fn read_claude_procs(
     if snap.is_unknown() {
         return None;
     }
-    let pids = pt::claude_pids_in_inclusive_subtree(root, &snap);
+    let pids = pt::ai_cli_pids_in_inclusive_subtree(root, &snap);
     // An UNKNOWN command-line read skips this poll (`None`), exactly as an
     // UNKNOWN table does: a list built from it would drop every process (each
     // `ClaudeProc` needs its cmdline) and read as "the resumed claude is not
@@ -899,6 +899,7 @@ mod tests {
             closed_at: Some(5),
             close_reason: None,
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            lane: super::super::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             awaiting_account_since: None,

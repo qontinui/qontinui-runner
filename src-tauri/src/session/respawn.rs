@@ -532,7 +532,9 @@ fn materialize_from(
 /// whatever the transcript scanner discovers. De-duplicated, order preserved.
 fn local_config_dirs() -> Vec<String> {
     let mut out: Vec<String> = crate::settings::get_claude_config_dirs();
-    for d in crate::terminal::transcript::find_claude_config_dirs() {
+    for d in crate::terminal::transcript::find_transcript_config_dirs(
+        &qontinui_runner_lib::cli_profile::claude::PROFILE,
+    ) {
         let s = d.to_string_lossy().into_owned();
         if !out.contains(&s) {
             out.push(s);
@@ -908,6 +910,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             awaiting_account_since: None,

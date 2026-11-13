@@ -1809,6 +1809,7 @@ fn registry_record_from_restore_payload(
         closed_at: None,
         close_reason: None,
         provider,
+        lane: crate::session::session_lifecycle_store::SessionLane::Pty,
         origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
         awaiting_account_since: None,

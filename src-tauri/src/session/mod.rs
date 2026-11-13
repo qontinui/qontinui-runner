@@ -62,14 +62,18 @@ pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/s
 pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
+pub mod codex_capture; // Codex read-back identity: the session id from its rollout file, matched by cwd (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 6)
 pub mod coord_identity; // THE seam that re-keys a pane's coord row to the harness id pid-exact evidence names — hook, rung 2, R2 resume (plan 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row, D1)
 pub mod coord_sync;
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
+pub mod failure; // One session-failure taxonomy + classifier + recovery table (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 7)
+pub mod failure_recovery; // Records, announces and executes the recovery policy for a classified failure (same plan, Phase 7)
 pub mod handoff;
 pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
 pub mod intent;
+pub mod launch_spec; // The profile-driven AI-CLI launch builder: one flag model, argv + PTY renderers (moved from claude_session/ by plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 6)
 pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)

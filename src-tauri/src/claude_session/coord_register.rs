@@ -606,7 +606,7 @@ impl AiCoordRegistrar {
     /// Session-identity fabric Phase 3 — register a SNIFFED interactive
     /// session (a `claude --resume <id>` / `--session-id <id>` line the
     /// operator typed into a plain terminal, lifted by
-    /// [`crate::terminal::claude_resume_sniff`]) with coord, through the SAME
+    /// [`crate::terminal::typed_resume_sniff`]) with coord, through the SAME
     /// machinery as [`Self::register_session`].
     ///
     /// Differences from the pinned plane, both derived from `task_run_id`
@@ -3820,6 +3820,7 @@ mod tests {
                 closed_at: None,
                 close_reason: None,
                 provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                lane: crate::session::session_lifecycle_store::SessionLane::Pty,
                 origin: None,
                 restore_pending_at: None,
                 awaiting_account_since: None,
@@ -3928,6 +3929,7 @@ mod tests {
                 closed_at: None,
                 close_reason: None,
                 provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                lane: crate::session::session_lifecycle_store::SessionLane::Pty,
                 origin: None,
                 restore_pending_at: None,
                 awaiting_account_since: None,

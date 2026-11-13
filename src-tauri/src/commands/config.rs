@@ -627,7 +627,7 @@ pub fn get_claude_session_permission() -> Result<CommandResponse, String> {
 /// `{"mode":"allow_list","tools":[…]}`.
 #[tauri::command]
 pub fn save_claude_session_permission(
-    permission: crate::claude_session::launch_spec::SessionPermissionSetting,
+    permission: crate::session::launch_spec::SessionPermissionSetting,
 ) -> Result<CommandResponse, String> {
     let stored = settings::save_claude_session_permission(permission)?;
     info!("Saved session permission posture: {:?}", stored);
@@ -638,55 +638,80 @@ pub fn save_claude_session_permission(
     })
 }
 
-/// Build the PTY launch command for a new AI (`/spawn-ai`) session, routed
-/// through the shared launch-spec builder ([`crate::claude_session::launch_spec`]).
+/// Build the PTY launch command for a new AI session of `provider`, routed
+/// through the shared launch-spec builder ([`crate::session::launch_spec`]).
 ///
 /// This is the single source of truth for the #779 frontend `aiLaunchCommand.ts`
-/// (now a thin wrapper): the operator's per-account override and machine-global
-/// `claude_default_launch_command` flags layer in here, so the PTY-typed spawn
-/// and the argv spawn sites can never drift.
+/// (now a thin wrapper): every CLI spelling comes from `provider`'s CLI profile,
+/// and for a Claude launch the operator's per-account override and
+/// machine-global `claude_default_launch_command` flags layer in here, so the
+/// PTY-typed spawn and the argv spawn sites can never drift.
 ///
 /// # Arguments
-/// * `config_dir` - The account's `CLAUDE_CONFIG_DIR` (env-prefixed onto the
-///   command; also selects the per-account override template).
+/// * `provider` - The CLI profile id to launch (`"claude"`, `"codex"`). An
+///   unknown id is refused rather than launched as another CLI.
+/// * `config_dir` - The account dir, env-prefixed through the profile's account
+///   variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`); for Claude it also selects
+///   the per-account override template. `None` launches under the CLI's own
+///   default account.
 /// * `session_id` - Fresh UUIDv4 minted by the frontend (it needs the id
-///   synchronously to record the tab), pinned as `--session-id`/`{sessionId}`.
+///   synchronously to record the tab), pinned as `--session-id`/`{sessionId}`
+///   when the profile pins.
 /// * `is_windows` - PowerShell (`$env:…`) vs POSIX (`VAR=…`) env-prefix + quoting.
 ///
 /// Returns `{ command, pinnedSessionId }` matching the `AiLaunchCommand` TS
-/// contract. `pinnedSessionId` is the passed `session_id` when a real `claude`
-/// command was built; `null` when the per-account override was an opaque alias
-/// returned verbatim (no pin — the mtime-capture fallback then applies). The
-/// alias case is detected the same way the frontend did: a pinned command
-/// contains the id; a verbatim alias does not.
+/// contract. `pinnedSessionId` is the passed `session_id` only when the command
+/// actually pins it. It is `null` for a profile that reads its id back (Codex
+/// mints its own; the runner records it once its identity shim signals the
+/// start) and when a Claude per-account override was an opaque alias returned
+/// verbatim (no pin). The alias case is detected the way the frontend did: a
+/// pinned command contains the id; a verbatim alias does not.
 #[tauri::command]
 pub fn build_ai_launch_command(
-    config_dir: String,
+    provider: String,
+    config_dir: Option<String>,
     session_id: Option<String>,
     is_windows: bool,
 ) -> Result<CommandResponse, String> {
-    use crate::claude_session::launch_spec::{
-        render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
-    };
+    use crate::session::launch_spec::{render_pty_command, LaunchConfig, LaunchSpec};
 
+    let profile = qontinui_runner_lib::cli_profile::profile_for(&provider)
+        .ok_or_else(|| format!("no CLI profile for provider {provider:?}; nothing launched"))?;
+    let config_dir = config_dir.filter(|d| !d.trim().is_empty());
     // A declared model gateway owns the session's account: the typed
     // `CLAUDE_CONFIG_DIR` prefix names the gateway config dir, never the
     // subscription account the UI picked (`crate::model_gateway`). A gateway
     // whose dir could not be prepared, or is unresolved, refuses (review N1).
+    // Only Claude speaks the gateway's protocol, so while one is declared (or
+    // its state is unresolved) another CLI is refused rather than launched
+    // straight at its vendor — the same rule the resume renderer applies.
     let gateway_declared = crate::model_gateway::gateway_declared();
-    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
-        return Err(refusal);
+    if gateway_declared && profile.id != qontinui_runner_lib::cli_profile::claude::ID {
+        return Err(format!(
+            "refusing to launch a {} session: a model gateway is configured and only Claude \
+             sessions can route through it",
+            profile.id
+        ));
     }
-    let config_dir = gateway_launch_dir(
-        gateway_declared,
-        crate::model_gateway::session_config_dir_override(),
-        config_dir,
-    )?;
-    crate::claude_session::launch_spec::check_shell_safe_path(&config_dir)?;
-    let cfg = LaunchConfig::from_settings(Some(&config_dir));
+    let config_dir = if gateway_declared {
+        if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+            return Err(refusal);
+        }
+        Some(gateway_launch_dir(
+            gateway_declared,
+            crate::model_gateway::session_config_dir_override(),
+            config_dir.unwrap_or_default(),
+        )?)
+    } else {
+        config_dir
+    };
+    if let Some(dir) = &config_dir {
+        crate::session::launch_spec::check_shell_safe_path(dir)?;
+    }
+    let cfg = LaunchConfig::from_settings(config_dir.as_deref());
     let spec = LaunchSpec {
-        config_dir: Some(config_dir),
-        permission: PermissionMode::BypassPermissions,
+        provider: profile,
+        config_dir,
         session_id: session_id.clone(),
         ..Default::default()
     };
@@ -700,7 +725,7 @@ pub fn build_ai_launch_command(
     }
 
     let pinned_session_id = match &session_id {
-        Some(id) if command.contains(id.as_str()) => Some(id.clone()),
+        Some(id) if spec.pins_session_id() && command.contains(id.as_str()) => Some(id.clone()),
         _ => None,
     };
 
@@ -841,9 +866,9 @@ pub(crate) fn render_ai_resume_command(
     gateway_config_dir: Option<&str>,
     is_windows: bool,
     full_resume: bool,
-    posture: &crate::claude_session::launch_spec::SessionPermissionSetting,
+    posture: &crate::session::launch_spec::SessionPermissionSetting,
 ) -> Result<String, String> {
-    use crate::claude_session::launch_spec::{
+    use crate::session::launch_spec::{
         render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
     };
     if session_id.is_empty()
@@ -856,14 +881,29 @@ pub(crate) fn render_ai_resume_command(
         ));
     }
     // Only Claude speaks the gateway's protocol (review N7): another
-    // provider's resume is refused while a gateway is declared. With no
-    // gateway, every provider currently resumes through the Claude adapter
-    // (`session::provider_adapter::adapter_for`), as the frontend did.
+    // provider's resume is refused while a gateway is declared.
     let provider = provider.trim();
     if gateway_declared && !provider.is_empty() && provider != "claude" {
         return Err(format!(
             "refusing to resume a {provider} session: a model gateway is configured and only \
              Claude sessions can route through it"
+        ));
+    }
+    // The resume line is the provider's own: a row recorded before providers
+    // existed is a Claude row; a provider with no profile, or whose profile
+    // does not promise the conversation back by id (`restore_tier`), is
+    // refused rather than typed as another CLI's resume.
+    let profile_id = if provider.is_empty() {
+        qontinui_runner_lib::cli_profile::claude::ID
+    } else {
+        provider
+    };
+    let profile = qontinui_runner_lib::cli_profile::profile_for(profile_id)
+        .ok_or_else(|| format!("refusing to resume: no CLI profile for provider {profile_id:?}"))?;
+    if profile.restore_tier != qontinui_types::cli_session::RestoreTier::Full {
+        return Err(format!(
+            "refusing to resume a {profile_id} session: its CLI profile does not promise the \
+             conversation back by id"
         ));
     }
     // The gateway dir wins over whatever account the tab recorded, and a
@@ -880,9 +920,10 @@ pub(crate) fn render_ai_resume_command(
     .map(str::trim)
     .filter(|d| !d.is_empty());
     if let Some(dir) = config_dir {
-        crate::claude_session::launch_spec::check_shell_safe_path(dir)?;
+        crate::session::launch_spec::check_shell_safe_path(dir)?;
     }
     let spec = LaunchSpec {
+        provider: profile,
         config_dir: config_dir.map(str::to_string),
         permission: PermissionMode::BypassPermissions,
         resume_id: Some(session_id.to_string()),
@@ -948,7 +989,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod resume_render_tests {
     use super::{render_ai_resume_command, resume_gate_env};
-    use crate::claude_session::launch_spec::SessionPermissionSetting;
+    use crate::session::launch_spec::SessionPermissionSetting;
 
     const SID: &str = "230feb99-2dd7-42d7-92bc-6d36c1883089";
 
@@ -1117,6 +1158,31 @@ mod resume_render_tests {
         )
         .unwrap_err();
         assert!(err.contains("gemini"), "{err}");
+    }
+
+    /// A resume is the provider's own line: a provider with no profile, or one
+    /// whose profile restores terminal-only (Codex), is refused rather than
+    /// typed as `claude --resume <its id>`.
+    #[test]
+    fn a_resume_without_a_full_tier_profile_is_refused() {
+        let render = |provider: &str| {
+            render_ai_resume_command(
+                SID,
+                provider,
+                None,
+                false,
+                None,
+                false,
+                false,
+                &Default::default(),
+            )
+        };
+        let codex = render(qontinui_runner_lib::cli_profile::codex::ID).unwrap_err();
+        assert!(codex.contains("codex"), "{codex}");
+        let unknown = render("gemini").unwrap_err();
+        assert!(unknown.contains("no CLI profile"), "{unknown}");
+        // A pre-provider row is a Claude row.
+        assert!(render("").unwrap().contains(&format!("--resume {SID}")));
     }
 
     #[test]

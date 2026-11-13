@@ -268,6 +268,7 @@ _No hits._
 | `src/ci_node/executor.rs` | `spawn_step_child` | `let mut shim = build_step_command("cmd.exe", &argv);` | 1 | unreviewed |
 | `src/ci_node/services.rs` | `reap_blocking` | `spawn("cmd.exe", &shim_argv)` | 1 | unreviewed |
 | `src/ci_node/tools.rs` | `run_capture_env` | `let mut shim = build("cmd.exe", &argv_ref, path_dir, envs);` | 1 | unreviewed |
+| `src/cli_profile/mod.rs` | `program_stem` | `for suffix in [".exe", ".cmd", ".bat", ".ps1"] {` | 1 | fallback_correct — Strips a Windows launcher suffix (.exe/.cmd/.bat/.ps1) off a program name so 'claude.cmd' and 'claude' match the same CLI profile. On every other OS the names carry no suffix, the loop matches nothing and the bare basename is returned; no Windows tool is invoked. |
 | `src/commands/saved_projects.rs` | `is_drive_rooted` | `cfg(windows)-only fn 'is_drive_rooted' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `resolve_subst_once` | `cfg(windows)-only fn 'resolve_subst_once' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `rewrite_msys_root` | `cfg(windows)-only fn 'rewrite_msys_root' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
@@ -304,6 +305,7 @@ _No hits._
 | `src/health_monitor.rs` | `probe_ui_thread_blocking` | `cfg(windows)-only fn 'probe_ui_thread_blocking' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `copy_exe_stub` | `cfg(windows)-only fn 'copy_exe_stub' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `exe_shadow_needed` | `cfg(windows)-only fn 'exe_shadow_needed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/install_effects_producer/intercept/shim_materializer.rs` | `identity_cmd_template` | `cfg(windows)-only fn 'identity_cmd_template' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows '.cmd' flavour of the identity shim, called only from the cfg(windows) block of write_identity_shims_for. Every OS gets the extensionless bash shim from identity_bash_template, so a non-Windows sibling would have nothing to render. |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `locate_stub_exe` | `cfg(windows)-only fn 'locate_stub_exe' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `From Windows PowerShell spell it 'curl.exe' (bare 'curl' there is an alias of 'Invoke-WebRequest'), or use 'Invoke-RestMethod -Method Pos...` | 1 | unreviewed |
 | `src/mcp/ui_bridge/screenshots.rs` | `capture_webview_contents` | `cfg(windows)-only fn 'capture_webview_contents' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
@@ -337,7 +339,6 @@ _No hits._
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_check_step` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `"powershell"` | 1 | unreviewed |
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
-| `src/terminal/claude_resume_sniff.rs` | `is_claude_program` | `matches!(base, "claude" \| "claude.exe" \| "claude.cmd" \| "claude.ps1")` | 1 | unreviewed |
 | `src/terminal/session.rs` | `TerminalSession::assign_to_job_object` | `cfg(windows)-only fn 'assign_to_job_object' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/ui_thread_probe.rs` | `resolve_own_main_window` | `cfg(windows)-only fn 'resolve_own_main_window' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/webview_recovery.rs` | `attach_process_failed` | `cfg(windows)-only fn 'attach_process_failed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

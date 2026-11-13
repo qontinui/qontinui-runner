@@ -1,0 +1,153 @@
+{
+  "cli": "claude",
+  "cli_version": "2.1.285",
+  "recorded": "2026-09-30",
+  "host_os": "linux",
+  "redaction": "uuids -> 00000000-0000-4000-8000-00000000000N (consistent per scenario across stdout/stdin); cwd -> /redacted/cwd; config dir -> /redacted/config; other home paths -> /redacted/path; account email/organization -> redacted; thinking signatures -> redacted; pid -> 0; toolu_/msg_/req_ ids -> *_redacted_NN. Otherwise byte-for-byte CLI stdout.",
+  "scenarios": {
+    "plain_turn": {
+      "stdout": "plain_turn.ndjson",
+      "stdin": "plain_turn.stdin.ndjson",
+      "argv": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "00000000-0000-4000-8000-000000000001",
+        "--model",
+        "haiku",
+        "--setting-sources",
+        "project",
+        "--strict-mcp-config"
+      ],
+      "extra_env": {},
+      "exit_code": 0,
+      "killed_by_probe_watchdog": false,
+      "probe_watchdog_secs": null,
+      "control_requests_received": [],
+      "write_target_created": false,
+      "stderr": ""
+    },
+    "errored_turn_invalid_model": {
+      "stdout": "errored_turn_invalid_model.ndjson",
+      "stdin": "errored_turn_invalid_model.stdin.ndjson",
+      "argv": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "00000000-0000-4000-8000-000000000001",
+        "--model",
+        "claude-nonexistent-probe-model-0",
+        "--setting-sources",
+        "project",
+        "--strict-mcp-config"
+      ],
+      "extra_env": {},
+      "exit_code": 1,
+      "killed_by_probe_watchdog": false,
+      "probe_watchdog_secs": null,
+      "control_requests_received": [],
+      "write_target_created": false,
+      "stderr": "[claude-code:unrecognized_model] {\"model\":\"claude-nonexistent-probe-model-0\",\"query_source\":\"sdk\"}\n"
+    },
+    "can_use_tool_runner_shape_ignored": {
+      "stdout": "can_use_tool_runner_shape_ignored.ndjson",
+      "stdin": "can_use_tool_runner_shape_ignored.stdin.ndjson",
+      "argv": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "00000000-0000-4000-8000-000000000001",
+        "--model",
+        "haiku",
+        "--setting-sources",
+        "project",
+        "--strict-mcp-config",
+        "--permission-prompt-tool",
+        "stdio"
+      ],
+      "extra_env": {},
+      "exit_code": -9,
+      "killed_by_probe_watchdog": true,
+      "probe_watchdog_secs": 90.0,
+      "control_requests_received": [
+        "can_use_tool"
+      ],
+      "write_target_created": false,
+      "stderr": ""
+    },
+    "can_use_tool_sdk_allow_with_session_state_events": {
+      "stdout": "can_use_tool_sdk_allow_with_session_state_events.ndjson",
+      "stdin": "can_use_tool_sdk_allow_with_session_state_events.stdin.ndjson",
+      "argv": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "00000000-0000-4000-8000-000000000002",
+        "--model",
+        "haiku",
+        "--setting-sources",
+        "project",
+        "--strict-mcp-config",
+        "--permission-prompt-tool",
+        "stdio"
+      ],
+      "extra_env": {
+        "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"
+      },
+      "exit_code": 0,
+      "killed_by_probe_watchdog": false,
+      "probe_watchdog_secs": null,
+      "control_requests_received": [
+        "can_use_tool"
+      ],
+      "write_target_created": true,
+      "stderr": ""
+    },
+    "can_use_tool_sdk_deny": {
+      "stdout": "can_use_tool_sdk_deny.ndjson",
+      "stdin": "can_use_tool_sdk_deny.stdin.ndjson",
+      "argv": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "00000000-0000-4000-8000-000000000001",
+        "--model",
+        "haiku",
+        "--setting-sources",
+        "project",
+        "--strict-mcp-config",
+        "--permission-prompt-tool",
+        "stdio"
+      ],
+      "extra_env": {},
+      "exit_code": 0,
+      "killed_by_probe_watchdog": false,
+      "probe_watchdog_secs": null,
+      "control_requests_received": [
+        "can_use_tool"
+      ],
+      "write_target_created": false,
+      "stderr": ""
+    }
+  }
+}

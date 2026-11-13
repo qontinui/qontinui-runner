@@ -219,7 +219,7 @@ function ZoneGridInner({
    *
    * There is no worker-tab case to skip here. A Conductor worker's tab is
    * `sessionBacked` and both mount sites below render it through
-   * `WorkerSessionCell`, never `TerminalInstance` — and `onTitleChange` is
+   * `StructuredSessionCell`, never `TerminalInstance` — and `onTitleChange` is
    * passed to `TerminalInstance` alone. A worker emits no OSC 0/2 at all
    * (it is an in-process stream-json session, not a pty), so the `Worker N`
    * pin is enforced by the mount split, not by a test in this callback. The

@@ -482,7 +482,9 @@ impl SessionDirectory {
     pub fn discover() -> Self {
         Self::discover_from(
             &session_names_dir(),
-            &crate::terminal::transcript::find_claude_config_dirs(),
+            &crate::terminal::transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE,
+            ),
         )
     }
 

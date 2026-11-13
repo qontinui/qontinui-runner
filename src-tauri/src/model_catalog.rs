@@ -39,48 +39,13 @@
 // Capability state
 // ============================================================================
 
-/// Three-valued capability fact.
+/// Three-valued capability fact — the shared tri-state, defined once in
+/// `qontinui-types` so this model/API layer and the CLI-session layer
+/// (`qontinui_runner_lib::cli_profile`) speak one vocabulary.
 ///
 /// `Unknown` is the default for anything the catalog does not state. It is a
 /// distinct value from `Unsupported` on purpose — see the module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CapabilityState {
-    /// The catalog states the capability is available.
-    Supported,
-    /// The catalog states the capability is NOT available.
-    Unsupported,
-    /// The catalog says nothing. **Not** a synonym for `Unsupported`.
-    ///
-    /// This is the `Default` on purpose: a `CapabilityState` that nobody set
-    /// must read as "we never asked", never as "no".
-    #[default]
-    Unknown,
-}
-
-impl CapabilityState {
-    /// True only when the catalog positively states support.
-    ///
-    /// Do NOT use this to decide whether to strip content — `Unknown` returns
-    /// `false` here, and treating that as "strip" is the exact coercion this
-    /// type exists to prevent. Use [`Self::is_known_unsupported`] for that.
-    pub fn is_supported(self) -> bool {
-        matches!(self, Self::Supported)
-    }
-
-    /// True only when the catalog positively states the capability is absent.
-    ///
-    /// This is the correct predicate for "should I downgrade?": an `Unknown`
-    /// fact answers `false`, so the capability is attempted and the backend
-    /// gets to be the authority.
-    pub fn is_known_unsupported(self) -> bool {
-        matches!(self, Self::Unsupported)
-    }
-
-    /// True when the catalog has no opinion.
-    pub fn is_unknown(self) -> bool {
-        matches!(self, Self::Unknown)
-    }
-}
+pub use qontinui_types::cli_session::CapabilityState;
 
 // ============================================================================
 // API shape (the second layer)
