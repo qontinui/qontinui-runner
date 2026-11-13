@@ -1538,7 +1538,7 @@ mod tests {
         assert_eq!(window(), 420_000);
         assert!(window() >= 2 * TTL_MS);
         assert!(window() >= orphan_grace_ms(GRACE_SECS) + TTL_MS);
-        assert!(DISPLACED_MIN_HELD_TICKS >= 6);
+        const { assert!(DISPLACED_MIN_HELD_TICKS >= 6) }
     }
 
     #[test]

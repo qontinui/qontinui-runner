@@ -2200,9 +2200,9 @@ mod tests {
 
     /// Take a slot on `table`, charged to the calling thread's lane there.
     ///
-    /// `#[must_use]` for the same reason [`BlockingSlot`] carries it: a slot that
-    /// is not HELD counts nothing.
-    #[must_use]
+    /// Must be held: [`BlockingSlot`] is itself `#[must_use]`, because a slot
+    /// that is not HELD counts nothing, and a function returning it inherits
+    /// that.
     fn enter_in(table: &'static LaneTable) -> BlockingSlot {
         BlockingSlot::enter_lane_in(table, table.lane_for_thread(&std::thread::current()))
     }

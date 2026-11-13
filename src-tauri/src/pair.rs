@@ -7111,8 +7111,11 @@ mod one_binding_store_tests {
 
         // Canonical = the LEGACY copy (an instance-scoped runner pointed at
         // `%APPDATA%`); the other computed path is the live v2 default.
-        let report =
-            converge_binding_store_with(&b.roaming_legacy, &[b.local.clone()], &credentialed);
+        let report = converge_binding_store_with(
+            &b.roaming_legacy,
+            std::slice::from_ref(&b.local),
+            &credentialed,
+        );
 
         assert!(report.wrote_canonical, "canonical must be rewritten");
         assert!(
@@ -7320,7 +7323,8 @@ mod one_binding_store_tests {
         );
         write(&other, "{ this is not json");
 
-        let report = converge_binding_store_with(&canonical, &[other.clone()], &credentialed);
+        let report =
+            converge_binding_store_with(&canonical, std::slice::from_ref(&other), &credentialed);
         assert_eq!(report.unreadable, vec![other.clone()]);
         assert!(report.retained.is_empty(), "an unread copy is not absorbed");
         assert!(other.exists(), "and it is left in place");
@@ -7340,7 +7344,8 @@ mod one_binding_store_tests {
         let other = tmp.path().join("other/paired_user.json");
         write(&other, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
 
-        let report = converge_binding_store_with(&canonical, &[other.clone()], &credentialed);
+        let report =
+            converge_binding_store_with(&canonical, std::slice::from_ref(&other), &credentialed);
         assert_eq!(report, BindingStoreMergeReport::default());
         assert!(!canonical.exists());
         assert!(other.exists(), "and the other copy is left alone");
@@ -7433,7 +7438,7 @@ mod converge_retains_every_absorbed_copy_tests {
 
         let report = converge_binding_store_with(
             &instance,
-            &[primary.clone()],
+            std::slice::from_ref(&primary),
             &|_t: &uuid::Uuid, _d: bool| Some(true),
         );
 
@@ -7474,7 +7479,7 @@ mod converge_retains_every_absorbed_copy_tests {
 
         let report = converge_binding_store_with(
             &canonical,
-            &[canonical.clone()],
+            std::slice::from_ref(&canonical),
             &|_t: &uuid::Uuid, _d: bool| Some(true),
         );
 

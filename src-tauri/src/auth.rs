@@ -4019,14 +4019,15 @@ mod bearer_selection_tests {
                     if let Some(j) = legacy {
                         mgr.store_tokens(j, "").unwrap();
                     }
-                    let default_tenant = Some(if is_default { t } else { stranger });
+                    let default_id = if is_default { t } else { stranger };
+                    let default_tenant = Some(default_id);
                     // A device stating exactly ONE binding, the default one.
                     // Written per cell because `default_tenant` moves with it.
                     std::fs::write(
                         amb.dir().join("paired_user.json"),
                         serde_json::json!({
-                            "default_tenant_id": default_tenant.unwrap().to_string(),
-                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                            "default_tenant_id": default_id.to_string(),
+                            "bindings": [{"tenant_id": default_id.to_string()}]
                         })
                         .to_string(),
                     )
@@ -5228,14 +5229,15 @@ mod bearer_selection_tests {
                     if let Some(j) = legacy {
                         mgr.store_tokens(j, "").unwrap();
                     }
-                    let default_tenant = Some(if is_default { t } else { stranger });
+                    let default_id = if is_default { t } else { stranger };
+                    let default_tenant = Some(default_id);
                     // A device stating exactly ONE binding, the default one.
                     // Written per cell because `default_tenant` moves with it.
                     std::fs::write(
                         amb.dir().join("paired_user.json"),
                         serde_json::json!({
-                            "default_tenant_id": default_tenant.unwrap().to_string(),
-                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                            "default_tenant_id": default_id.to_string(),
+                            "bindings": [{"tenant_id": default_id.to_string()}]
                         })
                         .to_string(),
                     )
@@ -5936,19 +5938,25 @@ mod device_jwt_tests {
     /// token's own lifetime makes `cognito_token_needs_refresh` permanently
     /// true. The device-JWT constant (4_800s) violates it, which is exactly
     /// why Cognito may not borrow it.
+    ///
+    /// Both operands are constants, so the check is a `const` block: a
+    /// violation fails the test target's COMPILATION rather than a test run
+    /// (a const panic message cannot interpolate, so the values are named in
+    /// the compile error's source line instead).
     #[test]
     fn cognito_threshold_is_below_token_ttl() {
-        assert!(
-            COGNITO_REFRESH_BEFORE_EXPIRY_SECS < COGNITO_ACCESS_TOKEN_TTL_SECS,
-            "a refresh threshold >= the token TTL makes every freshly-minted \
-             token instantly stale (threshold={COGNITO_REFRESH_BEFORE_EXPIRY_SECS}, \
-             ttl={COGNITO_ACCESS_TOKEN_TTL_SECS})"
-        );
-        assert!(
-            REFRESH_BEFORE_EXPIRY_SECS >= COGNITO_ACCESS_TOKEN_TTL_SECS,
-            "regression guard: the device-JWT threshold exceeds the Cognito \
-             TTL, so reusing it for Cognito reintroduces the always-stale loop"
-        );
+        const {
+            assert!(
+                COGNITO_REFRESH_BEFORE_EXPIRY_SECS < COGNITO_ACCESS_TOKEN_TTL_SECS,
+                "a refresh threshold >= the token TTL makes every freshly-minted \
+                 token instantly stale"
+            );
+            assert!(
+                REFRESH_BEFORE_EXPIRY_SECS >= COGNITO_ACCESS_TOKEN_TTL_SECS,
+                "regression guard: the device-JWT threshold exceeds the Cognito \
+                 TTL, so reusing it for Cognito reintroduces the always-stale loop"
+            );
+        }
     }
 
     /// The reported symptom, at the unit level: store tokens exactly as
