@@ -2257,6 +2257,10 @@ pub async fn session_ledger_report(
 /// page already restored without it is not reported as still owed a restore
 /// ([`crate::session::awaiting_restore::PagesRestored`]). Keyed by window
 /// label, as each window restores the pages it shows.
+///
+/// It trusts the local webview, its only caller, for WHICH pages it names;
+/// it bounds only the size: blank ids are skipped and each list keeps at most
+/// [`MAX_REPORTED_PAGES`] ids.
 #[tauri::command]
 pub fn terminal_report_restore_progress(
     window: tauri::Window,
@@ -2264,15 +2268,25 @@ pub fn terminal_report_restore_progress(
     deferred_pages: Vec<String>,
     known_page_ids: Vec<String>,
 ) {
+    let pages = |ids: Vec<String>| {
+        ids.into_iter()
+            .filter(|id| !id.trim().is_empty())
+            .take(MAX_REPORTED_PAGES)
+            .collect()
+    };
     crate::session::awaiting_restore::record_page_restore_progress(
         window.label(),
         crate::session::awaiting_restore::PageRestoreProgress {
-            complete: complete_pages.into_iter().collect(),
-            deferred: deferred_pages.into_iter().collect(),
-            known: known_page_ids.into_iter().collect(),
+            complete: pages(complete_pages),
+            deferred: pages(deferred_pages),
+            known: pages(known_page_ids),
         },
     );
 }
+
+/// The most page ids [`terminal_report_restore_progress`] keeps per list. A
+/// layout holds a handful of pages; this only caps a runaway caller.
+const MAX_REPORTED_PAGES: usize = 1024;
 
 /// The operator's "Capture now": capture the current roster with reason
 /// [`crate::session::session_ledger::REASON_OPERATOR`] through the SAME
