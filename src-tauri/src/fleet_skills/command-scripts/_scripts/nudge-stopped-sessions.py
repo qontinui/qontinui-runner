@@ -8,15 +8,18 @@ Usage: nudge-stopped-sessions.py [--send] [--cooldown-hours H] [--idle-min N]
 
 A STOPPED session is idle at an empty prompt (not working) and not finished.
 The screen is close-finished-sessions.py's, imported from beside this file, so
-both overlord commands judge "busy" and "empty prompt" the same way. Of its
+both overlord commands judge "busy", "empty prompt" and "finished" the same
+way: a finish is read by that script's finish_state, one rule for both. Of its
 verdicts, ACTIVE, REVIVED and FOOTER-ONLY are stopped, and so is a LIMITED
-session whose usage-limit reset time has passed. That screen leans to "not
-finished" when unsure, which is the safe side for a close and the unsafe side
-for a nudge, so this script adds its own holds: any finished signal (the
-runner marker, or coord session_status finished, unless a prompt came after
-every finish time it has, so the newer of the two decides; a coord finish
-with no time holds), coord session_status waiting_human, and a last prompt
-that was a /next-move that changed nothing.
+session whose usage-limit reset time has passed; CONTRADICTED (a finish the
+session's own record contradicts) and CLOSEOUT / FOOTER-FINISHED (a finish only
+its final reply states, which coord has not recorded) are nudged too, so
+/next-move reconciles or records them. That screen leans to "not finished" when
+unsure, which is the safe side for a close and the unsafe side for a nudge, so
+this script adds its own holds: a finish no later turn reopened (finished, a
+turn inside coord's 1 s stamp band, or a coord finish with no time), coord
+session_status waiting_human, and a last prompt that was a /next-move that
+changed nothing.
 
 A row whose last prompt is /next-move is held by what changed, not by a
 clock. A /next-move followed by a work-class tool call (an edit, a commit, a
@@ -30,8 +33,7 @@ futile hold. --cooldown-hours is the backstop: no futile or class-B hold
 outlasts it. Coord is read through the coord-revive skill's `call` verb (the
 session's own .mcp.json nonce, nothing minted) and pull requests through `gh`;
 an unreadable read leaves the transcript verdict standing, annotated UNKNOWN.
-A session finished at a known time, with no prompt since, whose final message
-says work remains reads CONTRADICTED: reported, never nudged or closed.
+Only a STUCK row is left for the operator.
 
 The report is always printed. --send then types `/next-move` into each STOPPED
 row through POST /terminals/{id}/submit-prompt, re-screening the row
@@ -43,7 +45,9 @@ documents the verdicts and the evidence they rest on.
 
 Exit codes: 0 done (every attempted nudge verified), 1 a nudge was skipped or
 did not verify, 3 UNKNOWN: the runner could not be read (nothing screened), or
---send was refused because /restart-readiness could not be read.
+--send was refused because /restart-readiness or its restart_prep block could
+not be read. An operator restart prepare in force makes --send type nothing and
+exit 0: its paused sessions read STOPPED, and /next-move would end the pause.
 """
 import argparse
 import datetime as dt
@@ -77,7 +81,15 @@ except ImportError:  # the command-scripts carrier ships lib/envelope.py only: s
         return {k: v for k, v in src.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
 
 PROMPT = "/next-move"
-STOPPED_FROM = {"ACTIVE", "REVIVED", "FOOTER-ONLY"}
+# The close-screen verdicts judge() may turn into STOPPED. CONTRADICTED is a finish
+# the session's own record contradicts, and CLOSEOUT / FOOTER-FINISHED a finish only
+# its final reply states: the close screen never closes them (finished-criteria
+# conditions 1 and 4), so /next-move reconciles them, and its class E records the
+# finish the next close pass closes.
+STOPPED_FROM = {"ACTIVE", "REVIVED", "FOOTER-ONLY", "CONTRADICTED", "CLOSEOUT", "FOOTER-FINISHED"}
+# The finish_state states nudge holds: a nudge into a finished session reopens it.
+# in_band is the close screen's revival and nudge's hold: each keeps its safe side.
+HOLD_STATES = ("finished", "in_band", "unconfirmed")
 # /next-move as the transcript records a slash command that RAN. Only this form
 # verifies a send: pasted text that never ran as a command is a plain message.
 NEXT_MOVE_RAN = re.compile(r"<command-name>/next-move</command-name>")
@@ -181,27 +193,18 @@ def completion(verdict, tx):
     return m.group(0) if m else None
 
 
-def remains_phrase(tx):
-    """The first "work remains" label in the final message, or None: the
-    screen's NEGATIVE phrases and phrase_hits' negatives, over the whole text."""
-    text = (tx or {}).get("final_text") or ""
-    if not text.strip():
-        return None
-    norm = cfs.normalize(text)
-    hit = next((label for label, r in cfs.NEG_RE if r.search(norm)), None)
-    return hit or next(iter(cfs.phrase_hits(text)[1]), None)
-
-
-def finished_hold(base, tx, marker_ms, now_ms, backstop_h):
-    """A finished signal holds the row. When it has a finish time (`marker_ms`,
-    at or after the last prompt) and the final message says work remains, the
-    two signals disagree: CONTRADICTED, for the operator. With no finish time
-    there is nothing to weigh the message against, so the row is only held."""
-    phrase = remains_phrase(tx) if marker_ms else None
-    if phrase:
-        return "CONTRADICTED", [f"{base}, but the final message says work remains ({phrase})"]
-    if marker_ms and (now_ms - marker_ms) / 3600000 >= backstop_h:
-        base += f"; finished marker stale ({cfs.fmt_age(marker_ms)})"
+def finished_hold(fs, now_ms, backstop_h):
+    """HELD, for a finish the screens share (cfs.finish_state) that a nudge must
+    not reopen: finished, in_band (a turn inside coord's stamp band, which the
+    close screen keeps open) or unconfirmed (coord says finished with no time to
+    weigh a turn against). A finish older than the backstop says so."""
+    if fs.state == "in_band":
+        base = (f"coord session_status=finished ({cfs.fmt_age(fs.at)} ago), no prompt since outside that "
+                "stamp's 1 s band")
+    else:
+        base = "; ".join(fs.why)
+    if fs.at and (now_ms - fs.at) / 3600000 >= backstop_h:
+        base += f"; finished marker stale ({cfs.fmt_age(fs.at)})"
     return "HELD", [base]
 
 
@@ -246,29 +249,93 @@ def nudge_hold(tx, now_ms, backstop_h, ext):
     return None, f"no-progress hold expired (strike {streak}, held {hold:g}h){note}"
 
 
+def progress_since_nudge(tx):
+    """Whether the /next-move that is this row's last prompt led to work: True
+    after a work-class tool call, False when the session answered it and did no
+    work. None when that was not measured: no transcript read, a later prompt, or
+    a /next-move with no real reply (cfs.nudge_replied). nudge_streak is not a
+    substitute for the reply: it counts the run of nudges, so an earlier strike
+    keeps it above zero when the newest /next-move never ran."""
+    if not tx or not NEXT_MOVE_ANY.search((tx.get("last_prompt_text") or "").strip()):
+        return None
+    if tx.get("work_tools_since_nudge"):
+        return True
+    return False if tx.get("nudge_replied") else None
+
+
+def progress_tx(row):
+    """The transcript facts of a row judge() does not read: None when unreadable,
+    which is a row with no measurement, never a failed pass."""
+    try:
+        return cfs.transcript_facts(row) if row else None
+    except Exception:  # noqa: BLE001 - a measurement must not take the screen down
+        return None
+
+
+def status_hold(facts, tx, now_ms, backstop_h):
+    """(verdict, reasons) when coord's waiting_human status, or a finish the
+    close screen's own rule (cfs.finish_state) says a nudge must not reopen,
+    holds the row, else None. That rule weighs one finish time (coord's where
+    usable, else the runner mark's) against the last prompt and any other
+    turn-opening record; judge's docstring says which states hold."""
+    if facts.get("sessionStatus") == "waiting_human":
+        return "HELD", ["coord session_status=waiting_human: a pending operator question"]
+    fs = cfs.finish_state(facts, facts, tx, now_ms, cfs.finish_hits(facts, facts, tx, now_ms))
+    if fs is not None and fs.state in HOLD_STATES:
+        return finished_hold(fs, now_ms, backstop_h)
+    return None
+
+
 def judge(verdict, reasons, facts, tx, now_ms, cooldown_h, include_complete=False, ext=None):
     """(nudge verdict, reasons) for one screened row: STOPPED, a row that needs
-    no /next-move (HELD, NO-TASK, COMPLETE, STUCK, CONTRADICTED), or the
-    screen's own verdict when the row is not a stopped session at all.
+    no /next-move (HELD, NO-TASK, COMPLETE, STUCK), or the screen's own verdict
+    when the row is not a stopped session at all.
 
     `facts` carries the registry's `finished` / `finishedAt` and coord's
-    `sessionStatus` / `sessionStatusSince`. A nudge into a finished session
-    reopens it (/next-move reads an owed item it cannot prove as owed), so every
-    finished signal holds the row, except one that a later real prompt revived.
-    Where the runner serves coord's finish time (status_since; it moves on a
-    re-finish once coord restamps a finished->finished report, plan Phase 2,
-    and the runner passes the time through, plan Phase 3, while finishedAt
-    stays where it was on a runner build predating plan Phase 3), the row is
-    held on the NEWER of that and the runner
-    marker's: it is revived only by a prompt more than 1 s after every finish
-    stamp it has. close-finished-sessions prefers coord's time instead; nudge
-    holds on the newer stamp. Without a usable coord time, coord's finished
-    status holds even a revived runner marker, since coord is then the only
-    sign it finished again (on a runner build predating plan Phase 3, or for a
-    re-finish made through coord_report_status only).
+    `sessionStatus` / `sessionStatusSince`. A finish is judged by the close
+    screen's own rule, cfs.finish_state (plan Phase 6), so the two screens read
+    one finish time (coord's where usable, else the runner mark's) and one
+    revival. A nudge into a finished session reopens it (/next-move reads an
+    owed item it cannot prove as owed), so a `finished` row is held, and so are
+    `in_band` (inside coord's stamp band, which close keeps open) and
+    `unconfirmed` (coord says finished with no time to weigh a turn against). A
+    `revived` row is not held: a turn after the finish (a prompt, a Session Bus
+    delivery, its own scheduled wake, or work long past it) already reopened it.
+    A `contradicted` row is nudged, its reason naming both signals: /next-move
+    reconciles them, where the close screen never closes it. CLOSEOUT and
+    FOOTER-FINISHED rows (a finish only the final reply states) are nudged so
+    /next-move records the finish. coord's waiting_human holds before any of
+    that, the /next-move holds still apply to a row about to be nudged, and STUCK
+    still ends a run of futile nudges.
     `cooldown_h` is the backstop (None: BACKSTOP_H); `ext` is the coord/PR
     signals for a row whose last prompt is /next-move (None: not read)."""
     backstop_h = BACKSTOP_H if cooldown_h is None else cooldown_h
+    # A held or finished row is never LIMITED. triage-sessions.py's
+    # hand_off_limited types /next-move into every row this returns LIMITED,
+    # and a nudge into a finished session reopens it, so the holds come before
+    # any LIMITED answer, whatever the reset says. A /next-move that got only
+    # the limit notice never ran its turn, so it revives nothing: the row is
+    # weighed against the newest prompt that did run (cfs.last_ran_prompt).
+    if verdict == "LIMITED":
+        ht = tx
+        if tx:
+            # The limit notice is Claude Code's own record, not work, so finish_state's
+            # kept-working test is not read on this path: only a turn reopens the row.
+            ht = dict(tx, last_asst=None)
+            ran_at = tx.get("last_ran_prompt", tx.get("last_prompt"))
+            if ran_at != tx.get("last_prompt"):
+                ht["last_prompt"] = ran_at or 0
+                # finish_state reads any turn-opening record as a revival, and the
+                # never-ran /next-move is the newest one: it is skipped there too.
+                if tx.get("last_turn_open") == tx.get("last_prompt"):
+                    ht["last_turn_open"] = ran_at or 0
+        held = status_hold(facts, ht, now_ms, backstop_h)
+        if held:
+            # name the skipped /next-move only when it is what held the row
+            note = (["a later /next-move got only the limit notice, so it revives nothing"]
+                    if tx and ht["last_prompt"] != tx.get("last_prompt")
+                    and not status_hold(facts, dict(tx, last_asst=None), now_ms, backstop_h) else [])
+            return held[0], held[1] + note + reasons
     limited = verdict == "LIMITED"
     if limited:
         if tx is None:
@@ -284,37 +351,29 @@ def judge(verdict, reasons, facts, tx, now_ms, cooldown_h, include_complete=Fals
     if tx is not None and not tx.get("task_prompts"):
         return "NO-TASK", ["never given a task: no prompt beyond built-in commands Claude Code answered "
                            "itself (/model, /effort, /clear, ...)"] + reasons
-    status = facts.get("sessionStatus")
-    if status == "waiting_human":
-        return "HELD", ["coord session_status=waiting_human: a pending operator question"] + reasons
+    held = status_hold(facts, tx, now_ms, backstop_h)
+    if held:
+        return held[0], held[1] + reasons
+    # The close screen's own finish rule (one rule for both screens, plan Phase 6).
+    fs = cfs.finish_state(facts, facts, tx, now_ms, cfs.finish_hits(facts, facts, tx, now_ms))
+    if fs is not None and fs.state == "contradicted":
+        # Both signals are named; /next-move reconciles them (class E re-finishes, class A works on).
+        reasons = ["a finish its own record contradicts: nudged so /next-move reconciles it"] + [
+            w for w in fs.why if w not in reasons] + reasons
+    elif fs is not None:  # revived: a turn after the finish already reopened it
+        reasons = [w for w in fs.why if w not in reasons] + reasons
     last_prompt = (tx or {}).get("last_prompt") or 0
-    since = cfs.status_since(facts, now_ms) if status == "finished" else None
-    # With coord's time, hold on the NEWER of the two finish stamps: a nudge
-    # into a finished session reopens it, so a row is revived only when every
-    # stamp it has is older than its last prompt (close prefers coord's instead).
-    marked = facts.get("finishedAt") if facts.get("finished") else None
-    marked = marked if isinstance(marked, (int, float)) and not isinstance(marked, bool) else 0
-    if since is not None and last_prompt <= max(since, marked) + 1000:
-        src = f"coord session_status=finished ({cfs.fmt_age(since)} ago)" if since >= marked else \
-            f"runner finished marker ({cfs.fmt_age(marked)} ago, newer than coord's {cfs.fmt_age(since)} ago)"
-        v, why = finished_hold(f"{src}, no prompt since", tx, max(since, marked), now_ms, backstop_h)
-        return v, why + reasons
-    if facts.get("finished") and since is None:
-        fa = facts.get("finishedAt") or 0
-        if not last_prompt or last_prompt <= fa + 1000:
-            v, why = finished_hold(f"runner finished marker ({cfs.fmt_age(fa) if fa else '?'} ago), "
-                                   "no prompt since", tx, fa, now_ms, backstop_h)
-            return v, why + reasons
-    if status == "finished" and since is None:
-        v, why = finished_hold("coord session_status=finished (no finish time to compare a revival against)",
-                               tx, None, now_ms, backstop_h)
-        return v, why + reasons
     # A /next-move answered by a usage-limit notice never ran, so it holds nothing.
     if tx and last_prompt and not limited and NEXT_MOVE_ANY.search(tx["last_prompt_text"].strip()):
         v, why = nudge_hold(tx, now_ms, backstop_h, ext)
         if v:
             return v, [why] + reasons
         reasons = [why] + reasons
+    if verdict in ("CLOSEOUT", "FOOTER-FINISHED"):
+        # judge's include_complete arm, for a finish the close screen found in the reply's own
+        # words and withheld because coord has not recorded it (finished-criteria condition 1).
+        return "STOPPED", ["finished in its final reply, not in coord: nudged so /next-move records the "
+                           "finish"] + reasons
     done = completion(verdict, tx)
     if done:
         if include_complete:
@@ -489,7 +548,7 @@ def session_repo(cwd):
         return None
     try:
         url = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True,
-                             text=True, timeout=20, env=git_scope_env()).stdout.strip()
+                             text=True, encoding="utf-8", errors="replace", timeout=20, env=git_scope_env()).stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return None
     m = re.search(r"[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", url)
@@ -545,8 +604,8 @@ def pr_signals(tx, since_ms, ext):
     for ref in pr_refs(tx.get("final_text"), lambda: session_repo(tx.get("cwd"))):
         repo, n = ref.rsplit("#", 1)
         try:
-            p = subprocess.run([gh, "pr", "view", n, "--repo", repo, "--json", "state,mergedAt,closedAt,commits"],
-                               capture_output=True, text=True, timeout=30)
+            p = subprocess.run([gh, "pr", "view", n, "--repo", repo, "--json", "mergedAt,closedAt,commits"],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
             moved = pr_moved_at(json.loads(p.stdout)) if p.returncode == 0 else False
         except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
             moved = False
@@ -582,7 +641,10 @@ def external_signals(tx, row, use_coord=True, use_gh=True):
 def row_facts(row, ready):
     row = row or {}
     rp = ready.get(row.get("claudeSessionId")) or {}
+    # finishReason rides along so finish_state reads the reply as the close screen
+    # does: an /unattended mark relaxes its wording (cfs.finish_hits).
     return {"finished": bool(row.get("finished")), "finishedAt": row.get("finishedAt"),
+            "finishReason": row.get("finishReason"),
             "sessionStatus": rp.get("sessionStatus"), "sessionStatusSince": rp.get("sessionStatusSince")}
 
 
@@ -598,13 +660,20 @@ def screen(idle_min, only, cooldown_h, include_complete, use_coord=True, use_gh=
                      sessionStatusSince=r.get("sessionStatusSince"))
         ext = external_signals(tx, row, use_coord, use_gh) if r["verdict"] in STOPPED_FROM else None
         r["screen"] = r["verdict"]
+        # Measured on every row, not just the stopped ones judge() reads: a
+        # session a nudge put to work reads BUSY, and a rate over only the
+        # sessions that stopped again reads low. 260 transcripts took 6 s.
+        r["progress_since_nudge"] = progress_since_nudge(tx if tx is not None else progress_tx(row))
         r["verdict"], r["reasons"] = judge(r["verdict"], r["reasons"], facts, tx, now, cooldown_h,
                                            include_complete, ext)
     return res, warnings, ready_err
 
 
-ORDER = ["STOPPED", "COMPLETE", "NO-TASK", "HELD", "STUCK", "CONTRADICTED", "LIMITED", "BUSY", "FINISHED", "CLOSEOUT", "EXITED-FINISHED", "EXITED", "UNKNOWN",
-         "SHELL", "SELF"]
+# Every verdict judge() can return: its own, and each close-screen verdict it
+# passes through (cfs.VERDICTS outside STOPPED_FROM). The selftest checks this
+# against both, so a verdict with no report row fails CI, not print_report.
+ORDER = ["STOPPED", "COMPLETE", "NO-TASK", "HELD", "STUCK", "LIMITED", "BUSY", "FINISHED", "EXITED-FINISHED",
+         "CUSTODY", "EXITED", "UNKNOWN", "SHELL", "SELF"]
 
 
 def print_report(res, warnings):
@@ -685,13 +754,18 @@ def nudge_one(tid, idle_min, cooldown_h, own, include_complete, use_coord=True, 
     moving = cfs.output_moving(tid)
     if moving is not False:
         return False, False, "terminal output still moving" if moving else "terminal output could not be sampled"
+    # A prepare can start after the screen. This read can take seconds, so it
+    # comes before the prompt look below, which must stay the last thing here.
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        return False, False, f"re-screen: {prep_text}"
     # The route pastes onto whatever the input box holds and presses Enter, so
     # the last thing before the POST is one more look at the prompt itself:
     # a draft typed during the re-screen must not ride along.
     raw = cfs.raw_tail(tid)
     # Same width the screen passes: on Windows the replay must auto-wrap at the
     # pane's columns, or the cursor lands off the prompt row and reads as a draft.
-    state, typed = cfs.prompt_state(raw, cfs.wrap_cols(t)) if raw is not None else ("unknown", "screen unreadable")
+    state, typed = cfs.prompt_state(raw, cols=cfs.wrap_cols(t)) if raw is not None else ("unknown", "screen unreadable")
     if state != "empty":
         return False, False, f"input prompt not empty just before the send ({state}: {str(typed)[:50]!r})"
     path = (tx or {}).get("path")
@@ -732,6 +806,281 @@ def nudge_one(tid, idle_min, cooldown_h, own, include_complete, use_coord=True, 
 
 
 # ---------------------------------------------------------------- selftest
+def selftest_prepare():
+    """The restart prepare's hold: the verdict table, then main() and nudge_one()
+    driven with every door stubbed, nudge_one itself raising in the main() arms,
+    so a run cannot type into a pane. Returns failure strings."""
+    import contextlib
+    import io
+    import http.server
+    import threading
+    bad = []
+    # prepare_status itself: every way the read can fail is unknown, and never raises.
+    bodies = {"/torn": (b'{"a"', 100), "/deep": (b"[" * 200000, None), "/junk": (b"not json", None)}
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(served[1] or len(served[0])))
+            self.end_headers()
+            self.wfile.write(served[0])
+            self.close_connection = True
+        def log_message(self, *a):
+            pass
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    saved_api = cfs.API
+    try:
+        cfs.API = "http://127.0.0.1:9"  # nothing listens here
+        if cfs.prepare_status()[0] != "unknown":
+            bad.append(f"prepare_status on a closed port: {cfs.prepare_status()}")
+        cfs.API = f"http://127.0.0.1:{server.server_address[1]}"
+        for name, served in bodies.items():
+            try:
+                got = cfs.prepare_status()
+            except Exception as e:
+                got = ("raised", repr(e)[:80])
+            if got[0] != "unknown":
+                bad.append(f"prepare_status on a {name} body: {got}")
+        served = (b'{"restart_prep": {"state": "ready", "prepare_id": "abcdef012345"}}', None)
+        if cfs.prepare_status()[0] != "held":
+            bad.append("prepare_status does not read a served block")
+    finally:
+        cfs.API = saved_api
+        server.shutdown()
+        server.server_close()
+    verdicts = [
+        ({"safe_to_restart": True}, "clear"),            # a build that predates the prepare
+        ({"restart_prep": None}, "clear"),
+        ({"restart_prep": {"state": "done"}}, "clear"),
+        ({"restart_prep": {"state": "cancelled"}}, "clear"),
+        ({"restart_prep": {"state": "restoring"}}, "clear"),
+        ({"restart_prep": {"state": "preparing", "prepare_id": "abcdef012345"}}, "held"),
+        ({"restart_prep": {"state": "ready"}}, "held"),
+        ({"restart_prep": {"state": "new-word"}}, "unknown"),
+        ({"restart_prep": {}}, "unknown"),
+        ({"restart_prep": "ready"}, "unknown"),
+        (["not an object"], "unknown"),
+    ]
+    for body, want in verdicts:
+        got, text = cfs.prepare_verdict(body)
+        if got != want or (want != "clear") != bool(text):
+            bad.append(f"prepare_verdict({body!r}) = {got!r} {text!r}, want {want!r}")
+    if "abcdef01," not in cfs.prepare_verdict(verdicts[5][0])[1]:
+        bad.append("prepare_verdict does not name the prepare it is holding for")
+
+    stopped = {"terminalId": "t1", "verdict": "STOPPED", "tab": "x", "account": "a", "name": "n", "reasons": []}
+    me = sys.modules[__name__]
+    saved = {k: getattr(me, k) for k in ("screen", "nudge_one", "print_report")}
+    saved_cfs = {k: getattr(cfs, k) for k in ("prepare_status", "terminals", "readiness", "open_rows", "classify",
+                                              "proc_table", "transcript_facts", "output_moving", "raw_tail")}
+    saved_me2 = {k: getattr(me, k) for k in ("judge", "external_signals", "row_facts")}
+    saved_argv = sys.argv
+    sent = []
+    def fake_nudge(tid, *a):
+        sent.append(tid)
+        return True, True, "stubbed"
+    try:
+        me.screen = lambda *a: ([stopped], [], None)
+        me.nudge_one = fake_nudge
+        me.print_report = lambda *a: None
+        for state, want_rc, want_sent, label in (
+                (("held", "held text"), 0, [], "a prepare in force"),
+                (("unknown", "unknown text"), 3, [], "an unreadable prepare"),
+                (("clear", ""), 0, ["t1"], "no prepare")):
+            sent.clear()
+            cfs.prepare_status = lambda state=state: state
+            sys.argv = ["nudge-stopped-sessions.py", "--send"]
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main()
+            if rc != want_rc or sent != want_sent:
+                bad.append(f"main --send under {label}: rc {rc}, sent {sent}; want rc {want_rc}, sent {want_sent}")
+        # The re-screen: a prepare that started after the screen stops the send
+        # before the final prompt look, and so before the POST.
+        cfs.terminals = lambda: [{"id": "t1"}]
+        cfs.readiness = lambda: ({}, None)
+        cfs.open_rows = lambda: {"t1": {}}
+        cfs.classify = lambda *a: ("ACTIVE", [])
+        cfs.proc_table = lambda: {}
+        cfs.transcript_facts = lambda row: None
+        me.external_signals = lambda *a: None
+        me.row_facts = lambda *a: {}
+        me.judge = lambda *a: ("STOPPED", [])
+        cfs.output_moving = lambda tid: False
+        def tail(tid):
+            raise AssertionError("the final prompt look reached under a held prepare")
+        cfs.raw_tail = tail
+        me.nudge_one = saved["nudge_one"]
+        cfs.prepare_status = lambda: ("held", "held text")
+        got = me.nudge_one("t1", 0, 48, "", False, False, False)
+        if got[:2] != (False, False) or "held text" not in got[2]:
+            bad.append(f"nudge_one under a prepare started after the screen: {got}")
+    finally:
+        sys.argv = saved_argv
+        for k, v in {**saved, **saved_me2}.items():
+            setattr(me, k, v)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+    return bad
+
+
+def roster_selftest():
+    """The verdict roster (plan Phase 2, D1): ORDER holds exactly what judge() can
+    return - its own verdicts, read from judge, finished_hold and nudge_hold, and
+    each close-screen verdict (cfs.VERDICTS) it passes through - and print_report
+    survives a row of each. A FOOTER-FINISHED row once raised ValueError there and
+    ended the report, and with it the send. Returns (failures, checks)."""
+    import contextlib
+    import io
+    bad = []
+    want = cfs.returned_verdicts(judge, finished_hold, nudge_hold) | (set(cfs.VERDICTS) - STOPPED_FROM)
+    for what, extra in (("ORDER has no report row for", want - set(ORDER)),
+                        ("ORDER names a verdict judge() never returns", set(ORDER) - want)):
+        if extra:
+            bad.append(f"verdict roster: {what}: {sorted(extra)}")
+
+    def report(rows):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                print_report([dict({"reasons": [], "name": "", "tab": "", "account": ""}, **r) for r in rows], [])
+        except ValueError as e:
+            return repr(e)
+        return None
+    every = [{"terminalId": f"t{i:07d}", "verdict": v, "screen": v} for i, v in enumerate(sorted(want))]
+    if report(every):
+        bad.append(f"print_report over every verdict judge() returns raised {report(every)}")
+    # The D1 row itself: the close screen's FOOTER-FINISHED, judged, then reported.
+    v, why = judge("FOOTER-FINISHED", ["footer final state, no marker: 'x'"], {}, None, 0, None)
+    err = report([{"terminalId": "t0000001", "verdict": v, "screen": "FOOTER-FINISHED", "reasons": why}])
+    if err:
+        bad.append(f"print_report over a FOOTER-FINISHED row ({v}) raised {err}")
+    # A finish_stranded code (plan 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run Phase 2) rides
+    # through screen(): the close screen's reason_code stays on the row judge() re-verdicts, and the coded line
+    # stays in its reasons, so triage-sessions.py can list a coded HELD row for the operator.
+    now = time.time() * 1000
+    coded = {"terminalId": "t1234567", "verdict": "REVIVED", "tab": "x", "account": "a", "name": "n",
+             "reasons": ["coord finished 1h ago, then prompted 1h ago, inside that stamp's 1 s band: 'x'",
+                         "finish_stranded.in_band: a turn inside coord's 1 s stamp band"],
+             "reason_code": "finish_stranded.in_band", "finishedAt": None,
+             "sessionStatus": "finished", "sessionStatusSince": int(now - 3600000)}
+    tx = {"final_text": "Done.", "final_text_at": now - 3500000, "last_prompt": now - 3600000 - 500,
+          "last_prompt_text": "x", "last_asst": now - 3500000, "last_activity": now - 3500000, "pending_tool": False,
+          "last_turn_open": now - 3600000 - 500, "last_turn_open_text": "x", "task_prompts": 1}
+    saved = {k: getattr(cfs, k) for k in ("screen_all", "open_rows", "transcript_facts")}
+    try:
+        cfs.screen_all = lambda idle, only: ([dict(coded)], [], None)
+        cfs.open_rows = lambda: {"t1234567": {"claudeSessionId": "s"}}
+        cfs.transcript_facts = lambda row: dict(tx)
+        got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
+    finally:
+        for k, v_ in saved.items():
+            setattr(cfs, k, v_)
+    if got["verdict"] != "HELD" or got.get("reason_code") != "finish_stranded.in_band" \
+            or not any(w.startswith("finish_stranded.in_band: ") for w in got["reasons"]):
+        bad.append(f"a finish_stranded row lost its code through screen(): {got}")
+    return bad, 5
+
+
+def cross_screen_selftest():
+    """Both screens take one verdict from cfs.finish_state (second-round pre-PR
+    review): a runner mark, a prompt after it, and coord's finished with no
+    usable time is `revived` there, so the close screen (cfs.classify) reads
+    REVIVED and never closes it, and this screen nudges it (judge -> STOPPED,
+    status_hold holds nothing). Every runner read is stubbed. Returns
+    (failures, checks)."""
+    bad = []
+    now = time.time() * 1000
+    m = 60000
+    lp = int(now - 62 * m)
+    tx = {"final_text": "PR #3 landed.\n\nSAFE TO CLOSE", "final_text_at": now - 60 * m, "last_prompt": lp,
+          "last_prompt_text": "fix the bug", "last_asst": now - 60 * m, "last_activity": now - 60 * m,
+          "pending_tool": False, "last_turn_open": lp, "last_turn_open_text": "fix the bug", "task_prompts": 1,
+          "cwd": cfs.LINKED_CWD}
+    reg = {"claudeSessionId": "s1", "finished": True, "finishedAt": int(now - 90 * m)}
+    ready = {"s1": {"sessionStatus": "finished"}}
+    stubs = {"proc_facts": lambda table, pid, windows=None: ([11], [], []),
+             "live_session_ids": lambda claudes: {"s1"}, "raw_tail": lambda tid, chars=30000: "screen",
+             "running_turn": lambda text: False, "prompt_state": lambda raw, *, cols: ("empty", ""),
+             "wrap_cols": lambda term, windows=None: None, "transcript_facts": lambda row: dict(tx),
+             "git_rev_parse_dirs": cfs.fake_git_dirs}
+    saved = {k: getattr(cfs, k) for k in stubs}
+    try:
+        for k, v in stubs.items():
+            setattr(cfs, k, v)
+        verdict, why = cfs.classify({"id": "t1", "isAlive": True, "pid": 10}, reg, {10: (1, ["bash"])}, 15, "", ready)
+    finally:
+        for k, v in saved.items():
+            setattr(cfs, k, v)
+    facts = row_facts(reg, ready)
+    fs = cfs.finish_state(facts, facts, tx, now, cfs.finish_hits(facts, facts, tx, now))
+    judged, reasons = judge(verdict, why, facts, tx, now, None)
+    if verdict != "REVIVED" or verdict in cfs.CLOSABLE or "reopened after its runner finish mark" not in "; ".join(why):
+        bad.append(f"cross-screen: close reads {verdict} {why}; want REVIVED (never closed)")
+    if fs is None or fs.state != "revived":
+        bad.append(f"cross-screen: finish_state = {fs}; want revived")
+    if judged != "STOPPED" or status_hold(facts, tx, now, BACKSTOP_H) is not None:
+        bad.append(f"cross-screen: nudge reads {judged} {reasons}; want STOPPED, no hold")
+    # A runner mark with no usable finishedAt beside coord's untimed finished, and a closeout reply: no time
+    # dates anything, so finish_state returns unconfirmed tagged untimed_mark; close never closes it and
+    # nudge holds it.
+    reg2 = {"claudeSessionId": "s1", "finished": True, "finishedAt": None}
+    saved = {k: getattr(cfs, k) for k in stubs}
+    try:
+        for k, v in stubs.items():
+            setattr(cfs, k, v)
+        verdict2, why2 = cfs.classify({"id": "t1", "isAlive": True, "pid": 10}, reg2, {10: (1, ["bash"])}, 15, "",
+                                      ready)
+    finally:
+        for k, v in saved.items():
+            setattr(cfs, k, v)
+    facts2 = row_facts(reg2, ready)
+    fs2 = cfs.finish_state(facts2, facts2, tx, now, cfs.finish_hits(facts2, facts2, tx, now))
+    held2 = status_hold(facts2, tx, now, BACKSTOP_H)
+    if verdict2 != "UNKNOWN" or "no usable time" not in "; ".join(why2) or fs2 is None or (fs2.state, fs2.rule) != ("unconfirmed", "untimed_mark") \
+            or not held2 or held2[0] != "HELD":
+        bad.append(f"cross-screen, untimed mark: close reads {verdict2} {why2}, finish_state {fs2}, nudge hold "
+                   f"{held2}; want UNKNOWN (no usable time), unconfirmed/untimed_mark, HELD")
+    return bad, 4
+
+
+def trusted_finish_selftest():
+    """Both screens hand cfs.finish_state the same inputs (pre-PR review of the
+    triage ten-gaps branch): a runner mark /unattended set ("unattended: ...")
+    relaxes the final reply's wording on the close screen (cfs.reply_reading),
+    and nudge reads that row's finish the same way, through row_facts'
+    finishReason and cfs.finish_hits. Literal fixture. Returns (failures, checks)."""
+    bad = []
+    now = time.time() * 1000
+    m = 60000
+    lp = int(now - 62 * m)
+    tx = {"final_text": "PR #3 is pushed; its checks are still running and a gate watches the merge.\n"
+                        "- Whether coord can auto-close this session is UNKNOWN: the obligations check timed out."
+                        "\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1.",
+          "final_text_at": now - 60 * m, "last_prompt": lp, "last_prompt_text": "fix the bug",
+          "last_asst": now - 60 * m, "last_activity": now - 60 * m, "pending_tool": False,
+          "last_turn_open": lp, "last_turn_open_text": "fix the bug", "task_prompts": 1}
+    row = {"claudeSessionId": "s", "finished": True, "finishedAt": int(now - 61 * m),
+           "finishReason": "unattended: 3 units, all landed or watched"}
+    for rp in ({"sessionStatus": "finished"}, {"sessionStatus": "finished", "sessionStatusSince": int(now - 61 * m)}):
+        facts = row_facts(row, {"s": rp})
+        close = cfs.finish_state(row, rp, tx, now, cfs.finish_hits(row, rp, tx, now))
+        nudge = cfs.finish_state(facts, facts, tx, now, cfs.finish_hits(facts, facts, tx, now))
+        if facts.get("finishReason") != row["finishReason"]:
+            bad.append(f"row_facts dropped finishReason: {facts}")
+        if close is None or nudge is None or close.state != "finished" or (close.state, close.at, close.by) != (
+                nudge.state, nudge.at, nudge.by):
+            bad.append(f"trusted /unattended row, {rp}: close {close}, nudge {nudge}; want both finished")
+        held = status_hold(facts, tx, now, BACKSTOP_H)
+        if not held or held[0] != "HELD":
+            bad.append(f"trusted /unattended row, {rp}: status_hold = {held}; want HELD (a finished row)")
+    # One clock: trust is judged against the caller's now_ms, not this box's. A coord stamp 60 s ahead of this
+    # box is a usable time to a caller whose clock reads 2 min ahead, and unusable to this one.
+    ahead = int(now + 60000)
+    if (cfs.finish_since({"sessionStatusSince": ahead}, True, now + 120000) != ahead
+            or cfs.finish_since({"sessionStatusSince": ahead}, True) is not None):
+        bad.append("finish_since must judge coord's stamp against the caller's now_ms")
+    return bad, 7
+
+
 def selftest():
     import tempfile
     bad = []
@@ -782,16 +1131,18 @@ def selftest():
         ("ACTIVE", none, tx, "HELD"),  # nudged 1h ago, no progress: the 4h hold
         ("ACTIVE", none, dict(tx, last_prompt=now - 25 * 3600000), "STOPPED"),  # past the 4h hold
         # Finished signals the close screen lets through as ACTIVE / FOOTER-ONLY / REVIVED:
-        ("ACTIVE", {"finished": True, "finishedAt": now - 1800000}, work, "HELD"),  # veto phrase after the mark
+        # a plain runner mark 30m after the last prompt and reply, nothing after it: finished, held
+        ("ACTIVE", {"finished": True, "finishedAt": now - 1800000}, work, "HELD"),
         ("FOOTER-ONLY", {"sessionStatus": "finished"}, work, "HELD"),
         ("REVIVED", {"sessionStatus": "finished"}, work, "HELD"),
-        # kept working after its mark with no new prompt: still finished
-        ("REVIVED", {"finished": True, "finishedAt": now - 1800000}, dict(work, last_asst=now), "HELD"),
+        # kept working 30m after its mark with no closeout: a turn after the finish reopened it (Phase 6)
+        ("REVIVED", {"finished": True, "finishedAt": now - 1800000}, dict(work, last_asst=now), "STOPPED"),
         # ...and the one real revival: a prompt after the runner mark,
         ("REVIVED", {"finished": True, "finishedAt": now - 7200000}, work, "STOPPED"),
-        # unless coord says it finished again (finishedAt does not move on a re-finish
-        # on a runner build predating plan Phase 3).
-        ("REVIVED", {"finished": True, "finishedAt": now - 7200000, "sessionStatus": "finished"}, work, "HELD"),
+        # ...even beside coord's finished with no time: whether coord's finish came after that prompt is
+        # UNKNOWN, so cfs.finish_state reads it revived (condition 4 cannot be ruled out) and both screens
+        # follow it: close keeps it REVIVED, nudge sends /next-move, which records a re-finish if there was one.
+        ("REVIVED", {"finished": True, "finishedAt": now - 7200000, "sessionStatus": "finished"}, work, "STOPPED"),
         # a /next-move the limit answered never ran: no hold once the limit resets
         # (with no zone data the reset is unreadable, so the row stays LIMITED)
         ("LIMITED", none, dict(tx, final_text="You've hit your session limit \u00b7 resets 1am (UTC)",
@@ -805,6 +1156,58 @@ def selftest():
         got = judge(verdict, [], facts, t, now, 24)[0]
         if got != want:
             bad.append(f"judge({verdict}, {facts}, prompt={t and t['last_prompt_text'][:20]!r}) = {got}, want {want}")
+    # A held or finished row is never LIMITED, whatever its reset says: the
+    # limit hand-off types /next-move into a LIMITED row, which reopens a
+    # finished one. Only a prompt after every finish stamp revives it.
+    # A zone-less reset is read in local time as the next such clock time, so
+    # two hours after the notice is a reset still ahead with or without zone data.
+    ahead = dt.datetime.fromtimestamp((now + 2 * 3600000) / 1000).astimezone()
+    unreset = dict(work, final_text=f"You've hit your session limit · resets "
+                   f"{ahead.hour % 12 or 12}:{ahead.minute:02d}{'pm' if ahead.hour >= 12 else 'am'}",
+                   last_asst=now - 60000, final_text_at=now - 60000)
+    unread = dict(work, final_text="You've hit your session limit")  # no reset phrase
+    lim_h, lim_sn, lim_cf = 3600000, 1_790_000_000_000, {"sessionStatus": "finished"}  # a clock status_since accepts
+    # a /next-move answered only by the limit notice never ran (cfs.last_ran_prompt
+    # skips it), so the revival is weighed against the prompt before it
+    unran = dict(unread, last_prompt_text=ran, nudge_replied=False, last_prompt=now - 3600000)
+    limited_hold_cases = [  # (facts, tx, now, want)
+        ({"finished": True, "finishedAt": now - 1800000}, dict(unreset, last_prompt=now - 3600000), now, "HELD"),
+        ({"finished": True, "finishedAt": now - 1800000}, dict(unread, last_prompt=now - 3600000), now, "HELD"),
+        ({"sessionStatus": "finished"}, unreset, now, "HELD"),  # coord finished, no finish time
+        ({"sessionStatus": "waiting_human"}, unread, now, "HELD"),
+        ({"finished": True, "finishedAt": now - 1800000}, None, now, "HELD"),  # transcript unreadable
+        # revived: a real prompt after the mark, then the limit - still LIMITED
+        ({"finished": True, "finishedAt": now - 7200000}, dict(unread, last_prompt=now - 3600000), now, "LIMITED"),
+        ({"finished": True, "finishedAt": now - 7200000}, dict(unreset, last_prompt=now - 3600000), now, "LIMITED"),
+        (none, unread, now, "LIMITED"),
+        # ...but a /next-move that never ran is no revival: no prompt ran since the mark
+        ({"finished": True, "finishedAt": now - 7200000}, dict(unran, last_ran_prompt=None), now, "HELD"),
+        ({"finished": True, "finishedAt": now - 7200000}, dict(unran, last_ran_prompt=now - 5 * 3600000), now, "HELD"),
+        # a real prompt after the mark, then a /next-move that never ran: still revived
+        ({"finished": True, "finishedAt": now - 4 * 3600000}, dict(unran, last_ran_prompt=now - 3 * 3600000), now,
+         "LIMITED"),
+        # a /next-move that did run (a reply, or work) is a revival like any prompt
+        ({"finished": True, "finishedAt": now - 7200000},
+         dict(unran, nudge_replied=True, last_ran_prompt=now - 3600000), now, "LIMITED"),
+        # coord's finish time on a plausible clock decides, as for any other verdict (cfs.finish_state, the
+        # one finish rule): a runner mark newer than it does not, so a prompt after coord's stamp revives the row
+        (dict(lim_cf, sessionStatusSince=lim_sn - lim_h * 2, finished=True, finishedAt=lim_sn - 1800000),
+         dict(unread, last_prompt=lim_sn - lim_h), lim_sn, "LIMITED"),
+        (dict(lim_cf, sessionStatusSince=lim_sn - lim_h * 2), dict(unread, last_prompt=lim_sn - lim_h), lim_sn, "LIMITED"),
+        (dict(lim_cf, sessionStatusSince=lim_sn - 1800000), dict(unread, last_prompt=lim_sn - lim_h), lim_sn, "HELD"),
+    ]
+    for facts, t, at, want in limited_hold_cases:
+        got = judge("LIMITED", [], facts, t, at, 24)[0]
+        if got != want:
+            bad.append(f"judge(LIMITED, {facts}, final={t and t['final_text'][:30]!r}) = {got}, want {want}")
+    real = {"nudge": False, "work": 0, "final": "", "at": 1}
+    nm = {"nudge": True, "work": 0, "final": "", "at": 2}  # a /next-move with no reply and no work
+    for segs, want in [([], None), ([real], 1), ([real, nm], 1), ([real, nm, dict(nm, at=3)], 1), ([nm], None),
+                       ([real, dict(nm, replied=True)], 2), ([real, dict(nm, work=3)], 2),
+                       ([dict(nm, at=0), real, nm], 1)]:
+        got = cfs.last_ran_prompt(segs)
+        if got != want:
+            bad.append(f"last_ran_prompt({segs}) = {got}, want {want}")
     # The /next-move holds: progress, futility, strike backoff, the backstop,
     # STUCK, and the coord / PR signals that hold or release them.
     h = 3600000
@@ -857,6 +1260,18 @@ def selftest():
     ]:
         if cfs.nudge_facts(segs) != want:
             bad.append(f"nudge_facts({segs}) = {cfs.nudge_facts(segs)}, want {want}")
+    # What the pass ledger records from those counts: unmeasured is None, never False.
+    nudge_tx = {"last_prompt_text": "/next-move"}
+    for t, want in [
+        (dict(nudge_tx, work_tools_since_nudge=2, nudge_replied=False), True),
+        (dict(nudge_tx, work_tools_since_nudge=0, nudge_replied=True), False),
+        (dict(nudge_tx, work_tools_since_nudge=0, nudge_replied=False, nudge_streak=1), None),
+        ({"last_prompt_text": "fix the bug", "work_tools_since_nudge": 3, "nudge_replied": False}, None),
+        ({"last_prompt_text": None}, None),
+        (None, None),
+    ]:
+        if progress_since_nudge(t) is not want:
+            bad.append(f"progress_since_nudge({t}) = {progress_since_nudge(t)}, want {want}")
     # A limit-answered /next-move never ran: the screen reads it LIMITED and it holds nothing.
     if judge("LIMITED", [], none, dict(fut, final_text="You've hit your session limit"), now, 48)[0] != "LIMITED":
         bad.append("a limit-answered /next-move was held instead of staying LIMITED")
@@ -867,6 +1282,10 @@ def selftest():
                         ({"type": "tool_use", "name": "Bash", "input": {"command": "git -C d push origin x"}}, True),
                         ({"type": "tool_use", "name": "Bash", "input": {"command": "git status; echo commit"}}, False),
                         ({"type": "tool_use", "name": "Bash", "input": {"command": "gh pr view 3"}}, False),
+                        ({"type": "tool_use", "name": "Bash", "input": {"command": "qontinui-pr create --title t"}}, True),
+                        ({"type": "tool_use", "name": "Bash", "input": {"command": "qontinui-pr.exe create --title t"}},
+                         True),
+                        ({"type": "tool_use", "name": "Bash", "input": {"command": "qontinui-pr --help"}}, False),
                         ({"type": "tool_use", "name": "Read", "input": {}}, False),
                         ({"type": "tool_use", "name": "Write", "input": {"file_path": "/x/.qontinui/scratch/row.json"}},
                          False),
@@ -878,29 +1297,34 @@ def selftest():
                         ({"type": "tool_use", "name": "mcp__coord-mcp__coord_register_gate", "input": {}}, False)]:
         if cfs.is_work_tool(block) != want:
             bad.append(f"is_work_tool({block['name']} {block['input']}) != {want}")
-    # Phase 4: a finished signal with a finish time beside a "work remains"
-    # message is CONTRADICTED; a coord finish with no time to weigh it against is only HELD.
+    # A finished signal with a finish time beside a "work remains" message is
+    # contradicted, and nudged so /next-move reconciles it (Phase 6; it was
+    # CONTRADICTED, for the operator); a coord finish with no time to weigh it against is only HELD.
     still = dict(work, final_text="The deploy is still running; I'll check it in an hour.")
-    for facts, t, want in [
-        ({"finished": True, "finishedAt": now - 42 * h}, dict(still, last_prompt=now - 43 * h), "CONTRADICTED"),
-        ({"sessionStatus": "finished"}, still, "HELD"),
-        ({"sessionStatus": "finished"}, dict(work, final_text="PR #3 landed. SAFE TO CLOSE."), "HELD"),
-        ({"finished": True, "finishedAt": now - 1800000}, work, "HELD"),
+    for facts, t, want, frag in [
+        ({"finished": True, "finishedAt": now - 42 * h}, dict(still, last_prompt=now - 43 * h, last_asst=now - 43 * h),
+         "STOPPED", ("contradicts", "runner finished marker (", "the final message says work remains")),
+        ({"sessionStatus": "finished"}, still, "HELD", "no finish time"),
+        ({"sessionStatus": "finished"}, dict(work, final_text="PR #3 landed. SAFE TO CLOSE."), "HELD", "no finish time"),
+        ({"finished": True, "finishedAt": now - 1800000}, work, "HELD", "runner finished marker ("),
     ]:
-        if judge("ACTIVE", [], facts, t, now, 48)[0] != want:
-            bad.append(f"finished hold({facts}, {t['final_text'][:30]!r}) != {want}")
+        got, why = judge("ACTIVE", [], facts, t, now, 48)
+        if got != want or not all(f in "; ".join(why) for f in ((frag,) if isinstance(frag, str) else frag)):
+            bad.append(f"finished hold({facts}, {t['final_text'][:30]!r}) = {got} {why}, want {want} with {frag!r}")
     # Coord's finish time (sessionStatusSince) against the last prompt (`sw` was
     # prompted 1h before `sn`, a plausible clock): after it is a revival, none
-    # after it a finish; beside the runner marker the NEWER stamp decides;
-    # anything status_since reads as UNKNOWN holds on the no-time reason. A
-    # fragment tuple must all appear in the reasons.
+    # after it a finish. Both screens read ONE finish time, coord's where usable,
+    # else the runner mark's (cfs.finish_state, plan Phase 6; nudge used to hold on
+    # the newer of the two, D5); anything status_since reads as UNKNOWN, or a stamp
+    # ahead of this clock, holds on the no-time reason. A fragment tuple must all
+    # appear in the reasons.
     sn = 1_790_000_000_000
     sw = dict(work, last_prompt=sn - h, last_asst=sn - h, final_text_at=sn - h)
     ss = dict(sw, final_text=still["final_text"])
     lp = sw["last_prompt"]
     no_time = "coord session_status=finished (no finish time to compare a revival against)"
     by_time = ("coord session_status=finished (", "ago), no prompt since")
-    by_marker = ("runner finished marker (", "newer than coord's", "ago), no prompt since")
+    reopened = ("coord finished", "then prompted")
     cf = {"sessionStatus": "finished"}
     since_cases = [  # (screen verdict, facts, tx, want, reason fragment(s))
         ("REVIVED", dict(cf, sessionStatusSince=sn - 2 * h), sw, "STOPPED", ""),
@@ -910,7 +1334,9 @@ def selftest():
         ("REVIVED", dict(cf, sessionStatusSince=lp - 1000), sw, "HELD", by_time),  # exact edge: prompt == since + 1 s
         ("REVIVED", dict(cf, sessionStatusSince=lp - 1001), sw, "STOPPED", ""),  # just past it
         ("ACTIVE", dict(cf, sessionStatusSince=sn - 1800000), dict(sw, last_prompt=None), "HELD", by_time),
-        ("ACTIVE", dict(cf, sessionStatusSince=sn - 1800000), ss, "CONTRADICTED", by_time + ("work remains",)),
+        # coord's finish beside a "work remains" message is contradicted: nudged, both signals named
+        ("ACTIVE", dict(cf, sessionStatusSince=sn - 1800000), ss, "STOPPED",
+         ("contradicts", "coord session_status=finished (", "work remains")),
         ("ACTIVE", cf, ss, "HELD", no_time),
         ("REVIVED", cf, sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=None), sw, "HELD", no_time),
@@ -921,19 +1347,20 @@ def selftest():
         ("REVIVED", dict(cf, sessionStatusSince=-1), sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=1_000_000_000), sw, "HELD", no_time),  # seconds, not ms
         ("REVIVED", dict(cf, sessionStatusSince=sn + 10 * 60000), sw, "HELD", no_time),  # in the future
-        ("REVIVED", dict(cf, sessionStatusSince=sn + 2 * 60000), sw, "HELD", by_time),  # skew inside the allowance
-        # the runner marker and coord's time disagree: the newer stamp holds, either way round
+        # a stamp ahead of this clock is no usable time for either screen (the close screen's guard)
+        ("REVIVED", dict(cf, sessionStatusSince=sn + 2 * 60000), sw, "HELD", no_time),
+        # the runner marker and coord's time disagree: coord's usable stamp decides, either way round
         ("REVIVED", dict(cf, finished=True, finishedAt=sn - 2 * h, sessionStatusSince=sn - 1800000), sw,
          "HELD", by_time),  # a re-finish after the revival
         ("ACTIVE", dict(cf, finished=True, finishedAt=sn - 1800000, sessionStatusSince=sn - 2 * h), sw,
-         "HELD", by_marker),  # coord missed the re-finish: still held
+         "STOPPED", reopened),  # coord's stamp predates the prompt: revived, as the close screen reads it (D5)
         ("ACTIVE", dict(cf, finished=True, finishedAt=sn - 1800000, sessionStatusSince=sn - 2 * h), ss,
-         "CONTRADICTED", by_marker),
+         "STOPPED", reopened),
         ("REVIVED", dict(cf, finished=True, finishedAt=lp - 500, sessionStatusSince=sn - 2 * h), sw,
-         "HELD", by_marker),  # the marker inside the 1 s tolerance
+         "STOPPED", reopened),  # the marker inside the 1 s tolerance does not matter beside coord's stamp
         ("ACTIVE", dict(cf, finished=True, finishedAt=sn - 1200000, sessionStatusSince=sn - 1800000), sw,
-         "HELD", by_marker),  # both after the prompt: the newer one is named
-        # every stamp older than the prompt is the only revival
+         "HELD", by_time + ("!runner finished marker",)),  # both after the prompt: coord's time is named
+        # every stamp older than the prompt is a revival
         ("REVIVED", dict(cf, finished=True, finishedAt=sn - 2 * h, sessionStatusSince=sn - 90 * 60000), sw,
          "STOPPED", ""),
         ("REVIVED", dict(cf, finished=True, finishedAt=None, sessionStatusSince=sn - 2 * h), sw, "STOPPED", ""),
@@ -946,11 +1373,64 @@ def selftest():
     ]
     for verdict, facts, t, want, frag in since_cases:
         got, why = judge(verdict, [], facts, t, sn, 48)
-        if got != want or not all(f in "; ".join(why) for f in ((frag,) if isinstance(frag, str) else frag)):
+        said = "; ".join(why)
+        if got != want or not all((f[1:] not in said) if f.startswith("!") else (f in said)
+                                  for f in ((frag,) if isinstance(frag, str) else frag)):
             bad.append(f"finish time judge({verdict}, {facts}, prompt={t.get('last_prompt')}) = {got} {why}, "
                        f"want {want} with {frag!r}")
-    stale = judge("ACTIVE", [], {"finished": True, "finishedAt": now - 50 * h}, dict(work, last_prompt=now - 51 * h),
-                  now, 48)
+    # Plan Phase 6: a later turn, or the session's own record, reopens a finish, and the reopened row goes
+    # to /next-move instead of sitting held while the close screen keeps it open. `fm` is the runner mark,
+    # 30 minutes after `sw`'s last prompt. (screen verdict, facts, tx, want, reason fragment(s))
+    fm = sn - 1800000
+    mark = {"finished": True, "finishedAt": fm}
+    woke = "Woke on schedule; the check it was set for already ran, so there is nothing to do here."
+    bus = ("<system-reminder>Session Bus stuck_pr_nudge message. Message: PR #7 has had no review for three "
+           "days</system-reminder>")
+    shut = dict(sw, final_text="PR #3 landed.\n\nSAFE TO CLOSE")
+    phase6_cases = [
+        # N5: its own scheduled wake opened a turn 5 or 40 minutes after the mark (it was HELD)
+        ("REVIVED", mark, dict(sw, last_turn_open=fm + 5 * 60000, last_turn_open_text=cfs.SCHEDULED_WAKE,
+                               last_asst=fm + 5 * 60000 + 30000, final_text=woke), "STOPPED",
+         ("marked finished", "a turn opened")),
+        ("REVIVED", mark, dict(sw, last_turn_open=fm + 40 * 60000, last_turn_open_text=cfs.SCHEDULED_WAKE,
+                               last_asst=fm + 40 * 60000 + 30000, final_text=woke), "STOPPED", "a turn opened"),
+        # N8: a Session Bus delivery after the mark opened a turn, and the session worked on it (it was HELD)
+        ("REVIVED", mark, dict(sw, last_turn_open=fm + 3 * 60000, last_turn_open_text=bus, last_asst=fm + 8 * 60000),
+         "STOPPED", ("a turn opened", "Session Bus")),
+        # ...and the same delivery pasted as a prompt reads the same (retention)
+        ("REVIVED", mark, dict(sw, last_prompt=fm + 3 * 60000, last_prompt_text="pasted: " + bus,
+                               last_turn_open=fm + 3 * 60000, last_turn_open_text="pasted: " + bus,
+                               last_asst=fm + 8 * 60000), "STOPPED", "then prompted"),
+        # the dead zone: a runner mark beside a well-formed No is nudged, both signals named (it was CONTRADICTED)
+        ("CONTRADICTED", mark, dict(sw, final_text="Pushed the fix to #12.\n\n**Safe to close:** no - PR #12 is still open."),
+         "STOPPED", ("contradicts", "runner finished marker (", "says work remains (not safe to close)")),
+        # ...and a runner mark beside coord's working (the close screen's CONTRADICTED since Phase 2)
+        ("CONTRADICTED", dict(mark, sessionStatus="working"), sw, "STOPPED",
+         ("contradicts", "coord session_status reads working, not finished")),
+        # ...while beside coord's waiting_human it waits for the operator's answer
+        ("CONTRADICTED", dict(mark, sessionStatus="waiting_human"), sw, "HELD", "waiting_human"),
+        # D5: coord's stamp before the last prompt and the runner mark after it: revived, as close reads it
+        ("REVIVED", dict(cf, sessionStatusSince=sn - 2 * h, finished=True, finishedAt=fm), sw, "STOPPED", reopened),
+        # retention: coord finished with no usable time stays held (unconfirmed)
+        ("REVIVED", dict(cf, sessionStatusSince=None), sw, "HELD", no_time),
+        # a finish only the final reply states is nudged so /next-move records it (the close screen withholds it)
+        ("CLOSEOUT", {"sessionStatus": "working"}, shut, "STOPPED", "records the finish"),
+        ("FOOTER-FINISHED", {}, shut, "STOPPED", "records the finish"),
+        ("CLOSEOUT", dict(mark, sessionStatus="working", finishedAt=sn - 2 * h), shut, "STOPPED",
+         ("records the finish", "marked finished")),  # revived after its mark, then closed out again
+        ("CLOSEOUT", {"sessionStatus": "waiting_human"}, shut, "HELD", "waiting_human"),
+        # ...unless its last /next-move changed nothing: the futile-nudge hold still applies
+        ("CLOSEOUT", {"sessionStatus": "working"}, dict(shut, last_prompt_text=ran, work_tools_since_nudge=0,
+                                                         nudge_streak=1), "HELD", "no progress (strike 1"),
+    ]
+    for verdict, facts, t, want, frag in phase6_cases:
+        got, why = judge(verdict, [], facts, t, sn, 48)
+        if got != want or not all(f in "; ".join(why) for f in ((frag,) if isinstance(frag, str) else frag)):
+            bad.append(f"finish rule judge({verdict}, {facts}, turn opened {t.get('last_turn_open')}) = {got} {why}, "
+                       f"want {want} with {frag!r}")
+    # (its last reply predates the mark too: work long after a mark is a revival under the shared rule)
+    stale = judge("ACTIVE", [], {"finished": True, "finishedAt": now - 50 * h},
+                  dict(work, last_prompt=now - 51 * h, last_asst=now - 51 * h + 60000), now, 48)
     if stale[0] != "HELD" or "finished marker stale" not in stale[1][0]:
         bad.append(f"a 50h-old finished marker = {stale}, want HELD with 'finished marker stale'")
     # The gate ids an intervention row records, and the PR references a message names.
@@ -1144,6 +1624,28 @@ def selftest():
                        f"text={got['last_prompt_text'][:20]!r}; want {want_tasks} / {at} / {want_last!r}")
         if want_tasks == 0 and judge("ACTIVE", [], none, got, now, 24)[0] != "NO-TASK":
             bad.append(f"transcript case {k}: judge != NO-TASK")
+    # last_ran_prompt through transcript_facts: a /next-move answered only by
+    # Claude Code's own limit notice never ran, so a LIMITED row is weighed
+    # against the prompt before it (here at :00) and a finish between the two holds it.
+    # The finish is given in ms after :00; records are 1 s apart and a revival needs more than 1 s.
+    notice = {"type": "assistant", "isApiErrorMessage": True,
+              "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "You've hit your session limit"}]}}
+    for k, (records, want_at, finish_ms, want_v) in enumerate([
+            ([first, report, user(ran), notice], 0, 500, "HELD"),  # finished after the real prompt, before the /next-move
+            ([first, report, user(ran), notice], 0, -60000, "LIMITED"),  # revived by it
+            ([first, report, user(ran), report], 2, 500, "LIMITED"),  # only the /next-move that ran revives it
+    ]):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "projects", "p"))
+            with open(os.path.join(d, "projects", "p", "s.jsonl"), "w") as f:
+                for i, e in enumerate(records):
+                    f.write(json.dumps(dict(e, timestamp=f"2026-10-18T10:00:{i:02d}Z")) + "\n")
+            got = cfs.transcript_facts({"configDir": d, "claudeSessionId": "s"})
+        at = cfs.ms(f"2026-10-18T10:00:{want_at:02d}Z")
+        mark = cfs.ms("2026-10-18T10:00:00Z") + finish_ms
+        got_v = judge("LIMITED", [], {"finished": True, "finishedAt": mark}, got, at + 3600000, 24)[0]
+        if got.get("last_ran_prompt") != at or got_v != want_v:
+            bad.append(f"last_ran_prompt case {k}: {got.get('last_ran_prompt')} / {got_v}, want {at} / {want_v}")
     # The segment fields: an Edit after a /next-move is progress, and cwd is read.
     nudge_rec = user(ran)
     edit = asst({"type": "tool_use", "id": "t2", "name": "Edit", "input": {}})
@@ -1161,6 +1663,36 @@ def selftest():
         if (got["work_tools_since_nudge"], got["nudge_streak"]) != want or got["cwd"] != "/w":
             bad.append(f"transcript nudge fields = {got['work_tools_since_nudge']}, {got['nudge_streak']}, "
                        f"cwd={got['cwd']!r}; want {want}, '/w'")
+    # What the pass ledger records, from real transcripts: unmeasured is None, never False.
+    said = lambda text: asst({"type": "text", "text": text})
+    limit_reply = said("You've hit your session limit \u00b7 resets 5pm")
+    notice = lambda text: dict(said(text), isApiErrorMessage=True)
+    synthetic = said("No response requested.")
+    synthetic["message"] = dict(synthetic["message"], model="<synthetic>")
+    for records, want in [([first, report, nudge_rec, edit, report], True),
+                          ([first, report, nudge_rec, report], False),
+                          ([first, report, nudge_rec, coord_rec, report], False),
+                          ([first, report, nudge_rec, report, model, stdout], False),
+                          ([first, report, nudge_rec], None),                      # no reply recorded
+                          ([first, report, nudge_rec, coord_rec], None),           # tools, no words yet
+                          ([first, report, nudge_rec, limit_reply], None),
+                          ([first, report, nudge_rec, report, nudge_rec, limit_reply], None),  # an earlier strike
+                          ([first, report, nudge_rec, notice("API Error: 500 overloaded")], None),
+                          ([first, report, nudge_rec, notice("You've hit your monthly spend limit")], None),
+                          ([first, report, nudge_rec, notice("Login expired \u00b7 Please run /login")], None),
+                          ([first, report, nudge_rec, synthetic], None),
+                          ([first, report, nudge_rec, said("API error handling is fixed.")], False),
+                          ([first, report, nudge_rec, report, notice("API Error: 500")], False),
+                          ([first, report, nudge_rec, edit, limit_reply], True),
+                          ([first, report, nudge_rec, report, first, report], None)]:  # a later prompt
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "projects", "p"))
+            with open(os.path.join(d, "projects", "p", "s.jsonl"), "w") as f:
+                for i, e in enumerate(records):
+                    f.write(json.dumps(dict(e, timestamp=f"2026-10-18T10:00:{i:02d}Z", cwd="/w")) + "\n")
+            got = progress_since_nudge(cfs.transcript_facts({"configDir": d, "claudeSessionId": "s"}))
+        if got is not want:
+            bad.append(f"progress_since_nudge over {len(records)} records = {got!r}, want {want!r}")
     # Work a /next-move delegated to a subagent is progress: its Edit sits in <sid>/subagents/.
     agent_call = asst({"type": "tool_use", "id": "t4", "name": "Agent", "input": {}})
     for sub_at, want in [("2026-10-18T10:00:09Z", (1, 0)), ("2026-10-18T09:00:00Z", (0, 1))]:
@@ -1175,6 +1707,69 @@ def selftest():
         if (got["work_tools_since_nudge"], got["nudge_streak"]) != want:
             bad.append(f"subagent work at {sub_at} = {got['work_tools_since_nudge']}, {got['nudge_streak']}; "
                        f"want {want}")
+    # The streak walks back over every /next-move in a row, so a subagent's work
+    # after an EARLIER one ends it too, though that subagent finished before the
+    # newest. Three nudges with work after the first are strike 2, not STUCK.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "projects", "p", "s", "subagents"))
+        with open(os.path.join(d, "projects", "p", "s.jsonl"), "w") as f:
+            for i, e in enumerate([first, report, nudge_rec, agent_call, report, nudge_rec, report, nudge_rec, report]):
+                f.write(json.dumps(dict(e, timestamp=f"2026-10-18T10:00:{i:02d}Z")) + "\n")
+        with open(os.path.join(d, "projects", "p", "s", "subagents", "a.jsonl"), "w") as f:
+            f.write(json.dumps(dict(edit, timestamp="2026-10-18T10:00:03Z")) + "\n")
+        got = cfs.transcript_facts({"configDir": d, "claudeSessionId": "s"})
+    if (got["work_tools_since_nudge"], got["nudge_streak"]) != (0, 2):
+        bad.append(f"subagent work after an earlier /next-move = {got['work_tools_since_nudge']}, "
+                   f"{got['nudge_streak']}; want (0, 2)")
+    # newest_record reads a subagent file whatever its tail holds: a last record larger
+    # than the window, a raw U+2028 (legal in JSON, not a line end), an invalid UTF-8
+    # byte, a line that is not an object, an unreadable time. Its work counts, its time
+    # is activity, and it raises nothing. (records written, work calls, newest readable time)
+    def with_text(text, at):
+        return dict(edit, timestamp=at, message=dict(edit["message"], content=edit["message"]["content"]
+                                                     + [{"type": "text", "text": text}]))
+    t3, t9 = "2026-10-18T10:00:03Z", "2026-10-18T10:00:09Z"
+    for label, lines, want_work, want_at in [
+        ("over the window", [dict(edit, timestamp=t3), with_text("x" * 70000, t9)], 2, t9),
+        ("raw U+2028", [with_text("a\u2028b", t9)], 1, t9),
+        ("an invalid UTF-8 byte", [json.dumps(with_text("ab", t9)).encode().replace(b"ab", b"a\xffb")], 1, t9),
+        ("a non-object line", [dict(edit, timestamp=t9), 7], 1, t9),
+        ("deep nesting", [dict(edit, timestamp=t9), b"[" * 200000], 1, t9),
+        ("an unreadable time", [dict(edit, timestamp=t9), dict(edit, timestamp="not a time")], 1, t9),
+    ]:
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "projects", "p", "s", "subagents"))
+            with open(os.path.join(d, "projects", "p", "s.jsonl"), "w") as f:
+                for i, e in enumerate([first, report, nudge_rec, agent_call, report]):
+                    f.write(json.dumps(dict(e, timestamp=f"2026-10-18T10:00:{i:02d}Z")) + "\n")
+            with open(os.path.join(d, "projects", "p", "s", "subagents", "a.jsonl"), "wb") as f:
+                for e in lines:
+                    f.write((e if isinstance(e, bytes) else json.dumps(e, ensure_ascii=False).encode()) + b"\n")
+            try:
+                got = cfs.transcript_facts({"configDir": d, "claudeSessionId": "s"})
+                seen = (got["work_tools_since_nudge"], got["nudge_streak"], got["last_activity"])
+            except Exception as e:  # the failure under test: a bad subagent line must not raise out
+                seen = repr(e)
+        if seen != (want_work, 0, cfs.ms(want_at)):
+            bad.append(f"subagent file with {label} = {seen}; want {(want_work, 0, cfs.ms(want_at))}")
+    # In the session's own transcript each of these lines is skipped, and the records
+    # around it still count. One line per file, so each is pinned on its own.
+    for label, line in [("a non-object line", b"7"),
+                        ("an unreadable time", json.dumps(dict(report, timestamp="not a time")).encode()),
+                        ("deep nesting", b"[" * 200000)]:
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "projects", "p"))
+            with open(os.path.join(d, "projects", "p", "s.jsonl"), "wb") as f:
+                for i, e in enumerate([first, report, nudge_rec, line, report]):
+                    f.write((e if isinstance(e, bytes) else json.dumps(dict(e, timestamp=f"2026-10-18T10:00:{i:02d}Z")).encode())
+                            + b"\n")
+            try:
+                got = cfs.transcript_facts({"configDir": d, "claudeSessionId": "s"})
+                seen = (got["work_tools_since_nudge"], got["nudge_streak"], got["last_asst"])
+            except Exception as e:
+                seen = repr(e)
+        if seen != (0, 1, cfs.ms("2026-10-18T10:00:04Z")):
+            bad.append(f"session transcript with {label} = {seen}; want (0, 1, {cfs.ms('2026-10-18T10:00:04Z')})")
     # A report followed by a new task whose turn made only tool calls is stale.
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, "projects", "p"))
@@ -1220,7 +1815,9 @@ def selftest():
              "classify": lambda *a: ("ACTIVE", []), "proc_table": lambda: {},
              "transcript_facts": lambda row: dict(work, last_prompt=time.time() * 1000 - 3600000),
              "output_moving": lambda tid: False, "wrap_cols": lambda term: ("cols", term["cols"]),
-             "prompt_state": lambda raw, cols=None: seen.append((raw, cols)) or ("text", "draft"),
+             # keyword-only like the real one, so a positional width fails here
+             "prompt_state": lambda raw, *, cols: seen.append((raw, cols)) or ("text", "draft"),
+             "prepare_status": lambda: ("clear", ""),
              "API": "http://127.0.0.1:9"}  # a regression past the check must fail here, never send live
     saved = {k: getattr(cfs, k) for k in list(stubs) + ["raw_tail"]}
     try:
@@ -1230,7 +1827,10 @@ def selftest():
                                          (None, [], "(unknown: 'screen unreadable')")]:
             seen.clear()
             cfs.raw_tail = lambda tid, raw=raw: raw
-            got = nudge_one("t1", 15, 24, set(), False)
+            try:
+                got = nudge_one("t1", 15, 24, set(), False)
+            except TypeError as e:  # a positional width: prompt_state takes cols by keyword only
+                got = (None, None, f"raised TypeError: {e}")
             if got[:2] != (False, False) or want_msg not in got[2] or seen != want_seen:
                 bad.append(f"nudge_one pre-send check (raw={raw!r}) = {got}, prompt_state saw {seen}")
         # The /next-move branch: a futile nudge an hour ago is re-screened HELD and never sent.
@@ -1259,19 +1859,54 @@ def selftest():
         got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
         if got["verdict"] != "HELD" or "no prompt since" not in "; ".join(got["reasons"]):
             bad.append(f"screen() did not judge by coord's finish time: {got['verdict']} {got['reasons']}")
+        # screen() hands the pass ledger the nudge's measured outcome.
+        cfs.transcript_facts = lambda row: dict(work, last_prompt=real_now - 3600000, last_prompt_text="/next-move",
+                                                work_tools_since_nudge=2, nudge_streak=0)
+        got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
+        if got.get("progress_since_nudge") is not True:
+            bad.append(f"screen() dropped progress_since_nudge: {got.get('progress_since_nudge')!r}")
+        # A session the nudge put to work is measured too, whatever it reads now,
+        # and an unreadable transcript there is no measurement, not a failed pass.
+        for v in ("BUSY", "FINISHED", "EXITED-FINISHED"):
+            cfs.screen_all = lambda idle, only, v=v: ([{"terminalId": "t1", "verdict": v, "reasons": []}], [], None)
+            got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
+            if got["verdict"] != v or got.get("progress_since_nudge") is not True:
+                bad.append(f"screen() on a {v} row: {got['verdict']} {got.get('progress_since_nudge')!r}")
+
+        def unreadable(row):
+            raise OSError("gone")
+        cfs.transcript_facts = unreadable
+        got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
+        if got.get("progress_since_nudge") is not None:
+            bad.append(f"screen() on an unreadable transcript: {got.get('progress_since_nudge')!r}")
     finally:
         for k, v in saved.items():
             setattr(cfs, k, v)
+    bad += selftest_prepare()
+    roster_bad, roster_checks = roster_selftest()
+    bad += roster_bad
+    trusted_bad, trusted_checks = trusted_finish_selftest()
+    bad += trusted_bad
+    cross_bad, cross_checks = cross_screen_selftest()
+    bad += cross_bad
     for b in bad:
         print("FAIL: " + b)
     print(f"selftest: {len(cases)} reset cases, 7 prompt cases, {len(judge_cases)} judge cases, "
           f"{len(hold_cases)} /next-move hold cases, {len(since_cases) + 2} finish-time cases, "
-          f"{len(complete_cases)} completion cases, {len(transcript_cases) + 1} transcript cases, "
-          f"2 send cases, {len(bad)} failure(s)")
+          f"{len(phase6_cases)} finish-rule cases, "
+          f"{len(complete_cases)} completion cases, {len(transcript_cases) + 11} transcript cases, "
+          f"2 send cases, {roster_checks} verdict-roster checks, {trusted_checks} trusted-finish checks, "
+          f"{cross_checks} cross-screen checks, "
+          f"{len(bad)} failure(s)")
     return 1 if bad else 0
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a piped Windows console is cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--send", action="store_true", help="prompt /next-move into every STOPPED row")
     ap.add_argument("--cooldown-hours", type=float, default=BACKSTOP_H,
@@ -1301,6 +1936,9 @@ def main():
     except cfs.READ_ERRORS as e:
         print(f"UNKNOWN: could not read the runner at {cfs.API}: {e}", file=sys.stderr)
         return 3
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        warnings.append(prep_text)
     if a.json:
         print(json.dumps({"warnings": warnings, "sessions": res}, indent=1))
     else:
@@ -1310,6 +1948,12 @@ def main():
     if ready_err:
         print("\nUNKNOWN: --send refused - GET /restart-readiness could not be read", file=sys.stderr)
         return 3
+    if prep == "unknown":
+        print(f"\nUNKNOWN: --send refused - {prep_text}", file=sys.stderr)
+        return 3
+    if prep == "held":
+        print(f"\nHELD: --send types nothing - {prep_text}")
+        return 0
     targets = [r for r in res if r["verdict"] == "STOPPED"]
     print(f"\nprompting {PROMPT} into up to {a.max or len(targets)} of {len(targets)} terminal(s)")
     own = os.environ.get("QONTINUI_TERMINAL_ID", "")
