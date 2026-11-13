@@ -26,7 +26,8 @@ describe("elementDomTree §4.6 scrub", () => {
         <button id="c" role="tab" name="n" type="button" class="btn"
           title="secret title" aria-label="secret label"
           data-foo="secret-data" data-testid="tid" data-ui-bridge-id="uid"
-          data-ui-bridge-test-id="utid" data-awas-element="awas" data-bridge-kind="k"></button>
+          data-ui-bridge-test-id="utid" data-awas-element="awas" data-bridge-invisible="true"
+          data-bridge-note="developer secret"></button>
       </section>`);
     const attrs = serializeDomTreeAttrs(host.querySelector("#c")!);
     expect(attrs).toEqual({
@@ -41,7 +42,8 @@ describe("elementDomTree §4.6 scrub", () => {
       "data-ui-bridge-id": "uid",
       "data-ui-bridge-test-id": "utid",
       "data-awas-element": "awas",
-      "data-bridge-kind": "k",
+      "data-bridge-invisible": "true",
+      "data-bridge-note": REDACTED_VALUE,
     });
   });
 
@@ -95,6 +97,20 @@ describe("elementDomTree §4.6 scrub", () => {
     expect(out.truncated).toBe(true);
     expect(out.tree.children).toHaveLength(199);
     expect(out.tree.childCount).toBe(250);
+  });
+
+  it("truncates a long class and walks to the depth budget, no further", () => {
+    const longCls = "c".repeat(90);
+    const host = mount(`<div id="root"><p class="${longCls}"><i><b><u></u></b></i></p></div>`);
+    const out = buildElementDomTree(host.querySelector("#root")!, 3);
+    const p = out.tree.children[0];
+    expect(p.attrs.class).toBe("c".repeat(80) + "…");
+    expect(out.depth).toBe(3);
+    const b = p.children[0].children[0];
+    expect(b.tagName.toLowerCase()).toBe("b");
+    expect(b.childCount).toBe(1);
+    expect(b.children).toHaveLength(0);
+    expect(out.truncated).toBe(false);
   });
 
   it("collapses the /debug/element-tree label inside a boundary only", () => {
