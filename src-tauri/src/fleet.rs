@@ -1187,7 +1187,15 @@ async fn publish_budget_with(
 
     let ci = crate::settings::get_ci_node_settings();
     let host = crate::ci_node::host_sizing::probe();
-    let suggested = crate::ci_node::host_sizing::suggested_concurrent_builds_now(host).0;
+    // The capacity model is read only when its answer is used: a CI node
+    // with no explicit capacity. Elsewhere `build_budget_request` ignores
+    // `suggested`, and reading the model would log D9 records for a consumer
+    // that is off on this box.
+    let suggested = if ci.enabled && ci.max_concurrent_builds.is_none() {
+        crate::ci_node::host_sizing::suggested_concurrent_builds_now(host).0
+    } else {
+        crate::ci_node::host_sizing::suggested_concurrent_builds(host)
+    };
     let body = build_budget_request(
         &device.hostname,
         role,

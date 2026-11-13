@@ -693,6 +693,20 @@ fn room_opened(last_cap: u32, cap: u32, running: usize, queued: usize) -> usize 
     (cap as usize).saturating_sub(running).min(queued)
 }
 
+/// The cap the last republisher tick saw, LOWERED by every deferral to the
+/// cap that deferral was decided at ([`note_deferred_at_cap`]). A cap that dips
+/// and recovers between two ticks (a build finishes, lowering the model's cap
+/// and the running count together, and the next read restores the cap) is then
+/// still seen as a rise by the next tick, so the dispatch deferred at the dip
+/// is drained rather than waiting for the running set to empty.
+static LAST_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Record that a dispatch was deferred at `cap`, so the next cap-rise drain
+/// measures its rise from there ([`LAST_CAP`]).
+fn note_deferred_at_cap(cap: u32) {
+    LAST_CAP.fetch_min(cap, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Re-admit deferred dispatches when the node's cap ROSE. The capacity model
 /// (plan `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
 /// Phase 7) can raise an unset cap without a build finishing, and a finished
@@ -701,7 +715,6 @@ fn room_opened(last_cap: u32, cap: u32, running: usize, queued: usize) -> usize 
 /// budget republisher's tick. Takes `ci_state`'s lock itself, and the cap read
 /// takes it too, so never call it while holding that lock.
 pub(crate) fn drain_deferred_on_cap_rise() {
-    static LAST_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     let settings = crate::settings::get_ci_node_settings();
     if !settings.enabled {
         return;
@@ -799,6 +812,7 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
     match decision {
         Admission::Reject(reason) => reject(&payload, reason),
         Admission::Defer => {
+            note_deferred_at_cap(max_concurrent);
             let (dispatch_id, repo) = (payload.dispatch_id.clone(), payload.repo.clone());
             let (depth, needs_waker) = {
                 let mut state = ci_state().lock().unwrap();
@@ -943,6 +957,7 @@ fn start_build(
         // in-between for the disk probe).
         if state.running.len() >= max_concurrent.max(1) as usize {
             drop(state);
+            note_deferred_at_cap(max_concurrent);
             info!(
                 "ci_node: slot taken while gating — deferring dispatch {}",
                 payload.dispatch_id
