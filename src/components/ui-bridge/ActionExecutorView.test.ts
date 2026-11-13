@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import servedActions from "@/lib/ui-bridge/servedActions.0.46.json";
 
-import { availableActionsFor, paramsFor, parseKeys } from "./ActionExecutorView";
+import { availableActionsFor, paramsFor, parseJsonParams, parseKeys } from "./ActionExecutorView";
 
 const ids = (element: Parameters<typeof availableActionsFor>[0]) =>
   availableActionsFor(element).map((a) => a.id);
@@ -43,6 +43,8 @@ describe("availableActionsFor", () => {
       "unhover",
       "scrollIntoView",
       "sendKeys",
+      "scroll",
+      "drag",
     ]);
   });
 
@@ -127,5 +129,47 @@ describe("paramsFor", () => {
     expect(paramsFor({}, fields)).toEqual({});
     expect(paramsFor({ paramType: "keys" }, { ...fields, keys: "   " })).toEqual({});
     expect(paramsFor({ paramType: "value" }, { ...fields, value: "" })).toEqual({});
+  });
+});
+
+describe("structured-param verbs (scroll, drag, autocomplete)", () => {
+  it("offers all three where advertised, through the JSON field", () => {
+    const offered = availableActionsFor({
+      type: "input",
+      actions: servedActions.autoRegisteredTextInput,
+    });
+    for (const id of ["scroll", "drag", "autocomplete"]) {
+      const action = offered.find((a) => a.id === id);
+      expect(action?.requiresParams).toBe(true);
+      expect(action?.paramType).toBe("json");
+    }
+  });
+
+  it("never guesses them from the kind", () => {
+    for (const type of ["input", "textarea", "button", "select"]) {
+      const offered = ids({ type });
+      for (const id of ["scroll", "drag", "autocomplete"]) expect(offered).not.toContain(id);
+    }
+  });
+
+  it("parseJsonParams accepts only a JSON object", () => {
+    expect(parseJsonParams('{"direction":"down","amount":300}')).toEqual({
+      direction: "down",
+      amount: 300,
+    });
+    for (const bad of ["", "   ", "{", "[1,2]", "null", "42", '"s"']) {
+      expect(parseJsonParams(bad)).toBeNull();
+    }
+  });
+
+  it("sends the JSON field's object verbatim, else {}", () => {
+    const base = { text: "", value: "", keys: "" };
+    expect(
+      paramsFor(
+        { paramType: "json" },
+        { ...base, json: '{"searchText":"ber","selectValue":"Berlin"}' },
+      ),
+    ).toEqual({ searchText: "ber", selectValue: "Berlin" });
+    expect(paramsFor({ paramType: "json" }, { ...base, json: "not json" })).toEqual({});
   });
 });

@@ -47,7 +47,7 @@ export interface ActionConfig {
   label: string;
   icon: React.ReactNode;
   requiresParams?: boolean;
-  paramType?: "text" | "value" | "keys" | "options";
+  paramType?: "text" | "value" | "keys" | "json" | "options";
   description?: string;
 }
 
@@ -191,7 +191,51 @@ const ADVERTISED_ONLY_ACTIONS: ActionConfig[] = [
     paramType: "keys",
     description: "Dispatch a key sequence (space-separated key names)",
   },
+  // The three verbs whose SDK params are a structured object take it verbatim
+  // from the JSON field, under the SDK's own field names
+  // (`control/types.ts` ScrollAction / DragAction / AutocompleteAction).
+  {
+    id: "scroll",
+    label: "Scroll",
+    icon: <ScanEye className="w-4 h-4" />,
+    requiresParams: true,
+    paramType: "json",
+    description: 'Scroll, e.g. {"direction":"down","amount":300} or {"deltaY":-200}',
+  },
+  {
+    id: "drag",
+    label: "Drag",
+    icon: <MousePointer className="w-4 h-4" />,
+    requiresParams: true,
+    paramType: "json",
+    description:
+      'Drag to a target, e.g. {"target":{"elementId":"…"}} or {"targetPosition":{"x":400,"y":200}}',
+  },
+  {
+    id: "autocomplete",
+    label: "Autocomplete",
+    icon: <List className="w-4 h-4" />,
+    requiresParams: true,
+    paramType: "json",
+    description: 'Type then pick a suggestion, e.g. {"searchText":"ber","selectValue":"Berlin"}',
+  },
 ];
+
+/**
+ * Parse the JSON params field. Only a JSON OBJECT is a params payload; any
+ * other value, empty input, or invalid JSON answers `null`.
+ */
+export function parseJsonParams(raw: string): Record<string, unknown> | null {
+  if (!raw.trim()) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Split the keys field into the SDK's `keys` list: whitespace-separated names. */
 export function parseKeys(raw: string): string[] {
@@ -201,18 +245,22 @@ export function parseKeys(raw: string): string[] {
 /**
  * The params an action sends, from the raw field texts: `{ text }` for
  * `type`, `{ value }` for `select` / `setValue`, `{ keys }` for `sendKeys` —
- * each the name the SDK reads. An empty field, or an action with no param
- * type, sends `{}`.
+ * each the name the SDK reads — and the JSON field's object verbatim for
+ * `scroll` / `drag` / `autocomplete`. An empty or unparseable field, or an
+ * action with no param type, sends `{}`.
  */
 export function paramsFor(
   action: Pick<ActionConfig, "paramType">,
-  fields: { text: string; value: string; keys: string },
+  fields: { text: string; value: string; keys: string; json?: string },
 ): Record<string, unknown> {
   if (action.paramType === "text" && fields.text) return { text: fields.text };
   if (action.paramType === "value" && fields.value) return { value: fields.value };
   if (action.paramType === "keys") {
     const keys = parseKeys(fields.keys);
     if (keys.length > 0) return { keys };
+  }
+  if (action.paramType === "json") {
+    return parseJsonParams(fields.json ?? "") ?? {};
   }
   return {};
 }
@@ -279,6 +327,7 @@ export function ActionExecutorView({
   const [textParam, setTextParam] = useState("");
   const [valueParam, setValueParam] = useState("");
   const [keysParam, setKeysParam] = useState("");
+  const [jsonParam, setJsonParam] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const getAvailableActions = useCallback(
@@ -299,6 +348,7 @@ export function ActionExecutorView({
           text: textParam,
           value: valueParam,
           keys: keysParam,
+          json: jsonParam,
         });
 
         await onExecuteAction(element.id, action.id, params);
@@ -317,7 +367,7 @@ export function ActionExecutorView({
         setExecuting(false);
       }
     },
-    [element, onExecuteAction, disabled, executing, textParam, valueParam, keysParam],
+    [element, onExecuteAction, disabled, executing, textParam, valueParam, keysParam, jsonParam],
   );
 
   // Quick action button
@@ -328,7 +378,8 @@ export function ActionExecutorView({
       (action.requiresParams &&
         ((action.paramType === "text" && !textParam) ||
           (action.paramType === "value" && !valueParam) ||
-          (action.paramType === "keys" && parseKeys(keysParam).length === 0)));
+          (action.paramType === "keys" && parseKeys(keysParam).length === 0) ||
+          (action.paramType === "json" && parseJsonParams(jsonParam) === null)));
 
     return (
       <Button
@@ -433,6 +484,26 @@ export function ActionExecutorView({
                 />
                 {paramActions
                   .filter((a) => a.paramType === "text")
+                  .map((action) => renderActionButton(action))}
+              </div>
+            </div>
+          )}
+
+          {/* JSON params input for scroll / drag / autocomplete */}
+          {paramActions.some((a) => a.paramType === "json") && (
+            <div className="mb-3">
+              <label className="text-xs text-muted-foreground mb-1 block">Params (JSON):</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={jsonParam}
+                  onChange={(e) => setJsonParam(e.target.value)}
+                  placeholder='e.g. {"direction":"down","amount":300}'
+                  className="flex-1 px-2 py-1.5 text-sm font-mono bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
+                  disabled={disabled || executing}
+                />
+                {paramActions
+                  .filter((a) => a.paramType === "json")
                   .map((action) => renderActionButton(action))}
               </div>
             </div>
