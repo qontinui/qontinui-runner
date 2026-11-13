@@ -104,6 +104,7 @@ mcp/steward.rs | reap_emptied_panes | exempt | no live claude in the pane: a ste
 mcp/steward.rs | start_steward | exempt | a terminal never handed to a session: the steward pane just created, closed when its metadata could not be recorded, before the detached launch task types `claude`
 looping_agent_supervisor.rs | supervise_one | product | the looping-agent supervisor's Relaunch kills a live idle claude at a cycle boundary with no probe, and its loop continues in the fresh instance it spawns (state in the journal); the same fn also closes a tab whose process already EXITED (no live claude). NOT in architecture §3.8's inventory, so its door class is an open question for R0b-1 (Phase 15) to settle before doors are recorded at runtime
 terminal/account_migration.rs | migrate_session | exempt | the Migrator's close of a migrated session's OLD instance once its replacement is up — the session lives on in the new instance (§4.6)
+session/failure_recovery.rs | resume_in_place | exempt | crash-resume's close of the DEAD pane (its PTY already exited — the only pane plan_for hands it) once spawn_resumed_pane has launched the replacement: no live claude in it, and the session lives on in the resumed instance (the Migrator's §4.6 shape); the row is marked TerminalSuperseded first
 
 # ── the session transports' teardown, and the registry close that drives it
 session/transport/pty.rs | close | helper | transport.close(

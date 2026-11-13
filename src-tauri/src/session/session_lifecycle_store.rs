@@ -11158,10 +11158,11 @@ mod tests {
         let mut no_origin = unrecorded("no-origin");
         no_origin.origin = None;
         let no_transcript = unrecorded("no-transcript");
-        // Parity, not a gemini rule: no Gemini adapter ships, so the frontend's
-        // `providerDescriptorFor` (like `adapter_for` here) resolves `gemini`
-        // to the full-tier Claude descriptor and calls this row needs-account.
-        // When a Gemini adapter lands on both sides this row stops being held.
+        // Parity, not a gemini rule: no Gemini profile ships, so the frontend's
+        // `providerDescriptorFor` returns null for `gemini` and `profile_for`
+        // here returns None — neither falls back to the Claude descriptor, so
+        // the row is never needs-account and is NOT held (plan
+        // 2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy).
         let mut gemini = unrecorded("gemini");
         gemini.provider = "gemini".to_string();
         write_fixture(
@@ -11186,7 +11187,6 @@ mod tests {
         assert_eq!(
             held,
             vec![
-                "gemini".to_string(),
                 "no-holder".to_string(),
                 "observed".to_string(),
                 "two-holders".to_string()

@@ -434,6 +434,7 @@ GET /sessions/policy-context-stats policy_context_stats
 GET /sessions/transcript-coverage transcript_coverage
 GET /sessions/tree-resets list_tree_resets
 GET /sessions/{id}/latest-review get_latest_review_for_session
+GET /sessions/{id}/permission-requests get_permission_requests
 GET /sessions/{id}/policy-context policy_context
 GET /sessions/{id}/touched-files get_touched_files
 GET /sessions/{id}/transcript get_transcript
@@ -533,9 +534,11 @@ GET /task-runs/{id}/workflow-state get_workflow_state
 GET /tenant/active get_active_tenant
 GET /terminal-pages list_terminal_pages_handler
 GET /terminals list_terminals_handler
+GET /terminals/cli-profiles list_cli_profiles_handler
 GET /terminals/transport-stats get_transport_stats_handler
 GET /terminals/{id}/buffer get_buffer_handler
 GET /terminals/{id}/coord-session get_coord_session_handler
+GET /terminals/{id}/failures get_failures_handler
 GET /terminals/{id}/output get_buffer_handler
 GET /terminals/{id}/ws ws_terminal_handler
 GET /test-results list_test_results

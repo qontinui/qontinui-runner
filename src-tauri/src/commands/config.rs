@@ -1014,8 +1014,8 @@ mod resume_render_tests {
             format!(
                 "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=\"999999999\" \
                  CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=\"999999999\" \
-                 CLAUDE_CONFIG_DIR=\"/home/user/.claude\" claude --permission-mode \
-                 bypassPermissions --resume {SID}"
+                 CLAUDE_CONFIG_DIR=\"/home/user/.claude\" claude --teammate-mode in-process \
+                 --permission-mode bypassPermissions --resume {SID}"
             )
         );
         let summary = render_ai_resume_command(
@@ -1031,7 +1031,7 @@ mod resume_render_tests {
         .unwrap();
         assert_eq!(
             summary,
-            format!("claude --permission-mode bypassPermissions --resume {SID}")
+            format!("claude --teammate-mode in-process --permission-mode bypassPermissions --resume {SID}")
         );
     }
 
@@ -1072,7 +1072,8 @@ mod resume_render_tests {
         );
         assert!(
             cmd.ends_with(&format!(
-                "claude --permission-mode dontAsk --allowedTools Read --resume {SID}"
+                "claude --teammate-mode in-process --permission-mode dontAsk --allowedTools Read \
+                 --resume {SID}"
             )),
             "{cmd}"
         );

@@ -1475,7 +1475,9 @@ mod tests {
         let cmd = render_pty_command(&spec(), &cfg, false);
         assert_ne!(cmd, "clg");
         assert!(
-            cmd.starts_with("claude --permission-mode dontAsk --allowedTools Read"),
+            cmd.starts_with(
+                "claude --teammate-mode in-process --permission-mode dontAsk --allowedTools Read"
+            ),
             "{cmd}"
         );
     }
@@ -1552,7 +1554,9 @@ mod tests {
         // The PTY renderer composes the same flags.
         let cmd = render_pty_command(&spec(), &cfg, false);
         assert!(
-            cmd.starts_with("claude --permission-mode dontAsk --allowedTools Read"),
+            cmd.starts_with(
+                "claude --teammate-mode in-process --permission-mode dontAsk --allowedTools Read"
+            ),
             "{cmd}"
         );
     }
