@@ -2128,6 +2128,22 @@ pub struct BaselineRegistryEntry {
     pub snapshot_id: Option<String>,
 }
 
+/// The element boxes a baseline records: vision-core's own
+/// [`qontinui_vision_core::BaselineEntry::from_snapshot`] projection, so the
+/// rounding is the one `no_layout_shift_since` compares against.
+///
+/// `Element::bbox` is the producer's unrounded measurement
+/// (`Option<ElementRect>`); the layout-shift check reads each element's
+/// `region()` (its pixel-grid rounding). Recording anything else here — an
+/// `as i32` / `as u32` truncation in particular — would report up to 1px of
+/// phantom shift on every fractional box. Elements with no bbox are skipped,
+/// as vision-core skips them, rather than failing the whole baseline.
+fn baseline_element_bboxes(
+    snapshot: &qontinui_vision_core::ElementSnapshot,
+) -> std::collections::HashMap<String, qontinui_vision_core::Region> {
+    qontinui_vision_core::BaselineEntry::from_snapshot(snapshot).element_bboxes
+}
+
 impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
     fn from(b: &BaselineRegistryEntry) -> Self {
         qontinui_vision_core::BaselineEntry {
@@ -3891,15 +3907,7 @@ async fn vision_baseline_handler(
             )
         })?;
 
-    let element_bboxes: std::collections::HashMap<String, qontinui_vision_core::Region> = req
-        .snapshot
-        .elements
-        .iter()
-        // `bbox` is now `Option<Region>` — only elements with a measured bbox
-        // can participate in layout-shift baselines; skip bbox-less (hidden/
-        // unmeasured) elements rather than failing the whole baseline.
-        .filter_map(|e| e.bbox.map(|b| (e.id.clone(), b)))
-        .collect();
+    let element_bboxes = baseline_element_bboxes(&req.snapshot);
     let registered_at_unix_ms = chrono::Utc::now().timestamp_millis();
     let entry = BaselineRegistryEntry {
         name: req.name.clone(),
@@ -4682,17 +4690,104 @@ mod tests {
     /// Both arms are pinned, because the informative half of `coverage` is
     /// that its absence is a statement: `None` means no snapshot was
     /// supplied, never "the count was skipped".
+    /// A baseline registered from a snapshot with a FRACTIONAL bbox must not
+    /// report a shift when the same snapshot is checked against it at zero
+    /// tolerance. `no_layout_shift_since` compares each element's `region()`
+    /// (edge-rounded) with what the baseline recorded, so the baseline has to
+    /// record `region()` too: a truncating `as i32` / `as u32` projection of
+    /// this box records `{10, 20, 30, 40}` against a current `{11, 20, 30, 41}`
+    /// and reads 1px of phantom shift.
+    #[test]
+    fn a_fractional_bbox_baseline_reads_no_shift_against_its_own_snapshot() {
+        let rect = qontinui_vision_core::ElementRect {
+            x: 10.6,
+            y: 20.4,
+            w: 30.5,
+            h: 40.7,
+        };
+        let snapshot = qontinui_vision_core::ElementSnapshot {
+            elements: vec![
+                qontinui_vision_core::Element {
+                    id: "card".to_string(),
+                    bbox: Some(rect),
+                    ..Default::default()
+                },
+                // Unmeasured: skipped by the baseline, not an error.
+                qontinui_vision_core::Element {
+                    id: "hidden".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let bboxes = baseline_element_bboxes(&snapshot);
+        assert_eq!(bboxes.len(), 1, "the bbox-less element is skipped");
+        let recorded = bboxes["card"];
+        assert_eq!(recorded, snapshot.elements[0].region().unwrap());
+        assert_eq!(
+            recorded,
+            Region {
+                x: 11,
+                y: 20,
+                w: 30,
+                h: 41
+            }
+        );
+        let truncated = Region {
+            x: rect.x as i32,
+            y: rect.y as i32,
+            w: rect.w as u32,
+            h: rect.h as u32,
+        };
+        assert_ne!(
+            recorded, truncated,
+            "the fixture must be one where truncation and region() disagree"
+        );
+
+        let entry = BaselineRegistryEntry {
+            name: "fractional".to_string(),
+            sha256: String::new(),
+            width: 100,
+            height: 100,
+            registered_at_unix_ms: 0,
+            element_bboxes: bboxes,
+            snapshot_id: None,
+        };
+        let baselines: std::collections::HashMap<String, qontinui_vision_core::BaselineEntry> =
+            [(entry.name.clone(), qontinui_vision_core::BaselineEntry::from(&entry))].into();
+        let result = qontinui_vision_core::evaluate_assertion(
+            &qontinui_vision_core::Assertion::NoLayoutShiftSince {
+                baseline: "fractional".to_string(),
+                tolerance_px: Some(0),
+            },
+            &qontinui_vision_core::EvalContext {
+                snapshot: Some(&snapshot),
+                baselines: Some(&baselines),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            result.outcome,
+            qontinui_vision_core::AssertionOutcome::Passed,
+            "{result:?}"
+        );
+    }
+
     #[test]
     fn assert_response_coverage_is_present_with_a_snapshot_and_absent_without() {
         let snapshot = qontinui_vision_core::ElementSnapshot {
             elements: vec![qontinui_vision_core::Element {
                 id: "a".to_string(),
-                bbox: Some(Region {
-                    x: 0,
-                    y: 0,
-                    w: 10,
-                    h: 10,
-                }),
+                bbox: Some(
+                    Region {
+                        x: 0,
+                        y: 0,
+                        w: 10,
+                        h: 10,
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             }],
             ..Default::default()
@@ -6162,7 +6257,7 @@ mod text_hidden_tests {
             elements: vec![
                 Element {
                     id: "hero".into(),
-                    bbox: Some(region(0, 0, 200, 100)),
+                    bbox: Some(region(0, 0, 200, 100).into()),
                     media: Some(ElementMedia {
                         object_fit: Some(ObjectFit::Fill),
                         ..ElementMedia::new(MediaKind::Img)
@@ -6171,7 +6266,7 @@ mod text_hidden_tests {
                 },
                 Element {
                     id: "heading".into(),
-                    bbox: Some(region(20, 30, 160, 40)),
+                    bbox: Some(region(20, 30, 160, 40).into()),
                     text: Some("Measured on real pixels".into()),
                     fg_color: Some(Rgb::new(255, 255, 255)),
                     ..Default::default()
