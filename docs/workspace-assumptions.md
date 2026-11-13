@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 106 | 107 | 96 | 10 | 0 | 0 |
+| `os_bound_tooling` | 107 | 108 | 95 | 12 | 0 | 0 |
 
 ## `repo_layout` (69 rows)
 
@@ -248,7 +248,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (106 rows)
+## `os_bound_tooling` (107 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
