@@ -1150,27 +1150,8 @@ pub struct TestAssociation {
 }
 
 // ============================================================================
-// Orchestrator Types (Verification Plans, Task Knowledge, Results)
+// Orchestrator Types (Task Knowledge, Results)
 // ============================================================================
-
-/// Stored verification plan from the database.
-/// Contains the full plan JSON plus metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredVerificationPlan {
-    pub id: String,
-    pub task_run_id: String,
-    pub version: u32,
-    /// Full VerificationPlan serialized as JSON
-    pub plan_json: String,
-    pub goal_summary: String,
-    pub criteria_count: u32,
-    pub has_ai_criteria: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replan_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_version_id: Option<String>,
-    pub created_at: String,
-}
 
 /// Stored task knowledge entry from the database.
 /// Represents findings, observations, hypotheses, etc. from agents.
