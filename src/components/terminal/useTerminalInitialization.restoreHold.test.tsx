@@ -455,4 +455,33 @@ describe("restore runs and the trim hold", () => {
     finishSecondRead();
     await until("the trim the hold deferred", () => api.current?.zone.layoutId !== "six-pack");
   }, 30_000);
+
+  // Found by the 2026-11-13 since-restart E2E: every render retries a deferred
+  // page, and each retry published the page as neither deferred nor restored
+  // until its fetch came back, so the strip and its rows flapped between
+  // "deferred by drain" and "page not opened".
+  it("keeps reporting a drain-deferred page as deferred through its retries", async () => {
+    const reports: string[][] = [];
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_report_restore_progress") {
+        reports.push([
+          ...((args as { deferredPages?: string[] } | undefined)?.deferredPages ?? []),
+        ]);
+        return { success: true, data: null };
+      }
+      await settle(5);
+      if (cmd === "terminal_session_list_open") {
+        return { success: true, data: { sessions: [], deferredByDrain: { reason: "drain" } } };
+      }
+      return { success: true, data: { settled: true, held: [] } };
+    };
+    mount();
+    await until("the first deferral report", () => reports.some((r) => r.includes(PAGE)));
+    await renderUntil("two retries", api, () => reconnectRuns >= 3);
+    await settle(100);
+    const first = reports.findIndex((r) => r.includes(PAGE));
+    const after = reports.slice(first);
+    expect(after.length).toBeGreaterThan(1);
+    for (const r of after) expect(r).toContain(PAGE);
+  }, 30_000);
 });

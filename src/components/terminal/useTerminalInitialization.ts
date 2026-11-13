@@ -1650,6 +1650,17 @@ export function useTerminalInitialization({
   // re-runs the restore effect. Closing the hold at the start of every retry
   // turned that into a loop that lasted as long as the drain.
   const deferredRetryPages = useRef<Set<string>>(new Set());
+  // Pages whose restore the drain has deferred and no run has restored since:
+  // what is PUBLISHED as "deferred" to the since-restart strip and the backend's
+  // `restoreOwed`. Unlike `drainDeferredPages` (which also marks a merging
+  // re-run, and which a re-run clears the moment it starts), a page leaves this
+  // set only when a run gets a restore set the drain did not withhold. Any
+  // render of the page's scope re-runs a deferred restore, and publishing
+  // `drainDeferredPages` let every such retry report the page as neither
+  // deferred nor restored for as long as the retry ran, so the strip and its
+  // rows flapped between "deferred by drain" and "page not opened" (measured
+  // 2026-11-13 on a temp runner, two reads two seconds apart).
+  const drainHeldPages = useRef<Set<string>>(new Set());
   // Each page's newest restore run. A re-run can start before an earlier run's
   // drain timer fires, and that timer must not release the hold the newer run
   // still needs.
@@ -1669,12 +1680,12 @@ export function useTerminalInitialization({
   );
   const publishRestorePages = useCallback(() => {
     setPublishedCompletePages(new Set(restoreCompletePages.current));
-    setPublishedDeferredPages(new Set(drainDeferredPages.current));
+    setPublishedDeferredPages(new Set(drainHeldPages.current));
     // The backend's since-restart ledger reads the same progress, so a row
     // whose page already restored without it is not reported as still owed.
     invoke("terminal_report_restore_progress", {
       completePages: [...restoreCompletePages.current],
-      deferredPages: [...drainDeferredPages.current],
+      deferredPages: [...drainHeldPages.current],
       knownPageIds: loadKnownPageIds(),
     }).catch((err) => {
       console.warn("[TerminalPage] terminal_report_restore_progress failed:", err);
@@ -1826,7 +1837,9 @@ export function useTerminalInitialization({
     }> = [];
 
     (async () => {
-      // A drain re-run moved this page out of both sets above.
+      // A drain re-run moved this page out of the complete set above. It stays
+      // in `drainHeldPages`, so the published view still says the drain holds
+      // it until this run learns otherwise.
       if (isDrainRerun) publishRestorePages();
       // True once a deferred resume/scrollback drain timer is scheduled. When
       // set, that timer owns flipping the per-page restore-complete gate (after
@@ -1905,6 +1918,7 @@ export function useTerminalInitialization({
           restoreDeferred = true;
           deferredRetryPages.current.add(initPageId);
           drainDeferredPages.current.add(initPageId);
+          drainHeldPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
           console.warn(
@@ -1915,6 +1929,7 @@ export function useTerminalInitialization({
           return;
         }
         // Not deferred after all, so this retry is a real restore: hold the trim.
+        drainHeldPages.current.delete(initPageId);
         setRestoreSettled(false);
         const openRecords = restoreSet.records;
         // The default Claude home, for the account rule (`resolveAccountDir`):
