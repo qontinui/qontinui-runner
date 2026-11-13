@@ -37,6 +37,41 @@ exactly localhost, [::1] or 127.a.b.c with CANONICAL decimal octets <= 255 -
 no leading zero, which would send `127.08.0.1` to DNS) and resolves on the
 DEFAULT arm otherwise. Same rule as mcp_url_is_loopback in mcp-env-ref.sh.
 
+PORT gate - the environment's nonce goes to the HOSTING RUNNER only (finding
+e4c596d6; plan 2026-11-06-a-walked-up-mcp-json-gets-the-sessions-nonce-on-any-loopback-port):
+loopback alone is not enough, because the doors find their .mcp.json by
+walking UP from a directory, and a file planted in a directory the walk
+reaches first could name `http://127.0.0.1:<any port>/x` with this terminal's
+`${QONTINUI_COORD_MCP_NONCE_<K>}` and receive it. The terminal nonce has ONE
+audience, the runner that hosts this terminal, whose API port (the port its
+coord-mcp proxy is served on) the runner exports as $QONTINUI_RUNNER_API_PORT.
+So expand_env_ref_for_url reads the environment only when
+url_port_is_hosting_runner(url) holds: the URL is loopback (above), its host is
+EXACTLY 127.0.0.1 (the one host the runner writes and binds - `localhost`,
+`[::1]` and 127.0.0.2 are loopback a planted listener can hold on the runner's
+port), AND its effective port (the explicit one, else 80 for http / 443 for https) equals
+$QONTINUI_RUNNER_API_PORT (1-5 ASCII digits, 1..65535, compared as integers,
+read from the same mapping the expansion reads). Every other URL resolves on
+the DEFAULT arm - the file's own literal, never this process's secret. An unset
+or malformed $QONTINUI_RUNNER_API_PORT reads the environment for no URL.
+Same rule as mcp_url_port_is_hosting_runner in mcp-env-ref.sh and
+Test-CoordMcpHostingRunnerUrl in coord-credential.psm1. Only the `127.0.0.1`
+SPELLING gets the environment value: a `localhost:<runner port>` door resolves
+on its default unless its caller normalizes the host first (coord-mcp-shim.py
+does). $QONTINUI_RUNNER_API_PORT is trusted as the host's port, so an operator
+who points it at another runner directs the terminal nonce there (a planted
+file cannot set it).
+
+The gate also names WHICH predicate failed: hosting_runner_gate_cause(url)
+returns None when the URL IS the hosting runner's door, else one token of a
+closed ASCII vocabulary, in precedence order (the first that holds is
+reported): not_loopback, api_port_unset (absent or empty), api_port_malformed
+(not 1-5 ASCII digits in 1..65535), host_not_runner, port_not_runner.
+url_port_is_hosting_runner is its projection. expand_env_ref_for_url carries
+the token into a DEFAULT-arm refusal as `(default_arm=<token>: <prose>)`;
+`minted` and `unstated` complete the vocabulary the three owners share. The
+refusal prints no value: not the URL, not the API port, not the default.
+
 The error message names the VARIABLE only - never a value, never the default
 (the default is a nonce).
 """
@@ -61,20 +96,28 @@ _OCTET = r"(0|[1-9][0-9]{0,2})"
 _LOOPBACK_V4 = re.compile(r"\A127\." + _OCTET + r"\." + _OCTET + r"\." + _OCTET + r"\Z")
 
 
-def url_is_loopback(url):
-    """True iff `url` is strictly this box's loopback (see the module doc)."""
-    if not isinstance(url, str):
-        return False
+def _authority(url):
+    """(scheme length, authority) of `url`, or None without an http(s) scheme."""
     m = _SCHEME.match(url)
     if not m:
-        return False
+        return None
     rest = url[m.end():]
     cut = len(rest)
     for ch in "/?#":
         i = rest.find(ch)
         if i != -1 and i < cut:
             cut = i
-    auth = rest[:cut]
+    return m.end(), rest[:cut]
+
+
+def url_is_loopback(url):
+    """True iff `url` is strictly this box's loopback (see the module doc)."""
+    if not isinstance(url, str):
+        return False
+    parsed = _authority(url)
+    if parsed is None:
+        return False
+    auth = parsed[1]
     if not _AUTHORITY_CHARS.match(auth):
         return False
     if auth == "[::1]":
@@ -92,10 +135,57 @@ def url_is_loopback(url):
     return bool(v4) and all(int(o) <= 255 for o in v4.groups())
 
 
+RUNNER_API_PORT_ENV = "QONTINUI_RUNNER_API_PORT"
+RUNNER_HOST = "127.0.0.1"
+_API_PORT = re.compile(r"\A[0-9]{1,5}\Z")
+
+
+def hosting_runner_gate_cause(url, environ=None):
+    """None iff `url` is loopback AND its effective port is the hosting
+    runner's $QONTINUI_RUNNER_API_PORT, read from `environ` (default
+    os.environ); else the token of the first predicate that failed. See
+    "PORT gate" in the module doc."""
+    if not url_is_loopback(url):
+        return "not_loopback"
+    env = os.environ if environ is None else environ
+    api = env.get(RUNNER_API_PORT_ENV) or ""
+    if not api:
+        return "api_port_unset"
+    if not _API_PORT.match(api) or not 1 <= int(api) <= 65535:
+        return "api_port_malformed"
+    scheme_len, auth = _authority(url)
+    default = 443 if scheme_len == len("https://") else 80
+    host, _, port = auth.partition(":")
+    # Exactly the host the runner writes and binds. `localhost`, `[::1]` and
+    # any other 127.x.y.z are loopback too, but a planted listener can hold
+    # them on the runner's port while the runner holds only 127.0.0.1.
+    if host != RUNNER_HOST:
+        return "host_not_runner"
+    if not port:
+        return None if default == int(api) else "port_not_runner"
+    # url_is_loopback already holds the port to ASCII digits; bound its length
+    # before int() so a 4000-digit port is a plain mismatch.
+    if len(port) <= 5 and int(port) == int(api):
+        return None
+    return "port_not_runner"
+
+
+def url_port_is_hosting_runner(url, environ=None):
+    """True iff `url` is loopback AND its effective port is the hosting
+    runner's $QONTINUI_RUNNER_API_PORT (the projection of
+    hosting_runner_gate_cause). See "PORT gate" in the module doc."""
+    return hosting_runner_gate_cause(url, environ) is None
+
+
 def expand_env_ref_for_url(value, url, environ=None):
     """expand_env_ref for a value about to be sent to `url`: the environment
-    arm only for a strictly-loopback URL, the DEFAULT arm otherwise."""
-    return expand_env_ref(value, environ if url_is_loopback(url) else {})
+    arm only for the HOSTING RUNNER's loopback port, the DEFAULT arm for every
+    other URL (see "URL gate" and "PORT gate" in the module doc). The gate is
+    evaluated once; its cause names a DEFAULT-arm refusal."""
+    cause = hosting_runner_gate_cause(url, environ)
+    if cause is None:
+        return expand_env_ref(value, environ)
+    return _expand(value, {}, cause)
 
 
 def env_ref_allowlisted(name):
@@ -103,16 +193,53 @@ def env_ref_allowlisted(name):
     return bool(_ALLOWLIST.match(name or ""))
 
 
-class EnvRefError(ValueError):
-    """An env reference with no default whose variable is unset or empty."""
+# The DEFAULT-arm cause vocabulary (closed, ASCII, spelled identically in the
+# bash and PowerShell owners) and the prose each token renders.
+_DEFAULT_ARM_WHY = {
+    "minted": "a minted answer, whose contract is the workdir nonce",
+    "not_loopback": "the door URL is not strictly this box's loopback",
+    "api_port_unset": "$QONTINUI_RUNNER_API_PORT is not set to a value in this "
+    "process's environment, so the PORT gate cannot identify this terminal's "
+    "hosting runner",
+    "api_port_malformed": "$QONTINUI_RUNNER_API_PORT is not a port (1-5 ASCII "
+    "digits, 1..65535), so the PORT gate cannot identify this terminal's "
+    "hosting runner",
+    "host_not_runner": "the door URL's host is not 127.0.0.1, the one host the "
+    "hosting runner binds",
+    "port_not_runner": "the door URL's port is not $QONTINUI_RUNNER_API_PORT, "
+    "the hosting runner's",
+    "unstated": "no cause was supplied - never a guessed one",
+}
 
-    def __init__(self, name):
+
+class EnvRefError(ValueError):
+    """An env reference with no default whose variable is unset or empty.
+
+    `default_arm` is None for the ENVIRONMENT arm; otherwise the DEFAULT arm
+    was taken, and it names why (a token outside the vocabulary renders
+    `unstated`, never the value it was given)."""
+
+    def __init__(self, name, default_arm=None):
         self.name = name
+        self.default_arm = default_arm
         if name == MALFORMED_REFERENCE:
+            self.default_arm = None  # a malformed reference names no arm
             super().__init__(
                 "%s %s: the .mcp.json value carries a ${...} whose name part is not "
                 "an identifier - refusing to send it as a credential (the body is "
                 "withheld: it may hold a nonce)" % (UNEXPANDED_ENV_REF, name)
+            )
+            return
+        if default_arm is not None:
+            if default_arm not in _DEFAULT_ARM_WHY:
+                default_arm = "unstated"
+            self.default_arm = default_arm
+            super().__init__(
+                "%s %s: the value resolves on its DEFAULT arm (default_arm=%s: %s) "
+                "and references ${%s} with no default - refusing to send the "
+                "literal reference as a credential (UNKNOWN shape, not a coord "
+                "verdict)" % (UNEXPANDED_ENV_REF, name, default_arm,
+                              _DEFAULT_ARM_WHY[default_arm], name)
             )
             return
         super().__init__(
@@ -137,9 +264,14 @@ def expand_env_ref(value, environ=None):
     Raises EnvRefError for a no-default reference whose variable is unset or
     empty. A non-string is returned unchanged.
     """
+    return _expand(value, os.environ if environ is None else environ, None)
+
+
+def _expand(value, env, default_arm):
+    """expand_env_ref over `env`; a non-None `default_arm` marks the DEFAULT
+    arm (env is then empty) and names its cause in a refusal."""
     if not isinstance(value, str) or "${" not in value:
         return value
-    env = os.environ if environ is None else environ
     out = []
     rest = value
     while True:
@@ -167,5 +299,5 @@ def expand_env_ref(value, environ=None):
         elif has_default:
             out.append(default)
         else:
-            raise EnvRefError(name)
+            raise EnvRefError(name, default_arm=default_arm)
     return "".join(out)
