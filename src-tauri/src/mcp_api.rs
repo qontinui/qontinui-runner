@@ -24582,6 +24582,38 @@ mod provision_probe_tests {
     use super::{capability_manifest_provision_probe, enclosing_git_work_tree, ProvisionProbeBody};
     use axum::response::Json;
 
+    /// A temporary directory guaranteed to sit outside every git work tree, as
+    /// the handler judges one ([`enclosing_git_work_tree`] on the canonical
+    /// path). `TMPDIR` comes first; when it lies inside a checkout (a runner
+    /// session's scratch dir can), the next candidate that does not is used, so
+    /// a test that needs a scratch cwd outside any repository always runs its
+    /// assertions instead of skipping them.
+    fn tempdir_outside_any_work_tree() -> tempfile::TempDir {
+        let mut candidates = vec![std::env::temp_dir()];
+        #[cfg(unix)]
+        candidates.extend(["/tmp", "/var/tmp", "/dev/shm"].map(std::path::PathBuf::from));
+        #[cfg(windows)]
+        candidates.extend(
+            ["SystemRoot", "SystemDrive"]
+                .iter()
+                .filter_map(|v| std::env::var_os(v))
+                .map(|v| std::path::PathBuf::from(v).join("Temp")),
+        );
+        for base in &candidates {
+            let Ok(dir) = tempfile::tempdir_in(base) else {
+                continue;
+            };
+            let canonical = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().into());
+            if enclosing_git_work_tree(&canonical).is_none() {
+                return dir;
+            }
+        }
+        panic!(
+            "no writable temporary directory outside a git work tree among {candidates:?}; \
+             this test needs one to reach the refusal arms it covers"
+        );
+    }
+
     /// Drive the handler and return `(status, body)`.
     async fn probe(workdir: &str) -> (axum::http::StatusCode, String) {
         probe_with(workdir, None).await
@@ -24613,7 +24645,7 @@ mod provision_probe_tests {
     /// pins the `session_repo_parent` arm through the same injected door.)
     #[tokio::test(flavor = "multi_thread")]
     async fn a_session_repo_is_vetted_read_only_and_its_rung_is_echoed() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = tempdir_outside_any_work_tree();
         let scratch = root.path().join("scratch");
         let repo = root.path().join("foreign-repo");
         let not_a_checkout = root.path().join("plain-folder");
@@ -24621,18 +24653,6 @@ mod provision_probe_tests {
             std::fs::create_dir_all(d).expect("create");
         }
         std::fs::create_dir_all(repo.join(".git")).expect("create .git");
-        let scratch_c = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
-        if let Some(work_tree) = enclosing_git_work_tree(&scratch_c) {
-            eprintln!(
-                "SKIPPED a_session_repo_is_vetted_read_only_and_its_rung_is_echoed: the \
-                 tempdir {} is inside the git work tree {}, so a scratch cwd there is \
-                 itself a checkout and the refusal arms this test exercises cannot be \
-                 reached; point TMPDIR outside any repository to run it",
-                scratch_c.display(),
-                work_tree.display()
-            );
-            return;
-        }
 
         // `.`/`..` components are refused even when the path they spell would
         // resolve to the real checkout.
@@ -24896,16 +24916,15 @@ mod provision_probe_tests {
     /// row the ledger recorded — the property the parity harness reads.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scratch_dir_is_probed_and_the_recorded_row_comes_back() {
-        let dir = std::env::temp_dir().join(format!("parity-probe-ok-{}", std::process::id()));
+        // Outside every work tree, checked on the CANONICAL path the handler
+        // checks (on macOS /var resolves to /private/var), so the assertions
+        // below always run rather than skipping on a TMPDIR inside a repo.
+        let root = tempdir_outside_any_work_tree();
+        let dir = root
+            .path()
+            .join(format!("parity-probe-ok-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch");
-        // Guard the guard: a temp dir that happens to sit inside a repo would
-        // make this test assert the wrong arm. Check the CANONICAL path, which
-        // is what the handler checks — on macOS /var resolves to /private/var.
         let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        if enclosing_git_work_tree(&canonical).is_some() {
-            std::fs::remove_dir_all(&dir).ok();
-            return;
-        }
 
         let (status, body) = probe(&dir.display().to_string()).await;
         assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");

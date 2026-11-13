@@ -1458,10 +1458,19 @@ pub(crate) fn provision_session_cwd(
 /// pass is not run and ONE skip naming that reason is recorded instead of a
 /// per-name claim.
 ///
+/// "An allocated agent worktree" is either layout: the runner's own
+/// `qontinui-worktrees/<id>/<repo>` and the script-allocated
+/// `<workspace_root>/agent-worktrees/<id>/<repo>`
+/// ([`super::canonical_paths::script_allocated_worktree_for_path`]).
+///
+/// Every spawn path whose cwd an operator chooses goes through here (this
+/// chokepoint, and the scheduler's remote-agent launch).
+///
 /// [`SkipReason::RepoAuthored`]: crate::capability_manifest::SkipReason::RepoAuthored
-fn provision_fleet_for_cwd(wd: &str) {
-    let in_agent_worktree =
-        super::canonical_paths::allocated_worktree_for_path(Path::new(wd)).is_some();
+pub(crate) fn provision_fleet_for_cwd(wd: &str) {
+    let in_agent_worktree = super::canonical_paths::allocated_worktree_for_path(Path::new(wd))
+        .is_some()
+        || super::canonical_paths::script_allocated_worktree_for_path(Path::new(wd)).is_some();
     provision_fleet_for_cwd_in(wd, in_agent_worktree);
 }
 

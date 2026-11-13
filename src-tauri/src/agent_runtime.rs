@@ -11282,7 +11282,7 @@ fn provision_agent_definitions_layers(
                 s.reason,
                 capability_manifest::SkipReason::GitTracked
                     | capability_manifest::SkipReason::ProbeUnknownInRepo
-                    | capability_manifest::SkipReason::Rejected(_)
+                    | capability_manifest::SkipReason::OperatorAuthored(_)
             )
         })
         .count();
@@ -11306,7 +11306,14 @@ fn provision_agent_definitions_layers(
         write_failure: write_failure.as_deref(),
     };
     let overlaid = match src_dir.as_deref() {
-        Ok(src_dir) => overlay_checkout_agent_definitions(src_dir, &dst_dir, &keep, floor, retired),
+        Ok(src_dir) => overlay_checkout_agent_definitions(
+            src_dir,
+            &dst_dir,
+            &keep,
+            &candidates,
+            floor,
+            retired,
+        ),
         // No root: no overlay to read. The row states why (the typed error) and
         // which copy the floor left serving.
         Err(unresolved) => Ok(ProvisionReport::unresolved(
@@ -11379,10 +11386,16 @@ struct FloorOutcome<'a> {
 /// left on disk. No checkout dir is not an error: it is the `unresolved` report
 /// whose statement ([`overlay_absent_statement`]) says what the floor left
 /// serving.
+///
+/// `decided` is the candidate list `keep` was computed over. The overlay walks
+/// `src_dir` again, so a definition that appeared there since has no decision;
+/// such a name gets the same [`crate::fleet_agents::foreign_destination_reason`]
+/// check here, before its copy, so no name reaches the write unchecked.
 fn overlay_checkout_agent_definitions(
     src_dir: &Path,
     dst_dir: &Path,
     keep: &crate::provision_guard::KeepDecisions,
+    decided: &[String],
     floor: FloorOutcome<'_>,
     retired: &[&str],
 ) -> anyhow::Result<ProvisionReport> {
@@ -11494,6 +11507,21 @@ fn overlay_checkout_agent_definitions(
             report.skip(unit, reason.clone());
             continue;
         }
+        // A name the keep decisions never saw (it appeared in the checkout
+        // after they were computed) is judged here, exactly as they would have.
+        if !decided.contains(&unit) {
+            if let Some(reason) =
+                crate::fleet_agents::foreign_destination_reason(&dst, &unit, Some(src_dir), retired)
+            {
+                info!(
+                    "agent_runtime: keeping {} as it is on disk — {}",
+                    dst.display(),
+                    reason.describe()
+                );
+                report.skip(unit, reason);
+                continue;
+            }
+        }
         // Never copy THROUGH a symlink: `fs::copy` follows it and would replace
         // whatever it points at (its own source included). `keep` already holds
         // a symlink decided before the floor ran; this re-check is per write.
@@ -11517,14 +11545,23 @@ fn overlay_checkout_agent_definitions(
             );
             report.skip(
                 unit,
-                capability_manifest::SkipReason::Unresolved(
-                    "the destination is the source file itself; nothing to copy".to_string(),
+                capability_manifest::SkipReason::OperatorAuthored(
+                    "the destination is the overlay source file itself, served in place; \
+                     nothing to copy"
+                        .to_string(),
                 ),
             );
             continue;
         }
-        // Idempotent: overwrite is fine (std::fs::copy truncates the target).
-        if let Err(e) = std::fs::copy(&path, &dst) {
+        // Idempotent and ATOMIC: the source's bytes go to a temporary file
+        // beside the destination, renamed over it, so a link that appeared
+        // since the checks above is replaced as an entry, never written
+        // through, and the destination is never seen half-written.
+        let copied_one = std::fs::read(&path).and_then(|bytes| {
+            let perms = std::fs::metadata(&path).ok().map(|m| m.permissions());
+            crate::fleet_agents::write_atomically(&dst, &bytes, perms)
+        });
+        if let Err(e) = copied_one {
             warn!(
                 "agent_runtime: failed to copy agent def {} -> {}: {e}",
                 path.display(),
@@ -16082,8 +16119,8 @@ mod tests {
 
     /// A1: a destination whose bytes are a copy this runner shipped is still
     /// refreshed. Here the stale copy is an older version of the overlay
-    /// checkout's definition (a blob its object store holds), and the overlay
-    /// replaces it with the current one.
+    /// checkout's definition (a blob its history holds at that definition's
+    /// path), and the overlay replaces it with the current one.
     #[test]
     fn provision_agent_defs_refreshes_a_copy_this_runner_shipped() {
         let root = tempfile::tempdir().unwrap();
@@ -16097,6 +16134,7 @@ mod tests {
             &checkout,
             Path::new(".claude/agents/local-agent.md"),
         );
+        crate::provision_guard::test_support::git_commit(&checkout, "version 1");
         let new = b"# local-agent, version 2\n";
         std::fs::write(src.join("local-agent.md"), new).unwrap();
 
@@ -16123,6 +16161,93 @@ mod tests {
         );
         assert_eq!(report.written, 1, "{:?}", report.skipped);
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    }
+
+    /// A5: a checkout definition the keep decisions never saw (it appeared
+    /// after they were computed) is still checked before its copy: an
+    /// operator's file at that name is kept, an absent one is written.
+    #[test]
+    fn the_overlay_checks_a_name_the_keep_decisions_never_saw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("late.md"), b"# late arrival\n").unwrap();
+        std::fs::write(src.join("fresh.md"), b"# fresh\n").unwrap();
+        std::fs::write(dst.join("late.md"), b"# the operator's own\n").unwrap();
+        let floor = FloorOutcome {
+            written: 0,
+            kept: 0,
+            write_failure: None,
+        };
+
+        let report = overlay_checkout_agent_definitions(
+            &src,
+            &dst,
+            &crate::provision_guard::KeepDecisions::default(),
+            &[],
+            floor,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(dst.join("late.md")).unwrap(),
+            b"# the operator's own\n"
+        );
+        assert_eq!(std::fs::read(dst.join("fresh.md")).unwrap(), b"# fresh\n");
+        assert!(
+            report.skipped.iter().any(|u| u.unit == "late.md"
+                && matches!(
+                    &u.reason,
+                    crate::capability_manifest::SkipReason::OperatorAuthored(_)
+                )),
+            "{:?}",
+            report.skipped
+        );
+        assert_eq!(report.written, 1);
+    }
+
+    /// A8: a destination that is a hard link to its own source is served in
+    /// place, and the skip says so rather than claiming a rung did not resolve.
+    #[cfg(unix)]
+    #[test]
+    fn overlay_records_a_destination_that_is_its_source_as_served_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("linked.md"), b"# linked\n").unwrap();
+        std::fs::hard_link(src.join("linked.md"), dst.join("linked.md")).unwrap();
+        let floor = FloorOutcome {
+            written: 0,
+            kept: 0,
+            write_failure: None,
+        };
+
+        let report = overlay_checkout_agent_definitions(
+            &src,
+            &dst,
+            &crate::provision_guard::KeepDecisions::default(),
+            &["linked.md".to_string()],
+            floor,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(src.join("linked.md")).unwrap(), b"# linked\n");
+        assert!(
+            report.skipped.iter().any(|u| u.unit == "linked.md"
+                && matches!(
+                    &u.reason,
+                    crate::capability_manifest::SkipReason::OperatorAuthored(why)
+                        if why.contains("served in place")
+                )),
+            "{:?}",
+            report.skipped
+        );
     }
 
     /// A4: a destination symlink at a bundled name is never written through:
@@ -16254,13 +16379,14 @@ mod tests {
             .join("agents");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("merge-specialist.md"), "# PRIMARY copy").unwrap();
-        // The checkout once held loose.md as "# stale loose" (its object store
-        // has that blob), so a worktree copy with those bytes is one the overlay
+        // The checkout once committed loose.md as "# stale loose" (that path's
+        // history holds the blob), so a worktree copy with those bytes is one the overlay
         // wrote, and is refreshed. An operator's own bytes would be kept.
         let primary = root.path().join("qontinui-claude-config");
         git_init(&primary);
         std::fs::write(src.join("loose.md"), "# stale loose").unwrap();
         git_add(&primary, Path::new(".claude/agents/loose.md"));
+        crate::provision_guard::test_support::git_commit(&primary, "stale loose");
         std::fs::write(src.join("loose.md"), "# PRIMARY loose").unwrap();
 
         // The session worktree: a repo tracking its own definitions.

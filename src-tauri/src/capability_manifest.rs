@@ -1037,6 +1037,18 @@ pub enum SkipReason {
     /// git could not be started for want of a machine resource, and the skip
     /// was taken to avoid clobbering files it could not see.
     RepoAuthored,
+    /// An EXISTING destination was kept because nothing shows this runner
+    /// wrote it: an operator-authored file whose bytes are no copy this runner
+    /// ships or shipped, a symbolic link (never written through), a destination
+    /// that is not a regular file or could not be inspected or read, or the
+    /// overlay source file itself, which is served in place. The detail says
+    /// which.
+    ///
+    /// Distinct from [`SkipReason::Rejected`] on purpose: that one says the
+    /// provisioner's validation REFUSED the content it was handed, while this
+    /// one says the content was fine and the file already on disk is not this
+    /// runner's to replace. A deliberate keep, like [`SkipReason::GitTracked`].
+    OperatorAuthored(String),
 }
 
 impl SkipReason {
@@ -1051,6 +1063,7 @@ impl SkipReason {
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
             SkipReason::RepoAuthored => "repo_authored",
+            SkipReason::OperatorAuthored(_) => "operator_authored",
         }
     }
 
@@ -1075,6 +1088,7 @@ impl SkipReason {
                  for the whole tree"
                     .to_string()
             }
+            SkipReason::OperatorAuthored(why) => format!("kept: {why}"),
         }
     }
 }
@@ -2209,6 +2223,17 @@ mod tests {
             .contains("authored by its repository"));
         let json = serde_json::to_value(SkipReason::RepoAuthored).unwrap();
         assert_eq!(json["reason"], "repo_authored");
+    }
+
+    #[test]
+    fn operator_authored_is_its_own_skip_reason() {
+        let reason = SkipReason::OperatorAuthored("a symbolic link".to_string());
+        assert_eq!(reason.wire(), "operator_authored");
+        assert_ne!(reason, SkipReason::Rejected("a symbolic link".to_string()));
+        assert_eq!(reason.describe(), "kept: a symbolic link");
+        let json = serde_json::to_value(&reason).unwrap();
+        assert_eq!(json["reason"], "operator_authored");
+        assert_eq!(json["detail"], "a symbolic link");
     }
 
     #[test]

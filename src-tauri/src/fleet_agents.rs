@@ -164,8 +164,10 @@ pub(crate) fn provision_fleet_agents_into(
         }
         // Per-file rather than `?`: one unwritable definition must not cost the
         // session the others, and it must be NAMED rather than aborting the
-        // pass at whatever point it happened to reach.
-        match std::fs::write(&dst, file.contents()) {
+        // pass at whatever point it happened to reach. Atomic: a symlink or
+        // hard link that appeared since the check above is REPLACED as a
+        // directory entry, never written through.
+        match write_atomically(&dst, file.contents(), None) {
             Ok(()) => out.record_written(),
             Err(e) => out.skip(unit, SkipReason::WriteFailed(e.to_string())),
         }
@@ -402,8 +404,9 @@ pub(crate) const SHIPPED_AGENTS: &[&str] = &[
     "repo-auditor.md 45954e716979d2d6e6c6ecc7d1616db1ff19f58e 5781f39d5c0a2f7abe9455b661fd72cde6784a8e 64764a4119d9277a1ce58a09ad7e683cd2111367 6e3b88232bd59f0569aa8ab459d8f6396a025b1e a877ff7aa55ec01b3a29ed08250aa0f32b85c7c6 aba1edddfec2c7f0806685ba9cc184f2439b0df3 e5ec73ffb9ab0389102e6f737ac10ea288f9571d",
 ];
 
-/// How long the overlay checkout's object store may take to say whether it holds
-/// a blob before the answer is taken as "no" (and the file kept).
+/// How long the overlay checkout's history may take to say whether its
+/// definition's path held a blob before the answer is taken as "no" (and the
+/// file kept).
 const BLOB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why the existing destination `dst` (definition `name`) must be KEPT rather
@@ -418,12 +421,16 @@ const BLOB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// folded to LF, are
 /// - the bundled body, or a blob [`SHIPPED_AGENTS`] or `retired` lists for it;
 /// - byte-equal to the overlay checkout's current copy (`overlay_src`); or
-/// - a blob the overlay checkout's object store holds, i.e. a version of that
-///   checkout's definition (bounded by [`BLOB_PROBE_TIMEOUT`]; no answer reads
-///   as "not ours", the safe side).
+/// - a blob the overlay checkout's history holds AT THIS DEFINITION'S PATH
+///   (`.claude/agents/<name>` on any ref), i.e. a version of that checkout's
+///   own definition. The same bytes at a different path are not evidence, so
+///   they do not count ([`checkout_history_holds_blob`]; bounded by
+///   [`BLOB_PROBE_TIMEOUT`], never lazily fetched; no answer reads as "not
+///   ours", the safe side).
 ///
 /// A symlink is never written through, whatever it points at, and anything that
 /// cannot be inspected or read is kept: overwriting needs a positive answer.
+/// Every keep is a [`SkipReason::OperatorAuthored`] whose detail says which.
 pub(crate) fn foreign_destination_reason(
     dst: &Path,
     name: &str,
@@ -446,8 +453,8 @@ fn foreign_destination_reason_with(
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            return Some(SkipReason::Rejected(format!(
-                "kept: the existing destination could not be inspected ({e}), so it was not \
+            return Some(SkipReason::OperatorAuthored(format!(
+                "the existing destination could not be inspected ({e}), so it was not \
                  overwritten"
             )))
         }
@@ -456,15 +463,15 @@ fn foreign_destination_reason_with(
         return Some(symlink_destination_reason(dst));
     }
     if !meta.is_file() {
-        return Some(SkipReason::Rejected(
-            "kept: the destination exists and is not a regular file".to_string(),
+        return Some(SkipReason::OperatorAuthored(
+            "the destination exists and is not a regular file".to_string(),
         ));
     }
     let bytes = match std::fs::read(dst) {
         Ok(bytes) => bytes,
         Err(e) => {
-            return Some(SkipReason::Rejected(format!(
-                "kept: the existing destination could not be read ({e}), so it was not \
+            return Some(SkipReason::OperatorAuthored(format!(
+                "the existing destination could not be read ({e}), so it was not \
                  overwritten"
             )))
         }
@@ -494,13 +501,18 @@ fn foreign_destination_reason_with(
                 return None;
             }
         }
-        let folded_blob = crate::provenance::git_blob_id(&folded);
-        if checkout_holds_blob(src_dir, &own) || checkout_holds_blob(src_dir, &folded_blob) {
+        // One probe for both spellings, and the folded blob only when folding
+        // changed anything: an LF file's folded blob IS its own.
+        let mut blobs = vec![own.clone()];
+        if folded != bytes {
+            blobs.push(crate::provenance::git_blob_id(&folded));
+        }
+        if checkout_history_holds_blob(src_dir, name, &blobs) {
             return None;
         }
     }
-    Some(SkipReason::Rejected(format!(
-        "kept: an operator-authored file not written by this runner (blob {own} is not one it \
+    Some(SkipReason::OperatorAuthored(format!(
+        "an operator-authored file not written by this runner (blob {own} is not one it \
          ships or shipped)"
     )))
 }
@@ -511,9 +523,9 @@ pub(crate) fn symlink_destination_reason(dst: &Path) -> SkipReason {
     let target = std::fs::read_link(dst)
         .map(|t| t.display().to_string())
         .unwrap_or_else(|e| format!("<unreadable link: {e}>"));
-    SkipReason::Rejected(format!(
-        "kept: the destination is a symbolic link (to {target}); this runner never writes \
-         through one"
+    SkipReason::OperatorAuthored(format!(
+        "the destination is a symbolic link (to {target}); this runner never writes through \
+         one"
     ))
 }
 
@@ -522,39 +534,121 @@ pub(crate) fn is_symlink(dst: &Path) -> bool {
     std::fs::symlink_metadata(dst).is_ok_and(|m| m.file_type().is_symlink())
 }
 
-/// True when the git repository holding `dir` has object `blob`. Bounded by
-/// [`BLOB_PROBE_TIMEOUT`]; anything but a clean "yes" (no repository, git
-/// missing, a timeout) is `false`.
-fn checkout_holds_blob(dir: &Path, blob: &str) -> bool {
+/// True when the history of definition `name` in the git repository holding
+/// `dir` (the overlay's `.claude/agents`) has, at THAT path, one of `blobs`: a
+/// version the overlay checkout itself carried for this definition on some ref.
+///
+/// Scoped to the path on purpose. `git cat-file -e` would accept the blob as
+/// any object anywhere in the repository, so an operator's file whose bytes
+/// happen to equal some other tracked file (another definition, a fixture)
+/// would read as ours and be overwritten. `git log --all --raw -- <name>` lists
+/// only the blobs that path has held, old and new side of every change.
+///
+/// `GIT_NO_LAZY_FETCH=1`: on a partial clone a missing object would otherwise
+/// be fetched from the remote inside this probe. Bounded by
+/// [`BLOB_PROBE_TIMEOUT`]; anything but a clean, matching answer (no
+/// repository, git missing, a timeout, a non-zero exit) is `false`, so the file
+/// is kept.
+fn checkout_history_holds_blob(dir: &Path, name: &str, blobs: &[String]) -> bool {
+    use std::io::Read;
     use std::process::Stdio;
     let Ok(mut child) = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(dir)
-        .arg("cat-file")
-        .arg("-e")
-        .arg(format!("{blob}^{{blob}}"))
+        .args(["log", "--all", "--format=", "--raw", "--no-abbrev", "--"])
+        // A literal pathspec, relative to `dir`: `name` is a file name, never a
+        // glob.
+        .arg(format!(":(literal){name}"))
+        .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     else {
         return false;
     };
+    // Drained on its own thread so a long history cannot fill the pipe and
+    // stall the child past the deadline.
+    let reader = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = out.read_to_string(&mut text);
+            text
+        })
+    });
     let deadline = std::time::Instant::now() + BLOB_PROBE_TIMEOUT;
-    loop {
+    let succeeded = loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => break status.success(),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                break false;
+            }
+        }
+    };
+    let text = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+    succeeded && raw_log_names_blob(&text, blobs)
+}
+
+/// True when a `git log --raw --no-abbrev` listing names one of `blobs` on
+/// either side of a change. Each raw line is
+/// `:<old mode> <new mode> <old blob> <new blob> <status>\t<path>…`.
+fn raw_log_names_blob(text: &str, blobs: &[String]) -> bool {
+    text.lines()
+        .filter_map(|line| line.strip_prefix(':'))
+        .filter_map(|line| line.split('\t').next())
+        .any(|meta| {
+            let fields: Vec<&str> = meta.split(' ').collect();
+            fields.len() >= 4 && blobs.iter().any(|b| b == fields[2] || b == fields[3])
+        })
+}
+
+/// Write `bytes` to `dst` ATOMICALLY: into a temporary file in the same
+/// directory, then renamed over `dst`. A rename REPLACES the directory entry,
+/// so a destination that is (or became, after the caller checked) a symbolic
+/// link or a hard link is replaced rather than written through, and a reader
+/// never sees a half-written definition. On any error the temporary file is
+/// removed (dropping an unpersisted [`tempfile::NamedTempFile`] deletes it).
+///
+/// `permissions` sets the new file's mode (the overlay passes its source's);
+/// `None` is `0644` on unix, since a temporary file is created `0600`.
+pub(crate) fn write_atomically(
+    dst: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = dst.parent().unwrap_or_else(|| Path::new("."));
+    let prefix = format!(
+        ".{}.",
+        dst.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    match permissions {
+        Some(perms) => tmp.as_file().set_permissions(perms)?,
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tmp.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o644))?;
             }
         }
     }
+    tmp.persist(dst).map(|_| ()).map_err(|e| e.error)
 }
+
 /// The blob in `shipped` that `bytes` is, as they are or with CRLF folded to
 /// LF; otherwise `Err` carrying the bytes' own blob id, for the record.
 fn shipped_blob(bytes: &[u8], shipped: &[&str]) -> Result<String, String> {
@@ -685,7 +779,7 @@ mod tests {
         let reason = foreign_destination_reason_with(&dst, "code-reviewer.md", None, &[], &[])
             .expect("an unknown file is kept");
         assert!(
-            matches!(&reason, SkipReason::Rejected(why) if why.contains("operator-authored")),
+            matches!(&reason, SkipReason::OperatorAuthored(why) if why.contains("operator-authored")),
             "{reason:?}"
         );
 
@@ -760,7 +854,7 @@ mod tests {
             .is_symlink());
         assert!(
             report.skipped.iter().any(|u| u.unit == "code-reviewer.md"
-                && matches!(&u.reason, SkipReason::Rejected(why) if why.contains("symbolic link"))),
+                && matches!(&u.reason, SkipReason::OperatorAuthored(why) if why.contains("symbolic link"))),
             "{:?}",
             report.skipped
         );
@@ -935,5 +1029,129 @@ mod tests {
             "an unmatched CRLF copy reports its raw blob, not the folded one"
         );
         assert_eq!(fold_crlf(b"a\r\nb\rc\r\n"), b"a\nb\rc\n".to_vec());
+    }
+
+    /// Run `git` in `dir` with a throwaway identity, panicking on failure.
+    fn git(dir: &Path, args: &[&str]) {
+        // Scrubbed of the repo-local git environment, like
+        // `provision_guard::test_support`: a run from inside a git hook would
+        // otherwise act on the hook's repository.
+        let out = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A blob counts as the overlay checkout's own only when THIS definition's
+    /// path held it. The same bytes committed at another path in the same
+    /// repository (another definition) are not evidence the destination is a
+    /// copy of this one, so the operator's file is kept; a former version of
+    /// this definition's own path is ours and may be refreshed.
+    #[test]
+    fn a_blob_held_only_at_a_different_path_is_not_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("ccfg");
+        let src = repo.join(".claude").join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(src.join("other-agent.md"), b"# shared bytes\n").unwrap();
+        std::fs::write(src.join("local-agent.md"), b"# version one\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "one"]);
+        std::fs::write(src.join("local-agent.md"), b"# version two\n").unwrap();
+        git(&repo, &["commit", "-q", "-am", "two"]);
+
+        let dst_dir = tmp.path().join("dst");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("local-agent.md");
+
+        std::fs::write(&dst, b"# shared bytes\n").unwrap();
+        let reason = foreign_destination_reason_with(&dst, "local-agent.md", Some(&src), &[], &[])
+            .expect("bytes held only at another path are kept");
+        assert!(
+            matches!(&reason, SkipReason::OperatorAuthored(why) if why.contains("operator-authored")),
+            "{reason:?}"
+        );
+
+        std::fs::write(&dst, b"# version one\n").unwrap();
+        assert_eq!(
+            foreign_destination_reason_with(&dst, "local-agent.md", Some(&src), &[], &[]),
+            None,
+            "a former version of this definition's own path is ours"
+        );
+        std::fs::write(&dst, b"# version one\r\n").unwrap();
+        assert_eq!(
+            foreign_destination_reason_with(&dst, "local-agent.md", Some(&src), &[], &[]),
+            None,
+            "an autocrlf copy of a former version is ours too"
+        );
+    }
+
+    /// The raw-log parser matches a blob on either side of a change, and
+    /// nothing in a path or a status.
+    #[test]
+    fn the_raw_log_parser_reads_both_sides_of_a_change_and_nothing_else() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let line = format!(":100644 100644 {old} {new} M\tx.md\n");
+        assert!(raw_log_names_blob(&line, &[old.clone()]));
+        assert!(raw_log_names_blob(&line, &[new.clone()]));
+        assert!(!raw_log_names_blob(&line, &["c".repeat(40)]));
+        let path_only = format!(":100644 100644 {old} {old} M\t{new}\n");
+        assert!(!raw_log_names_blob(&path_only, &[new]));
+        assert!(!raw_log_names_blob("", &[old]));
+    }
+
+    /// An atomic write replaces a destination hard link as a directory entry:
+    /// the file the link shared its inode with keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_write_replaces_a_hard_link_instead_of_writing_through_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("operator.md");
+        std::fs::write(&other, b"OPERATOR").unwrap();
+        let dst = tmp.path().join("code-reviewer.md");
+        std::fs::hard_link(&other, &dst).unwrap();
+
+        write_atomically(&dst, b"NEW", None).unwrap();
+
+        assert_eq!(std::fs::read(&other).unwrap(), b"OPERATOR");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary file is left behind");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    /// A write that cannot land leaves no temporary file behind.
+    #[test]
+    fn a_failed_atomic_write_leaves_no_temporary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The destination is a non-empty directory, so the rename fails.
+        let dst = tmp.path().join("code-reviewer.md");
+        std::fs::create_dir_all(dst.join("inner")).unwrap();
+        assert!(write_atomically(&dst, b"NEW", None).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }
