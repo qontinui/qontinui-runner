@@ -748,8 +748,15 @@ def evaluate(summary, names, first, second, have_fixture) -> None:
         "why": "a session that never came back has no tab: its page restore either brings it "
                "back or has not run, so the UI tab close cannot reach it"}
     strip = first["strip_text"] or ""
-    a["strip_form"] = {"result": "OBSERVED", "deferred_form": strip.startswith("Restore deferred by drain"),
-                       "strip_text": strip, "section_text": (first["section_text"] or "")[:800]}
+    section = first["section_text"] or ""
+    strip_drain = strip.startswith("Restore deferred by drain")
+    strip_page = "not opened yet" in strip
+    rows_drain = "waiting: restore deferred by drain" in section
+    rows_page = "waiting: page not opened" in section
+    put("strip_and_rows_name_the_same_cause",
+        (strip_drain == rows_drain) and (strip_page == rows_page),
+        strip_drain=strip_drain, strip_page=strip_page, rows_drain=rows_drain,
+        rows_page=rows_page, strip_text=strip, section_text=section[:800])
     summary["sessions"] = by_key
 
 
