@@ -732,6 +732,21 @@ def evaluate(summary, names, first, second, have_fixture) -> None:
     a["later_closed_across_forced_prune"] = {
         "result": "OBSERVED", "later_closed_before": sorted(lc1),
         "later_closed_after": sorted(lc2)}
+    # A session that came back and was then closed through the UI tab close
+    # reads `back` with a deliberate (`explicit`) laterClosed. A tab-closed
+    # session that never came back cannot be produced honestly here: a session
+    # that never came back has no tab to close (its page restore either brings
+    # it back or has not run).
+    returned = {str(o.get("claudeSessionId", "")).lower(): o for o in led.get("returned", []) or []}
+    ui_ids = [by_key[k] for k in (summary.get("closes") or {}).get("ui", [])]
+    ui_rows = {i: (returned.get(i) or {}).get("laterClosed") for i in ui_ids}
+    put("tab_closed_back_reads_deliberate_later_closed",
+        bool(ui_ids) and all(lc and lc.get("deliberate") is True for lc in ui_rows.values()),
+        tab_closed=ui_rows)
+    a["tab_closed_never_back_reads_closed_since"] = {
+        "result": "NOT_PRODUCIBLE",
+        "why": "a session that never came back has no tab: its page restore either brings it "
+               "back or has not run, so the UI tab close cannot reach it"}
     strip = first["strip_text"] or ""
     a["strip_form"] = {"result": "OBSERVED", "deferred_form": strip.startswith("Restore deferred by drain"),
                        "strip_text": strip, "section_text": (first["section_text"] or "")[:800]}
