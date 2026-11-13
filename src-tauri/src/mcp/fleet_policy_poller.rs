@@ -501,10 +501,14 @@ fn capacity_model_cache() -> &'static RwLock<Option<CapacityModelReading>> {
 }
 
 /// The last capacity-model dial coord served this process, or `None` before
-/// the first (and on a poisoned lock): UNKNOWN, never a default dial.
+/// the first: UNKNOWN, never a default dial. A poisoned lock is read through,
+/// since a reading is replaced whole and is never left half-written.
 /// SYNCHRONOUS + lock-only, like the other caches here.
 pub(crate) fn capacity_model_dial() -> Option<CapacityModelReading> {
-    capacity_model_cache().read().ok().and_then(|g| g.clone())
+    capacity_model_cache()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// The dial as it is served beside a capacity read, at `now`:
@@ -555,12 +559,10 @@ fn record_capacity_model(dial: &serde_json::Value) {
 /// [`record_capacity_model`] into `cache` (a test's own, so it never touches
 /// the process-global one other tests read).
 fn record_dial_in(cache: &RwLock<Option<CapacityModelReading>>, dial: &serde_json::Value) {
-    if let Ok(mut g) = cache.write() {
-        *g = Some(CapacityModelReading {
-            dial: dial.clone(),
-            read_at: chrono::Utc::now(),
-        });
-    }
+    *cache.write().unwrap_or_else(|e| e.into_inner()) = Some(CapacityModelReading {
+        dial: dial.clone(),
+        read_at: chrono::Utc::now(),
+    });
 }
 
 // ===========================================================================
@@ -3815,12 +3817,24 @@ async fn poll_egress_with<F, Fut>(
 /// opinion", while an error arm would preserve floors that are no longer
 /// current.
 async fn poll_controls_once() -> ControlsOutcome {
-    match fetch_fleet_policy(CONTROLS_DOMAIN).await {
+    controls_outcome(
+        fetch_fleet_policy(CONTROLS_DOMAIN).await,
+        record_capacity_model,
+    )
+}
+
+/// [`poll_controls_once`]'s outcome of one fetch, recording through `record`
+/// the capacity-model dial (cache #7) the answer carried.
+fn controls_outcome(
+    fetched: Result<FleetPolicyResponse, FetchError>,
+    record: impl FnOnce(&serde_json::Value),
+) -> ControlsOutcome {
+    match fetched {
         Ok(body) => {
             // Cache #7 rides the same answer. Only a 2xx that carried a dial
             // records one; every other arm below leaves the last good dial.
             if let Some(dial) = capacity_model_from(&body) {
-                record_capacity_model(dial);
+                record(dial);
             }
             ControlsOutcome::Updated(session_floors_from(&body))
         }
@@ -4019,6 +4033,38 @@ mod tests {
             cache.read().unwrap().as_ref().map(|r| &r.dial),
             Some(&second)
         );
+    }
+
+    /// The controls poll records the dial only from a 2xx that carried one:
+    /// a null dial, an unpaired skip, a 401/404 reset and a failed poll record
+    /// nothing, so the last good dial stands.
+    #[test]
+    fn only_a_dial_carrying_answer_records_the_dial() {
+        let dial = serde_json::json!({"mode": "off", "permitted_consumers": []});
+        let answer = |v: serde_json::Value| -> Result<FleetPolicyResponse, FetchError> {
+            Ok(serde_json::from_value(v).expect("decode"))
+        };
+        let mut recorded = Vec::new();
+        let outcome = controls_outcome(
+            answer(serde_json::json!({"domain": "fleet_resources", "capacity_model": dial})),
+            |d| recorded.push(d.clone()),
+        );
+        assert!(
+            matches!(outcome, ControlsOutcome::Updated(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(recorded, vec![dial]);
+
+        for fetched in [
+            answer(serde_json::json!({"domain": "fleet_resources", "capacity_model": null})),
+            Err(FetchError::NoJwt),
+            Err(FetchError::AuthOrAbsent(404)),
+            Err(FetchError::Failed("timeout".to_string())),
+        ] {
+            let mut wrote = false;
+            controls_outcome(fetched, |_| wrote = true);
+            assert!(!wrote, "only a dial-carrying 2xx records the dial");
+        }
     }
 
     /// The dial is served as the poller read it, block unchanged, with when

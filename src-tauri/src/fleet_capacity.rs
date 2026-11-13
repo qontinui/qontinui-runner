@@ -39,8 +39,9 @@
 //! and whatever serves it beside a read serves it with its age
 //! (`mcp::fleet_policy_poller::capacity_model_view`).
 //!
-//! An `unknown` carries no row and no number, so nothing can read it as zero
-//! free capacity [policy: unknown-must-not-render-as-a-default]; a consumer
+//! An `unknown` carries no capacity row and no capacity number (a `no_plan_yet`
+//! read still carries coord's own answer beside it), so nothing can read it as
+//! zero free capacity [policy: unknown-must-not-render-as-a-default]; a consumer
 //! falls back to its own static sizing and says so. Inside `row`, coord's own
 //! convention still holds: `{"state":"known","value":…}` is known and
 //! `{"state":"unknown","reason":…}` is UNKNOWN (coord's
@@ -50,7 +51,9 @@
 //!
 //! One read is kept per process: an answer from coord (a row, or `no_plan_yet`)
 //! for [`CACHE_TTL`] (60 s); any other `unknown` for [`UNKNOWN_TTL`] (10 s), so
-//! a coord outage costs one fetch per 10 s rather than one per caller. A fetch
+//! a coord outage costs one fetch per 10 s rather than one per caller. A TTL
+//! runs from when the fetch FINISHED, so a slow failure (a timeout) is still
+//! kept its full 10 s; the read's age runs from when it began (below). A fetch
 //! is single-flight: a caller that finds the kept read stale fetches, and the
 //! callers that arrive while it does wait for that fetch rather than start
 //! their own. coord caches its own answer for up to 15 s per tenant, and the
@@ -59,11 +62,21 @@
 //! A read is stamped with the moment its fetch began (`fetched_at`: when the
 //! runner asked coord), and every read is aged at the moment it is handed
 //! back, so `cache_age_secs` holds the fetch's own time and any wait for a
-//! fetch in flight: it never reads younger than the answer is.
+//! fetch in flight: it never reads younger than the runner's ask. It does not
+//! include coord's own cache: coord may answer from a read up to 15 s old,
+//! and says how old in `coord.cache_age_secs`.
 //!
-//! A fetch is not detached from its caller: a caller that is dropped while its
-//! fetch is in flight drops the fetch, nothing is kept, and the next read
-//! fetches again.
+//! A fetch has one deadline, [`FETCH_DEADLINE`], over its asynchronous part
+//! (the credential read, which runs on the blocking pool, and the HTTP round
+//! trip), so a stalled credential store cannot hold every caller behind the
+//! single-flight lock: past it the read is `unknown`, kept for
+//! [`UNKNOWN_TTL`]. The coord base and the device file are small synchronous
+//! file reads inside it, which a timeout cannot interrupt.
+//!
+//! [`current`] runs the read on its own task ([`get_detached`]), so a caller
+//! that is dropped while a fetch is in flight (a loopback client that gave up
+//! before coord answered) does not drop the fetch: it finishes and is kept,
+//! and the callers after it are served it.
 //!
 //! # The credential
 //!
@@ -90,10 +103,14 @@ pub(crate) const CACHE_TTL: Duration = Duration::from_secs(60);
 /// How long any other `unknown` is kept before the fetch is tried again.
 pub(crate) const UNKNOWN_TTL: Duration = Duration::from_secs(10);
 
-/// The fetch's own deadline. On a cache miss coord recomputes the tenant's
+/// The HTTP request's own deadline. On a cache miss coord recomputes the tenant's
 /// answer (the newest plan row, the newest runner sample per device), which a
 /// loaded coord database can take seconds to serve.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The fetch's deadline over everything in it that awaits: the credential read
+/// and the request itself ([`FETCH_TIMEOUT`]), with a margin.
+const FETCH_DEADLINE: Duration = Duration::from_secs(15);
 
 /// The most bytes of coord's answer accepted. One device's row with its parity
 /// readout is a few KiB. Enforced as the body arrives ([`read_body`]): a
@@ -131,6 +148,16 @@ impl Fetched {
         Fetched::Unknown {
             device_id,
             reason: reason.into(),
+        }
+    }
+
+    /// Its state and reason, which a change of is logged.
+    fn outcome(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Fetched::Known { .. } => ("known", None),
+            Fetched::NoPlanYet { reason, .. } | Fetched::Unknown { reason, .. } => {
+                ("unknown", Some(reason))
+            }
         }
     }
 
@@ -260,15 +287,18 @@ fn row_device(served: &Value) -> Option<Uuid> {
 /// One kept read.
 #[derive(Debug)]
 struct Entry {
-    /// When its fetch began.
+    /// When its fetch began: the read's age runs from here.
     at: Instant,
+    /// When its fetch finished: its TTL runs from here, so a slow fetch is
+    /// kept as long as a quick one.
+    done: Instant,
     fetched_at: DateTime<Utc>,
     fetched: Fetched,
 }
 
 impl Entry {
     fn fresh_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.at) < self.fetched.ttl()
+        now.saturating_duration_since(self.done) < self.fetched.ttl()
     }
 
     fn read_at(&self, now: Instant) -> CapacityRead {
@@ -346,9 +376,23 @@ impl CapacityCache {
     /// this call fetches is stamped with the moment its fetch began, and every
     /// read it returns, kept or fetched, is aged at the moment it is returned
     /// — so the fetch's own time, and any wait for a fetch in flight, are in
-    /// the age, which never reads younger than the answer is.
+    /// the age, which never reads younger than the runner's ask. A fetch that
+    /// has not answered within [`FETCH_DEADLINE`] is `unknown`.
     pub(crate) async fn get<Fut>(
         &self,
+        clock: impl Fn() -> (Instant, DateTime<Utc>),
+        fetch: impl FnOnce() -> Fut,
+    ) -> CapacityRead
+    where
+        Fut: Future<Output = Fetched>,
+    {
+        self.get_within(FETCH_DEADLINE, clock, fetch).await
+    }
+
+    /// [`CapacityCache::get`] with the fetch's deadline given.
+    async fn get_within<Fut>(
+        &self,
+        deadline: Duration,
         clock: impl Fn() -> (Instant, DateTime<Utc>),
         fetch: impl FnOnce() -> Fut,
     ) -> CapacityRead
@@ -365,14 +409,37 @@ impl CapacityCache {
             return read;
         }
         let (at, fetched_at) = clock();
-        let fetched = fetch().await;
+        let fetched = tokio::time::timeout(deadline, fetch())
+            .await
+            .unwrap_or_else(|_| {
+                Fetched::unknown(
+                    None,
+                    format!(
+                        "the capacity fetch did not finish within {} s (the device file, the \
+                         credential read or coord stalled)",
+                        deadline.as_secs_f64()
+                    ),
+                )
+            });
+        let done = clock().0;
         let entry = Entry {
             at,
+            done,
             fetched_at,
             fetched,
         };
-        let read = entry.read_at(clock().0);
-        *self.last_guard() = Some(entry);
+        let read = entry.read_at(done);
+        let mut last = self.last_guard();
+        let changed = last.as_ref().map(|e| e.fetched.outcome()) != Some(entry.fetched.outcome());
+        if changed {
+            // The bearer never reaches a reason, so a reason is safe to log.
+            tracing::info!(
+                state = read.state,
+                reason = read.reason.as_deref().unwrap_or(""),
+                "fleet capacity: this device's read changed"
+            );
+        }
+        *last = Some(entry);
         read
     }
 
@@ -390,9 +457,26 @@ fn cache() -> &'static CapacityCache {
 /// This device's capacity: the kept read while it is fresh, otherwise a new
 /// read of coord's capacity door.
 pub(crate) async fn current() -> CapacityRead {
-    cache()
-        .get(|| (Instant::now(), Utc::now()), fetch_live)
-        .await
+    get_detached(cache(), fetch_live).await
+}
+
+/// `cache.get(fetch)` on a task of its own, so dropping the caller does not
+/// drop a fetch in flight. A task that panicked is an `unknown` read.
+async fn get_detached<F, Fut>(cache: &'static CapacityCache, fetch: F) -> CapacityRead
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Fetched> + Send + 'static,
+{
+    match tokio::spawn(cache.get(|| (Instant::now(), Utc::now()), fetch)).await {
+        Ok(read) => read,
+        Err(e) => Entry {
+            at: Instant::now(),
+            done: Instant::now(),
+            fetched_at: Utc::now(),
+            fetched: Fetched::unknown(None, format!("the capacity read's task failed: {e}")),
+        }
+        .read_at(Instant::now()),
+    }
 }
 
 /// The last read, synchronously and without asking coord: `None` before the
@@ -404,9 +488,11 @@ pub(crate) fn cached() -> Option<CapacityRead> {
 
 /// One live read of coord's capacity door for this device.
 ///
-/// The coord base is resolved first: under test it is deflected to "not
-/// connected" (`ambient::canary`), so a test read never reaches the device file
-/// or the credential store.
+/// The coord base is resolved first. A test that holds no isolated ambient is
+/// deflected to "not connected" there (`ambient::canary`); one that holds
+/// `isolated_ambient` resolves against its own empty fixture, which configures
+/// no coord base. Either way a test read never reaches the operator's device
+/// file or credential store.
 async fn fetch_live() -> Fetched {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         return Fetched::unknown(
@@ -560,6 +646,7 @@ mod tests {
     fn entry_at(at: Instant, fetched: Fetched) -> Entry {
         Entry {
             at,
+            done: at,
             fetched_at: Utc::now(),
             fetched,
         }
@@ -710,6 +797,107 @@ mod tests {
         assert_eq!(second.cache_ttl_secs, 60);
     }
 
+    /// A fetch that never answers (a stalled credential store) is cut off at
+    /// the deadline: the read is UNKNOWN naming it, with no row, and kept for
+    /// the short TTL, so the callers behind the single-flight lock are freed.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_past_its_deadline_is_unknown() {
+        let cache = CapacityCache::new();
+        let t0 = Instant::now();
+        let read = cache
+            .get_within(
+                Duration::from_secs(15),
+                at(t0),
+                std::future::pending::<Fetched>,
+            )
+            .await;
+        assert_eq!(read.state, "unknown");
+        assert!(read.row.is_none());
+        let reason = read.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("did not finish within 15 s"), "{reason}");
+        assert_eq!(read.cache_ttl_secs, UNKNOWN_TTL.as_secs());
+    }
+
+    /// A slow failure is kept its full TTL from when it FINISHED: a fetch that
+    /// took longer than the 10 s UNKNOWN TTL (a timeout) is not stale on
+    /// arrival, so the next caller is served it rather than fetching again.
+    #[tokio::test]
+    async fn a_slow_failure_is_kept_its_ttl_from_when_it_finished() {
+        let t0 = Instant::now();
+        let now = Arc::new(std::sync::Mutex::new(t0));
+        let clock = {
+            let now = now.clone();
+            move || (*now.lock().unwrap(), Utc::now())
+        };
+        let cache = CapacityCache::new();
+        let calls = AtomicUsize::new(0);
+        let slow = cache
+            .get(clock.clone(), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // The fetch took 15 s, past the 10 s TTL of what it returns.
+                *now.lock().unwrap() += Duration::from_secs(15);
+                std::future::ready(Fetched::unknown(None, "timed out"))
+            })
+            .await;
+        assert_eq!(slow.state, "unknown");
+        assert_eq!(slow.cache_age_secs, 15.0, "aged from when it began");
+        *now.lock().unwrap() += Duration::from_secs(9);
+        let next = cache
+            .get(clock.clone(), || {
+                counting(&calls, Fetched::unknown(None, "must not run"))
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "kept, not refetched");
+        assert_eq!(next.reason.as_deref(), Some("timed out"));
+        assert_eq!(next.cache_age_secs, 24.0);
+        *now.lock().unwrap() += Duration::from_secs(1);
+        cache
+            .get(clock, || counting(&calls, Fetched::unknown(None, "again")))
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "10 s after it finished");
+    }
+
+    /// A caller dropped while its fetch is in flight does not drop the fetch:
+    /// it finishes on its own task and is kept, so the next caller is served
+    /// it rather than asking coord again.
+    #[tokio::test]
+    async fn a_dropped_caller_does_not_drop_its_fetch() {
+        let cache: &'static CapacityCache = Box::leak(Box::new(CapacityCache::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = {
+            let calls = calls.clone();
+            tokio::spawn(get_detached(cache, move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = gate.await;
+                let _ = done_tx.send(());
+                known()
+            }))
+        };
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        let _ = first.await;
+        release.send(()).unwrap();
+        done_rx.await.unwrap();
+        // The detached fetch stores its read just after it answers.
+        while cache.last(Instant::now()).is_none() {
+            tokio::task::yield_now().await;
+        }
+        let again = {
+            let calls = calls.clone();
+            get_detached(cache, move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Fetched::unknown(None, "must not run")
+            })
+            .await
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "coord was asked once");
+        assert_eq!(again.state, "known");
+    }
+
     /// Once the read is a minute old coord is asked again, and the new
     /// answer, not the old row, is returned.
     #[tokio::test]
@@ -832,7 +1020,7 @@ mod tests {
     /// A read is aged when it is handed back, not when it was asked for: the
     /// fetch's own time is in the age of the read it fetched, and a read that
     /// waited for that fetch is aged at its own return too, so neither reads
-    /// younger than the answer is.
+    /// younger than the runner's ask.
     #[tokio::test]
     async fn a_read_is_aged_when_it_is_handed_back() {
         let t0 = Instant::now();
@@ -1025,9 +1213,11 @@ mod tests {
     /// it, with no row and no number.
     #[tokio::test]
     async fn the_fetch_from_an_unreachable_coord_is_unknown() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bound but never listening: the port stays this test's, so no
+        // parallel test's server can take it, and a connect to it is refused.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = closed.local_addr().unwrap();
-        drop(closed);
         let fetched = fetch_from(&format!("http://{addr}"), device(), "jwt").await;
         let Fetched::Unknown { device_id, reason } = &fetched else {
             panic!("an unreachable coord is unknown: {fetched:?}");
