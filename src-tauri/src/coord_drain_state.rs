@@ -901,9 +901,12 @@ pub const FORCED_DRAIN_DEFAULT_REASON: &str = "forced by the UI Bridge test fixt
 /// [`current_at`], so every reader sees it: [`current`], [`drain_gate`] and
 /// [`drain_gate_for_work`] (the boot tab restore's `terminal_session_list_open`
 /// and the lifecycle poll's census hold both read the BootResume gate through
-/// them), [`autonomous_spawns_allowed_now`], [`snapshot`], and the fold's own
-/// before/after comparison. Holding it beside the tracker rather than writing
-/// it into the tracker is what lets it survive the 30 s heartbeat re-fold.
+/// them), [`autonomous_spawns_allowed_now`], [`snapshot`], and the state
+/// [`fold_locked`] announces after a fold. NOT the fold's `before` read, which
+/// goes through [`folded_at`] without the override so a forced drain cannot
+/// hide a silence the tracker must adopt as `Unknown`. Holding it beside the
+/// tracker rather than writing it into the tracker is what lets it survive the
+/// 30 s heartbeat re-fold.
 ///
 /// ONE-WAY by construction: an override can only ever produce `Drained`, so
 /// it can never lift a drain. A REAL drain is passed through unchanged (with

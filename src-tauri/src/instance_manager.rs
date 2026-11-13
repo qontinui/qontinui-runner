@@ -19,6 +19,26 @@ use crate::database::pg::PgDb;
 use crate::settings::{RunnerInstanceConfig, SpawnPlacement};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+/// The instance-name prefix the dev supervisor reserves for its TEMP runners
+/// (qontinui-supervisor `routes::runners` spawn-test mints `test-<hex>` and
+/// passes it as both `QONTINUI_RUNNER_ID` and `QONTINUI_INSTANCE_NAME`).
+pub const TEMP_RUNNER_NAME_PREFIX: &str = "test-";
+
+/// PURE: refuse a runner-launched instance whose name claims the supervisor's
+/// temp-runner prefix. Being a temp runner unlocks test-only powers (the
+/// forced coord drain in `mcp::test_fixtures`), so this launcher must not be
+/// able to mint that identity; the supervisor's named-runner route refuses the
+/// same prefix.
+pub fn refuse_temp_runner_name(name: &str) -> Result<(), String> {
+    if name.trim_start().starts_with(TEMP_RUNNER_NAME_PREFIX) {
+        return Err(format!(
+            "Instance name {name:?} must not start with '{TEMP_RUNNER_NAME_PREFIX}': that prefix \
+             is reserved for the dev supervisor's temp runners"
+        ));
+    }
+    Ok(())
+}
+
 /// Status of a runner instance.
 #[derive(Debug, Clone, Serialize)]
 pub struct InstanceStatus {
@@ -344,6 +364,8 @@ impl InstanceManager {
         app: Option<&tauri::AppHandle>,
         resource_override: bool,
     ) -> Result<u32, String> {
+        refuse_temp_runner_name(&config.name)?;
+
         let mut instances = self.instances.lock().await;
 
         // Check if already running
@@ -750,4 +772,36 @@ async fn probe_instance_api(port: u16) -> bool {
 
     let url = format!("{}/status", crate::mcp::types::runner_loopback_base(port));
     client.get(&url).send().await.is_ok()
+}
+
+#[cfg(test)]
+mod temp_runner_name_tests {
+    use super::*;
+
+    /// The runner's own instance launcher must never mint the supervisor's
+    /// temp-runner identity, so the forced-drain discriminator holds at both ends.
+    #[test]
+    fn launcher_refuses_a_temp_runner_name() {
+        assert!(refuse_temp_runner_name("test-1a1d5eb4953-22").is_err());
+        assert!(refuse_temp_runner_name("test-").is_err());
+        assert!(refuse_temp_runner_name(" test-x").is_err());
+        assert!(refuse_temp_runner_name("local-web").is_ok());
+        assert!(refuse_temp_runner_name("my-test-runner").is_ok());
+        assert!(refuse_temp_runner_name("testing").is_ok());
+    }
+
+    /// The refusal sits in `launch_instance_with_app` itself, ahead of every
+    /// side effect, so the saved-config and restore paths cannot route around it.
+    #[test]
+    fn launch_instance_with_app_checks_the_name_first() {
+        let src = include_str!("instance_manager.rs");
+        let (_, body) = src
+            .split_once("pub async fn launch_instance_with_app(")
+            .expect("launcher present");
+        let guard = body
+            .find("refuse_temp_runner_name(&config.name)?")
+            .expect("launcher calls refuse_temp_runner_name");
+        let lock = body.find("self.instances.lock()").expect("lock present");
+        assert!(guard < lock, "the name refusal must precede the launch");
+    }
 }

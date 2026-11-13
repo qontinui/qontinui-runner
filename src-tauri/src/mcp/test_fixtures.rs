@@ -2972,31 +2972,46 @@ async fn append_transcript_record_handler(
 // A forced drain is a real drain to every reader, the wind-down executor
 // included: it stops stewards and closes FINISHED idle sessions. That is the
 // point on a temp runner under test and a hazard on anything else, so `drain`
-// is refused unless this process is a supervisor TEMP runner, whose
-// `QONTINUI_INSTANCE_NAME` is its own `test-…` id (qontinui-supervisor
-// `process::temp_runner_instance_name`). The primary carries no instance name,
-// and a named secondary carries an operator-chosen one. With the override
+// is refused unless this process is a supervisor TEMP runner. The `test-`
+// name prefix alone is not proof of one, so the signal is the pair the
+// supervisor sets together (qontinui-supervisor origin/main `b59b86b`):
+// `QONTINUI_RUNNER_ID` is the runner's id on every spawn
+// (`process::env_forwarders::PanicLogEnv`), and a temp runner's
+// `QONTINUI_INSTANCE_NAME` is that same id (`process::temp_runner_instance_name`,
+// minted `test-<hex>` by `routes::runners` spawn-test). So both must be set,
+// equal, and `test-…`. The supervisor's named-runner route refuses a `test-`
+// name, and so does this runner's own instance launcher
+// (`instance_manager::refuse_temp_runner_name`), which sets only the name — so
+// neither door can produce the pair. The primary carries no instance name. With the override
 // unreachable everywhere else, keeping it out of the wind-down executor's reads
 // would only make the temp runner's drain less real, so it is not done.
 // `release` is allowed anywhere: it can only remove this route's own override.
 
-/// The instance-name prefix the supervisor gives every temp runner.
-const TEMP_RUNNER_NAME_PREFIX: &str = "test-";
+use crate::instance_manager::TEMP_RUNNER_NAME_PREFIX;
 
-/// PURE: may this process force a drain? Only a supervisor temp runner may.
-fn force_drain_allowed(instance_name: Option<&str>) -> Result<(), String> {
-    match instance_name {
-        Some(name) if name.starts_with(TEMP_RUNNER_NAME_PREFIX) => Ok(()),
-        Some(name) => Err(format!(
+/// PURE: may this process force a drain? Only a supervisor temp runner may:
+/// `QONTINUI_RUNNER_ID` and `QONTINUI_INSTANCE_NAME` both set, equal, and
+/// `test-…` — the pair only the supervisor's temp-runner spawn sets.
+fn force_drain_allowed(runner_id: Option<&str>, instance_name: Option<&str>) -> Result<(), String> {
+    const WHY: &str = "a forced drain winds down finished sessions. Use a supervisor temp runner.";
+    let Some(name) = instance_name else {
+        return Err(format!(
+            "refused: no temp-runner identity (no QONTINUI_INSTANCE_NAME); {WHY}"
+        ));
+    };
+    if !name.starts_with(TEMP_RUNNER_NAME_PREFIX) {
+        return Err(format!(
             "refused: this runner's instance name {name:?} is not a supervisor temp runner's \
-             (`{TEMP_RUNNER_NAME_PREFIX}…`); a forced drain winds down finished sessions"
-        )),
-        None => Err(
-            "refused: this is the primary runner (no QONTINUI_INSTANCE_NAME); a forced drain \
-             would wind down its finished sessions. Use a supervisor temp runner."
-                .to_string(),
-        ),
+             (`{TEMP_RUNNER_NAME_PREFIX}…`); {WHY}"
+        ));
     }
+    if runner_id != Some(name) {
+        return Err(format!(
+            "refused: instance name {name:?} is not confirmed by the supervisor \
+             (QONTINUI_RUNNER_ID is {runner_id:?}, a temp runner's equals its name); {WHY}"
+        ));
+    }
+    Ok(())
 }
 
 /// What the route may do. There is deliberately no variant that clears.
@@ -3057,7 +3072,10 @@ async fn force_coord_drain_handler(
     })?;
     if req.action == ForceCoordDrainAction::Drain {
         let name = qontinui_runner_lib::instance_env::instance_name();
-        force_drain_allowed(name.as_deref()).map_err(|error| {
+        let runner_id = std::env::var("QONTINUI_RUNNER_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        force_drain_allowed(runner_id.as_deref(), name.as_deref()).map_err(|error| {
             (
                 StatusCode::FORBIDDEN,
                 Json(InjectSessionError {
@@ -3341,13 +3359,27 @@ mod tests {
     }
 
     /// Only a supervisor temp runner may force a drain: never the primary (no
-    /// instance name), never a named secondary.
+    /// instance name), never a named secondary, and never a `test-` name the
+    /// supervisor's QONTINUI_RUNNER_ID does not confirm.
     #[test]
     fn force_coord_drain_is_refused_off_a_temp_runner() {
-        assert!(force_drain_allowed(None).is_err());
-        assert!(force_drain_allowed(Some("named-29890-1a1bd55781c-1")).is_err());
-        assert!(force_drain_allowed(Some("local-web")).is_err());
-        assert!(force_drain_allowed(Some("test-1a1d5eb4953-22")).is_ok());
+        let temp = "test-1a1d5eb4953-22";
+        let none = force_drain_allowed(None, None).unwrap_err();
+        assert!(none.contains("no temp-runner identity"), "{none}");
+        assert!(!none.contains("primary runner"), "{none}");
+        assert!(force_drain_allowed(Some("runner-1"), None).is_err());
+        assert!(force_drain_allowed(
+            Some("named-29890-1a1bd55781c-1"),
+            Some("named-29890-1a1bd55781c-1")
+        )
+        .is_err());
+        assert!(force_drain_allowed(None, Some("local-web")).is_err());
+        // The prefix alone is not proof: the runner's own instance launcher
+        // sets only the name, and an inherited or absent id must not pass.
+        assert!(force_drain_allowed(None, Some(temp)).is_err());
+        assert!(force_drain_allowed(Some("runner-abc"), Some(temp)).is_err());
+        assert!(force_drain_allowed(Some("test-other-1"), Some(temp)).is_err());
+        assert!(force_drain_allowed(Some(temp), Some(temp)).is_ok());
     }
 
     /// The force-coord-drain body grammar is one-way: `drain` (with an optional

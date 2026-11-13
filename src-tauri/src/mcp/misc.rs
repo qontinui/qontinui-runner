@@ -1554,6 +1554,14 @@ async fn spawn_instance(
             Json(ApiResponse::error("Instance name must not be empty")),
         ));
     }
+    // `launch_instance_with_app` refuses it too; refusing here keeps the
+    // config from being saved first.
+    if let Err(e) = crate::instance_manager::refuse_temp_runner_name(&name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(e)),
+        ));
+    }
 
     // Agent-registry spawn authorization (plan
     // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
