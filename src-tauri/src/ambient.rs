@@ -176,11 +176,11 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_CENSUS_CHUNK_ROWS",
     "QONTINUI_CENSUS_CHUNK_SECS",
     "QONTINUI_CENSUS_POST_TIMEOUT_SECS",
+    // Read through `terminal::child_path::SHELL_READ_ENV`.
+    "QONTINUI_CHILD_PATH_SHELL_READ",
     // Read through `ci_node::cgroup::CGROUP_ROOT_ENV`, by `ci_node` and by the
     // slice telemetry's CPU attribution (`fleet::slice_telemetry::cpu`).
     "QONTINUI_CI_CGROUP_ROOT",
-    // Read through `terminal::child_path::SHELL_READ_ENV`.
-    "QONTINUI_CHILD_PATH_SHELL_READ",
     "QONTINUI_CLAUDE_BIN",
     "QONTINUI_CLAUDE_HOOK_SETTINGS",
     "QONTINUI_CODE_GRAPH_ROOTS",
