@@ -354,7 +354,7 @@ def run(args) -> int:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = Path(args.out)
     log = Log(out / f"{args.label}-{stamp}.jsonl")
-    work = out / f"{args.label}-{stamp}-work"
+    work = Path(args.work_dir) if args.work_dir else out / f"{args.label}-{stamp}-work"
     stub_dir, acct_a, acct_b, cwd = (work / "bin", work / "acct-a", work / "acct-b", work / "cwd")
     for d in (stub_dir, acct_a, acct_b, cwd):
         d.mkdir(parents=True, exist_ok=True)
@@ -369,6 +369,9 @@ def run(args) -> int:
             if not recd:
                 raise SystemExit(f"no such runner {args.runner_id}")
             r = Runner(args.runner_id, int(recd["port"]), log)
+            end = time.time() + 3 * 3600
+            while not (supervisor_record_of(r.id) or {}).get("running") and time.time() < end:
+                time.sleep(20)
         else:
             r = spawn(args, log, env_for(stub_dir, acct_a))
         h = r.wait_healthy()
@@ -451,6 +454,17 @@ def run(args) -> int:
         ss = subprocess.run(["ss", "-ltnpH", f"sport = :{r.port}"], capture_output=True, text=True).stdout
         if not pid or f"pid={pid}," not in ss:
             raise SystemExit(f"refusing to kill: pid {pid} is not the listener on :{r.port} ({ss!r})")
+        # The supervisor relaunches a temp runner from the FRESHEST slot exe, not
+        # from the exe it spawned, so a concurrent build elsewhere would swap the
+        # binary under test. Refuse before the kill when the pick has moved.
+        sb, builds = http("GET", f"{SUPERVISOR}/builds")
+        slot_now = (builds or {}).get("last_successful_slot") if isinstance(builds, dict) else None
+        exe = (rec.get("source_exe") or {}) if isinstance(rec.get("source_exe"), dict) else {}
+        log.rec("restart.exe_pick", runner_slot=exe.get("slot_id"), runner_sha=exe.get("build_sha"),
+                freshest_slot=slot_now)
+        if exe.get("slot_id") is None or slot_now != exe.get("slot_id"):
+            raise SystemExit(f"refusing to restart: the relaunch would run slot {slot_now}, "
+                             f"not this runner's slot {exe.get('slot_id')}")
         stub_pids = {k: stub_pid_for(n["session_id"]) for k, n in names.items()}
         os.kill(int(pid), signal.SIGKILL)
         log.rec("restart.killed_runner", pid=pid)
@@ -463,11 +477,17 @@ def run(args) -> int:
                     os.killpg(sid, signal.SIGKILL)
                     log.rec("restart.killed_holder", key=k, stub_pid=sp, holder_sid=sid)
         time.sleep(2)
-        s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/start", {}, timeout=120)
+        # wait=false: the supervisor's own 30 s health wait is shorter than a
+        # temp runner's boot with fifteen holders to adopt; poll it here.
+        s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/start?wait=false", {}, timeout=120)
         log.rec("restart.start", status=s, body=v)
         if s not in (200, 202):
             raise SystemExit(f"relaunch refused: {s} {v}")
-        r.wait_healthy()
+        h2 = data_of(r.wait_healthy(limit_s=600))
+        sha2 = h2.get("gitSha") or (h2.get("provenance") or {}).get("gitSha")
+        log.rec("restart.relaunched_build", git_sha=sha2, build_id=h2.get("buildId"))
+        if sha2 != sha:
+            raise SystemExit(f"the relaunch ran {sha2}, not the build under test {sha}")
         survived = {k: (p is not None and Path(f"/proc/{p}").exists()) for k, p in stub_pids.items()}
         log.rec("restart.holders_survived", survived=survived, stub_pids=stub_pids)
 
@@ -670,6 +690,8 @@ def main() -> int:
     g.add_argument("--git-ref")
     g.add_argument("--runner-id", help="an already-spawned temp runner (its env must carry the stub PATH)")
     ap.add_argument("--keep", action="store_true", help="do not stop the runner at the end")
+    ap.add_argument("--work-dir", help="reuse a work dir (stub bin, account dirs) whose bin/ the "
+                    "runner's PATH already names; needed with --runner-id")
     args = ap.parse_args()
     if sys.platform != "linux":
         raise SystemExit("Linux only")
