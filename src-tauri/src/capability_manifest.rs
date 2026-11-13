@@ -758,9 +758,9 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       qontinui-claude-config's hourly `fleet-agents-parity` gate \
                       (`agent-bundle-parity.sh`) checks that the two repositories' \
                       default branches agree, not this disk against this binary. When \
-                      the root does not resolve the \
-                      copy is a no-op that logs \"no qontinui-root resolved; skipping \
-                      .claude/agents\" and continues.",
+                      the root does not resolve, the checkout copy is skipped while the \
+                      embedded floor is still written, and this row is `unresolved` with \
+                      the workspace-root-unresolved refusal as its reason.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },

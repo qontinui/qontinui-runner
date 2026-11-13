@@ -479,6 +479,31 @@ impl<T: Serialize> ApiResponse<T> {
         }
     }
 
+    /// The error envelope for a surface that needed the workspace root and got
+    /// the typed [`WorkspaceRootUnresolved`](qontinui_types::paths::WorkspaceRootUnresolved)
+    /// instead — the same body `/api-surface/scan` sends for that case: `error`
+    /// is the error's one operator sentence (never a re-wording), `code` is
+    /// `workspace_root_unresolved`, and `hint` carries the full shared refusal
+    /// envelope (discriminator, next action, the probe-order detail) for a
+    /// reader that renders refusals itself. Pair it with `422`.
+    pub fn workspace_root_unresolved(
+        unresolved: &qontinui_types::paths::WorkspaceRootUnresolved,
+    ) -> Self {
+        let refusal = unresolved.refusal(
+            qontinui_types::refusal::RefusalSource::Runner,
+            chrono::Utc::now().to_rfc3339(),
+        );
+        Self {
+            success: false,
+            data: None,
+            error: Some(unresolved.to_string()),
+            error_detail: None,
+            hint: serde_json::to_value(&refusal).ok(),
+            code: Some(refusal.code.as_str().to_string()),
+            suggestions: None,
+        }
+    }
+
     /// Like `error_with_code` but also attaches a list of human-readable
     /// recovery suggestions surfaced to callers alongside the `code`.
     pub fn error_with_code_and_suggestions(

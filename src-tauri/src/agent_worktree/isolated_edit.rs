@@ -1434,7 +1434,8 @@ pub(crate) fn provision_session_cwd(
     provision_fleet_for_cwd(wd);
 }
 
-/// The guarded fleet commands + skills provisioning for one session cwd.
+/// The guarded fleet commands + skills + agent-definitions provisioning for one
+/// session cwd.
 ///
 /// Where the cwd's `.claude/` is repo-authored the skip is RECORDED, not only
 /// logged: one [`crate::capability_manifest::ProvisionReport`] per provisioner
@@ -1454,14 +1455,16 @@ fn provision_fleet_for_cwd(wd: &str) {
     } else {
         crate::fleet_commands::provision_fleet_commands_for_session(wd);
         crate::fleet_skills::provision_fleet_skills_for_session(wd);
+        let _ = crate::agent_runtime::provision_agent_definitions_recorded(wd);
     }
 }
 
-/// Record the repo-authored skip against `wd` for both provisioners.
+/// Record the repo-authored skip against `wd` for every provisioner.
 ///
-/// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry and every
-/// embedded skill file — not the account-resolved registry: resolving that
-/// would fetch overrides for a pass that writes nothing.
+/// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry, every
+/// embedded skill file and every embedded agent definition — not the
+/// account-resolved registry: resolving that would fetch overrides for a pass
+/// that writes nothing.
 fn record_repo_authored_skip(wd: &str) {
     use crate::capability_manifest::{record_provision, ProvisionReport, Rung, SkipReason};
 
@@ -1491,6 +1494,15 @@ fn record_repo_authored_skip(wd: &str) {
         }
     }
     record_provision(wd, skills);
+
+    let agents_dir = Path::new(wd).join(".claude").join("agents");
+    let agent_names = crate::fleet_agents::embedded_agent_names();
+    let mut agents = ProvisionReport::new("agent_definitions", agent_names.len(), Rung::Unresolved)
+        .with_destination(agents_dir.display().to_string());
+    for name in agent_names {
+        agents.skip(name, SkipReason::RepoAuthored);
+    }
+    record_provision(wd, agents);
 }
 
 /// What [`acquire_for_terminal`] does with the cwd `.mcp.json` for one spawn.
@@ -1903,6 +1915,24 @@ mod tests {
             .expect("a skills report");
         assert_eq!(skills.written, 0);
         assert_eq!(skills.skipped.len(), skills.expected);
+        let agents = ledger
+            .reports
+            .iter()
+            .find(|r| r.capability == "agent_definitions")
+            .expect("an agent_definitions report");
+        assert_eq!(agents.written, 0);
+        assert_eq!(
+            agents.skipped.len(),
+            crate::fleet_agents::embedded_agent_count()
+        );
+        assert!(agents
+            .skipped
+            .iter()
+            .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored));
+        assert!(
+            !root.join(".claude/agents").exists(),
+            "no agent definition is written into a repo-authored .claude/"
+        );
 
         let line = crate::served_corpus::probe(root).render_line();
         assert!(

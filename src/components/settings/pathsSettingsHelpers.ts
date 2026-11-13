@@ -386,6 +386,39 @@ export function resolvedDiffers(
 }
 
 /**
+ * The workspace root's resolution order when the setting is unset, highest
+ * first — ONE list, so the field copy and the "In effect" explanation cannot
+ * state different orders. Mirrors `qontinui_types::paths::resolve_workspace_root`
+ * (the setting itself ranks between the second and third rungs). `perSession`
+ * marks the rung only a resolution scoped to one session has: the runner-wide
+ * value shown under "In effect" never reaches it.
+ */
+export const WORKSPACE_ROOT_UNSET_RUNGS: ReadonlyArray<{
+  readonly label: string;
+  readonly perSession: boolean;
+}> = [
+  { label: "$QONTINUI_ROOT", perSession: false },
+  { label: "$QONTINUI_WORKSPACE_ROOT", perSession: false },
+  { label: "an ancestor walk from the runner executable", perSession: false },
+  {
+    label: "the folder holding the repository a session was opened on (for that session)",
+    perSession: true,
+  },
+  { label: "<home>/qontinui-root", perSession: false },
+];
+
+/**
+ * {@link WORKSPACE_ROOT_UNSET_RUNGS} as prose, `"A, then B, then C"`. With
+ * `runnerWide`, the per-session rung is left out — that is the order the
+ * runner-wide value was resolved by.
+ */
+export function workspaceRootOrder({ runnerWide }: { runnerWide: boolean }): string {
+  return WORKSPACE_ROOT_UNSET_RUNGS.filter((r) => !(runnerWide && r.perSession))
+    .map((r) => r.label)
+    .join(", then ");
+}
+
+/**
  * WHY the in-effect value differs from the configured one — the explanation
  * the panel renders beside the flag.
  *
@@ -394,9 +427,9 @@ export function resolvedDiffers(
  *                  default (`dev_logs_dir`'s platform default). Not a
  *                  discrepancy; shown as provenance.
  * - `"fallback"` — also `workspace_root` with nothing configured: the
- *                  runner resolved it from `$QONTINUI_ROOT` /
- *                  `$QONTINUI_WORKSPACE_ROOT` or the ancestor walk from the
- *                  executable. Provenance, not a discrepancy.
+ *                  runner resolved it through the runner-wide rungs of
+ *                  {@link WORKSPACE_ROOT_UNSET_RUNGS}. Provenance, not a
+ *                  discrepancy.
  * - `"override"` — `workspace_root` with a CONFIGURED value that is not the
  *                  one in effect: `$QONTINUI_ROOT` / `$QONTINUI_WORKSPACE_ROOT`
  *                  in the runner's environment beat the setting. Deliberate;

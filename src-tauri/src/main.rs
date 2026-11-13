@@ -6282,9 +6282,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     } else if let Err(why) = &workspace_root {
                         warn!(
-                            "Dev-mode: no Qontinui workspace root resolves, so the default \
-                             dev services (Docker/backend/frontend/embedding) were NOT \
-                             injected. {why} Dev services are injected at boot, so a \
+                            "Dev-mode: the default dev services \
+                             (Docker/backend/frontend/embedding) were NOT injected: \
+                             {why} Dev services are injected at boot, so a \
                              change takes effect at the next runner start. \
                              `workspace_paths` has already logged which probe was rejected."
                         );

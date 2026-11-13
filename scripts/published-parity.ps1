@@ -611,6 +611,18 @@ function Invoke-ParityProvisioningDrive {
         # agents listing has to follow it there. $null when the probe did not
         # answer, or answered without the field (an artifact predating it).
         probe_workdir  = $null
+        # The throwaway FOREIGN repository passed to the probe as session_repo:
+        # a fresh `git init` per leg, sibling to (never containing) $workdir, so
+        # the probe resolves the workspace root the way a session opened on an
+        # operator's own repository does. $null when git could not create it.
+        session_repo   = $null
+        # Which rung resolved the root for the probe's pass (the response's
+        # workspace_root_kind): `session_repo_parent` is the expected answer on
+        # a published install with nothing declared. Per leg, and NOT a manifest
+        # row: the two legs are expected to differ here (a dev leg's own checkout
+        # answers first), so a difference is recorded, never counted as a defect.
+        # $null when the probe did not answer, or its artifact predates the field.
+        probe_workspace_root_kind = $null
     }
 
     # --- 1. POST /terminals -------------------------------------------------
@@ -689,8 +701,27 @@ function Invoke-ParityProvisioningDrive {
     }
 
     # --- 3. POST /capability-manifest/provision-probe -----------------------
+    #
+    # A foreign repository, `git init`ed fresh for this leg, is handed over as
+    # session_repo. The probe only READS it to resolve the workspace root (its
+    # writes still land in its own directory under $workdir), so it is removed
+    # right after the call. A box with no git skips it and probes without one,
+    # which the drive records rather than hides.
+    $sessionRepo = Join-Path $tempRoot ("parity-foreign-repo-" + $Label + "-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
     try {
-        $body = @{ workdir = $workdir } | ConvertTo-Json -Compress
+        $null = & git init -q -- $sessionRepo 2>&1
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath (Join-Path $sessionRepo '.git'))) {
+            $drive.session_repo = $sessionRepo
+        } else {
+            Write-Host "    provisioning drive: git init of a foreign session repo failed (exit $LASTEXITCODE) -- probing without session_repo"
+        }
+    } catch {
+        Write-Host "    provisioning drive: git is unavailable ($($_.Exception.Message)) -- probing without session_repo"
+    }
+    try {
+        $probeBody = @{ workdir = $workdir }
+        if ($drive.session_repo) { $probeBody.session_repo = $drive.session_repo }
+        $body = $probeBody | ConvertTo-Json -Compress
         $resp = Invoke-WebRequest -Uri "$base/capability-manifest/provision-probe" -Method Post `
             -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
         $probeParsed = $resp.Content | ConvertFrom-Json
@@ -699,8 +730,12 @@ function Invoke-ParityProvisioningDrive {
             # Test-Path, Get-ChildItem -- then sees a path 5.1 can carry.
             $drive.probe_workdir = ConvertFrom-VerbatimPath ([string]$probeParsed.provisioned_into)
         }
+        if ($probeParsed -and $probeParsed.workspace_root_kind) {
+            $drive.probe_workspace_root_kind = [string]$probeParsed.workspace_root_kind
+        }
         $drive.provision_probe = 'ok'
-        Write-Host "    provisioning drive: provision-probe ok (wrote into $($drive.probe_workdir))"
+        Write-Host ("    provisioning drive: provision-probe ok (wrote into {0}; workspace root resolved as {1})" -f `
+            $drive.probe_workdir, $(if ($drive.probe_workspace_root_kind) { $drive.probe_workspace_root_kind } else { 'unknown' }))
     } catch {
         $code = $null
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
@@ -711,6 +746,11 @@ function Invoke-ParityProvisioningDrive {
         $reason = $(if ($code -eq 404) { 'door_404_artifact_predates_probe' } else { "http_$code" })
         $drive.provision_probe = "unknown($reason)"
         Write-Host "    provisioning drive: provision-probe -> $reason"
+    } finally {
+        # Read only to resolve the root; nothing of it is witnessed afterwards.
+        if (Test-Path -LiteralPath $sessionRepo) {
+            Remove-Item -LiteralPath $sessionRepo -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     return $drive
@@ -1126,6 +1166,19 @@ $observability = [PSCustomObject]@{
         dev       = $devRead.Witness
         published = $pubRead.Witness
     }
+    # Which rung resolved the workspace root for each leg's provision probe,
+    # driven with a freshly `git init`ed foreign repository as session_repo. The
+    # acceptance reading is `session_repo_parent` on the published leg. A
+    # DIFFERENCE between the legs is EXPECTED and is not a parity defect: the dev
+    # leg runs from its own checkout, whose ancestor walk answers before the
+    # session rung is reached. The runner-wide `workspace_root` manifest row is
+    # unchanged by this and is compared as before.
+    probe_workspace_root_kind  = [PSCustomObject]@{
+        dev       = $(if ($devRead.Drive) { $devRead.Drive.probe_workspace_root_kind } else { $null })
+        published = $(if ($pubRead.Drive) { $pubRead.Drive.probe_workspace_root_kind } else { $null })
+        note      = ("Per-leg, not a manifest row, and never counted: the legs are expected to differ " +
+                     "(expected_difference). null = the probe did not answer or predates the field (unknown).")
+    }
     # Which database arm each leg took, and the embedded cluster's port. Two
     # legs reporting `embedded-attached` / the SAME port are sharing one
     # cluster, which couples two legs that must differ in one property only.
@@ -1167,6 +1220,9 @@ if (@($unobservedBoth).Count -gt 0) {
 }
 Write-Host "   $($observability.session_ledger_limitation)"
 Write-Host "   slash_commands_status: $slashCommandsStatus"
+Write-Host ("   provision probe workspace_root_kind: dev={0} published={1} (a difference is expected, not a defect)" -f `
+    $(if ($observability.probe_workspace_root_kind.dev) { $observability.probe_workspace_root_kind.dev } else { 'unknown' }), `
+    $(if ($observability.probe_workspace_root_kind.published) { $observability.probe_workspace_root_kind.published } else { 'unknown' }))
 if (@($selfReportDisagreements).Count -gt 0) {
     Write-Host "   SELF-REPORT DISAGREES with the filesystem on $(@($selfReportDisagreements).Count) row(s) -- a finding about the INSTRUMENT, counted separately:"
     foreach ($d in @($selfReportDisagreements)) {

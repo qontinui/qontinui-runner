@@ -8064,6 +8064,8 @@ async fn run_continuation_terminal(
         // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
         // no qontinui-claude-config checkout has no skills dir at all.
         crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+        // And the named-subagent defs (embedded floor + checkout overlay).
+        provision_agent_definitions_recorded(workdir);
 
         // The PTY seam derives workspace trust for the pinned account through the
         // trust gate's SYNC door, which can only read the dial cache. Warm it here,
@@ -9388,7 +9390,7 @@ async fn acquire_continuation_workdir(
     // anything — with the `workdir_not_a_checkout` detail the caller posts as
     // the gate's `spawn_failed` outcome.
     let workdir = continuation_fallback_workdir(
-        crate::workspace_paths::require_workspace_root(),
+        crate::workspace_paths::require_workspace_root().map_err(|e| e.to_string()),
         repos,
         crate::agent_worktree::canonical_paths::has_foreign_owner,
         crate::agent_worktree::canonical_paths::resolve_checkout,
@@ -10922,11 +10924,12 @@ async fn add_planned_worktrees(
 /// operator fleet.
 ///
 /// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`).
-/// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
-/// unresolved checkout stated only in a log file — and is now a
-/// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
-/// why. The control flow is unchanged: it returns a report, never an error, and
-/// the spawn still proceeds.
+/// With no root resolved, the embedded floor (`fleet_agents`) and the retirement
+/// pass still run — only the checkout overlay needs a root — and the
+/// `agent_definitions` row is a [`capability_manifest::Rung::Unresolved`] whose
+/// detail renders the typed `WorkspaceRootUnresolved` followed by which copy the
+/// floor left serving. It returns a report, never an error, and the spawn still
+/// proceeds.
 ///
 /// `resolved` is the root as this session sees it
 /// ([`crate::workspace_paths::session_workspace_root`]), so a session opened on
@@ -10949,52 +10952,50 @@ fn provision_agent_definitions(
          as {}",
         resolved.kind.wire()
     );
-    let Some(root) = resolved.into_root() else {
-        // `rejected` is always `Some` here: the input at fault, or that every
-        // probe missed. Only the second is the normal published-install state.
-        let why = rejected.map_or_else(|| "no rung answered".to_string(), |r| r.describe());
-        let operator_input_at_fault = rejected
-            .is_some_and(|r| !matches!(r.source, qontinui_types::paths::RootSource::Probes));
-        warn!(
-            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
-             provisioning for {worktree_cwd} ({why}; auto-spawned subagents will not resolve)"
-        );
-        let state = if operator_input_at_fault {
-            format!(
-                "correct that input, or set the \"{}\" setting",
-                qontinui_types::paths::WORKSPACE_ROOT_SETTING
+    let kind = resolved.kind;
+    let report = match resolved.require() {
+        Ok(root) => provision_agent_definitions_from_root(&root, worktree_cwd),
+        // No root: the embedded floor still runs (only the qontinui-claude-config
+        // overlay needs a root), so a published-install session outside any
+        // checkout gets the built-in subagents exactly as it gets the built-in
+        // commands and skills. The row's detail is the typed error's render.
+        Err(unresolved) => {
+            warn!(
+                "agent_runtime: {unresolved} Writing the embedded subagent definitions into \
+                 {worktree_cwd} without the qontinui-claude-config overlay ({})",
+                unresolved.detail()
+            );
+            provision_agent_definitions_layers(
+                Err(unresolved),
+                worktree_cwd,
+                crate::fleet_agents::RETIRED_AGENTS,
             )
-        } else {
-            "the normal state on a published install".to_string()
-        };
-        let mut report = ProvisionReport::unresolved(
-            "agent_definitions",
-            0,
-            Path::new(worktree_cwd)
-                .join(".claude")
-                .join("agents")
-                .display()
-                .to_string(),
-            format!(
-                "no qontinui-root resolved ({why}), so \
-                 <root>/qontinui-claude-config/.claude/agents cannot be located — {state}"
-            ),
-        );
-        // An older binary's copy of a retired definition can sit in this workdir
-        // whether or not a root resolves now, so the retirement pass runs here too.
-        retire_agent_definitions(
-            worktree_cwd,
-            crate::fleet_agents::RETIRED_AGENTS,
-            &mut report,
-        );
-        return report;
+        }
     };
-    provision_agent_definitions_from_root(&root, worktree_cwd)
+    with_workspace_root_kind(report, kind)
 }
 
-/// The retirement pass on its own, for a spawn with no checkout root: the
-/// [`crate::provision_guard::KeepDecisions`] are decided over the retired names
-/// alone, since no layer writes in this workdir.
+/// Append which rung resolved the workspace root (`WorkspaceRootKind::wire`) to
+/// the `agent_definitions` row's detail, so a reader of the row — the provision
+/// probe's caller above all — can tell a `session_repo_parent` pass from a
+/// `declared` one without a second resolution.
+fn with_workspace_root_kind(
+    mut report: ProvisionReport,
+    kind: qontinui_types::paths::WorkspaceRootKind,
+) -> ProvisionReport {
+    let stamp = format!("workspace_root_kind: {}", kind.wire());
+    report.detail = Some(match report.detail.take() {
+        Some(detail) => format!("{detail}; {stamp}"),
+        None => stamp,
+    });
+    report
+}
+
+/// The retirement pass on its own, the [`crate::provision_guard::KeepDecisions`]
+/// decided over the retired names alone. Test-only: every production arm now
+/// runs the pass from [`provision_agent_definitions_layers`], after the floor;
+/// this isolates [`crate::fleet_agents::remove_retired_agents`]'s own behaviour.
+#[cfg(test)]
 fn retire_agent_definitions(worktree_cwd: &str, retired: &[&str], report: &mut ProvisionReport) {
     let workdir = Path::new(worktree_cwd);
     let dst_dir = workdir.join(".claude").join("agents");
@@ -11041,8 +11042,10 @@ pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<Provisi
 }
 
 /// [`provision_agent_definitions_recorded`] with the root resolver injected, so a
-/// test can show the workdir is what the resolver is asked about.
-fn provision_agent_definitions_recorded_with(
+/// test can show the workdir is what the resolver is asked about, and so the
+/// capability-manifest provision probe can resolve for a caller-named
+/// `session_repo` while writing into its own scratch directory.
+pub(crate) fn provision_agent_definitions_recorded_with(
     workdir: &str,
     resolve: impl FnOnce(&Path) -> qontinui_types::paths::WorkspaceRoot,
 ) -> Vec<ProvisionReport> {
@@ -11124,10 +11127,23 @@ fn provision_agent_definitions_retiring(
     worktree_cwd: &str,
     retired: &[&str],
 ) -> ProvisionReport {
-    let src_dir = root
-        .join("qontinui-claude-config")
-        .join(".claude")
-        .join("agents");
+    provision_agent_definitions_layers(Ok(root), worktree_cwd, retired)
+}
+
+/// Both layers and the retirement pass. `overlay_root` is the workspace root the
+/// qontinui-claude-config overlay is read from, or the typed reason there is
+/// none — in which case the embedded floor and the retirement pass still run and
+/// the `agent_definitions` row's detail renders that reason.
+fn provision_agent_definitions_layers(
+    overlay_root: Result<&Path, qontinui_types::paths::WorkspaceRootUnresolved>,
+    worktree_cwd: &str,
+    retired: &[&str],
+) -> ProvisionReport {
+    let src_dir = overlay_root.map(|root| {
+        root.join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents")
+    });
     let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
 
     // TRACKED DESTINATIONS ARE KEPT, in both layers below. Decided ONCE, before
@@ -11147,7 +11163,7 @@ fn provision_agent_definitions_retiring(
     // the probe's own fail-soft answer.
     let _ = std::fs::create_dir_all(&dst_dir);
     let mut written_names = crate::fleet_agents::embedded_agent_names();
-    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+    if let Ok(Ok(entries)) = src_dir.as_deref().map(std::fs::read_dir) {
         written_names.extend(
             entries
                 .filter_map(Result::ok)
@@ -11171,15 +11187,21 @@ fn provision_agent_definitions_retiring(
     // repo-local agent whose name collides with an untracked overlay file reads
     // as versioned while the source probe is UNKNOWN, and withholds its absent
     // embedded agents for that pass.
-    let overlay_tracked = crate::provision_guard::TrackedPaths::probe(&src_dir);
+    // With no overlay root there are no overlay names, so the roster is the
+    // embedded names alone.
+    let overlay_tracked = src_dir
+        .as_deref()
+        .ok()
+        .map(crate::provision_guard::TrackedPaths::probe);
     let embedded_names = crate::fleet_agents::embedded_agent_names();
     let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir).versioning(
         written_names
             .iter()
             .filter(|n| {
                 embedded_names.contains(n)
-                    || overlay_tracked.is_unknown_in_repo()
-                    || overlay_tracked.contains(Path::new(n.as_str()))
+                    || overlay_tracked.as_ref().is_some_and(|t| {
+                        t.is_unknown_in_repo() || t.contains(Path::new(n.as_str()))
+                    })
             })
             .map(PathBuf::from),
     );
@@ -11248,17 +11270,27 @@ fn provision_agent_definitions_retiring(
     // retired definition is never overlaid.
     // An overlay that errored still gets the retirement pass below, so its
     // error becomes an errored report rather than an early return.
-    let mut report = match overlay_checkout_agent_definitions(
-        &src_dir,
-        &dst_dir,
-        &keep,
-        FloorOutcome {
-            written: embedded,
-            kept,
-            write_failure: write_failure.as_deref(),
-        },
-        retired,
-    ) {
+    let floor = FloorOutcome {
+        written: embedded,
+        kept,
+        write_failure: write_failure.as_deref(),
+    };
+    let overlaid = match src_dir.as_deref() {
+        Ok(src_dir) => overlay_checkout_agent_definitions(src_dir, &dst_dir, &keep, floor, retired),
+        // No root: no overlay to read. The row states why (the typed error) and
+        // which copy the floor left serving.
+        Err(unresolved) => Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            dst_dir.display().to_string(),
+            format!(
+                "{unresolved} {}",
+                overlay_absent_statement(floor.written, floor.kept, floor.write_failure, &dst_dir)
+            ),
+        )
+        .with_destination(dst_dir.display().to_string())),
+    };
+    let mut report = match overlaid {
         Ok(report) => report,
         Err(e) => {
             warn!("agent_runtime: agent-def checkout overlay errored (continuing): {e:#}");
@@ -11284,7 +11316,7 @@ fn provision_agent_definitions_retiring(
     // were already on disk. It runs whether the checkout answered, was absent
     // or errored, because a device with no
     // checkout is exactly where an older binary's embedded copy sits (the
-    // no-root arm of `provision_agent_definitions` runs it as well). `keep`
+    // no-root arm reaches this same pass). `keep`
     // was decided before either layer wrote, so a tracked copy stays.
     crate::fleet_agents::remove_retired_agents(
         Path::new(worktree_cwd),
@@ -17178,9 +17210,9 @@ mod tests {
 
     /// Plan `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`,
     /// B3: when nothing is declared and the workdir is a repository checkout, the
-    /// embedded subagents are written instead of the no-root arm skipping them. A
-    /// folder that is not a checkout still takes that arm. Only the paths that call
-    /// this provisioner benefit; the terminal chokepoint does not call it yet.
+    /// root resolves to its parent and the embedded subagents are written. A
+    /// folder that is not a checkout takes the no-root arm, which writes the same
+    /// embedded floor (B3 vet 2026-11-13 item 2) and states the unresolved root.
     #[test]
     fn a_session_opened_on_a_checkout_reaches_the_embedded_floor() {
         let _amb = crate::test_env::isolated_ambient();
@@ -17222,7 +17254,43 @@ mod tests {
         );
         let report = provision_agent_definitions(resolved, &cwd);
         assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
-        assert!(!plain.join(".claude").exists());
+        let written = std::fs::read_dir(plain.join(".claude").join("agents"))
+            .expect("the no-root arm must still write the embedded floor")
+            .count();
+        assert_eq!(written, crate::fleet_agents::embedded_agent_count());
+    }
+
+    /// B3 vet 2026-11-13 item 2: with no root at all, the embedded floor is
+    /// written (only the overlay needs a root), and the `agent_definitions`
+    /// row's detail is the render of the
+    /// typed `WorkspaceRootUnresolved` plus the floor's statement — not a
+    /// sentence of this module's own.
+    #[test]
+    fn the_no_root_arm_writes_the_embedded_floor_and_renders_the_typed_error() {
+        let wt = tempfile::tempdir().unwrap();
+        let cwd = wt.path().to_string_lossy().into_owned();
+        let resolved =
+            qontinui_types::paths::resolve_workspace_root(None, None, None, None, None, None);
+        let unresolved = resolved
+            .clone()
+            .require()
+            .expect_err("nothing was supplied, so nothing resolves");
+
+        let report = provision_agent_definitions(resolved, &cwd);
+
+        let agents = wt.path().join(".claude").join("agents");
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(agents.join(&name).is_file(), "{name} must be written");
+        }
+        assert_eq!(report.capability, "agent_definitions");
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        let why = report.skipped[0].reason.describe();
+        assert!(why.contains(&unresolved.to_string()), "{why}");
+        assert!(
+            why.contains("This capability is served from the copy built into"),
+            "{why}"
+        );
+        assert!(!why.contains("no qontinui-root resolved"), "{why}");
     }
 
     /// A workspace root a test declares, without the process-wide resolver.
@@ -17234,9 +17302,8 @@ mod tests {
         }
     }
 
-    /// With no root, the row names the rejected input. It calls the outcome a
-    /// published install's normal state only when no explicit input was at
-    /// fault.
+    /// With no root, the row names the rejected input — through the typed
+    /// error's `Cause:` clause — only when an explicit input was at fault.
     #[test]
     fn the_no_root_row_names_the_input_at_fault() {
         let wt = tempfile::tempdir().unwrap();
@@ -17254,19 +17321,16 @@ mod tests {
         );
         let why = blank.skipped[0].reason.describe();
         assert!(why.contains("is blank"), "{why}");
-        assert!(why.contains("correct that input"), "{why}");
-        assert!(!why.contains("normal state"), "{why}");
+        assert!(why.contains("Cause:"), "{why}");
+        assert!(why.contains("Workspace root"), "{why}");
 
         let nothing = provision_agent_definitions(
             qontinui_types::paths::resolve_workspace_root(None, None, None, None, None, None),
             &cwd,
         );
         let why = nothing.skipped[0].reason.describe();
-        assert!(
-            why.contains("the normal state on a published install"),
-            "{why}"
-        );
-        assert!(!why.contains("correct that input"), "{why}");
+        assert!(why.contains("Workspace root"), "{why}");
+        assert!(!why.contains("Cause:"), "{why}");
     }
 
     /// The spawn path hands its root resolver its OWN workdir: that is what makes
@@ -17282,6 +17346,52 @@ mod tests {
             qontinui_types::paths::resolve_workspace_root(None, None, None, None, None, None)
         });
         assert_eq!(asked.as_deref(), Some(wt.path()));
+    }
+
+    /// B3 vet 2026-11-13 item 1: the provision probe resolves the root for a
+    /// caller-named `session_repo` checkout while writing into its OWN scratch
+    /// directory. A foreign checkout with nothing declared yields
+    /// `session_repo_parent`, the recorded row's detail says so, and nothing is
+    /// written into the checkout.
+    #[test]
+    fn a_session_repo_checkout_yields_session_repo_parent_and_stays_untouched() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("foreign-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let cwd = scratch.path().to_string_lossy().into_owned();
+
+        let mut kind = None;
+        let reports = provision_agent_definitions_recorded_with(&cwd, |_| {
+            let resolved = qontinui_types::paths::resolve_workspace_root(
+                None,
+                None,
+                None,
+                None,
+                Some(&repo),
+                None,
+            );
+            kind = Some(resolved.kind);
+            resolved
+        });
+
+        assert_eq!(
+            kind,
+            Some(qontinui_types::paths::WorkspaceRootKind::SessionRepoParent)
+        );
+        let detail = reports[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("workspace_root_kind: session_repo_parent"),
+            "{detail}"
+        );
+        assert!(
+            scratch.path().join(".claude").join("agents").is_dir(),
+            "the embedded floor lands in the probe's own directory"
+        );
+        assert!(
+            !repo.join(".claude").exists(),
+            "the session repository is read, never written"
+        );
     }
 
     /// With no claude-config overlay, a floor that could not write anything names

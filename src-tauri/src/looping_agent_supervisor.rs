@@ -1778,6 +1778,7 @@ async fn spawn_looping_agent_terminal(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port, None);
     crate::fleet_commands::provision_fleet_commands_for_session(&workdir);
     crate::fleet_skills::provision_fleet_skills_for_session(&workdir);
+    crate::agent_runtime::provision_agent_definitions_recorded(&workdir);
 
     // Interactive `claude` argv with the prompt as the trailing positional
     // arg (the proven continuation recipe — flags before prompt, `--`

@@ -305,13 +305,15 @@ pub(crate) async fn launch(
     crate::resource_guard::precheck_spawn("scheduled remote agent", false)?;
 
     // Provision what a session on a runner-only device has no other source
-    // for: the coord-mcp door, the bundled fleet commands and the bundled
-    // fleet skills (`/return-to-main` among them). Every one of these skips a
+    // for: the coord-mcp door, the bundled fleet commands, the bundled fleet
+    // skills (`/return-to-main` among them) and the bundled subagent
+    // definitions. Every one of these skips a
     // destination the enclosing repo tracks, so a workspace root whose
     // `.claude/` is a checkout is left alone.
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir_s, bound_port, None);
     crate::fleet_commands::provision_fleet_commands_for_session(&workdir_s);
     crate::fleet_skills::provision_fleet_skills_for_session(&workdir_s);
+    crate::agent_runtime::provision_agent_definitions_recorded(&workdir_s);
 
     // Most-available account, so the child does not spawn under a
     // quota-exhausted default and die on its first request.
