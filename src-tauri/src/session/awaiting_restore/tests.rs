@@ -453,6 +453,25 @@ fn closed_completions_alone_do_not_make_layout_pages_read_restored() {
     );
 }
 
+/// An open window's report with no layout (an empty `known`) does not let a
+/// closed window's completions in either: the merge would still carry no
+/// layout, and every layout page would read as an adopted orphan. Mutation:
+/// `pages` admitting the closed set whenever any open report is readable.
+#[test]
+fn closed_completions_need_an_open_report_that_carries_the_layout() {
+    use BootRestorePhase::Ran;
+    let mut reports = WindowReports::default();
+    reports.record("term-a", Some(report(&["p2"], &[])));
+    reports.forget("term-a");
+    reports.record("main", Some(PageRestoreProgress::default()));
+
+    assert_eq!(
+        reports.pages(Ran).has_run("default"),
+        Some(false),
+        "no page restored by an open window; the closed p2 does not decide"
+    );
+}
+
 /// A closed window's `known` set is not kept: the open windows report the
 /// whole layout, so a page only the closed window listed is no longer a layout
 /// page, and its rows are orphans the first restore adopted. Mutation: `forget`
