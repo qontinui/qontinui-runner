@@ -26,6 +26,8 @@ import {
   CheckCircle,
   ChevronDown,
   ChevronRight,
+  Keyboard,
+  ScanEye,
 } from "lucide-react";
 import type { UIBridgeElement } from "./inspector-types";
 import { describeThrown } from "@/lib/utils";
@@ -45,7 +47,7 @@ export interface ActionConfig {
   label: string;
   icon: React.ReactNode;
   requiresParams?: boolean;
-  paramType?: "text" | "value" | "options";
+  paramType?: "text" | "value" | "keys" | "options";
   description?: string;
 }
 
@@ -145,6 +147,76 @@ const SET_VALUE_ACTION: ActionConfig = {
   description: "Set the element's value directly",
 };
 
+// Verbs `@qontinui/ui-bridge` 0.46 advertises that the kind fallback below
+// deliberately does NOT guess at: they are offered only where an element
+// advertises them. Five take no parameters; `sendKeys` reads the SDK's
+// `{ keys }` param — a list of key names (`"Enter"`, `"ctrl+a"`), typed into
+// the keys field space-separated.
+const ADVERTISED_ONLY_ACTIONS: ActionConfig[] = [
+  {
+    id: "hoverClick",
+    label: "Hover Click",
+    icon: <MousePointer className="w-4 h-4" />,
+    description: "Reveal a hover-gated control, then click it",
+  },
+  {
+    id: "rightClick",
+    label: "Right Click",
+    icon: <MousePointer className="w-4 h-4" />,
+    description: "Simulate a right (context-menu) click",
+  },
+  {
+    id: "middleClick",
+    label: "Middle Click",
+    icon: <MousePointer className="w-4 h-4" />,
+    description: "Simulate a middle click",
+  },
+  {
+    id: "unhover",
+    label: "Unhover",
+    icon: <MousePointer className="w-4 h-4" />,
+    description: "Release a forced hover",
+  },
+  {
+    id: "scrollIntoView",
+    label: "Scroll Into View",
+    icon: <ScanEye className="w-4 h-4" />,
+    description: "Scroll the element into the viewport",
+  },
+  {
+    id: "sendKeys",
+    label: "Send Keys",
+    icon: <Keyboard className="w-4 h-4" />,
+    requiresParams: true,
+    paramType: "keys",
+    description: "Dispatch a key sequence (space-separated key names)",
+  },
+];
+
+/** Split the keys field into the SDK's `keys` list: whitespace-separated names. */
+export function parseKeys(raw: string): string[] {
+  return raw.split(/\s+/).filter((k) => k.length > 0);
+}
+
+/**
+ * The params an action sends, from the raw field texts: `{ text }` for
+ * `type`, `{ value }` for `select` / `setValue`, `{ keys }` for `sendKeys` —
+ * each the name the SDK reads. An empty field, or an action with no param
+ * type, sends `{}`.
+ */
+export function paramsFor(
+  action: Pick<ActionConfig, "paramType">,
+  fields: { text: string; value: string; keys: string },
+): Record<string, unknown> {
+  if (action.paramType === "text" && fields.text) return { text: fields.text };
+  if (action.paramType === "value" && fields.value) return { value: fields.value };
+  if (action.paramType === "keys") {
+    const keys = parseKeys(fields.keys);
+    if (keys.length > 0) return { keys };
+  }
+  return {};
+}
+
 /** Every verb this view has a control for, each once. */
 const ALL_ACTIONS: ActionConfig[] = [
   ...COMMON_ACTIONS,
@@ -152,6 +224,7 @@ const ALL_ACTIONS: ActionConfig[] = [
   ...CHECKBOX_ACTIONS,
   ...SELECT_ACTIONS,
   SET_VALUE_ACTION,
+  ...ADVERTISED_ONLY_ACTIONS,
 ];
 
 /**
@@ -205,6 +278,7 @@ export function ActionExecutorView({
   } | null>(null);
   const [textParam, setTextParam] = useState("");
   const [valueParam, setValueParam] = useState("");
+  const [keysParam, setKeysParam] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const getAvailableActions = useCallback(
@@ -221,14 +295,11 @@ export function ActionExecutorView({
       setLastResult(null);
 
       try {
-        let params: Record<string, unknown> = {};
-
-        // Add parameters based on action type
-        if (action.paramType === "text" && textParam) {
-          params = { text: textParam };
-        } else if (action.paramType === "value" && valueParam) {
-          params = { value: valueParam };
-        }
+        const params = paramsFor(action, {
+          text: textParam,
+          value: valueParam,
+          keys: keysParam,
+        });
 
         await onExecuteAction(element.id, action.id, params);
 
@@ -246,7 +317,7 @@ export function ActionExecutorView({
         setExecuting(false);
       }
     },
-    [element, onExecuteAction, disabled, executing, textParam, valueParam],
+    [element, onExecuteAction, disabled, executing, textParam, valueParam, keysParam],
   );
 
   // Quick action button
@@ -256,7 +327,8 @@ export function ActionExecutorView({
       executing ||
       (action.requiresParams &&
         ((action.paramType === "text" && !textParam) ||
-          (action.paramType === "value" && !valueParam)));
+          (action.paramType === "value" && !valueParam) ||
+          (action.paramType === "keys" && parseKeys(keysParam).length === 0)));
 
     return (
       <Button
@@ -361,6 +433,26 @@ export function ActionExecutorView({
                 />
                 {paramActions
                   .filter((a) => a.paramType === "text")
+                  .map((action) => renderActionButton(action))}
+              </div>
+            </div>
+          )}
+
+          {/* Keys input for sendKeys */}
+          {paramActions.some((a) => a.paramType === "keys") && (
+            <div className="mb-3">
+              <label className="text-xs text-muted-foreground mb-1 block">Keys:</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={keysParam}
+                  onChange={(e) => setKeysParam(e.target.value)}
+                  placeholder="e.g. ctrl+a Backspace Enter"
+                  className="flex-1 px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
+                  disabled={disabled || executing}
+                />
+                {paramActions
+                  .filter((a) => a.paramType === "keys")
                   .map((action) => renderActionButton(action))}
               </div>
             </div>
