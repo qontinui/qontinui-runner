@@ -46,7 +46,8 @@
 //!   unused for [`TEMPLATE_IDLE_LIMIT`].
 //! - **Process** (`run-<pid>-<nonce>/`): a copy of the cached data directory,
 //!   started on a free loopback port. No live cluster is shared between
-//!   processes, so only its owner ever stops it.
+//!   processes, so only its owner stops it — unless it outlives that owner, when
+//!   the next boot's sweep ends it.
 //! - **Test**: `CREATE DATABASE <unique> TEMPLATE <template>`, serialized per
 //!   server. A template with a session open cannot be copied, so every template
 //!   refuses connections once it is built.
@@ -59,21 +60,36 @@
 //!
 //! | how the test process ends | Linux / macOS | Windows |
 //! |---|---|---|
-//! | every test passed (`main` returns) | `atexit`: `pg_ctl stop -m immediate`, then the root is removed | the same |
-//! | a test failed (libtest calls `process::exit`) | the same `atexit` | `process::exit` is `ExitProcess`, and whether the C runtime runs `atexit` handlers then is not established here (the failing-child self-test logs which happened): either way the postmaster dies — stopped by `atexit` if it runs, killed by the kill-on-close job if not — and a root `atexit` did not remove waits for the next sweep |
-//! | killed or crashed | the postmaster is orphaned; the next boot's sweep stops it (`pg_ctl stop -m immediate`, so it frees its shared memory; a kill only if that fails) and removes the root | the job kills the postmaster; the next sweep removes the root |
+//! | every test passed (`main` returns) | `atexit` ends the postmaster ([`end_postmaster`]), then removes the root | the same |
+//! | a test failed (libtest calls `process::exit`) | the same `atexit` | `process::exit` is `ExitProcess`, and whether the C runtime runs `atexit` handlers then is not established here (the failing-child self-test logs which happened): the postmaster is ended by `atexit` if it runs, else by the kill-on-close job, else — where the job could not be attached — by the next boot's sweep; a root `atexit` did not remove waits for the next sweep |
+//! | killed or crashed | the postmaster is orphaned; the next boot's sweep ends it ([`end_postmaster`]) and removes the root | the job kills the postmaster — or, where it could not be attached, the next boot's sweep ends it — and the next sweep removes the root |
 //! | any of these, on an external server ([`EXTERNAL_URL_ENV`]) | `atexit`, where it runs, drops this process's `qtpl_<nonce>*` and `qtest_<nonce>_*` databases; a killed or crashed process leaves them, and a later boot only reports them | the same, and a failed test process leaves them too if `atexit` did not run |
 //!
-//! The sweep runs at every boot: a `run-*` root whose recorded owner pid is gone
-//! has its postmaster stopped — after checking that the pid really is that
-//! root's postmaster — and is removed. The stop is `pg_ctl stop -m immediate`,
-//! which lets the postmaster remove its System V and dynamic shared memory
-//! segments as it exits; a postmaster that does not stop is killed, which
-//! leaves them behind. A pid is judged only in the PID
-//! namespace that recorded it: a root whose owner recorded another one (a
-//! container sharing the target directory, a second WSL distro) is presumed
-//! live until its record is [`FOREIGN_OWNER_GRACE`] old, because its pid names
-//! nothing here.
+//! The sweep runs at every boot: a `run-*` root whose owner is gone
+//! ([`owner_may_be_live`]) has its postmaster ended, and is removed. Ending a
+//! postmaster ([`end_postmaster`]) acts only on a process proven to work in
+//! that data directory, and what keeps a pid recycled after the proof from
+//! being hit depends on the OS:
+//!
+//! - **Linux**: the process is held by a pidfd from before the proof until it
+//!   is gone. It is sent SIGQUIT — what `pg_ctl stop -m immediate` sends —
+//!   through the pidfd, which lets it remove its System V and dynamic shared
+//!   memory segments as it exits, and SIGKILL only if it has not exited within
+//!   30 s (`QUIT_WAIT`). A signal through a pidfd reaches the process the pidfd
+//!   was opened on or none, never a later holder of its pid.
+//! - **Windows**: one handle is opened before the proof, the proof is tied to
+//!   that handle's process (by its creation time, or its image), and the
+//!   process is terminated and waited for through the same handle.
+//! - **macOS and other Unix, and Linux without pidfds (before 5.3)**: the proof
+//!   and the action each name the pid. `pg_ctl stop -m immediate` is used when
+//!   `postmaster.pid` names the proven pid (`pg_ctl` signals whatever that
+//!   file names), and a kill by pid follows a second proof, so a pid recycled
+//!   between a proof and the signal after it can still be hit there.
+//!
+//! A pid is judged only in the PID namespace that recorded it: a root whose
+//! owner recorded another one (a container sharing the target directory, a
+//! second WSL distro) is presumed live until its record is
+//! [`FOREIGN_OWNER_GRACE`] old, because its pid names nothing here.
 //!
 //! Nothing sweeps an external server. Its boot names the harness databases there
 //! that belong to no nonce it knows ([`foreign_harness_databases`]) and drops
@@ -208,13 +224,19 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// process can take it in between.
 const START_ATTEMPTS: usize = 3;
 /// How long a `pg_ctl stop -m immediate` ([`stop_immediately`]) waits for the
-/// server: at exit, on this process's cluster, and in the sweep, on a dead
-/// root's.
+/// server, where a postmaster is ended that way ([`end_postmaster`]).
+#[cfg(unix)]
 const STOP_TIMEOUT_SECS: &str = "30";
 /// The hard bound on that `pg_ctl stop` itself: its own `--timeout` plus margin.
+#[cfg(unix)]
 const STOP_WAIT: Duration = Duration::from_secs(45);
-/// How long a postmaster may take to be gone once `pg_ctl` reported it stopped,
-/// or once it was killed.
+/// How long a postmaster sent SIGQUIT through a pidfd — what `pg_ctl stop -m
+/// immediate` sends — may take to exit before it is killed: the same bound
+/// `pg_ctl` would give it ([`STOP_TIMEOUT_SECS`]).
+#[cfg(target_os = "linux")]
+const QUIT_WAIT: Duration = Duration::from_secs(30);
+/// How long a postmaster may take to be gone once it was killed or terminated,
+/// or once `pg_ctl` reported it stopped.
 const POSTMASTER_EXIT_WAIT: Duration = Duration::from_secs(10);
 /// A `run-*` root with no readable owner record is left alone this long: it may
 /// be a live process's root, caught between its `mkdir` and its record's write.
@@ -958,7 +980,6 @@ fn enter_template(
     let root = create_run_root(dir, key)?;
     arm_teardown(Teardown {
         cluster: Some(ClusterTeardown {
-            pg_ctl: pg_ctl_in(&install),
             data_dir: root.join(DATA_DIR),
             root: root.clone(),
             postmaster_pid: None,
@@ -2024,64 +2045,10 @@ fn modified_before(path: &Path, age: Duration) -> bool {
         .is_some_and(|elapsed| elapsed > age)
 }
 
-/// End the postmaster still running in `root/pg-data`, if there is one: the pid
-/// its `postmaster.pid` names, and `recorded` (the owner record's). A pid is
-/// acted on only once [`is_postmaster_of`] confirms it is that data directory's
-/// postmaster, so a recycled pid is never touched.
-///
-/// It is stopped first ([`stop_postmaster`]): an immediate stop lets the
-/// postmaster run its own exit cleanup, which removes its System V interlock
-/// segment and its dynamic shared memory control segment. A kill skips that,
-/// and with the data directory removed straight after, no later start could
-/// reclaim them. Only a postmaster the stop did not end is killed, once it is
-/// proven again to be this directory's.
+/// End the postmaster still running in `root/pg-data`, if there is one
+/// ([`end_postmasters`]).
 fn reap_postmaster(root: &Path, recorded: Option<u32>) -> String {
-    let data_dir = root.join(DATA_DIR);
-    let named = read_postmaster_pid(&data_dir);
-    let mut candidates: Vec<u32> = named.into_iter().collect();
-    if let Some(pid) = recorded {
-        if !candidates.contains(&pid) {
-            candidates.push(pid);
-        }
-    }
-    let mut notes = Vec::new();
-    for pid in candidates {
-        if !crate::runner_breadcrumb::pid_is_live(pid) {
-            continue;
-        }
-        if !is_postmaster_of(pid, &data_dir) {
-            notes.push(format!(
-                "pid {pid} is alive but is not this root's postmaster, so it was left alone"
-            ));
-            continue;
-        }
-        // `pg_ctl` signals whichever pid `postmaster.pid` names, so it is used
-        // only when that is the pid just proven to be this directory's.
-        let not_stopped = if named == Some(pid) {
-            match stop_postmaster(pid, &data_dir) {
-                Ok(()) => {
-                    notes.push(format!(
-                        "stopped its postmaster {pid} (pg_ctl stop -m immediate)"
-                    ));
-                    continue;
-                }
-                Err(e) => e,
-            }
-        } else {
-            "postmaster.pid does not name it, so pg_ctl cannot stop it".to_string()
-        };
-        // While the stop ran, the postmaster may have exited and its pid been
-        // taken by another process.
-        if !(crate::runner_breadcrumb::pid_is_live(pid) && is_postmaster_of(pid, &data_dir)) {
-            notes.push(format!("its postmaster {pid} exited ({not_stopped})"));
-            continue;
-        }
-        notes.push(if kill_and_wait(pid) {
-            format!("killed its postmaster {pid} ({not_stopped})")
-        } else {
-            format!("its postmaster {pid} would not die ({not_stopped})")
-        });
-    }
+    let notes = end_postmasters(&root.join(DATA_DIR), recorded);
     if notes.is_empty() {
         "no postmaster was running".to_string()
     } else {
@@ -2089,9 +2056,367 @@ fn reap_postmaster(root: &Path, recorded: Option<u32>) -> String {
     }
 }
 
+/// End every postmaster still running in `data_dir` ([`end_postmaster`]): the
+/// pid its `postmaster.pid` names, and `recorded` (an owner record's, or this
+/// process's own postmaster at exit). One note per pid that was running.
+fn end_postmasters(data_dir: &Path, recorded: Option<u32>) -> Vec<String> {
+    let named = read_postmaster_pid(data_dir);
+    let mut candidates: Vec<u32> = named.into_iter().collect();
+    if let Some(pid) = recorded {
+        if !candidates.contains(&pid) {
+            candidates.push(pid);
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|pid| end_postmaster(pid, data_dir, named == Some(pid)))
+        .collect()
+}
+
+/// End `pid` once it is proven to be a postmaster of `data_dir`
+/// ([`is_postmaster_of`]), and say what happened; `None` when no process has
+/// `pid`. `named`: `data_dir`'s `postmaster.pid` names it.
+///
+/// On Linux the process is held by a pidfd from before the proof until it is
+/// gone ([`end_held`]): a signal through the pidfd reaches the process it was
+/// opened on or none, so a pid freed and taken by another process after the
+/// proof is never signalled. Only a kernel without pidfds (`ENOSYS`, before
+/// 5.3) gets the unheld path ([`end_unheld`]), window and all.
+#[cfg(target_os = "linux")]
+fn end_postmaster(pid: u32, data_dir: &Path, named: bool) -> Option<String> {
+    match Pidfd::open(pid) {
+        Ok(held) => Some(end_held(&held, pid, data_dir)),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => None,
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => end_unheld(pid, data_dir, named),
+        Err(e) => Some(format!(
+            "pid {pid} could not be held by a pidfd ({e}), so it was left alone"
+        )),
+    }
+}
+
+/// End `pid` once it is proven to be a postmaster of `data_dir`
+/// ([`postmaster_identity`]), and say what happened; `None` when no process
+/// has `pid`. On Windows it is held by one process handle from before the proof
+/// until it is gone ([`end_held`]); `postmaster.pid` is not consulted.
+#[cfg(windows)]
+fn end_postmaster(pid: u32, data_dir: &Path, _named: bool) -> Option<String> {
+    end_held(pid, data_dir)
+}
+
+/// End `pid` once it is proven to be a postmaster of `data_dir`
+/// ([`is_postmaster_of`]), and say what happened; `None` when no process has
+/// `pid`. `named`: `data_dir`'s `postmaster.pid` names it. On Unix other than
+/// Linux nothing holds the process ([`end_unheld`]).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn end_postmaster(pid: u32, data_dir: &Path, named: bool) -> Option<String> {
+    end_unheld(pid, data_dir, named)
+}
+
+/// Linux: end `pid`, held by `held` — opened on it before this runs — once it
+/// is proven to be a postmaster of `data_dir`. It is sent SIGQUIT through the
+/// pidfd, which is what `pg_ctl stop -m immediate` sends: the postmaster then
+/// runs its own exit cleanup, removing its System V interlock segment and its
+/// dynamic shared memory, which a kill would leave behind for good once its
+/// data directory is removed. SIGKILL follows through the same pidfd only if it
+/// has not exited within [`QUIT_WAIT`].
+///
+/// The proof reads `/proc/<pid>` after the pidfd was opened, and a signal
+/// through a pidfd fails once the process it was opened on is gone. So when a
+/// signal is delivered, that process was alive from the open through the
+/// proof, held `pid` throughout, and is the process the proof read: a pid freed
+/// and taken by another process in between gets no signal at all.
+#[cfg(target_os = "linux")]
+fn end_held(held: &Pidfd, pid: u32, data_dir: &Path) -> String {
+    if !is_postmaster_of(pid, data_dir) {
+        return format!(
+            "pid {pid} is alive but is not this root's postmaster, so it was left alone"
+        );
+    }
+    let gone = |e: &std::io::Error| e.raw_os_error() == Some(libc::ESRCH);
+    let unquit = match held.signal(libc::SIGQUIT) {
+        Ok(()) if held.exits_within(QUIT_WAIT) => {
+            return format!("stopped its postmaster {pid} (SIGQUIT through a pidfd)");
+        }
+        Ok(()) => format!("SIGQUIT did not end it within {} s", QUIT_WAIT.as_secs()),
+        Err(e) if gone(&e) => return format!("its postmaster {pid} exited"),
+        Err(e) => format!("SIGQUIT could not be sent: {e}"),
+    };
+    match held.signal(libc::SIGKILL) {
+        Ok(()) if held.exits_within(POSTMASTER_EXIT_WAIT) => {
+            format!("killed its postmaster {pid} ({unquit})")
+        }
+        Ok(()) => format!("its postmaster {pid} would not die ({unquit})"),
+        Err(e) if gone(&e) => format!("its postmaster {pid} exited ({unquit})"),
+        Err(e) => format!("its postmaster {pid} could not be killed ({unquit}; {e})"),
+    }
+}
+
+/// Windows: end `pid` once it is proven to be a postmaster of `data_dir`,
+/// through ONE handle opened before the proof. The proof is tied to that
+/// handle's process — its creation time is the start sysinfo reported at the
+/// proof, or its image is the executable the proof read — and the process is
+/// then terminated and waited for through the same handle. A handle names its
+/// process for as long as it is open, whatever is given the pid later, so a
+/// pid freed and taken by another process after the proof is never
+/// terminated. (Windows frees a postmaster's shared memory with its last
+/// handle, so terminating one leaks nothing.)
+#[cfg(windows)]
+fn end_held(pid: u32, data_dir: &Path) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+    let held = match ProcessHandle::open(pid, access) {
+        Ok(held) => held,
+        Err(e) => {
+            return crate::runner_breadcrumb::pid_is_live(pid)
+                .then(|| format!("pid {pid} could not be opened ({e}), so it was left alone"));
+        }
+    };
+    let Some((started, exe)) = postmaster_identity(pid, data_dir) else {
+        return Some(format!(
+            "pid {pid} is alive but is not this root's postmaster, so it was left alone"
+        ));
+    };
+    let created = held.created().and_then(unix_seconds_of_filetime);
+    let tied = created == Some(started) || (exe.is_some() && held.image() == exe);
+    if !tied {
+        return Some(format!(
+            "pid {pid} could not be tied to the process its handle holds, so it was left alone"
+        ));
+    }
+    Some(match held.terminate() {
+        Ok(()) if held.exits_within(POSTMASTER_EXIT_WAIT) => {
+            format!("terminated its postmaster {pid} (through a handle held across the proof)")
+        }
+        Ok(()) => format!("its postmaster {pid} would not die"),
+        Err(_) if held.exits_within(Duration::ZERO) => format!("its postmaster {pid} exited"),
+        Err(e) => format!("its postmaster {pid} could not be terminated ({e})"),
+    })
+}
+
+/// A Windows `FILETIME` (100 ns ticks since 1601) as whole seconds since the
+/// Unix epoch, computed the way sysinfo computes a process's `start_time`.
+#[cfg(windows)]
+fn unix_seconds_of_filetime(ticks: u64) -> Option<u64> {
+    (ticks / 10_000_000).checked_sub(11_644_473_600)
+}
+
+/// Unix without a held process (other than Linux, or Linux without pidfds):
+/// end `pid` once it is proven to be a postmaster of `data_dir`. When
+/// `postmaster.pid` names it (`named`) it is stopped with `pg_ctl stop -m
+/// immediate` ([`stop_postmaster`]); `pg_ctl` signals whatever that file names.
+/// A postmaster the stop did not end is killed once it is proven again. Every
+/// step names the pid, so a pid freed and taken by another process between a
+/// proof and the signal after it can still be hit here.
+#[cfg(unix)]
+fn end_unheld(pid: u32, data_dir: &Path, named: bool) -> Option<String> {
+    if !crate::runner_breadcrumb::pid_is_live(pid) {
+        return None;
+    }
+    if !is_postmaster_of(pid, data_dir) {
+        return Some(format!(
+            "pid {pid} is alive but is not this root's postmaster, so it was left alone"
+        ));
+    }
+    let not_stopped = if named {
+        match stop_postmaster(pid, data_dir) {
+            Ok(()) => {
+                return Some(format!(
+                    "stopped its postmaster {pid} (pg_ctl stop -m immediate)"
+                ));
+            }
+            Err(e) => e,
+        }
+    } else {
+        "postmaster.pid does not name it, so pg_ctl cannot stop it".to_string()
+    };
+    // While the stop ran, the postmaster may have exited and its pid been
+    // taken by another process.
+    if !(crate::runner_breadcrumb::pid_is_live(pid) && is_postmaster_of(pid, data_dir)) {
+        return Some(format!("its postmaster {pid} exited ({not_stopped})"));
+    }
+    Some(if kill_and_wait(pid) {
+        format!("killed its postmaster {pid} ({not_stopped})")
+    } else {
+        format!("its postmaster {pid} would not die ({not_stopped})")
+    })
+}
+
+/// A process held by a pidfd (`pidfd_open(2)`, Linux 5.3): a signal sent
+/// through it reaches that process, or fails with `ESRCH` once the process is
+/// gone — never another process given its pid since — and it turns readable
+/// when the process exits.
+#[cfg(target_os = "linux")]
+struct Pidfd(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl Pidfd {
+    fn open(pid: u32) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let pid = libc::pid_t::try_from(pid)
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ESRCH))?;
+        // SAFETY: pidfd_open reads only its two integer arguments, and returns
+        // a new descriptor or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+        let fd = std::os::fd::RawFd::try_from(fd)
+            .ok()
+            .filter(|fd| *fd >= 0)
+            .ok_or_else(std::io::Error::last_os_error)?;
+        // SAFETY: `fd` is the descriptor pidfd_open just returned; nothing else
+        // owns it.
+        Ok(Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Send `signal` to the held process: `ESRCH` once it is gone.
+    fn signal(&self, signal: libc::c_int) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: pidfd_send_signal reads the descriptor, the signal number,
+        // a null `siginfo_t` pointer (the kernel then fills one in as `kill`
+        // would) and zero flags.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        if sent == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Whether the held process exits within `limit`: the pidfd turns
+    /// readable when it does.
+    fn exits_within(&self, limit: Duration) -> bool {
+        use std::os::fd::AsRawFd;
+        let deadline = Instant::now() + limit;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let timeout = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+            let mut ready = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll reads and writes exactly the one `pollfd` it is
+            // given, which lives on this frame.
+            match unsafe { libc::poll(&mut ready, 1, timeout) } {
+                0 => return false,
+                polled if polled > 0 => return true,
+                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    && Instant::now() < deadline => {}
+                _ => return false,
+            }
+        }
+    }
+}
+
+/// A process held by a Windows process handle, which names that one process for
+/// as long as it is open, whatever is given its pid later.
+#[cfg(windows)]
+struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ProcessHandle {
+    fn open(
+        pid: u32,
+        access: windows_sys::Win32::System::Threading::PROCESS_ACCESS_RIGHTS,
+    ) -> std::io::Result<Self> {
+        use windows_sys::Win32::System::Threading::OpenProcess;
+        // SAFETY: OpenProcess has no preconditions; a null handle is its
+        // failure, handled here.
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    /// Its creation time, in 100 ns ticks since 1601: unique to the process
+    /// among all that held its pid.
+    fn created(&self) -> Option<u64> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: the handle was opened with PROCESS_QUERY_LIMITED_INFORMATION,
+        // and each pointer is to a FILETIME on this frame.
+        let read =
+            unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) };
+        if read == 0 {
+            None
+        } else {
+            Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+        }
+    }
+
+    /// The full path of its executable.
+    fn image(&self) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::Threading::{
+            QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        };
+        let mut path = vec![0_u16; 32_768];
+        let mut len = u32::try_from(path.len()).unwrap_or(u32::MAX);
+        // SAFETY: `path` holds `len` u16s; the call writes at most that many
+        // and stores in `len` how many it wrote.
+        let read = unsafe {
+            QueryFullProcessImageNameW(self.0, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut len)
+        };
+        let len = usize::try_from(len).ok()?;
+        (read != 0 && len <= path.len())
+            .then(|| PathBuf::from(std::ffi::OsString::from_wide(&path[..len])))
+    }
+
+    fn terminate(&self) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        // SAFETY: the handle was opened with PROCESS_TERMINATE.
+        if unsafe { TerminateProcess(self.0, 1) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether the held process exits within `limit`.
+    fn exits_within(&self, limit: Duration) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // `u32::MAX` is INFINITE: the longest finite wait is one less.
+        let millis = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: the handle was opened with PROCESS_SYNCHRONIZE.
+        unsafe { WaitForSingleObject(self.0, millis) == WAIT_OBJECT_0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle was opened by `open` and is closed once, here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
 /// Whether `pid` is a postgres process working in `data_dir` — the postmaster
 /// `chdir`s into its data directory and is started with `-D <data_dir>`.
+#[cfg(any(unix, test))]
 fn is_postmaster_of(pid: u32, data_dir: &Path) -> bool {
+    postmaster_identity(pid, data_dir).is_some()
+}
+
+/// The proof that `pid` is a postgres process working in `data_dir`, and what
+/// it read of the process: the start sysinfo reports (seconds since the Unix
+/// epoch) and the executable, if readable. `None` when it is not.
+fn postmaster_identity(pid: u32, data_dir: &Path) -> Option<(u64, Option<PathBuf>)> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
@@ -2100,22 +2425,22 @@ fn is_postmaster_of(pid: u32, data_dir: &Path) -> bool {
         true,
         ProcessRefreshKind::new()
             .with_cmd(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always),
+            .with_cwd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
     );
-    let Some(process) = system.process(pid) else {
-        return false;
-    };
+    let process = system.process(pid)?;
     let named_postgres = process
         .name()
         .to_string_lossy()
         .to_ascii_lowercase()
         .starts_with("postgres");
-    named_postgres
-        && (process.cwd().is_some_and(|cwd| same_dir(cwd, data_dir))
-            || process
-                .cmd()
-                .iter()
-                .any(|arg| same_dir(Path::new(arg), data_dir)))
+    let in_data_dir = process.cwd().is_some_and(|cwd| same_dir(cwd, data_dir))
+        || process
+            .cmd()
+            .iter()
+            .any(|arg| same_dir(Path::new(arg), data_dir));
+    (named_postgres && in_data_dir)
+        .then(|| (process.start_time(), process.exe().map(Path::to_path_buf)))
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -2128,6 +2453,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// Stop the postmaster `pid` of `data_dir` with `pg_ctl stop -m immediate`
 /// ([`stop_immediately`]), run from the install the postmaster itself runs
 /// from. `Ok` once the pid is gone.
+#[cfg(unix)]
 fn stop_postmaster(pid: u32, data_dir: &Path) -> Result<(), String> {
     let pg_ctl = executable_of(pid)
         .and_then(|exe| {
@@ -2148,6 +2474,7 @@ fn stop_postmaster(pid: u32, data_dir: &Path) -> Result<(), String> {
 }
 
 /// The executable `pid` runs, where this process can read it.
+#[cfg(unix)]
 fn executable_of(pid: u32) -> Option<PathBuf> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let pid = Pid::from_u32(pid);
@@ -2162,9 +2489,8 @@ fn executable_of(pid: u32) -> Option<PathBuf> {
 
 /// `pg_ctl stop -m immediate` on `data_dir`. Bounded twice: `pg_ctl --timeout`
 /// gives up on a server that will not stop, and the wrapper kills a `pg_ctl`
-/// that will not return. `Ok` when `pg_ctl` reports the server stopped. The
-/// exit-time teardown stops this process's own cluster with it, and the sweep a
-/// dead root's ([`stop_postmaster`]).
+/// that will not return. `Ok` when `pg_ctl` reports the server stopped.
+#[cfg(unix)]
 fn stop_immediately(pg_ctl: &Path, data_dir: &Path) -> Result<(), String> {
     let mut command = crate::process_helpers::no_window(pg_ctl);
     command
@@ -2197,9 +2523,10 @@ fn stop_immediately(pg_ctl: &Path, data_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Kill `pid` outright and wait for it to go. Only ever applied to a postmaster
-/// whose data directory is being thrown away, and that a stop could not end;
-/// its workers exit when it does.
+/// Kill `pid` outright, by pid, and wait for it to go. Only ever applied to a
+/// postmaster whose data directory is being thrown away, and that a stop could
+/// not end; its workers exit when it does.
+#[cfg(unix)]
 fn kill_and_wait(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessesToUpdate, System};
     let target = Pid::from_u32(pid);
@@ -2214,6 +2541,8 @@ fn kill_and_wait(pid: u32) -> bool {
     )
 }
 
+/// Whether `done` holds within `limit`, polled every 100 ms.
+#[cfg(any(unix, test))]
 fn wait_for(mut done: impl FnMut() -> bool, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
     loop {
@@ -2421,7 +2750,6 @@ struct Teardown {
 }
 
 struct ClusterTeardown {
-    pg_ctl: PathBuf,
     data_dir: PathBuf,
     root: PathBuf,
     postmaster_pid: Option<u32>,
@@ -2501,34 +2829,24 @@ impl Teardown {
 
 impl ClusterTeardown {
     fn run(&self) -> String {
-        let stopped = if self.data_dir.join(POSTMASTER_PID).exists() {
-            match stop_immediately(&self.pg_ctl, &self.data_dir) {
-                Ok(()) => "cluster stopped".to_string(),
-                Err(e) => e,
-            }
-        } else {
+        // This process's postmaster is ended as the sweep ends a dead root's
+        // ([`end_postmaster`]): proven to work in this data directory, then
+        // signalled through a pidfd on Linux, or terminated through a process
+        // handle on Windows, each held from before the proof until the process
+        // is gone. A postmaster that died early and whose pid another process
+        // has taken since is therefore never signalled there. On other Unix the
+        // proof and the signal each name the pid, and that window remains.
+        let ended = end_postmasters(&self.data_dir, self.postmaster_pid);
+        let stopped = if ended.is_empty() {
             "no cluster was running".to_string()
+        } else {
+            ended.join("; ")
         };
-        // A postmaster `pg_ctl` could not stop is killed outright.
-        let killed = self
-            .postmaster_pid
-            .filter(|pid| {
-                crate::runner_breadcrumb::pid_is_live(*pid)
-                    && is_postmaster_of(*pid, &self.data_dir)
-            })
-            .map(|pid| {
-                if kill_and_wait(pid) {
-                    format!("; postmaster {pid} killed")
-                } else {
-                    format!("; postmaster {pid} would not die")
-                }
-            })
-            .unwrap_or_default();
         let removed = match remove_dir_all_retrying(&self.root) {
             Ok(()) => format!("root {} removed", self.root.display()),
             Err(e) => format!("root {} NOT removed: {e}", self.root.display()),
         };
-        format!("{stopped}{killed}; {removed}")
+        format!("{stopped}; {removed}")
     }
 }
 
@@ -3938,5 +4256,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A pidfd sees the process it holds exit, and signals nothing once that
+    /// process is gone: `ESRCH`, where a signal by pid would reach whatever
+    /// process holds the pid by then. No test can make the kernel hand that pid
+    /// to another process on demand, so this shows the held signal failing, not
+    /// a later process being spared.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pidfd_sees_its_process_exit_and_signals_nothing_after() {
+        /// Kills the sleeping child if the test ends before it is reaped.
+        struct Sleeping(std::process::Child);
+        impl Drop for Sleeping {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Sleeping(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let held = Pidfd::open(child.0.id()).expect("hold the child with a pidfd");
+        assert!(
+            !held.exits_within(Duration::from_millis(200)),
+            "a sleeping process has not exited"
+        );
+        held.signal(libc::SIGTERM)
+            .expect("signal the held child through its pidfd");
+        assert!(
+            held.exits_within(Duration::from_secs(10)),
+            "the held child did not exit after SIGTERM"
+        );
+        let _ = child.0.wait();
+        let refused = held
+            .signal(libc::SIGTERM)
+            .expect_err("a process that is gone is not signalled");
+        assert_eq!(refused.raw_os_error(), Some(libc::ESRCH), "{refused}");
     }
 }
