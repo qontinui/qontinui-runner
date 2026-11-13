@@ -1734,6 +1734,20 @@ export function useTerminalInitialization({
       removedPages.current.add(pageId);
       const held = drainHeldPages.current.delete(pageId);
       const complete = restoreCompletePages.current.delete(pageId);
+      // A page can come back ("default" through reconcile, an explicit id
+      // through `openPage`). Release its once-per-page guard so it restores
+      // again when it is next shown — as a deferred page already does — or it
+      // would never re-enter `restoreCompletePages`, and its auto-save gate
+      // (which reads that set) would stay closed for the window's life. The run
+      // is a MERGING one (`drainDeferredPages`, like a drain re-run), so it
+      // never re-lays the page out, and it cannot double-restore a session that
+      // is already live: reconnected PTYs are reattached, not recreated
+      // (`reconnectToExistingSessions`), a record whose session a live tab
+      // already shows is skipped on a merging run (the `isDrainRerun &&
+      // liveTabsRef` check in the cold-restore loop), and a session another
+      // run is already creating a tab for is skipped by `coldResumeGuard`.
+      didInitPages.current.delete(pageId);
+      drainDeferredPages.current.add(pageId);
       if (held || complete) publishRestorePages();
     };
     window.addEventListener(TERMINAL_PAGE_REMOVED_EVENT, onRemoved);

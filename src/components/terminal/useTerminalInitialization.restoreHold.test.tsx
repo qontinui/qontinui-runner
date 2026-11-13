@@ -48,7 +48,11 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { useZoneLayout, zoneLayoutStorageKey } from "./useZoneLayout";
 import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
 import { useTerminalInitialization } from "./useTerminalInitialization";
-import { PAGES_STORAGE_KEY, TERMINAL_PAGE_REMOVED_EVENT } from "./useTerminalPages";
+import {
+  PAGES_STORAGE_KEY,
+  TERMINAL_PAGE_REMOVED_EVENT,
+  useTerminalPages,
+} from "./useTerminalPages";
 
 const PAGE = "hold-test";
 const NOOP = () => {};
@@ -92,7 +96,15 @@ const reconnect = async () => {
   return reconnectIndeterminate ? null : [];
 };
 
-function Page({ value, pageId = PAGE }: { value: ScopeValue; pageId?: string }) {
+function Page({
+  value,
+  pageId = PAGE,
+  persistence = PERSISTENCE,
+}: {
+  value: ScopeValue;
+  pageId?: string;
+  persistence?: typeof PERSISTENCE;
+}) {
   useTerminalInitialization({
     pageId,
     authenticated: true,
@@ -106,7 +118,7 @@ function Page({ value, pageId = PAGE }: { value: ScopeValue; pageId?: string }) 
     updateTab: NOOP,
     zoneLayout: value.zone,
     labelsAndTags: value.labels,
-    sessionPersistence: PERSISTENCE,
+    sessionPersistence: persistence,
     layoutState: LAYOUT_STATE,
   } as never);
   return null;
@@ -190,6 +202,69 @@ function TwoPages({
   );
 }
 
+/** One stable register callback per page id, made on first use. */
+function stableRegister(
+  registers: Map<string, (v: ScopeValue) => void>,
+  id: string,
+  setValues: (update: (p: Record<string, ScopeValue>) => Record<string, ScopeValue>) => void,
+): (v: ScopeValue) => void {
+  let r = registers.get(id);
+  if (!r) {
+    r = (v: ScopeValue) => setValues((p) => ({ ...p, [id]: v }));
+    registers.set(id, r);
+  }
+  return r;
+}
+
+/** The api box a page's scope publishes into, made on first use. */
+function scopeApi(
+  scopes: Record<string, { current: Api | null }>,
+  id: string,
+): { current: Api | null } {
+  scopes[id] ??= { current: null };
+  return scopes[id];
+}
+
+/**
+ * The page roster from the real `useTerminalPages`, one scope per page in it,
+ * and one restore hook following the active page — the provider's wiring, so a
+ * page is removed and re-added through the hook's own `removePage`/`openPage`.
+ */
+function WithPages({
+  onPages,
+  scopeFor,
+  saves,
+}: {
+  onPages: (pages: ReturnType<typeof useTerminalPages>) => void;
+  scopeFor: (id: string) => { current: Api | null };
+  saves: string[];
+}) {
+  const pages = useTerminalPages();
+  useEffect(() => {
+    onPages(pages);
+  });
+  const [values, setValues] = useState<Record<string, ScopeValue>>({});
+  const registers = useMemo(() => new Map<string, (v: ScopeValue) => void>(), []);
+  const registerFor = (id: string) => stableRegister(registers, id, setValues);
+  const active = pages.activePageId;
+  // One persistence per active page, recording which page each save is for.
+  const persistence = useMemo(
+    () => ({ ...PERSISTENCE, saveSessionLayout: () => void saves.push(active) }),
+    [active, saves],
+  );
+  // The restore hook stays mounted across the switch, as TerminalPage's does:
+  // a page with no scope yet borrows another's for the instant it lasts.
+  const value = values[active] ?? Object.values(values)[0];
+  return (
+    <>
+      {pages.allPages.map((p) => (
+        <Scope key={p.id} pageId={p.id} register={registerFor(p.id)} api={scopeFor(p.id)} />
+      ))}
+      {value ? <Page value={value} pageId={active} persistence={persistence} /> : null}
+    </>
+  );
+}
+
 const ROOM = { setup: 20_000 };
 
 async function until(what: string, ready: () => boolean): Promise<void> {
@@ -239,7 +314,7 @@ beforeEach(() => {
 afterEach(async () => {
   root.unmount();
   vi.restoreAllMocks();
-  instanceStorage.removeItem?.(zoneLayoutStorageKey(PAGE, "main"));
+  instanceStorage.removeItem(zoneLayoutStorageKey(PAGE, "main"));
   await settle(20);
 });
 
@@ -593,7 +668,56 @@ describe("restore runs and the trim hold", () => {
         reports.slice(reportsBefore).some((r) => r.deferred.includes(PAGE)),
       );
     } finally {
-      instanceStorage.removeItem?.(PAGES_STORAGE_KEY);
+      instanceStorage.removeItem(PAGES_STORAGE_KEY);
+    }
+  }, 30_000);
+  // A page whose restore COMPLETED, then removed and re-added through the
+  // page hook's own doors, restores again: it is reported complete again and
+  // its auto-save (gated on that set) resumes.
+  it("restores a completed page again after it is removed and re-added", async () => {
+    const reports = captureProgress();
+    const inner = fake.invoke;
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_session_list_open") {
+        await settle(5);
+        return { success: true, data: { sessions: [], deferredByDrain: null } };
+      }
+      return inner(cmd, args);
+    };
+    const OTHER = "other-page";
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      { id: OTHER, name: "Page 1", createdAt: 1 },
+      { id: PAGE, name: "Page 2", createdAt: 2 },
+    ]);
+    instanceStorage.setItem("qontinui-terminal-active-page", PAGE);
+    const pagesRef: { current: ReturnType<typeof useTerminalPages> | null } = { current: null };
+    const scopes: Record<string, { current: Api | null }> = {};
+
+    const saves: string[] = [];
+    try {
+      root = createRoot(document.createElement("div"));
+      root.render(
+        <WithPages
+          onPages={(p) => (pagesRef.current = p)}
+          scopeFor={(id) => scopeApi(scopes, id)}
+          saves={saves}
+        />,
+      );
+      const completeNow = () => reports.at(-1)?.complete.includes(PAGE) === true;
+      await until("the page's restore to complete", completeNow);
+      await pagesRef.current?.removePage(PAGE);
+      await until("the removal reported", () => !completeNow());
+      await until("another page active", () => pagesRef.current?.activePageId !== PAGE);
+
+      pagesRef.current?.openPage(PAGE, "Page 2");
+      await until("the re-added page complete again", completeNow);
+      await until("the re-added page's scope", () => scopes[PAGE]?.current != null);
+      const savesBefore = saves.length;
+      await scopes[PAGE].current?.createTerminal();
+      await until("auto-save for the re-added page", () => saves.slice(savesBefore).includes(PAGE));
+    } finally {
+      instanceStorage.removeItem(PAGES_STORAGE_KEY);
+      instanceStorage.removeItem("qontinui-terminal-active-page");
     }
   }, 30_000);
 });

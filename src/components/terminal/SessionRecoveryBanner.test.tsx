@@ -11,13 +11,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import {
-  fidelityLabel,
-  isLossy,
-  isDegraded,
-  claimLabel,
-  wipLabel,
-} from "./SessionRecoveryBanner";
+import { fidelityLabel, isLossy, isDegraded, claimLabel, wipLabel } from "./SessionRecoveryBanner";
 import type { SessionRecoveryOutcome } from "@/hooks/useSessionRecovery";
 
 function outcome(over: Partial<SessionRecoveryOutcome>): SessionRecoveryOutcome {

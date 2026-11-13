@@ -110,9 +110,7 @@ describe("formatBannerText", () => {
         secondsLabel: "10s",
         waiterCount: 2,
       }),
-    ).toBe(
-      "Session alpha is waiting on src/foo.rs (waiting 10s; +1 more waiter)",
-    );
+    ).toBe("Session alpha is waiting on src/foo.rs (waiting 10s; +1 more waiter)");
   });
 
   it("plural form with 'N more waiters' when waiterCount > 2", () => {
@@ -123,9 +121,7 @@ describe("formatBannerText", () => {
         secondsLabel: "10s",
         waiterCount: 4,
       }),
-    ).toBe(
-      "Session alpha is waiting on src/foo.rs (waiting 10s; +3 more waiters)",
-    );
+    ).toBe("Session alpha is waiting on src/foo.rs (waiting 10s; +3 more waiters)");
   });
 
   it("singular form when waiterCount === 0 (defensive — caller gates this case)", () => {
@@ -361,10 +357,13 @@ describe("yield POST dispatch", () => {
 
   it("posts to /file-locks/yield with the right body + JSON content-type", async () => {
     const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(JSON.stringify({ released: true, file_path: "src/foo.rs", task_run_id: "tab-A" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({ released: true, file_path: "src/foo.rs", task_run_id: "tab-A" }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
     );
     await simulateYieldClick({
       taskRunId: "tab-A",
@@ -385,9 +384,7 @@ describe("yield POST dispatch", () => {
 
   it("uses the dynamic port from getApiPort()", async () => {
     mockGetApiPort.mockReturnValue(12345);
-    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("{}", { status: 200 }),
-    );
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}", { status: 200 }));
     await simulateYieldClick({
       taskRunId: "tab-A",
       filePath: "src/foo.rs",
@@ -463,9 +460,7 @@ describe("formatIncomingRequestText", () => {
         totalRequests: 2,
         secondsLabel: "5s",
       }),
-    ).toBe(
-      "Session alpha has asked you to yield on src/foo.rs (5s ago); +1 more request",
-    );
+    ).toBe("Session alpha has asked you to yield on src/foo.rs (5s ago); +1 more request");
   });
 
   it("'+N more requests' for totalRequests > 2", () => {
@@ -475,9 +470,7 @@ describe("formatIncomingRequestText", () => {
         totalRequests: 4,
         secondsLabel: "5s",
       }),
-    ).toBe(
-      "Session alpha has asked you to yield on src/foo.rs (5s ago); +3 more requests",
-    );
+    ).toBe("Session alpha has asked you to yield on src/foo.rs (5s ago); +3 more requests");
   });
 
   it("uses the OLDEST request's filePath + requesterName, not an arbitrary one", () => {
@@ -627,8 +620,7 @@ describe("'I'll be a while' button (Phase 3 — enabled)", () => {
   it("tooltip uses the plain stuck-session heartbeat wording", () => {
     // Pin the static title attribute baked into HoldingLockBanner.tsx
     // post-Phase 3. If the JSX tooltip drifts, this assertion flags it.
-    const expectedTitle =
-      "Signal to the waiter that you'll be busy with this lock for a while.";
+    const expectedTitle = "Signal to the waiter that you'll be busy with this lock for a while.";
     expect(expectedTitle).toContain("Signal to the waiter");
     expect(expectedTitle).toContain("for a while");
     expect(expectedTitle).not.toContain("Open Q6");
@@ -659,19 +651,16 @@ interface SignalLongWaitClickArgs {
 async function simulateSignalLongWaitClick(args: SignalLongWaitClickArgs): Promise<Response> {
   // Mirror the component's actual call. Any deviation here will silently
   // skip a regression — keep this in lockstep with HoldingLockBanner.tsx.
-  return args.fetchImpl(
-    `http://127.0.0.1:${mockGetApiPort()}/file-locks/signal-long-wait`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        file_path: args.filePath,
-        holder_task_run_id: args.taskRunId,
-        holder_name: args.taskRunName,
-        estimated_remaining_ms: null,
-      }),
-    },
-  );
+  return args.fetchImpl(`http://127.0.0.1:${mockGetApiPort()}/file-locks/signal-long-wait`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      file_path: args.filePath,
+      holder_task_run_id: args.taskRunId,
+      holder_name: args.taskRunName,
+      estimated_remaining_ms: null,
+    }),
+  });
 }
 
 describe("signal-long-wait POST dispatch", () => {
@@ -701,9 +690,7 @@ describe("signal-long-wait POST dispatch", () => {
     expect(url).toBe("http://127.0.0.1:9876/file-locks/signal-long-wait");
     expect(init).toBeDefined();
     expect(init!.method).toBe("POST");
-    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe(
-      "application/json",
-    );
+    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
     // EXACT body shape — must match the Phase 3 Rust handler's
     // SignalLongWaitRequest deserializer.
     expect(JSON.parse(init!.body as string)).toEqual({
@@ -716,18 +703,14 @@ describe("signal-long-wait POST dispatch", () => {
 
   it("uses the dynamic port from getApiPort()", async () => {
     mockGetApiPort.mockReturnValue(12345);
-    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("{}", { status: 200 }),
-    );
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}", { status: 200 }));
     await simulateSignalLongWaitClick({
       taskRunId: "tab-B",
       taskRunName: "bravo",
       filePath: "src/foo.rs",
       fetchImpl: fetchSpy,
     });
-    expect(fetchSpy.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:12345/file-locks/signal-long-wait",
-    );
+    expect(fetchSpy.mock.calls[0][0]).toBe("http://127.0.0.1:12345/file-locks/signal-long-wait");
   });
 });
 
@@ -754,9 +737,7 @@ describe("signal-long-wait cooldown lifecycle", () => {
   const inSignalCooldown = (cooldownUntilMs: number, nowMs: number): boolean =>
     nowMs < cooldownUntilMs;
   const signalCooldownLeft = (cooldownUntilMs: number, nowMs: number): number =>
-    inSignalCooldown(cooldownUntilMs, nowMs)
-      ? Math.ceil((cooldownUntilMs - nowMs) / 1000)
-      : 0;
+    inSignalCooldown(cooldownUntilMs, nowMs) ? Math.ceil((cooldownUntilMs - nowMs) / 1000) : 0;
 
   it("button enters cooldown for 30s after click and re-enables after", async () => {
     const { SIGNAL_LONG_WAIT_COOLDOWN_MS } = await import("./HoldingLockBanner");

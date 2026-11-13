@@ -222,6 +222,34 @@ describe("removePage announces the removal", () => {
     expect(seen).toEqual(["p2"]);
   });
 
+  it("announces both pages when two are removed in the same tick", async () => {
+    seed([
+      { id: "p1", name: "Page 1", createdAt: 1 },
+      { id: "p2", name: "Page 2", createdAt: 2 },
+      { id: "p3", name: "Page 3", createdAt: 3 },
+    ]);
+    const { hook } = mount();
+    await act(async () => {
+      await Promise.all([hook().removePage("p2"), hook().removePage("p3")]);
+    });
+    expect(persisted().map((p) => p.id)).toEqual(["p1"]);
+    expect([...seen].sort()).toEqual(["p2", "p3"]);
+  });
+
+  it("announces nothing on mount, rename or reorder", async () => {
+    seed([
+      { id: "p1", name: "Page 1", createdAt: 1 },
+      { id: "p2", name: "Page 2", createdAt: 2 },
+    ]);
+    const { hook } = mount();
+    act(() => void hook().renamePage("p2", "renamed"));
+    act(() => hook().reorderPage("p2", "p1"));
+    await act(async () => {});
+    expect(persisted().map((p) => p.id)).toEqual(["p2", "p1"]);
+    expect(persisted()[0].name).toBe("renamed");
+    expect(seen).toEqual([]);
+  });
+
   it("does not announce the last page, which is never removed", async () => {
     seed([{ id: "p1", name: "Page 1", createdAt: 1 }]);
     const { hook } = mount();

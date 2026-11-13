@@ -200,8 +200,7 @@ describe("disabled state — unresolved holder", () => {
 
   it("uses the guidance tooltip when no holder can be resolved", () => {
     // Mirror the static title attribute the JSX bakes in.
-    const expected =
-      "Can't identify the holder session — try from your tab's waiting indicator";
+    const expected = "Can't identify the holder session — try from your tab's waiting indicator";
     expect(expected).toContain("Can't identify the holder session");
   });
 });
@@ -220,19 +219,16 @@ interface RequestYieldClickArgs {
 }
 
 async function simulateRequestYieldClick(args: RequestYieldClickArgs): Promise<Response> {
-  return args.fetchImpl(
-    `http://127.0.0.1:${mockGetApiPort()}/file-locks/yield-request`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        file_path: args.filePath,
-        requester_task_run_id: args.taskRunId,
-        requester_name: args.taskRunName,
-        holder_task_run_id: args.blockerTaskRunId,
-      }),
-    },
-  );
+  return args.fetchImpl(`http://127.0.0.1:${mockGetApiPort()}/file-locks/yield-request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      file_path: args.filePath,
+      requester_task_run_id: args.taskRunId,
+      requester_name: args.taskRunName,
+      holder_task_run_id: args.blockerTaskRunId,
+    }),
+  });
 }
 
 describe("yield-request POST dispatch", () => {
@@ -263,9 +259,7 @@ describe("yield-request POST dispatch", () => {
     expect(url).toBe("http://127.0.0.1:9876/file-locks/yield-request");
     expect(init).toBeDefined();
     expect(init!.method).toBe("POST");
-    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe(
-      "application/json",
-    );
+    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
     // EXACT body shape — must match the Phase 1 Rust handler's
     // YieldRequestRequest deserializer. Any drift breaks the wire
     // contract.
@@ -279,9 +273,7 @@ describe("yield-request POST dispatch", () => {
 
   it("uses the dynamic port from getApiPort()", async () => {
     mockGetApiPort.mockReturnValue(12345);
-    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("{}", { status: 200 }),
-    );
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}", { status: 200 }));
     await simulateRequestYieldClick({
       taskRunId: "tab-A",
       taskRunName: "alpha",
@@ -289,9 +281,7 @@ describe("yield-request POST dispatch", () => {
       blockerTaskRunId: "tab-B",
       fetchImpl: fetchSpy,
     });
-    expect(fetchSpy.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:12345/file-locks/yield-request",
-    );
+    expect(fetchSpy.mock.calls[0][0]).toBe("http://127.0.0.1:12345/file-locks/yield-request");
   });
 });
 
@@ -365,9 +355,7 @@ describe("long-wait advisory line — render predicate", () => {
       holderName: "bravo",
       signaledAtMs: 1_700_000_000_000,
     });
-    expect(rendered).toBe(
-      "bravo says they'll be a while. Request yield or cancel?",
-    );
+    expect(rendered).toBe("bravo says they'll be a while. Request yield or cancel?");
     // Estimate tail must NOT be present when `estimatedRemainingMs` is omitted.
     expect(rendered).not.toMatch(/\(~/);
   });
@@ -378,9 +366,7 @@ describe("long-wait advisory line — render predicate", () => {
       estimatedRemainingMs: 300_000,
       signaledAtMs: 1_700_000_000_000,
     });
-    expect(rendered).toBe(
-      "bravo says they'll be a while. Request yield or cancel? (~5m)",
-    );
+    expect(rendered).toBe("bravo says they'll be a while. Request yield or cancel? (~5m)");
   });
 
   it("uses seconds rounding for sub-minute estimates", () => {
