@@ -1922,7 +1922,12 @@ impl TerminalSession {
         // PATH + set the loopback port/mode so an agent that types `npm install …`
         // is transparently declared/observed. Fail-open: any materialize failure
         // injects nothing.
-        Self::apply_install_intercept_env(&mut cmd, &id, seam.identity_dir.as_deref());
+        Self::apply_install_intercept_env(
+            &mut cmd,
+            &id,
+            seam.identity_dir.as_deref(),
+            &std::env::temp_dir(),
+        );
 
         // The LAST env mutations before the spawn — account pin, then the
         // credential scrub. Extracted so the ordering is unit-testable; see the
@@ -3323,23 +3328,27 @@ impl TerminalSession {
     /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`
     /// Phase 2 this seam re-read the runner's PATH and silently DROPPED the
     /// identity prepend whenever interception was on.
+    ///
+    /// `base_dir` is where the per-terminal shim dir is materialized (and stale
+    /// ones swept): production passes `std::env::temp_dir()`, a test its own
+    /// fixture dir so it never has to repoint the process's temp dir.
     fn apply_install_intercept_env(
         cmd: &mut CommandBuilder,
         terminal_id: &str,
         identity_dir: Option<&std::path::Path>,
+        base_dir: &std::path::Path,
     ) {
         use crate::install_effects_producer::intercept::shim_materializer;
 
         if !shim_materializer::intercept_enabled() {
             return; // ships dark — byte-identical child env
         }
-        let base_dir = std::env::temp_dir();
         let port = crate::install_effects_producer::intercept::bound_port();
         // The MODE the terminal gets is resolved from the runner's OWN env
         // (`QONTINUI_INSTALL_INTERCEPT_MODE`; default observe, `gate` enables
         // Phase-3 gating, anything else fails open to observe — plan §3 step 3).
         let mode = shim_materializer::resolve_mode();
-        let seam = match shim_materializer::materialize(&base_dir, terminal_id, port, mode) {
+        let seam = match shim_materializer::materialize(base_dir, terminal_id, port, mode) {
             Some(s) => s,
             None => return, // fail-open: couldn't write shims ⇒ inject nothing
         };
@@ -7412,19 +7421,21 @@ pub(crate) mod tests {
     #[test]
     fn install_intercept_seam_keeps_the_appended_toolchain_dirs() {
         use crate::install_effects_producer::intercept::shim_materializer::ENABLE_FLAG;
-        // TMPDIR (TMP/TEMP on Windows) at the fixture, so the shim materializer
-        // writes — and sweeps — there, never in the box's shared temp dir.
-        let (amb, _restore, cargo_bin) = toolchain_fixture(&[ENABLE_FLAG, "TMPDIR", "TMP", "TEMP"]);
-        let tmp = amb.dir().join("tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
-        for key in ["TMPDIR", "TMP", "TEMP"] {
-            std::env::set_var(key, &tmp);
-        }
+        let (amb, _restore, cargo_bin) = toolchain_fixture(&[ENABLE_FLAG]);
         std::env::set_var(ENABLE_FLAG, "1");
+        // The shim materializer writes — and sweeps — in the fixture, never in
+        // the box's shared temp dir.
+        let shim_base = amb.dir().join("tmp");
+        std::fs::create_dir_all(&shim_base).unwrap();
 
         let identity = amb.dir().join("qontinui-identity-armtest");
         let mut cmd = CommandBuilder::new("dummy");
-        TerminalSession::apply_install_intercept_env(&mut cmd, "term-toolchain", Some(&identity));
+        TerminalSession::apply_install_intercept_env(
+            &mut cmd,
+            "term-toolchain",
+            Some(&identity),
+            &shim_base,
+        );
         let got = child_path_entries(&cmd);
         assert_eq!(
             got.first().map(String::as_str),

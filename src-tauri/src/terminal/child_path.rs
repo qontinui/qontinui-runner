@@ -37,6 +37,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -55,14 +56,20 @@ const BEGIN_SENTINEL: &str = "__QONTINUI_CHILD_PATH_BEGIN__";
 const END_SENTINEL: &str = "__QONTINUI_CHILD_PATH_END__";
 
 /// The `-c` script: `$PATH` between sentinels, so whatever a profile prints
-/// (a motd, a version banner) is ignored rather than parsed.
+/// (a motd, a version banner) is ignored rather than parsed. `printenv`
+/// rather than `"$PATH"`, because fish joins a quoted list with spaces; the
+/// exported variable is `:`-joined in sh, bash, zsh and fish alike.
 fn login_shell_script() -> String {
-    format!("printf '%s%s%s\\n' '{BEGIN_SENTINEL}' \"$PATH\" '{END_SENTINEL}'")
+    format!("echo {BEGIN_SENTINEL}; printenv PATH; echo {END_SENTINEL}")
 }
 
 /// The login-shell read's result for this process: unset while pending,
 /// `Some(dirs)` once it answered, `None` when it failed or timed out.
 static LOGIN_SHELL_DIRS: OnceLock<Option<Vec<PathBuf>>> = OnceLock::new();
+
+/// Set once [`start_login_shell_read`] has run in this process, so "never
+/// started" is not reported as "pending".
+static READ_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Where the login-shell read stands — named in the config report so a reader
 /// knows which source the appended dirs came from.
@@ -70,7 +77,10 @@ static LOGIN_SHELL_DIRS: OnceLock<Option<Vec<PathBuf>>> = OnceLock::new();
 pub(crate) enum LoginShellRead {
     /// [`SHELL_READ_ENV`] is `0`, or this platform has no read.
     Disabled,
-    /// Started (or not yet started) and not answered.
+    /// [`start_login_shell_read`] never ran in this process (it runs from
+    /// `main`), so no answer is coming.
+    NotStarted,
+    /// Started and not answered yet.
     Pending,
     /// Answered; its dirs are part of the appended set.
     Answered,
@@ -88,6 +98,7 @@ pub(crate) fn login_shell_read_state() -> LoginShellRead {
         return LoginShellRead::Disabled;
     }
     match LOGIN_SHELL_DIRS.get() {
+        None if !READ_STARTED.load(Ordering::Acquire) => LoginShellRead::NotStarted,
         None => LoginShellRead::Pending,
         Some(Some(_)) => LoginShellRead::Answered,
         Some(None) => LoginShellRead::Failed,
@@ -100,7 +111,7 @@ pub(crate) fn login_shell_read_state() -> LoginShellRead {
 /// Does nothing when [`SHELL_READ_ENV`] is `0`, on a non-Unix platform, or when
 /// `$SHELL` is unset or not absolute — the fallback dirs then stand alone.
 pub(crate) fn start_login_shell_read() {
-    if !shell_read_enabled() || LOGIN_SHELL_DIRS.get().is_some() {
+    if !shell_read_enabled() || READ_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
     let Some(shell) = std::env::var_os("SHELL")
@@ -149,6 +160,9 @@ fn read_login_shell_dirs(shell: &Path, script: &str, timeout: Duration) -> Optio
 
     let mut cmd = crate::process_helpers::no_window(shell);
     cmd.arg("-l").arg("-c").arg(script);
+    // The user's profile runs here: strip the credential values every other
+    // child seam strips (PATH, HOME and SHELL are untouched).
+    crate::terminal::scrub_credential_env_std(&mut cmd);
     // `run_with_timeout` nulls stdin, pipes both streams, arms a process group
     // before the spawn and kills it on expiry.
     match run_with_timeout(cmd, timeout) {
@@ -170,7 +184,7 @@ fn parse_sentinel_path(stdout: &str) -> Option<Vec<PathBuf>> {
     let (_, after_begin) = stdout.split_once(BEGIN_SENTINEL)?;
     let (path, _) = after_begin.split_once(END_SENTINEL)?;
     let sep = if cfg!(windows) { ';' } else { ':' };
-    Some(keep_usable(path.split(sep).map(PathBuf::from)))
+    Some(keep_usable(path.trim().split(sep).map(PathBuf::from)))
 }
 
 /// Absolute, existing, non-shim directories, first spelling kept.
@@ -230,9 +244,19 @@ fn toolchain_dirs() -> Vec<PathBuf> {
     } else {
         None
     };
+    // Windows normally sets no HOME; the user's home is USERPROFILE there.
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("USERPROFILE")
+            } else {
+                None
+            }
+        });
     toolchain_dirs_from(
         shell_dirs,
-        std::env::var_os("HOME").as_deref(),
+        home.as_deref(),
         std::env::var_os("CARGO_HOME").as_deref(),
     )
 }
@@ -582,6 +606,12 @@ mod tests {
     fn shell_read_off_reports_disabled() {
         let amb = crate::test_env::isolated_ambient();
         let _env = crate::test_env::EnvVarRestore::capture(&[SHELL_READ_ENV]);
+        // A test process never runs `main`, so the read was never started —
+        // reported as such, not as pending.
+        std::env::remove_var(SHELL_READ_ENV);
+        if cfg!(unix) {
+            assert_eq!(login_shell_read_state(), LoginShellRead::NotStarted);
+        }
         std::env::set_var(SHELL_READ_ENV, "0");
         assert_eq!(login_shell_read_state(), LoginShellRead::Disabled);
         // And the cached result (if any) is ignored: only the fallback counts.
