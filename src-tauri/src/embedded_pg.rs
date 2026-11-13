@@ -91,11 +91,13 @@ use std::time::Duration;
 /// runs against: one bundled cluster per test process, booted from a cached
 /// ready data directory, with a fresh database per test. See the module doc.
 ///
-/// A child of this module so it reuses [`bootstrap`], the schema transform and
-/// the port picker without widening them, and compiled outside `cfg(test)` so
-/// one harness serves the lib's tests, the bin's tests and `tests/*.rs` alike
-/// (a `cfg(test)` module compiles into one crate's test binary only). Hidden:
-/// it is test infrastructure, not part of the runner's product surface.
+/// A child of this module so it reuses the schema rendering and transform, the
+/// port picker and the `postmaster.pid` name without widening them — it builds
+/// and starts its clusters itself, not through [`bootstrap`] — and compiled
+/// outside `cfg(test)` so one harness serves the lib's tests, the bin's tests
+/// and `tests/*.rs` alike (a `cfg(test)` module compiles into one crate's test
+/// binary only). Hidden: it is test infrastructure, not part of the runner's
+/// product surface.
 #[doc(hidden)]
 pub mod test_harness;
 
