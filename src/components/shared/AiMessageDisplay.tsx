@@ -10,7 +10,6 @@
  * - Renders markdown content with MarkdownViewer
  * - Supports multiple display modes (log style vs chat bubbles)
  * - Shows findings summary when findings are detected
- * - Displays orchestrator agent messages with distinct styling
  */
 
 import React, { memo, useMemo, useState, useCallback } from "react";
