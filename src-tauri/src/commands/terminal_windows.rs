@@ -123,6 +123,9 @@ fn build_pop_out_webview(
     let api_port = crate::mcp::types::get_mcp_api_port();
     builder = builder.initialization_script(format!("window.__QONTINUI_PORT__ = {};", api_port));
 
+    // A label can be reused after its window closed (`next_popout_label`):
+    // accept the new window's restore-progress reports.
+    crate::session::awaiting_restore::reopen_page_restore_progress(label);
     let window = builder
         .build()
         .map_err(|e| format!("Failed to build pop-out window {}: {}", label, e))?;

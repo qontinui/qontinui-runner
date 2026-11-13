@@ -2260,9 +2260,11 @@ pub async fn session_ledger_report(
 ///
 /// It trusts the local webview, its only caller, for WHICH pages it names, and
 /// bounds only the shape ([`PageRestoreProgress::from_report`]: an oversized
-/// report is recorded as unreadable). A report from a window that is no longer
-/// open (one queued before a `destroy()`) is dropped, so it cannot re-pin a
-/// closed window's deferrals.
+/// report is recorded as unreadable). A report from a closed window is refused:
+/// the registry tombstones a window's label when it is forgotten, under the
+/// same lock, until a window with that label is built again — `destroy()` is
+/// asynchronous, so the closing webview may still report after the forget.
+/// A label with no live window at all is dropped here before reaching it.
 ///
 /// [`PageRestoreProgress::from_report`]: crate::session::awaiting_restore::PageRestoreProgress::from_report
 #[tauri::command]
