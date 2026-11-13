@@ -508,12 +508,16 @@ def run(args) -> int:
         time.sleep(2 * POLL_TICK_S + 10)
         summary["reading_after_restart"] = reading(r, log, "after_restart")
 
-        # 3. Closes. UI tab close (explicit) for panes on the active page.
-        for k in UI_CLOSE:
+        # 3. Closes. The tab close button exists only for panes on the ACTIVE
+        # page, which is whichever page the webview had open before the
+        # restart, so the UI-closed pair is picked from the panes that have one.
+        ui_close, delete_close = pick_closes(r, names, log)
+        summary["closes"] = {"ui": ui_close, "delete": delete_close}
+        for k in ui_close:
             s, v = click(r, f"terminal.close-session-{names[k]['terminal_id']}")
             log.rec("close.ui", key=k, status=s, body=v)
             time.sleep(2)
-        for k in DELETE_CLOSE + [RESPAWN]:
+        for k in delete_close + [RESPAWN]:
             s, v = r.delete(f"/terminals/{names[k]['terminal_id']}")
             log.rec("close.delete", key=k, status=s, body=v)
         time.sleep(POLL_TICK_S + 10)
@@ -539,6 +543,7 @@ def run(args) -> int:
         first = reading(r, log, "final")
         summary["reading_final"] = first
 
+        snapshot_instance(r, out / f"{args.label}-{stamp}-instance" / "before-prune", log)
         # Prune: re-seed with every closed row's closedAt past retention, then a tick.
         pruned = prune_closed(r, log)
         summary["prune"] = pruned
@@ -546,6 +551,7 @@ def run(args) -> int:
         second = reading(r, log, "after_prune")
         summary["reading_after_prune"] = second
         summary["store_after_prune"] = store_closed_ids(r)
+        snapshot_instance(r, out / f"{args.label}-{stamp}-instance" / "after-prune", log)
 
         evaluate(summary, names, first, second, have_fixture)
         return 0
@@ -575,26 +581,59 @@ def stub_pid_for(session_id: str):
     return None
 
 
-def open_page(r: Runner, page_id: str, log: Log) -> bool:
-    """Click the page's tab. Tabs carry no UI Bridge id, so find the button by text."""
+def element_ids(r: Runner) -> list[str]:
     r.post("/ui-bridge/control/discover", {})
     s, v = r.get("/ui-bridge/control/elements", timeout=30)
     els = data_of(v)
     els = els.get("elements", els) if isinstance(els, dict) else els
-    cands = []
-    for e in els or []:
-        if not isinstance(e, dict):
-            continue
-        text = ((e.get("state") or {}).get("textContent") or e.get("label") or e.get("text") or "")
-        if page_id in text and len(text) < 80:
-            cands.append(e.get("id"))
-    log.rec("page.candidates", page=page_id, candidates=cands)
+    return [e.get("id", "") for e in els or [] if isinstance(e, dict)]
+
+
+def pick_closes(r: Runner, names: dict, log: Log):
+    """Two UI closes from panes that have a close button, the rest by DELETE."""
+    planned = UI_CLOSE + DELETE_CLOSE
+    pool = [k for k in names if k not in NEVER_BACK and k != RESPAWN]
+    ids = set(element_ids(r))
+    with_button = [k for k in pool if f"terminal.close-session-{names[k]['terminal_id']}" in ids]
+    ui = with_button[: len(UI_CLOSE)]
+    rest = [k for k in planned if k not in ui]
+    delete = rest[: len(DELETE_CLOSE)]
+    log.rec("close.plan", with_button=with_button, ui=ui, delete=delete)
+    return ui, delete
+
+
+def open_page(r: Runner, page_id: str, log: Log) -> bool:
+    """Click the page's tab. Tabs are named "Page N", not by page id, and their
+    UI Bridge ids end in the page's index in GET /terminal-pages."""
+    s, v = r.get("/terminal-pages")
+    pages = [p.get("pageId") for p in (data_of(v) or {}).get("pages", [])]
+    idx = pages.index(page_id) if page_id in pages else None
+    cands = [i for i in element_ids(r)
+             if idx is not None and i.startswith("tab-switch-to-") and i.endswith(f"-{idx}")]
+    log.rec("page.candidates", page=page_id, pages=pages, candidates=cands)
     for c in cands:
         s, v = click(r, c)
         log.rec("page.click", element=c, status=s, body=v)
         if s == 200:
             return True
     return False
+
+
+def snapshot_instance(r: Runner, dest: Path, log: Log) -> None:
+    """Copy the ledger, aftermath and store files out of the instance root."""
+    src = r.root / "home/runner"
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for f in sorted(src.glob("session-ledger*.json")) + [src / "terminal-sessions.json"]:
+        if f.is_file():
+            shutil.copy2(f, dest / f.name)
+            copied.append(f.name)
+    log.rec("instance.snapshot", dest=str(dest), files=copied)
+
+
+def later_closed_ids(led: dict) -> set[str]:
+    return {str(o.get("claudeSessionId", "")).lower()
+            for o in led.get("returned", []) or [] if o.get("laterClosed")}
 
 
 def store_records(r: Runner) -> list[dict]:
@@ -674,10 +713,18 @@ def evaluate(summary, names, first, second, have_fixture) -> None:
     l2 = second["ledger"]
     same = all(ids_in(led, b) == ids_in(l2, b)
                for b in ("missing", "returned", "closedSince", "finished")) and owed_ids(l2) == owed
+    lc1, lc2 = later_closed_ids(led), later_closed_ids(l2)
     put("reread_after_prune_unchanged", same and not summary.get("store_after_prune"),
         closed_left_in_store=summary.get("store_after_prune"),
         missing_after=sorted(ids_in(l2, "missing")), owed_after=sorted(owed_ids(l2)),
         strip_after=second["strip_text"])
+    # Not one of Phase 8's four assertions, but the D4 detail the aftermath
+    # record exists to keep after the registry prunes the row.
+    put("later_closed_survives_prune", lc1 == lc2 and bool(lc1),
+        later_closed_before=sorted(lc1), later_closed_after=sorted(lc2))
+    strip = first["strip_text"] or ""
+    a["strip_form"] = {"result": "OBSERVED", "deferred_form": strip.startswith("Restore deferred by drain"),
+                       "strip_text": strip, "section_text": (first["section_text"] or "")[:800]}
     summary["sessions"] = by_key
 
 
