@@ -286,8 +286,8 @@ def element_text(r: Runner, el: str):
     return st.get("textContent") or d.get("textContent"), d
 
 
-def click(r: Runner, el: str):
-    return r.post(f"/ui-bridge/control/element/{el}/action", {"action": "click"}, timeout=30)
+def click(r: Runner, el: str, action: str = "click"):
+    return r.post(f"/ui-bridge/control/element/{el}/action", {"action": action}, timeout=30)
 
 
 def waiting_count(strip_text: str | None):
@@ -514,7 +514,9 @@ def run(args) -> int:
         ui_close, delete_close = pick_closes(r, names, log)
         summary["closes"] = {"ui": ui_close, "delete": delete_close}
         for k in ui_close:
-            s, v = click(r, f"terminal.close-session-{names[k]['terminal_id']}")
+            # The close button is a hover action (pointer-events:none until the
+            # zone is hovered), so a plain click is refused as disabled.
+            s, v = click(r, f"terminal.close-session-{names[k]['terminal_id']}", "hoverClick")
             log.rec("close.ui", key=k, status=s, body=v)
             time.sleep(2)
         for k in delete_close + [RESPAWN]:
@@ -590,14 +592,17 @@ def element_ids(r: Runner) -> list[str]:
 
 
 def pick_closes(r: Runner, names: dict, log: Log):
-    """Two UI closes from panes that have a close button, the rest by DELETE."""
-    planned = UI_CLOSE + DELETE_CLOSE
+    """Two UI closes and two DELETEs, all from panes on the ACTIVE page.
+
+    Only a mounted pane's exit is recorded as a close (the webview's
+    `handleExit`); a pane DELETEd on a page whose restore has not run leaves its
+    row open and held for that restore (measured 2026-11-13, run 4), so a close
+    there is no close at all."""
     pool = [k for k in names if k not in NEVER_BACK and k != RESPAWN]
     ids = set(element_ids(r))
     with_button = [k for k in pool if f"terminal.close-session-{names[k]['terminal_id']}" in ids]
-    ui = with_button[: len(UI_CLOSE)]
-    rest = [k for k in planned if k not in ui]
-    delete = rest[: len(DELETE_CLOSE)]
+    ui = with_button[:2]
+    delete = with_button[2:4]
     log.rec("close.plan", with_button=with_button, ui=ui, delete=delete)
     return ui, delete
 
@@ -720,8 +725,13 @@ def evaluate(summary, names, first, second, have_fixture) -> None:
         strip_after=second["strip_text"])
     # Not one of Phase 8's four assertions, but the D4 detail the aftermath
     # record exists to keep after the registry prunes the row.
-    put("later_closed_survives_prune", lc1 == lc2 and bool(lc1),
-        later_closed_before=sorted(lc1), later_closed_after=sorted(lc2))
+    # Informational: the prune is forced by re-seeding closedAt 25 h back, and
+    # the aftermath record mirrors a row's close while the row exists, so it
+    # takes that pre-boot closedAt before the prune removes the row; a real
+    # prune 24 h after a real close keeps the real closedAt.
+    a["later_closed_across_forced_prune"] = {
+        "result": "OBSERVED", "later_closed_before": sorted(lc1),
+        "later_closed_after": sorted(lc2)}
     strip = first["strip_text"] or ""
     a["strip_form"] = {"result": "OBSERVED", "deferred_form": strip.startswith("Restore deferred by drain"),
                        "strip_text": strip, "section_text": (first["section_text"] or "")[:800]}
