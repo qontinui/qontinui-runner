@@ -3060,9 +3060,10 @@ mod tests {
     /// postmaster removes its System V segment and its dynamic shared memory
     /// as it exits, and a killed one leaves both behind for good once the sweep
     /// has removed its data directory. On Linux both are checked — the segment
-    /// in `/proc/sysvipc/shm`, and the `/dev/shm` files the postmaster maps —
-    /// present while the child runs and gone after the sweep. What a failing
-    /// run leaves is removed before anything is asserted.
+    /// in `/proc/sysvipc/shm`, and the `/dev/shm` files of the cluster's
+    /// dynamic shared memory ([`dsm_files_of`]) — present while the child runs
+    /// and gone after the sweep. What a failing run leaves of either is removed
+    /// before anything is asserted.
     ///
     /// The child boots in the shared harness directory, where another boot
     /// running this same code — another test's child — may sweep the root
@@ -3124,7 +3125,7 @@ mod tests {
                 "the running postmaster's segment {segment:?} is not in /proc/sysvipc/shm, so \
                  its absence after the sweep would prove nothing"
             );
-            let shm_files = shm_files_mapped_by(facts.postmaster_pid);
+            let shm_files = dsm_files_of(facts.postmaster_pid);
             assert!(
                 !shm_files.is_empty(),
                 "postmaster {} maps no /dev/shm/PostgreSQL.* file, so nothing can show the stop \
@@ -3195,17 +3196,47 @@ mod tests {
         );
     }
 
-    /// The `/dev/shm` files a running postmaster maps: its dynamic shared
-    /// memory control segment, and any segment it still holds.
+    /// The `/dev/shm` files of a running cluster's dynamic shared memory: the
+    /// control segment its postmaster maps, and every segment that control
+    /// segment lists as in use. Those are the ones the cluster's backends
+    /// created, the statistics area's among them; the postmaster maps none of
+    /// them, and a killed postmaster leaves them behind with its own.
+    ///
+    /// The control segment is read as PostgreSQL 18's `dsm.c` lays it out on a
+    /// 64-bit target: a 16-byte header (magic, item count, capacity), then
+    /// 40-byte items, each starting with a segment's handle and reference
+    /// count. An odd handle names the main shared memory region, not a file. A
+    /// mapped file without that magic is taken as it is.
     #[cfg(target_os = "linux")]
-    fn shm_files_mapped_by(pid: u32) -> Vec<PathBuf> {
-        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
-        let mut files: Vec<PathBuf> = maps
+    fn dsm_files_of(postmaster: u32) -> Vec<PathBuf> {
+        const CONTROL_MAGIC: u32 = 0x9a50_3d32;
+        const HEADER: usize = 16;
+        const ITEM: usize = 40;
+        let maps = std::fs::read_to_string(format!("/proc/{postmaster}/maps")).unwrap_or_default();
+        let mut files = Vec::new();
+        for mapped in maps
             .lines()
             .filter_map(|line| line.split_whitespace().nth(5))
             .filter(|path| path.starts_with("/dev/shm/PostgreSQL."))
-            .map(PathBuf::from)
-            .collect();
+        {
+            let control = std::fs::read(mapped).unwrap_or_default();
+            let word = |at: usize| {
+                control
+                    .get(at..at + 4)
+                    .map(|bytes| u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            };
+            if word(0) == Some(CONTROL_MAGIC) {
+                let items = (word(4).unwrap_or(0) as usize).min(control.len() / ITEM);
+                for item in (0..items).map(|index| HEADER + ITEM * index) {
+                    if let (Some(handle), Some(refcnt)) = (word(item), word(item + 4)) {
+                        if refcnt > 0 && handle.is_multiple_of(2) {
+                            files.push(PathBuf::from(format!("/dev/shm/PostgreSQL.{handle}")));
+                        }
+                    }
+                }
+            }
+            files.push(PathBuf::from(mapped));
+        }
         files.sort();
         files.dedup();
         files
