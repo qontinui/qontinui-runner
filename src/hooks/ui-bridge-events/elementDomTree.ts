@@ -4,18 +4,23 @@
  * Walks a registered element's rendered subtree breadth-first and serializes
  * each node's tagName, a filtered attribute set and its child count. Every
  * attribute value passes through the SDK's §4.6 redaction verdict for that
- * node, so this read withholds exactly what the element read
- * (`serializeRegisteredElement`) withholds:
+ * node, on the same two axes the element read (`serializeRegisteredElement`)
+ * uses:
  *
- * - PASSTHROUGH — structural or addressing keys the element read also serves
- *   raw inside a boundary: `role`, `name`, `type`, `class`, every
- *   `data-bridge-*`, `data-testid`, `data-awas-element`, and the SDK's two
- *   identifier attributes.
+ * - PASSTHROUGH — addressing and structural keys served raw whatever the
+ *   verdict. `role`, `data-testid`, `data-awas-element` and the SDK's two
+ *   identifier attributes are served raw by the element read too. `name`,
+ *   `type` and `class` are kept raw here by choice, as developer-authored
+ *   structure; that is wider than the SDK's own attribute-record scrub
+ *   (`scrubRecord`), which redacts every value inside a boundary. The SDK's
+ *   control attributes (`data-bridge-redact`, `data-bridge-invisible`) stay
+ *   raw so a reader can see where a boundary starts.
  * - CONTENT axis (`verdict.content`, a `data-bridge-redact` boundary only):
  *   `title`, `aria-label`.
  * - VALUE axis (`verdict.value`, boundary OR password input — the gate the
- *   SDK's `state.dataset` rides): every other key. The passthrough is an
- *   allowlist, so a key added later fails closed.
+ *   SDK's `state.dataset` rides): every other key, including any other
+ *   `data-bridge-*`. The passthrough is an exact allowlist, so a key added
+ *   later fails closed.
  *
  * Redacted values become `REDACTED_VALUE` and their keys survive, so a reader
  * can tell "redacted" from "absent". Never add `value` to the key list:
@@ -57,6 +62,8 @@ const PASSTHROUGH_KEYS: ReadonlySet<string> = new Set([
   "class",
   "data-testid",
   "data-awas-element",
+  "data-bridge-redact",
+  "data-bridge-invisible",
   UI_BRIDGE_ID_ATTR,
   UI_BRIDGE_TEST_ID_ATTR,
 ]);
@@ -67,10 +74,6 @@ const CONTENT_KEYS: ReadonlySet<string> = new Set(["title", "aria-label"]);
 const NAMED_KEYS = ["role", "title", "aria-label", "name", "type"] as const;
 
 const camelToKebab = (s: string): string => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
-
-function isPassthrough(key: string): boolean {
-  return PASSTHROUGH_KEYS.has(key) || key.startsWith("data-bridge-");
-}
 
 /**
  * Serialize one node's attributes, scrubbed per that node's §4.6 verdict.
@@ -95,14 +98,15 @@ export function serializeDomTreeAttrs(el: Element): Record<string, string> {
     }
   }
 
-  // The SDK's verdict accepts any Element at runtime (it walks `closest`);
+  // The SDK's verdict accepts any Element at runtime (it walks
+  // `parentElement` and reads attributes);
   // SVG nodes inside a boundary must be scrubbed too.
   const verdict = verdictOf(el as HTMLElement);
   if (!verdict.value && !verdict.content) return raw;
 
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(raw)) {
-    if (isPassthrough(k)) out[k] = v;
+    if (PASSTHROUGH_KEYS.has(k)) out[k] = v;
     else if (CONTENT_KEYS.has(k)) out[k] = verdict.content ? REDACTED_VALUE : v;
     else out[k] = verdict.value ? REDACTED_VALUE : v;
   }
