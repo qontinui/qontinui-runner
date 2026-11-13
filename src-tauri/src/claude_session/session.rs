@@ -707,7 +707,7 @@ impl ClaudeSession {
         let stdin_writer = Arc::new(StdinWriter::new(stdin));
         let permissions = super::permission::PermissionBroker::new(
             session_id,
-            permission,
+            permission.clone(),
             super::permission::decision_timeout(None),
             stdin_writer.clone(),
             Arc::new(super::permission::TauriPermissionSink::new(

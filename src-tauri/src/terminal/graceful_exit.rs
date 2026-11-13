@@ -3194,6 +3194,7 @@ mod tests {
         let pane = fake_process_table::register_with_children(
             PaneProcesses {
                 subtree_claude: vec![CLAUDE],
+                provider: Some("claude".to_string()),
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
@@ -4395,6 +4396,7 @@ mod tests {
     async fn a_scripted_pane_answers_only_while_registered() {
         let pane = fake_process_table::register(PaneProcesses {
             subtree_claude: vec![CLAUDE],
+            provider: Some("claude".to_string()),
             top_level_children: 0,
             exempted_children: Vec::new(),
             tracked_alive: Vec::new(),
@@ -4465,7 +4467,9 @@ mod tests {
     #[test]
     fn the_exit_command_comes_from_the_probed_cli_profile() {
         let snap = snapshot(&[(100, 1, "bash", 10), (200, 100, "claude.exe", 20)]);
-        let ClaudeProbe::Readable(view) = probe_from_snapshot(100, &snap, &[]) else {
+        let ClaudeProbe::Readable(view) =
+            probe_from_snapshot(100, &snap, &[], &RegistryWitness::naming(&[]))
+        else {
             panic!("readable");
         };
         assert_eq!(view.provider.as_deref(), Some("claude"));
@@ -4484,12 +4488,13 @@ mod tests {
         if let ClaudeProbe::Readable(v) = &mut view {
             v.provider = None;
         }
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             pane.write(Arc::clone(&log)),
             pane.screen(),
             scripted_probe(vec![view], Arc::clone(&log)),
             recording_close(Arc::clone(&log)),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         let GracefulExitOutcome::Refused { reason, .. } = outcome else {

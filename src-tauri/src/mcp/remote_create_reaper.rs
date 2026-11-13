@@ -1224,6 +1224,7 @@ mod tests {
         crate::terminal::graceful_exit::ClaudeProbe::Readable(
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude: Vec::new(),
+                provider: None,
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
@@ -1238,6 +1239,7 @@ mod tests {
                     pid,
                     started_at: 1_000,
                 }],
+                provider: Some("claude".to_string()),
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
