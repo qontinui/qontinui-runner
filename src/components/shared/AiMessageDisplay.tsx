@@ -15,16 +15,11 @@
 
 import React, { memo, useMemo, useState, useCallback } from "react";
 import {
-  Bot,
-  BookOpen,
   CheckCircle,
-  CheckSquare,
   ChevronDown,
   ChevronRight,
-  Cog,
   FileText,
   Info,
-  Lightbulb,
   MessageSquare,
   Play,
   User,
@@ -44,119 +39,56 @@ export {
 export type { AiMessageEntry, MessageGroup, IncrementalSourceGrouper } from "./messageGrouping";
 
 // ============================================================================
-// Orchestrator Source Constants
+// Current agent detection
 // ============================================================================
-// These match the source identifiers of the runner's former
-// orchestrator/output.rs emitters, deleted because none had a caller.
-
-/** Source identifier for Planning Agent output */
-export const SOURCE_PLANNING = "planning_agent";
-
-/** Source identifier for Verification Agent output */
-export const SOURCE_VERIFICATION = "verification_agent";
-
-/** Source identifier for Knowledge Base output */
-export const SOURCE_KNOWLEDGE = "knowledge_base";
-
-/** Source identifier for Orchestrator system output */
-export const SOURCE_ORCHESTRATOR = "orchestrator";
-
-/** All orchestrator-related sources */
-export const ORCHESTRATOR_SOURCES = [
-  SOURCE_PLANNING,
-  SOURCE_VERIFICATION,
-  SOURCE_KNOWLEDGE,
-  SOURCE_ORCHESTRATOR,
-] as const;
-
-/** Check if a source is an orchestrator agent */
-export function isOrchestratorSource(source: string): boolean {
-  return ORCHESTRATOR_SOURCES.includes(source as (typeof ORCHESTRATOR_SOURCES)[number]);
-}
+// The runner's orchestrator emitters (planning / verification agents, the
+// knowledge base, the orchestrator itself) were deleted with
+// `orchestrator/output.rs` because none had a caller, so the only agent a
+// stream can show is the worker.
 
 /**
- * Orchestrator agent type for display purposes.
+ * Agent type for display purposes.
  */
-export type OrchestratorAgent =
-  | "planning"
-  | "verification"
-  | "knowledge"
-  | "orchestrator"
-  | "worker"
-  | null;
+export type OrchestratorAgent = "worker" | null;
 
 /**
- * Configuration for orchestrator agent display in the status bar.
+ * Configuration for agent display in the status bar.
  */
 export interface OrchestratorAgentDisplayConfig {
   label: string;
-  icon: "Lightbulb" | "CheckSquare" | "BookOpen" | "Cog" | "Bot";
-  color: "blue" | "emerald" | "purple" | "amber" | "slate";
+  color: "slate";
 }
 
 /**
- * Map orchestrator sources to agent types.
- */
-export const ORCHESTRATOR_AGENT_MAP: Record<string, OrchestratorAgent> = {
-  [SOURCE_PLANNING]: "planning",
-  [SOURCE_VERIFICATION]: "verification",
-  [SOURCE_KNOWLEDGE]: "knowledge",
-  [SOURCE_ORCHESTRATOR]: "orchestrator",
-};
-
-/**
- * Display configuration for each orchestrator agent.
+ * Display configuration for each agent.
  */
 export const ORCHESTRATOR_AGENT_DISPLAY: Record<
   NonNullable<OrchestratorAgent>,
   OrchestratorAgentDisplayConfig
 > = {
-  planning: { label: "Planning", icon: "Lightbulb", color: "blue" },
-  verification: { label: "Verification", icon: "CheckSquare", color: "emerald" },
-  knowledge: { label: "Knowledge Base", icon: "BookOpen", color: "purple" },
-  orchestrator: { label: "Orchestrator", icon: "Cog", color: "amber" },
-  worker: { label: "Worker", icon: "Bot", color: "slate" },
+  worker: { label: "Worker", color: "slate" },
 };
 
 /**
- * Detect the current orchestrator agent from AI output entries.
- * Returns the most recently active agent based on the latest entries.
+ * Detect the current agent from AI output entries: the worker, when a
+ * `claude` or `response` entry falls inside the lookback window.
  *
  * @param entries AI output entries to analyze
  * @param lookbackMs How far back to look for agent activity (default 10 seconds)
- * @returns The current active agent or null if no orchestrator activity
+ * @returns "worker", or null when no recent worker output
  */
 export function detectCurrentOrchestratorAgent(
   entries: Array<{ source: string; timestamp: number }>,
   lookbackMs: number = 10000,
 ): OrchestratorAgent {
-  if (entries.length === 0) return null;
-
-  const now = Date.now();
-  const cutoff = now - lookbackMs;
+  const cutoff = Date.now() - lookbackMs;
 
   // Look at recent entries from newest to oldest
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
-
-    // Only consider recent entries
     if (entry.timestamp < cutoff) break;
-
-    // Check if this is an orchestrator source
-    if (isOrchestratorSource(entry.source)) {
-      return ORCHESTRATOR_AGENT_MAP[entry.source] ?? null;
-    }
-
-    // If we see claude/response without orchestrator prefix, it's the worker
     if (entry.source === "claude" || entry.source === "response") {
-      // Check if there's recent orchestrator activity - if not, it's the worker
-      const hasRecentOrchestratorActivity = entries
-        .slice(Math.max(0, i - 5), i)
-        .some((e) => isOrchestratorSource(e.source));
-
-      if (!hasRecentOrchestratorActivity) {
-        return "worker";
-      }
+      return "worker";
     }
   }
 
@@ -342,141 +274,6 @@ const UserHintLogBlock = memo(function UserHintLogBlock({
         </span>
       </div>
       <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
-    </div>
-  );
-});
-
-// ============================================================================
-// Orchestrator Agent Log Blocks
-// ============================================================================
-
-/**
- * Get styling configuration for an orchestrator source.
- */
-function getOrchestratorAgentConfig(source: string) {
-  switch (source) {
-    case SOURCE_PLANNING:
-      return {
-        label: "PLANNING AGENT",
-        Icon: Lightbulb,
-        colors: getAccentColors("blue"),
-        description: "Creating verification plan",
-      };
-    case SOURCE_VERIFICATION:
-      return {
-        label: "VERIFICATION AGENT",
-        Icon: CheckSquare,
-        colors: getAccentColors("emerald"),
-        description: "Running checks",
-      };
-    case SOURCE_KNOWLEDGE:
-      return {
-        label: "KNOWLEDGE BASE",
-        Icon: BookOpen,
-        colors: getAccentColors("purple"),
-        description: "Recording findings",
-      };
-    case SOURCE_ORCHESTRATOR:
-      return {
-        label: "ORCHESTRATOR",
-        Icon: Cog,
-        colors: getAccentColors("amber"),
-        description: "Coordinating agents",
-      };
-    default:
-      return {
-        label: "AGENT",
-        Icon: Bot,
-        colors: getAccentColors("zinc"),
-        description: "",
-      };
-  }
-}
-
-/**
- * Renders an orchestrator agent message in log mode.
- * Each agent type has distinct styling for easy identification.
- */
-const OrchestratorLogBlock = memo(function OrchestratorLogBlock({
-  group,
-}: {
-  group: MessageGroup;
-}) {
-  const config = getOrchestratorAgentConfig(group.source);
-  const { label, Icon, colors } = config;
-
-  // Check if this is a pass/fail message for verification
-  const isPass = group.combinedText.includes("[PASS]");
-  const isFail = group.combinedText.includes("[FAIL]");
-
-  // Use red styling for failed verifications
-  const effectiveColors = isFail ? getAccentColors("red") : colors;
-
-  // Format the content - orchestrator messages are typically single lines
-  // with prefixes like [Planning Agent], [Verification Agent], etc.
-  // We preserve the format but style it nicely
-  const lines = group.combinedText.split("\n").filter((l) => l.trim());
-
-  return (
-    <div
-      className={cn("rounded-lg px-3 py-2 mb-2 border", effectiveColors.bg, effectiveColors.border)}
-    >
-      <div
-        className={cn("flex items-center gap-2 text-xs font-semibold mb-1", effectiveColors.text)}
-      >
-        <Icon className="w-4 h-4" />
-        <span>{label}</span>
-        {isPass && <CheckCircle className="w-3 h-3 text-green-500" />}
-        {isFail && <XCircle className="w-3 h-3 text-red-500" />}
-        <span className="text-muted-foreground font-normal ml-auto text-[10px]">
-          {formatTimestamp(group.timestamp)}
-        </span>
-      </div>
-      <div className="text-xs text-foreground/90 space-y-0.5">
-        {lines.map((line, idx) => {
-          // Strip the agent prefix since we show it in the header
-          const cleanLine = line
-            .replace(/^\[Planning Agent\]\s*/i, "")
-            .replace(/^\[Verification Agent\]\s*/i, "")
-            .replace(/^\[Knowledge Base\]\s*/i, "")
-            .replace(/^\[Orchestrator\]\s*/i, "");
-
-          // Style pass/fail indicators
-          const hasPassIndicator = cleanLine.includes("[PASS]");
-          const hasFailIndicator = cleanLine.includes("[FAIL]");
-          const hasAiIndicator = cleanLine.includes("[AI]");
-          const hasDeterministicIndicator = cleanLine.includes("[DETERMINISTIC]");
-          const hasCriticalIndicator = cleanLine.includes("[CRITICAL]");
-
-          return (
-            <div
-              key={`${idx}-${cleanLine.slice(0, 40)}`}
-              className={cn(
-                "font-mono leading-relaxed",
-                hasPassIndicator && "text-green-400",
-                hasFailIndicator && "text-red-400",
-                hasCriticalIndicator && "font-bold",
-              )}
-            >
-              {/* Add subtle icon indicators */}
-              {hasPassIndicator && <span className="mr-1">✓</span>}
-              {hasFailIndicator && <span className="mr-1">✗</span>}
-              {hasAiIndicator && <span className="mr-1 text-purple-400">🤖</span>}
-              {hasDeterministicIndicator && <span className="mr-1 text-blue-400">⚡</span>}
-              {cleanLine
-                .replace("[PASS]", "")
-                .replace("[FAIL]", "")
-                .replace("[AI]", "")
-                .replace("[DETERMINISTIC]", "")
-                .replace("[CRITICAL]", "")
-                .trim()}
-              {hasCriticalIndicator && (
-                <span className="ml-1 text-red-400 text-[10px]">CRITICAL</span>
-              )}
-            </div>
-          );
-        })}
-      </div>
     </div>
   );
 });
@@ -795,11 +592,6 @@ const MessageBlock = memo(function MessageBlock({
   // Finding notifications are rendered as compact banners
   if (group.source === "finding") {
     return <FindingBanner group={group} />;
-  }
-
-  // Orchestrator agent messages have their own styling
-  if (isOrchestratorSource(group.source)) {
-    return <OrchestratorLogBlock group={group} />;
   }
 
   if (mode === "chat") {
