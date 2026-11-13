@@ -3648,7 +3648,7 @@ impl TerminalSession {
                 // recorded 0 is always a real zone (the tab's own record, a
                 // zone hint) and a reconcile bind never takes a placeholder
                 // for where the pane sits.
-                crate::session::session_lifecycle_store::UNZONED_ZONE_INDEX,
+                crate::session::session_lifecycle_store::recorded_zone_for(None),
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 None,
             );

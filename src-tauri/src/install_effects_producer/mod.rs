@@ -1299,7 +1299,12 @@ fn record_session_open_into(
                     .filter(|s| !s.is_empty())
                     .unwrap_or(provider)
                     .to_string();
-                ("default".to_string(), 0, working_dir, title)
+                (
+                    "default".to_string(),
+                    crate::session::session_lifecycle_store::recorded_zone_for(None),
+                    working_dir,
+                    title,
+                )
             }
         };
     let page_id = live_page.map(str::to_string).unwrap_or(page_id);
@@ -3497,7 +3502,11 @@ mod tests {
             rec.page_id, "default",
             "no terminal record ⇒ the hook's own default"
         );
-        assert_eq!(rec.zone_index, 0);
+        assert_eq!(
+            rec.zone_index,
+            crate::session::session_lifecycle_store::UNZONED_ZONE_INDEX,
+            "no terminal record ⇒ the zone is unknown, not a placeholder 0"
+        );
         assert_eq!(
             rec.title.as_deref(),
             Some("qontinui-root"),

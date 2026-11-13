@@ -3115,8 +3115,8 @@ pub(crate) fn create_terminal_session_backend(
             // actually put the pane on (its unpaged arm picks one), so the
             // record and the live pane never disagree.
             let record_page_id = hint_page_id.unwrap_or_else(|| info.page_id.clone());
-            let record_zone_index = hint_zone_index
-                .unwrap_or(crate::session::session_lifecycle_store::UNZONED_ZONE_INDEX);
+            let record_zone_index =
+                crate::session::session_lifecycle_store::recorded_zone_for(hint_zone_index);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
                 // the transcript appears. NEVER rebinds from transcripts.

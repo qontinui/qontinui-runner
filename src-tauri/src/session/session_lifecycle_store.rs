@@ -219,12 +219,23 @@ pub const ORIGIN_OBSERVED: &str = "observed";
 ///
 /// It carries TWO meanings and the writer decides which: the frontend writes it
 /// to ASSERT that a tab was dragged out of every zone (past the 9-zone ceiling a
-/// live tab is genuinely unassigned), while a backstop that simply has no view
-/// of the grid means "unknown". Only the asserting writer may persist it —
-/// [`crate::session::reconcile`] carries the terminal's existing zone forward
-/// instead, because an unknown that overwrites a known value is not a default,
-/// it is data loss. Mirrors `UNZONED_INDEX` in `src/components/terminal/sessionRecordArgs.ts`.
+/// live tab is genuinely unassigned), while a writer that does not know the
+/// zone means "unknown". Spawns persist it in that second sense
+/// ([`recorded_zone_for`]): a pane's zone is assigned by the webview after the
+/// pane exists, so a recorded 0 is always a real zone, and a restore auto-fills
+/// a row carrying the sentinel into a free zone. A writer that would OVERWRITE
+/// a known zone with it must not — [`crate::session::reconcile`] carries the
+/// terminal's existing zone forward instead, because an unknown that
+/// overwrites a known value is not a default, it is data loss. Mirrors
+/// `UNZONED_INDEX` in `src/components/terminal/sessionRecordArgs.ts`.
 pub const UNZONED_ZONE_INDEX: i32 = -1;
+
+/// The zone a new row records for its pane: the caller's zone when it knows
+/// one, else [`UNZONED_ZONE_INDEX`] ("unknown"), never a placeholder 0 that
+/// would read as a real zone.
+pub fn recorded_zone_for(known: Option<i32>) -> i32 {
+    known.unwrap_or(UNZONED_ZONE_INDEX)
+}
 
 /// Normalize a possibly-legacy `origin` value to the current vocabulary. Maps
 /// the pre-migration `bind_origin` values (`"pinned"`→`"authoritative"`,
@@ -13322,6 +13333,16 @@ mod tests {
         );
         assert_eq!(boot_restore_phase(), BootRestorePhase::Ran);
         reset_boot_restore_phase_for_test();
+    }
+
+    /// A spawn that knows no zone records the sentinel, never a placeholder 0,
+    /// so a recorded 0 is a real zone; a known zone, 0 included, is kept.
+    /// Mutation: `recorded_zone_for` falling back to 0.
+    #[test]
+    fn a_new_row_records_the_sentinel_for_an_unknown_zone() {
+        assert_eq!(recorded_zone_for(None), UNZONED_ZONE_INDEX);
+        assert_eq!(recorded_zone_for(Some(0)), 0);
+        assert_eq!(recorded_zone_for(Some(4)), 4);
     }
 
     /// Clean boot: the shutdown marker (written before this boot) joins the

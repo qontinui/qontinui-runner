@@ -788,13 +788,15 @@ async fn materialize(
             config_dir: &config_dir,
             title,
             // Land back on the tile the session used to occupy when this box
-            // still remembers it; otherwise the default page, zone 0 (a wrong
-            // tile beats a lost session).
+            // still remembers it; otherwise the default page with no zone
+            // recorded, which a restore auto-fills into a free zone.
             page_id: local
                 .as_ref()
                 .map(|r| r.page_id.clone())
                 .unwrap_or_else(|| "default".to_string()),
-            zone_index: local.as_ref().map(|r| r.zone_index).unwrap_or(0),
+            zone_index: crate::session::session_lifecycle_store::recorded_zone_for(
+                local.as_ref().map(|r| r.zone_index),
+            ),
             work_unit_slug: child_intent.work_unit_slug.clone(),
             correlation_topic: child_intent.correlation_topic.clone(),
             intent_repo: child_intent.repo.clone(),
