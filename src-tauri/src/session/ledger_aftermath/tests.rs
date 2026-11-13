@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use crate::session::session_ledger::{LedgerEntry, SessionLedger, LEDGER_VERSION, REASON_POLL};
 use crate::session::session_lifecycle_store::{
-    PollTerminalMatch, SessionLifecycleStore, TerminalSessionRecord,
+    PollTerminalMatch, SessionLifecycleStore, TerminalSessionRecord, RESTORE_TIER_RESUMED,
 };
 
 /// The generation file the boots under test observe.
