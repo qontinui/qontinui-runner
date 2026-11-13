@@ -100,6 +100,7 @@ fn structured_record(
         // (`--session-id`) by the chat path.
         origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
+        awaiting_account_since: None,
         confirmed_at: None,
         handle: None,
         account_label: None,
@@ -116,11 +117,17 @@ fn structured_record(
         finished_at: None,
         wind_down_outcome: None,
         wind_down_at: None,
+        wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
         // A structured launch is never a `/clear` adoption of another session.
         adopted_from: None,
+        last_session_start_at: None,
+        last_alive_at: None,
+        gate_id: None,
+        gate_consuming_device_id: None,
+        gate_bound_boot_ms: None,
     }
 }
 

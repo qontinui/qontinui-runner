@@ -1109,7 +1109,10 @@ mod tests {
         });
         assert_eq!(h, ControlHandling::DeniedByDial);
         assert_eq!(behavior(&w), "deny");
-        assert_eq!(w["response"]["response"]["message"], ALLOW_LIST_DENY_MESSAGE);
+        assert_eq!(
+            w["response"]["response"]["message"],
+            ALLOW_LIST_DENY_MESSAGE
+        );
 
         // A prompted launch is the operator's choice to be asked: it parks.
         let (b, _out, _) = broker(PermissionMode::Prompt, Duration::from_secs(60));

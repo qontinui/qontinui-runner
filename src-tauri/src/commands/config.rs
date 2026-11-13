@@ -900,7 +900,9 @@ pub(crate) fn render_ai_resume_command(
     };
     let profile = qontinui_runner_lib::cli_profile::profile_for(profile_id)
         .ok_or_else(|| format!("refusing to resume: no CLI profile for provider {profile_id:?}"))?;
-    if profile.restore_tier != qontinui_types::cli_session::RestoreTier::Full {
+    if qontinui_runner_lib::cli_profile::restore_tier(profile)
+        != qontinui_types::cli_session::RestoreTier::Full
+    {
         return Err(format!(
             "refusing to resume a {profile_id} session: its CLI profile does not promise the \
              conversation back by id"

@@ -323,6 +323,7 @@ mod tests {
             "default".to_string(),
             0,
             qontinui_runner_lib::cli_profile::claude::ID.to_string(),
+            None,
         );
         assert!(
             scan_target(&store, "pane-1").is_none(),

@@ -2426,6 +2426,7 @@ mod tests {
         let cfg = LaunchConfig {
             default_template: Some("claude --model opus --permission-mode acceptEdits".to_string()),
             account_command: Some("clh".to_string()),
+            ..Default::default()
         };
         let s = LaunchSpec {
             provider: codex(),

@@ -1245,6 +1245,7 @@ fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
             resource_override: false,
             // The dead pane's exit hook already answered any gate it carried.
             gate_identity: None,
+            origin: crate::coord_drain_state::SpawnOrigin::Respawn,
         },
     )?;
 
@@ -2170,6 +2171,7 @@ mod tests {
                 "default".to_string(),
                 0,
                 claude.to_string(),
+                None,
             )
         };
 
@@ -2287,6 +2289,7 @@ mod tests {
                 "default".to_string(),
                 0,
                 provider.to_string(),
+                None,
             );
             store.get(id).unwrap()
         };

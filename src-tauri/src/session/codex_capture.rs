@@ -373,6 +373,7 @@ pub fn record_captured_session(
         placement.map_or_else(|| "default".to_string(), |r| r.page_id.clone()),
         placement.map_or(0, |r| r.zone_index),
         codex::ID.to_string(),
+        None,
     );
     // A rollout file proves the session exists — the read-back analogue of a
     // provider's SessionStart hook confirming it.
@@ -831,6 +832,7 @@ mod tests {
             "page-2".to_string(),
             3,
             qontinui_runner_lib::cli_profile::claude::ID.to_string(),
+            None,
         );
         assert_eq!(store.open_records().len(), 1);
 
@@ -875,6 +877,7 @@ mod tests {
             "default".to_string(),
             0,
             qontinui_runner_lib::cli_profile::claude::ID.to_string(),
+            None,
         );
         store.confirm_session("earlier");
 

@@ -6446,6 +6446,7 @@ pub(crate) mod tests {
         let scripted = crate::terminal::graceful_exit::fake_process_table::register_with_children(
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude,
+                provider: Some("claude".to_string()),
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
