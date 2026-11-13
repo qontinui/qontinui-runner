@@ -44,7 +44,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use super::policy_context::Mode;
@@ -340,10 +340,30 @@ pub(crate) async fn route_policy_decision(
     session_key: &str,
 ) -> PolicyTenantDecision {
     let (workdir, registry_session) = route_session_ref(route_id, session_key);
-    let read = read_session_policy_tenant(route_id, workdir.as_deref(), registry_session).await;
+    let read = match tokio::time::timeout(
+        ROUTE_TENANT_BUDGET,
+        read_session_policy_tenant(route_id, workdir.as_deref(), registry_session),
+    )
+    .await
+    {
+        Ok(read) => read,
+        Err(_) => PolicyTenantRead::Unnamed(format!(
+            "the session's tenant did not settle within the SessionStart route's {}s budget",
+            ROUTE_TENANT_BUDGET.as_secs()
+        )),
+    };
     let multi_bound = device_multi_bound().await;
     policy_tenant_decision(read, multi_bound)
 }
+
+/// How long the SessionStart route waits for the session's tenant. The hook
+/// calls the route under `curl --max-time 15` and swallows a timeout, so a read
+/// that used the proxy's whole `CWD_TENANT_BUDGET` (10 s) before a 4 s fetch
+/// would leave under a second of margin and, past it, deliver neither the body
+/// nor the fail-open notice. Capping the read keeps the notice deliverable: an
+/// unsettled read is `Unnamed`, which the decision turns into UNKNOWN on a
+/// multi-bound device and the default slot on a single-bound one.
+pub(crate) const ROUTE_TENANT_BUDGET: Duration = Duration::from_secs(8);
 
 /// `(workdir, registry session id)` for the route's session: the hosting
 /// terminal's cwd and coord row when `route_id` names a live terminal, else
@@ -371,15 +391,41 @@ fn route_session_ref(route_id: &str, session_key: &str) -> (Option<String>, Opti
 /// any other answer, which leaves the spawn on the inline briefing while the
 /// SessionStart route delivers the full body or the UNKNOWN notice.
 ///
+/// On a MULTI-BOUND device an answer the repo tier did not settle is not good
+/// enough: `resolve_new_session_tenant_in` then falls through to the machine
+/// rows (the device default), and composing that tenant's body would brief the
+/// session under another tenant's documents in exactly the first-call race the
+/// SessionStart route refuses as UNKNOWN. [`new_session_body_tenant`] decides.
+///
 /// Skips the resolution (bounded by `repo_tenant::CWD_TENANT_BUDGET`) when the
 /// injection is not `on`, because no body would be composed anyway.
 pub(crate) async fn new_session_policy_tenant(workdir: &Path) -> Option<Uuid> {
     if Mode::from_env() != Mode::On {
         return None;
     }
-    crate::session::resolve_new_session_tenant_in(Some(workdir))
-        .await
-        .tenant()
+    let (decided, repo_settled) =
+        crate::session::resolve_new_session_tenant_settled_in(Some(workdir)).await;
+    let multi_bound = if repo_settled {
+        false
+    } else {
+        device_multi_bound().await
+    };
+    new_session_body_tenant(decided.tenant(), repo_settled, multi_bound)
+}
+
+/// The pure half of [`new_session_policy_tenant`]: the stated tenant, unless
+/// the repo answer did not settle on a multi-bound device — then nothing, and
+/// the SessionStart route delivers the body or the UNKNOWN notice. A
+/// single-bound device keeps the machine-row answer, which is its sole tenant.
+pub(crate) fn new_session_body_tenant(
+    stated: Option<Uuid>,
+    repo_settled: bool,
+    multi_bound: bool,
+) -> Option<Uuid> {
+    if multi_bound && !repo_settled {
+        return None;
+    }
+    stated
 }
 
 /// How long a SHELL pane's spawn waits for its session tenant before composing
@@ -442,8 +488,11 @@ pub(crate) fn resolve_shell_pane_policy_tenant(terminal_id: &str, workdir: &str)
             }
             spawn_body_tenant(&decision, default_slot_tenant)
         }
+        // An EXPECTED path on a multi-bound device (a fresh repo's 10 s read
+        // outlasts this 3 s budget), and SessionStart delivers the body, so it
+        // is not a warning.
         Err(_) => {
-            warn!(
+            debug!(
                 terminal_id,
                 budget_secs = SHELL_PANE_TENANT_BUDGET.as_secs(),
                 "policy-tenant: the shell pane's session tenant did not settle within the spawn \
@@ -483,6 +532,22 @@ mod tests {
                 message: "the tenant of this session's repo is not established yet".to_string(),
             },
         ]
+    }
+
+    // ── new_session_body_tenant: a machine-row answer never briefs a multi-bound spawn ──
+
+    /// Review finding A1: on a multi-bound device an UNSETTLED repo answer
+    /// falls through to the machine rows (the device default), so a direct-exec
+    /// spawn must compose no body rather than the default tenant's. A settled
+    /// answer, or any single-bound device, keeps the stated tenant.
+    #[test]
+    fn a_direct_exec_spawn_composes_no_body_on_an_unsettled_repo_of_a_multi_bound_device() {
+        let a = tenant(0xA);
+        assert_eq!(new_session_body_tenant(Some(a), false, true), None);
+        assert_eq!(new_session_body_tenant(Some(a), true, true), Some(a));
+        assert_eq!(new_session_body_tenant(Some(a), false, false), Some(a));
+        assert_eq!(new_session_body_tenant(Some(a), true, false), Some(a));
+        assert_eq!(new_session_body_tenant(None, true, true), None);
     }
 
     // ── spawn_policy_body_in: the session's tenant, never the default's ──
