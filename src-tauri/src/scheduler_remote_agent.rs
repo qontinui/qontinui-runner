@@ -545,6 +545,51 @@ mod tests {
             written, 0,
             "no agent file lands in an operator's tracked checkout"
         );
+        assert_eq!(
+            std::fs::read(root.join(".claude/commands/own.md")).unwrap(),
+            b"own",
+            "the checkout's own tracked command is byte-unchanged"
+        );
+        let commands = std::fs::read_dir(root.join(".claude/commands"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec!["own.md".to_string()], "no command was added");
+
+        // The skip is RECORDED, not silent: the ledger holds the operator-checkout
+        // agent row, and the commands pass as repo-authored.
+        let ledger = crate::capability_manifest::session_provision_ledger(root.to_str().unwrap())
+            .expect("the gate records its skips against this workdir");
+        let agent_rows: Vec<_> = ledger
+            .reports
+            .iter()
+            .filter(|r| r.capability == "agent_definitions")
+            .collect();
+        assert_eq!(agent_rows.len(), 1, "{agent_rows:?}");
+        assert_eq!(agent_rows[0].written, 0);
+        assert!(
+            agent_rows[0].skipped.iter().any(|u| matches!(
+                &u.reason,
+                crate::capability_manifest::SkipReason::Unresolved(why)
+                    if why.contains("not an allocated agent worktree")
+            )),
+            "{:?}",
+            agent_rows[0].skipped
+        );
+        assert!(
+            ledger
+                .reports
+                .iter()
+                .any(|r| r.capability == "fleet_commands"
+                    && r.written == 0
+                    && !r.skipped.is_empty()
+                    && r.skipped
+                        .iter()
+                        .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored)),
+            "the commands pass is recorded as repo-authored: {:?}",
+            ledger.reports
+        );
     }
 
     #[tokio::test]

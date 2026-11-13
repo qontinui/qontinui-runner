@@ -405,9 +405,24 @@ pub(crate) const SHIPPED_AGENTS: &[&str] = &[
 ];
 
 /// How long the overlay checkout's history may take to say whether its
-/// definition's path held a blob before the answer is taken as "no" (and the
-/// file kept).
-const BLOB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// definition's path held a blob before the probe is taken as UNANSWERED (and
+/// the file kept). A whole-history `git log --all` over a large repository is
+/// not a quick read, so this is sized for that walk rather than for a lookup.
+const BLOB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What [`checkout_history_holds_blob`] learned. Only `Yes` licenses an
+/// overwrite; `No` and `NoAnswer` both keep the file, but they are recorded
+/// differently: `No` is a definite "not ours", `NoAnswer` is UNKNOWN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryProbe {
+    /// The path's history holds one of the blobs.
+    Yes,
+    /// The probe answered cleanly and the history holds none of them.
+    No,
+    /// The probe gave no usable answer; `why` is `timeout`, `exit <N>`,
+    /// `killed by signal` or `spawn failed (<error>)`.
+    NoAnswer { why: String },
+}
 
 /// Why the existing destination `dst` (definition `name`) must be KEPT rather
 /// than overwritten, or `None` when this pass may write it: it is absent, or its
@@ -425,8 +440,9 @@ const BLOB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 ///   (`.claude/agents/<name>` on any ref), i.e. a version of that checkout's
 ///   own definition. The same bytes at a different path are not evidence, so
 ///   they do not count ([`checkout_history_holds_blob`]; bounded by
-///   [`BLOB_PROBE_TIMEOUT`], never lazily fetched; no answer reads as "not
-///   ours", the safe side).
+///   [`BLOB_PROBE_TIMEOUT`], never lazily fetched). A probe that gives no
+///   answer keeps the file, the safe side, and the detail says the ownership
+///   probe did not answer rather than claiming the blob is not ours.
 ///
 /// A symlink is never written through, whatever it points at, and anything that
 /// cannot be inspected or read is kept: overwriting needs a positive answer.
@@ -507,8 +523,16 @@ fn foreign_destination_reason_with(
         if folded != bytes {
             blobs.push(crate::provenance::git_blob_id(&folded));
         }
-        if checkout_history_holds_blob(src_dir, name, &blobs) {
-            return None;
+        match checkout_history_holds_blob(src_dir, name, &blobs) {
+            HistoryProbe::Yes => return None,
+            HistoryProbe::No => {}
+            HistoryProbe::NoAnswer { why } => {
+                return Some(SkipReason::OperatorAuthored(format!(
+                    "kept: ownership probe did not answer ({why}); blob {own} is not one \
+                     this runner ships, and whether the overlay checkout's history holds \
+                     it is UNKNOWN"
+                )))
+            }
         }
     }
     Some(SkipReason::OperatorAuthored(format!(
@@ -546,13 +570,13 @@ pub(crate) fn is_symlink(dst: &Path) -> bool {
 ///
 /// `GIT_NO_LAZY_FETCH=1`: on a partial clone a missing object would otherwise
 /// be fetched from the remote inside this probe. Bounded by
-/// [`BLOB_PROBE_TIMEOUT`]; anything but a clean, matching answer (no
-/// repository, git missing, a timeout, a non-zero exit) is `false`, so the file
-/// is kept.
-fn checkout_history_holds_blob(dir: &Path, name: &str, blobs: &[String]) -> bool {
+/// [`BLOB_PROBE_TIMEOUT`]. Only a clean exit gives `Yes`/`No`; no repository,
+/// git missing, a timeout or a non-zero exit is [`HistoryProbe::NoAnswer`],
+/// which keeps the file and is recorded as UNKNOWN.
+fn checkout_history_holds_blob(dir: &Path, name: &str, blobs: &[String]) -> HistoryProbe {
     use std::io::Read;
     use std::process::Stdio;
-    let Ok(mut child) = crate::process_helpers::no_window("git")
+    let mut child = match crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(dir)
         .args(["log", "--all", "--format=", "--raw", "--no-abbrev", "--"])
@@ -564,8 +588,13 @@ fn checkout_history_holds_blob(dir: &Path, name: &str, blobs: &[String]) -> bool
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return false;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return HistoryProbe::NoAnswer {
+                why: format!("spawn failed ({e})"),
+            }
+        }
     };
     // Drained on its own thread so a long history cannot fill the pipe and
     // stall the child past the deadline.
@@ -577,21 +606,36 @@ fn checkout_history_holds_blob(dir: &Path, name: &str, blobs: &[String]) -> bool
         })
     });
     let deadline = std::time::Instant::now() + BLOB_PROBE_TIMEOUT;
-    let succeeded = loop {
+    let outcome: Result<(), String> = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
+            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) => {
+                break Err(match status.code() {
+                    Some(code) => format!("exit {code}"),
+                    None => "killed by signal".to_string(),
+                })
+            }
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            _ => {
+            Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                break false;
+                break Err("timeout".to_string());
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("wait failed ({e})"));
             }
         }
     };
     let text = reader.and_then(|r| r.join().ok()).unwrap_or_default();
-    succeeded && raw_log_names_blob(&text, blobs)
+    match outcome {
+        Ok(()) if raw_log_names_blob(&text, blobs) => HistoryProbe::Yes,
+        Ok(()) => HistoryProbe::No,
+        Err(why) => HistoryProbe::NoAnswer { why },
+    }
 }
 
 /// True when a `git log --raw --no-abbrev` listing names one of `blobs` on
@@ -614,8 +658,10 @@ fn raw_log_names_blob(text: &str, blobs: &[String]) -> bool {
 /// never sees a half-written definition. On any error the temporary file is
 /// removed (dropping an unpersisted [`tempfile::NamedTempFile`] deletes it).
 ///
-/// `permissions` sets the new file's mode (the overlay passes its source's);
-/// `None` is `0644` on unix, since a temporary file is created `0600`.
+/// `permissions` sets the new file's mode (the overlay passes its source's).
+/// With `None`, on unix, a destination that already exists keeps its own mode
+/// (the replacement inherits it); a new destination gets `0644`. Without this
+/// the file would land `0600`, the mode a temporary file is created with.
 pub(crate) fn write_atomically(
     dst: &Path,
     bytes: &[u8],
@@ -641,8 +687,14 @@ pub(crate) fn write_atomically(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                // `metadata` follows a link, but a link destination is never
+                // reached here (callers skip symlinks), and its target's mode
+                // would be the honest one to keep anyway.
+                let mode = std::fs::metadata(dst)
+                    .map(|m| m.permissions().mode() & 0o7777)
+                    .unwrap_or(0o644);
                 tmp.as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+                    .set_permissions(std::fs::Permissions::from_mode(mode))?;
             }
         }
     }
@@ -1096,6 +1148,57 @@ mod tests {
         );
     }
 
+    /// A probe that cannot answer (here: `git -C` on a directory that does not
+    /// exist, which exits 128) is UNKNOWN, not "no". The file is kept, and the
+    /// recorded detail says the probe did not answer rather than claiming the
+    /// blob is not one this runner ships or shipped.
+    #[test]
+    fn an_unanswered_ownership_probe_keeps_the_file_as_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp
+            .path()
+            .join("no-such-checkout")
+            .join(".claude")
+            .join("agents");
+        let probe = checkout_history_holds_blob(&missing, "local-agent.md", &["a".repeat(40)]);
+        assert!(
+            matches!(&probe, HistoryProbe::NoAnswer { why } if why.starts_with("exit ")),
+            "{probe:?}"
+        );
+
+        let dst = tmp.path().join("local-agent.md");
+        std::fs::write(&dst, b"# operator bytes\n").unwrap();
+        let reason =
+            foreign_destination_reason_with(&dst, "local-agent.md", Some(&missing), &[], &[])
+                .expect("an unanswered probe keeps the file");
+        let SkipReason::OperatorAuthored(why) = &reason else {
+            panic!("{reason:?}");
+        };
+        assert!(
+            why.starts_with("kept: ownership probe did not answer (exit "),
+            "{why}"
+        );
+        assert!(!why.contains("ships or shipped"), "{why}");
+    }
+
+    /// A clean probe whose history lacks the blob is a definite "no", recorded
+    /// with the definite wording.
+    #[test]
+    fn an_answered_probe_without_the_blob_is_a_definite_no() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("ccfg");
+        let src = repo.join(".claude").join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(src.join("local-agent.md"), b"# version one\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "one"]);
+        assert_eq!(
+            checkout_history_holds_blob(&src, "local-agent.md", &["a".repeat(40)]),
+            HistoryProbe::No
+        );
+    }
+
     /// The raw-log parser matches a blob on either side of a change, and
     /// nothing in a path or a status.
     #[test]
@@ -1119,6 +1222,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let other = tmp.path().join("operator.md");
         std::fs::write(&other, b"OPERATOR").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o640)).unwrap();
         let dst = tmp.path().join("code-reviewer.md");
         std::fs::hard_link(&other, &dst).unwrap();
 
@@ -1132,11 +1237,41 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "no temporary file is left behind");
-        use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
-            0o644
+            0o640,
+            "with no permissions given, the replaced destination's mode is kept"
         );
+    }
+
+    /// With no permissions given, a NEW destination is `0644` (not the `0600`
+    /// a temporary file is created with), and an existing one keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_write_without_permissions_preserves_an_existing_mode_else_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+
+        let fresh = tmp.path().join("fresh.md");
+        write_atomically(&fresh, b"NEW", None).unwrap();
+        assert_eq!(mode(&fresh), 0o644);
+
+        let existing = tmp.path().join("existing.md");
+        std::fs::write(&existing, b"OLD").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_atomically(&existing, b"NEW", None).unwrap();
+        assert_eq!(mode(&existing), 0o755);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"NEW");
+
+        // Explicit permissions still win over the destination's.
+        write_atomically(
+            &existing,
+            b"NEWER",
+            Some(std::fs::Permissions::from_mode(0o600)),
+        )
+        .unwrap();
+        assert_eq!(mode(&existing), 0o600);
     }
 
     /// A write that cannot land leaves no temporary file behind.

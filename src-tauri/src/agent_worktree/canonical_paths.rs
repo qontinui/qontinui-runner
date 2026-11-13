@@ -710,6 +710,13 @@ fn allocated_worktree_for_path_with(
         .collect::<Vec<_>>()
         .into_iter();
     let path_str = path.to_string_lossy().replace('\\', "/");
+    // Every segment must be NORMAL, not only `<agent_id>` and `<repo>`: the
+    // match is lexical, so `<root>/<id>/<repo>/../../../other` would otherwise
+    // "resolve" to the allocation while naming a path outside it, and
+    // `<root>/../<checkout>` to one outside the worktree root.
+    if path_str.split('/').any(|s| s == "." || s == "..") {
+        return None;
+    }
     let mut path_parts = path_str.split('/').filter(|s| !s.is_empty());
 
     for rp in root_parts.by_ref() {
@@ -721,14 +728,6 @@ fn allocated_worktree_for_path_with(
     // `path` must be the `<agent_id>/<repo_name>` dir or a descendant of it.
     let agent_id = path_parts.next()?;
     let repo_name = path_parts.next()?;
-    // Both must be NORMAL segments: `<root>/../<checkout>` would otherwise
-    // "resolve" to an allocation outside the worktree root.
-    if [agent_id, repo_name]
-        .iter()
-        .any(|s| *s == "." || *s == "..")
-    {
-        return None;
-    }
 
     let candidate = worktree_root.join(agent_id).join(repo_name);
     if is_live(&candidate) {
@@ -1157,6 +1156,47 @@ mod allocated_worktree_probe_tests {
             script_allocated_worktree_for_path_in(root, &elsewhere),
             None
         );
+    }
+
+    /// A6: a `.` or `..` segment ANYWHERE in the path refuses the match, not
+    /// only at `<agent_id>`/`<repo>`: `<root>/agent-worktrees/<id>/<repo>/../../../other`
+    /// names a path outside the allocation even though its first segments are
+    /// the allocation's.
+    #[test]
+    fn a_dot_or_dotdot_segment_anywhere_is_never_an_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wt = root
+            .join("agent-worktrees")
+            .join("01a1-agent")
+            .join("qontinui-runner");
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            "gitdir: /x/.git/worktrees/qontinui-runner1\n",
+        )
+        .unwrap();
+        // Sanity: the clean path IS an allocation, so a None below is the
+        // dot segment's doing.
+        assert!(script_allocated_worktree_for_path_in(root, &wt).is_some());
+
+        for escaped in [
+            wt.join("..").join("..").join("..").join("other"),
+            wt.join("src-tauri").join(".."),
+            wt.join(".").join("src-tauri"),
+            root.join("agent-worktrees")
+                .join("01a1-agent")
+                .join("..")
+                .join("01a1-agent")
+                .join("qontinui-runner"),
+        ] {
+            assert_eq!(
+                script_allocated_worktree_for_path_in(root, &escaped),
+                None,
+                "{}",
+                escaped.display()
+            );
+        }
     }
 
     fn live(_p: &Path) -> bool {

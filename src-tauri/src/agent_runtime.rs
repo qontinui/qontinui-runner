@@ -11461,6 +11461,7 @@ fn overlay_checkout_agent_definitions(
     )
     .with_destination(dst_dir.display().to_string());
     let mut copied = 0usize;
+    let mut served_in_place = 0usize;
     for entry in std::fs::read_dir(src_dir)
         .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
     {
@@ -11543,14 +11544,8 @@ fn overlay_checkout_agent_definitions(
                 path.display(),
                 dst.display()
             );
-            report.skip(
-                unit,
-                capability_manifest::SkipReason::OperatorAuthored(
-                    "the destination is the overlay source file itself, served in place; \
-                     nothing to copy"
-                        .to_string(),
-                ),
-            );
+            report.skip(unit, capability_manifest::SkipReason::ServedInPlace);
+            served_in_place += 1;
             continue;
         }
         // Idempotent and ATOMIC: the source's bytes go to a temporary file
@@ -11592,9 +11587,11 @@ fn overlay_checkout_agent_definitions(
         ));
     }
     report = report.with_detail(detail);
-    if report.written == 0 {
+    if report.written == 0 && served_in_place == 0 {
         // The checkout was present but supplied nothing usable — `unresolved`
-        // rather than `operator_checkout`, which would claim it answered.
+        // rather than `operator_checkout`, which would claim it answered. A
+        // unit served in place IS the checkout answering (the session reads
+        // its own source file), so it keeps the checkout rung.
         report.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(report)
@@ -16242,11 +16239,23 @@ mod tests {
             report.skipped.iter().any(|u| u.unit == "linked.md"
                 && matches!(
                     &u.reason,
-                    crate::capability_manifest::SkipReason::OperatorAuthored(why)
-                        if why.contains("served in place")
+                    crate::capability_manifest::SkipReason::ServedInPlace
                 )),
             "{:?}",
             report.skipped
+        );
+        assert!(
+            !report
+                .skipped
+                .iter()
+                .any(|u| u.reason.wire() == "operator_authored"),
+            "served in place is not an operator-authored keep: {:?}",
+            report.skipped
+        );
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout,
+            "a unit served in place is the checkout answering"
         );
     }
 

@@ -1040,15 +1040,24 @@ pub enum SkipReason {
     /// An EXISTING destination was kept because nothing shows this runner
     /// wrote it: an operator-authored file whose bytes are no copy this runner
     /// ships or shipped, a symbolic link (never written through), a destination
-    /// that is not a regular file or could not be inspected or read, or the
-    /// overlay source file itself, which is served in place. The detail says
-    /// which.
+    /// that is not a regular file or could not be inspected or read, or one
+    /// whose ownership probe did not answer (UNKNOWN, kept on the safe side).
+    /// The detail says which.
     ///
     /// Distinct from [`SkipReason::Rejected`] on purpose: that one says the
     /// provisioner's validation REFUSED the content it was handed, while this
     /// one says the content was fine and the file already on disk is not this
     /// runner's to replace. A deliberate keep, like [`SkipReason::GitTracked`].
     OperatorAuthored(String),
+    /// The destination IS the overlay source file (a hard link to it, or the
+    /// same file through another path), so the checkout's own copy is what the
+    /// session reads, served in place, and there was nothing to copy.
+    ///
+    /// Distinct from [`SkipReason::OperatorAuthored`] on purpose: nothing here
+    /// is an operator's file kept against this runner; the unit is the
+    /// checkout's own definition and the session has it. The pass still
+    /// records it, so a reader can see the unit was not freshly written.
+    ServedInPlace,
 }
 
 impl SkipReason {
@@ -1064,6 +1073,7 @@ impl SkipReason {
             SkipReason::Rejected(_) => "rejected",
             SkipReason::RepoAuthored => "repo_authored",
             SkipReason::OperatorAuthored(_) => "operator_authored",
+            SkipReason::ServedInPlace => "served_in_place",
         }
     }
 
@@ -1089,6 +1099,9 @@ impl SkipReason {
                     .to_string()
             }
             SkipReason::OperatorAuthored(why) => format!("kept: {why}"),
+            SkipReason::ServedInPlace => "served in place: the destination is the checkout's \
+                 own source file, so there was nothing to copy"
+                .to_string(),
         }
     }
 }
