@@ -484,4 +484,29 @@ describe("restore runs and the trim hold", () => {
     expect(after.length).toBeGreaterThan(1);
     for (const r of after) expect(r).toContain(PAGE);
   }, 30_000);
+
+  it("keeps a drain-deferred page held when a retry aborts on an indeterminate reconnect", async () => {
+    const reports: string[][] = [];
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_report_restore_progress") {
+        reports.push([
+          ...((args as { deferredPages?: string[] } | undefined)?.deferredPages ?? []),
+        ]);
+        return { success: true, data: null };
+      }
+      await settle(5);
+      if (cmd === "terminal_session_list_open") {
+        return { success: true, data: { sessions: [], deferredByDrain: { reason: "drain" } } };
+      }
+      return { success: true, data: { settled: true, held: [] } };
+    };
+    mount();
+    await until("the first deferral report", () => reports.some((r) => r.includes(PAGE)));
+    reconnectIndeterminate = true;
+    const before = reconnectRuns;
+    await renderUntil("an aborted retry", api, () => reconnectRuns >= before + 1);
+    await settle(100);
+    const first = reports.findIndex((r) => r.includes(PAGE));
+    for (const r of reports.slice(first)) expect(r).toContain(PAGE);
+  }, 30_000);
 });

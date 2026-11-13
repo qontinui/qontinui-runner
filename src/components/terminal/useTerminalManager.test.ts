@@ -9,6 +9,8 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
 import {
   applyBypassMark,
@@ -642,5 +644,59 @@ describe("closeTabAndRecord", () => {
       recordClose: () => {},
     });
     expect(onRemoved).toHaveBeenCalledWith(tabs, [tabs[1]]);
+  });
+
+  it("fills the record from the updater's prev when the snapshot lags a pending id", () => {
+    const lagging = [tab("t1"), tab("t2")]; // the id is still in a queued update
+    const recordClose = vi.fn();
+    const deferred: Array<(prev: TerminalTab[]) => TerminalTab[]> = [];
+    closeTabAndRecord("t1", {
+      tabs: lagging,
+      sessionBacked: false,
+      setTabs: (u) => deferred.push(u),
+      onRemoved: () => {},
+      recordClose,
+    });
+    expect(recordClose).not.toHaveBeenCalled();
+    deferred[0](tabs);
+    expect(recordClose).toHaveBeenCalledTimes(1);
+    expect(recordClose.mock.calls[0][0]).toMatchObject({ terminalId: "t1", reason: "explicit" });
+  });
+
+  it("records once when StrictMode runs the updater twice", () => {
+    const recordClose = vi.fn();
+    closeTabAndRecord("t1", {
+      tabs: [tab("t1"), tab("t2")],
+      sessionBacked: false,
+      setTabs: (u) => {
+        u(tabs);
+        u(tabs);
+      },
+      onRemoved: () => {},
+      recordClose,
+    });
+    expect(recordClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("never records the same terminal twice when both the snapshot and prev name it", () => {
+    const recordClose = vi.fn();
+    closeTabAndRecord("t1", {
+      tabs,
+      sessionBacked: false,
+      setTabs: (u) => void u(tabs),
+      onRemoved: () => {},
+      recordClose,
+    });
+    expect(recordClose).toHaveBeenCalledTimes(1);
+  });
+
+  // Review A10: the hook must hand closeTabAndRecord the live snapshot, not a
+  // list read inside the updater, or the deferred-updater defect comes back.
+  it("the hook's closeTerminal passes tabsRef.current as the snapshot", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL("./useTerminalManager.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(src).toMatch(/closeTabAndRecord\(id, \{\s*tabs: tabsRef\.current,/);
   });
 });

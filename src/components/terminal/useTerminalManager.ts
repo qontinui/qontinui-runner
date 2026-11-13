@@ -275,25 +275,39 @@ export interface TabCloseSteps {
 
 /**
  * Close tab `id`: remove it from the list and record an `explicit` close for the
- * Claude session it ran.
+ * Claude session it ran — exactly once.
  *
- * The record is built from `steps.tabs` BEFORE `setTabs`, never inside the
- * updater. React runs an updater synchronously only when the component has no
- * other update queued; otherwise it runs at the next render, after this
- * handler has returned. The record used to be assigned inside the updater and
- * read right after `setTabs`, so a close with any update pending (measured
- * 2026-11-13 on a temp runner, a UI Bridge tab close) found it still `null`
- * and recorded nothing: the session's row stayed open and the since-restart
- * ledger could never see a deliberate close.
+ * The record is built from `steps.tabs` BEFORE `setTabs` and sent at once.
+ * React runs an updater synchronously only when the component has no other
+ * update queued; otherwise it runs at the next render, after this handler has
+ * returned. The record used to be assigned inside the updater and read right
+ * after `setTabs`, so a close with any update pending (measured 2026-11-13 on
+ * a temp runner, a UI Bridge tab close) found it still `null` and recorded
+ * nothing: the session's row stayed open and the since-restart ledger could
+ * never see a deliberate close.
+ *
+ * The snapshot can lag the updates still queued: a session id backfilled in a
+ * pending update is absent from it. When the snapshot names no session, the
+ * updater FILLS the record from `prev`. It never sends a second record for a
+ * terminal the snapshot already recorded: the backend cross-checks the
+ * `(claudeSessionId, terminalId)` pair and closes the record the terminal
+ * actually owns, so a stale id in the snapshot is corrected there. The
+ * once-flag also absorbs StrictMode's double invocation of the updater.
  */
 export function closeTabAndRecord(id: string, steps: TabCloseSteps): void {
-  const record = steps.sessionBacked ? null : buildSessionCloseRecord(steps.tabs, id);
+  let recorded = false;
+  const send = (record: SessionCloseArgs | null) => {
+    if (recorded || record === null || steps.sessionBacked) return;
+    recorded = true;
+    steps.recordClose(record);
+  };
+  send(buildSessionCloseRecord(steps.tabs, id));
   steps.setTabs((prev) => {
+    send(buildSessionCloseRecord(prev, id));
     const next = prev.filter((t) => t.id !== id);
     steps.onRemoved(prev, next);
     return next;
   });
-  if (record) steps.recordClose(record);
 }
 
 /**

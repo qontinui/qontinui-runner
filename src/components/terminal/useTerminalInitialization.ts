@@ -1660,6 +1660,14 @@ export function useTerminalInitialization({
   // deferred nor restored for as long as the retry ran, so the strip and its
   // rows flapped between "deferred by drain" and "page not opened" (measured
   // 2026-11-13 on a temp runner, two reads two seconds apart).
+  //
+  // A page is cleared ONLY when a run learned the drain no longer withholds it.
+  // A retry that aborts on an indeterminate reconnect, or throws, learned
+  // nothing about the drain, so the page stays held — the honest reading is
+  // still "the drain deferred it and nothing has restored it". A page removed
+  // from the layout is not pruned either: `removePage` closes every terminal on
+  // it, so its rows close and no restore is owed them, and a waiting row is
+  // what the strip and `restoreOwed` count — never the set's size.
   const drainHeldPages = useRef<Set<string>>(new Set());
   // Each page's newest restore run. A re-run can start before an earlier run's
   // drain timer fires, and that timer must not release the hold the newer run
