@@ -141,9 +141,14 @@ use super::{
 
 /// Relocates the whole harness — template cache and per-process roots — away
 /// from the default `<cargo target dir>/qontinui-test-pg` (to a RAM disk, or a
-/// roomier volume). It is also the boot-failure self-test's hook: pointed at a
-/// regular file, the harness cannot create its directory and must fail every
-/// test that asks it for a database.
+/// roomier volume). The directory must be the tester's own: the harness runs
+/// PostgreSQL out of it and keeps each cluster's superuser password in it, so
+/// on Unix it refuses one that another user owns or that it cannot make private
+/// ([`require_private`]). Name a directory of your own, such as
+/// `/dev/shm/<you>/qontinui-test-pg` (missing parents are created private),
+/// never a shared one such as `/dev/shm` itself. It is also the boot-failure
+/// self-test's hook: pointed at a regular file, the harness cannot create its
+/// directory and must fail every test that asks it for a database.
 pub const HARNESS_DIR_ENV: &str = "QONTINUI_TEST_PG_DIR";
 
 /// Runs every harness database on this EXTERNAL server instead of the bundled
@@ -898,8 +903,8 @@ async fn boot_embedded() -> Result<Server, String> {
 /// directory, then removed each other's cache in turn until neither became
 /// ready.
 ///
-/// Either way the cache is marked used ([`LAST_USED_FILE`]) and made private
-/// ([`ensure_private`]) as it is entered, under the same lock.
+/// Either way the cache is entered under the same lock through
+/// [`enter_private`]: required private, marked used, then entered.
 async fn enter_or_build<T, Built>(
     cache_lock: &std::fs::File,
     template_dir: &Path,
@@ -917,9 +922,7 @@ where
     };
     cache_lock.lock_shared().map_err(lock_failed)?;
     if template_dir.join(READY_FILE).is_file() {
-        touch_last_used(template_dir);
-        ensure_private(template_dir);
-        let entered = enter();
+        let entered = enter_private(template_dir, enter);
         let _ = cache_lock.unlock();
         return entered.map(|entered| (entered, None));
     }
@@ -932,13 +935,23 @@ where
         } else {
             Some(build().await?)
         };
-        touch_last_used(template_dir);
-        ensure_private(template_dir);
-        enter().map(|entered| (entered, built))
+        enter_private(template_dir, enter).map(|entered| (entered, built))
     }
     .await;
     let _ = cache_lock.unlock();
     outcome
+}
+
+/// Enter the template cache in `template_dir` with `enter` once it is proven
+/// private ([`require_private`]): it holds the binaries the cluster runs and
+/// its superuser password. Marks it used ([`LAST_USED_FILE`]) first.
+fn enter_private<T>(
+    template_dir: &Path,
+    enter: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    require_private(template_dir)?;
+    touch_last_used(template_dir);
+    enter()
 }
 
 /// Mark a template cache used now. [`LAST_USED_FILE`]'s mtime is what
@@ -2618,8 +2631,8 @@ fn private_dir_builder() -> std::fs::DirBuilder {
     builder
 }
 
-/// Enter the harness directory: create it private if it is missing, and make
-/// it private if it is not ([`ensure_private`]).
+/// Enter the harness directory: create it private if it is missing, and
+/// require it private either way ([`require_private`]).
 fn prepare_harness_dir(dir: &Path) -> Result<(), String> {
     create_private_dir_all(dir).map_err(|e| {
         format!(
@@ -2627,44 +2640,75 @@ fn prepare_harness_dir(dir: &Path) -> Result<(), String> {
             dir.display()
         )
     })?;
-    ensure_private(dir);
-    Ok(())
+    require_private(dir)
 }
 
-/// [`make_private`], saying what it could not do and carrying on: a directory
-/// whose mode this process cannot change, another user's say, still works.
-fn ensure_private(dir: &Path) {
-    if let Err(problem) = make_private(dir) {
-        say(format!("{problem}; carrying on with it as it is"));
-    }
-}
-
-/// Set a directory that is not private to 0700 on Unix; one already private is
-/// left as it is. A directory that exists keeps its mode when it is created
-/// again ([`create_private_dir_all`]), and the harness directory and every
-/// template cache hold a cluster's superuser password (`tpl-*/pg-pass`), so
-/// each is made private whenever the harness enters it, however it was made.
-fn make_private(dir: &Path) -> Result<(), String> {
+/// Make `dir` private to this user, and refuse it if it is not.
+///
+/// The harness runs PostgreSQL out of the template caches in its directory and
+/// keeps each cluster's superuser password there (`tpl-*/pg-pass`), so a
+/// directory another user owns, or can write to, could hand this process their
+/// binaries to run. On Unix a directory this process's effective user owns that
+/// is open to its group or to others is set to 0700 — creating a directory that
+/// exists leaves its mode as it is ([`create_private_dir_all`]) — and then the
+/// directory must be owned by that user and open to no one else
+/// ([`privacy_problem`]), or the boot fails with an error naming it and the
+/// remedy. Windows is not checked.
+fn require_private(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir)
-            .map_err(|e| format!("could not read the mode of {}: {e}", dir.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-                format!(
-                    "could not make {} private (it is {mode:o}): {e}",
-                    dir.display()
-                )
-            })?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner_and_mode = |dir: &Path| {
+            std::fs::metadata(dir)
+                .map(|meta| (meta.uid(), meta.mode() & 0o7777))
+                .map_err(|e| {
+                    format!(
+                        "could not read the owner and mode of {}: {e}",
+                        dir.display()
+                    )
+                })
+        };
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let (owner, mode) = owner_and_mode(dir)?;
+        let unchanged = if owner == me && mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).err()
+        } else {
+            None
+        };
+        let (owner, mode) = owner_and_mode(dir)?;
+        if let Some(problem) = privacy_problem(owner, mode, me) {
+            let tried = unchanged
+                .map(|e| format!(" (setting it to 0700 failed: {e})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "{} is {problem}{tried}. The harness runs PostgreSQL out of it and keeps a \
+                 cluster's superuser password in it, so it must be private to this user: \
+                 remove it, or point {HARNESS_DIR_ENV} at a directory of your own",
+                dir.display()
+            ));
         }
     }
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+/// Why a directory owned by uid `owner`, with permission bits `mode`, is not
+/// private to uid `me`: another user owns it, or its group or others have any
+/// access. `None` when it is private.
+#[cfg(any(unix, test))]
+fn privacy_problem(owner: u32, mode: u32, me: u32) -> Option<String> {
+    if owner != me {
+        Some(format!("owned by uid {owner}, not by this user (uid {me})"))
+    } else if mode & 0o077 != 0 {
+        Some(format!(
+            "open to its group or to others (mode {:o})",
+            mode & 0o777
+        ))
+    } else {
+        None
+    }
 }
 
 /// How long a server log is now, in bytes: where whatever is written to it next
@@ -3874,8 +3918,75 @@ mod tests {
         );
 
         assert!(
-            make_private(&dir.join("not-there")).is_err(),
-            "a directory whose mode cannot be read must be reported, not passed over"
+            require_private(&dir.join("not-there")).is_err(),
+            "a directory whose mode cannot be read must be refused, not passed over"
+        );
+    }
+
+    /// A directory is private to a user only when that user owns it and its
+    /// group and others have no access at all: read, write or search.
+    #[test]
+    fn a_directory_is_private_only_to_its_owner_with_no_other_access() {
+        let me = 1000;
+        assert_eq!(privacy_problem(me, 0o700, me), None);
+        assert_eq!(
+            privacy_problem(me, 0o1700, me),
+            None,
+            "the sticky bit opens nothing"
+        );
+        for open in [0o740, 0o720, 0o710, 0o704, 0o702, 0o701, 0o775, 0o777] {
+            let problem = privacy_problem(me, open, me)
+                .unwrap_or_else(|| panic!("mode {open:o} is open to its group or others"));
+            assert!(
+                problem.contains(&format!("{open:o}")),
+                "the problem names the mode: {problem}"
+            );
+        }
+        for owner in [0, 1001] {
+            let problem = privacy_problem(owner, 0o700, me)
+                .unwrap_or_else(|| panic!("a directory uid {owner} owns is not this user's"));
+            assert!(
+                problem.contains(&format!("uid {owner}")),
+                "the problem names the owner: {problem}"
+            );
+        }
+    }
+
+    /// A directory that stays open to its group or others after the harness tried
+    /// to make it private FAILS the boot, as the harness directory and as a
+    /// template cache alike, and the error names it. `/proc/self` is such a
+    /// directory for every user, root included: it is the process's own and
+    /// readable by all, and procfs refuses to change its mode. (A directory
+    /// another user owns cannot be made by a test; the predicate's own test
+    /// covers that case, and the tightening of an open one is covered above.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_made_private_is_refused() {
+        let open = Path::new("/proc/self");
+        let refused = prepare_harness_dir(open)
+            .expect_err("a harness directory open to others must fail the boot");
+        assert!(
+            refused.contains("/proc/self") && refused.contains(HARNESS_DIR_ENV),
+            "the error names the directory and the remedy: {refused}"
+        );
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let lock = open_lock(scratch.path()).expect("the cache lock");
+        let entered = std::cell::Cell::new(false);
+        let refused = enter_or_build(
+            &lock,
+            open,
+            || async { Ok::<_, String>(Duration::from_millis(1)) },
+            || {
+                entered.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a template cache open to others must not be entered");
+        assert!(
+            !entered.get() && refused.contains("/proc/self"),
+            "the cache was refused before it was entered, by name: {refused}"
         );
     }
 
