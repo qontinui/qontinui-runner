@@ -9,7 +9,6 @@ use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::claude_protocol::codec::encode_message;
-use crate::str_utils::truncate_str;
 
 /// Thread-safe wrapper around Claude CLI's stdin pipe.
 pub struct StdinWriter {
@@ -40,15 +39,14 @@ impl StdinWriter {
                 stdin
                     .flush()
                     .map_err(|e| format!("Failed to flush stdin: {}", e))?;
-                let preview = if encoded.len() > 200 {
-                    truncate_str(&encoded, 200)
-                } else {
-                    &encoded
-                };
+                // Control frames are logged as type and size only: a
+                // permission answer carries the tool's full input (commands,
+                // file contents) and an operator's deny message.
+                let preview = super::dispatcher::stdout_log_preview(encoded.trim_end());
                 info!(
                     "[STDIN_WRITER] Wrote NDJSON message ({} bytes): {}",
                     encoded.len(),
-                    preview.trim()
+                    preview
                 );
                 Ok(())
             }

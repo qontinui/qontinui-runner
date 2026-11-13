@@ -90,7 +90,7 @@ pub struct ProcessSnapshot {
     pub names: HashMap<u32, String>,
     /// `exe_paths[pid] -> full executable path` (WMI `ExecutablePath` on
     /// Windows, `/proc/<pid>/exe` on Unix), when resolvable. Powers the
-    /// qontinui-shim exclusion in [`is_countable_claude`]: the path-identity
+    /// qontinui-shim exclusion in [`is_countable_ai_cli`]: the path-identity
     /// shim is ALSO named `claude.exe`, and the one fact that distinguishes it
     /// from a real claude is the directory it lives in. Fail-open: a pid
     /// absent here (access denied, protected process) is treated as a real
@@ -175,13 +175,18 @@ pub fn inclusive_subtree_pids(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<
 
 /// Extract the session id a process command line NAMES, returning it ONLY when
 /// it is UUID-shaped (8-4-4-4-12 hex, case-insensitive). Handles every flag
-/// that carries a concrete id, in each spelling the provider CLI accepts:
+/// that carries a concrete id in some CLI profile
+/// ([`qontinui_runner_lib::cli_profile::id_flags`]), in each spelling the CLI
+/// accepts — for Claude Code:
 ///   - `--session-id <uuid>` / `--session-id=<uuid>` / `--session-id "<uuid>"`
 ///   - `--resume <uuid>`     / `--resume=<uuid>`     / `--resume "<uuid>"`
-///   - `-r <uuid>`  (claude's short `--resume`)
+///   - `-r <uuid>`  (the profile's short alias of `--resume`)
+///
+/// A long (`--`) flag is scanned as a substring; a short alias only at a token
+/// boundary (see [`find_flag_uuid`]).
 ///
 /// The resume forms matter because a resumed session's argv carries ONLY
-/// `--resume` — `claude_session::launch_spec::render_argv` drops `--session-id`
+/// `--resume` — `session::launch_spec::render_argv` drops `--session-id`
 /// when a resume id is present. Reading them here is the SAME class of evidence
 /// as reading `--session-id`: this is the live anchor process's own argv, which
 /// names the id that process is demonstrably running under, so the resulting
@@ -192,7 +197,7 @@ pub fn inclusive_subtree_pids(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<
 ///
 /// PRECEDENCE: `--resume` beats `--session-id`, mirroring
 /// `launch_spec::render_argv` step 3 ("resume takes precedence over
-/// session-id", `claude_session/launch_spec.rs:225-235`) — the resume id is the
+/// session-id", `session/launch_spec.rs` `compose_flags` step 3) — the resume id is the
 /// one the process actually runs under.
 ///
 /// FORK: `--resume X --fork-session` names the PARENT, while the process runs a
@@ -209,10 +214,17 @@ pub fn parse_session_id_from_cmdline(cmdline: &str) -> Option<String> {
     {
         return find_flag_uuid(cmdline, "--session-id", false);
     }
-    // resume first — see PRECEDENCE above.
-    find_flag_uuid(cmdline, "--resume", false)
-        .or_else(|| find_flag_uuid(cmdline, "-r", true))
-        .or_else(|| find_flag_uuid(cmdline, "--session-id", false))
+    use qontinui_runner_lib::cli_profile;
+    let flags: Vec<(&str, bool)> = cli_profile::all()
+        .iter()
+        .flat_map(cli_profile::id_flags)
+        .collect();
+    // resume flags first — see PRECEDENCE above.
+    let resumes = flags.iter().filter(|(_, resumes)| *resumes);
+    let pins = flags.iter().filter(|(_, resumes)| !*resumes);
+    resumes
+        .chain(pins)
+        .find_map(|&(flag, _)| find_flag_uuid(cmdline, flag, !flag.starts_with("--")))
 }
 
 /// Scan `cmdline` for `<needle>=<uuid>` / `<needle> <uuid>` (quotes tolerated)
@@ -279,12 +291,6 @@ fn is_uuid_shaped(s: &str) -> bool {
         .all(|(p, &l)| p.len() == l && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Case-insensitive basename match on `claude` / `claude.exe`. Tolerates a
-/// path-qualified name (takes the basename) and a trailing `.exe`.
-fn is_claude_image(name: Option<&String>) -> bool {
-    name.is_some_and(|name| image_stem(name) == "claude")
-}
-
 /// An image name as both image checks compare it: the last path component,
 /// lowercased, `.exe` stripped.
 fn image_stem(name: &str) -> String {
@@ -321,7 +327,7 @@ pub(crate) fn config_dir_of_pid(_pid: u32) -> Option<String> {
 
 /// The images a JS-runtime Claude Code is known to run as: the npm install is
 /// `node … cli.js` (`nodejs` where the distro names the binary so), and a build
-/// run under Bun is `bun`. These are the known images [`is_claude_image`] can
+/// run under Bun is `bun`. These are the known images [`is_ai_cli_image`] can
 /// miss a live `claude` behind — not the only possible ones: `deno`, or a
 /// version-suffixed `node22`, would escape this list too — and they are the
 /// ones the graceful-exit probe leaves UNDECIDED when Claude Code's session
@@ -340,25 +346,44 @@ pub(crate) fn may_be_js_runtime_claude(pid: u32, snapshot: &ProcessSnapshot) -> 
         .is_none_or(|name| JS_RUNTIME_IMAGES.contains(&image_stem(name).as_str()))
 }
 
-/// A pid counts as a live claude iff its image name matches `claude*` AND its
-/// executable does NOT live in one of qontinui's own shim directories. The
-/// path-identity shim (the `qontinui-shim` stub materialized as `claude.exe`)
-/// is indistinguishable from a real claude by basename — it exists precisely
-/// to shadow the name — so counting by [`is_claude_image`] alone double-counts
+/// Whether a process image names an AI CLI some profile claims
+/// ([`qontinui_runner_lib::cli_profile::profile_for_program`]: basename,
+/// case-insensitive, a Windows launcher suffix such as `.exe` tolerated).
+fn is_ai_cli_image(name: Option<&String>) -> bool {
+    name.is_some_and(|n| qontinui_runner_lib::cli_profile::profile_for_program(n).is_some())
+}
+
+/// A pid counts as a live AI CLI iff its image is one ([`is_ai_cli_image`])
+/// AND its executable does NOT live in one of qontinui's own shim directories.
+/// The path-identity shim (the `qontinui-shim` stub materialized as
+/// `claude.exe`) is indistinguishable from a real claude by basename — it
+/// exists precisely to shadow the name — so counting by image alone double-counts
 /// every shim-launched session (measured live 2026-07: 36 of 156 claude-named
 /// processes were the shim). The one fact that defines the shim is where it
 /// lives on disk, so the exclusion keys on the exe's directory (never on
 /// tree-shape heuristics like parent-is-also-claude, which miscount legitimate
 /// nested claude launches). Fail-open: a pid with no resolved exe path counts
 /// as real.
-pub(crate) fn is_countable_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
-    if !is_claude_image(snapshot.names.get(&pid)) {
+pub(crate) fn is_countable_ai_cli(pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    if !is_ai_cli_image(snapshot.names.get(&pid)) {
         return false;
     }
     match snapshot.exe_paths.get(&pid) {
         Some(exe_path) => !is_shim_dir_exe_path(exe_path, persistent_identity_shim_dir()),
         None => true,
     }
+}
+
+/// [`is_countable_ai_cli`] narrowed to the CLI the Claude profile claims — for
+/// a reader whose subject is Claude Code itself (its session registry, the
+/// agent-kind label `claude`), where a Codex process must not count.
+pub(crate) fn is_countable_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    is_countable_ai_cli(pid, snapshot)
+        && snapshot
+            .names
+            .get(&pid)
+            .and_then(|name| qontinui_runner_lib::cli_profile::profile_for_program(name))
+            .is_some_and(|profile| profile.id == qontinui_runner_lib::cli_profile::claude::ID)
 }
 
 /// The persistent identity-shim dir (`~/.qontinui/runner/identity-shim`) as a
@@ -390,7 +415,7 @@ fn persistent_identity_shim_dir() -> Option<&'static str> {
 ///
 /// Pure over its inputs apart from that marker probe; parsed with manual
 /// `/`+`\` splitting (not `std::path`) so Windows-style snapshot paths behave
-/// identically on every host, mirroring [`is_claude_image`].
+/// identically on every host, mirroring [`is_ai_cli_image`].
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"

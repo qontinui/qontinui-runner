@@ -45,7 +45,7 @@ pub(crate) fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::
     // The operator's session posture (review M2): bypass by default, `dontAsk`
     // plus the allow-list when selected.
     let permission = crate::settings::get_claude_session_permission()
-        .apply(crate::claude_session::launch_spec::PermissionMode::BypassPermissions);
+        .apply(crate::session::launch_spec::PermissionMode::BypassPermissions);
     build_fix_agent_command_with(prompt_file, model, &permission)
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::
 pub(crate) fn build_fix_agent_command_with(
     prompt_file: &str,
     model: &str,
-    permission: &crate::claude_session::launch_spec::PermissionMode,
+    permission: &crate::session::launch_spec::PermissionMode,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("claude");
     cmd.args(["--print", prompt_file]);
@@ -257,7 +257,7 @@ mod tests {
     /// Review M2: the fix agent honours the allow-list posture.
     #[test]
     fn fix_agent_command_renders_the_session_permission_posture() {
-        use crate::claude_session::launch_spec::PermissionMode;
+        use crate::session::launch_spec::PermissionMode;
         let cmd = build_fix_agent_command_with(
             "/tmp/p.txt",
             "sonnet",

@@ -86,6 +86,7 @@ export type LiveRowTab = Pick<
   | "createdAt"
   | "claudeSessionId"
   | "claudeConfigDir"
+  | "sessionProvider"
   | "remote"
   | "__synthetic"
 >;
@@ -129,6 +130,9 @@ export function buildTabRows({
     rows.push({
       source: "tab",
       sessionId: tab.id,
+      // The tab's launch provider; a tab that never named one is a Claude tab,
+      // the same default the transcript rows use.
+      provider: tab.sessionProvider ?? "claude",
       accountLabel: configDir ? extractAccountLabel(configDir) : "default",
       configDir,
       projectPath,

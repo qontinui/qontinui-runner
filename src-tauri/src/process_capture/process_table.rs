@@ -903,24 +903,22 @@ fn is_node_image(name: &str) -> bool {
     }
 }
 
-/// Whether a command line names claude (Windows: case-insensitive, as the
-/// PowerShell `-match 'claude'` it replaces was).
-///
-/// SEQUENCING: open qontinui-runner PR #1990 widens the subprocess
-/// enumeration's match from `claude` to every CLI profile's program
-/// (`cli_profile::all_programs`). This is now the predicate the scan actually
-/// applies — whichever of #1990 and this change lands second must widen THIS
-/// function the same way, or the in-process scan keeps matching claude alone.
-fn mentions_claude(cmdline: &str) -> bool {
-    if cfg!(windows) {
-        cmdline.to_ascii_lowercase().contains("claude")
+/// Whether a command line names any program a CLI profile claims
+/// ([`qontinui_runner_lib::cli_profile::all_programs`]) — the same set the
+/// PowerShell enumeration fallback's `-match` alternation names (Windows:
+/// case-insensitive, as that `-match` is). The profiles' program stems are
+/// lowercase, so lowercasing the line is the whole comparison.
+fn mentions_ai_cli(cmdline: &str) -> bool {
+    let line = if cfg!(windows) {
+        std::borrow::Cow::Owned(cmdline.to_ascii_lowercase())
     } else {
-        cmdline.contains("claude")
-    }
+        std::borrow::Cow::Borrowed(cmdline)
+    };
+    qontinui_runner_lib::cli_profile::all_programs().any(|program| line.contains(program))
 }
 
-/// `(pid, command line)` of every `node` process whose command line names
-/// `claude`, sorted by pid — the set the external-session scan reports — from
+/// `(pid, command line)` of every `node` process whose command line names an
+/// AI CLI's program (`claude`, `codex`), sorted by pid — the set the external-session scan reports — from
 /// the shared snapshot plus an in-process read of the candidates' command
 /// lines. `Err` when either read could not be made in-process; the caller's
 /// own enumeration is then the fallback.
@@ -946,7 +944,7 @@ fn node_claude_processes_in(
     }
     let mut found: Vec<(u32, String)> = command_lines(&candidates)?
         .into_iter()
-        .filter(|(_, line)| mentions_claude(line))
+        .filter(|(_, line)| mentions_ai_cli(line))
         .collect();
     found.sort_by_key(|(pid, _)| *pid);
     Ok(found)
