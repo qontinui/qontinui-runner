@@ -2967,6 +2967,38 @@ async fn append_transcript_record_handler(
 // webview reports as deferred pages, which the ledger's `restoreOwed` reads),
 // the lifecycle poll's census hold, the wind-down executor and the banner.
 
+// ## Why only a temp runner may force it
+//
+// A forced drain is a real drain to every reader, the wind-down executor
+// included: it stops stewards and closes FINISHED idle sessions. That is the
+// point on a temp runner under test and a hazard on anything else, so `drain`
+// is refused unless this process is a supervisor TEMP runner, whose
+// `QONTINUI_INSTANCE_NAME` is its own `test-…` id (qontinui-supervisor
+// `process::temp_runner_instance_name`). The primary carries no instance name,
+// and a named secondary carries an operator-chosen one. With the override
+// unreachable everywhere else, keeping it out of the wind-down executor's reads
+// would only make the temp runner's drain less real, so it is not done.
+// `release` is allowed anywhere: it can only remove this route's own override.
+
+/// The instance-name prefix the supervisor gives every temp runner.
+const TEMP_RUNNER_NAME_PREFIX: &str = "test-";
+
+/// PURE: may this process force a drain? Only a supervisor temp runner may.
+fn force_drain_allowed(instance_name: Option<&str>) -> Result<(), String> {
+    match instance_name {
+        Some(name) if name.starts_with(TEMP_RUNNER_NAME_PREFIX) => Ok(()),
+        Some(name) => Err(format!(
+            "refused: this runner's instance name {name:?} is not a supervisor temp runner's \
+             (`{TEMP_RUNNER_NAME_PREFIX}…`); a forced drain winds down finished sessions"
+        )),
+        None => Err(
+            "refused: this is the primary runner (no QONTINUI_INSTANCE_NAME); a forced drain \
+             would wind down its finished sessions. Use a supervisor temp runner."
+                .to_string(),
+        ),
+    }
+}
+
 /// What the route may do. There is deliberately no variant that clears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -3023,6 +3055,18 @@ async fn force_coord_drain_handler(
             }),
         )
     })?;
+    if req.action == ForceCoordDrainAction::Drain {
+        let name = qontinui_runner_lib::instance_env::instance_name();
+        force_drain_allowed(name.as_deref()).map_err(|error| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(InjectSessionError {
+                    success: false,
+                    error,
+                }),
+            )
+        })?;
+    }
     let change = match req.action {
         ForceCoordDrainAction::Drain => {
             crate::coord_drain_state::force_drained(req.reason.as_deref())
@@ -3294,6 +3338,16 @@ mod tests {
                 "route {route} must remain wired in test_fixtures::routes()",
             );
         }
+    }
+
+    /// Only a supervisor temp runner may force a drain: never the primary (no
+    /// instance name), never a named secondary.
+    #[test]
+    fn force_coord_drain_is_refused_off_a_temp_runner() {
+        assert!(force_drain_allowed(None).is_err());
+        assert!(force_drain_allowed(Some("named-29890-1a1bd55781c-1")).is_err());
+        assert!(force_drain_allowed(Some("local-web")).is_err());
+        assert!(force_drain_allowed(Some("test-1a1d5eb4953-22")).is_ok());
     }
 
     /// The force-coord-drain body grammar is one-way: `drain` (with an optional
