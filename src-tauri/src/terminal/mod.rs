@@ -14,6 +14,7 @@ pub mod account_migration;
 pub mod agent_status_sideband;
 pub mod auto_response;
 pub mod auto_response_fleet;
+pub mod child_path; // The base PATH every hosted-session child is composed from (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path)
 pub mod claude_resume_sniff;
 pub mod close_authority;
 pub mod commit_report;
