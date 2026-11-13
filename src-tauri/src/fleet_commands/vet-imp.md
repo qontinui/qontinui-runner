@@ -231,10 +231,15 @@ no peer can see, which is precisely the failure this precondition exists to
 prevent. Publish it with:
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on new \
   "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
   "docs: add <plan-stem> (DRAFT)"
 ```
+
+`--based-on new` asserts the file is not on origin yet; exit 7 (STALE BASE)
+means it is, so the local untracked copy is not the plan peers read — vet the
+origin copy instead (`_status-writers.md` → "Publishing a stamp — the
+compare-and-swap").
 
 The helper is the one implementation of what this step used to spell out by
 hand: it fetches the default branch with an explicit refspec, builds the commit
@@ -636,7 +641,7 @@ verdict on its **exit code**: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
 `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
 runtime bound: the `--max-runtime` cap with the owner's liveness UNKNOWN, or the
 `--max-runtime-hard` ceiling; not a coord verdict; re-`add` then `start`),
-`OWNER_GONE` (11 — the owning session died and the loop released every row).
+`OWNER_GONE` (11 — the owning session is gone: its pid died, its transcript went idle or missing, or coord closed or finished the session; the loop released every row).
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"
@@ -678,17 +683,22 @@ stale token after a successful `REFRESHED`.
 
 Fire this at Step 5, in the same try/finally so it also runs on every abort path
 (a `/vet-plan` abort at Step 3, an operator **Abort** above, a failed chain).
-**Stop the heartbeat FIRST** — `remove` the row, then `stop` the loop — so the
-loop cannot re-arm a key this chain is about to give up:
+**Release through the one door, then `stop` the loop.** `plan-reserve-release.sh
+release` withdraws the plan's open implement→ship net (`/implement-plan` Step 0.5)
+FIRST, then `remove`s the heartbeat row, then POSTs `/claims/release`: a release
+with the net still open clears it and dispatches a duplicate session. Pass
+`--net-gate` when the implement half reported the net's `gate_id`. It finds the
+session's ledger itself (no `--ledger`) and runs at most about 90 s, inside the
+Bash tool's 120 s default (its RUNTIME header):
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh remove \
-  --ledger "$CLAIM_LEDGER" --kind semantic_resource --key "plan:<plan-stem>"
+bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
+  --stem "<plan-stem>" --reason "<why>"
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh stop --ledger "$CLAIM_LEDGER"
 ```
 
 `remove` of the last row stops the loop by itself and `stop` is idempotent
-**once the ledger is empty**, so running both in that order is safe. Both are
+**once the ledger is empty**, so running `stop` after the script is safe. Both are
 skipped on `renewed`, exactly as the release is — this chain neither started that
 loop nor owns it.
 
@@ -696,7 +706,7 @@ loop nor owns it.
 past it.** The ledger is keyed on `$CLAUDE_CODE_SESSION_ID`, which a subagent
 **inherits**, so one file is shared by every context under one harness session
 and this loop is the sole renewer of every row in it. Rows still present mean the
-`remove` above did not run, or a sibling context still holds claims. Note the
+script's `remove` did not run, or a sibling context still holds claims. Note the
 `renewed` skip does **not** cover the subagent case: a subagent running this
 chain on its own plan reserves a key the parent never took and gets `granted`
 (measured 2026-09-04). Plan
@@ -710,32 +720,32 @@ line cannot be read; there is no usable pidfile and the process table is
 unreadable; or the pidfile's loop WAS stopped (a `stopped pid=…` line comes
 first) but the unreadable table cannot rule out a second loop. On either exit,
 quote the `stop-failed …` / `unknown=1 …` line in your report and never record
-the loop as stopped. Still run the release below, because the release is what
+the loop as stopped. The script reports its own `remove` as `heartbeat=rc_<n>` on
+its final line and releases anyway, because the release is what
 coord reads. A loop that is still running with its rows gone (a refused signal,
 or an UNKNOWN) ends by itself at its next pass over the empty ledger. A loop
 that outlived KILL will NOT end by itself, so name its pid as left behind.
 `--force` changes neither answer. What each line means: `scripts/README.md` →
 "`stop` reports only what it observes".
 
-Then release:
-
-```bash
-curl -fsS -X POST "$COORD_HTTP_URL/claims/release" \
-  -H "Content-Type: application/json" \
-  -d "$(cat <<EOF
-{
-  "kind": "semantic_resource",
-  "resource_key": "plan:<plan-stem>",
-  "machine_id": "<machine_id>",
-  "agent_session_id": "$AGENT_SESSION_ID"
-}
-EOF
-)"
-```
+The script prints a line per net it found, then ONE final verdict line: quote it
+in the Step 5 report. `RELEASED` (exit 0) is clean; `NET_UNRETIRED <id|unknown>`
+(3) means the net read or a withdraw failed, a `--net-gate` was not this plan's
+net, or the 60 s retire budget ran out, and the release ran anyway, so a
+redundant session is expected; `NET_FIRED <id>` (6) means the net `--net-gate`
+names had already dispatched one (a consumed net it does not name is read as a
+predecessor's, `NET_INERT`); `NOT_HELD` (4) is the lapse below, and `holder=other`
+on it means another owner holds the reserve now; `RELEASE_UNKNOWN` (5) got no
+readable answer. `UNKNOWN` (2) and a usage error (64) did nothing and released
+NOTHING: the reserve is still held, so fix the cause and run it again. A
+`NET_MUTED <id>` line, and a `NET_CANCELLED <id>` line saying the mute did not
+land, are nets that stay open: name each id in the report (the final line's `--`
+note lists them).
 
 The release MUST carry the SAME `agent_session_id` used at acquire — the owner
 token is the match key, so omitting it returns `"not_held"` and leaves the
-reservation to TTL out. **Skip the release entirely if this step returned
+reservation to TTL out (the script resolves the pair as the acquire above does;
+`--machine-id` / `--session-id` override it). **Skip the release entirely if this step returned
 `renewed`** — something outside this chain acquired the reserve and owns it.
 
 ⚠️ **A `not_held` release is evidence the lock LAPSED. It is not a no-op.** The
@@ -941,7 +951,8 @@ the vet report says `NO NET (no withdraw door: …)` so the gap is visible.
 > not know this chain existed: without a brief its whole context is
 > `run /implement-plan <path>`. This is the untagged `continuation_spawn` shape,
 > which has no `hint` field, so the brief is appended to `initial_prompt` after
-> a blank line — byte-identical to what coord builds from a typed `hint`.
+> a blank line — byte-identical to what coord builds from a typed `hint`, less
+> the closing `/unattended` line coord adds only to a typed `run_skill`.
 > Canonical: `_gate-registration` → "The brief — a continuation with no `hint`
 > is a fresh agent with no context" — keep copies in sync.
 
@@ -1080,7 +1091,10 @@ states that legitimately stop the lifecycle must stop it here too:
   4. `phases_declared` is **not `null`**
   5. `phases_remaining == []` — the LITERAL empty list, never `null`
   6. that `[]` is **corroborated by the same response** (the corroboration rule
-     below)
+     below: a non-empty `phases_declared_indices`, and either
+     `phases_complete_scope` the literal `true` or every declared index covered
+     by `phases_delivered` or by a resolved `phases_attested` entry, with at
+     least one declared index in `phases_delivered`)
   7. `evidence_gaps` carries no `NO PHASE ATTRIBUTION` entry
 
   **Before routing to closeout, retire this run's net.** If Step 2's `/vet-plan`
@@ -1141,7 +1155,7 @@ states that legitimately stop the lifecycle must stop it here too:
   tenant (each printed `bearer <tenant>=<path>`,
   `POST https://coord.qontinui.io/mcp`, `-H "@<path>"`), classify each answer
   by its RESPONSE SHAPE with `/vet-plan` §0.25's shape table (a not-found body
-  or a clean arm-5 body is `clear`; a body meeting all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response ∧ no `NO PHASE ATTRIBUTION` gap — is `found`; any body carrying a top-level
+  or a clean arm-5 body is `clear`; a body meeting all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response (a non-empty `phases_declared_indices`, and either `phases_complete_scope` the literal `true` or every declared index in `phases_delivered` or in a resolved `phases_attested` entry, with at least one declared index in `phases_delivered`) ∧ no `NO PHASE ATTRIBUTION` gap — is `found`; any body carrying a top-level
   `merged_degraded_reason` is `unknown` whatever else it says; anything else or no answer is `unknown` — by shape, not by the arm
   rows, whose recon conjunct applies only to the folded result), and fold with
   `recon-tenant.sh --union --tenants <…> --set <h>`. `FOUND` is the closeout STOP above, and it wins over
@@ -1176,10 +1190,15 @@ states that legitimately stop the lifecycle must stop it here too:
 
   > ⚠️ **The corroboration rule — what entitles a literal `[]` to stop.** The
   > literal `[]` may stop **only when the same response corroborates it**:
-  > `phases_declared_indices` is non-empty and every index in it also appears in
-  > `phases_delivered`. When `phases_declared_indices` is non-empty and
-  > `phases_delivered` does not cover it, `[]` contradicts its own neighbours —
-  > coord is claiming nothing remains while not having attributed every declared
+  > `phases_declared_indices` is non-empty, and **either**
+  > `phases_complete_scope` is the literal `true` **or** `phases_delivered` names at least one declared index and
+  > every declared index is **covered** — it appears in `phases_delivered`,
+  > **or** it appears in `phases_attested` **and** `phase_attestations` carries
+  > an entry with that `phase_index` whose `resolution` is `"resolved"`. When
+  > `phases_complete_scope` is not `true`,
+  > `phases_declared_indices` is non-empty and that union does not cover it,
+  > `[]` contradicts its own neighbours — coord is claiming nothing remains while
+  > neither a landed attribution nor a live attestation covers every declared
   > phase — so read
   > it as UNKNOWN and fall through. An EMPTY `phases_declared_indices` is not
   > corroboration either: there is nothing for the `[]` to be the answer to, so
@@ -1188,10 +1207,46 @@ states that legitimately stop the lifecycle must stop it here too:
   > establish (the coord-fix plan is `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
   > throughout this arm — not the plan you are running).
   >
+  > **The attested arm, and its bounds — the same rule as `/vet-plan` §0.25.** A
+  > phase whose output is not a PR (an evidence record, a measurement, a
+  > decision) is closed by a phase attestation, and coord serves it as
+  > `phases_attested` beside `phase_attestations` (only `resolution:
+  > "resolved"` rows reach the former). coord unions it into `phases_remaining`
+  > and `shipped`, and served policy `finished-criteria` counts an attested phase
+  > as finished — so a PR-only test left such a plan at UNKNOWN forever (coord
+  > finding `426553fc`). An index without a matching `resolved` row, a
+  > `retracted` / `vanished` / `unreadable` row with no `resolved` row beside it
+  > for that index, a missing or malformed `phase_attestations`, an attested index outside the declaration, or a coord
+  > serving no `phases_attested` at all, contributes NOTHING — the phase stays
+  > uncovered, which is UNKNOWN, never permission. At least one DECLARED index
+  > must appear in `phases_delivered`, so a stop never rests on attestations
+  > alone — and it must be a declared one, because coord does not clip
+  > `phases_delivered` to the declaration: a PR scoped to an undeclared phase
+  > (an off-by-one between 0- and 1-based numbering) leaves it non-empty while no
+  > declared phase has a landed PR. Erring that way is a false negative that
+  > falls through to the stamp arms, which still guard. `PHASE
+  > ATTESTED WITHOUT A PR` in `evidence_gaps` is a disclosure, not a blocker —
+  > conjunct 7 names `NO PHASE ATTRIBUTION` only.
+  >
+  > **`phases_complete_scope: true` satisfies the coverage half by itself** (a
+  > non-empty `phases_declared_indices` is still required). coord (on a coord carrying the `phases_complete_scope` change — the qontinui-coord PR is pending)
+  > serves it `true` only when a LANDED, non-document citation's `Plan:`
+  > marker declared `delivers: complete` — a landed PR attributed the whole
+  > plan, so the stop still rests on a PR, not on attestations. Its residue —
+  > an author over-declaring `complete` — is the same trust as a wrongly scoped
+  > `phases:` marker, and the "bound, not a proof" paragraph below covers it.
+  > Only the literal `true` counts: a coord serving no `phases_complete_scope`
+  > (one predating that field) keeps the stricter reading above, so an ABSENT
+  > field is never read as `true`.
+  >
   > **This test is deliberately BUILD-INDEPENDENT, and that is why it is the
   > test.** `phases_declared_indices` and `phases_delivered` are already served
   > beside `phases_remaining` by the coord build running today, so the rule needs
-  > no deployment tell — no version probe, no "has the nullable contract reached
+  > no deployment tell (the attested arm is additive: a build serving no
+  > `phases_attested` reduces the union to `phases_delivered`, the old, stricter
+  > answer; the complete-scope branch is additive too: on a coord serving no
+  > `phases_complete_scope` it never fires and the test reduces to its prior
+  > reading) — no version probe, no "has the nullable contract reached
   > this tenant yet" question you would have to answer before you could read the
   > field at all. It returns the same verdict on a PRE-contract coord (which
   > spells every non-established state `[]`) and on a post-contract one (which
@@ -1211,13 +1266,13 @@ states that legitimately stop the lifecycle must stop it here too:
   >
   > **What the rule costs — stated so you do not "fix" it.** A genuinely
   > complete unit whose completeness was asserted some OTHER way fails
-  > corroboration and falls through to the stamp arms instead of stopping.
-  > **Two spellings, and the SECOND is the larger population today.** One: a
-  > citation declaring `complete`, which satisfies coord's coverage gate for a
-  > plan of any length while attributing no index at all, so `phases_delivered`
-  > stays empty. Two: landed citations carrying **no phase scope at all**, which
-  > leaves `phases_delivered` empty the same way. For a declaration of two or
-  > more phases that second spelling costs nothing new — coord raises the
+  > corroboration and falls through to the stamp arms instead of stopping. (A
+  > phase closed by a resolved attestation is no longer one of those ways, and
+  > nor is a landed citation declaring `complete`, which `phases_complete_scope`
+  > now carries.)
+  > **One spelling remains:** landed citations carrying **no phase scope at
+  > all**, which leaves `phases_delivered` empty. For a declaration of two or
+  > more phases that spelling costs nothing new — coord raises the
   > `NO PHASE ATTRIBUTION` gap there and the gap conjunct already blocked the
   > stop. It bites on a **single-phase declaration**, where that gap is
   > withheld on the build serving today (coord's Gap-5 arm requires
@@ -1263,9 +1318,10 @@ states that legitimately stop the lifecycle must stop it here too:
   > two spellings and both count as total — every declared index carries a
   > landed attribution, or **a single landed citation declared `complete`**,
   > which satisfies coord's coverage gate whatever the declared count is. The
-  > corroboration rule above is what separates them: only the first spelling can
-  > corroborate itself, and the `complete` spelling deliberately falls through
-  > (see "What the rule costs"). Under the nullable contract *(plan
+  > corroboration rule above is what separates them: the first spelling
+  > corroborates through `phases_delivered`, the `complete` spelling through
+  > `phases_complete_scope: true` (absent on an older coord, where it falls
+  > through to the stamp arms). Under the nullable contract *(plan
   > `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`,
   > Phase 3)* the first three render **`null`** — coord could not establish the
   > phase axis — and only the fourth renders **`[]`**: coord looked and nothing
@@ -1340,7 +1396,9 @@ states that legitimately stop the lifecycle must stop it here too:
   > Constructible today: the same phantom `{1}` plus one landed citation whose
   > marker carries `phases: 1` gives `phases_declared_indices: [1]` ⊆
   > `phases_delivered: [1]`, `phases_remaining: []` and no gap — **corroborated,
-  > and it STOPs**, on a plan with phases outstanding. Same shape for any
+  > and it STOPs**, on a plan with phases outstanding. An attestation on a
+  > wrong-but-declared index corroborates the same way (the attest door requires
+  > `phase_index` to be one of `phases_declared_indices`). Same shape for any
   > thinly-parsed multi-phase plan whose single landed PR cites the one index
   > that was parsed. It is rare today only because phase attribution is rare,
   > and the direction of travel is to make attribution common. That residue is
@@ -1481,7 +1539,7 @@ no session. Run the same script `/implement-plan` Step 4.7 runs — it is one
 implementation, invoked from two places, not a second copy of the check:
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --artifact "$ARM_FILE" --tree-root <the worktree the implement half reviewed>
+bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --artifact "$ARM_FILE" --tree-root <a live worktree of the repo named like the reviewed checkout>
 ```
 
 **Run it in the background.** Door calls and tree re-measures are serial, each bounded by `REVIEW_ARM_CORROBORATE_TIMEOUT` (default 600 s), so a run can take up to (N+1+T) × that budget (N PRs, the coverage call, T checkouts re-measured). Start it with the Bash tool's `run_in_background` (or watch it with Monitor) and read the verdict line when it exits — a foreground call under the tool's 120 s / 600 s timeout is killed with no verdict.
@@ -1516,10 +1574,23 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   row's detail names the budgets involved and the elapsed time), the card reads `confidence:
   unknown`, the artifact predates `reviewed_head_sha`
   (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`),
-  or the tree could not be compared at all (`unknown_tree`: the producer
-  refused, a field carries the unresolved sentinel, or the two lines name
-  different checkouts — two unresolved measurements are string-equal and must
-  never compare SAME). Report *"corroboration
+  or the tree could not be compared (`unknown_tree`; the row's detail names
+  which), for example: no `--tree-root` covers the row's repo (the `$PWD`
+  default from a subdirectory, or from a directory not named like the
+  reviewed checkout, leaves every row here);
+  no worktree stood at the reviewed head at the recorded time — reaped, or
+  never offered, and a same-named checkout is never treated as a substitute;
+  ANY candidate worktree's HEAD reflog cannot answer (logging off, an
+  unreadable or gapped log, a gc-emptied log on a worktree standing at the
+  reviewed head or a newer commit, a review older than the reflog expiry)
+  or a root git could not list, which blocks the row even when the reviewed
+  worktree is intact; the row's `measured=` time or its `reviewed_tree` line
+  cannot be parsed; two or more were bound and now disagree; the producer
+  refused or timed out; or a line carries the unresolved sentinel — two
+  unresolved measurements are string-equal and must never compare SAME).
+  One `--tree-root` per repo is enough (repeat it per repo, each a checkout's top
+  directory named like the reviewed checkout); you do not need to offer the specific
+  worktree a row was reviewed in. Report *"corroboration
   UNKNOWN"* with the row's detail, never "corroborated"
   [policy: `verification-and-evidence` `silent-empty-is-unknown`,
   `unknown-must-not-render-as-a-default`]. UNKNOWN does not by itself make the
@@ -1615,10 +1686,14 @@ without this call having run.
 `/implement-plan` Step 0.5 arms a `claim_terminal` net on this same
 `plan:<plan-stem>` key. Its Step 6 item 4a and its stop paths withdraw it, but a
 chain that aborted between that arm and those withdrawals leaves it open. Releasing
-then CLEARS the net and dispatches a duplicate session. Read
-`coord_gate_list {work_unit_id, open_only: true}`. If an open row's `phase_name`
-begins `implement→ship safety net`, withdraw it first and name its `gate_id`
-in the report.
+then CLEARS the net and dispatches a duplicate session. Step 1.1's release door
+does this check itself: `plan-reserve-release.sh release` reads the plan's gates
+with `open_only: false`, withdraws every open `claim_terminal` row whose
+`phase_name` begins `implement→ship safety net` and that THIS device registered
+before it releases, and prints one line per `gate_id`. A net another device
+registered, or one the reserve's current holder owns when that is not this
+session, is skipped and named (`NET_INERT`), not withdrawn, unless `--net-gate`
+names it. Quote those lines, and its final line, in the report.
 
 Two things wrap that release, both specified in Step 1.1:
 
@@ -1627,8 +1702,9 @@ Two things wrap that release, both specified in Step 1.1:
   `bash <workspace-root>/qontinui-claude-config/scripts/coord-agent-refresh.sh` once and act on its verdict line. This is
   rule (c); hours have passed since rule (a) ran at the reserve, and the token
   that authenticated then may not authenticate now.
-- **Inside the same try/finally, before the release call**, `remove` the
-  `plan:<plan-stem>` row from the heartbeat ledger and `stop` the loop. A loop
+- **Inside the same try/finally**, the release door `remove`s the
+  `plan:<plan-stem>` row from the heartbeat ledger before its release call;
+  `stop` the loop after it. A loop
   still running past the release re-arms a key this chain no longer owns.
 
 If the release answers `not_held`, report it as a **lapse** per Step 1.1 — with
