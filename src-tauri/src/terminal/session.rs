@@ -3643,7 +3643,12 @@ impl TerminalSession {
                 cwd.to_string(),
                 title.to_string(),
                 page_id.to_string(),
-                0,
+                // The spawn does not know the pane's zone: the webview assigns
+                // it after the pane exists. The sentinel says "unknown", so a
+                // recorded 0 is always a real zone (the tab's own record, a
+                // zone hint) and a reconcile bind never takes a placeholder
+                // for where the pane sits.
+                crate::session::session_lifecycle_store::UNZONED_ZONE_INDEX,
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 None,
             );

@@ -2592,8 +2592,9 @@ pub(crate) struct SessionCaptureHint {
     /// `"pinned"`) and demotes the transcript poller to a verification arm.
     pub claude_session_id: Option<String>,
     /// Grid zone to durably record (account-migration respawns preserve the
-    /// migrated session's tile placement). `None` → zone 0 (the historical
-    /// continuation behavior — wrong zone beats a lost session).
+    /// migrated session's tile placement). `None` → the "no zone" sentinel
+    /// (`UNZONED_ZONE_INDEX`): the zone is unknown, and a restore auto-fills
+    /// such a row into a free zone, so the session is placed, never lost.
     pub zone_index: Option<i32>,
     /// When `true`, inject the autonomous-agent git author/committer identity
     /// (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`) into the spawned PTY's env so the
@@ -3102,7 +3103,8 @@ pub(crate) fn create_terminal_session_backend(
             // actually put the pane on (its unpaged arm picks one), so the
             // record and the live pane never disagree.
             let record_page_id = hint_page_id.unwrap_or_else(|| info.page_id.clone());
-            let record_zone_index = hint_zone_index.unwrap_or(0);
+            let record_zone_index = hint_zone_index
+                .unwrap_or(crate::session::session_lifecycle_store::UNZONED_ZONE_INDEX);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
                 // the transcript appears. NEVER rebinds from transcripts.
@@ -3218,7 +3220,8 @@ fn resolve_latest_claude_session_id(
 /// The resolver is injected so this loop is unit-testable without a real
 /// on-disk transcript. On the first resolve it builds a [`TerminalSessionRecord`]
 /// (restored into `zone_index` / the hint page — callers without a meaningful
-/// zone pass 0; wrong zone beats a lost session) and records it; on timeout
+/// zone pass `UNZONED_ZONE_INDEX`, which a restore auto-fills) and records it;
+/// on timeout
 /// it `warn!`s and gives up without recording.
 #[allow(clippy::too_many_arguments)]
 async fn poll_and_record_session<F>(
