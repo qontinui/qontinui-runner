@@ -838,7 +838,10 @@ mod tests {
             vec!["evidence_ref_terminal_at_ask: gate already cleared when asked".to_string()]
         );
         let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-        assert_warned(&log, "coord warned at ask time: evidence_ref_terminal_at_ask");
+        assert_warned(
+            &log,
+            "coord warned at ask time: evidence_ref_terminal_at_ask",
+        );
     }
 
     /// Malformed `warnings` never vanish: a non-array value and an entry with
