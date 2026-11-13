@@ -1651,15 +1651,14 @@ mod tests {
             w.row.kind = services::classify_unit(&w.row.unit).to_string();
             w
         };
-        // Two small-kind units, then more GitHub runners than coord allows.
-        let mut units = vec![
-            unit("qontinui-runner.service".into()),
-            unit("qontinui-runner-b.service".into()),
-        ];
-        units.extend(
-            (0..MAX_SERVICES_PER_COMPUTER + 1)
-                .map(|i| unit(format!("actions.runner.r{i}.service"))),
-        );
+        // More GitHub runners than coord allows, then two small-kind units
+        // LAST — so a plain truncate would cut them, and only the sort that
+        // moves the largest kind to the tail keeps them.
+        let mut units: Vec<WatchedUnit> = (0..MAX_SERVICES_PER_COMPUTER + 1)
+            .map(|i| unit(format!("actions.runner.r{i}.service")))
+            .collect();
+        units.push(unit("qontinui-runner.service".into()));
+        units.push(unit("qontinui-runner-b.service".into()));
         obs.scan.units = Some(units);
         obs.scan.complete_kinds = vec![
             services::KIND_GH_ACTIONS_RUNNER,
