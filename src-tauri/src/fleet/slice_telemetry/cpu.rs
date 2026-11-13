@@ -220,16 +220,19 @@
 //! known, or one that could not be listed) are in the `user.slice` remainder
 //! and in `unattributed_usec`, which is where their time was spent.
 //! `cpu_attribution` names no slice and carries no memory field, so a reader
-//! grading slice memory sees an unmeasured entry.
+//! grading slice memory sees an unmeasured entry. The session class's memory
+//! is its own top-level key, `memory_attribution` ([`memory`]), which names no
+//! slice either.
 //!
 //! Every name is published only when its JSON form, quotes and escapes
 //! included, fits [`MAX_PUBLISHED_NAME_BYTES`], and at most
 //! [`MAX_CI_CHILDREN`] children are named. That bounds the whole
-//! `cgroup_slices` document at 4 top-level keys, about 11 KiB and depth 4 (a
-//! scalar counting 1, as coord counts), with no NUL (a cgroup name cannot hold
-//! one), inside the caps that coord#3567 gives the column (open, caps as of
-//! b461649cb: 16 keys, 16 KiB, depth 8) whatever the machine's cgroups are
-//! called.
+//! `cgroup_slices` document at 5 top-level keys (the 3 watched slices,
+//! `cpu_attribution`, and `memory_attribution` (whose few counts and byte
+//! totals add under 1 KiB)), about 12 KiB and depth 4 (a scalar counting 1, as
+//! coord counts), with no NUL (a cgroup name cannot hold one), inside the caps
+//! coord gives the column (`device_resource_slice_telemetry`: 16 keys,
+//! 16 KiB, depth 8) whatever the machine's cgroups are called.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -246,6 +249,10 @@ use super::{nested_parent, read, slice_bases, slice_dirs_in, SliceBases, WATCHED
 use crate::ci_node::cgroup::{
     candidate_parents, parse_unified_cgroup, DispatchCounts, CGROUP_ROOT_ENV, DISPATCH_DIR_PREFIX,
 };
+
+/// The memory half of the split (`memory_attribution`): the session class's
+/// `memory.current`, formed over this module's own placement and forest.
+pub(super) mod memory;
 
 /// The `cgroup_slices` key holding the class split.
 pub(super) const ATTRIBUTION_KEY: &str = "cpu_attribution";
@@ -1155,6 +1162,16 @@ impl<'a> Forest<'a> {
     /// differently-classed runs directly inside it. `None` when a delta it needs
     /// is missing.
     fn class_totals(&self) -> BTreeMap<Class, Option<u64>> {
+        self.class_totals_by(exclusive)
+    }
+
+    /// [`Self::class_totals`] over whatever value the forest was built with,
+    /// `less_inner` taking a run's value less the runs inside it (the CPU
+    /// split's [`exclusive`], or the memory split's byte-sized twin).
+    fn class_totals_by(
+        &self,
+        less_inner: impl Fn(&str, u64, u64) -> Option<u64>,
+    ) -> BTreeMap<Class, Option<u64>> {
         let n = self.nodes.len();
         let mut out: BTreeMap<Class, Option<u64>> = BTreeMap::new();
         for h in (0..n).filter(|&i| self.run_head[i] == i) {
@@ -1167,7 +1184,7 @@ impl<'a> Forest<'a> {
             let (named, whole) = self.nodes[h];
             let own = whole
                 .zip(inner)
-                .and_then(|(w, s)| exclusive(&named.rel, w, s));
+                .and_then(|(w, s)| less_inner(&named.rel, w, s));
             let total = out.entry(named.class).or_insert(Some(0));
             *total = total.zip(own).map(|(t, o)| t.saturating_add(o));
         }

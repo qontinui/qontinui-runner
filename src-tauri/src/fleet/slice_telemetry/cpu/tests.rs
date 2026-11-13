@@ -159,7 +159,7 @@ fn has_nul(v: &Value) -> bool {
 
 /// Puts a directory's mode back to `0o755` when dropped, panics included.
 #[cfg(unix)]
-struct RestoreMode(PathBuf);
+pub(super) struct RestoreMode(PathBuf);
 
 #[cfg(unix)]
 impl Drop for RestoreMode {
@@ -171,9 +171,10 @@ impl Drop for RestoreMode {
 
 /// Makes `dir` unlistable until the guard drops: mode `--x` lets its files and
 /// subdirectories be opened by name but not be listed. `None`, said on
-/// stderr, where permissions are not enforced (a test run as root).
+/// stderr, where permissions are not enforced (a test run as root). The
+/// memory split's tests use it too.
 #[cfg(unix)]
-fn unlistable(dir: &Path) -> Option<RestoreMode> {
+pub(super) fn unlistable(dir: &Path) -> Option<RestoreMode> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o100)).unwrap();
     let guard = RestoreMode(dir.to_path_buf());
@@ -2654,7 +2655,7 @@ fn apply_adds_cpu_beside_memory_and_never_makes_an_entry() {
     );
 }
 
-/// coord#3567 (open; caps as of b461649cb) stores `cgroup_slices` only inside
+/// coord's `device_resource_slice_telemetry` stores `cgroup_slices` only inside
 /// its caps (16 top-level keys, 16 KiB, depth 8, no NUL), and the whole column
 /// as NULL otherwise, memory readings included. This also pins the
 /// attribution's key set.
@@ -2695,9 +2696,30 @@ fn the_published_map_stays_inside_coords_caps_on_a_crowded_machine() {
     let at =
         |k: u64| -> Vec<(&str, u64)> { cgroups.iter().map(|(c, v)| (c.as_str(), v * k)).collect() };
     let r = m.two_reads(&at(1), &at(2));
+    // Every session cgroup holds memory, so the memory split's object is
+    // published beside the CPU one, as large as it gets but for `withheld`.
+    write(&m.root, &format!("{u}/memory.current"), "1048576\n");
+    for i in 0..300 {
+        let pane = holder(&format!("p{i:03}"));
+        write(&m.root, &format!("{pane}/memory.current"), "1048576\n");
+    }
 
-    let mut slices = super::super::read_slice_reads(&m.root).memory;
+    let reads = super::super::read_slice_reads(&m.root);
+    let mut slices = reads.memory;
     apply(&r, &mut slices);
+    {
+        // `attach` reads `QONTINUI_CI_CGROUP_ROOT`: held unset.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[CGROUP_ROOT_ENV]);
+        std::env::remove_var(CGROUP_ROOT_ENV);
+        super::memory::attach(
+            &m.root,
+            &m.procfs.join("pressure"),
+            &reads.dirs,
+            DispatchCounts::default,
+            &mut slices,
+        );
+    }
     let doc = Value::Object(slices);
     let bytes = serde_json::to_vec(&doc).unwrap();
     assert!(doc.as_object().unwrap().len() <= 16);
@@ -2705,10 +2727,25 @@ fn the_published_map_stays_inside_coords_caps_on_a_crowded_machine() {
     assert!(json_depth(&doc) <= 8);
     assert!(!has_nul(&doc));
     // The most a read that withholds can add is `withheld` with every reason
-    // in `Why::ALL`.
+    // in `Why::ALL`, in each of the two objects.
     let withheld = json!({"withheld": Why::ALL.map(Why::key)});
-    let most = bytes.len() + serde_json::to_vec(&withheld).unwrap().len();
-    assert!(most <= 16 * 1024, "{most} bytes with every reason");
+    let most = bytes.len() + 2 * serde_json::to_vec(&withheld).unwrap().len();
+    assert!(most <= 16 * 1024, "{most} bytes with every reason, twice");
+    let memory = doc["memory_attribution"]
+        .as_object()
+        .expect("the memory split is published");
+    let memory_keys: BTreeSet<&str> = memory.keys().map(String::as_str).collect();
+    assert_eq!(
+        memory_keys,
+        BTreeSet::from([
+            "session_bytes",
+            "runner_unit_bytes",
+            "pty_holder_scopes_bytes",
+            "pty_holder_scopes_measured",
+            "pty_holder_scopes_seen",
+        ])
+    );
+    assert_eq!(memory["pty_holder_scopes_seen"], json!(300));
     for w in [
         "ci-runners.slice",
         "agent-builds.slice",
