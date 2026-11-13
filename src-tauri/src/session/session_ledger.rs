@@ -80,7 +80,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::session::awaiting_restore::{OwedRestores, RestoreView};
+use crate::session::awaiting_restore::{OwedRestores, PagesRestored, RestoreView};
 use crate::session::close_reason::CloseReason;
 use crate::session::ledger_aftermath::{AftermathInputs, AftermathView, Close};
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, NAME_SOURCE_DERIVED};
@@ -923,12 +923,14 @@ pub struct LedgerOutcome {
     /// owed to it ([`crate::session::awaiting_restore`], plan
     /// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D3)?
     /// `Some(true)` while the live store's restore set holds it unfinished and
-    /// unclosed since this boot (a restore may still bring it back: "waiting");
-    /// `Some(false)` when no restore in this process will (it closed since the
-    /// boot, finished, or left the restore set); `None` when that cannot be
-    /// read (no lifecycle store, or a boot not yet classified), never collapsed
-    /// into either. Always `None` on a `back` outcome: the question is not
-    /// asked of a session that came back.
+    /// unclosed since this boot AND its page's restore has not run yet (a
+    /// restore may still bring it back: "waiting"); `Some(false)` when no
+    /// restore in this process will (it closed since the boot, finished, left
+    /// the restore set, or its page's restore ran without bringing it back);
+    /// `None` when that cannot be read (no lifecycle store, a boot not yet
+    /// classified, or a restore that ran with no window saying which pages it
+    /// covered), never collapsed into either. Always `None` on a `back`
+    /// outcome: the question is not asked of a session that came back.
     pub restore_owed: Option<bool>,
     /// The directory a resume opens in ([`resume_dir_of`]) — the same one the
     /// copy line `cd`s into and the one-click resume launches in.
@@ -1771,7 +1773,11 @@ pub fn report(
         let unread = AfterRestart {
             registry: RegistryNow::default(),
             aftermath,
-            restore_owed: OwedRestores::read(None, &RestoreView::current()),
+            restore_owed: OwedRestores::read(
+                None,
+                &RestoreView::current(),
+                &PagesRestored::current(),
+            ),
         };
         let mut report = diff(prior, &[], &unread, empty, false);
         report.status = "unavailable".to_string();
@@ -1799,8 +1805,13 @@ pub fn report(
         registry: registry_now(store),
         aftermath,
         // The same restore set, under the same boot classification, that
-        // `terminal_session_list_open` and page placement read (D3).
-        restore_owed: OwedRestores::read(Some(store), &RestoreView::current()),
+        // `terminal_session_list_open` and page placement read (D3), less the
+        // rows whose page's restore has already run.
+        restore_owed: OwedRestores::read(
+            Some(store),
+            &RestoreView::current(),
+            &PagesRestored::current(),
+        ),
     };
     // Both inputs `back` rests on must be readable for a miss count to be a
     // claim rather than an upper bound.
