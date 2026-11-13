@@ -2048,6 +2048,11 @@ pub(crate) async fn publish_once() {
                 "fleet::resource_sample: published {} lane(s)",
                 body.samples.len()
             );
+            // A 200 is not "stored": coord drops invalid items and unknown
+            // fields INSIDE a 200 and says so only in the body.
+            if let Some(problems) = resp.text().await.ok().and_then(|t| sample_ack_problems(&t)) {
+                log_ack_problems(problems);
+            }
         }
         Ok(resp) => {
             let status = resp.status();
@@ -2055,6 +2060,107 @@ pub(crate) async fn publish_once() {
         }
         Err(e) => warn_once(format!("POST {url} failed: {e}")),
     }
+}
+
+/// What a 200 from `POST /coord/devices/{id}/resource-sample` says was NOT
+/// stored, one line per kind of loss. Empty = everything sent was stored.
+/// `None` = the body is not a JSON object (an older coord, or a body that could
+/// not be read) — UNKNOWN, which is neither a loss nor a recovery. PURE.
+pub(crate) fn sample_ack_problems(body: &str) -> Option<Vec<String>> {
+    let v = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .filter(serde_json::Value::is_object)?;
+    let num = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    let strs = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    let rejected = strs("rejected");
+    if !rejected.is_empty() {
+        out.push(format!(
+            "coord dropped invalid sample(s): {}",
+            rejected.join("; ")
+        ));
+    }
+    let unknown = strs("unknown_fields");
+    if !unknown.is_empty() {
+        out.push(format!(
+            "coord did not recognise and did NOT store field(s) {unknown:?}"
+        ));
+    }
+    if v.get("schema_pending").and_then(serde_json::Value::as_bool) == Some(true) {
+        out.push(
+            "coord's samples table is not migrated yet (schema_pending) — samples were not stored"
+                .into(),
+        );
+    } else if let (Some(accepted), Some(persisted)) = (num("accepted"), num("persisted")) {
+        if persisted < accepted {
+            out.push(format!(
+                "coord persisted {persisted} of {accepted} accepted sample(s)"
+            ));
+        }
+    }
+    // Only meaningful for rows that landed: coord leaves it `false` when
+    // nothing was persisted, and that loss is already named above.
+    if num("persisted").is_some_and(|n| n > 0)
+        && v.get("computer_axes_stored")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        out.push(
+            "coord did not store the computer-model axes (load_5m/15m, PSI, oom_kill_total, \
+             boot_id, measured) — its catalogue does not carry them yet"
+                .into(),
+        );
+    }
+    if v.get("body_device_id_mismatch")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        out.push("coord saw a body device_id that disagrees with the path (the path won)".into());
+    }
+    Some(out)
+}
+
+/// The change key of a problem list: the text with its digits removed, so a
+/// value coord echoes ("psi_cpu_some 140 is outside its domain", "persisted 3
+/// of 5") does not make the same steady loss read as a new one every push.
+/// PURE.
+pub(crate) fn ack_problems_key(problems: &[String]) -> Vec<String> {
+    problems
+        .iter()
+        .map(|p| p.chars().filter(|c| !c.is_ascii_digit()).collect())
+        .collect()
+}
+
+/// Log [`sample_ack_problems`] when its [`ack_problems_key`] CHANGES (a
+/// steady partial loss at a 30 s cadence would otherwise repeat forever), and
+/// say once when it clears.
+fn log_ack_problems(problems: Vec<String>) {
+    static LAST: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let key = ack_problems_key(&problems);
+    if *last == key {
+        return;
+    }
+    if problems.is_empty() {
+        debug!("fleet::resource_sample: coord stores every sample again");
+    } else {
+        warn!(
+            "fleet::resource_sample: published, but {}",
+            problems.join(" | ")
+        );
+    }
+    *last = key;
 }
 
 /// Log a publish failure loudly the first few times, then quietly.
@@ -2075,6 +2181,52 @@ fn warn_once(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_200_ack_names_what_coord_did_not_store() {
+        let clean = r#"{"received":3,"accepted":3,"persisted":3,"rejected":[],"schema_pending":false,"computer_axes_stored":true,"computer_id":null,"body_device_id_mismatch":false,"unknown_fields":[]}"#;
+        assert_eq!(sample_ack_problems(clean), Some(vec![]));
+        assert_eq!(
+            sample_ack_problems(""),
+            None,
+            "an unread body is UNKNOWN, not clean"
+        );
+        assert_eq!(sample_ack_problems("not json"), None);
+        assert_eq!(sample_ack_problems("[]"), None);
+
+        let lossy = r#"{"received":3,"accepted":2,"persisted":1,"rejected":["lane \"x\": unknown"],"schema_pending":false,"computer_axes_stored":false,"body_device_id_mismatch":true,"unknown_fields":["psi_cpu_sme"]}"#;
+        let p = sample_ack_problems(lossy).unwrap();
+        assert_eq!(p.len(), 5, "{p:?}");
+        assert!(p[0].contains("lane \"x\": unknown"));
+        assert!(p[1].contains("psi_cpu_sme"));
+        assert!(p[2].contains("persisted 1 of 2"));
+        assert!(p[3].contains("computer-model axes"));
+        assert!(p[4].contains("device_id"));
+
+        // schema_pending explains the shortfall; it is not reported twice.
+        let pending = r#"{"accepted":2,"persisted":0,"schema_pending":true}"#;
+        let p = sample_ack_problems(pending).unwrap();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("schema_pending"));
+
+        // A value coord echoes does not make a steady loss read as new.
+        let a = sample_ack_problems(
+            r#"{"rejected":["psi_cpu_some 140 is outside its domain"],"accepted":5,"persisted":3}"#,
+        )
+        .unwrap();
+        let b = sample_ack_problems(
+            r#"{"rejected":["psi_cpu_some 151 is outside its domain"],"accepted":4,"persisted":2}"#,
+        )
+        .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(ack_problems_key(&a), ack_problems_key(&b));
+        let c = sample_ack_problems(r#"{"rejected":["load_5m 9 is outside its domain"]}"#).unwrap();
+        assert_ne!(
+            ack_problems_key(&a),
+            ack_problems_key(&c),
+            "a different field is a new loss"
+        );
+    }
 
     /// One row never carries two readings of system PSI: `psi.system` wins
     /// for every resource it names, and a resource it omits keeps the
