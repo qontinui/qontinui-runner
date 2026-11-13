@@ -828,6 +828,14 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
             ),
         )
         .await;
+        // Whose policy body the respawn's system-prompt file carries: the
+        // tenant a session in its working dir resolves to, awaited HERE because
+        // the spawn seam below is synchronous (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Resolved per attempt: a retry spawns afresh.
+        let policy_tenant =
+            crate::mcp::policy_tenant::new_session_policy_tenant(Path::new(&cand.working_dir))
+                .await;
         // The seam is synchronous and runs here, on the async worker, NOT on
         // the blocking pool, exactly as the migration's and the respawn
         // receiver's `spawn_next` do: a spawn handed to `spawn_blocking` keeps
@@ -866,6 +874,7 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
                 // reopen under D3.
                 gate_identity: None,
                 origin: crate::coord_drain_state::SpawnOrigin::BootResume,
+                policy_tenant,
             },
         )
         .map(|(terminal_id, _coord_id)| terminal_id)

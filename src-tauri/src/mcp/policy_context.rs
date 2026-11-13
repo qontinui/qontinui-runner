@@ -169,6 +169,23 @@
 //! break loudly — it would silently inject the "pull failed" notice forever.
 //! The URL-shape regression tests below pin this the same way
 //! `continuation_verdict.rs` and `prompt_library.rs` do.
+//!
+//! ## Whose policy — the SESSION's tenant, not the device default
+//!
+//! Plan `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`.
+//! On a device bound to several tenants, the policy that governs a session is
+//! its OWNING tenant's, and coord scopes the agent door's rows from the bearer
+//! it is shown. So every fetch here presents the credential of the tenant the
+//! coord-mcp proxy decides for this session
+//! ([`crate::mcp::policy_tenant::route_policy_decision`]) through the
+//! tenant-stating seam (`coord_http::coord_get_for`), the in-process cache is
+//! keyed on `(coord base, tenant)`, the spawn cache file is named for the
+//! tenant whose credential actually fetched the body, and the injected body
+//! carries a `[tenant: …]` line directly under its version header — inside the
+//! hashed bytes, so a spawn-time copy for one tenant can never confirm a fetch
+//! for another. A multi-bound session whose tenant cannot be resolved gets the
+//! fail-open notice ([`PolicyRenderReason::TenantUnresolved`]), never the
+//! default tenant's documents.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -299,7 +316,9 @@ impl Mode {
 // ===========================================================================
 
 /// The agent-door LIST url, filtered to policy documents. Coord scopes the rows
-/// to the caller's tenant from the bearer — never pass a tenant here.
+/// to the caller's tenant from the bearer — never pass a tenant here. Which
+/// tenant that is, is decided by WHICH bearer the fetch presents: the session's
+/// own tenant's (see the module docs), never a tenant written into the URL.
 ///
 /// Same shape as `prompt_library::list_url`, which is the settled builder for
 /// this door; only the `kind` and the [`VIA_MARKER`] differ.
@@ -402,6 +421,13 @@ pub struct PolicyPayload {
     pub protocol_version: Option<i64>,
     /// Every `kind=policy` document, name + description + version.
     pub index: Vec<PolicyDocSummary>,
+    /// The tenant whose documents these are — the tenant whose credential the
+    /// fetch presented ([`crate::mcp::policy_tenant::PolicyTarget::tenant`]).
+    /// Rendered as the `[tenant: …]` line of [`render_policy_body`] and named
+    /// on the first line of every render. `None` only for a default-slot
+    /// credential that names no tenant, which renders as an explicit
+    /// `[tenant: unknown]` rather than as nothing.
+    pub tenant: Option<uuid::Uuid>,
 }
 
 // ===========================================================================
@@ -442,6 +468,48 @@ fn header(source: &str, fetched_at: &str) -> String {
     )
 }
 
+/// The first line of a render that carries policy: [`header`] plus whose
+/// documents they are. Naming the tenant on the line a session reads first is
+/// what lets it compare the injection against the tenant it acts as
+/// (`coord_query_identity` `tenant_id`) without parsing the body. The fail-open
+/// notice keeps the bare [`header`]: it carries no tenant's documents.
+fn payload_header(source: &str, fetched_at: &str, tenant: Option<uuid::Uuid>) -> String {
+    let whose = match tenant {
+        Some(t) => {
+            format!("These are tenant {t}'s policy documents, read under that tenant's credential.")
+        }
+        None => "The credential that read them names no tenant, so whose documents these are is \
+                 UNKNOWN."
+            .to_string(),
+    };
+    format!("{} {whose}", header(source, fetched_at))
+}
+
+/// The `[tenant: …]` line [`render_policy_body`] emits directly under the
+/// `===== policy/session-protocol (vN) =====` header (Design §4).
+///
+/// A SEPARATE line, so the version header every existing reader parses (the
+/// `/unattended` held rule, [`render_confirmation`]'s quote) stays
+/// byte-identical. Inside the hashed bytes, so the delivered-SHA becomes
+/// tenant-specific: a spawn-time body for tenant A can never confirm a fetch
+/// for tenant B.
+///
+/// **The slug always reads `slug unknown`.** The uuid is always rendered; the
+/// slug would be rendered only from a coord answer already in hand, and none
+/// carries it on this path — the agent-door list and document responses name
+/// no tenant, and at SessionStart the session's nonce has received no coord
+/// answer yet. A per-session source would also be wrong here even when it
+/// exists: these bytes are hashed and cached per TENANT, so one session's
+/// knowing the slug and the next one's not would make the same tenant's body
+/// hash two ways, and every such pair would read as a stale spawn-time copy.
+/// Never invented.
+pub(crate) fn tenant_line(tenant: Option<uuid::Uuid>) -> String {
+    match tenant {
+        Some(t) => format!("[tenant: slug unknown {t}]"),
+        None => "[tenant: unknown]".to_string(),
+    }
+}
+
 /// The spawn-time policy body: an intro paragraph plus the delimited
 /// `policy/session-protocol` text. `None` when the fetch carried no body.
 ///
@@ -452,6 +520,11 @@ fn header(source: &str, fetched_at: &str) -> String {
 /// [`crate::session::spawn_prompt::policy_body_sha`] hashes on both sides of
 /// the delivered-SHA check, which is why it is deterministic: no fetch time,
 /// no `source`, nothing that differs between two renders of one version.
+///
+/// The one per-render value it DOES carry is the tenant ([`tenant_line`],
+/// directly under the version header), and that is deliberate: two tenants'
+/// bodies must never hash alike, or one tenant's spawn-time copy would confirm
+/// another tenant's fetch.
 pub fn render_policy_body(payload: &PolicyPayload) -> Option<String> {
     let body = payload.protocol_body.as_deref()?;
     let version = version_label(payload.protocol_version);
@@ -464,9 +537,13 @@ pub fn render_policy_body(payload: &PolicyPayload) -> Option<String> {
          `{PROTOCOL_DOC_NAME}`; you DO still need to read the category bodies it names — the \
          policy document index (`kind={KIND}`) lists every one with its current version.\n\n"
     ));
+    // The version header line is byte-identical to what it was before the
+    // tenant line existed; the tenant line follows it, then the blank line.
     out.push_str(&format!(
-        "===== policy/{PROTOCOL_DOC_NAME} ({version}) =====\n\n"
+        "===== policy/{PROTOCOL_DOC_NAME} ({version}) =====\n"
     ));
+    out.push_str(&tenant_line(payload.tenant));
+    out.push_str("\n\n");
     out.push_str(body.trim_end());
     out.push('\n');
     Some(out)
@@ -531,7 +608,7 @@ fn push_index(out: &mut String, payload: &PolicyPayload) {
 /// injected text is asserted in tests against a fixed payload.
 pub fn render_injection(payload: &PolicyPayload, source: &str, fetched_at: &str) -> String {
     let mut out = String::with_capacity(16 * 1024);
-    out.push_str(&header(source, fetched_at));
+    out.push_str(&payload_header(source, fetched_at, payload.tenant));
     out.push_str("\n\n");
 
     match render_policy_body(payload) {
@@ -571,6 +648,11 @@ pub fn render_injection(payload: &PolicyPayload, source: &str, fetched_at: &str)
 /// version and a short prefix of the hash so a session holding the spawn-time
 /// copy through many `compact` cycles can match the block it has against what
 /// this hook vouched for.
+///
+/// It quotes the block's version header AND its `[tenant: …]` line, and names
+/// the tenant on its first line: the hash it vouches for is "the body coord
+/// serves right now" only for the tenant whose credential read it, so the
+/// session is told which tenant that is.
 pub fn render_confirmation(
     payload: &PolicyPayload,
     delivered_sha: &str,
@@ -578,20 +660,23 @@ pub fn render_confirmation(
     fetched_at: &str,
 ) -> String {
     let version = version_label(payload.protocol_version);
+    let tenant = tenant_line(payload.tenant);
     // The SAME prefix the render-decision log line carries, so an operator
     // comparing a transcript against a log is comparing one string.
     let short_sha: String = delivered_sha.chars().take(LOGGED_SHA_PREFIX).collect();
     let mut out = String::with_capacity(2 * 1024);
-    out.push_str(&header(source, fetched_at));
+    out.push_str(&payload_header(source, fetched_at, payload.tenant));
     out.push_str("\n\n");
     out.push_str(&format!(
         "The body of `policy/{PROTOCOL_DOC_NAME}` is not repeated here. At spawn the runner \
          composed a system-prompt file for this `claude` process (passed via \
          `--append-system-prompt-file`) containing that body ({version}, sha256 {short_sha}…), \
-         and that hash equals the body coord serves right now. If your system prompt holds the \
-         block headed `===== policy/{PROTOCOL_DOC_NAME} ({version}) =====`, it is the canonical \
-         text and Step 0 of the session protocol is satisfied by it. If you cannot find that \
-         block, treat Step 0 as NOT satisfied and fetch it yourself: \
+         and that hash equals the body coord serves right now to the tenant named above. If \
+         your system prompt holds the block headed \
+         `===== policy/{PROTOCOL_DOC_NAME} ({version}) =====` followed by the line \
+         `{tenant}`, it is the canonical text and Step 0 of the session protocol is satisfied \
+         by it. If you cannot find that block, treat Step 0 as NOT satisfied and fetch it \
+         yourself: \
          `coord_get_prompt_document(kind=\"{KIND}\", name=\"{PROTOCOL_DOC_NAME}\")`, or \
          `GET /coord/agent-prompt-documents/{KIND}/{PROTOCOL_DOC_NAME}`. You DO still need to \
          read the category bodies it names.\n\n"
@@ -649,11 +734,14 @@ pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
 /// Why one `SessionStart` got the render it got — one arm per distinguishable
 /// cause, and NEVER two causes folded into one arm.
 ///
-/// Six of the eight mean the FULL body crossed the hook boundary
+/// Six of the nine mean the FULL body crossed the hook boundary
 /// ([`Self::served_full_body`]); [`Self::Confirmed`] is the short confirmation —
 /// the denominator, without which the full-body count is a number with nothing
-/// to divide by; [`Self::PullFailed`] is neither, because that session got the
-/// fail-open notice and no policy body at all.
+/// to divide by; [`Self::PullFailed`] and [`Self::TenantUnresolved`] are
+/// neither, because those sessions got the fail-open notice and no policy body
+/// at all — and they are two arms, not one, because "coord could not be read"
+/// and "whose policy this session needs is unknown" are different findings
+/// with different remedies.
 ///
 /// **The three source arms are three different findings, not one.** Collapsing
 /// them is the exact blindness this phase exists to remove: Phase 0 of the plan
@@ -709,13 +797,24 @@ pub enum PolicyRenderReason {
     /// [`PolicyRenderStats::injections`] equals every `SessionStart` this
     /// route answered — a denominator with a hole in it is not a denominator.
     PullFailed,
+    /// The session's tenant could not be resolved on a device bound to several
+    /// tenants (no nonce and no registry answer, a proxy refusal, a repo still
+    /// unsettled after the proxy's budget), or it resolved to a tenant this
+    /// runner holds no usable credential for — so NOTHING was fetched and the
+    /// session got the fail-open notice naming the cause, rather than the
+    /// default tenant's documents (plan
+    /// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    /// Design §5). Never folded into [`Self::PullFailed`]: that arm means coord
+    /// was asked and did not answer; this one means the runner declined to ask
+    /// under a credential that might be the wrong tenant's.
+    TenantUnresolved,
 }
 
 impl PolicyRenderReason {
     /// How many arms there are — the counter array's width. Pinned to
     /// [`Self::ALL`] by `the_arm_count_is_pinned_to_the_arm_list`, so the two
     /// cannot drift.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     /// Every arm, in the precedence order documented on the enum. The single
     /// source of truth for the counter's indexing and for exhaustive tests.
@@ -728,6 +827,7 @@ impl PolicyRenderReason {
         PolicyRenderReason::MarkerMismatched,
         PolicyRenderReason::Confirmed,
         PolicyRenderReason::PullFailed,
+        PolicyRenderReason::TenantUnresolved,
     ];
 
     /// The stable snake_case label this reason is logged and counted under.
@@ -743,19 +843,22 @@ impl PolicyRenderReason {
             PolicyRenderReason::MarkerMismatched => "marker_mismatched",
             PolicyRenderReason::Confirmed => "confirmed",
             PolicyRenderReason::PullFailed => "pull_failed",
+            PolicyRenderReason::TenantUnresolved => "tenant_unresolved",
         }
     }
 
     /// Did the FULL policy body cross the SessionStart hook boundary?
     ///
     /// False for [`Self::Confirmed`] (the short confirmation) and for
-    /// [`Self::PullFailed`] (the fail-open notice, which carries no body).
-    /// [`Self::BodyUnavailable`] is true: the render is the partial injection,
-    /// which still carries everything the payload had.
+    /// [`Self::PullFailed`] / [`Self::TenantUnresolved`] (the fail-open notice,
+    /// which carries no body). [`Self::BodyUnavailable`] is true: the render is
+    /// the partial injection, which still carries everything the payload had.
     pub fn served_full_body(self) -> bool {
         !matches!(
             self,
-            PolicyRenderReason::Confirmed | PolicyRenderReason::PullFailed
+            PolicyRenderReason::Confirmed
+                | PolicyRenderReason::PullFailed
+                | PolicyRenderReason::TenantUnresolved
         )
     }
 
@@ -765,9 +868,10 @@ impl PolicyRenderReason {
     /// The hand-written version claimed to be "pinned to `ALL`'s order by
     /// construction" and was not — nothing derived it, and the compiler does
     /// not force `ALL` to grow when an arm is added: `ALL: [Self; COUNT]` stays
-    /// well-typed as an 8-element literal, so a 9th arm compiles, passes every
-    /// test that iterates `ALL` (it never sees the new arm), and then indexes 8
-    /// into an 8-element array on the first session that hits it. A panic there
+    /// well-typed as a `COUNT`-element literal, so one more arm compiles, passes
+    /// every test that iterates `ALL` (it never sees the new arm), and then
+    /// indexes `COUNT` into a `COUNT`-element array on the first session that
+    /// hits it. A panic there
     /// is a panic inside a FAIL-OPEN axum handler — the connection drops, the
     /// hook gets no response, and the session lands in exactly the no-policy
     /// state this module's header says it exists to end. Deriving the position
@@ -905,6 +1009,17 @@ impl PolicyRenderDecision {
         }
     }
 
+    /// The decision for a session whose tenant could not be resolved, so
+    /// nothing was fetched ([`PolicyRenderReason::TenantUnresolved`]). Same
+    /// known facts as [`Self::pull_failed`]; nothing about a body is known
+    /// because none was asked for.
+    pub fn tenant_unresolved(raw_source: Option<&str>, delivered_sha: Option<&str>) -> Self {
+        Self {
+            reason: PolicyRenderReason::TenantUnresolved,
+            ..Self::pull_failed(raw_source, delivered_sha)
+        }
+    }
+
     /// Was the short confirmation sent? The predicate the route used to return
     /// as a bare `bool`.
     pub fn confirmed(&self) -> bool {
@@ -935,7 +1050,7 @@ impl PolicyRenderDecision {
 /// Atomics rather than a lock, and a plain array rather than a metrics crate:
 /// `knowledge_acquisition::stats::ProviderCounters` is the shape this runner
 /// already counts things in, and the runner pulls in no metrics registry at
-/// all. Adding one for eight counters would be a second mechanism for the thing
+/// all. Adding one for nine counters would be a second mechanism for the thing
 /// the first one already does.
 fn render_counts() -> &'static [AtomicU64; PolicyRenderReason::COUNT] {
     static COUNTS: OnceLock<[AtomicU64; PolicyRenderReason::COUNT]> = OnceLock::new();
@@ -1029,6 +1144,10 @@ pub struct PolicyRenderStats {
     pub confirmed: u64,
     /// The coord pull failed; the fail-open notice went out instead.
     pub pull_failed: u64,
+    /// The session's tenant was unresolvable (or had no usable credential) on
+    /// a multi-bound device; nothing was fetched and the fail-open notice went
+    /// out instead of the default tenant's documents.
+    pub tenant_unresolved: u64,
     /// The six full-body arms summed.
     pub full_body_total: u64,
     /// Every arm summed — the number of INJECTIONS this route made, which is
@@ -1058,14 +1177,16 @@ pub fn render_stats() -> PolicyRenderStats {
     let marker_mismatched = at(PolicyRenderReason::MarkerMismatched);
     let confirmed = at(PolicyRenderReason::Confirmed);
     let pull_failed = at(PolicyRenderReason::PullFailed);
-    // DERIVED from `ALL`, not written out as a six-term sum: a ninth full-body
+    let tenant_unresolved = at(PolicyRenderReason::TenantUnresolved);
+    // DERIVED from `ALL`, not written out as a six-term sum: a seventh full-body
     // arm added to the enum, to `ALL` and to the struct would compile against a
     // hand-written sum and silently under-report — the same class the derived
     // `slot()` closed one level down. `served_full_body` is the single source
     // of truth for which arms belong here.
     //
-    // NOTE for whoever adds that ninth arm: `served_full_body` is a NEGATIVE
-    // list (everything except `Confirmed` and `PullFailed`), so a new arm lands
+    // NOTE for whoever adds the next arm: `served_full_body` is a NEGATIVE list
+    // (everything except `Confirmed`, `PullFailed` and `TenantUnresolved` — the
+    // last added exactly this way, because it carries no body), so a new arm lands
     // INSIDE this total by default. That is the conservative direction for a
     // metric whose job is catching a leaking seam — an over-count is visible,
     // an under-count is the silence this whole phase exists to end — but it is
@@ -1085,6 +1206,7 @@ pub fn render_stats() -> PolicyRenderStats {
         marker_mismatched,
         confirmed,
         pull_failed,
+        tenant_unresolved,
         full_body_total,
         // Likewise derived: every arm, so a new one cannot be left out of the
         // denominator by forgetting to add a term here.
@@ -1308,7 +1430,7 @@ struct CacheEntry {
     payload: PolicyPayload,
 }
 
-/// What the cache holds for one coord base.
+/// What the cache holds for one `(coord base, tenant)`.
 #[derive(Default)]
 struct CacheSnapshot {
     /// The payload, when it is still within [`CACHE_TTL`].
@@ -1319,24 +1441,35 @@ struct CacheSnapshot {
     doc_etag: Option<String>,
 }
 
-/// Keyed on the resolved coord base URL.
-///
-/// The plan asks for a tenant key; the coord base is the closest thing this
-/// process can actually observe, because tenancy is lifted server-side from the
-/// device JWT and never appears in the URL. Re-pointing the runner at a
-/// different coord (the only way its tenant changes without a restart) changes
-/// this key, so the cache cannot serve one coord's policies against another's.
-static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
+/// One cache slot: the resolved coord base URL and the tenant whose credential
+/// fetched the payload ([`crate::mcp::policy_tenant::PolicyTarget::tenant`]).
+type CacheKey = (String, Option<uuid::Uuid>);
 
-fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
+/// Keyed on `(coord base, tenant)`.
+///
+/// It used to be keyed on the coord base alone, on the reasoning that tenancy
+/// is lifted server-side from the bearer and re-pointing coord was "the only
+/// way its tenant changes without a restart". That is false on a device bound
+/// to several tenants: two sessions on one coord base can need two tenants'
+/// policies at the same moment, and a base-only key served whichever tenant
+/// fetched last to both (plan
+/// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+/// Design §3). The tenant is the one the fetch PRESENTS a credential for, so
+/// an entry can never be read back for a session of another tenant — and the
+/// `ETag`s replayed from it are that tenant's own validators. A cache cold per
+/// tenant costs one full fetch per tenant per process; the conditional fetch
+/// bounds the steady state.
+static CACHE: OnceLock<Mutex<HashMap<CacheKey, CacheEntry>>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cache_snapshot(base: &str) -> CacheSnapshot {
+fn cache_snapshot(base: &str, tenant: Option<uuid::Uuid>) -> CacheSnapshot {
     let Ok(g) = cache().lock() else {
         return CacheSnapshot::default();
     };
-    let Some(entry) = g.get(base) else {
+    let Some(entry) = g.get(&(base.to_string(), tenant)) else {
         return CacheSnapshot::default();
     };
     CacheSnapshot {
@@ -1349,13 +1482,14 @@ fn cache_snapshot(base: &str) -> CacheSnapshot {
 
 fn cache_store(
     base: &str,
+    tenant: Option<uuid::Uuid>,
     list_etag: Option<String>,
     doc_etag: Option<String>,
     payload: PolicyPayload,
 ) {
     if let Ok(mut g) = cache().lock() {
         g.insert(
-            base.to_string(),
+            (base.to_string(), tenant),
             CacheEntry {
                 at: Instant::now(),
                 list_etag,
@@ -1396,7 +1530,12 @@ enum ProtocolOutcome {
     Failed(String),
 }
 
-/// Fetch the injection payload for `base`.
+/// Fetch the injection payload for `base`, under `target`'s credential.
+///
+/// Returns the payload and the tenant the PROTOCOL fetch's bearer claimed —
+/// the claim [`persist_policy_body_cache`] names the spawn cache file from
+/// (Design §2a). `None` when no request carried one this call (a fresh cache
+/// hit, or a request that could not be built), which writes no file.
 ///
 /// ## Caching and RECORDING are separate concerns (the crux)
 ///
@@ -1425,31 +1564,45 @@ enum ProtocolOutcome {
 /// did.
 async fn fetch_payload(
     base: &str,
+    target: crate::mcp::policy_tenant::PolicyTarget,
     attribution: Option<uuid::Uuid>,
-) -> Result<PolicyPayload, String> {
-    let snap = cache_snapshot(base);
+) -> Result<(PolicyPayload, Option<uuid::Uuid>), String> {
+    let snap = cache_snapshot(base, target.tenant);
     if attribution.is_none() {
         if let Some(payload) = snap.fresh.clone() {
             debug!(
                 "policy-context: served from cache — no attributable session, so the \
                  recording round-trip would buy nothing"
             );
-            return Ok(payload);
+            return Ok((payload, None));
         }
     }
 
     let client = crate::mcp::continuation_verdict::http_client()?;
 
-    // Both reads go out. `coord_get` attaches the device bearer itself (re-read
-    // per call — the JWT has a short TTL) and drives the data-plane
-    // auth-coverage metric, which is why the caller's `coord_client_parts`
-    // token is used only to detect "unpaired" and is not threaded down here:
-    // one credential source, read as late as possible.
-    let list = fetch_list(&client, base, snap.list_etag.as_deref(), attribution).await;
-    let protocol = fetch_protocol(&client, base, snap.doc_etag.as_deref(), attribution).await;
+    // Both reads go out, CONCURRENTLY: the route now awaits the session's
+    // tenant (bounded by `repo_tenant::CWD_TENANT_BUDGET`) before fetching, and
+    // the hook gives the whole answer `--max-time 15`, so two sequential 4 s
+    // reads after a slow resolution could outlive the hook. `coord_get_for`
+    // attaches the TARGET tenant's bearer itself (re-read per call — the JWT
+    // has a short TTL) and drives the data-plane auth-coverage metric; the
+    // caller's `coord_client_parts` token is used only to detect "unpaired"
+    // and is not threaded down here: one credential source, read as late as
+    // possible.
+    let ((list, _), (protocol, presented)) = tokio::join!(
+        fetch_list(
+            &client,
+            base,
+            target,
+            snap.list_etag.as_deref(),
+            attribution
+        ),
+        fetch_protocol(&client, base, target, snap.doc_etag.as_deref(), attribution),
+    );
 
     // ---- Compose. Each half falls back to its cached counterpart independently,
-    // ---- so one failing door never discards the other's fresh answer.
+    // ---- so one failing door never discards the other's fresh answer. The
+    // ---- cached counterpart is THIS tenant's: the snapshot is keyed on it.
     let (index, list_etag) = match list {
         ListOutcome::Fresh { index, etag } => (index, etag),
         ListOutcome::NotModified => (
@@ -1506,60 +1659,136 @@ async fn fetch_payload(
         protocol_body,
         protocol_version,
         index,
+        tenant: target.tenant,
     };
     // Do NOT cache a partial: a transient blip on the body fetch must not pin an
     // index-only payload for a full TTL when the real body is one retry away.
     // Same reasoning `continuation_verdict` applies to its fallback.
     if payload.protocol_body.is_some() {
-        cache_store(base, list_etag, doc_etag, payload.clone());
+        cache_store(base, target.tenant, list_etag, doc_etag, payload.clone());
     }
     if payload.protocol_body.is_none() && payload.index.is_empty() {
         return Err(
             "coord returned neither the policy index nor the session-protocol body".to_string(),
         );
     }
-    Ok(payload)
+    Ok((payload, presented))
 }
 
-/// Conditionally fetch the `kind=policy` index.
-async fn fetch_list(
+/// The tenant a built request's bearer claims — the credential it will
+/// ACTUALLY present, read off its `Authorization` header rather than
+/// re-resolved, so the check below and the cache-file name are about the bytes
+/// on the wire. `None` for no header, a non-bearer one, or a token whose
+/// `tenant_id` claim is absent or not a uuid. The token itself goes no further.
+fn presented_claim(headers: &reqwest::header::HeaderMap) -> Option<uuid::Uuid> {
+    let value = headers.get(reqwest::header::AUTHORIZATION)?.to_str().ok()?;
+    tenant_of_jwt(value.trim().strip_prefix("Bearer ")?)
+}
+
+/// Refuse to send a policy read whose credential is not the target tenant's.
+///
+/// `coord_get_for(Owned(t))` sends UNAUTHENTICATED when `t` has no usable slot
+/// (and a slot can lapse between the tenant decision and the fetch), and an
+/// answer to such a read could be another tenant's — which would then be
+/// rendered, cached and filed as `t`'s. The tenant decision already refuses the
+/// no-credential case up front ([`crate::mcp::policy_tenant::policy_tenant_decision`]);
+/// this is the same rule at the last moment, on the request that would go out.
+/// A target naming no tenant (a default slot whose credential claims none)
+/// asserts nothing, so it checks nothing.
+fn check_presented(
+    target: Option<uuid::Uuid>,
+    presented: Option<uuid::Uuid>,
+) -> Result<(), String> {
+    match (target, presented) {
+        (Some(t), Some(p)) if t == p => Ok(()),
+        (Some(t), Some(p)) => Err(format!(
+            "the credential this runner would present for tenant {t} claims tenant {p}, so the \
+             policy read was not sent"
+        )),
+        (Some(t), None) => Err(format!(
+            "this runner holds no usable credential claiming tenant {t}, so the policy read was \
+             not sent"
+        )),
+        (None, _) => Ok(()),
+    }
+}
+
+/// Build one tenant-stating policy GET — `target`'s credential through
+/// `coord_http::coord_get_for`, the attribution header, the validator — and
+/// [`check_presented`] it BEFORE it can be sent. Returns the request and the
+/// tenant its bearer claims.
+fn build_policy_get(
     client: &reqwest::Client,
-    base: &str,
+    url: String,
+    target: crate::mcp::policy_tenant::PolicyTarget,
     etag: Option<&str>,
     attribution: Option<uuid::Uuid>,
-) -> ListOutcome {
+) -> Result<(reqwest::Request, Option<uuid::Uuid>), String> {
     let mut req = attach_attribution(
-        crate::coord_http::coord_get(client, list_url(base)),
+        crate::coord_http::coord_get_for(client, url, target.scope),
         attribution,
     );
     if let Some(etag) = etag {
         req = req.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let resp = match req.send().await {
+    let request = req
+        .build()
+        .map_err(|e| format!("could not build the policy request: {e}"))?;
+    let presented = presented_claim(request.headers());
+    check_presented(target.tenant, presented)?;
+    Ok((request, presented))
+}
+
+/// Conditionally fetch the `kind=policy` index under `target`'s credential.
+/// Returns the outcome and the tenant the presented bearer claimed.
+async fn fetch_list(
+    client: &reqwest::Client,
+    base: &str,
+    target: crate::mcp::policy_tenant::PolicyTarget,
+    etag: Option<&str>,
+    attribution: Option<uuid::Uuid>,
+) -> (ListOutcome, Option<uuid::Uuid>) {
+    let (request, presented) =
+        match build_policy_get(client, list_url(base), target, etag, attribution) {
+            Ok(built) => built,
+            Err(reason) => return (ListOutcome::Failed(reason), None),
+        };
+    let resp = match client.execute(request).await {
         Ok(r) => r,
-        Err(e) => return ListOutcome::Failed(format!("coord unreachable: {e}")),
+        Err(e) => {
+            return (
+                ListOutcome::Failed(format!("coord unreachable: {e}")),
+                presented,
+            )
+        }
     };
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_MODIFIED {
-        return ListOutcome::NotModified;
+        return (ListOutcome::NotModified, presented);
     }
     if !status.is_success() {
-        return ListOutcome::Failed(format!(
-            "coord answered HTTP {} to the policy-document list",
-            status.as_u16()
-        ));
+        return (
+            ListOutcome::Failed(format!(
+                "coord answered HTTP {} to the policy-document list",
+                status.as_u16()
+            )),
+            presented,
+        );
     }
     let etag = response_etag(&resp);
-    match resp.json::<Value>().await {
+    let outcome = match resp.json::<Value>().await {
         Ok(body) => ListOutcome::Fresh {
             index: parse_index(&body),
             etag,
         },
         Err(e) => ListOutcome::Failed(format!("coord policy-document list was undecodable: {e}")),
-    }
+    };
+    (outcome, presented)
 }
 
-/// Conditionally fetch `policy/session-protocol`'s body + version.
+/// Conditionally fetch `policy/session-protocol`'s body + version under
+/// `target`'s credential. Returns the outcome and the tenant the presented
+/// bearer claimed.
 ///
 /// The `If-None-Match` here is what turns the per-session-start recording read
 /// into a near-empty one: coord's agent single-document door answers 304 with no
@@ -1567,35 +1796,47 @@ async fn fetch_list(
 async fn fetch_protocol(
     client: &reqwest::Client,
     base: &str,
+    target: crate::mcp::policy_tenant::PolicyTarget,
     etag: Option<&str>,
     attribution: Option<uuid::Uuid>,
-) -> ProtocolOutcome {
-    let mut req = attach_attribution(
-        crate::coord_http::coord_get(client, document_url(base, PROTOCOL_DOC_NAME)),
+) -> (ProtocolOutcome, Option<uuid::Uuid>) {
+    let (request, presented) = match build_policy_get(
+        client,
+        document_url(base, PROTOCOL_DOC_NAME),
+        target,
+        etag,
         attribution,
-    );
-    if let Some(etag) = etag {
-        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
-    }
-    let resp = match req.send().await {
+    ) {
+        Ok(built) => built,
+        Err(reason) => return (ProtocolOutcome::Failed(reason), None),
+    };
+    let resp = match client.execute(request).await {
         Ok(r) => r,
-        Err(e) => return ProtocolOutcome::Failed(format!("request: {e}")),
+        Err(e) => return (ProtocolOutcome::Failed(format!("request: {e}")), presented),
     };
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_MODIFIED {
-        return ProtocolOutcome::NotModified;
+        return (ProtocolOutcome::NotModified, presented);
     }
     if !status.is_success() {
-        return ProtocolOutcome::Failed(format!("coord answered HTTP {}", status.as_u16()));
+        return (
+            ProtocolOutcome::Failed(format!("coord answered HTTP {}", status.as_u16())),
+            presented,
+        );
     }
     let etag = response_etag(&resp);
     let body: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return ProtocolOutcome::Failed(format!("undecodable: {e}")),
+        Err(e) => {
+            return (
+                ProtocolOutcome::Failed(format!("undecodable: {e}")),
+                presented,
+            )
+        }
     };
     // Reuse the settled row-envelope reader — it unwraps `document`, trims, and
     // treats an empty body as absent.
-    match crate::mcp::continuation_verdict::rules_from_doc_body(&body) {
+    let outcome = match crate::mcp::continuation_verdict::rules_from_doc_body(&body) {
         Some(text) => ProtocolOutcome::Fresh {
             body: text,
             version: parse_document_version(&body),
@@ -1604,7 +1845,8 @@ async fn fetch_protocol(
         None => {
             ProtocolOutcome::Failed("coord returned an empty session-protocol body".to_string())
         }
-    }
+    };
+    (outcome, presented)
 }
 
 /// The response's `ETag`, when it carries a header-safe one.
@@ -1632,13 +1874,21 @@ fn now_stamp() -> String {
 /// session that silently receives nothing is in exactly the pre-plan state this
 /// module exists to end.
 ///
+/// `route_id` is the route's `{id}` (the runner TERMINAL id the hook sends,
+/// falling back to the Claude session id) and `session_key` is what
+/// `mcp::sessions::resolve_session_key` made of it. Together they name the
+/// session whose tenant the coord-mcp proxy decides
+/// ([`crate::mcp::policy_tenant::route_policy_decision`]) — the tenant whose
+/// credential every fetch here presents.
+///
 /// `delivered_sha` is the session's spawn-time marker
 /// ([`crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV`], already parsed
 /// by [`parse_delivered_sha`]). It changes only the RENDER
 /// ([`render_for_session`]) — the attributed coord read happens identically
 /// either way, so `coord.session_policy_reads` keeps its
-/// `session_start_injection` row for every session.
+/// `session_start_injection` row for every session whose tenant resolves.
 pub async fn policy_context(
+    route_id: &str,
     session_key: &str,
     source: Option<&str>,
     attribution: Option<uuid::Uuid>,
@@ -1668,29 +1918,55 @@ pub async fn policy_context(
 
     let fetched_at = now_stamp();
     // `coord_client_parts` is the shared accessor `continuation_verdict` and
-    // `session_compliance` both use — same credential, same coord base. Its
-    // error is the honest "unpaired" reason, which the notice renders verbatim.
-    let (text, decision) = match crate::mcp::continuation_verdict::coord_client_parts() {
-        Ok((base, jwt)) => match fetch_payload(&base, attribution).await {
-            Ok(payload) => {
-                if mode == Mode::On {
-                    persist_policy_body_cache(&jwt, &payload);
+    // `session_compliance` both use — the coord base, and the "is this runner
+    // paired at all" gate. Its error is the honest "unpaired" reason, which the
+    // notice renders verbatim. Its token is NOT the fetch credential any more:
+    // that is the session's tenant's, decided next.
+    let (text, decision, tenant) = match crate::mcp::continuation_verdict::coord_client_parts() {
+        Ok((base, _default_jwt)) => {
+            // Whose policy: the tenant the coord-mcp proxy decides for THIS
+            // session, awaited (SessionStart is its first call). An UNKNOWN on a
+            // multi-bound device is no target at all, so nothing is fetched.
+            let tenant_decision =
+                crate::mcp::policy_tenant::route_policy_decision(route_id, session_key).await;
+            match crate::mcp::policy_tenant::fetch_target(
+                tenant_decision,
+                crate::mcp::policy_tenant::default_slot_tenant,
+            ) {
+                Err(reason) => {
+                    warn!(session = %session_key, source, reason = %reason, "policy-context: session tenant unresolved — injecting the fail-open notice instead of the default tenant's policy");
+                    (
+                        render_failure_notice(&reason, source, &fetched_at),
+                        PolicyRenderDecision::tenant_unresolved(raw_source, delivered_sha),
+                        None,
+                    )
                 }
-                render_for_session(&payload, delivered_sha, raw_source, &fetched_at)
+                Ok(target) => match fetch_payload(&base, target, attribution).await {
+                    Ok((payload, presented)) => {
+                        if mode == Mode::On {
+                            persist_policy_body_cache(target.tenant, presented, &payload);
+                        }
+                        let (text, decision) =
+                            render_for_session(&payload, delivered_sha, raw_source, &fetched_at);
+                        (text, decision, target.tenant)
+                    }
+                    Err(reason) => {
+                        warn!(session = %session_key, source, reason = %reason, "policy-context: pull failed — injecting the fail-open notice");
+                        (
+                            render_failure_notice(&reason, source, &fetched_at),
+                            PolicyRenderDecision::pull_failed(raw_source, delivered_sha),
+                            target.tenant,
+                        )
+                    }
+                },
             }
-            Err(reason) => {
-                warn!(session = %session_key, source, reason = %reason, "policy-context: pull failed — injecting the fail-open notice");
-                (
-                    render_failure_notice(&reason, source, &fetched_at),
-                    PolicyRenderDecision::pull_failed(raw_source, delivered_sha),
-                )
-            }
-        },
+        }
         Err(reason) => {
             warn!(session = %session_key, source, reason = %reason, "policy-context: cannot consult coord — injecting the fail-open notice");
             (
                 render_failure_notice(&reason, source, &fetched_at),
                 PolicyRenderDecision::pull_failed(raw_source, delivered_sha),
+                None,
             )
         }
     };
@@ -1714,8 +1990,9 @@ pub async fn policy_context(
     // ONE event per injected session, never zero and never two. This is the
     // event that already existed — message and `delivered_marker` /
     // `confirmed_spawn_delivery` field names kept verbatim so saved greps still
-    // match — EXTENDED with the typed reason, the facts behind it, and both
-    // SHAs. A second event beside it would make a grep count answer twice.
+    // match — EXTENDED with the typed reason, the facts behind it, both SHAs,
+    // and the tenant whose credential fetched it. A second event beside it
+    // would make a grep count answer twice.
     //
     // `source` is `normalize_source`'s LABEL and maps an absent source to
     // `startup`; `source_raw` is what the hook actually sent, and `reason`
@@ -1755,6 +2032,7 @@ pub async fn policy_context(
         marker_matches = decision.marker_matches,
         delivered_sha = %decision.delivered_sha_short(),
         policy_body_sha = %decision.body_sha_short(),
+        tenant = %tenant.map_or_else(|| ABSENT_FIELD.to_string(), |t| t.to_string()),
         "policy-context: injecting fleet policy at SessionStart"
     );
     Some(envelope(&text))
@@ -1766,10 +2044,10 @@ pub async fn policy_context(
 
 /// The tenant a device JWT names, from its unverified `tenant_id` claim.
 ///
-/// Used only to NAME a local cache file, never to authorize anything — the
-/// same posture `coord_mcp::device_jwt_claim_tenant` takes. The policy body
-/// this runner fetches is the tenant coord resolves from this same bearer, so
-/// the claim is the right scope for the file.
+/// Used only to NAME a local cache file and to check that a request presents
+/// the target tenant's credential, never to authorize anything — the same
+/// posture `coord_mcp::device_jwt_claim_tenant` takes. Coord resolves the
+/// policy rows from this same bearer, so the claim is the right scope for both.
 fn tenant_of_jwt(jwt: &str) -> Option<uuid::Uuid> {
     let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(jwt.trim())?;
     uuid::Uuid::parse_str(&raw).ok()
@@ -1779,22 +2057,14 @@ fn tenant_of_jwt(jwt: &str) -> Option<uuid::Uuid> {
 ///
 /// Called by the route after each successful fetch (no extra coord read — see
 /// [`crate::session::spawn_prompt`] for why a background refresher was
-/// rejected). A payload with no body writes nothing, so a transient body
-/// failure never blanks a good cache. No resolvable tenant ⇒ nothing is
-/// written: there is deliberately no unscoped name a prompt could cross
-/// tenants through.
-fn persist_policy_body_cache(jwt: &str, payload: &PolicyPayload) {
-    let Some(body) = render_policy_body(payload) else {
-        return;
-    };
-    let Some(tenant) = tenant_of_jwt(jwt) else {
-        debug!(
-            "policy-context: device JWT carries no tenant_id claim — spawn body cache not written"
-        );
-        return;
-    };
+/// rejected). See [`persist_policy_body_cache_in`] for what is written where.
+fn persist_policy_body_cache(
+    session_tenant: Option<uuid::Uuid>,
+    presented: Option<uuid::Uuid>,
+    payload: &PolicyPayload,
+) {
     let dir = crate::session::claude_hook::session_restore_dir();
-    if let Err(e) = crate::session::spawn_prompt::write_policy_body_cache(&dir, &tenant, &body) {
+    if let Err(e) = persist_policy_body_cache_in(&dir, session_tenant, presented, payload) {
         warn!(
             error = %e,
             dir = %dir.display(),
@@ -1804,24 +2074,36 @@ fn persist_policy_body_cache(jwt: &str, payload: &PolicyPayload) {
     }
 }
 
-/// The policy body a spawn seam should compose into the system prompt, or
-/// `None` for "stay inline".
+/// [`persist_policy_body_cache`] over an explicit dir — the unit-test surface.
+/// Returns the path written, `Ok(None)` when nothing was.
 ///
-/// Local I/O only, never a coord call: the injection flag must be `on`
-/// (`off`/`observe` inject nothing, and a system prompt is an injection), the
-/// runner's device JWT must name a tenant, and that tenant's cache must exist.
-/// Reading the JWT is a local secure-storage read — the same one the terminal
-/// seam's coord-mcp provisioning already makes on this path.
-pub fn spawn_policy_body() -> Option<String> {
-    if Mode::from_env() != Mode::On {
-        return None;
-    }
-    let jwt = crate::auth::AuthManager::new().get_access_token().ok()?;
-    let tenant = tenant_of_jwt(&jwt)?;
-    crate::session::spawn_prompt::read_policy_body_cache(
-        &crate::session::claude_hook::session_restore_dir(),
-        &tenant,
-    )
+/// The file is named for `presented` — the tenant the bearer the fetch
+/// ACTUALLY presented claims — and only when that is the session's tenant
+/// ([`crate::mcp::policy_tenant::cache_file_tenant`], Design §2a): a body
+/// fetched under any other credential is never filed under the session
+/// tenant's name, and there is deliberately no unscoped name a prompt could
+/// cross tenants through. A payload with no body writes nothing, so a transient
+/// body failure never blanks a good cache.
+fn persist_policy_body_cache_in(
+    dir: &std::path::Path,
+    session_tenant: Option<uuid::Uuid>,
+    presented: Option<uuid::Uuid>,
+    payload: &PolicyPayload,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let Some(body) = render_policy_body(payload) else {
+        return Ok(None);
+    };
+    let Some(tenant) = crate::mcp::policy_tenant::cache_file_tenant(session_tenant, presented)
+    else {
+        debug!(
+            session_tenant = ?session_tenant,
+            presented = ?presented,
+            "policy-context: the presented credential's tenant is not the session's (or is \
+             unknown) — spawn body cache not written"
+        );
+        return Ok(None);
+    };
+    crate::session::spawn_prompt::write_policy_body_cache(dir, &tenant, &body).map(Some)
 }
 
 // ===========================================================================
@@ -1870,7 +2152,13 @@ mod tests {
                     current_version: Some(6),
                 },
             ],
+            tenant: Some(sample_tenant()),
         }
+    }
+
+    /// The tenant [`sample_payload`] was fetched for.
+    fn sample_tenant() -> uuid::Uuid {
+        uuid::Uuid::parse_str("ce1ec20c-9cf1-427a-857d-81d6449cc6e4").unwrap()
     }
 
     // ── Flag parse (defaults to ON) ─────────────────────────────────────
@@ -2074,16 +2362,18 @@ mod tests {
     #[test]
     fn the_cache_round_trips_both_validators() {
         let base = format!("https://cache-test-{}.example.com", uuid::Uuid::new_v4());
-        assert!(cache_snapshot(&base).any.is_none(), "starts empty");
+        let tenant = Some(sample_tenant());
+        assert!(cache_snapshot(&base, tenant).any.is_none(), "starts empty");
 
         cache_store(
             &base,
+            tenant,
             Some("\"14:aaaa\"".to_string()),
             Some("\"1:bbbb\"".to_string()),
             sample_payload(),
         );
 
-        let snap = cache_snapshot(&base);
+        let snap = cache_snapshot(&base, tenant);
         assert_eq!(snap.list_etag.as_deref(), Some("\"14:aaaa\""));
         assert_eq!(
             snap.doc_etag.as_deref(),
@@ -2095,6 +2385,349 @@ mod tests {
             snap.fresh.is_some(),
             "a just-stored entry is inside the TTL"
         );
+    }
+
+    /// Tests bullet 2 / Design §3. One coord base, two tenants: an entry for
+    /// (base, A) is never served for (base, B), and vice versa — on a
+    /// multi-bound device two sessions on one coord can need two tenants'
+    /// policies at once.
+    #[test]
+    fn the_cache_never_serves_one_tenants_entry_for_another_on_the_same_base() {
+        let base = format!("https://cache-tenant-{}.example.com", uuid::Uuid::new_v4());
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let payload_for = |t: uuid::Uuid, body: &str| PolicyPayload {
+            protocol_body: Some(body.to_string()),
+            tenant: Some(t),
+            ..sample_payload()
+        };
+
+        cache_store(
+            &base,
+            Some(a),
+            Some("\"a-list\"".to_string()),
+            Some("\"a-doc\"".to_string()),
+            payload_for(a, "A's protocol"),
+        );
+        let for_b = cache_snapshot(&base, Some(b));
+        assert!(
+            for_b.any.is_none() && for_b.fresh.is_none(),
+            "tenant A's entry must not be served to a tenant-B session"
+        );
+        assert_eq!(
+            (for_b.list_etag, for_b.doc_etag),
+            (None, None),
+            "and A's validators must not be replayed under B's credential"
+        );
+
+        cache_store(
+            &base,
+            Some(b),
+            Some("\"b-list\"".to_string()),
+            Some("\"b-doc\"".to_string()),
+            payload_for(b, "B's protocol"),
+        );
+        let for_a = cache_snapshot(&base, Some(a));
+        let for_b = cache_snapshot(&base, Some(b));
+        assert_eq!(
+            for_a.any.and_then(|p| p.protocol_body).as_deref(),
+            Some("A's protocol"),
+            "storing B's entry must not overwrite A's"
+        );
+        assert_eq!(
+            for_b.any.and_then(|p| p.protocol_body).as_deref(),
+            Some("B's protocol")
+        );
+        assert_eq!(for_a.doc_etag.as_deref(), Some("\"a-doc\""));
+        assert_eq!(for_b.doc_etag.as_deref(), Some("\"b-doc\""));
+        // A default slot naming no tenant is its own slot, too.
+        assert!(cache_snapshot(&base, None).any.is_none());
+    }
+
+    // ── The presented credential (Design §2a) ────────────────────────────
+
+    /// A JWT-shaped token carrying `tenant_id` — the same shape
+    /// `tenant_of_jwt_reads_the_claim_and_rejects_non_uuids` builds.
+    fn jwt_claiming(tenant: uuid::Uuid) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({"tenant_id": tenant.to_string()})).unwrap()
+            )
+        )
+    }
+
+    /// The claim is read off the request's own `Authorization` header — the
+    /// bearer that will actually be presented — and nothing else.
+    #[test]
+    fn the_presented_claim_is_read_off_the_requests_own_bearer() {
+        use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+        let t = uuid::Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        assert_eq!(presented_claim(&headers), None, "no header, no claim");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", jwt_claiming(t))).unwrap(),
+        );
+        assert_eq!(presented_claim(&headers), Some(t));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(presented_claim(&headers), None, "a non-bearer credential");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer opaque-token"),
+        );
+        assert_eq!(presented_claim(&headers), None, "a bearer naming no tenant");
+    }
+
+    /// The last-moment guard: a read is sent only when its credential claims
+    /// the target tenant. A target naming no tenant asserts nothing.
+    #[test]
+    fn a_policy_read_is_sent_only_under_the_target_tenants_own_credential() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert_eq!(check_presented(Some(b), Some(b)), Ok(()));
+        let wrong = check_presented(Some(b), Some(a)).expect_err("A's credential for B");
+        assert!(wrong.contains(&format!("claims tenant {a}")), "{wrong}");
+        let none = check_presented(Some(b), None).expect_err("no credential for B");
+        assert!(
+            none.contains(&format!("no usable credential claiming tenant {b}")),
+            "{none}"
+        );
+        assert_eq!(check_presented(None, None), Ok(()));
+        assert_eq!(check_presented(None, Some(a)), Ok(()));
+    }
+
+    /// Tests bullet 5, at the request layer: for a tenant this runner holds no
+    /// usable credential for, `coord_get_for(Owned(t))` would go out
+    /// UNAUTHENTICATED — and `build_policy_get` refuses it before it can be
+    /// sent, so no fetch is made.
+    ///
+    /// `t` is a fresh random uuid, so no slot can exist for it whatever store
+    /// the test process reads (`cargo-guard.sh test` points it at an empty
+    /// per-run dir); the read is read-only either way.
+    #[test]
+    fn no_policy_request_is_built_for_a_tenant_with_no_usable_credential() {
+        let client = reqwest::Client::new();
+        let t = uuid::Uuid::new_v4();
+        let target = crate::mcp::policy_tenant::PolicyTarget {
+            scope: crate::auth::TenantScope::Owned(t),
+            tenant: Some(t),
+        };
+        for url in [
+            list_url("https://coord.example.com"),
+            document_url("https://coord.example.com", PROTOCOL_DOC_NAME),
+        ] {
+            let refused = build_policy_get(&client, url, target, None, None)
+                .expect_err("an unauthenticated read for tenant t must never be built to send");
+            assert!(
+                refused.contains(&format!("no usable credential claiming tenant {t}")),
+                "{refused}"
+            );
+        }
+    }
+
+    // ── The spawn cache file (Design §2a) ────────────────────────────────
+
+    /// Tests bullet 6. The file is named from the PRESENTED bearer's claim, and
+    /// nothing is written when that claim is not the session's tenant.
+    #[test]
+    fn the_spawn_cache_file_is_named_for_the_presented_claim_and_skipped_on_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let payload = PolicyPayload {
+            tenant: Some(b),
+            ..sample_payload()
+        };
+
+        // Mismatch: the session is B, the fetch presented A's credential.
+        let written = persist_policy_body_cache_in(dir.path(), Some(b), Some(a), &payload)
+            .expect("no I/O error");
+        assert_eq!(written, None, "nothing is filed when the claim is not B");
+        // No presented claim at all (a cache hit, an unbuildable request).
+        assert_eq!(
+            persist_policy_body_cache_in(dir.path(), Some(b), None, &payload).unwrap(),
+            None
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no file of any name was written on a mismatch"
+        );
+
+        // Match: B's file, named from the presented claim, holding B's body.
+        let written = persist_policy_body_cache_in(dir.path(), Some(b), Some(b), &payload)
+            .expect("no I/O error")
+            .expect("a file was written");
+        assert_eq!(
+            written,
+            crate::session::spawn_prompt::policy_body_cache_path(dir.path(), &b)
+        );
+        assert_eq!(
+            crate::session::spawn_prompt::read_policy_body_cache(dir.path(), &b),
+            render_policy_body(&payload)
+        );
+        assert_eq!(
+            crate::session::spawn_prompt::read_policy_body_cache(dir.path(), &a),
+            None,
+            "and nothing under A"
+        );
+    }
+
+    // ── The tenant line (Design §4) ──────────────────────────────────────
+
+    /// Tests bullet 7. The body carries `[tenant: …]` on the line directly
+    /// after the version header, the header line is byte-identical to what it
+    /// was, and the line is inside the hashed bytes — two tenants' bodies never
+    /// share a delivered-SHA.
+    #[test]
+    fn the_protocol_body_carries_the_tenant_line_under_a_byte_identical_header() {
+        let t = sample_tenant();
+        let body = render_policy_body(&sample_payload()).expect("a body");
+        let lines: Vec<&str> = body.lines().collect();
+        // The literal header — the string the `/unattended` held rule parses.
+        let at = lines
+            .iter()
+            .position(|l| *l == "===== policy/session-protocol (v6) =====")
+            .expect("the version header line is byte-identical");
+        assert_eq!(
+            lines.get(at + 1).copied(),
+            Some(format!("[tenant: slug unknown {t}]").as_str()),
+            "the tenant line follows the header directly"
+        );
+        assert_eq!(lines.get(at + 2).copied(), Some(""), "then the blank line");
+        assert_eq!(
+            lines.get(at + 3).copied(),
+            Some("Step 0 — read the policies, fresh."),
+            "then the body"
+        );
+
+        // Inside the hashed bytes: another tenant's render hashes differently.
+        let other = PolicyPayload {
+            tenant: Some(uuid::Uuid::new_v4()),
+            ..sample_payload()
+        };
+        assert_ne!(
+            crate::session::spawn_prompt::policy_body_sha(&body),
+            crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&other).unwrap()),
+            "a spawn-time body for one tenant must never confirm a fetch for another"
+        );
+
+        // A default credential naming no tenant says so, never renders blank.
+        let untenanted = PolicyPayload {
+            tenant: None,
+            ..sample_payload()
+        };
+        assert!(render_policy_body(&untenanted)
+            .unwrap()
+            .contains("===== policy/session-protocol (v6) =====\n[tenant: unknown]\n\n"));
+    }
+
+    /// The tenant line through the full SessionStart render
+    /// ([`render_injection`], which `render_for_session` serves every session
+    /// that is not confirmed by a spawn-time copy): the line directly under the
+    /// version header must name the tenant. Without the line it is the blank
+    /// separator instead, and this fails.
+    #[test]
+    fn the_full_render_names_the_tenant_directly_under_the_version_header() {
+        let payload = PolicyPayload {
+            protocol_body: Some("Step 0 — read the policies, fresh.".to_string()),
+            protocol_version: Some(13),
+            ..PolicyPayload::default()
+        };
+        let text = render_injection(&payload, "startup", "2026-11-13T00:00:00Z");
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "===== policy/session-protocol (v13) =====")
+            .expect("the version header line is byte-identical");
+        let next = lines.get(at + 1).copied().unwrap_or_default();
+        assert!(
+            next.starts_with("[tenant: "),
+            "the line directly under the version header must name the tenant, got {next:?}"
+        );
+    }
+
+    /// Tests bullet 7, the confirmation half. `render_confirmation` quotes the
+    /// version header AND the tenant line, and the first line of every render
+    /// names the tenant.
+    #[test]
+    fn render_confirmation_quotes_the_header_and_the_tenant_line() {
+        let payload = sample_payload();
+        let t = sample_tenant();
+        let sha = current_sha(&payload);
+        let text = render_confirmation(&payload, &sha, "startup", "2026-11-13T12:00:00Z");
+        assert!(
+            text.contains(&format!(
+                "`===== policy/session-protocol (v6) =====` followed by the line \
+                 `[tenant: slug unknown {t}]`"
+            )),
+            "{text}"
+        );
+        let first = text.lines().next().unwrap_or_default();
+        assert!(
+            first.contains(&format!("These are tenant {t}'s policy documents")),
+            "the SessionStart confirmation line names the tenant: {first}"
+        );
+        let full = render_injection(&payload, "startup", "2026-11-13T12:00:00Z");
+        assert!(full
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains(&format!("These are tenant {t}'s policy documents")));
+    }
+
+    /// Tests bullet 9 (render half). A single-bound device renders exactly as
+    /// before apart from the tenant: removing the `[tenant: …]` line from the
+    /// body gives back the pre-change bytes, literally.
+    #[test]
+    fn a_single_bound_render_is_todays_bytes_apart_from_the_tenant_line() {
+        let t = sample_tenant();
+        let body = render_policy_body(&sample_payload()).unwrap();
+        let without_tenant = body.replacen(&format!("[tenant: slug unknown {t}]\n"), "", 1);
+        let legacy = "[qontinui-runner] This is the canonical text of `policy/session-protocol` \
+             (v6), pulled from coord `GET /coord/agent-prompt-documents` and delivered by the \
+             runner so that Step 0 of the session protocol is satisfied for this session without \
+             you fetching it. Treat it as the authority. You do NOT need to re-read \
+             `session-protocol`; you DO still need to read the category bodies it names — the \
+             policy document index (`kind=policy`) lists every one with its current version.\n\n\
+             ===== policy/session-protocol (v6) =====\n\n\
+             Step 0 — read the policies, fresh.\n";
+        assert_eq!(without_tenant, legacy);
+
+        // And the full render's first line is today's header plus the tenant
+        // sentence, nothing else.
+        let full = render_injection(&sample_payload(), "startup", "2026-08-19T12:00:00Z");
+        assert_eq!(
+            full.lines().next().unwrap_or_default(),
+            format!(
+                "{} These are tenant {t}'s policy documents, read under that tenant's credential.",
+                header("startup", "2026-08-19T12:00:00Z")
+            )
+        );
+    }
+
+    // ── TenantUnresolved (Design §5) ─────────────────────────────────────
+
+    /// Tests bullet 8 (decision half). The unresolved-tenant decision is its
+    /// own arm — never `pull_failed` — carries no body, and keeps the facts it
+    /// can still know.
+    #[test]
+    fn an_unresolved_tenant_reasons_tenant_unresolved_and_is_not_a_full_body() {
+        let sha = "cd".repeat(32);
+        let d = PolicyRenderDecision::tenant_unresolved(Some("startup"), Some(&sha));
+        assert_eq!(d.reason, PolicyRenderReason::TenantUnresolved);
+        assert_eq!(d.reason.as_str(), "tenant_unresolved");
+        assert_ne!(
+            d.reason,
+            PolicyRenderReason::PullFailed,
+            "\"coord unreachable\" and \"whose policy is unknown\" are different findings"
+        );
+        assert!(!d.served_full_body() && !d.confirmed());
+        assert!(d.source_confirmable && d.marker_present);
+        assert!(!d.body_present && !d.marker_matches);
+        assert_eq!(d.body_sha, None);
     }
 
     // ── Rendering ───────────────────────────────────────────────────────
@@ -2143,6 +2776,7 @@ mod tests {
                 description: String::new(),
                 current_version: None,
             }],
+            tenant: Some(sample_tenant()),
         };
         let text = render_injection(&payload, "resume", "2026-08-19T12:00:00Z");
         assert!(text.contains("policy/session-protocol (version unknown)"));
@@ -2159,6 +2793,7 @@ mod tests {
             protocol_body: None,
             protocol_version: None,
             index: sample_payload().index,
+            tenant: Some(sample_tenant()),
         };
         let text = render_injection(&payload, "compact", "2026-08-19T12:00:00Z");
         assert!(text.contains("source: compact"));
@@ -2177,6 +2812,7 @@ mod tests {
             protocol_body: Some("body".to_string()),
             protocol_version: Some(6),
             index: Vec::new(),
+            tenant: Some(sample_tenant()),
         };
         let text = render_injection(&payload, "startup", "2026-08-19T12:00:00Z");
         assert!(text.contains("(kind=policy, 0 documents)"));
@@ -2683,7 +3319,7 @@ mod tests {
     }
 
     /// The label set is the grep contract — every saved query keys on these
-    /// strings — and exactly six of the eight arms mean a full body crossed the
+    /// strings — and exactly six of the nine arms mean a full body crossed the
     /// hook boundary.
     #[test]
     fn every_reason_has_a_distinct_stable_label_and_six_mean_full_body() {
@@ -2699,6 +3335,7 @@ mod tests {
                 "marker_mismatched",
                 "confirmed",
                 "pull_failed",
+                "tenant_unresolved",
             ]
         );
         let full: Vec<&str> = PolicyRenderReason::ALL
@@ -2716,7 +3353,8 @@ mod tests {
                 "marker_absent",
                 "marker_mismatched",
             ],
-            "a confirmation and a failed pull carry no body and must not be counted as one"
+            "a confirmation, a failed pull and an unresolved tenant carry no body and must not \
+             be counted as one"
         );
         // Slots are distinct, so no two reasons share a counter.
         let mut slots: Vec<Option<usize>> =
@@ -2735,6 +3373,12 @@ mod tests {
     #[test]
     fn the_arm_count_is_pinned_to_the_arm_list() {
         assert_eq!(PolicyRenderReason::ALL.len(), PolicyRenderReason::COUNT);
+        // Nine since `TenantUnresolved` (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §5): a literal, so the arm cannot be dropped from both
+        // declarations at once without this objecting.
+        assert_eq!(PolicyRenderReason::COUNT, 9);
+        assert!(PolicyRenderReason::ALL.contains(&PolicyRenderReason::TenantUnresolved));
     }
 
     /// `record_render` files each reason in its own slot, and the two derived
@@ -2771,14 +3415,15 @@ mod tests {
         assert_eq!(after.marker_mismatched - before.marker_mismatched, 6);
         assert_eq!(after.confirmed - before.confirmed, 7);
         assert_eq!(after.pull_failed - before.pull_failed, 8);
+        assert_eq!(after.tenant_unresolved - before.tenant_unresolved, 9);
 
         // Hand-computed literals, NOT the same sum `render_stats` just made
         // from the same locals: re-deriving `full_body_total` from the fields
         // beside it passes on any implementation, including one that reads
         // every slot as 0. 1+2+3+4+5+6 = 21 full-body; +7 confirmed +8 pull
-        // failed = 36 injections.
+        // failed +9 tenant unresolved = 45 injections.
         assert_eq!(after.full_body_total - before.full_body_total, 21);
-        assert_eq!(after.injections - before.injections, 36);
+        assert_eq!(after.injections - before.injections, 45);
     }
 
     /// `should_count` is the rule that keeps the tally a count of INJECTIONS.
@@ -2803,8 +3448,8 @@ mod tests {
     /// Every arm is reachable in the counter array, and none indexes past it.
     ///
     /// The slot is derived from `ALL`, so this is what makes the derivation's
-    /// promise real: a 9th arm left out of `ALL` compiles (`ALL: [Self; COUNT]`
-    /// stays a well-typed 8-element literal) and would otherwise be found only
+    /// promise real: one more arm left out of `ALL` compiles (`ALL: [Self; COUNT]`
+    /// stays a well-typed `COUNT`-element literal) and would otherwise be found only
     /// by a panic inside the fail-open route.
     #[test]
     fn the_every_arm_is_listed_and_slots_are_in_range() {
@@ -2816,7 +3461,7 @@ mod tests {
         }
         // Recording never panics, whatever the arm. This TOUCHES the shared
         // counters, so it takes `COUNTER_LOCK` like every other test that does —
-        // without it these eight increments race the delta assertions in
+        // without it these increments race the delta assertions in
         // `the_counter_files_each_reason_separately_and_the_totals_add_up` and
         // make it fail intermittently as though the slot mapping were wrong.
         let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2839,6 +3484,12 @@ mod tests {
             );
         }
         assert!(obj.contains_key("full_body_total"));
+        // The new arm's operator-facing key, by its literal name (the stats
+        // route is a grep contract like `as_str`'s labels).
+        assert!(
+            obj.contains_key("tenant_unresolved"),
+            "`/sessions/policy-context-stats` must publish the tenant_unresolved arm"
+        );
         assert!(
             obj.contains_key("injections"),
             "the unit is an injection, not a session — the key says so"

@@ -1141,6 +1141,13 @@ pub(crate) struct ResumeSpawn<'a> {
     /// Why this pane is being spawned — decides whether its tab is selected
     /// (`terminal-created` `surface`, [`crate::terminal::focus_coalescer`]).
     pub origin: crate::coord_drain_state::SpawnOrigin,
+    /// The tenant whose cached policy body the respawn's system-prompt file
+    /// composes: what [`crate::mcp::policy_tenant::new_session_policy_tenant`]
+    /// resolved for `working_dir`, awaited by the caller because this function
+    /// is synchronous (plan
+    /// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    /// Design §6). `None` composes no body — never the device default's.
+    pub policy_tenant: Option<uuid::Uuid>,
 }
 
 /// [`transcript_last_model`] off the async worker. It reads the WHOLE
@@ -1189,7 +1196,8 @@ pub(crate) fn spawn_resumed_pane(
     // plus the `--settings <hook file>` pair below.
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
-    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(None);
+    let prompt_carrier =
+        crate::session::spawn_prompt::resolve_system_prompt_carrier(None, spec.policy_tenant);
     let command = resume_respawn_argv(
         // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
         // `claude_bin_path()` cannot be the PTY child's program on Windows,
@@ -1212,7 +1220,7 @@ pub(crate) fn spawn_resumed_pane(
         // Plus the policy body at spawn (plan
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
         // this respawn has no briefing, so it carries a BODY-ONLY composed
-        // file when the tenant's cache exists, and nothing otherwise.
+        // file when `spec.policy_tenant`'s cache exists, and nothing otherwise.
         resume_respawn_extra_required(
             // A migrated GATE continuation keeps its Stop-armed carrier.
             crate::session::claude_hook::spawn_settings_args(spec.gate_identity.is_some()),
@@ -1636,6 +1644,13 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
             &self.record.claude_session_id,
         ))
         .await;
+        // Whose policy body the respawn's system-prompt file carries: the
+        // tenant a session in its working dir resolves to, awaited HERE because
+        // the spawn seam below is synchronous (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Resolved per attempt: a retry spawns afresh.
+        let policy_tenant =
+            crate::mcp::policy_tenant::new_session_policy_tenant(Path::new(self.working_dir)).await;
         // The seam is synchronous and runs here, on the async worker, NOT on
         // the blocking pool: a spawn handed to `spawn_blocking` keeps running
         // when this future is cancelled (task abort, shutdown), and would
@@ -1685,6 +1700,7 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
                 resource_override: true,
                 gate_identity: self.gate_identity,
                 origin: self.origin,
+                policy_tenant,
             },
         )
         .map(|(terminal_id, _coord_session_id)| terminal_id)
