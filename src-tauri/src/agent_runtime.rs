@@ -11372,6 +11372,33 @@ fn overlay_checkout_agent_definitions(
         )
         .with_destination(dst_dir.display().to_string()));
     }
+    // NEVER OVERLAY A DIRECTORY ONTO ITSELF. When the session cwd IS the
+    // qontinui-claude-config checkout, or a workspace root whose `.claude` is a
+    // symlink into it, `src_dir` and `dst_dir` name one directory, and
+    // `std::fs::copy(a, a)` opens the destination with truncation before it
+    // reads the source — every overlaid definition would become a 0-byte file.
+    // The checkout's own files are already what the session resolves, so there
+    // is nothing to copy; the row says so instead of claiming writes.
+    if same_directory(src_dir, dst_dir) {
+        info!(
+            "agent_runtime: agent-def overlay skipped — source {} is the destination {} \
+             itself; the checkout's own definitions are served in place",
+            src_dir.display(),
+            dst_dir.display()
+        );
+        return Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            dst_dir.display().to_string(),
+            format!(
+                "overlay not run: the source {} is the destination directory itself, so \
+                 nothing was copied and the checkout's own definitions are served in place \
+                 (a copy onto itself would truncate them)",
+                src_dir.display()
+            ),
+        )
+        .with_destination(dst_dir.display().to_string()));
+    }
     std::fs::create_dir_all(dst_dir).map_err(|e| {
         anyhow::anyhow!(
             "create {} for agent-def provisioning: {e}",
@@ -11433,6 +11460,22 @@ fn overlay_checkout_agent_definitions(
             report.skip(unit, reason.clone());
             continue;
         }
+        // Per file as well as per directory: a destination that is a symlink
+        // or hard link to its own source would be truncated by the copy too.
+        if same_file(&path, &dst) {
+            info!(
+                "agent_runtime: not overlaying {} onto {} — they are the same file",
+                path.display(),
+                dst.display()
+            );
+            report.skip(
+                unit,
+                capability_manifest::SkipReason::Unresolved(
+                    "the destination is the source file itself; nothing to copy".to_string(),
+                ),
+            );
+            continue;
+        }
         // Idempotent: overwrite is fine (std::fs::copy truncates the target).
         if let Err(e) = std::fs::copy(&path, &dst) {
             warn!(
@@ -11471,6 +11514,36 @@ fn overlay_checkout_agent_definitions(
         report.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(report)
+}
+
+/// True when `a` and `b` name the same existing directory, through any
+/// symlink. Compared by canonical path, and on unix also by device + inode so a
+/// bind mount or a path canonicalize spells differently still matches. A path
+/// that does not exist is never "the same" as one that does.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    same_fs_object(a, b)
+}
+
+/// True when `a` and `b` resolve to the same existing file (symlink or hard
+/// link included). See [`same_directory`].
+fn same_file(a: &Path, b: &Path) -> bool {
+    same_fs_object(a, b)
+}
+
+fn same_fs_object(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 /// The workspace root holding the runner's canonical checkouts.
@@ -15868,6 +15941,99 @@ mod tests {
             p.display()
         );
         assert!(p.to_string_lossy().contains("qontinui-worktrees"));
+    }
+
+    /// The cwd IS the overlay checkout: `src_dir` and `dst_dir` are one
+    /// directory, and copying a file onto itself truncates it. An untracked
+    /// overlay definition there keeps its bytes, and the row records the skip
+    /// rather than a write.
+    #[test]
+    fn provision_agent_defs_overlay_never_copies_a_file_onto_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("qontinui-claude-config");
+        let agents = checkout.join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let body = b"# a local, untracked overlay definition\n";
+        std::fs::write(agents.join("local-overlay-only.md"), body).unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &checkout.to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(agents.join("local-overlay-only.md")).unwrap(),
+            body,
+            "the overlay must never truncate its own source"
+        );
+        assert_eq!(report.written, 0, "nothing is claimed as written");
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert!(
+            report.skipped.iter().any(|u| matches!(
+                &u.reason,
+                crate::capability_manifest::SkipReason::Unresolved(why)
+                    if why.contains("destination directory itself")
+            )),
+            "the skip names why: {:?}",
+            report.skipped
+        );
+    }
+
+    /// The same hazard through a symlink: a workspace root whose `.claude` is a
+    /// symlink into the qontinui-claude-config checkout.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_overlay_never_copies_through_a_symlinked_claude_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_claude = root.path().join("qontinui-claude-config").join(".claude");
+        let agents = checkout_claude.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let body = b"# a local, untracked overlay definition\n";
+        std::fs::write(agents.join("local-overlay-only.md"), body).unwrap();
+        std::os::unix::fs::symlink(&checkout_claude, root.path().join(".claude")).unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &root.path().to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(agents.join("local-overlay-only.md")).unwrap(),
+            body,
+            "a symlinked .claude must not turn the overlay into a self-copy"
+        );
+        assert_eq!(report.written, 0);
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+    }
+
+    /// Per file: a destination that is a symlink to its own source is skipped
+    /// with a reason, while the other definitions are still overlaid.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_overlay_skips_a_destination_symlinked_to_its_source() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        let body = b"# linked\n";
+        std::fs::write(src.join("linked-overlay.md"), body).unwrap();
+        std::fs::write(src.join("plain-overlay.md"), b"# plain\n").unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(src.join("linked-overlay.md"), dst.join("linked-overlay.md"))
+            .unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+
+        assert_eq!(std::fs::read(src.join("linked-overlay.md")).unwrap(), body);
+        assert_eq!(
+            std::fs::read(dst.join("plain-overlay.md")).unwrap(),
+            b"# plain\n"
+        );
+        assert_eq!(report.written, 1);
+        assert!(report.skipped.iter().any(|u| u.unit == "linked-overlay.md"));
     }
 
     #[test]

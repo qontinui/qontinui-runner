@@ -67,6 +67,29 @@ export async function fetchConstraintConfig(projectPath?: string): Promise<ReadC
 }
 
 /**
+ * The message of a failed save. The backend answers a refusal (e.g. the 422 for
+ * an unsafe `project_path`) with JSON `{error, code, hint}`; its `error` is the
+ * message. Anything else — a non-JSON body, or JSON without a string `error` —
+ * falls back to the raw text.
+ */
+async function saveErrorMessage(response: Response): Promise<string> {
+  const text = await response.text();
+  try {
+    const body: unknown = JSON.parse(text);
+    if (
+      body !== null &&
+      typeof body === "object" &&
+      typeof (body as { error?: unknown }).error === "string"
+    ) {
+      return (body as { error: string }).error;
+    }
+  } catch {
+    // Not JSON: the raw text is the message.
+  }
+  return text;
+}
+
+/**
  * Validate and write a TOML config string.
  *
  * The backend validates the TOML before writing. If validation fails,
@@ -83,8 +106,7 @@ export async function saveConstraintConfig(
     body: JSON.stringify({ toml, project_path: projectPath }),
   });
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to save constraint config: ${text}`);
+    throw new Error(`Failed to save constraint config: ${await saveErrorMessage(response)}`);
   }
   return unwrapApiResponse<WriteConfigResponse>(response);
 }
