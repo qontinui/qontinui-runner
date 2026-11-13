@@ -237,7 +237,8 @@ fn progress(complete: &[&str], deferred: &[&str], known: &[&str]) -> PagesRestor
 /// set handed out yet nothing has run, and with no report after one it cannot
 /// be told. Mutations: the deferred check removed; the orphan arm removed
 /// (`complete.contains` alone); the orphan arm counting a deferred page as
-/// run; the blank-to-`default` mapping removed.
+/// run, or requiring every completed page to be undeferred (`all`); the
+/// blank-to-`default` mapping removed.
 #[test]
 fn which_pages_restore_has_run() {
     let known = ["default", "p2"];
@@ -255,6 +256,12 @@ fn which_pages_restore_has_run() {
 
     let deferred = progress(&["default"], &["default"], &known);
     assert_eq!(ran(&deferred, "default"), Some(false), "deferred re-runs");
+    let one_of_two = progress(&["default", "p2"], &["default"], &known);
+    assert_eq!(
+        ran(&one_of_two, "orphan-page"),
+        Some(true),
+        "p2 ran, so its first restore adopted the orphans"
+    );
     assert_eq!(
         ran(&deferred, "orphan-page"),
         Some(false),
@@ -314,7 +321,7 @@ fn report(complete: &[&str], deferred: &[&str]) -> PageRestoreProgress {
     PageRestoreProgress {
         complete: set(complete),
         deferred: set(deferred),
-        known: set(&["default", "p2"]),
+        known: set(&["default", "p2", "p3"]),
     }
 }
 
@@ -349,41 +356,104 @@ fn pages_restored_merges_the_windows_and_falls_back_to_the_latch() {
     }
 }
 
+/// A closed window keeps the restores it ran and drops its deferrals: window A
+/// completes p2 and closes, and p2 still reads run; a page A had deferred (it
+/// is in A's `complete` too) neither pins nor counts once A closes; another
+/// window's newer report replaces its older one; an open window's unreadable
+/// report makes the whole answer Unknown, until that window closes. Mutations:
+/// `forget` dropping the completions; `forget` keeping the deferrals; `forget`
+/// retaining a deferred page's completion; `record` keeping the first report;
+/// `pages` ignoring an unreadable report.
+#[test]
+fn a_closed_window_keeps_its_restores_and_drops_its_deferrals() {
+    use BootRestorePhase::Ran;
+    let mut reports = WindowReports::default();
+    reports.record("main", Some(report(&["default"], &[])));
+    reports.record("term-a", Some(report(&["p2", "p3"], &["p3"])));
+    assert_eq!(reports.pages(Ran).has_run("p3"), Some(false), "deferred");
+
+    reports.forget("term-a");
+    let pages = reports.pages(Ran);
+    assert_eq!(
+        pages.has_run("p2"),
+        Some(true),
+        "A's restore of p2 still ran"
+    );
+    assert_eq!(
+        pages.has_run("p3"),
+        Some(false),
+        "A's deferral of p3 no longer pins it, and it never restored"
+    );
+    reports.record("main", Some(report(&["default", "p3"], &[])));
+    assert_eq!(reports.pages(Ran).has_run("p3"), Some(true));
+    reports.record("main", Some(report(&["default"], &[])));
+    assert_eq!(
+        reports.pages(Ran).has_run("p3"),
+        Some(false),
+        "main's newer report replaced its older one"
+    );
+    assert_eq!(reports.pages(Ran).has_run("p2"), Some(true));
+
+    reports.record("term-b", None);
+    assert_eq!(reports.pages(Ran), PagesRestored::Unknown);
+    reports.forget("term-b");
+    assert_eq!(reports.pages(Ran).has_run("p2"), Some(true));
+}
+
+/// A window's report is bounded: ids are trimmed and blank ones dropped, and
+/// a list over the cap, or an id over the length cap, makes the report
+/// unreadable rather than silently orphaning the pages past the cap.
+/// Mutations: the trim removed; the count cap applied by truncation; the
+/// length check removed.
+#[test]
+fn a_report_is_trimmed_and_an_oversized_one_is_unreadable() {
+    let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let read = PageRestoreProgress::from_report(ids(&[" p1 ", ""]), ids(&[]), ids(&["p1", "  "]))
+        .expect("a small report reads");
+    assert_eq!(read.complete, ["p1".to_string()].into_iter().collect());
+    assert_eq!(read.known, ["p1".to_string()].into_iter().collect());
+
+    let many: Vec<String> = (0..=MAX_REPORTED_PAGES).map(|i| format!("p{i}")).collect();
+    assert_eq!(PageRestoreProgress::from_report(vec![], vec![], many), None);
+    let at_cap: Vec<String> = (0..MAX_REPORTED_PAGES).map(|i| format!("p{i}")).collect();
+    assert!(PageRestoreProgress::from_report(vec![], vec![], at_cap).is_some());
+    let long = "x".repeat(MAX_PAGE_ID_LEN + 1);
+    assert_eq!(
+        PageRestoreProgress::from_report(vec![long], vec![], vec![]),
+        None
+    );
+}
+
 /// Serializes the tests that touch the process-global window reports.
 static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Through the process-global registry, as the ledger reads it: two windows'
-/// reports are both read; a closed window's report is forgotten, so a page
-/// only it had deferred stops reading as still to restore; a window's newer
-/// report replaces its older one. Mutations: `forget_page_restore_progress`
-/// a no-op; `record_page_restore_progress` keeping the first report.
+/// The process-global wiring the ledger reads: two windows' reports are both
+/// read through [`PagesRestored::current`], and a closed window's deferral
+/// stops pinning while its restore still counts. Mutation:
+/// `forget_page_restore_progress` a no-op.
 #[test]
-fn a_closed_windows_report_is_forgotten_and_a_newer_one_replaces_it() {
+fn the_global_registry_reads_every_window_and_forgets_a_closed_ones_deferrals() {
     let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_page_restore_progress_for_test();
 
-    record_page_restore_progress("main", report(&["default", "p2"], &[]));
-    record_page_restore_progress("term-1", report(&["p2"], &["p2"]));
+    record_page_restore_progress("main", Some(report(&["default"], &[])));
+    record_page_restore_progress("term-1", Some(report(&["p2", "p3"], &["p3"])));
     let pages = PagesRestored::current();
     assert_eq!(
         pages.has_run("default"),
         Some(true),
         "main's report is read"
     );
-    assert_eq!(pages.has_run("p2"), Some(false), "term-1 deferred it");
+    assert_eq!(pages.has_run("p2"), Some(true), "term-1's report is read");
+    assert_eq!(pages.has_run("p3"), Some(false), "term-1 deferred it");
 
     forget_page_restore_progress("term-1");
+    let pages = PagesRestored::current();
+    assert_eq!(pages.has_run("p2"), Some(true), "its restore still ran");
     assert_eq!(
-        PagesRestored::current().has_run("p2"),
-        Some(true),
-        "the closed pop-out's deferral no longer counts"
-    );
-
-    record_page_restore_progress("main", report(&["default"], &[]));
-    assert_eq!(
-        PagesRestored::current().has_run("p2"),
+        pages.has_run("p3"),
         Some(false),
-        "main's newer report replaced its older one"
+        "never restored, and no longer pinned by a deferral"
     );
 
     reset_page_restore_progress_for_test();

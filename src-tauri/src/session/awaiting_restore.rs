@@ -145,35 +145,112 @@ impl PageRestoreProgress {
         self.known.extend(other.known.iter().cloned());
         self
     }
-}
 
-/// Each window's latest [`PageRestoreProgress`], by window label. A page
-/// restores in the window that shows it, so no one window's report covers
-/// every page; the union does.
-static PAGE_RESTORE_PROGRESS: Mutex<BTreeMap<String, PageRestoreProgress>> =
-    Mutex::new(BTreeMap::new());
-
-/// Record `window`'s latest restore progress, replacing its previous report.
-pub fn record_page_restore_progress(window: &str, progress: PageRestoreProgress) {
-    if let Ok(mut m) = PAGE_RESTORE_PROGRESS.lock() {
-        m.insert(window.to_string(), progress);
+    /// A window's report as the webview sent it, bounded: ids are trimmed and
+    /// blank ones skipped, each at most [`MAX_PAGE_ID_LEN`] bytes. `None` when a
+    /// list holds more than [`MAX_REPORTED_PAGES`] ids or an id is too long:
+    /// dropping the excess would silently turn a layout page into an orphan (or
+    /// a deferred page into a run one), so such a report cannot be read.
+    pub fn from_report(
+        complete: Vec<String>,
+        deferred: Vec<String>,
+        known: Vec<String>,
+    ) -> Option<Self> {
+        let pages = |ids: Vec<String>| -> Option<HashSet<String>> {
+            let ids: Vec<String> = ids
+                .iter()
+                .map(|id| id.trim())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect();
+            (ids.len() <= MAX_REPORTED_PAGES && ids.iter().all(|id| id.len() <= MAX_PAGE_ID_LEN))
+                .then(|| ids.into_iter().collect())
+        };
+        Some(Self {
+            complete: pages(complete)?,
+            deferred: pages(deferred)?,
+            known: pages(known)?,
+        })
     }
 }
 
-/// Drop a closed window's report. Its pages move to another window, which
-/// restores them itself; a stale report would keep, say, a page it deferred
-/// reading as still to restore for the life of the process.
+/// The most page ids one list of a window's report may hold. A layout holds a
+/// handful of pages; this only caps a runaway caller.
+pub const MAX_REPORTED_PAGES: usize = 1024;
+
+/// The longest page id a window's report may carry (a page id is a uuid or a
+/// short name).
+pub const MAX_PAGE_ID_LEN: usize = 256;
+
+/// Every window's restore progress. A page restores in the window that shows
+/// it, so no one window's report covers every page; the union does.
+#[derive(Debug, Default)]
+struct WindowReports {
+    /// Each open window's latest report, by label. `None` for a report that
+    /// could not be read ([`PageRestoreProgress::from_report`]).
+    live: BTreeMap<String, Option<PageRestoreProgress>>,
+    /// The completed (and not deferred) and known pages of windows that have
+    /// closed. A restore a closed window ran still ran; its deferrals are
+    /// dropped, because the pages move to another window, which restores them
+    /// itself.
+    closed: PageRestoreProgress,
+}
+
+impl WindowReports {
+    fn record(&mut self, window: &str, report: Option<PageRestoreProgress>) {
+        self.live.insert(window.to_string(), report);
+    }
+
+    fn forget(&mut self, window: &str) {
+        if let Some(Some(report)) = self.live.remove(window) {
+            // A deferred page is in `complete` too (the webview opens its
+            // auto-save gate) though it restored nothing: not retained.
+            self.closed.complete.extend(
+                report
+                    .complete
+                    .into_iter()
+                    .filter(|p| !report.deferred.contains(p)),
+            );
+            self.closed.known.extend(report.known);
+        }
+    }
+
+    /// Which pages have run, under the boot-restore latch `phase`: Unknown
+    /// while any open window's report cannot be read.
+    fn pages(&self, phase: BootRestorePhase) -> PagesRestored {
+        if self.live.values().any(Option::is_none) {
+            return PagesRestored::Unknown;
+        }
+        let closed = (!self.closed.complete.is_empty() || !self.closed.known.is_empty())
+            .then_some(&self.closed);
+        PagesRestored::from_parts(self.live.values().flatten().chain(closed), phase)
+    }
+}
+
+static WINDOW_REPORTS: std::sync::LazyLock<Mutex<WindowReports>> =
+    std::sync::LazyLock::new(|| Mutex::new(WindowReports::default()));
+
+/// Record `window`'s latest restore progress, replacing its previous report.
+/// `None` records a report that could not be read.
+pub fn record_page_restore_progress(window: &str, report: Option<PageRestoreProgress>) {
+    if let Ok(mut reports) = WINDOW_REPORTS.lock() {
+        reports.record(window, report);
+    }
+}
+
+/// A window closed: keep the restores it ran, drop its deferrals (see
+/// [`WindowReports::closed`]). Idempotent.
 pub fn forget_page_restore_progress(window: &str) {
-    if let Ok(mut m) = PAGE_RESTORE_PROGRESS.lock() {
-        m.remove(window);
+    if let Ok(mut reports) = WINDOW_REPORTS.lock() {
+        reports.forget(window);
     }
 }
 
 /// Test-only reset of the process-global window reports.
 #[cfg(test)]
 pub(crate) fn reset_page_restore_progress_for_test() {
-    if let Ok(mut m) = PAGE_RESTORE_PROGRESS.lock() {
-        m.clear();
+    if let Ok(mut reports) = WINDOW_REPORTS.lock() {
+        *reports = WindowReports::default();
     }
 }
 
@@ -185,8 +262,9 @@ pub enum PagesRestored {
     NoneYet,
     /// The windows' reports, merged.
     Reported(PageRestoreProgress),
-    /// A restore set was handed out but no window has reported where its pages
-    /// stand, so which pages have run cannot be told.
+    /// Which pages have run cannot be told: a restore set was handed out but no
+    /// window has reported where its pages stand, or an open window's report
+    /// could not be read.
     Unknown,
 }
 
@@ -194,14 +272,15 @@ impl PagesRestored {
     /// This process's state: the windows' reports, read under the boot-restore
     /// latch ([`Self::from_parts`]). A poisoned registry cannot be read.
     pub fn current() -> Self {
-        match PAGE_RESTORE_PROGRESS.lock() {
-            Ok(reports) => Self::from_parts(reports.values(), boot_restore_phase()),
+        match WINDOW_REPORTS.lock() {
+            Ok(reports) => reports.pages(boot_restore_phase()),
             Err(_) => Self::Unknown,
         }
     }
 
-    /// The windows' `reports` merged when any window has reported, else what
-    /// the boot-restore latch `phase` says.
+    /// The windows' `reports` merged when any window has reported (a closed
+    /// window's retained completions count), else what the boot-restore latch
+    /// `phase` says.
     fn from_parts<'a>(
         reports: impl Iterator<Item = &'a PageRestoreProgress>,
         phase: BootRestorePhase,

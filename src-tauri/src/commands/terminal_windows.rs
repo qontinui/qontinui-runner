@@ -453,6 +453,11 @@ pub fn sweep_empty_pop_out_windows(
     // having been in pop_out_records by the time prune ran) — de-dup by set.
     let mut set: std::collections::BTreeSet<String> = swept.into_iter().collect();
     set.extend(pruned);
+    // `destroy()` fires no `CloseRequested`, so `handle_window_close` never
+    // runs for these: drop their restore-progress reports here.
+    for label in &set {
+        crate::session::awaiting_restore::forget_page_restore_progress(label);
+    }
     set.into_iter().collect()
 }
 
@@ -545,6 +550,7 @@ pub fn auto_close_owner_window_if_empty(
             tracing::warn!(window = %owner, error = %e, "auto_close_owner_window_if_empty: destroy failed");
         }
     }
+    crate::session::awaiting_restore::forget_page_restore_progress(&owner);
     let pruned = assignments.prune_empty_pop_outs();
     tracing::info!(
         window = %owner,
@@ -790,6 +796,10 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
     if label == MAIN_WINDOW_LABEL {
         return false;
     }
+    // Its pages move to another window, which restores them: keep the restores
+    // it ran, drop its deferrals. Both the X button (`CloseRequested`) and
+    // `close_terminal_window` (`destroy()`) come through here.
+    crate::session::awaiting_restore::forget_page_restore_progress(label);
     // App shutting down: this close is teardown, not a user dismissing the
     // window. PRESERVE the record so Phase-2 restore recreates it next boot;
     // skip the reassignment/events (the process is going away). Still return
