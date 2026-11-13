@@ -208,6 +208,7 @@ GET /findings/by-status/{status} findings_by_status_handler
 GET /findings/summary get_findings_summary
 GET /findings/task/{task_run_id} get_task_findings_handler
 GET /findings/{finding_id} get_finding_handler
+GET /fleet/capacity get_fleet_capacity
 GET /generation-rules list_rules_handler
 GET /generation-rules/{id} get_rule_handler
 GET /generation/exploration-stats/{workflow_id} get_exploration_stats_handler
@@ -910,6 +911,7 @@ MERGE extraction::routes
 MERGE file_browser::routes
 MERGE file_registry::routes
 MERGE findings_api::routes
+MERGE fleet_capacity_api::routes
 MERGE followups::router
 MERGE forms::routes
 MERGE gated_flow::routes

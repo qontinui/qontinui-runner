@@ -14248,6 +14248,10 @@ pub fn create_router(
         // App-installation metrics) plus the low-headroom watch loop this
         // `routes()` call starts.
         .merge(crate::mcp::github_budget_api::routes())
+        // Phase 6 of 2026-11-05-one-free-resource-model-places-sessions-builds-and-ci
+        // — GET /fleet/capacity: this device's row of coord's capacity model,
+        // for local tools that hold no coord credential.
+        .merge(crate::mcp::fleet_capacity_api::routes())
         // D4+D6 Phase 2 — Blind-Spot Recommender endpoint (GET /blind-spots).
         .merge(crate::mcp::blind_spots_api::routes())
         .merge(crate::mcp::debug_builder_prompt::routes())

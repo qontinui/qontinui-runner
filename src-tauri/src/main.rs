@@ -153,6 +153,10 @@ mod fixer;
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
 mod fleet_agents;
+// This device's row of coord's free-resource model, cached for a minute: the
+// loopback `GET /fleet/capacity` and in-process sizing read it (plan
+// 2026-11-05-one-free-resource-model-places-sessions-builds-and-ci, Phase 6).
+mod fleet_capacity;
 mod fleet_commands;
 mod fleet_skills;
 mod flow_control;
