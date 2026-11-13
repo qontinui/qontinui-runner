@@ -107,11 +107,15 @@ export interface RestoreProgress {
  * Has this page's restore settled? A page in the layout settles when its own
  * restore drains — restore runs lazily, the first time a page is opened. A
  * row naming NO live page is an orphan, which the FIRST page to restore adopts
- * (`recordBelongsToRestore`), so it settles once any page has.
+ * (`recordBelongsToRestore`), so it settles once any page has. A page the
+ * drain deferred is in `completePages` too (its auto-save gate opens), yet it
+ * restored nothing and released the orphan-adoption claim, so it does not
+ * settle an orphan.
  */
 export function pageRestoreSettled(pageId: string, progress: RestoreProgress): boolean {
   if (progress.completePages.has(pageId)) return true;
-  return !progress.knownPageIds.includes(pageId) && progress.completePages.size > 0;
+  if (progress.knownPageIds.includes(pageId)) return false;
+  return [...progress.completePages].some((p) => !progress.deferredPages.has(p));
 }
 
 // ---------------------------------------------------------------------------

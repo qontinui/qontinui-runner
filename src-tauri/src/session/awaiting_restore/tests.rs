@@ -236,7 +236,8 @@ fn progress(complete: &[&str], deferred: &[&str], known: &[&str]) -> PagesRestor
 /// have run once any page has; a blank page id is `default`. With no restore
 /// set handed out yet nothing has run, and with no report after one it cannot
 /// be told. Mutations: the deferred check removed; the orphan arm removed
-/// (`complete.contains` alone); the blank-to-`default` mapping removed.
+/// (`complete.contains` alone); the orphan arm counting a deferred page as
+/// run; the blank-to-`default` mapping removed.
 #[test]
 fn which_pages_restore_has_run() {
     let known = ["default", "p2"];
@@ -254,6 +255,11 @@ fn which_pages_restore_has_run() {
 
     let deferred = progress(&["default"], &["default"], &known);
     assert_eq!(ran(&deferred, "default"), Some(false), "deferred re-runs");
+    assert_eq!(
+        ran(&deferred, "orphan-page"),
+        Some(false),
+        "a deferred page adopted no orphans"
+    );
 
     let none = progress(&[], &[], &known);
     assert_eq!(
