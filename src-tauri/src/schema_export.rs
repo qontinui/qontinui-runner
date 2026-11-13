@@ -1106,8 +1106,13 @@ mod tests {
         // - VerificationAgentContext (its only producer, the orchestrator
         // verifier's context builder, went with the types above; coord
         // finding 7c536351) = 619.
-        // The codegen's "Processing N top-level types" line should read 619 here.
-        assert_eq!(obj.len(), 619, "Expected 619 schema entries");
+        // - the 3 Historical Playback execution types (HistoricalActionQuery,
+        // HistoricalActionResult, PlaybackFrameRequest — no reader or writer
+        // anywhere, plan
+        // 2026-11-08-the-historical-playback-execution-schemas-have-no-consumer-and-are-deleted
+        // Phase 1) = 616.
+        // The codegen's "Processing N top-level types" line should read 616 here.
+        assert_eq!(obj.len(), 616, "Expected 616 schema entries");
         // Nothing in the product fills these any more, so registering one
         // again would export a DTO that has no producer.
         for removed in [
