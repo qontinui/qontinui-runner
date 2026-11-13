@@ -54,6 +54,12 @@ import {
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
+import served from "../../../src-tauri/tests/fixtures/cli_screens/served_profiles.json";
+import { setCliProfiles, type ServedCliProfile } from "./providerAdapter";
+
+// The runner's served CLI profiles, primed as the restore path primes them
+// (`loadCliProfiles` finds the cache full and makes no IPC call).
+setCliProfiles(served as ServedCliProfile[]);
 
 /** The default Claude home the account rule is judged against. */
 const HOME = "/home/u/.claude";
@@ -66,6 +72,8 @@ const rec = (overrides: Partial<TerminalSessionRecord>): TerminalSessionRecord =
   openedAt: 1,
   lastSeenAt: 1,
   state: "open",
+  // The backend always serializes a provider (serde default "claude").
+  provider: "claude",
   ...overrides,
 });
 
@@ -477,6 +485,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       verifyOptions: {
         settleMs: 1,
@@ -503,6 +512,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       verifyOptions: {
         settleMs: 1,
@@ -545,6 +555,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       recordOpen: RECORD_OPEN,
       verifyOptions: {
@@ -565,6 +576,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       recordOpen: RECORD_OPEN,
       verifyOptions: {
@@ -584,6 +596,30 @@ describe("runVerifiedResume", () => {
     );
   });
 
+  it("a provider with no served profile is never resumed: nothing typed, tab parked failed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      provider: "gemini",
+      updateTab,
+      recordOpen: RECORD_OPEN,
+      verifyOptions: { settleMs: 1, timeoutMs: 5, intervalMs: 1, readTail: async () => "" },
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([]);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", { isReconnecting: false, resumeFailed: true });
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "terminal_session_clear_restore_pending",
+      expect.anything(),
+    );
+    warn.mockRestore();
+  });
+
   it("bogus session id (failure frames inside Claude UI) → failed, marker kept, no re-assert (item 4)", async () => {
     const BOGUS =
       "╭──────────────╮\n│ No conversation found with session ID: sess-1 │\n╰──────────────╯\n  ? for shortcuts";
@@ -593,6 +629,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       recordOpen: RECORD_OPEN,
       verifyOptions: {
@@ -630,6 +667,7 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
           origin: "authoritative",
           confirmedAt: 1_700_000_000_000,
           configDir: "/home/u/.claude-x",
+          provider: "claude",
         },
         HOME,
       ),

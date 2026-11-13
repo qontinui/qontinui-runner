@@ -51,6 +51,7 @@ function runningTabRow(tabId: string, title: string): UnifiedSession {
     source: "tab",
     _transcript: null,
     sessionId: tabId,
+    provider: "claude",
     accountLabel: "",
     configDir: "",
     projectPath: "",

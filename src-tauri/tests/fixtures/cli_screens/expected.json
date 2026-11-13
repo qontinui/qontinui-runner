@@ -1,0 +1,16 @@
+{
+  "description": "ANSI-stripped CLI screens and how the served CLI profile classifies each. `resume` is the resume-verification verdict (failure markers first, then success markers): \"failed\" | \"verified\" | \"none\". `usageLimit` is whether a usage-limit phrase matches the lowercased, whitespace-collapsed screen. Asserted identically by src-tauri/src/cli_profile/mod.rs (Rust `regex`, the live manifest) and src/components/terminal/cliScreens.test.ts (JavaScript `RegExp`, served_profiles.json). A row that passes in one engine and fails in the other is a regex-dialect divergence.",
+  "screens": [
+    { "provider": "claude", "file": "claude/handshake_ok.txt", "resume": "verified", "usageLimit": false },
+    { "provider": "claude", "file": "claude/resume_failed.txt", "resume": "failed", "usageLimit": false },
+    { "provider": "claude", "file": "claude/session_picker.txt", "resume": "failed", "usageLimit": false },
+    { "provider": "claude", "file": "claude/resume_size_picker.txt", "resume": "verified", "usageLimit": false },
+    { "provider": "claude", "file": "claude/limit_reached.txt", "resume": "verified", "usageLimit": true },
+    { "provider": "claude", "file": "claude/plain_shell.txt", "resume": "none", "usageLimit": false },
+    { "provider": "claude", "file": "claude/v2_first_paint.txt", "resume": "verified", "usageLimit": false },
+    { "provider": "claude", "file": "claude/v2_logo.txt", "resume": "verified", "usageLimit": false },
+    { "provider": "claude", "file": "claude/two_line_shell_prompt.txt", "resume": "none", "usageLimit": false },
+    { "provider": "claude", "file": "claude/cli_error.txt", "resume": "none", "usageLimit": false },
+    { "provider": "codex", "file": "codex/plain_shell.txt", "resume": "none", "usageLimit": false }
+  ]
+}

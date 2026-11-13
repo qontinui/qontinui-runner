@@ -35,9 +35,7 @@ pub fn build_tool_policy_cli(policy: &ToolPolicy) -> (Vec<String>, Option<String
 
     // ── Allow-list → --allowedTools t1 t2 ... ────────────────────────────
     if let Some(allow) = policy.allow.as_ref() {
-        args.extend(crate::claude_session::launch_spec::allowed_tools_args(
-            allow,
-        ));
+        args.extend(crate::session::launch_spec::allowed_tools_args(allow));
     }
 
     // ── Denies: split tool-name vs command-arg-scoped via classified_denies ──
