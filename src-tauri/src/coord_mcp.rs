@@ -6903,7 +6903,12 @@ pub(crate) fn repo_unsettled_refusal(
 /// Does this device hold credentials for more than one tenant? An UNREADABLE
 /// store answers `true`: the conservative arm for a guard whose failure mode is
 /// a cross-tenant answer, and the refusal it produces is retryable.
-fn device_is_multi_bound() -> bool {
+///
+/// Also the SessionStart policy injection's "multi-bound" input
+/// ([`crate::mcp::policy_tenant::policy_tenant_decision`]), so the injection and
+/// the proxy's own row-1d guard agree on which devices can be answered by the
+/// wrong tenant.
+pub(crate) fn device_is_multi_bound() -> bool {
     crate::auth::HeldDeviceTenants::read(&crate::auth::AuthManager::new())
         .set()
         .map(|held| held.len() > 1)
@@ -7360,6 +7365,58 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
         })
         .await,
     )
+}
+
+/// What [`terminal_session_bearer_and_tenant`] found for one terminal.
+///
+/// Deliberately not `Debug`: [`Self::Answered`] carries a bearer token, and a
+/// `{:?}` of this value would put it in a log line.
+pub(crate) enum TerminalSessionTenant {
+    /// The terminal's session holds a nonce, and this is exactly what
+    /// [`session_bearer_and_tenant_or_refuse`] answered for it: the tenant the
+    /// session's own coord-mcp calls select (`None` = the default slot) and
+    /// that slot's bearer, or the proxy's refusal.
+    Answered(Result<(Option<Uuid>, Option<String>), ProxyRefusal>),
+    /// No nonce names the terminal's session, so the proxy has nothing to
+    /// decide for it. The reason is the session-tenancy census vocabulary
+    /// (`no_session_nonce` | `coord_mcp_delivery_unrecorded`).
+    NoNonce(&'static str),
+}
+
+/// The coord-mcp proxy's (tenant, bearer) decision for the session hosted in
+/// `terminal_id` — one minimal composition of [`session_nonce`] (the key the
+/// identity seam gave this terminal, or its cwd's `.mcp.json` key) and
+/// [`session_bearer_and_tenant_or_refuse`] (plan
+/// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+/// Design §1).
+///
+/// It adds no resolver: the answer is the one [`decide_session_tenant`] gives
+/// every coord-mcp call this session makes, so a reader using it (the
+/// SessionStart policy injection) acts as the tenant the session itself acts
+/// as. It goes through the AWAITING door on purpose — SessionStart is the
+/// session's FIRST call, and the read-only census paths
+/// ([`session_tenant_decision`], [`session_credential_tenant`]) do not wait
+/// for the repo expectation, so they would answer a repo-steered session from
+/// the machine rows.
+///
+/// A cwd `.mcp.json` that holds no runner nonce is [`TerminalSessionTenant::NoNonce`],
+/// not a decision for `None`: deciding for no nonce reads only the machine
+/// rows, which is the device default rather than this session.
+pub(crate) async fn terminal_session_bearer_and_tenant(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> TerminalSessionTenant {
+    match session_nonce(terminal_id, workdir) {
+        SessionNonce::Nonce(Some(nonce)) => {
+            TerminalSessionTenant::Answered(session_bearer_and_tenant_or_refuse(Some(nonce)).await)
+        }
+        SessionNonce::Nonce(None) | SessionNonce::NoNonce => {
+            TerminalSessionTenant::NoNonce("no_session_nonce")
+        }
+        SessionNonce::DeliveryUnrecorded => {
+            TerminalSessionTenant::NoNonce("coord_mcp_delivery_unrecorded")
+        }
+    }
 }
 
 /// The join-result half of [`session_bearer_and_tenant_or_refuse`], pure so the

@@ -777,6 +777,14 @@ async fn materialize(
         &working_dir,
         &claude_session_id,
     );
+    // Whose policy body the respawn's system-prompt file carries: the tenant a
+    // session in `working_dir` resolves to, awaited HERE because the spawn seam
+    // is synchronous (plan
+    // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    // Design §6).
+    let policy_tenant =
+        crate::mcp::policy_tenant::new_session_policy_tenant(std::path::Path::new(&working_dir))
+            .await;
     let (terminal_id, _coord_id) = crate::terminal::account_migration::spawn_resumed_pane(
         &app,
         &terminal_manager,
@@ -811,6 +819,7 @@ async fn materialize(
             // coord keys the outcome write on — are not this box's to carry.
             gate_identity: None,
             origin: crate::coord_drain_state::SpawnOrigin::Respawn,
+            policy_tenant,
         },
     )
     .map_err(RespawnError::Spawn)?;

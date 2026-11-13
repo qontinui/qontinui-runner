@@ -661,6 +661,13 @@ async fn resume_one(
     ) {
         info!(id = %cand.id, "resume_door: released the closed row's settled gate identity");
     }
+    // Whose policy body the resumed pane's system-prompt file carries: the
+    // tenant a session in its working dir resolves to, awaited here because the
+    // spawn below runs on the blocking pool (plan
+    // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    // Design §6).
+    let policy_tenant =
+        crate::mcp::policy_tenant::new_session_policy_tenant(Path::new(&cand.working_dir)).await;
     let spawn = {
         let (app, tm, registry, cand) = (app.clone(), tm.clone(), registry.clone(), cand.clone());
         tokio::task::spawn_blocking(move || {
@@ -699,6 +706,7 @@ async fn resume_one(
                     // reopen under D3.
                     gate_identity: None,
                     origin: crate::coord_drain_state::SpawnOrigin::BootResume,
+                    policy_tenant,
                 },
             )
         })

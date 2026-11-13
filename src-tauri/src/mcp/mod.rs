@@ -117,6 +117,7 @@ pub mod plan_library;
 pub mod playwright;
 pub mod playwright_collection;
 pub mod policy_context;
+pub mod policy_tenant; // whose policy a session is briefed under (plan 2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions)
 pub mod prm_export;
 pub mod probe_executor;
 pub mod processes;

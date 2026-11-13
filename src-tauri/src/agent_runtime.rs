@@ -8022,9 +8022,15 @@ async fn run_continuation_terminal(
         // path. The briefing is then composed with the tenant's cached policy body
         // into one `--append-system-prompt-file` when that cache exists (plan
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
-        // stays inline otherwise.
-        let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-            compose_continuation_terminal_system_prompt(
+        // stays inline otherwise. WHOSE body: the tenant a new session in
+        // `workdir` resolves to (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6) — a stated tenant only; anything else composes no body.
+        let policy_tenant =
+            crate::mcp::policy_tenant::new_session_policy_tenant(std::path::Path::new(workdir))
+                .await;
+        let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(
+            Some(compose_continuation_terminal_system_prompt(
                 crate::terminal::runner_context(
                     crate::terminal::spawn_seam_api_port(),
                     coord_mcp,
@@ -8034,8 +8040,9 @@ async fn run_continuation_terminal(
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
                 workdir,
                 no_worktree_cause,
-            ),
-        ));
+            )),
+            policy_tenant,
+        );
         // The marker the policy hook's route trusts as proof of delivery — taken
         // from the very carrier the argv uses, never recomputed.
         let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
@@ -9055,25 +9062,35 @@ async fn run_condition_check_terminal(
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
-    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-        // UNKNOWN, and honestly so: this function does NO coord-mcp
-        // provisioning of its own — it relies entirely on the downstream PTY
-        // identity seam, which decides the outcome long after this argv is
-        // built and cannot report back into it. The seam's own render of
-        // `QONTINUI_RUNNER_CONTEXT` for the same child DOES carry the settled
-        // verdict; this argv copy asserts no liveness rather than guessing one.
-        // NOT a brief seam, deliberately — see
-        // `compose_continuation_system_prompt`. This is
-        // `run_condition_check_terminal`, whose frame is a
-        // `ConditionCheckPayload`: a different `source` discriminator, published
-        // by a different coord path, carrying no `brief` key at all. The gate
-        // continuation's second spawn path is the HEADLESS arm below.
-        crate::terminal::runner_context(
-            crate::terminal::spawn_seam_api_port(),
-            crate::coord_mcp::CoordMcpDelivery::Unknown,
-            &crate::served_corpus::probe_async(workdir.as_str()).await,
+    // WHOSE policy body: the tenant a new session in `workdir` resolves to (plan
+    // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    // Design §6). No nonce is provisioned here, so the workdir-keyed decision is
+    // the one this seam holds; a stated tenant only, anything else composes no
+    // body and the SessionStart route delivers it.
+    let policy_tenant =
+        crate::mcp::policy_tenant::new_session_policy_tenant(std::path::Path::new(&workdir)).await;
+    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(
+        Some(
+            // UNKNOWN, and honestly so: this function does NO coord-mcp
+            // provisioning of its own — it relies entirely on the downstream PTY
+            // identity seam, which decides the outcome long after this argv is
+            // built and cannot report back into it. The seam's own render of
+            // `QONTINUI_RUNNER_CONTEXT` for the same child DOES carry the settled
+            // verdict; this argv copy asserts no liveness rather than guessing one.
+            // NOT a brief seam, deliberately — see
+            // `compose_continuation_system_prompt`. This is
+            // `run_condition_check_terminal`, whose frame is a
+            // `ConditionCheckPayload`: a different `source` discriminator, published
+            // by a different coord path, carrying no `brief` key at all. The gate
+            // continuation's second spawn path is the HEADLESS arm below.
+            crate::terminal::runner_context(
+                crate::terminal::spawn_seam_api_port(),
+                crate::coord_mcp::CoordMcpDelivery::Unknown,
+                &crate::served_corpus::probe_async(workdir.as_str()).await,
+            ),
         ),
-    ));
+        policy_tenant,
+    );
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());

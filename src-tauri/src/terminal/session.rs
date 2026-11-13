@@ -1965,9 +1965,17 @@ impl TerminalSession {
         // body this pane never got. A direct exec is skipped: its argv carrier
         // and its marker were settled together by the caller (`extra_env`),
         // after the inherited pair was scrubbed above.
+        //
+        // WHOSE body: the tenant the coord-mcp proxy decides for the nonce the
+        // seam above just provisioned for this terminal — the tenant every coord
+        // call of this pane's session acts as (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Bounded wait; an unresolved tenant composes no body.
         if is_shell_pane {
+            let policy_tenant =
+                crate::mcp::policy_tenant::resolve_shell_pane_policy_tenant(&id, &cwd);
             for (name, value) in
-                crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context)
+                crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context, policy_tenant)
             {
                 match value {
                     Some(v) => cmd.env(name, v),
