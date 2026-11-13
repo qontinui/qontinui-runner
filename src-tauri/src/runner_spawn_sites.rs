@@ -825,9 +825,7 @@ fn a_test_module_span_ignores_braces_in_literals_and_ends_at_its_own_closer() {
     let lines: Vec<&str> = src.lines().collect();
     assert_eq!(test_spans(&lines), vec![(1, 11), (15, 16)]);
     let sources = BTreeMap::from([("x.rs".to_string(), src.to_string())]);
-    let found: Vec<_> = scan_sites(&sources, &BTreeMap::new())
-        .into_iter()
-        .collect();
+    let found: Vec<_> = scan_sites(&sources, &BTreeMap::new()).into_iter().collect();
     assert_eq!(
         found,
         vec![
