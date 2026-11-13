@@ -135,7 +135,10 @@ mod tests {
             // deleted with its 2 attributes; `split_frontmatter`'s moved into
             // prompt_library.rs (plan
             // 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran, 7).
-            baseline: 423,
+            // 423 -> 417: #2857 deleted the orchestrator verifier with 3
+            // attributes (orchestrator/verification.rs 2, output.rs 1) and left
+            // the baseline; the other 3 were slack. 417 measured by this test.
+            baseline: 417,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
