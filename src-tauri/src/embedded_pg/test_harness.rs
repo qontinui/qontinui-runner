@@ -1825,14 +1825,18 @@ fn create_run_root(dir: &Path, key: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-/// Who owns a per-process root: the process — its pid, and the PID namespace
-/// that pid means something in — the template cache it was copied from (so a
-/// stale cache in use is not collected), and its postmaster.
+/// Who owns a per-process root: the process — its pid, the PID namespace that
+/// pid means something in, and when it started — the template cache it was
+/// copied from (so a stale cache in use is not collected), and its postmaster.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Owner {
     pid: u32,
     /// [`own_pid_namespace`] of the owner; `None` off Linux.
     pid_ns: Option<String>,
+    /// [`process_start`] of the owner, which tells it from a later process
+    /// given the same pid; `None` where none is read, and in a record written
+    /// before it was.
+    started: Option<u64>,
     template: String,
     postmaster: Option<u32>,
 }
@@ -1840,9 +1844,11 @@ struct Owner {
 impl Owner {
     /// This process, as the owner of a root copied from `template`.
     fn this_process(template: &str, postmaster: Option<u32>) -> Self {
+        let pid = std::process::id();
         Self {
-            pid: std::process::id(),
+            pid,
             pid_ns: own_pid_namespace().map(str::to_owned),
+            started: process_start(pid),
             template: template.to_string(),
             postmaster,
         }
@@ -1854,12 +1860,16 @@ impl Owner {
             .as_ref()
             .map(|ns| format!("pid_ns={ns}\n"))
             .unwrap_or_default();
+        let started = self
+            .started
+            .map(|started| format!("started={started}\n"))
+            .unwrap_or_default();
         let postmaster = self
             .postmaster
             .map(|pid| format!("postmaster={pid}\n"))
             .unwrap_or_default();
         format!(
-            "pid={}\n{pid_ns}template={}\n{postmaster}",
+            "pid={}\n{pid_ns}{started}template={}\n{postmaster}",
             self.pid, self.template
         )
     }
@@ -1877,10 +1887,47 @@ impl Owner {
                 .get("pid_ns")
                 .filter(|ns| !ns.is_empty())
                 .map(|ns| (*ns).to_string()),
+            started: fields.get("started").and_then(|at| at.parse().ok()),
             template: (*fields.get("template")?).to_string(),
             postmaster: fields.get("postmaster").and_then(|pid| pid.parse().ok()),
         })
     }
+}
+
+/// When the process `pid` started, exactly enough to tell it from a later
+/// process given the same pid: on Linux the `starttime` field of
+/// `/proc/<pid>/stat`, in clock ticks after boot. `None` where it cannot be
+/// read.
+#[cfg(target_os = "linux")]
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name, field 2, is parenthesised and may hold spaces and
+    // parentheses: the fields after its last `)` start at field 3, so
+    // `starttime`, field 22, is the 20th of them.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// When the process `pid` started, exactly enough to tell it from a later
+/// process given the same pid: on Windows its creation time, in 100 ns ticks.
+/// `None` where it cannot be read.
+#[cfg(windows)]
+fn process_start(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .ok()?
+        .created()
+}
+
+/// When the process `pid` started: not read on platforms other than Linux and
+/// Windows, so an owner there is judged by its pid alone.
+#[cfg(not(any(target_os = "linux", windows)))]
+fn process_start(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// This process's PID namespace — the target of `/proc/self/ns/pid`, such as
@@ -1913,6 +1960,13 @@ fn own_pid_namespace() -> Option<&'static str> {
 /// process has one (a Windows process's, read by a WSL process through a
 /// shared target directory), cannot be checked from here: its root is presumed
 /// live until the record is [`FOREIGN_OWNER_GRACE`] old.
+///
+/// A recorded pid that is free means a dead owner. One that is in use means a
+/// live owner only if the process using it started when the owner did
+/// ([`process_start`]): a pid is handed out again once its process is gone, at
+/// once on Windows, and the later process is not the owner. A record with no
+/// start — written before starts were recorded, or where none is read — is
+/// judged by the pid alone, as is a live pid whose start cannot be read.
 fn owner_may_be_live(root: &Path, owner: &Owner) -> bool {
     if OWN_ROOT.get().is_some_and(|own| own == root) {
         return true;
@@ -1922,7 +1976,13 @@ fn owner_may_be_live(root: &Path, owner: &Owner) -> bool {
     }
     // A record naming THIS process's pid is a dead predecessor's: this
     // process's own root is matched above.
-    owner.pid != std::process::id() && crate::runner_breadcrumb::pid_is_live(owner.pid)
+    if owner.pid == std::process::id() || !crate::runner_breadcrumb::pid_is_live(owner.pid) {
+        return false;
+    }
+    match (owner.started, process_start(owner.pid)) {
+        (Some(recorded), Some(now)) => recorded == now,
+        _ => true,
+    }
 }
 
 fn write_owner(root: &Path, owner: &Owner) -> Result<(), String> {
@@ -3720,16 +3780,23 @@ mod tests {
         let bare = Owner {
             pid: 4242,
             pid_ns: None,
+            started: None,
             template: "0123456789abcdef".to_string(),
             postmaster: None,
         };
         assert_eq!(Owner::parse(&bare.render()), Some(bare.clone()));
-        let started = Owner {
+        let full = Owner {
             pid_ns: Some("pid:[4026531836]".to_string()),
+            started: Some(133_877_312_051_234_567),
             postmaster: Some(777),
-            ..bare
+            ..bare.clone()
         };
-        assert_eq!(Owner::parse(&started.render()), Some(started));
+        assert_eq!(Owner::parse(&full.render()), Some(full));
+        // A record written before starts were recorded has no `started` line.
+        assert_eq!(
+            Owner::parse("pid=4242\ntemplate=0123456789abcdef\n"),
+            Some(bare)
+        );
         assert_eq!(
             Owner::parse(&Owner::this_process("k", None).render()),
             Some(Owner::this_process("k", None)),
@@ -4367,6 +4434,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A recorded owner whose pid is in use is live only if the process using it
+    /// started when the owner did: a pid is handed out again once its process is
+    /// gone (at once on Windows), and the later process is not the owner. A
+    /// record with no start is judged by the pid alone.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn an_owner_whose_pid_a_later_process_holds_is_dead() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path().join(format!("{RUN_PREFIX}reused"));
+        std::fs::create_dir(&root).expect("plant a root");
+        let pid = a_live_pid_not_ours();
+        let started = process_start(pid).expect("the start of a live process can be read");
+        let owner = |started| Owner {
+            pid,
+            started,
+            ..Owner::this_process("reused", None)
+        };
+        assert!(
+            owner_may_be_live(&root, &owner(Some(started))),
+            "the live process that started when the record says is the owner"
+        );
+        assert!(
+            !owner_may_be_live(&root, &owner(Some(started + 1))),
+            "a live pid whose process started at another time is a later process: the \
+             recorded owner is dead"
+        );
+        assert!(
+            owner_may_be_live(&root, &owner(None)),
+            "a record with no start falls back to the pid alone"
+        );
     }
 
     /// A pidfd sees the process it holds exit, and signals nothing once that
