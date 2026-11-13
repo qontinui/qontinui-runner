@@ -234,11 +234,18 @@ impl WindowReports {
 
     /// Which pages have run, under the boot-restore latch `phase`: Unknown
     /// while any open window's report cannot be read.
+    ///
+    /// A closed window's retained completions only ADD to an open window's
+    /// report. They carry no layout (`known` is not kept), so on their own they
+    /// would make every layout page look like an orphan the first restore
+    /// adopted, i.e. restored. With no open window reporting, the latch decides,
+    /// which errs toward owed or unknown.
     fn pages(&self, phase: BootRestorePhase) -> PagesRestored {
         if self.live.values().any(Option::is_none) {
             return PagesRestored::Unknown;
         }
-        let closed = (!self.closed.complete.is_empty()).then_some(&self.closed);
+        let closed =
+            (!self.live.is_empty() && !self.closed.complete.is_empty()).then_some(&self.closed);
         PagesRestored::from_parts(self.live.values().flatten().chain(closed), phase)
     }
 }
