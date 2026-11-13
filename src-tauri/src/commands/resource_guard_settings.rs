@@ -313,7 +313,9 @@ fn host_suggestion_json(cap: crate::ci_node::host_sizing::HostCapacity) -> serde
         "cpus": cap.cpus,
         "mem_gib": cap.mem_bytes.map(|b| b / (1024 * 1024 * 1024)),
         "limiting_term": limiting_term,
-        "effective": effective,
+        // What an UNSET value resolves to now — not the node's cap when an
+        // explicit `max_concurrent_builds` is set.
+        "unset_resolves_to": effective,
     })
 }
 
@@ -610,6 +612,11 @@ mod tests {
         assert_eq!(v["cpus"], 48);
         assert_eq!(v["mem_gib"], 368);
         assert_eq!(v["limiting_term"], "cores");
+        // The unset resolution is labelled with its source and a count.
+        let unset = &v["unset_resolves_to"];
+        assert!(unset["count"].is_u64(), "{unset}");
+        assert!(unset["source"].is_string(), "{unset}");
+        assert!(v.get("effective").is_none(), "the old, misleading key is gone");
         let unknown = host_suggestion_json(crate::ci_node::host_sizing::HostCapacity {
             mem_bytes: None,
             cpus: 8,
