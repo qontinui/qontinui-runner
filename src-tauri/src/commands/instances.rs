@@ -42,6 +42,9 @@ pub async fn save_runner_instance(
             port
         ));
     }
+    // The `test-` prefix is the supervisor's temp-runner identity; a saved
+    // config must not be able to carry it any more than a spawned one can.
+    crate::instance_manager::refuse_temp_runner_name(&name)?;
     let config = RunnerInstanceConfig {
         id,
         name: name.clone(),
@@ -434,4 +437,24 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             set_temp_spawn_placements,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod temp_runner_name_tests {
+    use super::*;
+
+    /// A saved config refuses the supervisor's temp-runner prefix BEFORE it
+    /// writes anything, as `POST /instances/spawn` and the launcher do.
+    #[tokio::test]
+    async fn save_runner_instance_refuses_a_temp_runner_name() {
+        let err = save_runner_instance(
+            "inst-test".to_string(),
+            "test-1a1d5eb4953-22".to_string(),
+            29_890,
+            None,
+        )
+        .await
+        .expect_err("a test- name must be refused");
+        assert!(err.contains("reserved"), "{err}");
+    }
 }
