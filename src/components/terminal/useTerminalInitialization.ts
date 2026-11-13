@@ -1670,6 +1670,15 @@ export function useTerminalInitialization({
   const publishRestorePages = useCallback(() => {
     setPublishedCompletePages(new Set(restoreCompletePages.current));
     setPublishedDeferredPages(new Set(drainDeferredPages.current));
+    // The backend's since-restart ledger reads the same progress, so a row
+    // whose page already restored without it is not reported as still owed.
+    invoke("terminal_report_restore_progress", {
+      completePages: [...restoreCompletePages.current],
+      deferredPages: [...drainDeferredPages.current],
+      knownPageIds: loadKnownPageIds(),
+    }).catch((err) => {
+      console.warn("[TerminalPage] terminal_report_restore_progress failed:", err);
+    });
   }, []);
   // Live tabs, for the re-run's "already open" check (the init effect does not
   // re-run on every tab change, so it cannot close over `tabs`).

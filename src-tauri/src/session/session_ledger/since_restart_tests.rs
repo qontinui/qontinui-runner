@@ -26,6 +26,7 @@
 //! `missing`, so a fix cannot pass by reporting nothing missing at all.
 
 use super::*;
+use crate::session::awaiting_restore::PageRestoreProgress;
 use crate::session::claude_session_registry::read_live_sessions;
 use crate::session::close_reason::CloseReason;
 use crate::session::ledger_aftermath::{LedgerAftermath, ProcessRead};
@@ -217,16 +218,23 @@ impl Restart {
     /// [`Self::report`] after a poll tick whose live-session read was
     /// `process`.
     fn report_after(&self, live_panes: &[&str], process: ProcessRead) -> LedgerReport {
-        self.report_under(live_panes, process, &self.restore_view())
+        self.report_under(
+            live_panes,
+            process,
+            &self.restore_view(),
+            &PagesRestored::NoneYet,
+        )
     }
 
-    /// [`Self::report_after`] with `restoreOwed` read under `view`, as
-    /// [`report`] reads it under [`RestoreView::current`].
+    /// [`Self::report_after`] with `restoreOwed` read under `view` and `pages`,
+    /// as [`report`] reads it under [`RestoreView::current`] and
+    /// [`PagesRestored::current`].
     fn report_under(
         &self,
         live_panes: &[&str],
         process: ProcessRead,
         view: &RestoreView,
+        pages: &PagesRestored,
     ) -> LedgerReport {
         self.poll_tick(&[], process);
         let live: HashSet<String> = live_panes.iter().map(|t| t.to_string()).collect();
@@ -234,7 +242,7 @@ impl Restart {
         let now_state = AfterRestart {
             registry: registry_now(&self.store),
             aftermath: self.aftermath.inputs(chrono::Utc::now().timestamp_millis()),
-            restore_owed: OwedRestores::read(Some(&self.store), view),
+            restore_owed: OwedRestores::read(Some(&self.store), view, pages),
         };
         let current = capture(
             &self.store,
@@ -874,6 +882,7 @@ fn since_restart_restore_owed_is_null_before_the_boot_is_classified() {
         &[UNRELATED_LIVE_PANE],
         ProcessRead::Held(Vec::new()),
         &unclassified,
+        &PagesRestored::NoneYet,
     );
 
     assert_eq!(ids(&report.missing), vec!["no-terminal", "owed"]);
@@ -888,4 +897,57 @@ fn since_restart_restore_owed_is_null_before_the_boot_is_classified() {
         "{}",
         report.note
     );
+}
+
+/// A miss whose page's restore already ran and did not bring it back is not
+/// owed: no restore in this process will (the boot restore declined it, see
+/// `terminal::page_placement`). Its page deferred by the drain is still owed,
+/// and with no window having reported which pages ran, it cannot be told. The
+/// note counts the declined miss as one this boot will not restore.
+///
+/// Mutation: `OwedRestores::read` ignoring `pages` (every row the predicate
+/// keeps reads owed, as before the page rule).
+#[test]
+fn since_restart_a_miss_on_a_page_whose_restore_already_ran_is_not_owed() {
+    let restart = Restart::new(&["declined"]);
+    let progress = |complete: &[&str], deferred: &[&str]| PageRestoreProgress {
+        complete: complete.iter().map(|p| p.to_string()).collect(),
+        deferred: deferred.iter().map(|p| p.to_string()).collect(),
+        known: ["default".to_string()].into_iter().collect(),
+    };
+    let owed_under = |pages: PagesRestored| {
+        let report = restart.report_under(
+            &[UNRELATED_LIVE_PANE],
+            ProcessRead::Held(Vec::new()),
+            &restart.restore_view(),
+            &pages,
+        );
+        assert_eq!(ids(&report.missing), vec!["declined"]);
+        (report.missing[0].restore_owed, report.note)
+    };
+
+    let (owed, note) = owed_under(PagesRestored::Reported(progress(&["default"], &[])));
+    assert_eq!(owed, Some(false), "its page's restore ran without it");
+    assert!(
+        note.contains(
+            "1 did not — 0 still owed a restore by this boot, 1 will not be restored by it;"
+        ),
+        "{note}"
+    );
+
+    assert_eq!(
+        owed_under(PagesRestored::Reported(progress(&["other"], &[]))).0,
+        Some(true),
+        "the control: another page ran, its own has not"
+    );
+    assert_eq!(
+        owed_under(PagesRestored::Reported(progress(
+            &["default"],
+            &["default"]
+        )))
+        .0,
+        Some(true),
+        "deferred by the drain: it re-runs"
+    );
+    assert_eq!(owed_under(PagesRestored::Unknown).0, None);
 }

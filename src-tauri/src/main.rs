@@ -3600,6 +3600,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_claude_session_list_live,
             commands::terminal::terminal_session_list_history,
             commands::terminal::session_ledger_report,
+            commands::terminal::terminal_report_restore_progress,
             commands::terminal::session_ledger_capture,
             commands::terminal::terminal_session_list_open,
             commands::terminal::terminal_holder_sweep_settled,

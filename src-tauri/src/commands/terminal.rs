@@ -2250,6 +2250,30 @@ pub async fn session_ledger_report(
     .map_err(|e| format!("session ledger report failed: {e}"))
 }
 
+/// The webview's boot-restore progress for the calling window: which pages'
+/// restores have run to their end, which the coord drain deferred, and every
+/// page in the persisted layout (`useTerminalInitialization.ts`,
+/// `publishRestorePages`). The since-restart ledger reads it so a row whose
+/// page already restored without it is not reported as still owed a restore
+/// ([`crate::session::awaiting_restore::PagesRestored`]). Keyed by window
+/// label, as each window restores the pages it shows.
+#[tauri::command]
+pub fn terminal_report_restore_progress(
+    window: tauri::Window,
+    complete_pages: Vec<String>,
+    deferred_pages: Vec<String>,
+    known_page_ids: Vec<String>,
+) {
+    crate::session::awaiting_restore::record_page_restore_progress(
+        window.label(),
+        crate::session::awaiting_restore::PageRestoreProgress {
+            complete: complete_pages.into_iter().collect(),
+            deferred: deferred_pages.into_iter().collect(),
+            known: known_page_ids.into_iter().collect(),
+        },
+    );
+}
+
 /// The operator's "Capture now": capture the current roster with reason
 /// [`crate::session::session_ledger::REASON_OPERATOR`] through the SAME
 /// [`crate::session::session_ledger::capture_now`] that

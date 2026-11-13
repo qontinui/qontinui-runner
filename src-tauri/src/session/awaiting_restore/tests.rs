@@ -137,7 +137,7 @@ fn the_live_store_says_which_sessions_are_still_owed() {
         "fixture: explicit and no-terminal closes leave it: {in_set:?}"
     );
 
-    let owed = OwedRestores::read(Some(&store), &view);
+    let owed = OwedRestores::read(Some(&store), &view, &PagesRestored::NoneYet);
     assert_eq!(owed.of("Awaiting"), Some(true));
     assert_eq!(
         owed.of("awaiting"),
@@ -162,22 +162,25 @@ fn the_live_store_says_which_sessions_are_still_owed() {
 /// check in `OwedRestores::read` removed (the empty set then answers `false`).
 #[test]
 fn with_no_store_or_an_unclassified_boot_the_value_is_null() {
-    assert_eq!(OwedRestores::read(None, &VIEW).of("any"), None);
+    assert_eq!(
+        OwedRestores::read(None, &VIEW, &PagesRestored::NoneYet).of("any"),
+        None
+    );
 
     let (_dir, store) = new_store();
     store.record_open(test_open_record("open"));
-    let owed = OwedRestores::read(Some(&store), &UNCLASSIFIED);
+    let owed = OwedRestores::read(Some(&store), &UNCLASSIFIED, &PagesRestored::NoneYet);
     assert_eq!(owed.of("open"), None);
     assert_eq!(owed.of("never-held"), None);
 
     let (_dir, empty) = new_store();
     assert!(UNCLASSIFIED.restore_set(&empty).is_empty());
     assert_eq!(
-        OwedRestores::read(Some(&empty), &UNCLASSIFIED).of("x"),
+        OwedRestores::read(Some(&empty), &UNCLASSIFIED, &PagesRestored::NoneYet).of("x"),
         None
     );
     assert_eq!(
-        OwedRestores::read(Some(&empty), &VIEW).of("x"),
+        OwedRestores::read(Some(&empty), &VIEW, &PagesRestored::NoneYet).of("x"),
         Some(false),
         "the control: a classified boot answers for an empty set"
     );
@@ -192,7 +195,12 @@ fn zero_one_and_many_owed_sessions() {
     let booted_at_ms = chrono::Utc::now().timestamp_millis();
     none_owed.record_close("gone", CloseReason::Explicit);
     assert_eq!(
-        OwedRestores::read(Some(&none_owed), &view_at(booted_at_ms)).of("gone"),
+        OwedRestores::read(
+            Some(&none_owed),
+            &view_at(booted_at_ms),
+            &PagesRestored::NoneYet
+        )
+        .of("gone"),
         Some(false)
     );
 
@@ -201,14 +209,96 @@ fn zero_one_and_many_owed_sessions() {
     for id in &ids {
         many.record_open(test_open_record(id));
     }
-    let owed = OwedRestores::read(Some(&many), &view_at(booted_at_ms));
+    let owed = OwedRestores::read(Some(&many), &view_at(booted_at_ms), &PagesRestored::NoneYet);
     for id in &ids {
         assert_eq!(owed.of(id), Some(true), "{id}");
     }
     let (_dir, one) = new_store();
     one.record_open(test_open_record("only"));
     assert_eq!(
-        OwedRestores::read(Some(&one), &view_at(booted_at_ms)).of("only"),
+        OwedRestores::read(Some(&one), &view_at(booted_at_ms), &PagesRestored::NoneYet).of("only"),
         Some(true)
+    );
+}
+
+fn progress(complete: &[&str], deferred: &[&str], known: &[&str]) -> PagesRestored {
+    let set = |pages: &[&str]| pages.iter().map(|p| p.to_string()).collect();
+    PagesRestored::Reported(PageRestoreProgress {
+        complete: set(complete),
+        deferred: set(deferred),
+        known: set(known),
+    })
+}
+
+/// The page rule, as the webview's strip reads it (`pageRestoreSettled`): a
+/// page in the layout has run once its own restore completed; a deferred page
+/// has not, even when also complete; a page in no layout holds orphans, which
+/// have run once any page has; a blank page id is `default`. With no restore
+/// set handed out yet nothing has run, and with no report after one it cannot
+/// be told. Mutations: the deferred check removed; the orphan arm removed
+/// (`complete.contains` alone); the blank-to-`default` mapping removed.
+#[test]
+fn which_pages_restore_has_run() {
+    let known = ["default", "p2"];
+    let ran = |pages: &PagesRestored, page: &str| pages.has_run(page);
+
+    let one = progress(&["default"], &[], &known);
+    assert_eq!(ran(&one, "default"), Some(true));
+    assert_eq!(ran(&one, ""), Some(true), "blank is default");
+    assert_eq!(ran(&one, "p2"), Some(false), "its own restore has not run");
+    assert_eq!(
+        ran(&one, "orphan-page"),
+        Some(true),
+        "adopted by the first page"
+    );
+
+    let deferred = progress(&["default"], &["default"], &known);
+    assert_eq!(ran(&deferred, "default"), Some(false), "deferred re-runs");
+
+    let none = progress(&[], &[], &known);
+    assert_eq!(
+        ran(&none, "orphan-page"),
+        Some(false),
+        "no page has run yet"
+    );
+
+    assert_eq!(ran(&PagesRestored::NoneYet, "default"), Some(false));
+    assert_eq!(ran(&PagesRestored::Unknown, "default"), None);
+}
+
+/// Through a real store: an owed row on a page whose restore already ran is
+/// not owed (that restore declined it); one on a page still to restore is;
+/// one whose page cannot be told is `null`; a row the predicate already drops
+/// stays `false` whatever the pages say. Mutation: `OwedRestores::read`
+/// ignoring `pages` (every predicate-owed row reads `true`).
+#[test]
+fn a_row_whose_page_already_restored_is_not_owed() {
+    let (_dir, store) = new_store();
+    for (id, page) in [("declined", "ran"), ("waiting", "not-yet"), ("gone", "ran")] {
+        store.record_open(TerminalSessionRecord {
+            page_id: page.to_string(),
+            ..test_open_record(id)
+        });
+    }
+    let booted_at_ms = chrono::Utc::now().timestamp_millis();
+    store.record_close("gone", CloseReason::PtyExit);
+    let view = view_at(booted_at_ms);
+
+    let owed = OwedRestores::read(
+        Some(&store),
+        &view,
+        &progress(&["ran"], &[], &["ran", "not-yet"]),
+    );
+    assert_eq!(owed.of("declined"), Some(false));
+    assert_eq!(owed.of("waiting"), Some(true), "the control");
+    assert_eq!(owed.of("gone"), Some(false));
+    assert_eq!(owed.of("never-held"), Some(false));
+
+    let unknown = OwedRestores::read(Some(&store), &view, &PagesRestored::Unknown);
+    assert_eq!(unknown.of("declined"), None);
+    assert_eq!(
+        unknown.of("gone"),
+        Some(false),
+        "the predicate already answers"
     );
 }
