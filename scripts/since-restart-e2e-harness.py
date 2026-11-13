@@ -178,12 +178,15 @@ def supervisor_record_of(rid: str):
 # ---------------------------------------------------------------------------
 
 
-def spawn(args, log: Log, env: dict) -> Runner:
+def request_spawn(args, log: Log, env: dict) -> tuple[Runner, str | None, str]:
+    """POST the spawn and return AT ONCE with the reserved runner, so the caller
+    owns it (and tears it down) even when the build later times out or fails."""
+    requester = f"since-restart-e2e-{args.label}-{os.getpid()}"
     body = {
         "rebuild": True,
         "async": True,
         "frontend_strict": True,
-        "requester_id": f"since-restart-e2e-{args.label}",
+        "requester_id": requester,
         "extra_env": env,
     }
     if args.worktree_path:
@@ -192,27 +195,40 @@ def spawn(args, log: Log, env: dict) -> Runner:
         body["git_ref"] = args.git_ref
     s, v = http("POST", f"{SUPERVISOR}/runners/spawn-test", body, timeout=120)
     log.rec("spawn.request", status=s, body=v)
-    if s not in (200, 202) or not isinstance(v, dict):
+    if s not in (200, 202) or not isinstance(v, dict) or not v.get("id") or not v.get("port"):
         raise SystemExit(f"spawn refused: {s} {v}")
-    rid, port = v.get("id"), v.get("port")
-    sub = v.get("submission_id")
-    if sub:
-        end = time.time() + 3 * 3600
-        while time.time() < end:
-            s2, st = http("GET", f"{SUPERVISOR}/build/{sub}/status")
-            state = ((st or {}).get("status") or {}).get("state") if isinstance(st, dict) else None
-            if state in ("succeeded", "failed"):
-                log.rec("spawn.outcome", status=s2, body=st)
-                spawn_out = (st or {}).get("spawn") or {}
-                if state == "failed" or spawn_out.get("http_status") not in (200, 201, None):
-                    raise SystemExit(f"spawn failed: {json.dumps(st)[:2000]}")
-                b = spawn_out.get("body") or {}
-                rid, port = b.get("id", rid), b.get("port", port)
-                break
-            time.sleep(20)
-        else:
-            raise SystemExit("spawn did not finish in 3 h")
-    return Runner(rid, int(port), log)
+    return Runner(v["id"], int(v["port"]), log), v.get("submission_id"), requester
+
+
+def await_spawn(r: Runner, sub: str | None, log: Log) -> None:
+    if not sub:
+        return
+    end = time.time() + 3 * 3600
+    while time.time() < end:
+        s2, st = http("GET", f"{SUPERVISOR}/build/{sub}/status")
+        state = ((st or {}).get("status") or {}).get("state") if isinstance(st, dict) else None
+        if state in ("succeeded", "failed"):
+            log.rec("spawn.outcome", status=s2, body=st)
+            spawn_out = (st or {}).get("spawn") or {}
+            if state == "failed" or spawn_out.get("http_status") not in (200, 201, None):
+                raise SystemExit(f"spawn failed: {json.dumps(st)[:2000]}")
+            b = spawn_out.get("body") or {}
+            if b.get("id") not in (None, r.id) or b.get("port") not in (None, r.port):
+                raise SystemExit(f"the spawn answered for another runner: {b}")
+            return
+        time.sleep(20)
+    raise SystemExit("spawn did not finish in 3 h")
+
+
+def require_own_temp_runner(r: Runner, requester: str) -> None:
+    """Refuse to drive any runner but the TEMP runner this process spawned."""
+    rec = r.supervisor_record() or {}
+    kind = (rec.get("kind") or {}).get("type") if isinstance(rec.get("kind"), dict) else rec.get("kind")
+    ok = (r.id.startswith("test-") and kind not in (None, "primary")
+          and rec.get("requester_id") == requester and int(rec.get("port") or 0) == r.port)
+    if not ok:
+        raise SystemExit(f"refusing to drive {r.id}: not the temp runner this harness spawned "
+                         f"(kind={kind!r}, requester={rec.get('requester_id')!r})")
 
 
 def env_for(stub_dir: Path, acct_a: Path) -> dict:
@@ -222,40 +238,115 @@ def env_for(stub_dir: Path, acct_a: Path) -> dict:
     }
 
 
-def holder_sessions_for(root: Path) -> list[int]:
-    """Session ids (setsid leaders) of PTY holders serving `root`'s pane dir."""
-    pane_dir = str(root / "home")
-    sids = set()
+def proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def proc_ppid(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm may hold spaces/parens: fields resume after the LAST ')'.
+    return int(stat[stat.rindex(")") + 2 :].split()[1])
+
+
+def is_our_holder(pid: int, root: Path) -> bool:
+    """A pty-holder whose --pane-dir lies inside THIS run's instance root, and
+    which leads its own session and group (it `setsid()`s at start)."""
+    argv = proc_cmdline(pid)
+    if not argv or "pty-holder" not in Path(argv[0]).name:
+        return False
+    try:
+        pane_dir = argv[argv.index("--pane-dir") + 1]
+    except (ValueError, IndexError):
+        return False
+    inside = Path(pane_dir).resolve().is_relative_to(root.resolve())
+    try:
+        leads = os.getsid(pid) == pid and os.getpgid(pid) == pid
+    except OSError:
+        return False
+    return inside and leads
+
+
+def descendants(pid: int) -> list[int]:
+    kids: dict[int, list[int]] = {}
     for p in Path("/proc").iterdir():
-        if not p.name.isdigit():
-            continue
+        if p.name.isdigit():
+            pp = proc_ppid(int(p.name))
+            if pp is not None:
+                kids.setdefault(pp, []).append(int(p.name))
+    out, stack = [], list(kids.get(pid, []))
+    while stack:
+        c = stack.pop()
+        out.append(c)
+        stack.extend(kids.get(c, []))
+    return out
+
+
+def holder_of(pid: int, root: Path) -> int | None:
+    """The verified holder this pid runs under, walking up the parent chain."""
+    cur: int | None = pid
+    for _ in range(16):
+        if cur is None or cur <= 1:
+            return None
+        if is_our_holder(cur, root):
+            return cur
+        cur = proc_ppid(cur)
+    return None
+
+
+def kill_holder_tree(holder: int, root: Path, log: Log, why: str) -> bool:
+    """SIGKILL a VERIFIED holder and every descendant, pid by pid (never a
+    process group), and confirm they are gone."""
+    if not is_our_holder(holder, root):
+        log.rec("kill.refused", holder=holder, why=f"{why}: not this run's holder")
+        return False
+    victims = [holder] + descendants(holder)
+    for v in victims:
         try:
-            cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+            os.kill(v, signal.SIGKILL)
         except OSError:
-            continue
-        if "pty-holder" in cmd and pane_dir in cmd:
-            try:
-                sids.add(os.getsid(int(p.name)))
-            except OSError:
-                pass
-    return sorted(s for s in sids if s > 1 and s != os.getsid(0))
+            pass
+    end = time.time() + 10
+    while time.time() < end and any(Path(f"/proc/{v}").exists() for v in victims):
+        time.sleep(0.2)
+    alive = [v for v in victims if Path(f"/proc/{v}").exists()
+             and (Path(f"/proc/{v}/stat").read_text(errors="replace").split(") ")[-1][:1] != "Z")]
+    log.rec("kill.holder_tree", why=why, holder=holder, victims=victims, survivors=alive)
+    return not alive
+
+
+def our_holders(root: Path) -> list[int]:
+    return sorted(int(p.name) for p in Path("/proc").iterdir()
+                  if p.name.isdigit() and is_our_holder(int(p.name), root))
 
 
 def teardown(r: Runner | None, log: Log, scratch: list[Path]) -> None:
+    """Stop the runner THIS process spawned, kill only holders verified to serve
+    its instance root, and remove that root only after the stop is confirmed."""
     if r is not None:
         s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/stop", {}, timeout=120)
         log.rec("teardown.stop", status=s, body=v)
-        for sid in holder_sessions_for(r.root):
-            try:
-                os.killpg(sid, signal.SIGKILL)
-                log.rec("teardown.holder_killed", sid=sid)
-            except OSError as e:
-                log.rec("teardown.holder_kill_failed", sid=sid, error=str(e))
-        time.sleep(3)
-        if r.root.exists():
+        for h in our_holders(r.root):
+            kill_holder_tree(h, r.root, log, "teardown")
+        end = time.time() + 60
+        stopped = False
+        while time.time() < end:
+            rec = r.supervisor_record()
+            if (rec is None or not rec.get("running")) and r.health() is None:
+                stopped = True
+                break
+            time.sleep(2)
+        if stopped and r.root.exists():
             shutil.rmtree(r.root, ignore_errors=True)
-        log.rec("teardown.root", root=str(r.root), exists=r.root.exists(),
-                record=r.supervisor_record())
+        log.rec("teardown.root", root=str(r.root), stop_confirmed=stopped,
+                exists=r.root.exists(), record=r.supervisor_record(),
+                holders_left=our_holders(r.root))
     for d in scratch:
         shutil.rmtree(d, ignore_errors=True)
     log.rec("teardown.scratch_removed", dirs=[str(d) for d in scratch],
@@ -293,8 +384,8 @@ def click(r: Runner, el: str, action: str = "click"):
 def waiting_count(strip_text: str | None):
     if not strip_text:
         return None
-    m = re.search(r"(\d+)(?: sessions?)? waiting", strip_text)
-    return int(m.group(1)) if m else 0
+    # The strip can name two causes ("N waiting · W waiting on pages ..."), so sum them.
+    return sum(int(n) for n in re.findall(r"(\d+)(?: sessions?)? waiting", strip_text))
 
 
 def ids_in(led: dict, bucket: str) -> set[str]:
@@ -354,7 +445,7 @@ def run(args) -> int:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = Path(args.out)
     log = Log(out / f"{args.label}-{stamp}.jsonl")
-    work = Path(args.work_dir) if args.work_dir else out / f"{args.label}-{stamp}-work"
+    work = out / f"{args.label}-{stamp}-work"
     stub_dir, acct_a, acct_b, cwd = (work / "bin", work / "acct-a", work / "acct-b", work / "cwd")
     for d in (stub_dir, acct_a, acct_b, cwd):
         d.mkdir(parents=True, exist_ok=True)
@@ -364,16 +455,11 @@ def run(args) -> int:
     summary: dict = {"label": args.label, "started_at": now_rfc3339(), "assertions": {}}
     r: Runner | None = None
     try:
-        if args.runner_id:
-            recd = supervisor_record_of(args.runner_id)
-            if not recd:
-                raise SystemExit(f"no such runner {args.runner_id}")
-            r = Runner(args.runner_id, int(recd["port"]), log)
-            end = time.time() + 3 * 3600
-            while not (supervisor_record_of(r.id) or {}).get("running") and time.time() < end:
-                time.sleep(20)
-        else:
-            r = spawn(args, log, env_for(stub_dir, acct_a))
+        # `r` is set from the spawn's FIRST reply, so a build that times out or
+        # fails still tears down whatever came up.
+        r, sub, requester = request_spawn(args, log, env_for(stub_dir, acct_a))
+        await_spawn(r, sub, log)
+        require_own_temp_runner(r, requester)
         h = r.wait_healthy()
         hd = data_of(h)
         sha = hd.get("gitSha") or (hd.get("provenance") or {}).get("gitSha")
@@ -465,17 +551,23 @@ def run(args) -> int:
         if exe.get("slot_id") is None or slot_now != exe.get("slot_id"):
             raise SystemExit(f"refusing to restart: the relaunch would run slot {slot_now}, "
                              f"not this runner's slot {exe.get('slot_id')}")
+        require_own_temp_runner(r, requester)
         stub_pids = {k: stub_pid_for(n["session_id"]) for k, n in names.items()}
+        # The never-back sessions' holders, verified BEFORE anything is killed:
+        # each stub must run under a pty-holder serving this run's root.
+        never_back_holders = {}
+        for k in NEVER_BACK:
+            sp = stub_pids.get(k)
+            hp = holder_of(sp, r.root) if sp else None
+            if hp is None:
+                raise SystemExit(f"refusing to restart: no verified holder for {k} (stub {sp})")
+            never_back_holders[k] = hp
         os.kill(int(pid), signal.SIGKILL)
         log.rec("restart.killed_runner", pid=pid)
         # The never-back sessions lose their holders with the runner.
-        for k in NEVER_BACK:
-            sp = stub_pids.get(k)
-            if sp:
-                sid = os.getsid(sp)
-                if sid > 1 and sid != os.getsid(0):
-                    os.killpg(sid, signal.SIGKILL)
-                    log.rec("restart.killed_holder", key=k, stub_pid=sp, holder_sid=sid)
+        for k, hp in never_back_holders.items():
+            dead = kill_holder_tree(hp, r.root, log, f"never-back {k}")
+            log.rec("restart.killed_holder", key=k, stub_pid=stub_pids.get(k), holder=hp, dead=dead)
         time.sleep(2)
         # wait=false: the supervisor's own 30 s health wait is shorter than a
         # temp runner's boot with fifteen holders to adopt; poll it here.
@@ -556,7 +648,9 @@ def run(args) -> int:
         snapshot_instance(r, out / f"{args.label}-{stamp}-instance" / "after-prune", log)
 
         evaluate(summary, names, first, second, have_fixture)
-        return 0
+        failed = [k for k, v in summary["assertions"].items() if v.get("result") == "FAIL"]
+        summary["failed"] = failed
+        return 1 if failed else 0
     finally:
         summary["finished_at"] = now_rfc3339()
         if not args.keep:
@@ -767,10 +861,7 @@ def main() -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--worktree-path")
     g.add_argument("--git-ref")
-    g.add_argument("--runner-id", help="an already-spawned temp runner (its env must carry the stub PATH)")
     ap.add_argument("--keep", action="store_true", help="do not stop the runner at the end")
-    ap.add_argument("--work-dir", help="reuse a work dir (stub bin, account dirs) whose bin/ the "
-                    "runner's PATH already names; needed with --runner-id")
     args = ap.parse_args()
     if sys.platform != "linux":
         raise SystemExit("Linux only")
