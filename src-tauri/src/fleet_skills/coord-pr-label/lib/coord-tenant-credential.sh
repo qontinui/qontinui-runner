@@ -23,7 +23,23 @@
 # slug (ctc_origin_slug reads it off a checkout's origin).
 #
 # CALLER CONTRACT (set before calling; all but CTC_TMP have defaults)
-#   CTC_TMP        a private (0700) directory this file may write into.
+#   CTC_TMP        a private (0700) directory this file may write into. It has
+#                  NO default: every function that writes under it (itself or
+#                  through a helper) REFUSES when it is unset, empty, not a
+#                  directory or not writable, before any file is written or
+#                  any request is sent, and says so in its own failure
+#                  convention -- ctc_stage_for_tenant prints rejected(<why>);
+#                  ctc_owner_tenant, ctc_prove_tenant and ctc_expected_tenant
+#                  end `unknown` with the reason in their note
+#                  (ctc_expected_tenant still answers `invalid` for a malformed
+#                  argument first); ctc_bindings refuses a FRESH read, leaving
+#                  the list UNKNOWN (not cached) with the reason in
+#                  CTC_BINDINGS_NOTE, but still serves a read it already
+#                  cached; ctc_bindings_over and ctc_drop_runner_token do
+#                  nothing and return 0. Without it every staged path resolved
+#                  to the filesystem root (measured 2026-11-09:
+#                  `/bearer.hdr: Permission denied`; run as root, a bearer
+#                  would have been staged at /bearer.hdr).
 #   CTC_COORD_URL  coord base (default $COORD_HTTP_URL, else https://coord.qontinui.io).
 #   CTC_CURL       curl binary or a test stub (default curl).
 #   CTC_PY         a Python 3 (default python3).
@@ -138,6 +154,25 @@ ctc_sanitize() {
 ctc_is_uuid() {
   local re='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
   [[ "${1:-}" =~ $re ]]
+}
+
+# _ctc_tmp_ok -> 0 iff $CTC_TMP names a directory this file can write into;
+# otherwise 1, with _CTC_TMP_WHY saying what is wrong and naming the CALLER
+# CONTRACT. Every public function that writes under $CTC_TMP calls it before
+# any write or request and refuses in its own failure convention (see the
+# header). Read through
+# ${CTC_TMP:-} / ${CTC_TMP+set}, never a bare "$CTC_TMP", so a caller running
+# under `set -u` reaches the refusal instead of an unbound-variable exit.
+_CTC_TMP_WHY=""
+_ctc_tmp_ok() {
+  local d="${CTC_TMP:-}" why
+  if [ -z "${CTC_TMP+set}" ]; then why="CTC_TMP is unset"
+  elif [ -z "$d" ]; then why="CTC_TMP is empty"
+  elif [ ! -d "$d" ]; then why="CTC_TMP ($(ctc_sanitize "$d")) is not a directory"
+  elif [ ! -w "$d" ] || [ ! -x "$d" ]; then why="CTC_TMP ($(ctc_sanitize "$d")) is not writable"
+  else _CTC_TMP_WHY=""; return 0; fi
+  _CTC_TMP_WHY="$why -- the CALLER CONTRACT of coord-tenant-credential.sh requires CTC_TMP to name a private (0700) directory this file may write into; refused before any file was written or request sent"
+  return 1
 }
 
 _ctc_np() { # a POSIX path as the native curl on this box wants it
@@ -418,6 +453,9 @@ _ctc_runner_rung() {
 }
 
 ctc_drop_runner_token() { # <tenant> <why>
+  # Nothing can have been cached under an unusable CTC_TMP, so there is nothing
+  # to forget: a no-op, returning 0 so a `set -e` caller is not killed by it.
+  _ctc_tmp_ok || return 0
   local slot="$CTC_TMP/ctc.mint.${1,,}"
   rm -f "$slot.runner.jwt"
   printf '%s' "$2" > "$slot.runner.rejected"
@@ -425,6 +463,7 @@ ctc_drop_runner_token() { # <tenant> <why>
 
 ctc_stage_for_tenant() {
   local want="${1,,}" home_dir="${HOME:-${USERPROFILE:-}}" jwt="" src="" why="" f code c slot
+  _ctc_tmp_ok || { printf 'rejected(%s)' "$_CTC_TMP_WHY"; return 0; }
   rm -f "$CTC_TMP/bearer.hdr"
   ctc_is_uuid "$want" || { printf 'rejected(tenant %s is not a uuid)' "$(ctc_sanitize "${1:-<empty>}")"; return 0; }
   _ctc_url_ok || { printf 'rejected(coord url %s is neither https nor loopback; no credential is sent to it)' "$(_ctc_url)"; return 0; }
@@ -494,7 +533,16 @@ CTC_BINDING_SLUGS=""; CTC_BINDINGS_COUNT=""; CTC_BINDINGS_MULTI=0
 ctc_bindings() {
   local code tok out
   if [ "$_CTC_BINDINGS_READ" = 1 ]; then
-    [ "${_CTC_BINDINGS_TRANSPORT:-0}" = 1 ] && _ctc_mark 000
+    # A read already made stays served (a proven multiplicity is never
+    # un-proven); only its transport mark needs a usable CTC_TMP.
+    [ "${_CTC_BINDINGS_TRANSPORT:-0}" = 1 ] && _ctc_tmp_ok && _ctc_mark 000
+    return 0
+  fi
+  if ! _ctc_tmp_ok; then
+    # A FRESH read is refused: UNKNOWN, and NOT cached, so a later call with a
+    # usable CTC_TMP reads afresh.
+    CTC_BINDINGS=""; CTC_BINDINGS_DROPPED=0; CTC_BINDING_SLUGS=""; CTC_BINDINGS_COUNT=""; CTC_BINDINGS_MULTI=0
+    CTC_BINDINGS_NOTE="$_CTC_TMP_WHY"
     return 0
   fi
   _CTC_BINDINGS_READ=1
@@ -628,6 +676,7 @@ ctc_bindings_over() {
   local sv_b="$CTC_BINDINGS" sv_n="$CTC_BINDINGS_NOTE" sv_d="$CTC_BINDINGS_DROPPED" sv_s="$CTC_BINDING_SLUGS" \
         sv_c="$CTC_BINDINGS_COUNT" sv_m="$CTC_BINDINGS_MULTI" sv_t="${_CTC_BINDINGS_TRANSPORT:-0}"
   [ -s "${1:-}" ] || return 0
+  _ctc_tmp_ok || return 0
   _ctc_url_ok || return 0
   CTC_BINDINGS=""; CTC_BINDINGS_NOTE=""; CTC_BINDINGS_DROPPED=0; CTC_BINDING_SLUGS=""; CTC_BINDINGS_COUNT=""; CTC_BINDINGS_MULTI=0
   _ctc_identity_read "$1"
@@ -664,6 +713,11 @@ _ctc_probe() {
 
 CTC_STATE=""; CTC_TENANT=""; CTC_NOTE=""; CTC_BEARER_SRC=""; CTC_TRANSPORT=0
 ctc_owner_tenant() {
+  if ! _ctc_tmp_ok; then
+    CTC_STATE=unknown; CTC_TENANT=""; CTC_BEARER_SRC=""; CTC_TRANSPORT=0
+    CTC_NOTE="$_CTC_TMP_WHY, so which tenant owns ${*:-<no repo named>} is UNKNOWN"
+    return 0
+  fi
   rm -f "$CTC_TMP/ctc.transport"
   _ctc_owner_walk "$@"
   CTC_TRANSPORT=0
@@ -768,6 +822,7 @@ CTC_DOOR_CODE=""
 ctc_prove_tenant() { # <tenant> <owner/repo>
   local t="${1,,}" r="$2" src
   CTC_STATE=unknown; CTC_TENANT=""; CTC_NOTE=""; CTC_BEARER_SRC=""; CTC_DOOR_CODE=""
+  _ctc_tmp_ok || { CTC_NOTE="$_CTC_TMP_WHY, so whether tenant $t owns $r is UNKNOWN"; return 0; }
   case "$r" in ?*/?*) ;; *) CTC_NOTE="'$r' is not an owner/name slug"; return 0 ;; esac
   src="$(ctc_stage_for_tenant "$t")"
   case "$src" in
@@ -849,6 +904,11 @@ ctc_expected_tenant() { # [--tenant <uuid>] [--owner-of <owner/repo>] [--no-slug
     if ctc_is_uuid "$QONTINUI_TENANT_ID"; then CTC_EXPECTED_TENANT="${QONTINUI_TENANT_ID,,}"; CTC_EXPECTED_SOURCE="\$QONTINUI_TENANT_ID"
     else CTC_EXPECTED_STATE=invalid; CTC_EXPECTED_NOTE="\$QONTINUI_TENANT_ID=$(ctc_sanitize "$QONTINUI_TENANT_ID") is not a tenant uuid"; return 0; fi
   fi
+  # Steps 1-2 write nothing, so a malformed argument above is still `invalid`.
+  # Past them, even a --tenant answer is refused: the slug read, the owner
+  # proof and the binding read all write under $CTC_TMP, so a caller in breach
+  # of the contract hears it here rather than from whichever step it reaches.
+  _ctc_tmp_ok || { CTC_EXPECTED_STATE=unknown; CTC_EXPECTED_TENANT=""; CTC_EXPECTED_SOURCE=""; CTC_EXPECTED_NOTE="$_CTC_TMP_WHY, so the tenant to act for is UNKNOWN"; return 0; }
   # 3. the tenant PROVEN to own a named repo (a workspace-global render names
   # the repo it renders from; a per-session door names none).
   if [ -z "$CTC_EXPECTED_TENANT" ] && [ -n "$owner" ]; then
