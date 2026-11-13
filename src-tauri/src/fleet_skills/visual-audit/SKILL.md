@@ -187,7 +187,9 @@ curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout", snapshot:$s, target:"<device-id>"}')" \
   | jq '.data.findings[]'
 
-# assert + baseline take `target` the same way
+# assert + baseline take `target` the same way.
+# `no_clipping` needs `parent_id` on the snapshot's elements (see its row in the
+# assertion table): without it this answers `unknown`, not `passed`.
 curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{snapshot:$s, target:"<device-id>", assertions:[{"type":"no_clipping"}]}')"
@@ -342,7 +344,7 @@ Each assertion is a tagged-JSON object:
 | `color_within` | `{"type":"color_within","element":"logo","expected":{"r":255,"g":51,"b":51},"delta_e_max":5}` |
 | `typography_consistent` | `{"type":"typography_consistent","elements":["h1","h2"],"dimensions":["font_family"]}` |
 | `no_layout_shift_since` | `{"type":"no_layout_shift_since","baseline":"v1.0-home","tolerance_px":2}` |
-| `no_clipping` | `{"type":"no_clipping","region":{"x":0,"y":0,"w":1280,"h":720}}` |
+| `no_clipping` | `{"type":"no_clipping","region":{"x":0,"y":0,"w":1280,"h":720}}` — needs **`parent_id`** on the snapshot elements: it compares each child's `bbox` against its nearest *actually-clipping* ancestor. An ancestor's optional `clips_children` bool says whether it clips (`overflow` other than `visible`, `clip-path`, scroll containers); **absent means unmeasured**, not "does not clip". When no element carries `parent_id`, or no parent/child pair could be compared, the assertion answers **`unknown`** (`input_missing`, `passed: false`) — never a vacuous `passed`. |
 | `animation_settled` | `{"type":"animation_settled","region":null,"settle_frames":3}` |
 | `contrast_meets_wcag` | `{"type":"contrast_meets_wcag","element":"btn-save","level":"aa"}` |
 | `image_palette_within` | `{"type":"image_palette_within","element":"hero","palette":[{"r":20,"g":40,"b":90}],"max_delta_e":10,"min_coverage":0.6}` — at least `min_coverage` of the image's pixels lie within `max_delta_e` (CIEDE2000) of a palette colour. Reads the frame. |
@@ -392,7 +394,7 @@ curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
     snapshot: $snapshot,
     assertions: [
       { "type": "no_overlap", "elements": ["button-terminal-1", "button-terminal-2"] },
-      { "type": "no_clipping" },
+      { "type": "no_clipping" },   # needs parent_id on the snapshot elements
       { "type": "aligned_horizontally", "elements": ["nav-link-1","nav-link-2","nav-link-3"], "axis_tolerance_px": 2 }
     ]
   }')" | jq '.data'
@@ -407,7 +409,9 @@ Response:
       "detail": "button-terminal-1 and button-terminal-2 overlap by 1632 px²",
       "assertion": { "type": "no_overlap", "elements": ["button-terminal-1","button-terminal-2"] },
       "confidence": null },
-    { "passed": true, "outcome": "passed", "assertion": { "type": "no_clipping" },
+    { "passed": false, "outcome": "unknown",
+      "detail": "no_clipping needs parent_id on the snapshot elements; none carries one, so no parent/child pair could be compared (input_missing)",
+      "assertion": { "type": "no_clipping" },
       "confidence": null },
     { "passed": true, "outcome": "passed",
       "assertion": { "type": "aligned_horizontally", "elements": [...] },
@@ -437,16 +441,22 @@ the key. Do not strip it and do not treat it as missing data.
 **`assert` carries `coverage` too, and you must read it here for the same
 reason you read it on `analyze`.** Every assertion in the DSL reads the
 snapshot (the image assertions too, to find the image's box), so
-`allPassed: true` over a snapshot with `withGeometry: 0` is a vacuous pass:
-`no_clipping` skips every element that carries no `bbox` and then returns a
-**genuine** `passed` over the emptiness it was left holding.
+`allPassed: true` over a snapshot with `withGeometry: 0` can still be a vacuous
+pass for an assertion that skips elements lacking the input it reads. `no_clipping`
+no longer is one: it needs `parent_id` (and optionally `clips_children`) on the
+snapshot elements, and answers `unknown` (`input_missing`) when none carries a
+`parent_id` or no pair is compared. In the example above the projector's
+snapshot carries no `parent_id`, so `no_clipping` is `unknown` and `allPassed`
+is `false` for that reason alone; the `unknown` is the honest answer, not a
+failure of the page.
 
 Each result also carries `outcome` — `"passed"`, `"failed"` or `"unknown"` —
 and it is worth reading, but it does NOT catch that case. `outcome: "unknown"`
 (deliberately `passed: false`) means an assertion could not be evaluated
-because an INPUT was absent; the vacuous pass above is an assertion that
-evaluated fine over nothing. `coverage` is what separates the two, and there is
-no analyzer-level `verdict` on this route to do it for you.
+because an INPUT was absent (as `no_clipping` does without `parent_id`); a
+vacuous pass is an assertion that evaluated fine over nothing. `coverage` helps
+you tell the remaining cases apart, and there is no analyzer-level `verdict` on
+this route to do it for you.
 
 Two absences here are STATEMENTS, not gaps, and `snapshotAttribution.state` is
 what makes them readable:
@@ -519,7 +529,9 @@ curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"color",snapshot:$s}')" \
   | jq '.data.findings[]'
 
-# 4. A default assertion bundle for every interactive page
+# 4. A default assertion bundle for every interactive page.
+#    `no_clipping` answers `unknown` unless the snapshot elements carry
+#    `parent_id` (optionally `clips_children`), so `allPassed` is false without it.
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{
