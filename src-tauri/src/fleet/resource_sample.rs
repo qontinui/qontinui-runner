@@ -2268,9 +2268,10 @@ mod tests {
             key("psi_cpu_some -3 is outside")
         );
         assert_eq!(key("… and 5 more"), key("… and 12 more"));
+        // A sentence-final value merges; a quoted field name next to it does not.
         assert_eq!(
-            key("did NOT store field(s) [\"gpus_v2\"]"),
-            key("did NOT store field(s) [\"gpus_v2\"]")
+            key("axis \"psi\" has state 5."),
+            key("axis \"psi\" has state 7.")
         );
         assert_ne!(key("field(s) [\"gpus_v2\"]"), key("field(s) [\"gpus_v3\"]"));
         assert_eq!(
