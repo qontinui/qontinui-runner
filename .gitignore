@@ -122,9 +122,12 @@ temp_dev/
 # .qontinui/ci-requirements.toml is repo content too: the declared CI
 # resource floors coord's fit verdict reads from its canonical mirror (no CI
 # node parses it).
+# .qontinui/ci-pool-variables.toml is repo content too: the lane variables
+# coord's pool-variable controller decides, read from its canonical mirror.
 .qontinui/*
 !.qontinui/ci.toml
 !.qontinui/ci-requirements.toml
+!.qontinui/ci-pool-variables.toml
 
 # Ignore CLAUDE notes file
 CLAUDE.md
