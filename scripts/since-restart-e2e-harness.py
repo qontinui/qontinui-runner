@@ -17,8 +17,6 @@ Usage (from anywhere):
         --worktree-path <runner checkout> --out <results dir>
     python3 scripts/since-restart-e2e-harness.py --label control \\
         --git-ref origin/main --out <results dir>
-    # or reuse a runner already spawned with the stub env:
-    python3 scripts/since-restart-e2e-harness.py --label fixed --runner-id test-… --out …
 
 The session layout (15 sessions over 3 pages, 5 each):
 
@@ -164,13 +162,23 @@ class Runner:
         return supervisor_record_of(self.id)
 
 
-def supervisor_record_of(rid: str):
+def supervisor_lookup(rid: str) -> tuple[bool, dict | None]:
+    """(readable, record). An unreadable supervisor is (False, None): the
+    record is UNKNOWN, never "absent"."""
     s, v = http("GET", f"{SUPERVISOR}/runners")
-    rs = v if isinstance(v, list) else (v or {}).get("runners", []) if isinstance(v, dict) else []
-    for r in rs if isinstance(rs, list) else []:
+    if s != 200:
+        return False, None
+    rs = v if isinstance(v, list) else v.get("runners") if isinstance(v, dict) else None
+    if not isinstance(rs, list):
+        return False, None
+    for r in rs:
         if isinstance(r, dict) and r.get("id") == rid:
-            return r
-    return None
+            return True, r
+    return True, None
+
+
+def supervisor_record_of(rid: str):
+    return supervisor_lookup(rid)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +254,17 @@ def proc_cmdline(pid: int) -> list[str]:
     return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
 
 
+def proc_alive(pid: int) -> bool:
+    """A pid that exists and is not a zombie. An unreadable /proc entry (the
+    process exited between the listing and the read) reads as gone."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="replace")
+    except OSError:
+        return False
+    tail = stat[stat.rfind(")") + 2 :]
+    return tail[:1] not in ("Z", "X", "")
+
+
 def proc_ppid(pid: int) -> int | None:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
@@ -313,10 +332,9 @@ def kill_holder_tree(holder: int, root: Path, log: Log, why: str) -> bool:
         except OSError:
             pass
     end = time.time() + 10
-    while time.time() < end and any(Path(f"/proc/{v}").exists() for v in victims):
+    while time.time() < end and any(proc_alive(v) for v in victims):
         time.sleep(0.2)
-    alive = [v for v in victims if Path(f"/proc/{v}").exists()
-             and (Path(f"/proc/{v}/stat").read_text(errors="replace").split(") ")[-1][:1] != "Z")]
+    alive = [v for v in victims if proc_alive(v)]
     log.rec("kill.holder_tree", why=why, holder=holder, victims=victims, survivors=alive)
     return not alive
 
@@ -326,27 +344,59 @@ def our_holders(root: Path) -> list[int]:
                   if p.name.isdigit() and is_our_holder(int(p.name), root))
 
 
-def teardown(r: Runner | None, log: Log, scratch: list[Path]) -> None:
-    """Stop the runner THIS process spawned, kill only holders verified to serve
-    its instance root, and remove that root only after the stop is confirmed."""
+def kill_our_holders(root: Path, log: Log, why: str) -> list[int]:
+    for h in our_holders(root):
+        kill_holder_tree(h, root, log, why)
+    return our_holders(root)
+
+
+def await_stopped(r: Runner, limit_s: float = 60) -> str:
+    """'stopped' | 'running' | 'unknown'. Stopped needs a READABLE supervisor
+    that lists the runner as not running (or no longer lists it) AND a dead
+    health port; an unreadable supervisor at the deadline is UNKNOWN."""
+    end = time.time() + limit_s
+    verdict = "unknown"
+    while time.time() < end:
+        readable, rec = supervisor_lookup(r.id)
+        up = r.health() is not None
+        if not readable:
+            verdict = "running" if up else "unknown"
+        elif (rec is None or not rec.get("running")) and not up:
+            return "stopped"
+        else:
+            verdict = "running"
+        time.sleep(2)
+    return verdict
+
+
+def teardown(r: Runner | None, owned: bool, log: Log, scratch: list[Path]) -> None:
+    """Stop the runner THIS process spawned. Holders are killed, and the
+    instance root removed, only for a runner `require_own_temp_runner` verified
+    (`owned`), and the root only once the stop is CONFIRMED. A runner that was
+    never verified is stopped by id alone (the id came from this process's own
+    spawn reply) and otherwise left alone and reported."""
     if r is not None:
         s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/stop", {}, timeout=120)
-        log.rec("teardown.stop", status=s, body=v)
-        for h in our_holders(r.root):
-            kill_holder_tree(h, r.root, log, "teardown")
-        end = time.time() + 60
-        stopped = False
-        while time.time() < end:
-            rec = r.supervisor_record()
-            if (rec is None or not rec.get("running")) and r.health() is None:
-                stopped = True
-                break
-            time.sleep(2)
-        if stopped and r.root.exists():
-            shutil.rmtree(r.root, ignore_errors=True)
-        log.rec("teardown.root", root=str(r.root), stop_confirmed=stopped,
-                exists=r.root.exists(), record=r.supervisor_record(),
-                holders_left=our_holders(r.root))
+        log.rec("teardown.stop", status=s, body=v, owned=owned)
+        if not owned:
+            log.rec("teardown.unverified_left_alone", runner_id=r.id, port=r.port,
+                    root=str(r.root), root_exists=r.root.exists(), record=r.supervisor_record(),
+                    why="never verified as this run's temp runner: no holder kill, no rmtree")
+        else:
+            kill_our_holders(r.root, log, "teardown")
+            stop = await_stopped(r)
+            holders_left: list[int] = []
+            if stop == "stopped":
+                # A holder the runner spawned while it was going down.
+                holders_left = kill_our_holders(r.root, log, "teardown-after-stop")
+                if not holders_left and r.root.exists():
+                    shutil.rmtree(r.root, ignore_errors=True)
+            else:
+                holders_left = our_holders(r.root)
+            log.rec("teardown.root", root=str(r.root), stop=stop,
+                    removed=stop == "stopped" and not holders_left,
+                    exists=r.root.exists(), record=r.supervisor_record(),
+                    holders_left=holders_left)
     for d in scratch:
         shutil.rmtree(d, ignore_errors=True)
     log.rec("teardown.scratch_removed", dirs=[str(d) for d in scratch],
@@ -454,12 +504,16 @@ def run(args) -> int:
     scratch = [work]
     summary: dict = {"label": args.label, "started_at": now_rfc3339(), "assertions": {}}
     r: Runner | None = None
+    # Set only once require_own_temp_runner has passed; gates teardown's holder
+    # kills and root removal.
+    owned = False
     try:
         # `r` is set from the spawn's FIRST reply, so a build that times out or
         # fails still tears down whatever came up.
         r, sub, requester = request_spawn(args, log, env_for(stub_dir, acct_a))
         await_spawn(r, sub, log)
         require_own_temp_runner(r, requester)
+        owned = True
         h = r.wait_healthy()
         hd = data_of(h)
         sha = hd.get("gitSha") or (hd.get("provenance") or {}).get("gitSha")
@@ -551,7 +605,10 @@ def run(args) -> int:
         if exe.get("slot_id") is None or slot_now != exe.get("slot_id"):
             raise SystemExit(f"refusing to restart: the relaunch would run slot {slot_now}, "
                              f"not this runner's slot {exe.get('slot_id')}")
+        # A record that no longer verifies is no longer provably ours.
+        owned = False
         require_own_temp_runner(r, requester)
+        owned = True
         stub_pids = {k: stub_pid_for(n["session_id"]) for k, n in names.items()}
         # The never-back sessions' holders, verified BEFORE anything is killed:
         # each stub must run under a pty-holder serving this run's root.
@@ -654,8 +711,13 @@ def run(args) -> int:
     finally:
         summary["finished_at"] = now_rfc3339()
         if not args.keep:
-            teardown(r, log, scratch)
-            summary["torn_down"] = True
+            try:
+                teardown(r, owned, log, scratch)
+                summary["torn_down"] = True
+            except Exception as e:  # the summary below must still be written
+                summary["torn_down"] = False
+                summary["teardown_error"] = repr(e)
+        summary["owned"] = owned
         (out / f"{args.label}-{stamp}-summary.json").write_text(
             json.dumps(summary, indent=2, default=str))
         print(f"summary: {out / f'{args.label}-{stamp}-summary.json'}")
