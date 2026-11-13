@@ -13,12 +13,14 @@
  * applies the layout once the closes have landed.
  */
 
+import type { PaneClaudeState } from "./claudePresence";
 import type { TerminalTab } from "./useTerminalManager";
 import { pickLayout, type SessionState, type ZoneAssignments } from "./useZoneLayout";
 
 type PruneTab = Pick<
   TerminalTab,
   | "id"
+  | "type"
   | "title"
   | "createdAt"
   | "claudeSessionId"
@@ -37,12 +39,24 @@ type PruneTab = Pick<
  */
 export const RECENT_TAB_GRACE_MS = 60_000;
 
-/** Live signals beyond the tab's own fields; both optional. */
+/** Live signals beyond the tab's own fields; all optional. */
 export interface PruneSignals {
   /** `useSessionStateTracking`'s per-tab state. */
   sessionStates?: Readonly<Record<string, SessionState>>;
   /** Epoch ms "now", for the {@link RECENT_TAB_GRACE_MS} window. */
   now?: number;
+  /**
+   * Panes an earlier probe read `live` (`useKnownClaudePanes`). Always kept.
+   */
+  knownClaudePanes?: ReadonlySet<string>;
+  /**
+   * The process table's answer per tab, from the probe the button runs before
+   * it arms. When this map is given, a terminal tab no other signal keeps is
+   * closed ONLY if it reads `absent`: `live`, `remote`, `unknown` and a
+   * missing entry all keep it. Plan viewers have no process to probe and are
+   * unaffected.
+   */
+  claudePresence?: Readonly<Record<string, PaneClaudeState>>;
 }
 
 /**
@@ -65,18 +79,40 @@ export interface PruneSignals {
  * `needs-input` (a Claude UI mid-turn or awaiting approval; a busy plain shell
  * is kept too, which is the safe direction).
  *
+ * Even together those miss an IDLE Claude whose id never bound: the runner
+ * pins an id at spawn, `terminal_list` surfaces only CONFIRMED ids, and a
+ * session that ran under a different id never confirms. Such a pane carries
+ * no tab signal at all, and an idle one was closed as a shell (2026-10-25). So
+ * the button probes the process table before it closes anything, and with
+ * {@link PruneSignals.claudePresence} given a terminal tab is closed only when
+ * the probe reads `absent`: no process image named `claude` under the pane's
+ * root. That match is by image name, so a Claude Code run as `node … cli.js`
+ * (an npm install) still reads `absent`; the native `claude.exe` does not.
+ *
  * Errs toward KEEPING: a tab is closed only when no signal says otherwise.
  */
 export function hasAiSession(tab: PruneTab, signals: PruneSignals = {}): boolean {
   if (tab.claudeSessionId || tab.sessionBacked === true || tab.taskRunId || tab.remote != null) {
     return true;
   }
+  const { now, knownClaudePanes, claudePresence } = signals;
+  if (knownClaudePanes?.has(tab.id)) return true;
   const state = signals.sessionStates?.[tab.id];
   if (state === "working" || state === "needs-input") return true;
-  const { now } = signals;
-  return (
-    now !== undefined && tab.createdAt !== undefined && now - tab.createdAt < RECENT_TAB_GRACE_MS
-  );
+  if (
+    now !== undefined &&
+    tab.createdAt !== undefined &&
+    now - tab.createdAt < RECENT_TAB_GRACE_MS
+  ) {
+    return true;
+  }
+  if (isPlanTab(tab)) return false;
+  return claudePresence !== undefined && claudePresence[tab.id] !== "absent";
+}
+
+/** A plan viewer: frontend-only, no PTY, nothing for a probe to see. */
+export function isPlanTab(tab: Pick<TerminalTab, "id" | "type">): boolean {
+  return tab.type === "plan" || tab.id.startsWith("plan-");
 }
 
 export interface PrunePlan {
