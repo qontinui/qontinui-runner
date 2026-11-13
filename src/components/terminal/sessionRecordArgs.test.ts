@@ -77,6 +77,24 @@ describe("buildSessionOpenArgs — onSessionIdBound zone resolution", () => {
     });
   });
 
+  // Provider: the caller's launch provider, else the tab's, else ABSENT — the
+  // backend then keeps the provider it holds, so a zone move of a Codex session
+  // never re-records it as Claude.
+  it("carries the launch provider, falls back to the tab's, and omits an unknown one", () => {
+    const base = {
+      assignments: {},
+      tabs: [{ id: "t", sessionProvider: "codex" }, { id: "plain" }],
+      claudeSessionId: "sid",
+      configDir: undefined,
+      pageId: "default",
+    };
+    expect(buildSessionOpenArgs({ ...base, tabId: "t" }).provider).toBe("codex");
+    expect(buildSessionOpenArgs({ ...base, tabId: "plain", provider: "claude" }).provider).toBe(
+      "claude",
+    );
+    expect("provider" in buildSessionOpenArgs({ ...base, tabId: "plain" })).toBe(false);
+  });
+
   // Omitted origin → key ABSENT so the backend preserves any existing origin.
   it("includes origin only when the caller asserts one", () => {
     const base = {

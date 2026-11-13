@@ -1902,6 +1902,7 @@ fn record_from_seed(
         closed_at,
         close_reason,
         provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+        lane: crate::session::session_lifecycle_store::SessionLane::Pty,
         origin: seed.origin.clone(),
         // Resolved against `now_ms` exactly like `last_seen_at` — so a caller
         // can place a confirmation or an in-flight restore marker at a precise

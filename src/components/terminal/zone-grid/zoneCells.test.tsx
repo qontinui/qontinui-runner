@@ -50,7 +50,7 @@ const rec = vi.hoisted(() => ({
   /** WebGL evictions (`downgrade`) and reveal restores, by terminal id. */
   downgrades: [] as string[],
   restores: [] as string[],
-  /** Live PlanViewer / WorkerSessionCell mounts, by tab id. */
+  /** Live PlanViewer / StructuredSessionCell mounts, by tab id. */
   plans: new Set<string>(),
   workers: new Set<string>(),
 }));
@@ -130,8 +130,8 @@ vi.mock("../PlanViewer", () => ({
     return null;
   },
 }));
-vi.mock("../WorkerSessionCell", () => ({
-  WorkerSessionCell: ({ taskRunId }: { taskRunId: string }) => {
+vi.mock("../StructuredSessionCell", () => ({
+  StructuredSessionCell: ({ taskRunId }: { taskRunId: string }) => {
     useEffect(() => {
       rec.workers.add(taskRunId);
       return () => void rec.workers.delete(taskRunId);

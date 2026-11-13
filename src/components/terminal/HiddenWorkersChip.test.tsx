@@ -3,7 +3,7 @@
  * worker cell REVERSIBLE.
  *
  * The runner's vitest config is `environment: "node"` with no React Testing
- * Library, so (as `UnzonedChip` / `WorkerSessionCell` do) the label contract is
+ * Library, so (as `UnzonedChip` / `StructuredSessionCell` do) the label contract is
  * locked on its pure helper and the markup with `renderToStaticMarkup`.
  */
 
@@ -25,11 +25,16 @@ const hidden = (partial: Partial<HiddenWorker> = {}): HiddenWorker => ({
 describe("hiddenWorkersChipLabel", () => {
   it("renders nothing when no worker view is hidden", () => {
     expect(hiddenWorkersChipLabel([])).toBeNull();
-    expect(renderToStaticMarkup(<HiddenWorkersChip hidden={[]} onRestoreAll={() => {}} />)).toBe("");
+    expect(renderToStaticMarkup(<HiddenWorkersChip hidden={[]} onRestoreAll={() => {}} />)).toBe(
+      "",
+    );
   });
 
   it("counts the hidden workers and names them in the tooltip", () => {
-    const label = hiddenWorkersChipLabel([hidden(), hidden({ tabId: "t2", title: "worker: tests" })]);
+    const label = hiddenWorkersChipLabel([
+      hidden(),
+      hidden({ tabId: "t2", title: "worker: tests" }),
+    ]);
     expect(label?.text).toBe("2 hidden workers");
     expect(label?.title).toContain("refactor parser");
     expect(label?.title).toContain("worker: tests");
@@ -43,7 +48,10 @@ describe("hiddenWorkersChipLabel", () => {
   it("says so when a previous restore could NOT bring a worker back", () => {
     // Honesty: a "show" click that silently did nothing is the failure the
     // affordance exists to remove, so a miss is reported rather than dropped.
-    const label = hiddenWorkersChipLabel([hidden({ restoreMissedAtMs: 5 }), hidden({ tabId: "t2" })]);
+    const label = hiddenWorkersChipLabel([
+      hidden({ restoreMissedAtMs: 5 }),
+      hidden({ tabId: "t2" }),
+    ]);
     expect(label?.title).toContain("could not be re-opened");
     expect(hiddenWorkersChipLabel([hidden()])?.title).not.toContain("could not be re-opened");
   });

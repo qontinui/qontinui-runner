@@ -193,17 +193,15 @@ pub(crate) fn compose_prompt(prompt: &str, mcp_connections: &[McpConnectionRef])
 /// none. A task whose tools share nothing with the operator's list is refused —
 /// running it with the task's wider list, or with none, would both be wrong.
 /// `--allowedTools` is rendered by the shared
-/// [`allowed_tools_args`](crate::claude_session::launch_spec::allowed_tools_args).
+/// [`allowed_tools_args`](crate::session::launch_spec::allowed_tools_args).
 pub(crate) fn claude_args(
     session_id: &str,
     model: Option<&str>,
     allowed_tools: &[String],
     max_turns: u32,
-    session_permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
+    session_permission: &crate::session::launch_spec::SessionPermissionSetting,
 ) -> Result<Vec<String>, String> {
-    use crate::claude_session::launch_spec::{
-        allowed_tools_args, intersect_tool_lists, PermissionMode,
-    };
+    use crate::session::launch_spec::{allowed_tools_args, intersect_tool_lists, PermissionMode};
 
     let task_tools = allowed_tools_args(allowed_tools);
     let (permission, tools_tail) = match session_permission.apply(PermissionMode::DangerouslySkip) {
@@ -579,7 +577,7 @@ mod tests {
     /// INTERSECTED with the operator's list — a task can narrow, never widen.
     #[test]
     fn allow_list_posture_intersects_task_and_operator_tools() {
-        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        use crate::session::launch_spec::SessionPermissionSetting;
         let op = SessionPermissionSetting::AllowList {
             tools: vec!["Read".to_string(), "Grep".to_string()],
         };
@@ -615,7 +613,7 @@ mod tests {
     /// refused rather than run with the task's (wider) list or with none.
     #[test]
     fn allow_list_posture_refuses_an_empty_intersection() {
-        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        use crate::session::launch_spec::SessionPermissionSetting;
         let op = SessionPermissionSetting::AllowList {
             tools: vec!["Read".to_string()],
         };

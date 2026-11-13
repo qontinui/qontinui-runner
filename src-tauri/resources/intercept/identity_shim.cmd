@@ -166,28 +166,50 @@ if defined QONTINUI_INSTALL_INTERCEPT_PORT (
   )
 )
 
-set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
-if "%USER_CHOSE%"=="1" goto :passthrough
-if not defined PINNED goto :passthrough
-
-rem ---- append the runner-pinned session id (+ claude --settings hook) -------
-if defined REAL (
-  call "%REAL%" %* %SETTINGS_ARGS% %MCPCFG_ARGS% --session-id %PINNED%
-) else (
-  call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS% --session-id %PINNED%
-)
-endlocal & exit /b %ERRORLEVEL%
+rem ---- what to append: the claude --settings / --mcp-config hooks, plus the
+rem runner-pinned session id unless the user chose their own session ---------
+set "TAIL=!SETTINGS_ARGS! !MCPCFG_ARGS!"
+if not "%USER_CHOSE%"=="1" if defined PINNED set "TAIL=!TAIL! --session-id !PINNED!"
+goto :launch
 
 :passthrough
 rem User chose their own session (or no pin) — still deliver the claude
 rem --settings hook so a --resume/--continue confirms via SessionStart.
-set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
-if defined REAL (
-  call "%REAL%" %* %SETTINGS_ARGS% %MCPCFG_ARGS%
-) else (
-  call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS%
+set "TAIL=!SETTINGS_ARGS! !MCPCFG_ARGS!"
+
+:launch
+rem Leave the delayed-expansion scope FIRST. With delayed expansion on, the
+rem line that expands %* strips every "!" from the user's arguments (and a
+rem caret before one), and CALL doubles their carets. REAL and TAIL cross
+rem ENDLOCAL through FOR variables (the R prefix keeps an unresolved REAL
+rem non-empty); the guard is set in a fresh SETLOCAL so it reaches the child
+rem without leaking into the caller's cmd session.
+for /f "tokens=1,* delims=|" %%A in ("R!REAL!|!TAIL!") do (
+  endlocal
+  setlocal DisableDelayedExpansion
+  set "QSHIM_REAL=%%A"
+  set "QSHIM_TAIL=%%B"
 )
-endlocal & exit /b %ERRORLEVEL%
+set "QSHIM_REAL=%QSHIM_REAL:~1%"
+set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
+if not defined QSHIM_REAL goto :run_by_name
+rem No CALL, for any target: CALL doubles the arguments' carets. An .exe
+rem returns here with its exit code. A .cmd/.bat target takes control
+rem instead (batch chaining): nothing after this line runs, and the
+rem target's exit code is the shim's.
+"%QSHIM_REAL%" %* %QSHIM_TAIL%
+exit /b %ERRORLEVEL%
+:run_by_name
+rem Nothing launchable resolved: chain to the tool by name. Without CALL, a
+rem name that resolves back to a qontinui shim would re-enter it for ever, so
+rem a by-name run that finds this marker already set is the loop, and fails.
+if defined QSHIM_BY_NAME (
+  >&2 echo qontinui shim: @@TOOL@@ could not be resolved on PATH outside the qontinui shim dirs
+  exit /b 9009
+)
+set "QSHIM_BY_NAME=1"
+@@TOOL@@ %* %QSHIM_TAIL%
+exit /b %ERRORLEVEL%
 
 rem ---- is_qontinui_shim_dir: DSKIP=1 when DENTRY is ANY qontinui shim dir ---
 rem Not only our own SHIM_DIR: a PATH inherited from another runner session

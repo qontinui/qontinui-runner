@@ -377,6 +377,7 @@ fn bind_record(
         closed_at: None,
         close_reason: None,
         provider: DEFAULT_PROVIDER.to_string(),
+        lane: crate::session::session_lifecycle_store::SessionLane::Pty,
         origin: Some(origin.to_string()),
         restore_pending_at: None,
         awaiting_account_since: None,
@@ -628,7 +629,9 @@ pub struct DiskTranscriptIndex {
 impl DiskTranscriptIndex {
     pub fn discover() -> Self {
         Self {
-            config_dirs: crate::terminal::transcript::find_claude_config_dirs(),
+            config_dirs: crate::terminal::transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE,
+            ),
         }
     }
 }
@@ -943,7 +946,9 @@ pub struct DiskProviderSessionIndex {
 impl DiskProviderSessionIndex {
     pub fn discover() -> Self {
         Self {
-            config_dirs: crate::terminal::transcript::find_claude_config_dirs(),
+            config_dirs: crate::terminal::transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE,
+            ),
         }
     }
 }
@@ -1226,11 +1231,11 @@ pub fn compute_provider_rows_blocking(
 pub async fn compute_provider_rows(live: &[LivePty], snapshot: &ProcessSnapshot) -> ProviderRows {
     let (live, snapshot) = (live.to_vec(), snapshot.clone());
     spawn_blocking_tracked(move || {
-        compute_provider_rows_blocking(
-            &live,
-            &snapshot,
-            crate::terminal::transcript::find_claude_config_dirs,
-        )
+        compute_provider_rows_blocking(&live, &snapshot, || {
+            crate::terminal::transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE,
+            )
+        })
     })
     .await
     .unwrap_or_default()
@@ -1767,6 +1772,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             awaiting_account_since: None,
@@ -2276,6 +2282,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             awaiting_account_since: None,
@@ -2451,6 +2458,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             awaiting_account_since: None,
@@ -2546,6 +2554,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             awaiting_account_since: None,

@@ -2,7 +2,8 @@
  * One zone's content: the state border, the zone header (label, notes, pin,
  * session switcher, prompts + review toggles), the prompts / review panels,
  * the quick and hover actions, and the terminal body — a `TerminalInstance`,
- * a `PlanViewer` or a Conductor `WorkerSessionCell`.
+ * a `PlanViewer` or a `StructuredSessionCell` (a Conductor worker or a
+ * structured, permission-prompting session).
  *
  * `buildZoneCells` (`zoneCells.tsx`) mounts it for both work modes and for the
  * grid's maximized view: one cell per tab that owns a mount, keyed by tab id
@@ -31,7 +32,7 @@ import {
   type ShellIntegrationEvent,
 } from "../TerminalInstance";
 import { PlanViewer } from "../PlanViewer";
-import { WorkerSessionCell } from "../WorkerSessionCell";
+import { StructuredSessionCell } from "../StructuredSessionCell";
 import { SuggestionChip } from "../suggestions";
 import { ZoneHoverActions } from "../ZoneHoverActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
@@ -927,7 +928,12 @@ function ZoneCellInner({
                   by its id, so the dual-mount race (two owners evicting each
                   other's UI Bridge registrations) stays impossible. */}
               {shouldMountInstance && tab.sessionBacked && tab.taskRunId && (
-                <WorkerSessionCell tab={tab} taskRunId={tab.taskRunId} visible={paneVisible} />
+                <StructuredSessionCell
+                  tab={tab}
+                  taskRunId={tab.taskRunId}
+                  visible={paneVisible}
+                  kind={tab.promptsForPermission ? "structured" : "worker"}
+                />
               )}
               {shouldMountInstance && !tab.sessionBacked && instanceHandlers && (
                 <TerminalInstance

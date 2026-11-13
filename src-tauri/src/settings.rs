@@ -3987,7 +3987,7 @@ pub struct Settings {
     /// default keeps each spawn site's bypass flag. `allow_list` replaces it
     /// with a pre-approved tool list, for machines whose IT-managed Claude Code
     /// settings disable bypass mode. Read per spawn: into
-    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`] (every
+    /// [`crate::session::launch_spec::LaunchConfig::from_settings`] (every
     /// `LaunchSpec` spawn site, the typed resume renderer
     /// `commands::config::build_ai_resume_command`, and the provider-adapter
     /// launch spec), by the scheduler's RemoteAgent launch (intersected with the
@@ -3995,7 +3995,7 @@ pub struct Settings {
     /// runner does not own (a repository's `.claude/settings.json`, managed
     /// settings) can still pre-approve more tools.
     #[serde(default)]
-    pub claude_session_permission: crate::claude_session::launch_spec::SessionPermissionSetting,
+    pub claude_session_permission: crate::session::launch_spec::SessionPermissionSetting,
 }
 
 /// `terminal.*` — how a LOCAL terminal pane is backed.
@@ -6779,16 +6779,15 @@ pub fn save_model_gateway(
 /// Get the session permission posture. See [`Settings::claude_session_permission`].
 ///
 /// Read-only loader: consulted per spawn by `LaunchConfig::from_settings`.
-pub fn get_claude_session_permission(
-) -> crate::claude_session::launch_spec::SessionPermissionSetting {
+pub fn get_claude_session_permission() -> crate::session::launch_spec::SessionPermissionSetting {
     read_settings_from_disk().settings.claude_session_permission
 }
 
 /// Validate, normalize and persist the session permission posture. Returns what
 /// was stored.
 pub fn save_claude_session_permission(
-    value: crate::claude_session::launch_spec::SessionPermissionSetting,
-) -> Result<crate::claude_session::launch_spec::SessionPermissionSetting, String> {
+    value: crate::session::launch_spec::SessionPermissionSetting,
+) -> Result<crate::session::launch_spec::SessionPermissionSetting, String> {
     let normalized = value.normalized()?;
     let stored = normalized.clone();
     update_settings(move |settings| settings.claude_session_permission = normalized)?;

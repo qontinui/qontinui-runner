@@ -1736,7 +1736,9 @@ pub async fn session_info_get(
     if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
         crate::session_pr_reconciler::nudge_session(uuid);
     }
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let config_dirs = crate::terminal::transcript::find_transcript_config_dirs(
+        &qontinui_runner_lib::cli_profile::claude::PROFILE,
+    );
     let probe = crate::session::reconcile::DiskTranscriptIndex::discover();
     Ok(build_session_info(&rec, &config_dirs, &probe).await)
 }
@@ -1839,6 +1841,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
             awaiting_account_since: None,

@@ -12,9 +12,13 @@
 //!
 //! ## Flow
 //!
-//! 1. **Hint** — [`super::usage_limit::scan_grids_once`] sees a usage-limit
-//!    message on a terminal's rendered screen and calls
-//!    [`handle_usage_limit_hint`] (debounced per terminal).
+//! 1. **Hint** — the usage-limit grid scan ([`super::usage_limit`]) sees one
+//!    of the session's profile phrases on the rendered screen and reports a
+//!    `quota_exhausted` hint to `session::failure_recovery`, whose recovery
+//!    table routes that kind's `migrate_account` policy here, to
+//!    [`handle_usage_limit_hint`] (debounced per terminal). The returned
+//!    [`HintOutcome`] is what turns the failure's `Hint` into `Confirmed`, or
+//!    clears it.
 //! 2. **Confirm** — re-probe every configured account
 //!    (`refresh_account_usage_snapshot`) and require the *probe* to agree the
 //!    session's account is exhausted. Conversation text that merely quotes a
@@ -331,25 +335,44 @@ pub struct MigrationOutcome {
     pub to_config_dir: String,
 }
 
-/// Entry point for a usage-limit hint (spawned async by the grid scanner,
-/// [`super::usage_limit::scan_grids_once`]). Resolves everything it needs from
-/// the global app handle, mirrors `agent_runtime`'s state-access pattern.
-pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'static str) {
+/// What the confirm-then-migrate path concluded about one usage-limit hint.
+/// `session::failure_recovery` turns it into evidence on the failure the hint
+/// raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HintOutcome {
+    /// The path could not judge the hint (no registered session, unknown
+    /// account, auto-migration off, a single account, no app state). The
+    /// failure stays as observed.
+    NotApplicable(&'static str),
+    /// The usage probe found the account NOT exhausted — the phrase was echoed
+    /// text or a historical repaint.
+    NotConfirmed,
+    /// The probe confirmed exhaustion. `migrated_to` is the replacement
+    /// terminal when the session was moved; `None` when it could not be (the
+    /// cap, no usable target, a failed respawn).
+    Confirmed { migrated_to: Option<String> },
+}
+
+/// Entry point for a PTY usage-limit hint (spawned async by
+/// `session::failure_recovery`). Resolves everything it needs from the global
+/// app handle, mirrors `agent_runtime`'s state-access pattern.
+pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: String) -> HintOutcome {
     use tauri::Manager;
 
     // Migration moves a session between subscription accounts, and those are
     // off while a model gateway is declared (`crate::model_gateway`).
     if crate::model_gateway::gateway_declared() {
         crate::model_gateway::note_subscription_path_off("account_migration");
-        return;
+        return HintOutcome::NotApplicable("a model gateway is declared");
     }
 
     let Some(app) = crate::tauri_app_handle::current() else {
-        return;
+        return HintOutcome::NotApplicable("no app handle");
     };
     let Some(store) = app.try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>() else {
-        return;
+        return HintOutcome::NotApplicable("no session lifecycle store");
     };
+    let matched_pattern = matched_pattern.as_str();
 
     // Only sessions the lifecycle registry knows about can migrate — a plain
     // shell pane (or an unregistered session) has no transcript binding.
@@ -359,7 +382,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             matched_pattern,
             "usage-limit hint on a terminal with no registered Claude session — ignoring"
         );
-        return;
+        return HintOutcome::NotApplicable("no registered session");
     };
 
     // Source account: the dir the session launched under, else the runner's
@@ -375,19 +398,16 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             session = %record.claude_session_id,
             "usage-limit hint but the session's account is unknown — cannot migrate"
         );
-        return;
+        return HintOutcome::NotApplicable("session account unknown");
     };
 
-    let ai_settings = crate::settings::get_ai_settings();
-    if !ai_settings.claude_cli.auto_migrate_on_token_exhaustion {
+    if let Err(why) = migration_unavailable() {
         info!(
             session = %record.claude_session_id,
-            "usage-limit confirmed-candidate but auto-migration is disabled in settings"
+            why,
+            "usage-limit confirmed-candidate but no migration is possible"
         );
-        return;
-    }
-    if crate::settings::get_claude_config_dirs().len() < 2 {
-        return; // nothing to migrate to
+        return HintOutcome::NotApplicable(why);
     }
 
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
@@ -402,7 +422,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             matched_pattern,
             "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
         );
-        return;
+        return HintOutcome::NotConfirmed;
     }
 
     // Keep spawn-time selection off the dead account, and repoint the global
@@ -431,7 +451,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             "migration cap reached for this session — not migrating again"
         );
         emit_skipped(&app, &record, &src, "migration-cap-reached");
-        return;
+        return HintOutcome::Confirmed { migrated_to: None };
     }
 
     let Some(dst) = crate::ai_provider::pick_migration_target(&src) else {
@@ -441,7 +461,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             "no usable migration target (every other account exhausted/cooled/unauthenticated)"
         );
         emit_skipped(&app, &record, &src, "no-usable-target");
-        return;
+        return HintOutcome::Confirmed { migrated_to: None };
     };
 
     info!(
@@ -472,7 +492,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         result,
         || crate::ai_provider::unrecord_handoff(&dst),
         |reason| emit_skipped(&app, &record, &src, reason),
-    );
+    )
 }
 
 /// The automatic path's answer to the migration's result.
@@ -491,21 +511,29 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
 ///
 /// Refused and Failed both `unrecord_handoff`: the session never reached the
 /// target this hint picked, so it must not count as a handoff to it.
+///
+/// The exhaustion was confirmed before this runs, so every arm answers
+/// [`HintOutcome::Confirmed`]; only a migration that ran names its new pane.
 fn settle_hint_migration(
     claude_session_id: &str,
     cap_stamp: i64,
     result: Result<MigrationOutcome, MigrateError>,
     unrecord_handoff: impl FnOnce(),
     emit_skipped: impl FnOnce(&str),
-) {
+) -> HintOutcome {
     match result {
-        Ok(outcome) => info!(
-            session = %claude_session_id,
-            new_terminal = %outcome.new_terminal_id,
-            from = %outcome.from_config_dir,
-            to = %outcome.to_config_dir,
-            "session migrated"
-        ),
+        Ok(outcome) => {
+            info!(
+                session = %claude_session_id,
+                new_terminal = %outcome.new_terminal_id,
+                from = %outcome.from_config_dir,
+                to = %outcome.to_config_dir,
+                "session migrated"
+            );
+            HintOutcome::Confirmed {
+                migrated_to: Some(outcome.new_terminal_id),
+            }
+        }
         Err(MigrateError::Refused(refusal)) => {
             info!(
                 session = %claude_session_id,
@@ -514,6 +542,7 @@ fn settle_hint_migration(
             );
             unrecord_handoff();
             refund_migration_cap(claude_session_id, cap_stamp);
+            HintOutcome::Confirmed { migrated_to: None }
         }
         Err(MigrateError::Failed(e)) => {
             warn!(
@@ -523,6 +552,7 @@ fn settle_hint_migration(
             );
             unrecord_handoff();
             emit_skipped(&format!("migration-failed: {e}"));
+            HintOutcome::Confirmed { migrated_to: None }
         }
     }
 }
@@ -958,6 +988,32 @@ pub(crate) struct ResumeSpawn<'a> {
     pub origin: crate::coord_drain_state::SpawnOrigin,
 }
 
+/// Why no account migration can happen at all, from settings alone — known
+/// synchronously, so a failure can be announced as manual up front instead of
+/// after an asynchronous confirm. `Ok` when one may be possible.
+pub(crate) fn migration_unavailable() -> Result<(), &'static str> {
+    migration_precondition(
+        crate::settings::get_ai_settings()
+            .claude_cli
+            .auto_migrate_on_token_exhaustion,
+        crate::settings::get_claude_config_dirs().len(),
+    )
+}
+
+/// [`migration_unavailable`]'s decision. Pure.
+pub(crate) fn migration_precondition(
+    auto_migrate: bool,
+    accounts: usize,
+) -> Result<(), &'static str> {
+    if !auto_migrate {
+        return Err("auto-migration disabled");
+    }
+    if accounts < 2 {
+        return Err("fewer than two accounts"); // nothing to migrate to
+    }
+    Ok(())
+}
+
 /// Spawn `claude --permission-mode bypassPermissions [--model m] --resume <sid>`
 /// in a fresh PTY pinned to `spec.config_dir`, tracked in the lifecycle store
 /// and mirrored into coord. Returns `(terminal_id, coord_session_id)`.
@@ -989,7 +1045,7 @@ pub(crate) fn spawn_resumed_pane(
     // `claude --permission-mode bypassPermissions [--model m] --resume <id>`
     // plus the `--settings <hook file>` pair below.
     let launch_cfg =
-        crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
+        crate::session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(None);
     let command = resume_respawn_argv(
         // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
@@ -1101,12 +1157,12 @@ fn resume_respawn_argv(
     claude_bin: &str,
     claude_session_id: &str,
     model: Option<String>,
-    launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    launch_cfg: &crate::session::launch_spec::LaunchConfig,
     extra_required: Vec<String>,
 ) -> Vec<String> {
-    crate::claude_session::launch_spec::render_argv(
-        &crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+    crate::session::launch_spec::render_argv(
+        &crate::session::launch_spec::LaunchSpec {
+            permission: crate::session::launch_spec::PermissionMode::BypassPermissions,
             resume_id: Some(claude_session_id.to_string()),
             model,
             extra_required,
@@ -1830,7 +1886,7 @@ mod tests {
             bin,
             "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
             Some("claude-opus-5".to_string()),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             vec!["--settings".to_string(), "hooks.json".to_string()],
         );
         assert_eq!(

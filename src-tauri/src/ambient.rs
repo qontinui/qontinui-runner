@@ -2494,6 +2494,18 @@ mod tests {
             1,
             "refuses the user's home directory as a workspace root (a check, not a store)",
         ),
+        (
+            "commands/structured_session.rs",
+            1,
+            "the user's home as a structured session's DEFAULT working directory when the \
+             caller names none — where the user's own CLI would start, not runner state",
+        ),
+        (
+            "session/codex_capture.rs",
+            1,
+            "the Codex CLI's own `~/.codex` home (its default when no `CODEX_HOME` is set), \
+             read to capture that CLI's transcripts — the CLI's store, not runner state",
+        ),
     ];
 
     /// Drift guard (d), plan

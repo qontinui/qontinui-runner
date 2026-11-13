@@ -245,10 +245,12 @@ fn resume_config_dir(
         None
     } else {
         working_dir.filter(|wd| !wd.trim().is_empty()).map(|wd| {
-            transcript::find_claude_config_dirs()
-                .into_iter()
-                .filter(|dir| transcript::session_transcript_path(dir, wd, session_id).exists())
-                .collect()
+            transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE,
+            )
+            .into_iter()
+            .filter(|dir| transcript::session_transcript_path(dir, wd, session_id).exists())
+            .collect()
         })
     };
     crate::session::session_ledger::resolve_config_dir(recorded, holders.as_deref())

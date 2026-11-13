@@ -19,12 +19,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { readLocalScrollbackRing } from "./backends/localScrollbackRing";
-import {
-  CLAUDE_HANDSHAKE_REGEXES,
-  CLAUDE_TITLE_REGEXES,
-  CLAUDE_RESUME_FAILURE_REGEXES,
-  type HandshakePatterns,
-} from "./providerAdapter";
+import type { HandshakePatterns } from "./providerAdapter";
 import { writeWhenReady, type TerminalRefsMap } from "./writeWhenReady";
 import { TERMINAL_EXITED, type TerminalWriteResult } from "./terminalWriteResult";
 
@@ -150,49 +145,37 @@ export function lastOscTitle(text: string): string | undefined {
  * (unknown session id / fell through to the session picker). Checked before
  * {@link detectClaudeHandshake} — failure frames are themselves provider UI.
  *
- * Matches the UNION of the descriptor's `failure` substrings and its
- * `failurePatterns` regexes; with no descriptor it falls back to Claude's own
- * regex set. See {@link HandshakePatterns} for why the union (and not the
- * former `if (patterns) return substringsOnly`) is the correct shape: the
- * boot-restore path always supplies a descriptor, so an either/or made every
- * regex marker dead in production.
+ * Matches the UNION of the provider's `failure` substrings and its
+ * `failurePatterns` regexes (the served profile's markers). There is no
+ * built-in fallback set: the markers are the provider's, and a caller without
+ * a provider's patterns has nothing to verify against.
  */
-export function detectResumeFailure(text: string, patterns?: HandshakePatterns): boolean {
+export function detectResumeFailure(text: string, patterns: HandshakePatterns): boolean {
   const stripped = stripAnsi(text);
-  if (patterns) {
-    return (
-      matchSubstrings(stripped, patterns.failure) ||
-      matchRegexes(stripped, patterns.failurePatterns)
-    );
-  }
-  return matchRegexes(stripped, CLAUDE_RESUME_FAILURE_REGEXES);
+  return (
+    matchSubstrings(stripped, patterns.failure) || matchRegexes(stripped, patterns.failurePatterns)
+  );
 }
 
 /**
  * True when the pane's recent output shows the provider's resume handshake.
- * Same union rule as {@link detectResumeFailure}: descriptor substrings ∪
- * descriptor regexes, falling back to Claude's regex set when no descriptor is
- * supplied. The Claude descriptor's regexes carry the input-box frame
- * markers, which no substring can express — a restored pane that has painted
- * only the frame verifies here. Body markers run over {@link renderAnsi}
- * output; title markers run over the pane's current window title
- * ({@link lastOscTitle}) alone.
+ * Same union rule as {@link detectResumeFailure}: substrings ∪ regexes. The
+ * Claude profile's regexes carry the input-box frame markers, which no
+ * substring can express — a restored pane that has painted only the frame
+ * verifies here. Body markers run over {@link renderAnsi} output; title
+ * markers run over the pane's current window title ({@link lastOscTitle})
+ * alone.
  */
-export function detectClaudeHandshake(text: string, patterns?: HandshakePatterns): boolean {
+export function detectClaudeHandshake(text: string, patterns: HandshakePatterns): boolean {
   const rendered = renderAnsi(text);
   // The current window title is matched only against title patterns: the shell
   // titles the window too, so body markers must never see it.
   const title = lastOscTitle(text);
-  const titleMatch = (titlePatterns?: RegExp[]) =>
-    title !== undefined && matchRegexes(title, titlePatterns);
-  if (patterns) {
-    return (
-      matchSubstrings(rendered, patterns.success) ||
-      matchRegexes(rendered, patterns.successPatterns) ||
-      titleMatch(patterns.titlePatterns)
-    );
-  }
-  return matchRegexes(rendered, CLAUDE_HANDSHAKE_REGEXES) || titleMatch(CLAUDE_TITLE_REGEXES);
+  return (
+    matchSubstrings(rendered, patterns.success) ||
+    matchRegexes(rendered, patterns.successPatterns) ||
+    (title !== undefined && matchRegexes(title, patterns.titlePatterns))
+  );
 }
 
 /** Case-insensitive substring match of any pattern in `text`. */
@@ -246,12 +229,11 @@ export interface HandshakeWaitOptions {
    */
   onProbe?: (tail: string) => void;
   /**
-   * Per-adapter resume success/failure substrings (Phase 4). When set, the
-   * detection uses the provider descriptor's patterns instead of the built-in
-   * Claude regex sets — so a Gemini resume verifies against Gemini's banners.
-   * Omit to use the Claude default.
+   * The provider's resume success/failure markers, from its served profile
+   * (`providerDescriptorFor(provider).handshakePatterns()`). Required: there
+   * is no default provider to verify against.
    */
-  handshakePatterns?: HandshakePatterns;
+  handshakePatterns: HandshakePatterns;
 }
 
 /**
@@ -262,7 +244,7 @@ export interface HandshakeWaitOptions {
  */
 export async function waitForClaudeHandshake(
   tabId: string,
-  options: HandshakeWaitOptions = {},
+  options: HandshakeWaitOptions,
 ): Promise<"verified" | "failed" | "timeout"> {
   const {
     timeoutMs = 15_000,
@@ -428,7 +410,7 @@ export async function typeResumeAndVerify(
   terminalRefs: TerminalRefsMap,
   tabId: string,
   resumeCmd: string,
-  options: TypeAndVerifyOptions = {},
+  options: TypeAndVerifyOptions,
 ): Promise<ResumeOutcome> {
   const {
     attempts = 2,

@@ -210,9 +210,15 @@ fn walk_probe() {}
 
 // ── Config Dir Discovery ─────────────────────────────────────────────────────
 
-/// Find Claude Code config directories on this machine.
+/// Find the config directories holding `profile`'s transcripts on this
+/// machine. Empty for a profile whose sessions do not live in per-account
+/// config dirs of JSONL transcripts
+/// ([`qontinui_runner_lib::session_archive::discovery::sweeps_profile`]) —
+/// the sweep below is that layout's, and would hand another CLI's directories
+/// to anyone else. Callers reading Claude Code transcripts pass
+/// [`qontinui_runner_lib::cli_profile::claude::PROFILE`].
 ///
-/// Checks (in order):
+/// For such a profile it checks (in order):
 /// 1. `CLAUDE_CONFIG_DIR` env var
 /// 2. User-configured dirs from settings (validated for `projects/` subfolder)
 /// 3. A sweep of `<claude_root>/.claude-*` — `C:\claude` on Windows, `$HOME`
@@ -226,7 +232,12 @@ fn walk_probe() {}
 /// (e.g. [`crate::session::reconcile::DiskTranscriptIndex`], the
 /// transcript watcher, Past Sessions) pays for and reaches exactly "every
 /// account on this machine", not only the current session's.
-pub fn find_claude_config_dirs() -> Vec<PathBuf> {
+pub fn find_transcript_config_dirs(
+    profile: &qontinui_types::cli_session::CliProfile,
+) -> Vec<PathBuf> {
+    if !qontinui_runner_lib::session_archive::discovery::sweeps_profile(profile) {
+        return Vec::new();
+    }
     // The rule itself lives in the LIB crate
     // (`session_archive::discovery::discover_account_homes`) because
     // `qontinui-pr session-archive-backfill` needs the identical sweep and is a
@@ -410,7 +421,7 @@ fn newest(copies: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
 
 /// Locate the on-disk transcript for `session_id` WITHOUT knowing its project
 /// path, by sweeping every Claude config dir on this machine
-/// ([`find_claude_config_dirs`] is MACHINE-scoped), plus `also_in` when the
+/// ([`find_transcript_config_dirs`] is MACHINE-scoped), plus `also_in` when the
 /// caller recorded one, for `projects/*/<session_id>.jsonl`. Session ids are
 /// unique, but a migrated session leaves frozen copies behind, so the NEWEST
 /// copy wins rather than the first one found.
@@ -422,7 +433,7 @@ pub(crate) fn find_transcript_by_session_id(
     also_in: Option<&Path>,
     session_id: &str,
 ) -> Option<PathBuf> {
-    let mut dirs = find_claude_config_dirs();
+    let mut dirs = find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE);
     if let Some(dir) = also_in {
         dirs.push(dir.to_path_buf());
     }
@@ -453,7 +464,9 @@ fn newest_copy_among(config_dirs: &[PathBuf], session_id: &str) -> Option<PathBu
 /// `stat`s); the full `projects/*` sweep runs only when none exists.
 fn existing_session_transcript(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
     let mut dirs = vec![config_dir.to_path_buf()];
-    dirs.extend(find_claude_config_dirs());
+    dirs.extend(find_transcript_config_dirs(
+        &qontinui_runner_lib::cli_profile::claude::PROFILE,
+    ));
     let mut seen = HashSet::new();
     dirs.retain(|d| seen.insert(d.clone()));
     newest(
@@ -2040,7 +2053,15 @@ pub struct ExternalClaudeProcess {
     pub working_directory: Option<String>,
 }
 
-/// Try to extract a project working directory from a Claude Code command line.
+/// Whether `text` mentions any program a CLI profile claims
+/// ([`qontinui_runner_lib::cli_profile::all_programs`]) — the substring test the
+/// external-process scan uses on a `node` command line, where the CLI shows up
+/// as its script path rather than as the process image.
+fn mentions_ai_cli_program(text: &str) -> bool {
+    qontinui_runner_lib::cli_profile::all_programs().any(|program| text.contains(program))
+}
+
+/// Try to extract a project working directory from an AI-CLI command line.
 /// Looks for common patterns in the command line arguments.
 fn extract_workdir_from_cmdline(cmdline: &str) -> Option<String> {
     // Look for --project or -p flag
@@ -2049,11 +2070,12 @@ fn extract_workdir_from_cmdline(cmdline: &str) -> Option<String> {
             return cmdline.split_whitespace().nth(i + 1).map(|s| s.to_string());
         }
     }
-    // Look for a path-like argument that's not a flag or node binary
+    // Look for a path-like argument that's not a flag, the node binary, or
+    // the AI CLI's own script path.
     for part in cmdline.split_whitespace().rev() {
         if !part.starts_with('-')
             && !part.contains("node")
-            && !part.contains("claude")
+            && !mentions_ai_cli_program(part)
             && (part.contains('/') || part.contains('\\'))
             && !part.contains("node_modules")
         {
@@ -2157,12 +2179,18 @@ fn scan_external_claude_processes_via_probe(exclude_pids: &[u32]) -> ExternalCla
         // wedged the runner from `process_tree::snapshot_process_table` — a
         // degraded WMI provider hangs it exactly as reliably here, and the
         // frontend can re-invoke this Tauri command at will.
+        // The `-match` alternation names every profile's program; each is
+        // regex-escaped for PowerShell and single-quote-safe (no profile
+        // program contains a quote, and `'` is doubled regardless).
+        let programs = qontinui_runner_lib::cli_profile::all_programs()
+            .map(|p| regex::escape(p).replace('\'', "''"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let query = format!(
+            r#"Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'node.exe' -and $_.CommandLine -match '(?:{programs})' }} | Select-Object ProcessId, CommandLine | ForEach-Object {{ "$($_.ProcessId)|$($_.CommandLine)" }}"#
+        );
         let mut cmd = crate::process_helpers::no_window("powershell");
-        cmd.args([
-            "-NoProfile",
-            "-Command",
-            r#"Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'claude' } | Select-Object ProcessId, CommandLine | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }"#,
-        ]);
+        cmd.args(["-NoProfile", "-Command", query.as_str()]);
         let output = crate::process_helpers::run_probe(
             cmd,
             EXTERNAL_PROCESS_SCAN_TIMEOUT,
@@ -2220,7 +2248,7 @@ fn scan_external_claude_processes_via_probe(exclude_pids: &[u32]) -> ExternalCla
         {
             let stdout = String::from_utf8_lossy(&raw);
             for line in stdout.lines() {
-                if line.contains("claude") && line.contains("node") {
+                if mentions_ai_cli_program(line) && line.contains("node") {
                     let fields: Vec<&str> = line.split_whitespace().collect();
                     if let Some(pid_str) = fields.get(1) {
                         if let Ok(pid) = pid_str.parse::<u32>() {
@@ -2901,12 +2929,18 @@ mod tests {
     }
 
     #[test]
-    fn test_find_claude_config_dirs() {
+    fn test_find_transcript_config_dirs() {
         // This test just verifies it doesn't panic — results depend on the machine
-        let dirs = find_claude_config_dirs();
+        let dirs = find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE);
         // On the dev machine, we should find at least one
         // (but don't assert that in CI)
         let _ = dirs;
+
+        // A profile whose sessions do not live in per-account config dirs has
+        // none: the sweep would hand it Claude's.
+        let mut home_dir = qontinui_runner_lib::cli_profile::claude::PROFILE.clone();
+        home_dir.account_isolation = qontinui_types::cli_session::AccountIsolation::HomeDir;
+        assert!(find_transcript_config_dirs(&home_dir).is_empty());
     }
 
     // ── Touched-File Extraction tests (Phase 1.5) ────────────────────────────

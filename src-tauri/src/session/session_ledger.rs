@@ -2496,6 +2496,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: Default::default(),
             origin: None,
             restore_pending_at: None,
             awaiting_account_since: None,
