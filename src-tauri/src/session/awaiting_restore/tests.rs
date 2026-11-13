@@ -308,3 +308,83 @@ fn a_row_whose_page_already_restored_is_not_owed() {
         "the predicate already answers"
     );
 }
+
+fn report(complete: &[&str], deferred: &[&str]) -> PageRestoreProgress {
+    let set = |pages: &[&str]| pages.iter().map(|p| p.to_string()).collect();
+    PageRestoreProgress {
+        complete: set(complete),
+        deferred: set(deferred),
+        known: set(&["default", "p2"]),
+    }
+}
+
+/// The report-vs-latch matrix and the multi-window fold: any window's report
+/// wins over the latch; with none, a latch that has not handed out a restore
+/// set (not yet run, or withheld) means no page has run, and one that has
+/// means it cannot be told. Two windows' reports are merged, so a page either
+/// window completed has run. Mutations: the fold keeping only the last window;
+/// the `NoneYet` and `Unknown` arms swapped; the latch read before the reports.
+#[test]
+fn pages_restored_merges_the_windows_and_falls_back_to_the_latch() {
+    use BootRestorePhase::{NotYetRun, Ran, Withheld};
+    let none: Vec<PageRestoreProgress> = Vec::new();
+    assert_eq!(
+        PagesRestored::from_parts(none.iter(), NotYetRun),
+        PagesRestored::NoneYet
+    );
+    assert_eq!(
+        PagesRestored::from_parts(none.iter(), Withheld),
+        PagesRestored::NoneYet
+    );
+    assert_eq!(
+        PagesRestored::from_parts(none.iter(), Ran),
+        PagesRestored::Unknown
+    );
+
+    let two = [report(&["default"], &[]), report(&["p2"], &[])];
+    for phase in [NotYetRun, Withheld, Ran] {
+        let pages = PagesRestored::from_parts(two.iter(), phase);
+        assert_eq!(pages.has_run("default"), Some(true), "{phase:?}");
+        assert_eq!(pages.has_run("p2"), Some(true), "{phase:?}");
+    }
+}
+
+/// Serializes the tests that touch the process-global window reports.
+static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Through the process-global registry, as the ledger reads it: two windows'
+/// reports are both read; a closed window's report is forgotten, so a page
+/// only it had deferred stops reading as still to restore; a window's newer
+/// report replaces its older one. Mutations: `forget_page_restore_progress`
+/// a no-op; `record_page_restore_progress` keeping the first report.
+#[test]
+fn a_closed_windows_report_is_forgotten_and_a_newer_one_replaces_it() {
+    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_page_restore_progress_for_test();
+
+    record_page_restore_progress("main", report(&["default", "p2"], &[]));
+    record_page_restore_progress("term-1", report(&["p2"], &["p2"]));
+    let pages = PagesRestored::current();
+    assert_eq!(
+        pages.has_run("default"),
+        Some(true),
+        "main's report is read"
+    );
+    assert_eq!(pages.has_run("p2"), Some(false), "term-1 deferred it");
+
+    forget_page_restore_progress("term-1");
+    assert_eq!(
+        PagesRestored::current().has_run("p2"),
+        Some(true),
+        "the closed pop-out's deferral no longer counts"
+    );
+
+    record_page_restore_progress("main", report(&["default"], &[]));
+    assert_eq!(
+        PagesRestored::current().has_run("p2"),
+        Some(false),
+        "main's newer report replaced its older one"
+    );
+
+    reset_page_restore_progress_for_test();
+}
