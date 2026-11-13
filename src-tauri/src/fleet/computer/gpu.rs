@@ -906,7 +906,11 @@ mod tests {
         assert_eq!(pci_device_is_gpu("0x030000", ""), None);
     }
 
-    /// A synthetic `/` for [`absence_evidence_at`].
+    /// A synthetic `/` for [`absence_evidence_at`]. Unix-only: real PCI
+    /// device directories are named by address (`0000:00:01.0`), and `:` is
+    /// not a legal filename character on Windows, where the absence proof
+    /// never runs anyway (it is Linux-only in production).
+    #[cfg(unix)]
     fn tree(
         pci: &[(&str, &str, &str)],
         drm: &[(&str, Option<&str>)],
@@ -937,6 +941,7 @@ mod tests {
         t
     }
 
+    #[cfg(unix)]
     #[test]
     fn absence_is_proven_only_by_a_clean_tree() {
         // A headless server: a NIC and a BMC display adapter.
