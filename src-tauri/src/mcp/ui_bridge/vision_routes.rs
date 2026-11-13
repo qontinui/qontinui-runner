@@ -4682,14 +4682,6 @@ mod tests {
         assert_eq!(v["snapshotAttribution"]["state"], "absent");
     }
 
-    /// Phase 2 of the vision-provenance plan. The assert path holds the same
-    /// snapshot the analyze path counts, and counting it is a pure O(n) pass
-    /// — an assert-only consumer had no answer at all to "what did this
-    /// cover".
-    ///
-    /// Both arms are pinned, because the informative half of `coverage` is
-    /// that its absence is a statement: `None` means no snapshot was
-    /// supplied, never "the count was skipped".
     /// A baseline registered from a snapshot with a FRACTIONAL bbox must not
     /// report a shift when the same snapshot is checked against it at zero
     /// tolerance. `no_layout_shift_since` compares each element's `region()`
@@ -4777,6 +4769,14 @@ mod tests {
         );
     }
 
+    /// Phase 2 of the vision-provenance plan. The assert path holds the same
+    /// snapshot the analyze path counts, and counting it is a pure O(n) pass
+    /// — an assert-only consumer had no answer at all to "what did this
+    /// cover".
+    ///
+    /// Both arms are pinned, because the informative half of `coverage` is
+    /// that its absence is a statement: `None` means no snapshot was
+    /// supplied, never "the count was skipped".
     #[test]
     fn assert_response_coverage_is_present_with_a_snapshot_and_absent_without() {
         let snapshot = qontinui_vision_core::ElementSnapshot {
