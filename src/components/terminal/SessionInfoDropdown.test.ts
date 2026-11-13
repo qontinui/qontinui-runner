@@ -13,8 +13,9 @@
  * `useUIElement` effect ran last decided the entry. In multi-zone layouts the
  * walker won, re-registering the trigger with `origin: "auto"` and the
  * DOM-derived accessible label — losing the `Session info (zone N)` label. The
- * `data-no-register` opt-out (App.tsx wires `excludeSelectors:
- * ["[data-no-register]"]`) removes the walker from the race entirely, and the
+ * `data-no-register` opt-out (App.tsx mounts the walker with
+ * `lib/ui-bridge/autoRegisterOptions.ts`, whose `excludeSelectors` carries
+ * `[data-no-register]`) removes the walker from the race entirely, and the
  * explicit `data-ui-bridge-id` stamp pins the same id the hook registers under
  * so no other scanner can mint a competing entry for the node.
  */
@@ -23,6 +24,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { describe, it, expect } from "vitest";
+
+import { RUNNER_AUTO_REGISTER_OPTIONS } from "@/lib/ui-bridge/autoRegisterOptions";
 
 import { sessionInfoElementId } from "./useSessionInfo";
 
@@ -108,7 +111,9 @@ describe("SessionInfoDropdown addressability", () => {
   });
 
   it("keeps the `data-no-register` opt-out wired in App.tsx", () => {
-    // The opt-out above is inert unless the provider still excludes it.
-    expect(APP_SOURCE).toContain('excludeSelectors={["[data-no-register]"]}');
+    // The opt-out above is inert unless the provider still excludes it: the
+    // options carry the selector, and App.tsx mounts the provider with them.
+    expect(RUNNER_AUTO_REGISTER_OPTIONS.excludeSelectors).toContain("[data-no-register]");
+    expect(APP_SOURCE).toContain("<AutoRegisterProvider {...RUNNER_AUTO_REGISTER_OPTIONS}>");
   });
 });

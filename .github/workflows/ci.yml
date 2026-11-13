@@ -1018,6 +1018,9 @@ jobs:
         run: |
           cd src-tauri
           cargo fmt -- --check
+          # The session-lifecycle kernel crate is a separate workspace member,
+          # which a bare `cargo fmt` from src-tauri does not reach.
+          cargo fmt -p session-lifecycle -- --check
 
       - name: Clippy check
         # UBUNTU ONLY. Windows clippy moved to the parallel `clippy-windows`
@@ -1044,9 +1047,18 @@ jobs:
         # by the parallel `clippy-windows` job below (`--all-targets`, off the
         # critical path); Linux-only (cfg(unix)) test code is linted only by
         # the nightly clippy-tiers.yml job.
+        #
+        # The session-lifecycle kernel crate (plan
+        # 2026-10-28-one-session-lifecycle-authority, Phase 37) is a separate
+        # workspace member that `cd src-tauri && cargo clippy` never reaches,
+        # so it is linted here, in this REQUIRED step: all targets (a small
+        # pure crate whose tests are most of it, and which compiles none of
+        # src-tauri), and `-D warnings`, so its own [lints] table's warn tiers
+        # are fatal. Pinned by src-tauri/tests/ci_rust_test_steps_split.rs.
         run: |
           cd src-tauri
           cargo clippy
+          cargo clippy -p session-lifecycle --all-targets -- -D warnings
 
       # Run the suite under DELIBERATELY POISONED ambient state, on both legs.
       #
@@ -1420,7 +1432,14 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then
             cargo build -p qontinui-pty-holder
           fi
-          cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
+          # `-p session-lifecycle`: the session-lifecycle kernel crate (plan
+          # 2026-10-28-one-session-lifecycle-authority, Phase 37; first slice
+          # plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box,
+          # Phase 2a) builds its tests HERE, so its binaries are among the
+          # `Executable` lines the run half executes and reach the test-results
+          # ingest. Its fixtures are embedded at compile time, so the run half's
+          # `src-tauri` cwd does not matter to it. Pinned by the shape test.
+          cargo test --no-run --verbose -p qontinui-runner -p session-lifecycle 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
         shell: bash
 
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:

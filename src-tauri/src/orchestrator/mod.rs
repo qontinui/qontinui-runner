@@ -1,13 +1,12 @@
 //! Task Orchestrator Module
 //!
-//! Implements the agentic architecture state machine for autonomous development automation.
-//! See docs/AGENTIC_ARCHITECTURE.md for full specification.
+//! Building blocks for autonomous development automation: planning, knowledge,
+//! retry, compression, context propagation and the modules listed below.
 //!
-//! Key principles:
-//! - Separation of concerns between planning, execution, and verification
-//! - System-enforced gates that agents cannot bypass
-//! - Information isolation for verification agents
-//! - Deterministic verification before AI verification
+//! The orchestrator's own task state machine (`TaskOrchestrator`) and its
+//! deterministic + AI verifier (`VerificationOrchestrator`) were deleted: no
+//! production path constructed either. Product workflow verification is the
+//! unified workflow executor's (`crate::unified_workflow_executor`).
 //!
 //! ## New Modules (2026 Enhancements)
 //!
@@ -76,7 +75,6 @@ pub mod learning;
 pub mod learning_recorder;
 pub mod ledger;
 pub mod memory;
-pub mod output;
 pub mod parallel;
 pub mod planning;
 pub mod realtime_events;
@@ -90,10 +88,8 @@ pub mod subflows;
 pub mod tool_guard;
 pub mod typed_channels;
 pub mod types;
-pub mod verification;
 
 // Re-exports for public API (only items actually used by other modules)
 pub use compression::*;
 pub use retry::*;
 pub use types::*;
-pub use verification::*;

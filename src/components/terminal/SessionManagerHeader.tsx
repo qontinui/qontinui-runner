@@ -19,7 +19,7 @@
  * than a hook — there is nothing to drive on them, only text to assert.
  */
 import { RefreshCw, Search, Filter } from "lucide-react";
-import { useUIElement, type StandardAction } from "@qontinui/ui-bridge";
+import { useUIElement } from "@qontinui/ui-bridge";
 
 import type {
   SessionLiveStatus,
@@ -78,29 +78,22 @@ export function sessionManagerAccountFilterId(account: string): string {
 }
 
 /**
- * Actions the search box advertises. `inferActions('input')` once omitted
- * `sendKeys`, the same per-element under-advertisement that made the command
- * bar reject a driver's keystrokes (`CommandBar.tsx`
- * `COMMAND_BAR_INPUT_ACTIONS`) — filtering the session list means typing into
- * this box, so it is advertised here for the same reason and with the same
- * SDK descriptor-array contract. Passing `actions` replaces the inferred list,
- * so this is the SDK 0.38.0 inferred input set verbatim (see the command bar's
- * comment for its provenance).
+ * The search box's bridge registration. Exported so the regression test
+ * registers exactly what this component registers.
+ *
+ * No `actions` override, for the reason `CommandBar.tsx`
+ * `COMMAND_BAR_INPUT_ELEMENT` gives: the override was written to add the
+ * `sendKeys` the registry of its day left off an `input`, and
+ * `@qontinui/ui-bridge` 0.46's one verb table gives a text `<input>`
+ * `sendKeys`, `type`, `clear`, `setValue` and `autocomplete` by itself — a
+ * superset of what the override listed. Filtering the session list means
+ * typing into this box, with the SDK's descriptor-array `sendKeys` contract.
  */
-export const SEARCH_INPUT_ACTIONS: StandardAction[] = [
-  "focus",
-  "blur",
-  "hover",
-  "unhover",
-  "scroll",
-  "scrollIntoView",
-  "click",
-  "hoverClick",
-  "type",
-  "sendKeys",
-  "clear",
-  "setValue",
-];
+export const SEARCH_INPUT_ELEMENT = {
+  id: SESSION_MANAGER_HEADER_IDS.search,
+  type: "input",
+  label: "Search sessions",
+} as const satisfies Parameters<typeof useUIElement>[0];
 
 /**
  * One account filter button. Its own component so the `useUIElement` call is a
@@ -170,12 +163,7 @@ export function SessionManagerHeader({
     type: "button",
     label: "Refresh sessions",
   });
-  const { ref: searchRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.search,
-    type: "input",
-    label: "Search sessions",
-    actions: SEARCH_INPUT_ACTIONS,
-  });
+  const { ref: searchRef } = useUIElement(SEARCH_INPUT_ELEMENT);
   const { ref: filterFrozenRef } = useUIElement({
     id: SESSION_MANAGER_HEADER_IDS.filterFrozen,
     type: "button",

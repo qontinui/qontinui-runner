@@ -241,6 +241,20 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
          the suite and the split measures nothing"
     );
 
+    // The session-lifecycle kernel crate (plan
+    // 2026-10-28-one-session-lifecycle-authority, Phase 37) is a separate
+    // workspace member: a bare `cargo test --no-run` from `src-tauri` builds
+    // only `qontinui-runner`'s tests, so the kernel's would never run in the
+    // required job nor reach the ingest. Both packages are named.
+    for package in ["-p qontinui-runner", "-p session-lifecycle"] {
+        assert!(
+            build_run.contains(package),
+            "`{BUILD}` must build `{package}`'s tests: the required job runs \
+             only the binaries the build half printed, so a package it does \
+             not name has no tests in CI at all"
+        );
+    }
+
     // THE assertion this file exists for after run 35477464051. A second cargo
     // invocation re-checks freshness, and `tauri::generate_context!()` writes
     // its codegen assets into OUT_DIR ~4 s AFTER the fingerprint cargo recorded
@@ -715,6 +729,89 @@ fn no_step_after_the_build_half_invokes_cargo_again() {
         "these steps invoke cargo after `{BUILD}`, and each one pays a full \
          recompile of the main crate: {offenders:?}. Recover the binary from \
          `cargo-test-build.log` and run it directly, as `{RUN}` does."
+    );
+}
+
+/// The session-lifecycle kernel crate (plan
+/// `2026-10-28-one-session-lifecycle-authority`, Phase 37) is a separate
+/// workspace member, so `cd src-tauri && cargo fmt` and `cargo clippy` reach
+/// none of it. Its format check and its clippy run must therefore be named in
+/// the REQUIRED `test` job, the clippy one in the ubuntu `Clippy check` step
+/// that is that job's blocking clippy, with `--all-targets` (the crate is
+/// mostly its tests) and `-D warnings` (its own `[lints]` table's warn tiers
+/// are the bar). The Phase 2a review found the clippy run in `holder-crates`,
+/// a job nothing requires, where a red would have blocked no merge; it must
+/// not drift back there.
+#[test]
+fn the_session_lifecycle_kernel_is_formatted_and_linted_in_the_required_job() {
+    const FMT: &str = "Format Rust code check";
+    const CLIPPY: &str = "Clippy check";
+    const CLIPPY_LINE: &str = "cargo clippy -p session-lifecycle --all-targets -- -D warnings";
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+
+    let fmt = command_lines(find_step(&steps, FMT), FMT);
+    assert!(
+        fmt.lines()
+            .any(|l| l.trim() == "cargo fmt -p session-lifecycle -- --check"),
+        "`{FMT}` must check the session-lifecycle crate's formatting: `cargo fmt` \
+         from src-tauri does not reach a sibling workspace member. Body was:\n{fmt}"
+    );
+
+    let clippy = find_step(&steps, CLIPPY);
+    assert_eq!(
+        clippy.get("if").and_then(|v| v.as_str()),
+        Some("matrix.platform == 'ubuntu-22.04'"),
+        "`{CLIPPY}` is the ubuntu leg's blocking clippy, and its `if:` must stay \
+         exactly that gate: widened, it runs on a leg that is not this one; \
+         narrowed or made unsatisfiable, the session-lifecycle lint runs nowhere"
+    );
+
+    // A required check that cannot fail requires nothing: `continue-on-error`
+    // on either step, or on the job, would let a red lint or an unformatted
+    // file pass `test` green.
+    let job = doc
+        .get("jobs")
+        .and_then(|j| j.get("test"))
+        .expect("ci.yml has a `test` job");
+    for (what, carrier) in [
+        ("job `test`", job),
+        (FMT, find_step(&steps, FMT)),
+        (CLIPPY, clippy),
+    ] {
+        assert!(
+            carrier.get("continue-on-error").is_none(),
+            "{what} must not carry `continue-on-error`: the session-lifecycle \
+             fmt and clippy runs are only gates while a failure fails `test`"
+        );
+    }
+
+    let body = command_lines(clippy, CLIPPY);
+    assert!(
+        body.lines().any(|l| l.trim() == CLIPPY_LINE),
+        "`{CLIPPY}` in the required `test` job must run `{CLIPPY_LINE}`. Body \
+         was:\n{body}"
+    );
+
+    let elsewhere: Vec<String> = ["holder-crates", "clippy-windows"]
+        .into_iter()
+        .flat_map(|job| {
+            job_steps(&doc, job)
+                .into_iter()
+                .filter(|s| s.get("run").is_some())
+                .filter_map(move |s| {
+                    let label = step_name(&s).unwrap_or("<unnamed>").to_string();
+                    command_lines(&s, &label)
+                        .contains("-p session-lifecycle")
+                        .then(|| format!("{job}: {label}"))
+                })
+        })
+        .collect();
+    assert!(
+        elsewhere.is_empty(),
+        "the session-lifecycle crate is linted in the required `test` job; a \
+         second copy elsewhere is how it ended up gated by a job nothing \
+         requires: {elsewhere:?}"
     );
 }
 

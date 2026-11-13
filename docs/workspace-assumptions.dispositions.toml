@@ -704,6 +704,16 @@ reviewed = [
 
 [[disposition]]
 class = "os_bound_tooling"
+file = "src/fleet/computer/services.rs"
+symbol = "sc"
+disposition = "fallback_correct"
+note = "The Windows service watcher's `sc query`/`sc qc` probe, inside `mod windows` and called only from cfg(windows) code. On Linux the systemd collector in the same file watches the units; other non-Windows targets report no service scan (units unknown, nothing deleted)."
+reviewed = [
+    "cfg(windows)-only fn `sc` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
 file = "src/process_capture/process_tree.rs"
 symbol = "port_owner_pid_powershell"
 disposition = "fallback_correct"
@@ -760,4 +770,24 @@ disposition = "fallback_correct"
 note = "The sibling repository NAME the agent_definitions row's sibling_checkout_absent statement carries as its discriminator. It is rendered only after the overlay was found absent, together with what serves instead (the built-in copy, the repository's own tracked definitions, a named write failure, or unsupported), so it is the statement of a fallback, never a path the runner resolves. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
 reviewed = [
     "const SIBLING: &str = \"qontinui-claude-config\";",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/wsl_guest.rs"
+symbol = "collect"
+disposition = "fallback_correct"
+note = "Probes the WSL2 guests of a Windows host; its only caller (fleet/computer/mod.rs) is cfg(windows). A WSL guest exists only under a Windows host, and a Linux box reports itself through the host collector."
+reviewed = [
+    "cfg(windows)-only fn `collect` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/wsl_guest.rs"
+symbol = "running"
+disposition = "fallback_correct"
+note = "Lists running WSL distros for `collect` (`wsl --list --running`); Windows-only by nature, reached only through the cfg(windows) caller of `collect`."
+reviewed = [
+    "cfg(windows)-only fn `running` has no cfg(not(windows)) sibling in this file",
 ]

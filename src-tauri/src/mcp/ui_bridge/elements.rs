@@ -648,9 +648,15 @@ pub async fn ui_bridge_batch_actions_handler(
 /// for autonomous loops (verified empirically 2026-05-21 with
 /// `action:"press"`).
 ///
-/// Includes both `camelCase` and `snake_case` aliases for the multi-token
-/// names because the SDK accepts either (e.g. `scrollIntoView` vs
-/// `scroll_into_view`, see `recovery_executor::execute_recovery_command`).
+/// Exactly the SDK's built-in verbs, in its order: `SUPPORTED_ACTIONS` in
+/// `@qontinui/ui-bridge` `packages/ui-bridge/src/control/action-executor.ts`
+/// (0.46.0, ui-bridge `9f373a12`), which the SDK checks with an exact
+/// `Set.has` before dispatching anything. This is also the `allowedActions`
+/// list the shape-error hints serve (`types.rs`, `page.rs`), so every name in
+/// it must be one the SDK actually performs —
+/// `supported_action_names_are_the_sdk_verbs` pins it against a literal of the
+/// SDK's set. Names a caller may send that are NOT SDK verbs live in
+/// [`SUPPORTED_ACTION_ALIASES`], never here.
 pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "click",
     // Reveal a hover-gated control (`pointer-events:none` until `:hover`/
@@ -658,10 +664,8 @@ pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     // `@qontinui/ui-bridge` >= 0.16.0; the runner just forwards it.
     "hoverClick",
     "doubleClick",
-    "double_click",
-    "double",
-    "right",
-    "middle",
+    "rightClick",
+    "middleClick",
     "type",
     "sendKeys",
     "clear",
@@ -678,7 +682,6 @@ pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "unhover",
     "scroll",
     "scrollIntoView",
-    "scroll_into_view",
     "check",
     "uncheck",
     "toggle",
@@ -689,14 +692,43 @@ pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "autocomplete",
 ];
 
+/// Spellings callers send that are NOT SDK verbs, each with the verb it means.
+///
+/// The SDK accepts none of them: it matches the verb exactly, and its own
+/// vocabulary lists `double` / `right` / `middle` only as "the runner's built-in
+/// aliases. Not SDK verbs" (`control/actionVocabulary.ts`), while the runner
+/// forwards the name verbatim. They used to sit in [`SUPPORTED_ACTION_NAMES`]
+/// — `scroll_into_view` on the belief that the SDK takes snake_case too, which
+/// it does not (the recovery command of that name is a separate vocabulary,
+/// `recovery_executor::execute_recovery_command`) — so the `allowedActions`
+/// hint advertised five names no element accepts and omitted `rightClick` and
+/// `middleClick`.
+///
+/// They stay CLASSIFIED as built-in ([`is_builtin_action`]) so the flow
+/// `action_vocabulary` documents still holds: an alias passes the unknown-verb
+/// gate and stops at the pre-IPC `ACTION_NOT_SUPPORTED`, whose "did you mean"
+/// names the canonical verb (elements advertise only canonical names).
+pub(crate) const SUPPORTED_ACTION_ALIASES: &[(&str, &str)] = &[
+    ("double_click", "doubleClick"),
+    ("double", "doubleClick"),
+    ("right", "rightClick"),
+    ("middle", "middleClick"),
+    ("scroll_into_view", "scrollIntoView"),
+];
+
 /// True when `raw` names a built-in action: a member of
-/// [`SUPPORTED_ACTION_NAMES`], after trimming and matched case-sensitively.
+/// [`SUPPORTED_ACTION_NAMES`] or an alias in [`SUPPORTED_ACTION_ALIASES`],
+/// after trimming and matched case-sensitively.
 ///
 /// This only classifies the verb. Rejecting one needs the element's own list,
 /// so the 400 is built by the deferred gate in `execute_action_dispatch`
 /// (`action_vocabulary::deferred_unknown_action_error`).
 pub(crate) fn is_builtin_action(raw: &str) -> bool {
-    SUPPORTED_ACTION_NAMES.contains(&raw.trim())
+    let name = raw.trim();
+    SUPPORTED_ACTION_NAMES.contains(&name)
+        || SUPPORTED_ACTION_ALIASES
+            .iter()
+            .any(|(alias, _)| *alias == name)
 }
 
 /// True when a `get_element` IPC reply is the frontend's "there is no such
@@ -924,24 +956,26 @@ fn advertise_custom_actions_in_element_response(data: &mut serde_json::Value) {
 ///
 /// Match semantics mirror `SUPPORTED_ACTION_NAMES` membership in
 /// `is_builtin_action`: case-sensitive string equality, here untrimmed. The SDK
-/// emits canonical camelCase names in element metadata; aliases like
-/// `scroll_into_view` -> `scrollIntoView` are normalized SDK-side before the
-/// `actions` list is built, so an additional alias-fold here would be a
-/// distortion not a feature.
+/// emits only canonical camelCase verbs in element metadata, and it does not
+/// accept an alias (`SUPPORTED_ACTION_ALIASES`) as a verb either, so folding
+/// `scroll_into_view` onto `scrollIntoView` here would pass a name the SDK then
+/// refuses — the refusal belongs here, where it can name the canonical verb.
 pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>) -> bool {
     match supported {
         Some(list) => {
             list.iter().any(|s| s == action)
                 // `hoverClick` is a click-variant — it reveals a hover-gated
-                // control then clicks it. Any element that advertises `click`
-                // can be hover-clicked, even when the SDK's inferActions didn't
-                // enumerate `hoverClick` explicitly on this element. Without
-                // this, hover-revealed toolbar buttons (which advertise `click`
-                // but not `hoverClick`) would be rejected here pre-IPC.
+                // control then clicks it, so any element that advertises
+                // `click` can be hover-clicked. Since `@qontinui/ui-bridge`
+                // 0.46 every INFERRED list carries `hoverClick` (the
+                // every-element row of `core/element-kind.ts`), so this arm
+                // now serves a list a registration DECLARED — the runner's own
+                // `useUIElement({ actions: ["click"] })` hover-revealed toolbar
+                // buttons among them — and one served by a pre-0.46 SDK.
                 || (action == "hoverClick" && list.iter().any(|s| s == "click"))
                 // `unhover` releases what `hover` forced, so it is allowed
-                // wherever `hover` is advertised even when the element's
-                // action list predates the SDK's `unhover`.
+                // wherever `hover` is advertised: an inferred 0.46 list carries
+                // both, a declared or pre-0.46 list may carry only `hover`.
                 || (action == "unhover" && list.iter().any(|s| s == "hover"))
         }
         // Unknown supported list (fetch failed or element didn't advertise
@@ -1688,6 +1722,12 @@ async fn execute_action_dispatch(
     // element accepts (`press` → `sendKeys` on a terminal input), and a verb
     // the element itself advertises is accepted here — see
     // `action_vocabulary::deferred_unknown_action_error`.
+    //
+    // The suggestion reads the element's kind as well as its list: an SDK
+    // `textbox` (ARIA textbox, contenteditable) takes keys but no `type`, so
+    // `press` there suggests `sendKeys`, not `click` (D4,
+    // `action_vocabulary::suggest_action`).
+    let keyboard_entry = super::action_vocabulary::keyboard_entry_of(element_probe.as_ref());
     if let Some(detail) = super::action_vocabulary::deferred_unknown_action_error(
         &request.action,
         &id,
@@ -1695,6 +1735,7 @@ async fn execute_action_dispatch(
         action_is_registered_custom,
         element_supported_actions.as_deref(),
         merged_params.as_ref(),
+        keyboard_entry,
     ) {
         warn!(
             "execute_action: rejecting unknown action '{}' on element {}: {}",
@@ -1767,6 +1808,7 @@ async fn execute_action_dispatch(
             &id,
             &supported,
             merged_params.as_ref(),
+            keyboard_entry,
         );
         let msg = detail.message.clone();
         return Err((
@@ -6551,7 +6593,74 @@ mod is_builtin_action_tests {
     //! future rename can't silently let `press` through to the
     //! RecoveryExecutor again. The 400 a non-built-in verb gets is the deferred
     //! gate's, tested in `action_vocabulary`.
-    use super::is_builtin_action;
+    use super::{is_builtin_action, SUPPORTED_ACTION_ALIASES, SUPPORTED_ACTION_NAMES};
+
+    /// `SUPPORTED_ACTIONS` in `@qontinui/ui-bridge`
+    /// `packages/ui-bridge/src/control/action-executor.ts` at ui-bridge
+    /// `9f373a12` (0.46.0), in its order — the verbs the SDK accepts, checked
+    /// with an exact `Set.has` before any dispatch. A literal, so a change on
+    /// either side fails here rather than passing a tautology.
+    const SDK_SUPPORTED_ACTIONS_0_46: &[&str] = &[
+        "click",
+        "hoverClick",
+        "doubleClick",
+        "rightClick",
+        "middleClick",
+        "type",
+        "sendKeys",
+        "clear",
+        "select",
+        "focus",
+        "blur",
+        "hover",
+        "unhover",
+        "scroll",
+        "scrollIntoView",
+        "check",
+        "uncheck",
+        "toggle",
+        "drag",
+        "setValue",
+        "submit",
+        "reset",
+        "autocomplete",
+    ];
+
+    #[test]
+    fn supported_action_names_are_the_sdk_verbs() {
+        // The `allowedActions` hint serves this list, so it must name exactly
+        // what the SDK performs: no alias it refuses, no verb it is missing.
+        assert_eq!(SUPPORTED_ACTION_NAMES, SDK_SUPPORTED_ACTIONS_0_46);
+    }
+
+    #[test]
+    fn every_alias_is_classified_builtin_but_is_not_an_sdk_verb() {
+        for (alias, canonical) in SUPPORTED_ACTION_ALIASES {
+            assert!(
+                is_builtin_action(alias),
+                "{alias} must pass the unknown-verb gate"
+            );
+            assert!(
+                !SDK_SUPPORTED_ACTIONS_0_46.contains(alias),
+                "{alias} is an SDK verb, so it belongs in SUPPORTED_ACTION_NAMES"
+            );
+            assert!(
+                SDK_SUPPORTED_ACTIONS_0_46.contains(canonical),
+                "{alias} must mean an SDK verb, not {canonical}"
+            );
+        }
+        // The spellings that used to be listed as verbs, every one kept.
+        let aliases: Vec<&str> = SUPPORTED_ACTION_ALIASES.iter().map(|(a, _)| *a).collect();
+        for kept in [
+            "double_click",
+            "double",
+            "right",
+            "middle",
+            "scroll_into_view",
+        ] {
+            assert!(aliases.contains(&kept), "{kept}");
+        }
+    }
 
     /// Literal names, so a rename in `SUPPORTED_ACTION_NAMES` fails here.
     #[test]
@@ -6560,6 +6669,8 @@ mod is_builtin_action_tests {
             "click",
             "hoverClick",
             "doubleClick",
+            "rightClick",
+            "middleClick",
             "type",
             "sendKeys",
             "focus",
@@ -6810,6 +6921,57 @@ mod action_not_supported_tests {
     fn is_action_advertised_unknown_supported_list_is_permissive() {
         // None → we don't know what the element supports; never accuse.
         assert!(is_action_advertised("setValue", &None));
+    }
+
+    #[test]
+    fn a_0_46_text_input_passes_the_pre_ipc_gate_for_set_value() {
+        // Plan 2026-11-09-an-elements-advertised-verbs-depend-on-which-path-found-it,
+        // Phase 5's gate: before 0.46 an auto-registered `<input>` advertised
+        // `focus, blur, type, clear, click` (measured on 0.38.0) — no
+        // `setValue`, no `sendKeys` — so this gate answered
+        // ACTION_NOT_SUPPORTED for them.
+        let supported = Some(crate::mcp::ui_bridge::element_kind::served_actions_0_46(
+            "autoRegisteredTextInput",
+        ));
+        for verb in [
+            "setValue",
+            "sendKeys",
+            "type",
+            "clear",
+            "autocomplete",
+            "hoverClick",
+        ] {
+            assert!(is_action_advertised(verb, &supported), "{verb}");
+        }
+        // The table still withholds what a text input does not perform.
+        for verb in ["select", "check", "uncheck", "toggle", "submit", "reset"] {
+            assert!(!is_action_advertised(verb, &supported), "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_0_46_content_row_advertises_nothing_and_the_gate_refuses_every_verb() {
+        // Which runner gate governs `[]`: two per-element gates read it
+        // oppositely. THIS one (`is_action_advertised`, pre-IPC in
+        // `execute_action_dispatch`, reading the `get_element` reply) treats
+        // `Some([])` as refuse-all and only `None` as permissive; the
+        // frontend's `isElementActionAllowed` (`useControlEvents.ts`, registered
+        // elements only) treats `[]` as permissive. `POST
+        // /control/element/{id}/action` passes this gate first, so here `[]`
+        // refuses every built-in verb; every other door that sends the
+        // `execute_action` IPC (the batch routes, action-plan,
+        // navigate-and-wait, the SDK route's IPC fallback, the Tauri command,
+        // GraphQL) meets only the frontend gate, where `[]` lets the SDK
+        // dispatcher decide. Since 0.46 `[]` is carried only by content rows
+        // (`registerContentElement`, the executor's content find row) and by
+        // registrations that declare it (the terminal proxy pane, which also
+        // registers custom actions, so neither gate sees an empty list there).
+        let elem = json!({ "id": "heading-title", "category": "content", "actions": [] });
+        let supported = extract_supported_actions(&elem);
+        assert_eq!(supported, Some(vec![]));
+        for verb in ["click", "sendKeys", "scrollIntoView", "focus"] {
+            assert!(!is_action_advertised(verb, &supported), "{verb}");
+        }
     }
 
     // ── Custom-action reachability via the /control/ route ──────────────

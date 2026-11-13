@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * Regression tests for the terminal-page UI-Bridge addressability contract
  * (plan `2026-07-19-session-titles-ansi-and-ui-bridge-friction`, Tasks B + C).
@@ -7,102 +8,159 @@
  *  1. Driving the command bar failed with `ACTION_NOT_SUPPORTED` —
  *     "Action 'sendKeys' is not supported by element …" — even though BOTH
  *     global whitelists carry `sendKeys`. The rejection came from the
- *     PER-ELEMENT advertised list, which the registry infers for an `input`
- *     WITHOUT `sendKeys`. Any future edit that drops `sendKeys` from a text
- *     input's advertised set silently restores that failure, so it is asserted
- *     rather than left to review.
+ *     PER-ELEMENT advertised list, which the SDK registry of that day inferred
+ *     for an `input` WITHOUT `sendKeys`. The components overrode the list until
+ *     `@qontinui/ui-bridge` 0.46, whose one verb table advertises `sendKeys` on
+ *     every kind; they now register no override, and these tests RENDER the two
+ *     components inside the real `UIBridgeProvider` and read what the registry
+ *     then serves. A future override that drops `sendKeys`, or an SDK that stops
+ *     inferring it, fails here.
  *  2. Session cards and the Session Manager header carried no bridge id at all
  *     and had to be reached by a `page/evaluate` DOM scrape. The ids are
  *     author-stamped precisely because the auto-derived one is minted from
  *     element TEXT — and a card's text is the session title, which changes on
  *     every re-title.
- *
- * The `useUIElement` calls themselves need a DOM; these specs are pure values,
- * so they are asserted directly (vitest `node` env — same precedent as
- * `ZoneLabel.test.ts`).
  */
 
-import { describe, it, expect } from "vitest";
+import { act, createElement, useEffect, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { UIBridgeProvider, useUIBridge, type UIBridgeRegistry } from "@qontinui/ui-bridge";
 
-import { COMMAND_BAR_INPUT_ID, COMMAND_BAR_INPUT_ACTIONS } from "./CommandBar";
+import servedActions from "@/lib/ui-bridge/servedActions.0.46.json";
+
+import { CommandBar, COMMAND_BAR_INPUT_ID, COMMAND_BAR_INPUT_ELEMENT } from "./CommandBar";
 import { sessionCardElementId } from "./SessionCard";
 import {
-  SEARCH_INPUT_ACTIONS,
+  SEARCH_INPUT_ELEMENT,
   SESSION_MANAGER_HEADER_IDS,
+  SessionManagerHeader,
   sessionManagerAccountFilterId,
 } from "./SessionManagerHeader";
 import { SESSION_MANAGER_TOGGLE_ID } from "./SessionManagerToggle";
 
+// The command bar's IO-bound siblings and its terminal-session context are not
+// what these tests observe; the bar's own input registration is.
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(null)) }));
+vi.mock("./contexts/TerminalSessionContext", () => ({
+  useTerminalSession: () => ({ tabs: [], activeId: null }),
+}));
+vi.mock("./SessionManagerToggle", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./SessionManagerToggle")>()),
+  SessionManagerToggle: () => null,
+}));
+vi.mock("./TerminalWorkModeToggle", () => ({ TerminalWorkModeToggle: () => null }));
+vi.mock("./SpawnTenantPicker", () => ({ SpawnTenantPicker: () => null }));
+
+let container: HTMLDivElement;
+let root: Root;
+let registry: UIBridgeRegistry | null = null;
+
+function CaptureRegistry() {
+  const bridgeRegistry = useUIBridge().registry;
+  useEffect(() => {
+    registry = bridgeRegistry;
+  }, [bridgeRegistry]);
+  return null;
+}
+
+/** Render `child` inside the real SDK provider and return what `id` serves. */
+function servedFor(child: ReactNode, id: string): readonly string[] {
+  act(() => {
+    root.render(
+      createElement(UIBridgeProvider, {
+        features: {},
+        children: [createElement(CaptureRegistry, { key: "probe" }), child],
+      }),
+    );
+  });
+  const element = registry?.getElement(id);
+  expect(element, `${id} is registered`).toBeDefined();
+  return element!.actions;
+}
+
+beforeEach(() => {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+
+afterEach(() => {
+  act(() => root.unmount());
+  container.remove();
+  registry = null;
+});
+
+const noop = () => {};
+
+/**
+ * The verbs the last override listed (main's 6e43e5f20: the SDK 0.38.0 inferred
+ * input set): every one must still be served. Pinned here independently of the
+ * served-list fixture, so a fixture regenerated together with a narrowed
+ * measurement cannot drop one of them unnoticed.
+ */
+const FORMER_OVERRIDE = [
+  "focus",
+  "blur",
+  "hover",
+  "unhover",
+  "scroll",
+  "scrollIntoView",
+  "click",
+  "hoverClick",
+  "type",
+  "sendKeys",
+  "clear",
+  "setValue",
+];
+
 describe("text inputs advertise sendKeys", () => {
-  it("the command bar input advertises sendKeys", () => {
-    expect(COMMAND_BAR_INPUT_ACTIONS).toContain("sendKeys");
-  });
-
-  it("the session search box advertises sendKeys", () => {
-    expect(SEARCH_INPUT_ACTIONS).toContain("sendKeys");
-  });
-
-  it("advertises sendKeys ALONGSIDE the inferred input actions, not instead of them", () => {
-    // `inferActions('input')` in the SDK registry at the pinned
-    // `@qontinui/ui-bridge` 0.38.0. Overriding `actions` REPLACES the inferred
-    // list, so an override that forgets one of these silently un-advertises a
-    // working action: before this list carried `unhover` and `setValue`, the
-    // runner's pre-IPC gate refused `setValue` on both inputs outright.
-    // Both lists are that set VERBATIM (same members, same order), as their
-    // comments say, so an extra or a dropped verb both fail here.
-    const INFERRED_INPUT_ACTIONS_0_38 = [
-      "focus",
-      "blur",
-      "hover",
-      "unhover",
-      "scroll",
-      "scrollIntoView",
-      "click",
-      "hoverClick",
-      "type",
-      "sendKeys",
-      "clear",
-      "setValue",
-    ];
-    expect(COMMAND_BAR_INPUT_ACTIONS).toEqual(INFERRED_INPUT_ACTIONS_0_38);
-    expect(SEARCH_INPUT_ACTIONS).toEqual(INFERRED_INPUT_ACTIONS_0_38);
-  });
-
-  it("advertises no custom action name — sendKeys keeps the SDK descriptor-array contract", () => {
-    // `TerminalInstance.tsx` registers a per-element CUSTOM `sendKeys` on the
-    // terminal PANE taking a plain string, and a registered custom action wins
-    // over the same-named built-in on that element. These two inputs must stay
-    // on the built-in (`keys: [{key, modifiers?}]`), so every entry has to be a
-    // member of the SDK's `StandardAction` union — a name outside it would mean
-    // a third meaning had been introduced.
-    const STANDARD_ACTIONS = new Set([
-      "click",
-      "hoverClick",
-      "doubleClick",
-      "rightClick",
-      "middleClick",
-      "type",
-      "sendKeys",
-      "clear",
-      "select",
-      "focus",
-      "blur",
-      "hover",
-      "unhover",
-      "scroll",
-      "scrollIntoView",
-      "check",
-      "uncheck",
-      "toggle",
-      "setValue",
-      "drag",
-      "submit",
-      "reset",
-      "autocomplete",
-    ]);
-    for (const action of [...COMMAND_BAR_INPUT_ACTIONS, ...SEARCH_INPUT_ACTIONS]) {
-      expect(STANDARD_ACTIONS.has(action)).toBe(true);
+  it("the components register no actions override and no custom sendKeys", () => {
+    // An override REPLACES the inferred list, so one that forgets a verb
+    // silently un-advertises a working action. And `TerminalInstance.tsx`
+    // registers a CUSTOM `sendKeys` on the terminal PANE taking a plain
+    // string, which would shadow the built-in (`keys: [{key, modifiers?}]`).
+    for (const descriptor of [COMMAND_BAR_INPUT_ELEMENT, SEARCH_INPUT_ELEMENT]) {
+      expect("actions" in descriptor).toBe(false);
+      expect("customActions" in descriptor).toBe(false);
     }
+  });
+
+  it("the rendered command bar input serves the 0.46 list, sendKeys and the old override's verbs included", () => {
+    const actions = servedFor(createElement(CommandBar), COMMAND_BAR_INPUT_ID);
+    for (const verb of FORMER_OVERRIDE) expect(actions).toContain(verb);
+    // Its structure adds what it performs: a text field (`setValue`,
+    // `autocomplete`), `role="combobox"` (`select`), `aria-expanded` (`toggle`).
+    // The same list the Rust vocabulary tests read (`action_vocabulary.rs`).
+    expect(actions).toEqual(servedActions.commandBarInput);
+  });
+
+  it("the rendered session search box serves sendKeys and every verb the old override listed", () => {
+    const actions = servedFor(
+      createElement(SessionManagerHeader, {
+        loading: false,
+        searchQuery: "",
+        onSearchChange: noop,
+        statusFilter: "all",
+        onStatusFilterChange: noop,
+        accountFilter: "all",
+        onAccountFilterChange: noop,
+        groupBy: "status",
+        onGroupByChange: noop,
+        sortBy: "recent",
+        onSortByChange: noop,
+        accountUsage: [],
+        accounts: [],
+        onRefresh: noop,
+        frozenCount: 0,
+        needsInputCount: 0,
+        activeCount: 0,
+        totalCount: 0,
+      }),
+      SESSION_MANAGER_HEADER_IDS.search,
+    );
+    for (const verb of FORMER_OVERRIDE) expect(actions).toContain(verb);
+    expect(actions).toEqual(servedActions.autoRegisteredTextInput);
   });
 });
 

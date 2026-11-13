@@ -78,11 +78,13 @@ impl<'a> IndexedSnapshot<'a> {
             //    `element_type` keyword) so a `{role: "heading"}` criterion
             //    finds `<h1>` even when the SDK didn't populate top-level
             //    role. See `crate::derive::role`.
-            if let Some(role) = derive::role(el) {
-                let key = normalize_text(&role);
-                if !key.is_empty() {
-                    by_role.entry(key).or_default().push(idx);
-                }
+            //    Indexed under every role name the element ANSWERS to
+            //    (`criteria::element_role_names`: its derived role, its kind,
+            //    the role its kind implies, and the one-way `select` / `input`
+            //    reach), so `lookup_by_role` finds exactly what
+            //    `criteria::score_role_against` accepts.
+            for key in crate::criteria::element_role_names(el) {
+                by_role.entry(key).or_default().push(idx);
             }
 
             // -- tag_name (Addendum A.5) — no derivation, raw field.

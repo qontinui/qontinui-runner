@@ -6,6 +6,7 @@
  */
 
 import type { ExternalElement } from "../../types/ui-bridge-types";
+import { isContentOrMediaRow } from "../../hooks/sdk-ui-bridge/utils";
 
 export interface AIContextOptions {
   /** Page title (optional) */
@@ -100,6 +101,14 @@ function getRole(element: ExternalElement): string {
 function isInteractive(element: ExternalElement): boolean {
   if (element.is_interactive !== undefined) {
     return element.is_interactive;
+  }
+
+  // A content or media row is never a control, whatever it advertises: since
+  // `@qontinui/ui-bridge` 0.46 a media row carries the every-element verbs
+  // (`click`, `sendKeys`, …), so the "has actions" arm below would list every
+  // image. Same classification as the SDK's `interactive_only` filter.
+  if (isContentOrMediaRow(element)) {
+    return false;
   }
 
   // Fallback: check based on type/role

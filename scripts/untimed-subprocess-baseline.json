@@ -191,20 +191,6 @@
       "reason": "Executes a user-authored orchestrator hook command through `cmd /C`. Its runtime is whatever the operator's script does; a blanket budget here would silently truncate hooks. Fires per task-run lifecycle event, not on a timer."
     },
     {
-      "site": "src-tauri/src/orchestrator/verification.rs::DeterministicVerifier::run_command",
-      "waits": [
-        "cmd",
-        "dyn:bash_path",
-        "sh"
-      ],
-      "reason_covers_waits": [
-        "cmd",
-        "dyn:bash_path",
-        "sh"
-      ],
-      "reason": "Executes a user-authored verification command (build/test/lint) through whichever shell the platform resolves to — a discovered `bash_path`, `cmd /C`, or `sh -c` — with a runtime that is legitimately unbounded. Budget belongs to the verification step's own config. One pass per orchestrator iteration, driven by task progress rather than a clock."
-    },
-    {
       "site": "src-tauri/src/playwright/executor.rs::run_script",
       "waits": [
         "npx",

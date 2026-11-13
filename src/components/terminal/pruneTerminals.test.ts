@@ -6,7 +6,14 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { hasAiSession, isPruneActionable, planPrune, RECENT_TAB_GRACE_MS } from "./pruneTerminals";
+import {
+  hasAiSession,
+  isPruneActionable,
+  panesSafeToClose,
+  planPrune,
+  probeKeeps,
+  RECENT_TAB_GRACE_MS,
+} from "./pruneTerminals";
 import type { RemoteTabIdentity } from "./remoteTabs";
 import { compactAssignments, resolveLayout } from "./useZoneLayout";
 
@@ -100,5 +107,40 @@ describe("isPruneActionable", () => {
   it("is NOT actionable on an already-compact AI-only grid", () => {
     const plan = planPrune([ai("a"), ai("b")], { 0: "a", 1: "b" });
     expect(isPruneActionable(plan, 2, 2, { 0: "a", 1: "b" })).toBe(false);
+  });
+});
+
+describe("non-Claude agent CLIs (process-table probe)", () => {
+  it("keeps a hand-launched pi / codex pane the tab fields know nothing about", () => {
+    expect(hasAiSession(shell("p"), { agentPanes: { p: "pi" } })).toBe(true);
+    expect(hasAiSession(shell("c"), { agentPanes: { c: "codex" } })).toBe(true);
+  });
+
+  it("keeps an unreadable pane; absent, none or not-yet-probed leave it to the other signals", () => {
+    expect(probeKeeps("s", { s: "unknown" })).toBe(true);
+    for (const v of ["absent", "none"]) {
+      expect(probeKeeps("s", { s: v })).toBe(false);
+    }
+    expect(probeKeeps("s", {})).toBe(false);
+    expect(probeKeeps("s")).toBe(false);
+  });
+
+  it("planPrune keeps the pi pane and closes the plain shell", () => {
+    const tabs = [ai("a"), shell("pi"), shell("sh")];
+    const plan = planPrune(
+      tabs,
+      { 0: "a", 1: "pi", 2: "sh" },
+      { agentPanes: { pi: "pi", sh: "absent" } },
+    );
+    expect(plan.closeIds).toEqual(["sh"]);
+    expect(plan.keepIds).toEqual(["a", "pi"]);
+  });
+
+  it("the closing click closes only panes a fresh probe read as absent or none", () => {
+    expect(panesSafeToClose(["s", "plan"], { s: "absent", plan: "none" })).toEqual(["s", "plan"]);
+    expect(panesSafeToClose(["s", "x"], { s: "absent", x: "pi" })).toEqual(["s"]);
+    expect(panesSafeToClose(["s", "u"], { s: "absent", u: "unknown" })).toEqual(["s"]);
+    expect(panesSafeToClose(["s", "m"], { s: "absent" })).toEqual(["s"]);
+    expect(panesSafeToClose(["s"], null)).toEqual([]);
   });
 });

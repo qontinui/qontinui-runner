@@ -31,7 +31,9 @@
 //! fork guard, the orphan reclaim's kill — uses [`snapshot_fresh`], which never
 //! serves the memo and joins only a walk that began after the call. A caller
 //! never waits on another caller's walk longer than [`JOIN_WAIT_MAX`]; past it
-//! the answer is the last good snapshot flagged `stale`.
+//! the answer is the last good snapshot flagged `stale`. One read stays out of
+//! all of this on purpose: [`snapshot_unshared`], an observer's private walk,
+//! which no other caller can join, be served from, or lose the fallback to.
 //!
 //! **The external probe is the fallback, behind one circuit.** On Windows the
 //! PowerShell/WMI queries run only when the in-process read fails (Unix has no
@@ -525,7 +527,7 @@ pub(crate) fn health_json() -> serde_json::Value {
 
 /// The Windows-only kill switch (see the module docs). Off Windows the
 /// in-process read is the only read, so it is never disabled.
-fn in_process_disabled() -> bool {
+pub(crate) fn in_process_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
         let disabled =
@@ -590,6 +592,56 @@ pub(crate) async fn snapshot_fresh() -> ProcessSnapshot {
         platform::fallback_snapshot,
     )
     .await
+}
+
+/// A fresh process table walked PRIVATELY, for an OBSERVER whose reads must
+/// change nothing any other caller is served (the `finished_close` arm's
+/// `classify_child` shadow). It is the same in-process walk the provider runs
+/// ([`walk_in_process`]), on the blocking pool and bounded by `budget`, but
+/// entirely outside the provider: it leads no walk another caller can join,
+/// reads and writes no memo, never takes the external-probe fallback slot and
+/// moves no counter or circuit. So a failed walk leaves no trace — every other
+/// caller leads and, if need be, falls back exactly as if this read had never
+/// happened — and a successful one is the observer's alone. A walk that fails,
+/// panics or outruns `budget` answers an empty stale table: UNKNOWN.
+///
+/// `budget` bounds the caller's wait, not the walk: a walk still running when
+/// it expires keeps its blocking-pool thread until the OS-level read returns.
+/// `hold` is the caller's account of that: it is moved INTO the blocking
+/// closure and dropped there only when the walk returns (or when the closure
+/// is dropped unrun), so a caller that passes a counting guard counts exactly
+/// the walks still on the pool — past `budget`, and past its own await.
+pub(crate) async fn snapshot_unshared<H: Send + 'static>(
+    budget: Duration,
+    hold: H,
+) -> ProcessSnapshot {
+    read_unshared(walk_in_process, budget, hold).await
+}
+
+/// The read behind [`snapshot_unshared`], generic over the walk so a test
+/// drives this exact path beside a provider's own callers. A walk still running
+/// when `budget` expires finishes on the pool, holding `hold`, and its answer
+/// is dropped.
+pub(crate) async fn read_unshared<W, H>(walk: W, budget: Duration, hold: H) -> ProcessSnapshot
+where
+    W: FnOnce() -> Result<ProcessSnapshot, String> + Send + 'static,
+    H: Send + 'static,
+{
+    let read = spawn_blocking_tracked(move || {
+        let _hold = hold;
+        walk()
+    });
+    let why = match tokio::time::timeout(budget, read).await {
+        Ok(Ok(Ok(mut snap))) => {
+            snap.stale = false;
+            return snap;
+        }
+        Ok(Ok(Err(why))) => why,
+        Ok(Err(e)) => format!("did not join: {e}"),
+        Err(_) => format!("still walking after {}ms", budget.as_millis()),
+    };
+    tracing::debug!("process_table: an unshared read answered stale: {why}");
+    ProcessSnapshot::default()
 }
 
 /// The async read every snapshot goes through: `walk` on the blocking pool
@@ -701,6 +753,57 @@ pub(crate) fn command_lines_blocking(pids: &[u32]) -> Result<HashMap<u32, String
     }
     std::panic::catch_unwind(|| platform::command_lines(pids))
         .map_err(|_| "the in-process command-line read panicked".to_string())?
+}
+
+/// The RAW argv of exactly `pids`, in-process, for a caller that must match
+/// what a process was started with — in the form its platform's measured
+/// chains were recorded in ([`session_lifecycle::Argv`]). Windows reads each
+/// PEB's command line ([`Argv::Line`](session_lifecycle::Argv::Line); never
+/// `sysinfo`'s split-and-rejoined `cmd()`, which cannot reproduce cmd's `^"`
+/// escapes). Unix splits `/proc/<pid>/cmdline` on NUL with every element kept
+/// ([`Argv::Elements`](session_lifecycle::Argv::Elements); never the
+/// space-joined line [`command_lines_for`] serves, in which distinct argvs
+/// collapse). No external fallback, so it never takes the fallback slot.
+///
+/// Bounded by `budget` and accounted by `hold` exactly as
+/// [`snapshot_unshared`] is: a Linux `/proc/<pid>/cmdline` read can block while
+/// a process in uninterruptible sleep holds its memory lock, so the wait gives
+/// up at `budget` while `hold` stays on the blocking thread until the read
+/// itself returns.
+///
+/// `None` when the read could not run (the in-process kill switch is set, the
+/// blocking task did not join, or it outran `budget`): UNKNOWN. A pid that is
+/// dead or unreadable is absent from a `Some` map.
+pub(crate) async fn raw_argvs_for<H: Send + 'static>(
+    pids: &[u32],
+    budget: Duration,
+    hold: H,
+) -> Option<HashMap<u32, session_lifecycle::Argv>> {
+    if pids.is_empty() {
+        return Some(HashMap::new());
+    }
+    if in_process_disabled() {
+        return None;
+    }
+    let asked = pids.to_vec();
+    let read = spawn_blocking_tracked(move || {
+        let _hold = hold;
+        std::panic::catch_unwind(|| platform::raw_argvs(&asked)).ok()
+    });
+    match tokio::time::timeout(budget, read).await {
+        Ok(Ok(argvs)) => argvs,
+        Ok(Err(e)) => {
+            tracing::debug!("process_table: the raw argv read did not join: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                "process_table: the raw argv read was still running after {}ms",
+                budget.as_millis()
+            );
+            None
+        }
+    }
 }
 
 /// Command lines for exactly `pids`: in-process, with the external probe
@@ -1009,6 +1112,39 @@ mod platform {
         }
     }
 
+    /// The RAW command line of exactly `pids` — the PEB's, as the process was
+    /// started with it ([`qontinui_runner_win32::process_tree::raw_command_line`]),
+    /// through a `PROCESS_QUERY_LIMITED_INFORMATION` handle — as
+    /// [`session_lifecycle::Argv::Line`]. A pid that cannot be opened or read
+    /// is absent.
+    pub(super) fn raw_argvs(pids: &[u32]) -> HashMap<u32, session_lifecycle::Argv> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let mut out = HashMap::new();
+        for &pid in pids {
+            if pid == 0 {
+                continue;
+            }
+            // SAFETY: OpenProcess takes no pointers; a non-null handle carries
+            // query access, is passed to `raw_command_line`, and closed once.
+            let line = unsafe {
+                let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle.is_null() {
+                    continue;
+                }
+                let line = qontinui_runner_win32::process_tree::raw_command_line(handle);
+                CloseHandle(handle);
+                line
+            };
+            if let Some(line) = line.filter(|l| !l.trim().is_empty()) {
+                out.insert(pid, session_lifecycle::Argv::Line(line));
+            }
+        }
+        out
+    }
+
     /// `cmd()` for exactly `pids`. This process is asked for too: a read that
     /// does not list it did not read the table at all.
     pub(super) fn command_lines(pids: &[u32]) -> Result<HashMap<u32, String>, String> {
@@ -1081,6 +1217,16 @@ mod platform {
     /// is no finer per-pid read here.
     pub(super) fn precise_creation_filetime(_pid: u32) -> Option<u64> {
         None
+    }
+
+    /// `/proc/<pid>/cmdline` for exactly `pids`, split on NUL with every
+    /// element kept ([`process_tree::proc_argvs`]), as
+    /// [`session_lifecycle::Argv::Elements`].
+    pub(super) fn raw_argvs(pids: &[u32]) -> HashMap<u32, session_lifecycle::Argv> {
+        process_tree::proc_argvs(pids)
+            .into_iter()
+            .map(|(pid, argv)| (pid, session_lifecycle::Argv::Elements(argv)))
+            .collect()
     }
 
     /// `/proc/<pid>/cmdline` for exactly `pids`.
@@ -1572,6 +1718,115 @@ mod tests {
         );
     }
 
+    /// `read_unshared` (behind `snapshot_unshared`, the classify_child shadow's
+    /// tables) is invisible to every other caller. While a FAILING unshared
+    /// read is still walking, a memoized `read_with` caller does not join it
+    /// and inherit its failure: it leads its own walk and, when that fails too,
+    /// takes the fallback and is served the fallback's table. The unshared read
+    /// then answers stale and leaves no trace — the caller's attempt is the only
+    /// one counted, and the circuit stays closed.
+    #[tokio::test]
+    async fn process_table_a_memo_caller_beside_a_failing_unshared_read_still_gets_the_fallback() {
+        let p: &'static Provider = Box::leak(Box::new(Provider::new(cfg())));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let unshared = tokio::spawn(read_unshared(
+            move || {
+                let _ = started_tx.send(());
+                // Stands in for a slow in-process walk that then fails.
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Err("scripted unshared walk failure".to_string())
+            },
+            Duration::from_secs(30),
+            (),
+        ));
+        started_rx.await.expect("the unshared walk started");
+
+        let fallbacks = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::clone(&fallbacks);
+        let served = read_with(
+            p,
+            MEMO_TTL,
+            || Err("scripted".to_string()),
+            || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Some(table(9))
+            },
+        )
+        .await;
+        assert!(
+            !served.stale && served.names.contains_key(&9),
+            "the memoized caller was served its own fallback's table"
+        );
+        assert_eq!(fallbacks.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).expect("release the unshared walk");
+        let observed = unshared.await.expect("the unshared read joined");
+        assert!(
+            observed.stale,
+            "a failed unshared walk is stale, never fabricated"
+        );
+        let health = p.health_json();
+        assert_eq!(
+            health["powershellFallbacks"], 1,
+            "only the caller's own attempt is counted: {health}"
+        );
+        assert!(health["circuitOpenUntil"].is_null(), "{health}");
+    }
+
+    /// `read_unshared` is bounded: a walk still running at its budget answers
+    /// stale at once (the walk finishes on the pool, its answer dropped), and a
+    /// good walk answers its own table, fresh. Its `hold` is held by the WALK,
+    /// not by the wait: it survives the budget and drops only once the walk on
+    /// the pool returns.
+    #[tokio::test]
+    async fn process_table_an_unshared_read_is_bounded_and_fresh_when_it_succeeds() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let token = Arc::new(());
+        let began = Instant::now();
+        let late = read_unshared(
+            move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Ok(table(7))
+            },
+            Duration::from_millis(50),
+            Arc::clone(&token),
+        )
+        .await;
+        assert!(
+            late.stale && late.names.is_empty(),
+            "past its budget: UNKNOWN"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            Arc::strong_count(&token),
+            2,
+            "the walk outlived the budget and still holds `hold`"
+        );
+        let _ = release_tx.send(());
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&token) > 1 && Instant::now() < give_up {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&token),
+            1,
+            "`hold` drops when the walk returns"
+        );
+
+        let mut walked = table(4);
+        walked.stale = true;
+        let good = read_unshared(move || Ok(walked), Duration::from_secs(30), ()).await;
+        assert!(
+            !good.stale && good.names.contains_key(&4),
+            "a good walk is fresh"
+        );
+    }
+
     /// The production ASYNC command-line path (`command_lines_with`, used by
     /// `command_lines_for`), with an injected read and fallback.
     #[tokio::test]
@@ -1966,11 +2221,19 @@ mod tests {
             .expect("spawn child");
         let pid = child.id();
         // The process may not have published its command line the instant
-        // it is created; give it a bounded moment.
+        // it is created; give it a bounded moment. Wait for the id to PARSE,
+        // not merely to appear: a read racing the child's exec can see a
+        // half-switched argv that already holds the id but not its flag
+        // (measured: `/home/spinak/Projects/qontinui-r <id>`), and stopping
+        // there failed the assertion below on a line the child never had.
+        let parsed = |l: &str| {
+            crate::process_capture::process_tree::parse_session_id_from_cmdline(l).as_deref()
+                == Some(id)
+        };
         let mut line = None;
         for _ in 0..50 {
             line = command_lines_blocking(&[pid]).expect("read").remove(&pid);
-            if line.as_deref().is_some_and(|l| l.contains(id)) {
+            if line.as_deref().is_some_and(parsed) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));

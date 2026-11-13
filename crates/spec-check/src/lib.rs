@@ -11,6 +11,7 @@ pub mod derive;
 pub mod diff;
 pub mod evaluator;
 pub mod fetch;
+pub mod named_type;
 pub mod policy;
 pub mod result_migration;
 pub mod role_categories;

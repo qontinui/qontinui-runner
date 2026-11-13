@@ -38,9 +38,11 @@ import { useTenant } from "@/contexts/TenantContext";
 
 import {
   coordRowSourceText,
+  tenantBoundMembership,
   useSessionInfo,
   type SessionTenancy,
   type TenancyRepoExpected,
+  type TenantBoundMembership,
   type TenantDisplay,
 } from "./useSessionInfo";
 
@@ -61,8 +63,8 @@ function tenantCount(n: number): string {
 /**
  * The bound-set half of `tenancy.display`, for the badge's title: the same
  * fact the session-info Tenant row states in its suffix (`boundSuffix`,
- * `useSessionInfo.ts`), read from the same derived block so the two surfaces
- * cannot disagree. `named` is the tenant the badge names; membership is said
+ * `useSessionInfo.ts`), switched on the same `tenantBoundMembership` so the
+ * two surfaces cannot disagree. `named` is the tenant the badge names; membership is said
  * only when it is the display's own tenant, since `actingInBoundSet` is about
  * that one. Every arm is stated, including a measured "in", so that no badge
  * reads the set by silence. `null` only when the runner sent no display, in
@@ -74,25 +76,28 @@ export function badgeBoundSetText(
   named: string | null | undefined,
 ): string | null {
   if (!display) return null;
-  const bound = display.bound;
-  if (bound.status !== "measured") {
-    return `The tenants this runner is bound to could not be read (${bound.reason ?? "no reason given"}).`;
+  const membership = tenantBoundMembership(display);
+  if (membership === "set-unread") {
+    return `The tenants this runner is bound to could not be read (${display.bound.reason ?? "no reason given"}).`;
   }
-  const n = bound.tenantIds.length;
   // An absent binding store, which is per runner instance: it holds nothing,
   // whatever membership claims.
-  if (n === 0) return "This runner has no bound tenants.";
-  if (!sameTenant(named, display.tenantId)) return `This runner is bound to ${tenantCount(n)}.`;
+  if (membership === "no-bound-tenants") return "This runner has no bound tenants.";
+  const n = display.bound.tenantIds.length;
+  // Membership is the display tenant's: any other named tenant gets the size.
+  if (membership === null || !sameTenant(named, display.tenantId)) {
+    return `This runner is bound to ${tenantCount(n)}.`;
+  }
   const id = stem((named as string).trim());
   const who = `Tenant ${id}`;
   // "the one tenant" on a single binding, "the N tenants" otherwise.
   const set = n === 1 ? "the one tenant" : `the ${tenantCount(n)}`;
-  if (display.actingInBoundSet === false) {
+  if (membership === "out") {
     return n === 1
       ? `${who} is NOT ${set} this runner is bound to.`
       : `${who} is NOT among ${set} this runner is bound to.`;
   }
-  if (display.actingInBoundSet !== true) {
+  if (membership === "unknown") {
     return n === 1
       ? `Whether tenant ${id} is ${set} this runner is bound to is unknown.`
       : `Whether tenant ${id} is among ${set} this runner is bound to is unknown.`;
@@ -109,11 +114,7 @@ function measuredOutsideBoundSet(
   named: string | null | undefined,
 ): boolean {
   return (
-    !!display &&
-    display.bound.status === "measured" &&
-    display.bound.tenantIds.length > 0 &&
-    display.actingInBoundSet === false &&
-    sameTenant(named, display.tenantId)
+    !!display && tenantBoundMembership(display) === "out" && sameTenant(named, display.tenantId)
   );
 }
 
@@ -389,8 +390,9 @@ export function tenantBadgeRendersWithoutSession(
  * here", not "no display": `data-tenant-display-status` alone says which.
  *
  * `data-tenant-bound-membership` is the display's own tenant
- * (`tenancy.display.tenantId`) against the runner's bound set, in the
- * session-info row's terms (`boundSuffix`): `in`, `out` (the row's `not among
+ * (`tenancy.display.tenantId`) against the runner's bound set — the value of
+ * `tenantBoundMembership`, the classification the session-info row's suffix
+ * (`boundSuffix`) switches on: `in`, `out` (the row's `not among
  * N bound`), `unknown`, `no-bound-tenants` (a measured empty set, whatever
  * membership claims) or `set-unread`. Its subject is the ROW's, which is not
  * always the tenant the chip names: a tab stamped for another tenant can read
@@ -405,7 +407,7 @@ export function tenantBadgeDisplayAttrs(tenancy: SessionTenancy | null): {
   "data-tenant-acting": string | undefined;
   "data-tenant-display-status": string | undefined;
   "data-tenant-display-source": string | undefined;
-  "data-tenant-bound-membership": string | undefined;
+  "data-tenant-bound-membership": TenantBoundMembership | undefined;
 } {
   const display = tenancy?.display ?? null;
   return {
@@ -413,18 +415,10 @@ export function tenantBadgeDisplayAttrs(tenancy: SessionTenancy | null): {
       display?.source === "row_stamp" ? undefined : (display?.tenantId ?? undefined),
     "data-tenant-display-status": display?.status ?? undefined,
     "data-tenant-display-source": display?.source ?? undefined,
-    "data-tenant-bound-membership": boundMembership(display),
+    "data-tenant-bound-membership": display
+      ? (tenantBoundMembership(display) ?? undefined)
+      : undefined,
   };
-}
-
-function boundMembership(display: TenantDisplay | null): string | undefined {
-  if (!display) return undefined;
-  if (display.bound.status !== "measured") return "set-unread";
-  if (display.bound.tenantIds.length === 0) return "no-bound-tenants";
-  if (!display.tenantId?.trim()) return undefined;
-  if (display.actingInBoundSet === false) return "out";
-  if (display.actingInBoundSet === true) return "in";
-  return "unknown";
 }
 
 interface TenantBadgeProps {

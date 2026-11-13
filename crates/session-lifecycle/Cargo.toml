@@ -1,0 +1,47 @@
+[package]
+name = "session-lifecycle"
+version = "0.1.0"
+description = "The session-lifecycle kernel: pure evaluators the runner's close paths decide from (first slice: classify_child)"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Plan 2026-10-28-one-session-lifecycle-authority, Phase 37 (the kernel crate),
+# first slice delivered by plan
+# 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a.
+#
+# A PURE library: no Tauri, no tokio, no I/O, and no dependency on the
+# src-tauri crate (the crates/pty-holder precedent). The runner gathers process
+# facts and hands them in; this crate only decides. Keep the dependency list
+# empty: a kernel that reads nothing cannot disagree with the table it is given.
+
+[lib]
+name = "session_lifecycle"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# pty-holder's tiered policy, verbatim (itself the src-tauri/Cargo.toml [lints]
+# of plan 2026-07-05-lint-tiers-and-diff-scoped-gates): correctness/suspicious
+# DENY, `string_slice` DENY, style/perf warn. The workspace defines no
+# [workspace.lints], so the table is repeated here rather than inherited. Every
+# entry applies to a pure crate as it is: `disallowed_methods` reads the
+# repo-root clippy.toml, whose entries this crate never names. CI lints it with
+# `-D warnings` in the REQUIRED `test` job's ubuntu `Clippy check` step, so the
+# warn tiers are fatal here.
+[lints.rust]
+unfulfilled_lint_expectations = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = 1 }
+suspicious = { level = "deny", priority = 1 }
+string_slice = { level = "deny", priority = 2 }
+disallowed_methods = { level = "deny", priority = 2 }
+perf = { level = "warn", priority = 1 }
+complexity = { level = "warn", priority = 0 }
+style = { level = "warn", priority = 0 }
+pedantic = { level = "allow", priority = 0 }
+nursery = { level = "allow", priority = 0 }

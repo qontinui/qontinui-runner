@@ -17,6 +17,7 @@ import { SessionProvider } from "./contexts/SessionContext";
 import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
+import { RUNNER_AUTO_REGISTER_OPTIONS } from "./lib/ui-bridge/autoRegisterOptions";
 
 import {
   UIBridgeProvider,
@@ -1391,16 +1392,9 @@ export default function App() {
           Auto-register every interactive element in the runner app so that
           GET /ui-bridge/control/elements and snapshot reflect the live DOM,
           not just elements wired up through explicit useUIElement hooks.
-          This was previously gated on `import.meta.env.DEV`, which silently
-          disabled the registry in production builds (the temp-runner build
-          and the embedded primary-runner build) — making the entire
-          UI Bridge element-discovery API return near-empty results.
-
-          Cost: a debounced MutationObserver scan (100ms debounce). The
-          runner is a power-user tool with a tight UI Bridge automation
-          loop, so the registry has to work in every shipped build, not
-          just dev. Use [data-no-register] on any element you want to opt
-          out individually.
+          The options, and why each is set as it is, live in
+          `lib/ui-bridge/autoRegisterOptions.ts` so a test can mount the SDK
+          exactly this way.
         */}
         {/*
           Phase 0 of plans/2026-06-03-runner-popout-terminal-windows.md.
@@ -1410,13 +1404,7 @@ export default function App() {
           identical to before; pop-out windows (Phase 1) supply "term-N".
         */}
         <UIBridgeWindowProvider windowLabel={getCurrentWindow().label}>
-          <AutoRegisterProvider
-            enabled
-            idStrategy="prefer-existing"
-            debounceMs={100}
-            excludeSelectors={["[data-no-register]"]}
-            contentDiscovery={{ enabled: true, maxContentElements: 200 }}
-          >
+          <AutoRegisterProvider {...RUNNER_AUTO_REGISTER_OPTIONS}>
             <AuthProvider>
               {/*
               CoordModeProvider — plan

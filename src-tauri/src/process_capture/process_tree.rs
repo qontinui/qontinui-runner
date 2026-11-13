@@ -106,6 +106,17 @@ pub struct ProcessSnapshot {
     /// creation time could not be read — which a consumer must read as
     /// UNKNOWN, never as a match and never as a mismatch.
     pub creation_filetimes: HashMap<u32, u64>,
+    /// `start_ticks[pid] -> /proc/<pid>/stat field 22`: the start time in clock
+    /// ticks since boot, exactly as the kernel records it. Constant for the
+    /// process's life and finer than `creation_times`' seconds (which divide
+    /// these ticks and add `btime`, a value a wall-clock step can move between
+    /// two reads), so a caller that binds a pid across two reads compares
+    /// these. Filled by the `/proc` walk ([`snapshot_process_table_sync`]) for
+    /// every row with a positive start.
+    ///
+    /// Populated on Linux only. Empty elsewhere, and absent for a pid whose
+    /// `stat` did not parse — UNKNOWN, as for `creation_filetimes`.
+    pub start_ticks: HashMap<u32, u64>,
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -125,6 +136,7 @@ impl Default for ProcessSnapshot {
             names: HashMap::new(),
             exe_paths: HashMap::new(),
             creation_filetimes: HashMap::new(),
+            start_ticks: HashMap::new(),
         }
     }
 }
@@ -619,6 +631,46 @@ async fn snapshot_process_table() -> ProcessSnapshot {
 /// an empty map.
 pub async fn command_lines_for_pids(pids: &[u32]) -> Option<HashMap<u32, String>> {
     super::process_table::command_lines_for(pids).await
+}
+
+/// The RAW argv of exactly `pids`, as each process was started with it, for a
+/// caller that matches command lines against a measured shape
+/// ([`super::process_table::raw_argvs_for`]): Windows answers its PEB's
+/// command line, Unix `/proc/<pid>/cmdline` split on NUL with every element
+/// kept. Use this, not [`command_lines_for_pids`], whenever the exact argv
+/// matters: that door's Windows answer is `sysinfo`'s argv rejoined, which
+/// loses cmd's `^"` escapes, and its Unix answer joins the argv with spaces, in
+/// which distinct argvs collapse. In-process only, with no fallback, bounded by
+/// `budget`; `hold` stays on the blocking thread until the read itself returns
+/// (see [`super::process_table::snapshot_unshared`]). `None` = UNKNOWN; a pid
+/// absent from a `Some` map is unreadable.
+pub async fn raw_argvs_for_pids<H: Send + 'static>(
+    pids: &[u32],
+    budget: std::time::Duration,
+    hold: H,
+) -> Option<HashMap<u32, session_lifecycle::Argv>> {
+    super::process_table::raw_argvs_for(pids, budget, hold).await
+}
+
+/// A fresh process table for an OBSERVER, walked privately and bounded by
+/// `budget` ([`super::process_table::snapshot_unshared`]): it shares nothing
+/// with the provider every other read goes through — no walk another caller
+/// can join, no memo, no fallback slot, no circuit — so it can change nothing
+/// any other caller is served. A failed or late walk answers stale (UNKNOWN);
+/// `hold` stays on the blocking thread until the walk itself returns, so a
+/// caller can count its walks still on the pool.
+pub async fn snapshot_process_table_unshared<H: Send + 'static>(
+    budget: std::time::Duration,
+    hold: H,
+) -> ProcessSnapshot {
+    super::process_table::snapshot_unshared(budget, hold).await
+}
+
+/// Whether `QONTINUI_PROCESS_TABLE_IN_PROCESS=0` has switched the in-process
+/// process-table read off (Windows only; never elsewhere). A caller whose every
+/// read is in-process only has nothing to read while it is set.
+pub fn in_process_table_read_disabled() -> bool {
+    super::process_table::in_process_disabled()
 }
 
 /// Identify which descendant is "the service" — port owner → leaf →
@@ -1202,6 +1254,13 @@ pub(super) fn snapshot_process_table_sync() -> ProcessSnapshot {
         };
         snap.parent_map.entry(ppid).or_default().push(pid);
         snap.creation_times.insert(pid, spawned_at_unix);
+        // The same field 22, undivided: the exact stamp a pid is bound by
+        // across two reads (`ProcessSnapshot::start_ticks`).
+        if let Ok(ticks) = u64::try_from(starttime_ticks) {
+            if ticks > 0 {
+                snap.start_ticks.insert(pid, ticks);
+            }
+        }
         // Image name for the claude-present liveness signal. `/proc/<pid>/comm`
         // is the kernel's `TASK_COMM` (≤15 chars, no path) — `claude` fits.
         // Fall back to the `comm` field already parsed out of `stat` (the text
@@ -1322,6 +1381,43 @@ pub(super) fn proc_command_lines(pids: &[u32]) -> HashMap<u32, String> {
         }
     }
     out
+}
+
+/// `/proc/<pid>/cmdline` for exactly `pids`, as the argv each process was
+/// started with ([`split_proc_cmdline`]): every element kept, empty ones too,
+/// so two different argvs never read as one. The raw read behind
+/// [`super::process_table::raw_argvs_for`]; [`proc_command_lines`] keeps
+/// serving the space-joined line its own callers want. A pid that is dead,
+/// unreadable, or whose argv is not UTF-8 is absent.
+#[cfg(unix)]
+pub(super) fn proc_argvs(pids: &[u32]) -> HashMap<u32, Vec<String>> {
+    let mut out = HashMap::new();
+    for &pid in pids {
+        let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if let Some(argv) = split_proc_cmdline(&bytes) {
+            out.insert(pid, argv);
+        }
+    }
+    out
+}
+
+/// PURE: a `/proc/<pid>/cmdline` read as an argv. The kernel writes each
+/// argument followed by a NUL, so exactly ONE trailing NUL terminates the last
+/// argument and every other NUL separates two: an empty argument is an empty
+/// element, never dropped. `None` for an empty read (a kernel thread, a
+/// zombie) and for an argument that is not UTF-8 — unreadable, rather than
+/// rewritten lossily into text another argv could also produce. Pure, so it is
+/// tested on every OS.
+pub(super) fn split_proc_cmdline(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let body = bytes.strip_suffix(b"\0").unwrap_or(bytes);
+    body.split(|b| *b == 0)
+        .map(|part| String::from_utf8(part.to_vec()).ok())
+        .collect()
 }
 
 #[cfg(unix)]
@@ -1648,6 +1744,74 @@ mod tests {
             None
         );
         assert_eq!(parse_proc_stat(&running, 0, 100), None, "no boot time");
+    }
+
+    /// `/proc/<pid>/cmdline` → argv: one trailing NUL is a terminator, every
+    /// other NUL a separator, and an empty argument survives — so argvs that
+    /// join to the same space-separated line stay apart.
+    #[test]
+    fn proc_cmdline_splits_on_nul_and_keeps_empty_arguments() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_proc_cmdline(b"/usr/bin/python3\0/x/shim.py\0--credential\0/p.json\0"),
+            Some(s(&[
+                "/usr/bin/python3",
+                "/x/shim.py",
+                "--credential",
+                "/p.json"
+            ]))
+        );
+        // The collapse a space-joined read could not tell apart.
+        assert_eq!(
+            split_proc_cmdline(b"python3\0shim.py\0--credential x\0"),
+            Some(s(&["python3", "shim.py", "--credential x"]))
+        );
+        assert_ne!(
+            split_proc_cmdline(b"python3\0shim.py\0--credential x\0"),
+            split_proc_cmdline(b"python3\0shim.py\0--credential\0x\0")
+        );
+        // Empty arguments, in the middle and at the end, are elements.
+        assert_eq!(
+            split_proc_cmdline(b"a\0\0b\0\0"),
+            Some(s(&["a", "", "b", ""]))
+        );
+        assert_eq!(split_proc_cmdline(b"\0"), Some(s(&[""])));
+        // A rewritten title with no terminator is one argument.
+        assert_eq!(
+            split_proc_cmdline(b"next-server (v16)"),
+            Some(s(&["next-server (v16)"]))
+        );
+        assert_eq!(split_proc_cmdline(b""), None, "an empty read says nothing");
+        assert_eq!(
+            split_proc_cmdline(b"a\0\xff\0"),
+            None,
+            "not UTF-8 is unreadable"
+        );
+    }
+
+    /// The live `/proc` read of this very test process: the argv it was
+    /// started with, element for element.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_argvs_reads_this_process_as_started() {
+        let me = std::process::id();
+        let read = proc_argvs(&[me]);
+        let expected: Vec<String> = std::env::args().collect();
+        assert_eq!(read.get(&me), Some(&expected));
+        assert!(proc_argvs(&[u32::MAX]).is_empty(), "no such pid: absent");
+    }
+
+    /// The `/proc` walk stamps every row with field 22's ticks as well as the
+    /// derived seconds, and the ticks are the ones a second read agrees on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_walk_carries_start_ticks_that_a_second_walk_repeats() {
+        let me = std::process::id();
+        let a = snapshot_process_table_sync();
+        let b = snapshot_process_table_sync();
+        let ticks = a.start_ticks.get(&me).copied();
+        assert!(ticks.is_some_and(|t| t > 0), "{ticks:?}");
+        assert_eq!(ticks, b.start_ticks.get(&me).copied());
     }
 
     #[test]

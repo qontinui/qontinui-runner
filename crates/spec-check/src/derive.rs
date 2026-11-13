@@ -37,6 +37,16 @@ use qontinui_types::ui_bridge::UIBridgeElement;
 /// 3. `el.element_type` when it looks like an ARIA role keyword
 ///    (covers SDK-emitted semantic types like `"heading"`, `"button"`,
 ///    `"link"`, `"paragraph"` even when the tag name is generic).
+///
+/// Arm 3 reads the element's KIND, which `@qontinui/ui-bridge` 0.46 moved for
+/// some spellings: `role="combobox"` / `"listbox"` are `combobox` / `listbox`
+/// (the 0.38 registry said `select`), `role="textbox"` is `textbox` (the 0.38
+/// registry said `input`, which this arm skips), a role-less contenteditable
+/// is `textbox` (the 0.38 registry said `custom`, its auto-register hook
+/// `generic`), and the registry's untyped default is `generic` (was
+/// `custom`). The role returned here is the precise one; a declared role is
+/// matched against it — and against the kind and the role the kind implies —
+/// by `criteria::score_role_against` ([`crate::named_type`]).
 pub fn role(el: &UIBridgeElement) -> Option<String> {
     if let Some(r) = non_empty(el.role.as_deref()) {
         return Some(r.to_string());

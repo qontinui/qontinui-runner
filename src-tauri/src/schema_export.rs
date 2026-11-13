@@ -675,20 +675,13 @@ pub fn export_all_schemas() -> Value {
     add!("WorkerStatus", qv::WorkerStatus);
     add!("WorkerInstance", qv::WorkerInstance);
     add!("WorkerCoordinationMessage", qv::WorkerCoordinationMessage);
-    add!("DomainVerificationResult", qv::DomainVerificationResult);
     add!("WorkerSignal", qv::WorkerSignal);
     add!("Finding", qv::Finding);
     add!("Confidence", qv::Confidence);
-    add!("VerificationResult", qv::VerificationResult);
-    add!(
-        "IterationVerificationResults",
-        qv::IterationVerificationResults
-    );
     add!("VerificationAgentContext", qv::VerificationAgentContext);
     add!("ExtendIterationsRequest", qv::ExtendIterationsRequest);
     add!("CriterionOverride", qv::CriterionOverride);
     add!("OverrideCollection", qv::OverrideCollection);
-    add!("TaskCompletionResult", qv::TaskCompletionResult);
     add!("StageTransition", qv::StageTransition);
 
     // ── qontinui-types: spec_check (Plan 01 foundation) ──
@@ -1108,8 +1101,27 @@ mod tests {
         // RecurringAgentStatusReport — plan
         // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
         // Phase 4a) = 624.
-        // The codegen's "Processing N top-level types" line should read 624 here.
-        assert_eq!(obj.len(), 624, "Expected 624 schema entries");
+        // - the 4 orchestrator verifier result types (DomainVerificationResult,
+        // VerificationResult, IterationVerificationResults,
+        // TaskCompletionResult — deleted with the unreachable orchestrator
+        // verifier that alone filled them, plan
+        // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+        // Phase 6) = 620.
+        // The codegen's "Processing N top-level types" line should read 620 here.
+        assert_eq!(obj.len(), 620, "Expected 620 schema entries");
+        // Nothing in the product fills those four any more, so registering
+        // one again would export a verdict DTO that has no producer.
+        for removed in [
+            "DomainVerificationResult",
+            "VerificationResult",
+            "IterationVerificationResults",
+            "TaskCompletionResult",
+        ] {
+            assert!(
+                !obj.contains_key(removed),
+                "{removed} was deleted with the orchestrator verifier and must not be exported"
+            );
+        }
         for recurring in [
             "ManagedBy",
             "RecurringAgentTarget",

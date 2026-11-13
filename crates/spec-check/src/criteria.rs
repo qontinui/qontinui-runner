@@ -36,7 +36,7 @@ pub fn matches_all(snapshot: &IndexedSnapshot, crit: &IrElementCriteria, idx: El
     let el = snapshot.element(idx);
 
     if let Some(role) = crit.role.as_deref() {
-        if score_role(role, &derive::role(el)) < 1.0 {
+        if score_role_against(role, el) < 1.0 {
             return false;
         }
     }
@@ -147,7 +147,8 @@ pub fn narrow_candidates(snapshot: &IndexedSnapshot, crit: &IrElementCriteria) -
 
 /// 1.0 on exact match (post-normalization), 0.5 when declared and observed
 /// roles share an ARIA category but differ literally, 0.0 otherwise (or when
-/// observed is absent).
+/// observed is absent). A comparison of two role STRINGS; matching a declared
+/// role against an ELEMENT is [`score_role_against`].
 pub fn score_role(declared: &str, observed: &Option<String>) -> f32 {
     let Some(obs) = observed else {
         return 0.0;
@@ -164,6 +165,32 @@ pub fn score_role(declared: &str, observed: &Option<String>) -> f32 {
     } else {
         0.0
     }
+}
+
+/// The role names `el` answers to — [`crate::named_type::role_names_answered`]
+/// over its derived role and its kind. The ONE value space every role reader
+/// in this crate uses: [`score_role_against`], the snapshot's role index and
+/// the selectivity weights.
+pub fn element_role_names(el: &UIBridgeElement) -> Vec<String> {
+    let role = derive::role(el).map(|r| normalize_text(&r));
+    let kind = normalize_text(&el.element_type);
+    crate::named_type::role_names_answered(role.as_deref(), Some(kind.as_str()))
+}
+
+/// How well `el` answers to a declared ROLE: 1.0 when it answers by
+/// [`crate::named_type::answers_to_named_role`] — its derived ARIA role, its
+/// kind, or the role its kind implies EQUALS the declared role, plus the
+/// one-way `select` / `input` reach for the kinds the pre-0.46 registry typed
+/// that way — else [`score_role`]'s partial credit against the derived role.
+/// Families do not apply to roles: `{role: "listbox"}` does not find a
+/// combobox trigger.
+pub fn score_role_against(declared: &str, el: &UIBridgeElement) -> f32 {
+    let observed = derive::role(el);
+    let d = normalize_text(declared);
+    if !d.is_empty() && element_role_names(el).contains(&d) {
+        return 1.0;
+    }
+    score_role(declared, &observed)
 }
 
 /// 1.0 on exact match, 0.0 otherwise. HTML tag names are categorical — no
@@ -1078,6 +1105,64 @@ mod tests {
             "expected the email input to derive role=textbox"
         );
         assert!(matches_all(&idx, &crit, cands[0]));
+    }
+
+    #[test]
+    fn a_declared_role_matches_by_equality_with_one_backward_reach() {
+        // `@qontinui/ui-bridge` 0.46 types role="combobox" `combobox` and
+        // role="textbox" `textbox`, where the 0.38 registry said `select` and
+        // `input`; with no top-level role the derived role is the kind itself.
+        // A declared ROLE matches by equality (observed role, kind, or the role
+        // the kind implies) — never by family — except that the two kind names
+        // `select` / `input` still reach their family, one way. Both the role
+        // index (narrowing) and `score_role_against` (Phase 1) agree.
+        let s = snap(vec![
+            live_elem("cb", "div", "combobox", Some("Country"), None),
+            live_elem("lb", "div", "listbox", Some("Countries"), None),
+            live_elem("sel", "select", "select", Some("Size"), None),
+            live_elem("ce", "div", "textbox", Some("Notes"), None),
+            live_elem("ta", "textarea", "textarea", Some("Body"), None),
+            live_elem("btn", "div", "button", Some("Go"), None),
+        ]);
+        let idx = IndexedSnapshot::new(&s);
+        for (named, expected) in [
+            // positive: equality with the kind / the implied role
+            ("combobox", vec!["cb", "sel"]),
+            ("listbox", vec!["lb"]),
+            ("textbox", vec!["ce", "ta"]),
+            // positive: the one-way backward reach of the two kind names
+            ("select", vec!["cb", "lb", "sel"]),
+            ("input", vec!["ce"]),
+            // negative control: a role nothing here has
+            ("checkbox", vec![]),
+        ] {
+            let crit = IrElementCriteria {
+                role: Some(named.to_string()),
+                ..Default::default()
+            };
+            let cands = narrow_candidates(&idx, &crit);
+            let matched: Vec<&str> = cands
+                .iter()
+                .filter(|i| matches_all(&idx, &crit, **i))
+                .map(|i| idx.element(*i).id.as_str())
+                .collect();
+            assert_eq!(matched, expected, "role {named:?}");
+        }
+    }
+
+    #[test]
+    fn a_role_is_not_a_family() {
+        // Negative controls for the over-match a family rule would give: a
+        // "dropdown closed" assertion on `listbox` must not trip on the trigger.
+        let trigger = live_elem("cb", "div", "combobox", None, None);
+        let popup = live_elem("lb", "div", "listbox", None, None);
+        assert!(score_role_against("listbox", &trigger) < 1.0);
+        assert!(score_role_against("combobox", &popup) < 1.0);
+        assert_eq!(score_role_against("combobox", &trigger), 1.0);
+        assert_eq!(score_role_against("select", &popup), 1.0);
+        // String scoring stays exact-or-category.
+        assert_eq!(score_role("Combobox", &Some("combobox".into())), 1.0);
+        assert!(score_role("Combobox", &Some("listbox".into())) < 1.0);
     }
 
     #[test]

@@ -773,7 +773,7 @@ fn confirm_inner(
 /// THE seam, by terminal: `coord_row` is that terminal's
 /// `TerminalSession::coord_session_id()` (resolved by the caller, so this stays
 /// testable without a `TerminalManager`). Evidence for a terminal with no row
-/// yet is parked and retried by [`apply_reconcile_tick`] once it has one; newer
+/// yet is parked and retried by [`apply_reconcile_tick_with`] once it has one; newer
 /// evidence for the terminal replaces it.
 pub fn confirm_for_terminal(
     registry: &SessionRegistry,
@@ -814,14 +814,17 @@ pub fn confirm_for_terminal(
 /// Feed one reconcile pass's rung-2 binds through the seam (D5): only a
 /// `Bind` graded [`BindOrigin::Authoritative`] (the anchor's own argv) — never
 /// a rung-3 `Observed` or rung-4 `Reconciled` correlation. At most one seam
-/// call per terminal, and none for a terminal whose anchor has a valid
-/// provider row this tick (`has_valid_provider_row`; the provider-registry
-/// source is the stronger, current evidence, fed by [`rekey_provider_rows`]).
+/// call per terminal, and none for a terminal `rung2_suppressed` names: one
+/// whose anchor has a valid provider row this tick, or whose anchor reads
+/// Unknown this tick after a provider-registry id was queued or found current
+/// for that same anchor (the provider-registry source is the stronger, current
+/// evidence, fed by [`rekey_provider_rows`]; the suppression set is built by
+/// [`apply_reconcile_tick_with`]).
 pub fn rekey_rung2_binds(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
-    has_valid_provider_row: impl Fn(&str) -> bool,
+    rung2_suppressed: impl Fn(&str) -> bool,
 ) -> Vec<(String, RekeyOutcome)> {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut out = Vec::new();
@@ -835,7 +838,7 @@ pub fn rekey_rung2_binds(
         else {
             continue;
         };
-        if !seen.insert(terminal_id.as_str()) || has_valid_provider_row(terminal_id) {
+        if !seen.insert(terminal_id.as_str()) || rung2_suppressed(terminal_id) {
             continue;
         }
         let outcome = confirm_for_terminal(
@@ -911,11 +914,10 @@ pub fn confirm_for_terminal_in_app(
     ))
 }
 
-/// One reconcile tick's coord-identity work, in order: restore the declines the
-/// drain recorded since the last tick; feed the pass's rung-2 binds through the
-/// seam; then retry what no pass will re-supply, skipping a row this tick
-/// already moved. Pure over its inputs (the terminal → coord-row lookup is
-/// injected), so the whole tick composition is testable against a fake coord.
+/// Test-only: [`apply_reconcile_tick_with`] for a tick that read no provider
+/// rows. Production always passes the tick's rows
+/// ([`apply_reconcile_tick_in_app`]).
+#[cfg(test)]
 pub fn apply_reconcile_tick(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
@@ -936,7 +938,7 @@ pub fn rekey_provider_rows(
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
 ) -> Vec<(String, RekeyOutcome)> {
     let mut out = Vec::new();
-    for (terminal_id, session_id) in rows.valid() {
+    for (terminal_id, session_id, config_dir) in rows.valid() {
         let Some(coord_row) = coord_row_for(terminal_id) else {
             continue;
         };
@@ -947,14 +949,32 @@ pub fn rekey_provider_rows(
             session_id,
             RekeySource::ProviderRegistry,
         );
+        if matches!(outcome, RekeyOutcome::Queued) {
+            // Which account's registry file supplied the id: on a multi-account
+            // box this is the only record of where the re-key's evidence came from.
+            tracing::info!(
+                terminal_id = %terminal_id,
+                coord_session_id = %coord_row,
+                claude_session_id = %session_id,
+                config_dir = %config_dir.display(),
+                "provider_registry re-key: evidence read from this config dir's sessions/<pid>.json"
+            );
+        }
         out.push((terminal_id.to_string(), outcome));
     }
     out
 }
 
-/// [`apply_reconcile_tick`] with this tick's provider rows. A valid provider
-/// row wins over the rung-2 argv id: rung 2 is skipped for a terminal that has
-/// one, so the seam is called at most once per terminal per tick.
+/// One reconcile tick's coord-identity work, in order: restore the declines the
+/// drain recorded since the last tick; feed the pass's rung-2 binds and this
+/// tick's valid provider rows through the seam; then retry what no pass will
+/// re-supply, skipping a row this tick already moved. Pure over its inputs (the
+/// terminal → coord-row lookup is injected), so the whole tick composition is
+/// testable against a fake coord.
+///
+/// A valid provider row wins over the rung-2 argv id: rung 2 is skipped for a
+/// terminal that has one, so the seam is called at most once per terminal per
+/// tick.
 ///
 /// The precedence is not stateless. Once a provider-registry id has been queued
 /// (or was already current) for an anchor, rung 2 stays suppressed for that
@@ -990,9 +1010,7 @@ pub fn apply_reconcile_tick_with(
     let provider_out = rekey_provider_rows(registry, rows, &coord_row_for);
     for (terminal_id, outcome) in &provider_out {
         if matches!(outcome, RekeyOutcome::Queued | RekeyOutcome::AlreadyCurrent) {
-            if let Some((_, anchor, _)) =
-                rows.entries().find(|(t, _, _)| *t == terminal_id.as_str())
-            {
+            if let Some(anchor) = rows.anchor(terminal_id) {
                 ledger.remember_provider_anchor(terminal_id, anchor);
             }
         }
@@ -1011,7 +1029,8 @@ pub fn prune_provider_memory(registry: &SessionRegistry, live: &HashSet<String>)
     registry.coord_sync().rekeys().retain_provider_anchors(live);
 }
 
-/// [`apply_reconcile_tick`] against the app's terminal manager + registry.
+/// [`apply_reconcile_tick_with`] against the app's terminal manager +
+/// registry, then [`prune_provider_memory`] over every live terminal.
 /// Fire-and-forget; a no-op when either is not in Tauri state.
 pub fn apply_reconcile_tick_in_app(
     app: &tauri::AppHandle,

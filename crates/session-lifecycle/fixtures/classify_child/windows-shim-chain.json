@@ -1,0 +1,48 @@
+{
+  "provenance": {
+    "host": "spaceship (Windows 11 Pro 10.0.26300)",
+    "measured_at": "2026-11-08T06:24:21Z",
+    "method": "Get-CimInstance Win32_Process, subtree of one real claude.exe (the path-identity shim excluded); start = CreationDate.ToFileTimeUtc(); coord-mcp-shim credential filenames redacted to 0123456789abcdef; tool-shell (bash.exe) command bodies redacted",
+    "shape": "cmd.exe(conhost.exe(),python3.exe(python.exe()))",
+    "census": "100 real claude.exe on the box at capture: 93 held exactly cmd.exe(conhost.exe(),python3.exe(python.exe())), 7 held that chain plus tool shells or a direct conhost.exe"
+  },
+  "platform": "windows",
+  "claude_pid": 3879480,
+  "table": [
+    {
+      "pid": 3879480,
+      "ppid": 752896,
+      "image": "claude.exe",
+      "start": 134381840723719050,
+      "cmdline": "<claude argv not recorded>"
+    },
+    {
+      "pid": 15922288,
+      "ppid": 3879480,
+      "image": "cmd.exe",
+      "start": 134381840776141630,
+      "cmdline": "C:\\WINDOWS\\system32\\cmd.exe /d /s /c \"C:\\Users\\jspin\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe ^\"D:\\qontinui-root\\qontinui-claude-config\\scripts\\coord-mcp-shim.py^\" ^\"--credential^\" ^\"C:\\Users\\jspin\\.qontinui\\coord-mcp-shim\\0123456789abcdef.json^\"\""
+    },
+    {
+      "pid": 3888740,
+      "ppid": 15922288,
+      "image": "conhost.exe",
+      "start": 134381840777342960,
+      "cmdline": "\\??\\C:\\WINDOWS\\system32\\conhost.exe 0x4"
+    },
+    {
+      "pid": 5679240,
+      "ppid": 15922288,
+      "image": "python3.exe",
+      "start": 134381840784799510,
+      "cmdline": "C:\\Users\\jspin\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe  \"D:\\qontinui-root\\qontinui-claude-config\\scripts\\coord-mcp-shim.py\" \"--credential\" \"C:\\Users\\jspin\\.qontinui\\coord-mcp-shim\\0123456789abcdef.json\""
+    },
+    {
+      "pid": 15924220,
+      "ppid": 5679240,
+      "image": "python.exe",
+      "start": 134381840786568350,
+      "cmdline": "\"C:\\Users\\jspin\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe\"  \"D:\\qontinui-root\\qontinui-claude-config\\scripts\\coord-mcp-shim.py\" \"--credential\" \"C:\\Users\\jspin\\.qontinui\\coord-mcp-shim\\0123456789abcdef.json\""
+    }
+  ]
+}

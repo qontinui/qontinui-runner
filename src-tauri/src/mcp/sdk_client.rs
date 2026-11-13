@@ -72,7 +72,13 @@ pub struct SdkConnection {
 /// What a stored connection's client does with the operator's bearer. It is decided
 /// at the handshake and holds until the next one, or until
 /// [`recheck_stored_bearers`] settles a [`Self::WithheldListUnreadable`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Listed per connection as `bearer` by `GET /ui-bridge/sdk/status` and
+/// `GET /ui-bridge/sdk/connections`, in snake_case (`sent`, `withheld_from_target`,
+/// `withheld_list_unreadable`, `absent`). It says why a device answers 401, or why
+/// a switch refuses a stored connection. It never carries the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConnectionBearer {
     /// Sent on every request.
     Sent,
@@ -166,6 +172,22 @@ impl SdkConnectionManager {
             .as_ref()
             .and_then(|url| self.connections.get(url))
             .filter(|conn| !conn.sends_bearer_off_machine())
+    }
+
+    /// The URL of the connection a dispatch would use: `active_url`, unless
+    /// [`Self::active_connection`] refuses it. It agrees with `active_connection`, so
+    /// a surface that names the active URL from it never names one a dispatch passes
+    /// over.
+    pub fn active_url_in_use(&self) -> Option<&str> {
+        self.active_url
+            .as_deref()
+            .filter(|_| self.active_connection().is_some())
+    }
+
+    /// Whether the connection stored under `url` is the one a dispatch would use (see
+    /// [`Self::active_url_in_use`]).
+    pub fn is_active(&self, url: &str) -> bool {
+        self.active_url_in_use() == Some(url)
     }
 
     /// Make the stored connection to `url` active and describe it, with no
@@ -316,11 +338,43 @@ pub(crate) struct ConnectionInfo {
     url: String,
     app: SdkAppInfo,
     connected_at: i64,
+    /// Whether a dispatch would use this connection: see
+    /// [`SdkConnectionManager::is_active`]. The active connection reads `false`
+    /// while its client would send the operator's bearer off this machine.
     is_active: bool,
     /// The origin the activating WS registration was verified at; `None` for
     /// operator trust and keyed/opaque principals.
     verified_origin: Option<String>,
     principal_class: &'static str,
+    /// What this connection's client does with the operator's bearer.
+    bearer: ConnectionBearer,
+    /// Whether this client would send the operator's bearer to a port that now
+    /// forwards off this machine. Such a connection is never used, active or not.
+    /// It is dropped at the next re-check, or by a connect or switch to its own URL.
+    /// This field is what tells it apart from an ordinary inactive connection that
+    /// sends the bearer.
+    sends_bearer_off_machine: bool,
+}
+
+/// One [`ConnectionInfo`] per stored connection, for the routes that list them.
+fn connection_infos(manager: &SdkConnectionManager) -> Vec<ConnectionInfo> {
+    manager
+        .connections
+        .iter()
+        .map(|(url, conn)| ConnectionInfo {
+            url: url.clone(),
+            app: conn.app_info.clone(),
+            connected_at: conn.connected_at,
+            is_active: manager.is_active(url),
+            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
+            principal_class: conn
+                .activated_by
+                .as_ref()
+                .map_or("operator_trust", |p| p.class_str()),
+            bearer: conn.bearer,
+            sends_bearer_off_machine: conn.sends_bearer_off_machine(),
+        })
+        .collect()
 }
 
 /// Request body for switching active connection
@@ -851,6 +905,36 @@ pub async fn recheck_stored_bearers(sdk_connection: &tokio::sync::Mutex<SdkConne
             (Err(e), _) => warn!("SDK relay client: could not rebuild the client for {url}: {e}"),
         }
     }
+}
+
+/// How often the runner re-checks stored connections' bearers.
+pub const STORED_BEARER_RECHECK_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `worker_supervisor` registry name of the loop [`spawn_stored_bearer_recheck`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const STORED_BEARER_RECHECK_WORKER: &str = "sdk_client.stored_bearer_recheck";
+
+/// Run [`recheck_stored_bearers`] every `period` for the life of the process.
+///
+/// Nothing else re-reads the adb forward list and settles stored clients between
+/// connects, so the loop runs under the panic supervisor: a pass that panics is
+/// logged, counted on `/health`, and the loop is rebuilt after a backoff, where a
+/// bare spawn would end it for good. Rebuilding it is safe, because the loop keeps
+/// no state but its interval.
+pub fn spawn_stored_bearer_recheck(
+    sdk_connection: Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised(STORED_BEARER_RECHECK_WORKER, move || {
+        let sdk_connection = sdk_connection.clone();
+        async move {
+            let mut interval = tokio::time::interval(period);
+            loop {
+                interval.tick().await;
+                recheck_stored_bearers(&sdk_connection).await;
+            }
+        }
+    })
 }
 
 /// What `POST /ui-bridge/sdk/connect` does: make the stored connection to `url`
@@ -1763,21 +1847,7 @@ async fn handle_disconnect(
 async fn handle_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<SdkStatusResponse>> {
     let manager = state.sdk_connection.lock().await;
 
-    let all_connections: Vec<ConnectionInfo> = manager
-        .connections
-        .iter()
-        .map(|(url, conn)| ConnectionInfo {
-            url: url.clone(),
-            app: conn.app_info.clone(),
-            connected_at: conn.connected_at,
-            is_active: manager.active_url.as_deref() == Some(url.as_str()),
-            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
-            principal_class: conn
-                .activated_by
-                .as_ref()
-                .map_or("operator_trust", |p| p.class_str()),
-        })
-        .collect();
+    let all_connections = connection_infos(&manager);
 
     // Check health via the SDK app's /health endpoint (quick, non-blocking)
     let healthy = if let Some(conn) = manager.active_connection() {
@@ -4375,24 +4445,7 @@ pub(crate) async fn handle_connections(
     State(state): State<crate::mcp::relay_binding::RelayState>,
 ) -> Json<ApiResponse<Vec<ConnectionInfo>>> {
     let manager = state.sdk_connection.lock().await;
-
-    let connections: Vec<ConnectionInfo> = manager
-        .connections
-        .iter()
-        .map(|(url, conn)| ConnectionInfo {
-            url: url.clone(),
-            app: conn.app_info.clone(),
-            connected_at: conn.connected_at,
-            is_active: manager.active_url.as_deref() == Some(url.as_str()),
-            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
-            principal_class: conn
-                .activated_by
-                .as_ref()
-                .map_or("operator_trust", |p| p.class_str()),
-        })
-        .collect();
-
-    Json(ApiResponse::success(connections))
+    Json(ApiResponse::success(connection_infos(&manager)))
 }
 
 /// GET /ui-bridge/sdk/check-health — Check health of all connections, remove stale ones
@@ -4441,14 +4494,16 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
         }
     }
 
-    let active_healthy =
-        manager.active_url.is_some() && !stale_urls.contains(manager.active_url.as_ref().unwrap());
+    // A stale active connection was unset above. What is left is reported only if a
+    // dispatch would use it.
+    let active_url = manager.active_url_in_use().map(str::to_owned);
+    let active_healthy = active_url.is_some();
 
     Json(serde_json::json!({
         "success": true,
         "data": {
             "activeHealthy": active_healthy,
-            "activeUrl": manager.active_url,
+            "activeUrl": active_url,
             "results": results,
             "staleRemoved": stale_urls,
             "totalConnections": manager.connections.len(),
@@ -9831,6 +9886,68 @@ mod connect_bearer_scope_tests {
         assert!(manager.reuse_stored_connection(&url, true).is_none());
         assert!(!manager.connections.contains_key(&url));
         assert_eq!(manager.active_url, None);
+    }
+
+    /// The listings' `is_active`, and `active_url_in_use` (which `check-health` and
+    /// GraphQL read), name a connection active only while a dispatch would use it. A stored bearer client
+    /// whose port turned into a forwarder is still `active_url` until the re-check
+    /// drops it. It is listed as inactive and as sending the bearer off this machine,
+    /// which is what tells it apart from an ordinary inactive bearer client.
+    #[tokio::test]
+    async fn a_listing_never_calls_active_a_connection_a_dispatch_refuses() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (port, url, manager) = stored_connection(bearer).await;
+        let listed = |manager: &SdkConnectionManager| {
+            let infos = connection_infos(manager);
+            assert_eq!(infos.len(), 1);
+            let json = serde_json::to_value(&infos[0]).expect("serialize");
+            (
+                json["isActive"].clone(),
+                json["bearer"].clone(),
+                json["sendsBearerOffMachine"].clone(),
+            )
+        };
+        assert_eq!(
+            listed(&manager),
+            (
+                serde_json::json!(true),
+                serde_json::json!("sent"),
+                serde_json::json!(false)
+            )
+        );
+        assert!(manager.is_active(&url));
+        assert_eq!(manager.active_url_in_use(), Some(url.as_str()));
+
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        assert_eq!(manager.active_url.as_deref(), Some(url.as_str()));
+        assert!(manager.active_connection().is_none());
+        assert_eq!(
+            listed(&manager),
+            (
+                serde_json::json!(false),
+                serde_json::json!("sent"),
+                serde_json::json!(true)
+            )
+        );
+        assert!(!manager.is_active(&url));
+        assert_eq!(manager.active_url_in_use(), None);
+    }
+
+    /// Each bearer decision is listed under the name the connection routes document.
+    #[test]
+    fn a_bearer_decision_is_listed_in_snake_case() {
+        for (bearer, name) in [
+            (ConnectionBearer::Sent, "sent"),
+            (ConnectionBearer::WithheldFromTarget, "withheld_from_target"),
+            (
+                ConnectionBearer::WithheldListUnreadable,
+                "withheld_list_unreadable",
+            ),
+            (ConnectionBearer::Absent, "absent"),
+        ] {
+            assert_eq!(serde_json::to_value(bearer).expect("serialize"), name);
+        }
     }
 
     /// A device's own connection never held the bearer, so it stays in use.

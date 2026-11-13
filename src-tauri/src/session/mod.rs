@@ -57,6 +57,7 @@
 //! has fully absorbed the old surface.
 
 pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
+pub mod classify_child_shadow; // `classify_child` in SHADOW beside the finished_close census: logs would-admit/refuse, decides nothing (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a)
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
@@ -282,6 +283,7 @@ pub enum SessionEventKind {
     ///   "phase_name":     "Phase 2",                 // required
     ///   "continuation_spawn": { … },                 // optional
     ///   "clearance_audience": "operator",            // optional
+    ///   "expires_at":         "<rfc3339>",           // optional
     ///   "gate_class":         "…",                   // optional
     ///   "work_unit_upsert":   { "title": …, "status": … } // optional bootstrap
     /// }

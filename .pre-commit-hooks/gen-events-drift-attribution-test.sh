@@ -367,6 +367,7 @@ CODEGEN_INPUT_PINS=(
     src-tauri/scripts/generate_types.sh Cargo.toml Cargo.lock
     rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml
     crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs crates/pty-holder/src/lib.rs
+    crates/session-lifecycle/src/lib.rs
     vendor/tao-0.35.0/src/lib.rs vendor/portable-pty-0.8.1/src/lib.rs
     src-tauri/.cargo/config.toml .cargo/config.toml src-tauri/.cargo/config .cargo/config
     rust-toolchain src-tauri/rust-toolchain.toml src-tauri/rust-toolchain
