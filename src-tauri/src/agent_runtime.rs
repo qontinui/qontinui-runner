@@ -11472,6 +11472,18 @@ pub(crate) fn finalize_headless_child_env(
     // silently regresses. See `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(cmd);
 
+    // The same base PATH the PTY plane composes from: the runner's own entries,
+    // then the user's toolchain dirs (plan
+    // 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path, Phase 1).
+    // Before it, a headless child inherited the systemd unit's PATH verbatim,
+    // with no `~/.cargo/bin`. A runner with no PATH leaves the child's alone.
+    if let Some(base) = crate::terminal::child_path::child_base_path() {
+        cmd.env(
+            "PATH",
+            crate::terminal::child_path::compose_child_path(Some(&base), &[]),
+        );
+    }
+
     crate::terminal::scrub_credential_env_tokio(cmd);
 }
 

@@ -715,6 +715,31 @@ const G3_FRESHNESS_NO_SHIM: &str =
      MATERIALIZES it (this report refuses to), so a real child's PATH would carry one extra \
      leading entry — unless that materialize fails, which the seam handles fail-open";
 
+/// The sentence G3's freshness line ends with: which toolchain dirs a real
+/// child's base PATH appends after the runner's own entries, and where the
+/// login-shell read stands (plan
+/// `2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path`, Phase 1).
+/// The dirs are in this capture's PATH only when the identity shim is
+/// materialized (the composed path); otherwise a real child adds them.
+fn g3_toolchain_freshness(
+    appended: &[std::path::PathBuf],
+    shell_read: crate::terminal::child_path::LoginShellRead,
+) -> String {
+    let dirs = if appended.is_empty() {
+        "none (each is already on the runner's PATH, or absent)".to_string()
+    } else {
+        appended
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        ". Toolchain dirs a hosted child's PATH appends after the runner's own entries: {dirs} \
+         (login-shell read: {shell_read:?})"
+    )
+}
+
 /// Build the throwaway `CommandBuilder` that G3 reads, by CALLING the
 /// production spawn seam's own extracted env functions in the production order.
 ///
@@ -1010,7 +1035,7 @@ pub(crate) fn env_generations_section(
     };
 
     let (pty, identity_shim) = pty_child_command(config_dir);
-    let g3 = EnvGeneration::capture(
+    let mut g3 = EnvGeneration::capture(
         &fp,
         EnvGenerationSpec {
             id: "G3",
@@ -1028,6 +1053,10 @@ pub(crate) fn env_generations_section(
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect::<Vec<_>>(),
     );
+    g3.freshness.push_str(&g3_toolchain_freshness(
+        &crate::terminal::child_path::appended_toolchain_dirs(),
+        crate::terminal::child_path::login_shell_read_state(),
+    ));
 
     let divergence = diff_generations(
         &g1,
@@ -1909,6 +1938,23 @@ pub fn config_report_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn g3_toolchain_freshness_names_the_appended_dirs_and_the_read_state() {
+        use crate::terminal::child_path::LoginShellRead;
+        let line = g3_toolchain_freshness(
+            &[
+                std::path::PathBuf::from("/h/.cargo/bin"),
+                std::path::PathBuf::from("/h/.local/bin"),
+            ],
+            LoginShellRead::Answered,
+        );
+        assert!(line.contains("/h/.cargo/bin, /h/.local/bin"), "{line}");
+        assert!(line.contains("login-shell read: Answered"), "{line}");
+        let none = g3_toolchain_freshness(&[], LoginShellRead::Pending);
+        assert!(none.contains(": none ("), "{none}");
+        assert!(none.contains("login-shell read: Pending"), "{none}");
+    }
     use qontinui_runner_lib::config_report::LayerSpec;
 
     fn fixed_stamp() -> DateTime<Utc> {
@@ -4108,10 +4154,18 @@ mod tests {
                  it is the whole answer to \"why does a pane resolve `claude` to the shim?\": \
                  {names:?}"
             );
-            assert_eq!(g3.freshness, G3_FRESHNESS_WITH_SHIM);
+            assert!(
+                g3.freshness.starts_with(G3_FRESHNESS_WITH_SHIM),
+                "{}",
+                g3.freshness
+            );
             assert!(g3.freshness.contains("SHIM-PREPENDED"), "{}", g3.freshness);
         } else {
-            assert_eq!(g3.freshness, G3_FRESHNESS_NO_SHIM);
+            assert!(
+                g3.freshness.starts_with(G3_FRESHNESS_NO_SHIM),
+                "{}",
+                g3.freshness
+            );
             assert!(
                 g3.freshness.contains("UN-SHIMMED"),
                 "an un-shimmed capture must say so rather than letting the reader assume the \
@@ -4119,6 +4173,14 @@ mod tests {
                 g3.freshness
             );
         }
+        // Either way the line names the toolchain dirs a real child appends.
+        assert!(
+            g3.freshness.contains(
+                "Toolchain dirs a hosted child's PATH appends after the runner's own entries: "
+            ),
+            "{}",
+            g3.freshness
+        );
 
         // …and the bounded claim. Each of these is a seam step this report
         // refuses to reproduce because reproducing it WRITES.
