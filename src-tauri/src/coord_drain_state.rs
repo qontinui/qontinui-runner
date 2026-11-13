@@ -867,15 +867,28 @@ fn current_at(
     stale_after: Duration,
 ) -> CoordDrainState {
     apply_forced_drain(
-        effective_state(
-            inner.tracker.state(),
-            inner.last_fold,
-            inner.last_fold_at,
-            stale_after,
-            now,
-            now_utc,
-        ),
+        folded_at(inner, now, now_utc, stale_after),
         inner.forced_drain.as_deref(),
+    )
+}
+
+/// PURE: the state coord's reads alone give, WITHOUT the fixture's forced
+/// drain. The fold's own bookkeeping ([`DrainTracker::adopt_stale`]) reads this,
+/// so a silence still becomes `Unknown` underneath a forced drain and survives
+/// its release.
+fn folded_at(
+    inner: &Inner,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    stale_after: Duration,
+) -> CoordDrainState {
+    effective_state(
+        inner.tracker.state(),
+        inner.last_fold,
+        inner.last_fold_at,
+        stale_after,
+        now,
+        now_utc,
     )
 }
 
@@ -1273,9 +1286,11 @@ fn fold_locked(
     now_utc: DateTime<Utc>,
     stale_after: Duration,
 ) -> (Transition, CoordDrainState) {
-    let before = current_at(inner, now, now_utc, stale_after);
     // A silence that already read as `Unknown` stays that episode until a
-    // successful read ends it (see `adopt_stale`).
+    // successful read ends it (see `adopt_stale`). Read WITHOUT a forced drain:
+    // the override would hide the silence, and releasing it would then bring
+    // back a `Clear` no read has confirmed.
+    let before = folded_at(inner, now, now_utc, stale_after);
     inner.tracker.adopt_stale(&before);
     let transition = f(&mut inner.tracker, now_utc);
     inner.folded_once = true;
@@ -3195,6 +3210,31 @@ mod tests {
         assert!(!was);
         assert!(!emit);
         assert!(matches!(state, CoordDrainState::Drained { .. }));
+    }
+
+    /// A silence underneath a forced drain is still adopted as `Unknown`, so a
+    /// failed read during it does not bring back `Clear` when the override is
+    /// released.
+    #[test]
+    fn a_silence_under_a_forced_drain_is_still_unknown_after_its_release() {
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        set_forced_locked(&mut inner, Some("fixture".into()), base, t0(), STALE);
+        // The heartbeat goes silent past `stale_after`, then one read fails.
+        let (now, now_utc) = after(base, 600);
+        let (_, during) = fold_locked(
+            &mut inner,
+            |tr, now| tr.miss("network unreachable", now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert_eq!(during, drained_real("fixture"));
+        let (_, released, _) = set_forced_locked(&mut inner, None, now, now_utc, STALE);
+        assert!(
+            matches!(&released, CoordDrainState::Unknown { since, .. } if *since == t0()),
+            "a failed read after a silence must not restore Clear: got {released:?}"
+        );
     }
 
     /// There is no way to force `Clear`: whatever the override holds, the
