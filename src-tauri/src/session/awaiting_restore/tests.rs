@@ -429,6 +429,30 @@ fn a_closed_windows_late_report_is_refused_until_the_label_is_reopened() {
     );
 }
 
+/// With no open window reporting, a closed window's retained completions do
+/// not decide: they carry no layout, so on their own every layout page would
+/// read as an orphan the first restore adopted. The latch decides instead
+/// (Unknown once a restore set was handed out, nothing run before). Mutation:
+/// `pages` chaining the closed set while `live` is empty.
+#[test]
+fn closed_completions_alone_do_not_make_layout_pages_read_restored() {
+    use BootRestorePhase::{NotYetRun, Ran};
+    let mut reports = WindowReports::default();
+    reports.record("term-a", Some(report(&["p2"], &[])));
+    reports.forget("term-a");
+
+    assert_eq!(reports.pages(Ran), PagesRestored::Unknown);
+    assert_eq!(reports.pages(Ran).has_run("default"), None);
+    assert_eq!(reports.pages(NotYetRun).has_run("default"), Some(false));
+
+    reports.record("main", Some(report(&["default"], &[])));
+    assert_eq!(
+        reports.pages(Ran).has_run("p2"),
+        Some(true),
+        "with an open window reporting, the closed completion adds"
+    );
+}
+
 /// A closed window's `known` set is not kept: the open windows report the
 /// whole layout, so a page only the closed window listed is no longer a layout
 /// page, and its rows are orphans the first restore adopted. Mutation: `forget`
