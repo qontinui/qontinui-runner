@@ -394,6 +394,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/test/clear-lifecycle-store", R08),
     ("/ui-bridge/test/clear-sessions", R08),
     ("/ui-bridge/test/coord-mcp/seed-agent-token", R08),
+    ("/ui-bridge/test/force-coord-drain", R08),
     ("/ui-bridge/test/force-identity-evidence", R08),
     ("/ui-bridge/test/inject-errors", R08),
     ("/ui-bridge/test/inject-session", R08),

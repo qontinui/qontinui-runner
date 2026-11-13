@@ -1710,6 +1710,7 @@ POST /ui-bridge/test/clear-injected clear_injected_handler
 POST /ui-bridge/test/clear-lifecycle-store clear_lifecycle_store_handler
 POST /ui-bridge/test/clear-sessions clear_sessions_handler
 POST /ui-bridge/test/coord-mcp/seed-agent-token seed_agent_token_handler
+POST /ui-bridge/test/force-coord-drain force_coord_drain_handler
 POST /ui-bridge/test/force-identity-evidence force_identity_evidence_handler
 POST /ui-bridge/test/inject-errors inject_errors_handler
 POST /ui-bridge/test/inject-session inject_session_handler

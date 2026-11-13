@@ -2935,6 +2935,115 @@ async fn append_transcript_record_handler(
 }
 
 // =============================================================================
+// /ui-bridge/test/force-coord-drain  (one-way: force Drained, or release)
+// =============================================================================
+//
+// Plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
+// Phase 8. The Since-restart strip's deferred form, the ledger's `restoreOwed`
+// and the boot restore's withheld pages are all driven by coord's device
+// drain, which a temp runner (not a coord device, or one nobody drained) can
+// never reach. This route forces it [policy: the-ui-bridge-is-the-instrument].
+//
+//   - `{"action":"drain","reason"?:"…"}` forces `Drained` until released.
+//   - `{"action":"release"}` removes ONLY this route's own override. Whatever
+//     coord says is back in force — a REAL coord drain still holds.
+//
+// ## Why it is one-way
+//
+// `/ui-bridge/test/*` mounts on every `debug_assertions` build, a debug
+// PRIMARY included. A route able to force `Clear` could lift a real coord
+// drain on a live runner — and with it every autonomous spawn the drain is
+// holding. So there is no `clear` action and no state field: any other body
+// is a 400 (unknown fields are refused, not ignored), and the override itself
+// can only produce `Drained` (`coord_drain_state::apply_forced_drain`).
+//
+// ## Why it is an override and not a fold
+//
+// Coord's answer is re-folded on every 30 s heartbeat, so a write into the
+// folded state would be overwritten mid-test. The override is held beside the
+// fold and laid over it inside `coord_drain_state::current_at`, the one
+// accessor every drain reader goes through — the boot tab restore's
+// `terminal_session_list_open` (whose `deferredByDrain` answer is what the
+// webview reports as deferred pages, which the ledger's `restoreOwed` reads),
+// the lifecycle poll's census hold, the wind-down executor and the banner.
+
+/// What the route may do. There is deliberately no variant that clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForceCoordDrainAction {
+    Drain,
+    Release,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForceCoordDrainRequest {
+    pub action: ForceCoordDrainAction,
+    /// The reason the forced drain reads with (`drain` only).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceCoordDrainResponse {
+    pub success: bool,
+    /// Whether this route's override was in force before the call.
+    pub was_forced: bool,
+    /// Whether it is in force after it.
+    pub forced: bool,
+    /// The drain state every reader sees now.
+    pub snapshot: crate::coord_drain_state::CoordDrainSnapshot,
+}
+
+/// Parse a body, refusing anything but the two actions. A `reason` on a
+/// `release` is refused too: it would read as if the release carried a state.
+fn parse_force_coord_drain(body: &serde_json::Value) -> Result<ForceCoordDrainRequest, String> {
+    let req: ForceCoordDrainRequest = serde_json::from_value(body.clone()).map_err(|e| {
+        format!(
+            "expected {{\"action\":\"drain\",\"reason\"?:\"…\"}} or {{\"action\":\"release\"}} \
+             — this route can force a drain and release its own, never force clear ({e})"
+        )
+    })?;
+    if req.action == ForceCoordDrainAction::Release && req.reason.is_some() {
+        return Err("`reason` applies to `drain` only".to_string());
+    }
+    Ok(req)
+}
+
+async fn force_coord_drain_handler(
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ForceCoordDrainResponse>, (StatusCode, Json<InjectSessionError>)> {
+    let req = parse_force_coord_drain(&body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(InjectSessionError {
+                success: false,
+                error,
+            }),
+        )
+    })?;
+    let change = match req.action {
+        ForceCoordDrainAction::Drain => {
+            crate::coord_drain_state::force_drained(req.reason.as_deref())
+        }
+        ForceCoordDrainAction::Release => crate::coord_drain_state::release_forced_drain(),
+    };
+    info!(
+        action = ?req.action,
+        was_forced = change.was_forced,
+        state = change.state.label(),
+        "ui-bridge test fixture: force-coord-drain"
+    );
+    Ok(Json(ForceCoordDrainResponse {
+        success: true,
+        was_forced: change.was_forced,
+        forced: change.forced,
+        snapshot: crate::coord_drain_state::snapshot(),
+    }))
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -2966,6 +3075,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/test/seed-error-scenario",
             post(seed_error_scenario_handler),
+        )
+        .route(
+            "/ui-bridge/test/force-coord-drain",
+            post(force_coord_drain_handler),
         )
         .route(
             "/ui-bridge/test/force-identity-evidence",
@@ -3168,6 +3281,7 @@ mod tests {
             "/ui-bridge/test/inject-errors",
             "/ui-bridge/test/seed-error-scenario",
             "/ui-bridge/test/force-identity-evidence",
+            "/ui-bridge/test/force-coord-drain",
             "/ui-bridge/test/seed-lifecycle-store",
             "/ui-bridge/test/list-lifecycle-open",
             "/ui-bridge/test/clear-lifecycle-store",
@@ -3178,6 +3292,38 @@ mod tests {
             assert!(
                 src.contains(&format!("\"{route}\"")),
                 "route {route} must remain wired in test_fixtures::routes()",
+            );
+        }
+    }
+
+    /// The force-coord-drain body grammar is one-way: `drain` (with an optional
+    /// reason) and `release`, nothing else — no `clear` action, no state field,
+    /// no unknown field silently ignored.
+    #[test]
+    fn force_coord_drain_accepts_only_drain_and_release() {
+        let ok = |v: serde_json::Value| parse_force_coord_drain(&v).expect("accepted");
+        assert_eq!(
+            ok(serde_json::json!({"action": "drain"})).action,
+            ForceCoordDrainAction::Drain
+        );
+        let with_reason = ok(serde_json::json!({"action": "drain", "reason": "e2e"}));
+        assert_eq!(with_reason.reason.as_deref(), Some("e2e"));
+        assert_eq!(
+            ok(serde_json::json!({"action": "release"})).action,
+            ForceCoordDrainAction::Release
+        );
+        for refused in [
+            serde_json::json!({"action": "clear"}),
+            serde_json::json!({"action": "undrain"}),
+            serde_json::json!({"state": "clear"}),
+            serde_json::json!({"action": "drain", "state": "clear"}),
+            serde_json::json!({"action": "release", "state": "clear"}),
+            serde_json::json!({"action": "release", "reason": "x"}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                parse_force_coord_drain(&refused).is_err(),
+                "{refused} must be refused"
             );
         }
     }

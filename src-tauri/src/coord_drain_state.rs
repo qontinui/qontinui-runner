@@ -793,6 +793,11 @@ struct Inner {
     /// The dispatch role the last SUCCESSFUL read served. `None` when it served
     /// none (or one this build does not know). Kept across failed reads.
     dispatch_role: Option<DispatchRole>,
+    /// A drain FORCED by the debug-only UI Bridge fixture
+    /// (`POST /ui-bridge/test/force-coord-drain`), holding the reason it reads
+    /// with. See [`apply_forced_drain`]. Always `None` in a release build: only
+    /// the cfg-gated setters below ever write it.
+    forced_drain: Option<String>,
 }
 
 struct Global {
@@ -818,6 +823,7 @@ fn global() -> &'static Global {
                 last_emitted: None,
                 folded_once: false,
                 dispatch_role: None,
+                forced_drain: None,
             }),
             tx,
             boot_read_done: tokio::sync::Notify::new(),
@@ -860,14 +866,137 @@ fn current_at(
     now_utc: DateTime<Utc>,
     stale_after: Duration,
 ) -> CoordDrainState {
-    effective_state(
-        inner.tracker.state(),
-        inner.last_fold,
-        inner.last_fold_at,
-        stale_after,
-        now,
-        now_utc,
+    apply_forced_drain(
+        effective_state(
+            inner.tracker.state(),
+            inner.last_fold,
+            inner.last_fold_at,
+            stale_after,
+            now,
+            now_utc,
+        ),
+        inner.forced_drain.as_deref(),
     )
+}
+
+/// The reason a fixture-forced drain reads with when its caller gave none.
+pub const FORCED_DRAIN_DEFAULT_REASON: &str = "forced by the UI Bridge test fixture";
+
+/// PURE: lay a fixture-forced drain OVER the folded state.
+///
+/// This is the one place the override meets the state, and it sits inside
+/// [`current_at`], so every reader sees it: [`current`], [`drain_gate`] and
+/// [`drain_gate_for_work`] (the boot tab restore's `terminal_session_list_open`
+/// and the lifecycle poll's census hold both read the BootResume gate through
+/// them), [`autonomous_spawns_allowed_now`], [`snapshot`], and the fold's own
+/// before/after comparison. Holding it beside the tracker rather than writing
+/// it into the tracker is what lets it survive the 30 s heartbeat re-fold.
+///
+/// ONE-WAY by construction: an override can only ever produce `Drained`, so
+/// it can never lift a drain. A REAL drain is passed through unchanged (with
+/// coord's own `until` and operator `reason`), so releasing the override can
+/// only ever uncover what coord says.
+fn apply_forced_drain(folded: CoordDrainState, forced: Option<&str>) -> CoordDrainState {
+    match (forced, folded) {
+        (_, real @ CoordDrainState::Drained { .. }) => real,
+        (Some(reason), _) => CoordDrainState::Drained {
+            until: None,
+            reason: Some(reason.to_string()),
+        },
+        (None, folded) => folded,
+    }
+}
+
+/// PURE: set or clear the forced drain under the lock at an explicit clock.
+/// Returns whether one was forced before, the state now, and whether that state
+/// is a new episode to announce (the [`fold_locked`] rule: also announced when
+/// nothing has been announced yet, so a waiter parked before the first fold
+/// still wakes).
+#[cfg(any(test, debug_assertions, feature = "test-fixtures"))]
+fn set_forced_locked(
+    inner: &mut Inner,
+    forced: Option<String>,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    stale_after: Duration,
+) -> (bool, CoordDrainState, bool) {
+    let was_forced = inner.forced_drain.is_some();
+    inner.forced_drain = forced;
+    let after = current_at(inner, now, now_utc, stale_after);
+    let emit = inner
+        .last_emitted
+        .as_ref()
+        .is_none_or(|last| !same_episode(last, &after));
+    if emit {
+        inner.last_emitted = Some(after.clone());
+    }
+    if autonomous_allowed(&after, inner.dispatch_role) {
+        inner.deferred.clear();
+        inner.deferred_capped = false;
+    }
+    (was_forced, after, emit)
+}
+
+/// What a forced-drain change did, for the fixture route's response.
+#[cfg(any(test, debug_assertions, feature = "test-fixtures"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForcedDrainChange {
+    /// Whether an override was in force before this call.
+    pub was_forced: bool,
+    /// Whether an override is in force after it.
+    pub forced: bool,
+    /// The state every reader sees now.
+    pub state: CoordDrainState,
+}
+
+#[cfg(any(test, debug_assertions, feature = "test-fixtures"))]
+fn set_forced(forced: Option<String>) -> ForcedDrainChange {
+    let now_forced = forced.is_some();
+    let (was_forced, state, emit) = {
+        let mut inner = lock_inner();
+        let out = set_forced_locked(
+            &mut inner,
+            forced,
+            Instant::now(),
+            Utc::now(),
+            stale_after(),
+        );
+        if out.2 {
+            // Under the lock for the same reason as in `current`.
+            global().tx.send_replace(out.1.clone());
+        }
+        out
+    };
+    if emit {
+        log_transition(&state);
+        emit_snapshot();
+    }
+    ForcedDrainChange {
+        was_forced,
+        forced: now_forced,
+        state,
+    }
+}
+
+/// Force this process's drain state to `Drained` until
+/// [`release_forced_drain`], whatever coord says. DEBUG-ONLY: it exists for the
+/// UI Bridge fixture that drives the drain-deferred restore on a temp runner.
+/// There is deliberately no way to force `Clear` (see [`apply_forced_drain`]):
+/// `/ui-bridge/test/*` mounts on every debug build, a debug primary included.
+#[cfg(any(test, debug_assertions, feature = "test-fixtures"))]
+pub fn force_drained(reason: Option<&str>) -> ForcedDrainChange {
+    let reason = reason
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or(FORCED_DRAIN_DEFAULT_REASON);
+    set_forced(Some(reason.to_string()))
+}
+
+/// Remove ONLY the fixture's own override. The state falls back to what the
+/// fold holds — a real coord drain still holds.
+#[cfg(any(test, debug_assertions, feature = "test-fixtures"))]
+pub fn release_forced_drain() -> ForcedDrainChange {
+    set_forced(None)
 }
 
 /// Whether autonomous spawns run under `state` and `role` together.
@@ -1022,6 +1151,7 @@ pub fn snapshot_fixture(state: &CoordDrainState) -> CoordDrainSnapshot {
         last_emitted: None,
         folded_once: true,
         dispatch_role: None,
+        forced_drain: None,
     };
     snapshot_of(state, &inner)
 }
@@ -1669,6 +1799,7 @@ pub(crate) fn reset_global_for_test() {
     inner.last_emitted = None;
     inner.folded_once = false;
     inner.dispatch_role = None;
+    inner.forced_drain = None;
 }
 
 /// Serialises the tests that mutate the process-global role cache.
@@ -2094,6 +2225,7 @@ mod tests {
             last_emitted: Some(CoordDrainState::Clear),
             folded_once: true,
             dispatch_role: None,
+            forced_drain: None,
         }
     }
 
@@ -2473,6 +2605,7 @@ mod tests {
             last_emitted: None,
             folded_once: true,
             dispatch_role: None,
+            forced_drain: None,
         };
         let snap = snapshot_of(
             &CoordDrainState::Drained {
@@ -2788,6 +2921,7 @@ mod tests {
             last_emitted: None,
             folded_once: true,
             dispatch_role: Some(DispatchRole::CiNode),
+            forced_drain: None,
         };
         let snap = snapshot_of(&CoordDrainState::Clear, &inner);
         assert_eq!(
@@ -2912,6 +3046,217 @@ mod tests {
         for o in SpawnOrigin::ALL {
             assert_eq!(drain_gate(o), DrainGate::Allow, "{o:?}");
         }
+        reset_global_role().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // The UI Bridge fixture's forced drain (plan
+    // 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing,
+    // Phase 8): one-way, held above the fold.
+    // -----------------------------------------------------------------------
+
+    fn drained_real(reason: &str) -> CoordDrainState {
+        CoordDrainState::Drained {
+            until: None,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    fn unknown_x() -> CoordDrainState {
+        CoordDrainState::Unknown {
+            since: t0(),
+            cause: "x".to_string(),
+        }
+    }
+
+    fn boot_resume_gate(state: &CoordDrainState) -> DrainGate {
+        gate_with_role_at(state, None, SpawnOrigin::BootResume, t0())
+    }
+
+    #[test]
+    fn a_forced_drain_reads_drained_over_every_folded_state_but_a_real_drain() {
+        let forced = Some("fixture");
+        for folded in [
+            CoordDrainState::Clear,
+            unknown_x(),
+            CoordDrainState::NotEnrolled {
+                why: "no machine.json",
+            },
+        ] {
+            assert_eq!(
+                apply_forced_drain(folded.clone(), forced),
+                drained_real("fixture"),
+                "{folded:?}"
+            );
+        }
+        // A REAL drain keeps coord's own until and reason.
+        let until = Some(t0() + chrono::Duration::hours(1));
+        let real = CoordDrainState::Drained {
+            until,
+            reason: Some("operator rebuild".into()),
+        };
+        assert_eq!(apply_forced_drain(real.clone(), forced), real);
+        // No override: the folded state, untouched — including Clear.
+        assert_eq!(
+            apply_forced_drain(CoordDrainState::Clear, None),
+            CoordDrainState::Clear
+        );
+    }
+
+    /// The restore-gate reader is the BootResume gate over `current_at`; the
+    /// override reaches it there, and survives the 30 s heartbeat re-fold of a
+    /// coord `Clear` answer.
+    #[test]
+    fn a_forced_drain_is_seen_by_the_boot_restore_gate_and_survives_a_clear_refold() {
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        assert_eq!(
+            boot_resume_gate(&current_at(&inner, base, t0(), STALE)),
+            DrainGate::Allow
+        );
+
+        let (was, state, emit) =
+            set_forced_locked(&mut inner, Some("fixture".into()), base, t0(), STALE);
+        assert!(!was);
+        assert!(emit, "a Clear -> forced Drained flip must be announced");
+        assert_eq!(state, drained_real("fixture"));
+        assert!(matches!(
+            boot_resume_gate(&current_at(&inner, base, t0(), STALE)),
+            DrainGate::Defer {
+                class: DeferClass::Drained,
+                ..
+            }
+        ));
+
+        // The heartbeat re-folds coord's Clear; the override still holds.
+        let (now, now_utc) = after(base, 30);
+        let (_, after_fold) = fold_locked(
+            &mut inner,
+            |tr, now| tr.observe(DrainObservation::Clear, now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert_eq!(after_fold, drained_real("fixture"));
+        assert!(!boot_resume_gate(&after_fold).allows());
+    }
+
+    #[test]
+    fn releasing_the_override_removes_only_the_override_and_a_real_drain_still_holds() {
+        let base = Instant::now();
+        // Coord itself has drained the device.
+        let mut inner = inner_read_clear_at(base);
+        fold_locked(
+            &mut inner,
+            |tr, now| {
+                tr.observe(
+                    DrainObservation::Drained {
+                        until: None,
+                        reason: Some("operator rebuild".into()),
+                    },
+                    now,
+                )
+            },
+            base,
+            t0(),
+            STALE,
+        );
+        set_forced_locked(&mut inner, Some("fixture".into()), base, t0(), STALE);
+        let (was, state, _) = set_forced_locked(&mut inner, None, base, t0(), STALE);
+        assert!(was);
+        assert_eq!(state, drained_real("operator rebuild"));
+        assert!(!boot_resume_gate(&state).allows());
+
+        // Over a coord Clear, the release uncovers Clear — coord's answer, not
+        // the fixture's — and announces it so a parked restore re-runs.
+        let mut inner = inner_read_clear_at(base);
+        set_forced_locked(&mut inner, Some("fixture".into()), base, t0(), STALE);
+        let (_, state, emit) = set_forced_locked(&mut inner, None, base, t0(), STALE);
+        assert_eq!(state, CoordDrainState::Clear);
+        assert!(emit);
+        // Releasing when nothing is forced is a no-op, never a Clear.
+        let mut inner = inner_read_clear_at(base);
+        fold_locked(
+            &mut inner,
+            |tr, now| {
+                tr.observe(
+                    DrainObservation::Drained {
+                        until: None,
+                        reason: None,
+                    },
+                    now,
+                )
+            },
+            base,
+            t0(),
+            STALE,
+        );
+        let (was, state, emit) = set_forced_locked(&mut inner, None, base, t0(), STALE);
+        assert!(!was);
+        assert!(!emit);
+        assert!(matches!(state, CoordDrainState::Drained { .. }));
+    }
+
+    /// There is no way to force `Clear`: whatever the override holds, the
+    /// result never allows more than the folded state does.
+    #[test]
+    fn no_override_value_can_lift_a_drain() {
+        for folded in [
+            drained_real("operator"),
+            unknown_x(),
+            CoordDrainState::Clear,
+        ] {
+            for forced in [None, Some(""), Some("clear"), Some("fixture")] {
+                let out = apply_forced_drain(folded.clone(), forced);
+                assert!(
+                    !out.allows_autonomous_spawns() || folded.allows_autonomous_spawns(),
+                    "{folded:?} + {forced:?} lifted to {out:?}"
+                );
+            }
+        }
+    }
+
+    /// End to end through the process-global accessors every restore reader
+    /// calls: `drain_gate(BootResume)`, `autonomous_spawns_allowed_now`,
+    /// `snapshot`.
+    #[tokio::test]
+    async fn the_global_force_and_release_reach_every_restore_reader() {
+        let _g = ROLE_TEST_LOCK.lock().await;
+        reset_global_role().await;
+        cache_role_from_me_drain(r#"{"state":"clear"}"#);
+        assert!(drain_gate(SpawnOrigin::BootResume).allows());
+
+        let change = force_drained(Some("  "));
+        assert!(change.forced && !change.was_forced);
+        assert_eq!(change.state, drained_real(FORCED_DRAIN_DEFAULT_REASON));
+        assert!(matches!(
+            drain_gate(SpawnOrigin::BootResume),
+            DrainGate::Defer {
+                class: DeferClass::Drained,
+                ..
+            }
+        ));
+        assert!(!autonomous_spawns_allowed_now());
+        assert_eq!(snapshot().state, "drained");
+        assert_eq!(
+            *subscribe().borrow(),
+            drained_real(FORCED_DRAIN_DEFAULT_REASON)
+        );
+        // A heartbeat answering Clear does not lift it.
+        cache_role_from_me_drain(r#"{"state":"clear"}"#);
+        assert!(!drain_gate(SpawnOrigin::BootResume).allows());
+
+        let change = release_forced_drain();
+        assert!(change.was_forced && !change.forced);
+        assert_eq!(change.state, CoordDrainState::Clear);
+        assert!(drain_gate(SpawnOrigin::BootResume).allows());
+
+        // Over a real coord drain, the release leaves it in force.
+        cache_role_from_me_drain(r#"{"state":"drained","reason":"operator"}"#);
+        force_drained(None);
+        let change = release_forced_drain();
+        assert!(matches!(change.state, CoordDrainState::Drained { .. }));
+        assert!(!drain_gate(SpawnOrigin::BootResume).allows());
         reset_global_role().await;
     }
 }
