@@ -481,11 +481,12 @@ impl<T: Serialize> ApiResponse<T> {
 
     /// The error envelope for a surface that needed the workspace root and got
     /// the typed [`WorkspaceRootUnresolved`](qontinui_types::paths::WorkspaceRootUnresolved)
-    /// instead — the same body `/api-surface/scan` sends for that case: `error`
-    /// is the error's one operator sentence (never a re-wording), `code` is
-    /// `workspace_root_unresolved`, and `hint` carries the full shared refusal
-    /// envelope (discriminator, next action, the probe-order detail) for a
-    /// reader that renders refusals itself. Pair it with `422`.
+    /// instead — the same `error`/`code` as `/api-surface/scan`; `hint` carries
+    /// the full Refusal envelope. `error` is the error's one operator sentence
+    /// (never a re-wording), `code` is `workspace_root_unresolved`, and `hint`
+    /// is the shared refusal envelope (discriminator, next action, the
+    /// probe-order detail) for a reader that renders refusals itself — where
+    /// `/api-surface/scan` puts a plain string. Pair it with `422`.
     pub fn workspace_root_unresolved(
         unresolved: &qontinui_types::paths::WorkspaceRootUnresolved,
     ) -> Self {

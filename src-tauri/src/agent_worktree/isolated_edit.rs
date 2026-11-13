@@ -1437,34 +1437,46 @@ pub(crate) fn provision_session_cwd(
 /// The guarded fleet commands + skills + agent-definitions provisioning for one
 /// session cwd.
 ///
-/// Where the cwd's `.claude/` is repo-authored the skip is RECORDED, not only
-/// logged: one [`crate::capability_manifest::ProvisionReport`] per provisioner
-/// with every bundled unit skipped as [`SkipReason::RepoAuthored`], so the
-/// ledger — and the `[provisioned: …]` token of the session's served-corpus
-/// header line — say the session got none of them and why.
+/// Commands and skills are guarded WHOLE-TREE: where the cwd's `.claude/` is
+/// repo-authored the skip is RECORDED, not only logged — one
+/// [`crate::capability_manifest::ProvisionReport`] per provisioner with every
+/// bundled unit skipped as [`SkipReason::RepoAuthored`], so the ledger — and
+/// the `[provisioned: …]` token of the session's served-corpus header line —
+/// say the session got none of them and why.
+///
+/// Agent definitions are provisioned in BOTH arms. Their provisioner guards
+/// PER NAME (`provision_guard::KeepDecisions`, decided once before either layer
+/// writes): a definition the repository tracks is kept, and every other
+/// embedded definition is still written. A whole-tree skip would withhold
+/// `code-reviewer.md` and the rest from every repository that tracks so much as
+/// one `.claude/` path of its own — the qontinui-forge shape, which tracks only
+/// a repo-local `clone-implementer.md`.
 ///
 /// [`SkipReason::RepoAuthored`]: crate::capability_manifest::SkipReason::RepoAuthored
 fn provision_fleet_for_cwd(wd: &str) {
     if claude_tree_is_repo_authored(wd) {
         info!(
             workdir = %wd,
-            "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
-             authors its own skills/commands and the bundle must not clobber them"
+            "fleet provisioning: commands/skills skipped — this cwd's .claude/ is git-tracked, \
+             so the repo authors its own skills/commands and the bundle must not clobber them; \
+             agent definitions are still provisioned, guarded per name"
         );
         record_repo_authored_skip(wd);
     } else {
         crate::fleet_commands::provision_fleet_commands_for_session(wd);
         crate::fleet_skills::provision_fleet_skills_for_session(wd);
-        let _ = crate::agent_runtime::provision_agent_definitions_recorded(wd);
     }
+    let _ = crate::agent_runtime::provision_agent_definitions_recorded(wd);
 }
 
-/// Record the repo-authored skip against `wd` for every provisioner.
+/// Record the repo-authored skip against `wd` for the commands and skills
+/// provisioners.
 ///
-/// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry, every
-/// embedded skill file and every embedded agent definition — not the
-/// account-resolved registry: resolving that would fetch overrides for a pass
-/// that writes nothing.
+/// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry and every
+/// embedded skill file — not the account-resolved registry: resolving that
+/// would fetch overrides for a pass that writes nothing. Agent definitions are
+/// not on it: [`provision_fleet_for_cwd`] provisions them in this arm too, under
+/// their own per-name guard.
 fn record_repo_authored_skip(wd: &str) {
     use crate::capability_manifest::{record_provision, ProvisionReport, Rung, SkipReason};
 
@@ -1494,15 +1506,6 @@ fn record_repo_authored_skip(wd: &str) {
         }
     }
     record_provision(wd, skills);
-
-    let agents_dir = Path::new(wd).join(".claude").join("agents");
-    let agent_names = crate::fleet_agents::embedded_agent_names();
-    let mut agents = ProvisionReport::new("agent_definitions", agent_names.len(), Rung::Unresolved)
-        .with_destination(agents_dir.display().to_string());
-    for name in agent_names {
-        agents.skip(name, SkipReason::RepoAuthored);
-    }
-    record_provision(wd, agents);
 }
 
 /// What [`acquire_for_terminal`] does with the cwd `.mcp.json` for one spawn.
@@ -1915,24 +1918,37 @@ mod tests {
             .expect("a skills report");
         assert_eq!(skills.written, 0);
         assert_eq!(skills.skipped.len(), skills.expected);
-        let agents = ledger
+        // Agent definitions are NOT skipped whole-tree: the chokepoint runs their
+        // per-name-guarded provisioner, so this repo (which tracks no agent
+        // definition) receives every embedded one.
+        for report in ledger
             .reports
             .iter()
-            .find(|r| r.capability == "agent_definitions")
-            .expect("an agent_definitions report");
-        assert_eq!(agents.written, 0);
-        assert_eq!(
-            agents.skipped.len(),
-            crate::fleet_agents::embedded_agent_count()
-        );
-        assert!(agents
-            .skipped
-            .iter()
-            .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored));
+            .filter(|r| r.capability == "agent_definitions" || r.capability == "fleet_agents")
+        {
+            assert!(
+                !report
+                    .skipped
+                    .iter()
+                    .any(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored),
+                "{}: no agent definition is skipped as repo-authored: {:?}",
+                report.capability,
+                report.skipped
+            );
+        }
         assert!(
-            !root.join(".claude/agents").exists(),
-            "no agent definition is written into a repo-authored .claude/"
+            ledger
+                .reports
+                .iter()
+                .any(|r| r.capability == "agent_definitions"),
+            "the agent-definitions pass ran at the chokepoint and was recorded"
         );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(
+                root.join(".claude/agents").join(&name).exists(),
+                "{name} is provisioned into a repo-authored .claude/"
+            );
+        }
 
         let line = crate::served_corpus::probe(root).render_line();
         assert!(
@@ -1940,6 +1956,58 @@ mod tests {
                 "[provisioned: commands written=0/{m_commands} skipped-repo-authored={m_commands} as-of="
             )),
             "{line}"
+        );
+    }
+
+    /// A repo that tracks ONLY its own agent definition (the qontinui-forge
+    /// shape: a repo-local `clone-implementer.md`) is repo-authored for
+    /// commands/skills, yet still receives every OTHER embedded agent at the
+    /// chokepoint, and its own file is untouched. The per-name guard itself is
+    /// pinned in `agent_runtime`
+    /// (`provision_agent_defs_still_floor_a_repo_tracking_only_its_own_agent`);
+    /// this pins that the chokepoint reaches it in the repo-authored arm.
+    #[test]
+    fn a_repo_tracking_only_its_own_agent_still_receives_the_embedded_agents() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+        std::fs::write(
+            root.join(".claude/agents/clone-implementer.md"),
+            b"# repo-local",
+        )
+        .unwrap();
+        git(root, &["add", ".claude"]);
+        git(root, &["commit", "-qm", "track own agent"]);
+        let wd = root.to_str().unwrap();
+        assert!(
+            claude_tree_is_repo_authored(wd),
+            "a tracked agent file makes the tree repo-authored"
+        );
+
+        provision_fleet_for_cwd(wd);
+
+        assert_eq!(
+            std::fs::read(root.join(".claude/agents/clone-implementer.md")).unwrap(),
+            b"# repo-local",
+            "the repo's own agent definition is untouched"
+        );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            if name == "clone-implementer.md" {
+                continue;
+            }
+            assert!(
+                root.join(".claude/agents").join(&name).exists(),
+                "{name} must still be provisioned at the chokepoint"
+            );
+        }
+        assert!(
+            !root.join(".claude/commands").exists(),
+            "commands stay whole-tree skipped in a repo-authored .claude/"
         );
     }
 

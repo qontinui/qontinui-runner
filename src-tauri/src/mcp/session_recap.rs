@@ -426,8 +426,8 @@ fn compute_start_time(
 /// - the walk was capped at 10 ancestors for no stated reason.
 ///
 /// Fails closed, because the recap's error is surfaced straight to the caller as
-/// a 500 and a fabricated root would silently produce an empty recap that reads
-/// like "nothing changed".
+/// a typed 422 (`workspace_root_unresolved`) and a fabricated root would
+/// silently produce an empty recap that reads like "nothing changed".
 fn find_qontinui_root() -> Result<PathBuf, qontinui_types::paths::WorkspaceRootUnresolved> {
     crate::workspace_paths::require_workspace_root()
 }

@@ -1883,13 +1883,29 @@ async fn capability_manifest_provision_probe(
     // `session_repo` is READ, never written: it only answers which workspace root
     // a session opened on it resolves. It is vetted before the probe creates
     // anything, and passed to the resolver as the caller spelled it (the
-    // resolver folds lexically and refuses `.`/`..` itself; canonicalizing here
-    // would hand it a Windows `\\?\` path no other rung produces).
+    // resolver folds lexically and refuses `.`/`..` itself, and this vetting
+    // refuses them too so the typed 400 names them; canonicalizing here would
+    // hand it a Windows `\\?\` path no other rung produces).
     if let Some(repo) = &session_repo {
         let repo_path = std::path::Path::new(repo);
         let refusal = if !repo_path.is_absolute() {
             Some(format!(
                 "session_repo must be an absolute path to a git checkout's top level; got {repo:?}."
+            ))
+        } else if repo_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }) || repo
+            // `Path::components` normalizes an interior `.` away (`/a/./b`
+            // yields no `CurDir`), so the raw segments are checked as well.
+            .split(['/', '\\'])
+            .any(|seg| seg == "." || seg == "..")
+        {
+            Some(format!(
+                "session_repo must not contain `.` or `..` components; got {repo:?}. Spell \
+                 the checkout's top level directly."
             ))
         } else if !repo_path.is_dir() {
             Some(format!(
@@ -24610,9 +24626,26 @@ mod provision_probe_tests {
             return;
         }
 
+        // `.`/`..` components are refused even when the path they spell would
+        // resolve to the real checkout.
+        let with_parent = root
+            .path()
+            .join("plain-folder")
+            .join("..")
+            .join("foreign-repo");
+        let with_cur_dir = format!("{}/./", repo.display());
+        let with_interior_cur_dir = root
+            .path()
+            .join(".")
+            .join("foreign-repo")
+            .display()
+            .to_string();
         for bad in [
             not_a_checkout.display().to_string(),
             "relative/repo".to_string(),
+            with_parent.display().to_string(),
+            with_cur_dir,
+            with_interior_cur_dir,
         ] {
             let (status, body) = probe_with(&scratch.display().to_string(), Some(&bad)).await;
             assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
