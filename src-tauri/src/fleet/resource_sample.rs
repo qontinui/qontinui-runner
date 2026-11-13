@@ -1253,7 +1253,10 @@ fn collect_host_lane() -> ResourceSample {
 
     // The runner's build lane IS its `ci_node` executor, so slots and CI jobs
     // are the same occupancy read two ways. The supervisor publishes the
-    // Windows build pool's slots under `source='supervisor'`.
+    // Windows build pool's slots under `source='supervisor'`. The total is what
+    // admission admits against: with the capacity model (plan 2026-11-05
+    // Phase 7) an unset capacity follows the box's load, so busy can briefly
+    // read above total after the model lowers it.
     let ci = crate::settings::get_ci_node_settings();
     let (running, queued) = crate::ci_node::admission::occupancy();
     if ci.enabled {

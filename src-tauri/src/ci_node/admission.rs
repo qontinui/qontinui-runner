@@ -13,6 +13,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -285,8 +287,9 @@ pub(crate) fn defer_commit_floor_gb(session_warn_floor_bytes: Option<u64>) -> u6
 /// [`CiNodeSettings::effective_max_concurrent_builds_for`] over a host probe —
 /// resolved ONCE by the caller (next to [`probe_headroom`], outside the state
 /// lock) and passed in, so an unset `max_concurrent_builds` never makes this
-/// function probe the host. The same number gates the under-lock re-check in
-/// `start_build` and sizes the dispatch's host share in the executor.
+/// function probe the host or read the capacity model. The same number gates
+/// the under-lock re-check in `start_build`; the executor's host share is the
+/// static partition it never exceeds (`CiNodeSettings::dispatch_share_for`).
 ///
 /// Order is load-bearing: **rejects first, then defers.** Nothing below the
 /// allowlist check can turn a `Defer` into a `Reject`, which is the property
@@ -634,6 +637,10 @@ pub(crate) fn commit_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
 struct CiState {
     /// dispatch_id → cancel token for the running build.
     running: HashMap<String, CancellationToken>,
+    /// dispatch_id → when it started, for every entry of `running`: what the
+    /// capacity model's sizing counts against a sample's instant
+    /// ([`running_started_by`]).
+    started_at: HashMap<String, DateTime<Utc>>,
     /// Deferred (at-cap, or below headroom) dispatches, FIFO.
     queued: VecDeque<CiDispatchPayload>,
     /// A [`spawn_headroom_waker`] task is in flight. At most one, ever —
@@ -647,6 +654,7 @@ fn ci_state() -> &'static Mutex<CiState> {
     STATE.get_or_init(|| {
         Mutex::new(CiState {
             running: HashMap::new(),
+            started_at: HashMap::new(),
             queued: VecDeque::new(),
             waker_armed: false,
         })
@@ -659,6 +667,59 @@ fn ci_state() -> &'static Mutex<CiState> {
 pub(crate) fn occupancy() -> (usize, usize) {
     let state = ci_state().lock().unwrap();
     (state.running.len(), state.queued.len())
+}
+
+/// How many of `started_at`'s dispatches had started by `t`. PURE.
+fn started_by(started_at: &HashMap<String, DateTime<Utc>>, t: DateTime<Utc>) -> usize {
+    started_at.values().filter(|started| **started <= t).count()
+}
+
+/// The dispatches running now that had started by `t` — the ones a capacity
+/// sample taken at `t` already saw (`host_sizing`, plan
+/// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci` Phase 7).
+/// Takes `ci_state`'s lock: never call it while holding that lock.
+pub(crate) fn running_started_by(t: DateTime<Utc>) -> usize {
+    let state = ci_state().lock().unwrap();
+    started_by(&state.started_at, t)
+}
+
+/// How many deferred dispatches a cap rise from `last_cap` to `cap` may
+/// re-admit with `running` builds running and `queued` waiting: the room the
+/// rise opened, only when the cap ROSE. PURE.
+fn room_opened(last_cap: u32, cap: u32, running: usize, queued: usize) -> usize {
+    if cap <= last_cap {
+        return 0;
+    }
+    (cap as usize).saturating_sub(running).min(queued)
+}
+
+/// Re-admit deferred dispatches when the node's cap ROSE. The capacity model
+/// (plan `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+/// Phase 7) can raise an unset cap without a build finishing, and a finished
+/// build is otherwise the only thing that drains a dispatch deferred at the
+/// cap — it would wait while the model reports free slots. Called from the
+/// budget republisher's tick. Takes `ci_state`'s lock itself, and the cap read
+/// takes it too, so never call it while holding that lock.
+pub(crate) fn drain_deferred_on_cap_rise() {
+    static LAST_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    let settings = crate::settings::get_ci_node_settings();
+    if !settings.enabled {
+        return;
+    }
+    let cap = settings.effective_max_concurrent_builds_for(super::host_sizing::probe());
+    let last_cap = LAST_CAP.swap(cap, std::sync::atomic::Ordering::Relaxed);
+    let ready: Vec<CiDispatchPayload> = {
+        let mut state = ci_state().lock().unwrap();
+        let n = room_opened(last_cap, cap, state.running.len(), state.queued.len());
+        state.queued.drain(..n).collect()
+    };
+    for payload in ready {
+        info!(
+            "ci_node: capacity rose to {cap} — re-admitting deferred dispatch {}",
+            payload.dispatch_id
+        );
+        submit(payload);
+    }
 }
 
 /// Coord base for reporting on a payload (payload-pinned URL first, profile
@@ -704,8 +765,10 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
     let headroom = probe_headroom();
     // The capacity is resolved here, once, for the same reason: an unset
     // `max_concurrent_builds` resolves to the host suggestion, which probes the
-    // host. `admission_decision`, the under-lock re-check and the executor's
-    // host share all use this one number.
+    // host and reads the capacity model (taking this state's lock, so it must
+    // run before the lock below). `admission_decision` and the under-lock
+    // re-check use this one number; the executor's host share is the static
+    // partition it never exceeds.
     let host = super::host_sizing::probe();
     let max_concurrent = settings.effective_max_concurrent_builds_for(host);
     let decision = {
@@ -805,8 +868,10 @@ fn spawn_headroom_waker() {
 /// with a fresh cancel token registered under the dispatch_id.
 ///
 /// `host` and `max_concurrent` are the probe and resolved capacity `submit`
-/// admitted against; they are threaded through so the re-check and the
-/// executor's per-dispatch host share use the same N.
+/// admitted against; they are threaded through so the re-check uses the same
+/// N. The executor's per-dispatch host share is the static partition of `host`
+/// (or the operator's value), which the admitted N never exceeds
+/// (`CiNodeSettings::dispatch_share_for`).
 fn start_build(
     payload: CiDispatchPayload,
     settings: CiNodeSettings,
@@ -888,6 +953,9 @@ fn start_build(
         state
             .running
             .insert(payload.dispatch_id.clone(), token.clone());
+        state
+            .started_at
+            .insert(payload.dispatch_id.clone(), Utc::now());
     }
 
     let dispatch_id = payload.dispatch_id.clone();
@@ -895,8 +963,14 @@ fn start_build(
         "ci_node: starting dispatch {} repo={} sha={} check_name={:?}",
         dispatch_id, payload.repo, payload.head_sha, payload.check_name
     );
+    // The executor sizes this dispatch as one of N equal host shares, N the
+    // static partition (or the operator's value). With the capacity model
+    // (plan 2026-11-05 Phase 7) the admitted total is at most N and falls
+    // below it on a busy box, so the shares never oversubscribe the host —
+    // `CiNodeSettings::dispatch_share_for`.
+    let share_n = settings.dispatch_share_for(host);
     tokio::spawn(async move {
-        super::executor::run_dispatch(payload, root, token, host, max_concurrent).await;
+        super::executor::run_dispatch(payload, root, token, host, share_n).await;
         on_build_finished(&dispatch_id);
     });
 }
@@ -908,6 +982,7 @@ fn on_build_finished(dispatch_id: &str) {
     let next = {
         let mut state = ci_state().lock().unwrap();
         state.running.remove(dispatch_id);
+        state.started_at.remove(dispatch_id);
         state.queued.pop_front()
     };
     if let Some(payload) = next {
@@ -1019,9 +1094,47 @@ mod tests {
             cpus: 48,
         };
 
-    /// The capacity `submit` would resolve for `s` — here against [`TEST_HOST`].
+    /// The capacity `submit` would resolve for `s` against [`TEST_HOST`] when
+    /// the capacity model does not answer (its static suggestion) — pure, so
+    /// no process-global read or dial can change it.
     fn cap_of(s: &CiNodeSettings) -> u32 {
-        s.effective_max_concurrent_builds_for(TEST_HOST)
+        s.effective_max_concurrent_builds_with(
+            super::super::host_sizing::suggested_concurrent_builds(TEST_HOST),
+        )
+    }
+
+    /// A cap rise re-admits what it made room for, and only a rise does; the
+    /// first tick (no previous cap) re-admits nothing.
+    #[test]
+    fn only_a_cap_rise_reopens_deferred_dispatches() {
+        assert_eq!(room_opened(3, 5, 3, 4), 2);
+        assert_eq!(room_opened(3, 5, 4, 1), 1);
+        assert_eq!(room_opened(5, 5, 0, 4), 0, "no rise, no drain");
+        assert_eq!(room_opened(5, 3, 0, 4), 0, "a fall drains nothing");
+        assert_eq!(room_opened(u32::MAX, 5, 0, 4), 0, "the first tick");
+        assert_eq!(room_opened(3, 5, 9, 4), 0, "still over the new cap");
+    }
+
+    /// The sizing counts only the dispatches that had started by the sample's
+    /// instant: one started after it is inside the slots the sample served.
+    #[test]
+    fn only_dispatches_started_by_the_instant_are_counted() {
+        let t = DateTime::parse_from_rfc3339("2026-11-13T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let started_at: HashMap<String, DateTime<Utc>> = [
+            ("before".to_string(), t - chrono::Duration::seconds(90)),
+            ("at".to_string(), t),
+            ("after".to_string(), t + chrono::Duration::seconds(5)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(started_by(&started_at, t), 2);
+        assert_eq!(
+            started_by(&started_at, t - chrono::Duration::seconds(91)),
+            0
+        );
+        assert_eq!(started_by(&HashMap::new(), t), 0);
     }
 
     /// Plan 2026-09-22-ci-capacity-...: an UNSET capacity admits up to the host

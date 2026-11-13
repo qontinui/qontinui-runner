@@ -448,6 +448,122 @@ fn set_floors(floors: SessionFloorsByLane) {
 }
 
 // ===========================================================================
+// Process-global cache #7 — the capacity-model dial (D9)
+// ===========================================================================
+//
+// Numbered #7 though it sits here: it is read off the same `fleet_resources`
+// answer as the floors above (cache #2), so it lives beside them.
+//
+// The dial is plan `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+// D9: `capacity_model_mode` (`off` | `enforce`) and the consumers switched
+// off, which coord resolves into one `capacity_model` block on every
+// `GET /coord/fleet-policy` answer (qontinui-coord
+// `fleet_policy_capacity_model.rs` `CapacityModelDial::view`:
+// `{mode, mode_source, off_consumers, ignored_off_consumers,
+// permitted_consumers, consumers}`). The runner does not interpret it: it
+// hands the block on exactly as coord served it (the runner's loopback route
+// `GET /fleet/capacity` serves it to local tools), and each consumer reads its
+// own name in `permitted_consumers`.
+//
+// D9's fail-safe is the consumer's, and this cache holds the half of it a
+// cache can: a dial is recorded only from a 2xx that CARRIED one. Coord serves
+// `capacity_model: null` whenever it could not read the dial, and that is no
+// reading — D9 forbids resolving an unread dial to NULL's `enforce` — so it,
+// a failed poll, a 401/404 and an unpaired skip all leave the last good dial
+// standing. Before the first one the cache is empty, which a consumer reads as
+// UNKNOWN and so keeps its legacy reader.
+//
+// Keeping the last good dial means a dial can be old, so it is never handed on
+// without its age: `capacity_model_view` serves it with `read_at` and
+// `age_secs`, and a consumer that wants a staleness rule reads them there.
+
+/// One recorded dial: the block as coord served it, and when it was read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapacityModelReading {
+    /// The `capacity_model` block, unchanged.
+    pub(crate) dial: serde_json::Value,
+    /// When the poll that carried it was answered.
+    pub(crate) read_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CapacityModelReading {
+    /// Seconds from `read_at` to `now`, to the millisecond; 0 for a `now`
+    /// before it (a wall clock stepped back).
+    pub(crate) fn age_secs(&self, now: chrono::DateTime<chrono::Utc>) -> f64 {
+        (now - self.read_at).num_milliseconds().max(0) as f64 / 1000.0
+    }
+}
+
+static CAPACITY_MODEL: OnceLock<RwLock<Option<CapacityModelReading>>> = OnceLock::new();
+
+fn capacity_model_cache() -> &'static RwLock<Option<CapacityModelReading>> {
+    CAPACITY_MODEL.get_or_init(|| RwLock::new(None))
+}
+
+/// The last capacity-model dial coord served this process, or `None` before
+/// the first (and on a poisoned lock): UNKNOWN, never a default dial.
+/// SYNCHRONOUS + lock-only, like the other caches here.
+pub(crate) fn capacity_model_dial() -> Option<CapacityModelReading> {
+    capacity_model_cache().read().ok().and_then(|g| g.clone())
+}
+
+/// The dial as it is served beside a capacity read, at `now`:
+/// `{"state":"known","value":<the block, unchanged>,"read_at":<RFC 3339>,
+/// "age_secs":<f64>}`, or `{"state":"unknown","reason":…}` before the first
+/// dial-carrying answer — which a consumer reads as "keep the legacy reader",
+/// never as a default dial. The age is there because the last good dial is
+/// kept however old it gets (D9), so a stale one is visible, not hidden.
+pub(crate) fn capacity_model_view(now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    dial_view(capacity_model_dial(), now)
+}
+
+/// [`capacity_model_view`] of `reading`. PURE.
+fn dial_view(
+    reading: Option<CapacityModelReading>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    match reading {
+        Some(r) => serde_json::json!({
+            "state": "known",
+            "read_at": r.read_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "age_secs": r.age_secs(now),
+            "value": r.dial,
+        }),
+        None => serde_json::json!({
+            "state": "unknown",
+            "reason": "this runner's fleet-policy poller has not read the capacity-model dial \
+                       (GET /coord/fleet-policy?domain=fleet_resources) yet: unpaired, coord \
+                       unreachable, or coord could not read the dial — keep the legacy reader",
+        }),
+    }
+}
+
+/// The dial a `fleet_resources` answer carries: its `capacity_model` block
+/// when that is an object. `null` (coord could not read the dial), an absent
+/// field (a coord that predates the dial) and any other shape carry none.
+/// PURE.
+fn capacity_model_from(body: &FleetPolicyResponse) -> Option<&serde_json::Value> {
+    body.capacity_model.as_ref().filter(|d| d.is_object())
+}
+
+/// Record `dial` as the last good one. Internal — only the controls poll
+/// calls this, and only with a dial a 2xx carried.
+fn record_capacity_model(dial: &serde_json::Value) {
+    record_dial_in(capacity_model_cache(), dial);
+}
+
+/// [`record_capacity_model`] into `cache` (a test's own, so it never touches
+/// the process-global one other tests read).
+fn record_dial_in(cache: &RwLock<Option<CapacityModelReading>>, dial: &serde_json::Value) {
+    if let Ok(mut g) = cache.write() {
+        *g = Some(CapacityModelReading {
+            dial: dial.clone(),
+            read_at: chrono::Utc::now(),
+        });
+    }
+}
+
+// ===========================================================================
 // Process-global cache #3 — the tenant-wide plan-capture level
 // ===========================================================================
 
@@ -2418,6 +2534,11 @@ struct FleetPolicyResponse {
     /// The §D1 controls object, `null` when coord cannot read the columns.
     #[serde(default)]
     controls: Option<ControlsPayload>,
+    /// The capacity-model dial (D9), kept as coord served it for cache #7
+    /// ([`capacity_model_from`]); `null` when coord could not read it, absent
+    /// on a coord that predates it.
+    #[serde(default)]
+    capacity_model: Option<serde_json::Value>,
 }
 
 /// The subset of coord's `controls` object this poller reads: the four
@@ -3695,7 +3816,14 @@ async fn poll_egress_with<F, Fut>(
 /// current.
 async fn poll_controls_once() -> ControlsOutcome {
     match fetch_fleet_policy(CONTROLS_DOMAIN).await {
-        Ok(body) => ControlsOutcome::Updated(session_floors_from(&body)),
+        Ok(body) => {
+            // Cache #7 rides the same answer. Only a 2xx that carried a dial
+            // records one; every other arm below leaves the last good dial.
+            if let Some(dial) = capacity_model_from(&body) {
+                record_capacity_model(dial);
+            }
+            ControlsOutcome::Updated(session_floors_from(&body))
+        }
         Err(FetchError::NoJwt) => ControlsOutcome::SkippedNoJwt,
         Err(FetchError::AuthOrAbsent(status)) => ControlsOutcome::Reset(status),
         Err(FetchError::Failed(e)) => ControlsOutcome::Kept(e),
@@ -3843,6 +3971,95 @@ mod tests {
         assert_eq!(decide(r#"{"status":"ok"}"#), CapabilityCheck::Capable);
         // Empty body ⇒ capable.
         assert_eq!(decide(r#"{}"#), CapabilityCheck::Capable);
+    }
+
+    // =======================================================================
+    // Capacity-model dial, cache #7 (plan 2026-11-05 D9)
+    // =======================================================================
+
+    /// The dial a `fleet_resources` answer carries is its `capacity_model`
+    /// object, unchanged; `null` (coord could not read it), an absent field (an
+    /// older coord) and another shape carry none — D9 forbids reading an unread
+    /// dial as NULL's `enforce`.
+    #[test]
+    fn the_dial_is_the_capacity_model_object_and_an_unread_one_is_none() {
+        let dial = serde_json::json!({
+            "mode": "enforce", "mode_source": "default", "off_consumers": [],
+            "ignored_off_consumers": [], "permitted_consumers": ["local_builds"],
+            "consumers": ["local_builds"]
+        });
+        let with = serde_json::json!({"domain": "fleet_resources", "capacity_model": dial});
+        let body: FleetPolicyResponse = serde_json::from_value(with).expect("decode");
+        assert_eq!(capacity_model_from(&body), Some(&dial));
+        for unread in [
+            serde_json::json!({"domain": "fleet_resources", "capacity_model": null}),
+            serde_json::json!({"domain": "fleet_resources"}),
+            serde_json::json!({"domain": "fleet_resources", "capacity_model": "enforce"}),
+        ] {
+            let body: FleetPolicyResponse = serde_json::from_value(unread.clone()).expect("decode");
+            assert_eq!(capacity_model_from(&body), None, "{unread}");
+        }
+    }
+
+    /// A recorded dial is kept unchanged with when it was read, and a later
+    /// one replaces it; nothing but a dial-carrying answer ever writes it, so
+    /// an answer carrying none leaves the last good one standing.
+    #[test]
+    fn the_last_recorded_dial_is_kept_unchanged() {
+        let cache = RwLock::new(None);
+        let first = serde_json::json!({"mode": "off", "permitted_consumers": []});
+        record_dial_in(&cache, &first);
+        let read = cache.read().unwrap().clone().expect("a recorded dial");
+        assert_eq!(read.dial, first);
+        assert!(read.read_at <= chrono::Utc::now());
+        let second =
+            serde_json::json!({"mode": "enforce", "permitted_consumers": ["local_builds"]});
+        record_dial_in(&cache, &second);
+        assert_eq!(
+            cache.read().unwrap().as_ref().map(|r| &r.dial),
+            Some(&second)
+        );
+    }
+
+    /// The dial is served as the poller read it, block unchanged, with when
+    /// it was read and its age — a kept dial can be old, and that shows; with
+    /// no reading it is UNKNOWN with why, never a default dial.
+    #[test]
+    fn the_dial_is_served_with_its_age_or_as_unknown() {
+        let block = serde_json::json!({"mode": "enforce", "mode_source": "default",
+                                       "permitted_consumers": ["local_builds"]});
+        let read_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let reading = CapacityModelReading {
+            dial: block.clone(),
+            read_at,
+        };
+        let known = dial_view(
+            Some(reading.clone()),
+            read_at + chrono::Duration::seconds(30),
+        );
+        assert_eq!(known["state"], "known");
+        assert_eq!(known["value"], block, "the block, unchanged");
+        assert_eq!(known["age_secs"], 30.0);
+        assert_eq!(
+            known["read_at"],
+            read_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        );
+        // Kept for an hour with no newer dial: still served, and its age says so.
+        let stale = dial_view(Some(reading.clone()), read_at + chrono::Duration::hours(1));
+        assert_eq!(stale["age_secs"], 3600.0);
+        // A wall clock stepped back never serves a negative age.
+        assert_eq!(
+            reading.age_secs(read_at - chrono::Duration::seconds(5)),
+            0.0
+        );
+
+        let unknown = dial_view(None, chrono::Utc::now());
+        assert_eq!(unknown["state"], "unknown");
+        assert!(unknown.get("value").is_none(), "no default dial: {unknown}");
+        assert!(unknown["reason"]
+            .as_str()
+            .unwrap()
+            .contains("legacy reader"));
     }
 
     // =======================================================================
