@@ -420,7 +420,7 @@ enum HistoryProbe {
     /// The probe answered cleanly and the history holds none of them.
     No,
     /// The probe gave no usable answer; `why` is `timeout`, `exit <N>`,
-    /// `killed by signal` or `spawn failed (<error>)`.
+    /// `killed by signal`, `spawn failed (<error>)` or `wait failed (<error>)`.
     NoAnswer { why: String },
 }
 
@@ -528,7 +528,7 @@ fn foreign_destination_reason_with(
             HistoryProbe::No => {}
             HistoryProbe::NoAnswer { why } => {
                 return Some(SkipReason::OperatorAuthored(format!(
-                    "kept: ownership probe did not answer ({why}); blob {own} is not one \
+                    "ownership probe did not answer ({why}); blob {own} is not one \
                      this runner ships, and whether the overlay checkout's history holds \
                      it is UNKNOWN"
                 )))
@@ -691,7 +691,7 @@ pub(crate) fn write_atomically(
                 // reached here (callers skip symlinks), and its target's mode
                 // would be the honest one to keep anyway.
                 let mode = std::fs::metadata(dst)
-                    .map(|m| m.permissions().mode() & 0o7777)
+                    .map(|m| (m.permissions().mode() & 0o777) | 0o400)
                     .unwrap_or(0o644);
                 tmp.as_file()
                     .set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -1175,7 +1175,7 @@ mod tests {
             panic!("{reason:?}");
         };
         assert!(
-            why.starts_with("kept: ownership probe did not answer (exit "),
+            why.starts_with("ownership probe did not answer (exit "),
             "{why}"
         );
         assert!(!why.contains("ships or shipped"), "{why}");

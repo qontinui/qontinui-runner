@@ -8064,8 +8064,12 @@ async fn run_continuation_terminal(
         // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
         // no qontinui-claude-config checkout has no skills dir at all.
         crate::fleet_skills::provision_fleet_skills_for_session(workdir);
-        // And the named-subagent defs (embedded floor + checkout overlay).
-        provision_agent_definitions_recorded(workdir);
+        // And the named-subagent defs (embedded floor + checkout overlay). Off
+        // the async worker: the ownership probe may run git per destination.
+        {
+            let wd = workdir.to_string();
+            let _ = spawn_blocking_tracked(move || provision_agent_definitions_recorded(&wd)).await;
+        }
 
         // The PTY seam derives workspace trust for the pinned account through the
         // trust gate's SYNC door, which can only read the dial cache. Warm it here,
@@ -10503,7 +10507,11 @@ async fn run_agent_subprocess(
     // headless `claude` can resolve subagents the spawn prompt references
     // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
     // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    provision_agent_definitions_recorded(&primary_wt);
+    // Off the async worker: the ownership probe may run git per destination.
+    {
+        let wt = primary_wt.clone();
+        let _ = spawn_blocking_tracked(move || provision_agent_definitions_recorded(&wt)).await;
+    }
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
