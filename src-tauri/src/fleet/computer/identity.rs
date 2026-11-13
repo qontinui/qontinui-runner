@@ -176,6 +176,8 @@ pub(crate) struct StaticFacts {
     pub(crate) swap_total_bytes: Option<u64>,
     pub(crate) disk_total_bytes: Option<u64>,
     pub(crate) booted_at: Option<String>,
+    /// `null` = UNKNOWN, `[]` = measured none — [`super::gpu`].
+    pub(crate) gpus: Option<Vec<super::gpu::Gpu>>,
 }
 
 /// Seconds-since-epoch → RFC3339; `0` (sysinfo's "could not read") is `None`.
@@ -215,6 +217,9 @@ pub(crate) fn collect_static() -> StaticFacts {
         swap_total_bytes: swap,
         disk_total_bytes: system_volume_total(),
         booted_at: epoch_secs_to_rfc3339(sysinfo::System::boot_time()),
+        // Forks `nvidia-smi` (bounded) on a cache miss — this function already
+        // runs on the blocking pool.
+        gpus: super::gpu::host_gpus_cached(),
     }
 }
 
