@@ -264,6 +264,10 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/ui-bridge/sdk/clipboard",
     "/ui-bridge/sdk/control/clipboard",
     "GET /ui-bridge/control/element/{id}/react-state",
+    // The structural captures carry the component's `state()` and its
+    // (scrubbed) props — the react-state class above. No browser caller.
+    "GET /ui-bridge/control/component/{id}/capture",
+    "GET /ui-bridge/control/element/{id}/capture",
     "GET /sessions/{id}/transcript",
     // Returns the pre-edit snapshot text AND the current on-disk text of every
     // file a session touched — local source content, the same class as the

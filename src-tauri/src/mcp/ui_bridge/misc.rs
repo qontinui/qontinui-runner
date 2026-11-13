@@ -9,6 +9,7 @@
 //!   - Spec store read-only access (`/control/specs`, `/control/spec/{id}`)
 //!   - Runner-specific tab navigation + storage clearing
 //!   - Single-component state read
+//!   - Structural component / element capture (`matches_isolated_render`)
 //!   - Page scroll
 //!   - Performance entries (read + clear)
 //!   - Annotations import
@@ -17,7 +18,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -25,7 +26,9 @@ use tracing::info;
 
 use crate::mcp::types::{ApiResponse, ApiState};
 
-use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use super::request::{
+    ui_bridge_request_sync, wrap_ipc_result, wrap_ipc_result_keeping_failure_data,
+};
 use super::{
     ipc_handler_get, ipc_handler_path_get, ipc_handler_post, ipc_handler_post_bumps_mutation,
 };
@@ -183,6 +186,129 @@ ipc_handler_path_get!(
     "componentId"
 );
 
+// ============================================================================
+// Structural capture (matches_isolated_render)
+// ============================================================================
+
+/// The SDK's typed capture refusal (`component_capture_refused`), read off a
+/// flattened IPC answer: its reason and the HTTP status the SDK answers it
+/// with — 404 `not_found`, 422 `no_mounted_elements`. `None` for any other
+/// answer.
+pub(crate) fn capture_refusal(answer: &serde_json::Value) -> Option<(&'static str, StatusCode)> {
+    if answer.get("success").and_then(|v| v.as_bool()) != Some(false)
+        || answer.get("error").and_then(|v| v.as_str()) != Some("component_capture_refused")
+    {
+        return None;
+    }
+    let reason = answer
+        .get("reason")
+        .or_else(|| answer.get("data").and_then(|d| d.get("reason")))
+        .and_then(|v| v.as_str())?;
+    match reason {
+        "not_found" => Some(("not_found", StatusCode::NOT_FOUND)),
+        "no_mounted_elements" => Some(("no_mounted_elements", StatusCode::UNPROCESSABLE_ENTITY)),
+        _ => None,
+    }
+}
+
+/// A capture route's failure body. The typed refusal is a plain JSON object
+/// because it carries `reason` at the top level beside `error`, which the
+/// shared `ApiResponse` envelope has no field for.
+type CaptureFailure = (StatusCode, Json<serde_json::Value>);
+
+/// The capture routes' query: `?props=true` opts in to the owning component's
+/// scrubbed props (off by default, as on the SDK route). Any other query key
+/// (the SDK's `tabId`) is ignored: the runner answers for its own webview.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct CaptureQuery {
+    #[serde(default)]
+    pub props: Option<String>,
+}
+
+/// Whether a `props` query value opts in: `true` or `1`, as the SDK reads it.
+pub(crate) fn props_opt_in(value: Option<&str>) -> bool {
+    matches!(value, Some("true" | "1"))
+}
+
+/// Forward a capture request to the runner's own webview and answer the way
+/// the SDK route does: the `ComponentCapture` under `data`, or the typed
+/// refusal — `error: "component_capture_refused"` and `reason` at the top
+/// level, the refusal body repeated under `data`, code `UB-ELEM-NOT-FOUND` /
+/// `UB-OBS-INPUT-MISSING` — at 404 / 422.
+async fn capture_via_ipc(
+    state: &Arc<ApiState>,
+    ipc_type: &str,
+    id: String,
+    props: bool,
+) -> Result<Json<ApiResponse<serde_json::Value>>, CaptureFailure> {
+    let result = ui_bridge_request_sync(
+        state,
+        ipc_type,
+        serde_json::json!({ "params": { "id": id, "props": props } }),
+    )
+    .await;
+    if let Ok(answer) = &result {
+        if let Some((reason, status)) = capture_refusal(answer) {
+            let code = if reason == "not_found" {
+                "UB-ELEM-NOT-FOUND"
+            } else {
+                "UB-OBS-INPUT-MISSING"
+            };
+            return Err((
+                status,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "component_capture_refused",
+                    "reason": reason,
+                    "code": code,
+                    "data": { "error": "component_capture_refused", "reason": reason },
+                })),
+            ));
+        }
+    }
+    wrap_ipc_result_keeping_failure_data(result).map_err(|(status, Json(body))| {
+        (
+            status,
+            Json(serde_json::to_value(body).unwrap_or_else(
+                |e| serde_json::json!({ "success": false, "error": e.to_string() }),
+            )),
+        )
+    })
+}
+
+/// `GET /ui-bridge/control/component/{id}/capture` — the component's
+/// structural `ComponentCapture` (plan
+/// 2026-11-13-ui-bridge-matches-isolated-render-assertion).
+pub async fn ui_bridge_get_component_capture_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(q): Query<CaptureQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, CaptureFailure> {
+    capture_via_ipc(
+        &state,
+        "get_component_capture",
+        id,
+        props_opt_in(q.props.as_deref()),
+    )
+    .await
+}
+
+/// `GET /ui-bridge/control/element/{id}/capture` — the structural
+/// `ComponentCapture` rooted at one registered element.
+pub async fn ui_bridge_get_element_capture_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(q): Query<CaptureQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, CaptureFailure> {
+    capture_via_ipc(
+        &state,
+        "get_element_capture",
+        id,
+        props_opt_in(q.props.as_deref()),
+    )
+    .await
+}
+
 // Page scroll: changes the viewport content → rendered pixels change.
 ipc_handler_post_bumps_mutation!(ui_bridge_scroll_page_handler_dispatch, "scroll_page");
 
@@ -246,6 +372,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/component/{id}/state",
             get(ui_bridge_get_component_state_handler),
         )
+        // Structural captures for `matches_isolated_render`.
+        .route(
+            "/ui-bridge/control/component/{id}/capture",
+            get(ui_bridge_get_component_capture_handler),
+        )
+        .route(
+            "/ui-bridge/control/element/{id}/capture",
+            get(ui_bridge_get_element_capture_handler),
+        )
         // Page scroll
         .route(
             "/ui-bridge/control/page/scroll",
@@ -299,6 +434,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/undo"),
         ("POST", "/ui-bridge/control/redo"),
         ("GET", "/ui-bridge/control/component/{id}/state"),
+        ("GET", "/ui-bridge/control/component/{id}/capture"),
+        ("GET", "/ui-bridge/control/element/{id}/capture"),
         ("POST", "/ui-bridge/control/page/scroll"),
         ("GET", "/ui-bridge/control/performance-entries"),
         ("POST", "/ui-bridge/control/performance-entries/clear"),

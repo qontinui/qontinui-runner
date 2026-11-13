@@ -238,6 +238,11 @@ export type UIBridgeRequestType =
   | "rank_elements"
   | "set_viewport_constraints"
   | "get_element_react_state"
+  // Structural captures for the `matches_isolated_render` vision assertion
+  // (GET /control/{component,element}/{id}/capture; plan
+  // 2026-11-13-ui-bridge-matches-isolated-render-assertion, Phase 3).
+  | "get_component_capture"
+  | "get_element_capture"
   // Bucket C deferred (plan 2026-05-07-ui-bridge-change-buffer-peek):
   // both back the runner's view of ChangeTracker.changeBuffer via
   // peekBuffer() (SDK 0.3.5).
@@ -400,7 +405,9 @@ export type DebugInspectEventTypes =
   | "highlight_element"
   | "get_toast_buffer"
   | "run_spec"
-  | "get_element_react_state";
+  | "get_element_react_state"
+  | "get_component_capture"
+  | "get_element_capture";
 
 export type NetworkIdleEventTypes =
   | "get_network_requests"

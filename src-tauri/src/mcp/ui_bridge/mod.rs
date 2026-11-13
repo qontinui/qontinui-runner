@@ -20,6 +20,7 @@ pub mod bookmarks;
 pub mod capabilities;
 pub mod circuit_breaker;
 pub mod cloud_snapshot;
+pub mod component_baseline_store;
 pub mod component_errors;
 pub mod design;
 pub mod design_eval;
@@ -741,6 +742,14 @@ mod manifest_drift_tests {
             // entry needed. (Earlier commits placed them in sdk_only_baseline
             // then runner_only_baseline; both were wrong polarity once the
             // ^0.8.0 bump landed the SDK declarations.)
+            //
+            // The durable component-baseline store is the exception: it is
+            // runner state (one JSON file per baseline in the instance's
+            // vision cache root), with no SDK-side analog to declare. Plan
+            // 2026-11-13-ui-bridge-matches-isolated-render-assertion, Phase 3.
+            ("POST", "/ui-bridge/vision/component-baseline"),
+            ("GET", "/ui-bridge/vision/component-baseline"),
+            ("GET", "/ui-bridge/vision/component-baselines"),
             ("POST", "/ui-bridge/batch"),
             ("POST", "/ui-bridge/control/batch"),
             ("POST", "/ui-bridge/render-log"),

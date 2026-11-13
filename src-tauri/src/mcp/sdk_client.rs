@@ -6029,6 +6029,64 @@ async fn handle_component_state(
     }
 }
 
+/// GET /ui-bridge/sdk/component/:id/capture — the component's structural
+/// `ComponentCapture` (`matches_isolated_render`, plan
+/// 2026-11-13-ui-bridge-matches-isolated-render-assertion). The SDK's answer is
+/// returned verbatim, the typed `component_capture_refused` refusal included.
+async fn handle_component_capture(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(q): Query<crate::mcp::ui_bridge::misc::CaptureQuery>,
+) -> Json<serde_json::Value> {
+    let props = crate::mcp::ui_bridge::misc::props_opt_in(q.props.as_deref());
+    let path = if props {
+        format!("/control/component/{}/capture?props=true", id)
+    } else {
+        format!("/control/component/{}/capture", id)
+    };
+    match dispatch_app_request(
+        &state,
+        "getComponentCapture",
+        serde_json::json!({ "id": id, "props": props }),
+        Method::GET,
+        &path,
+        None,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/element/:id/capture — the structural `ComponentCapture`
+/// rooted at one registered element.
+async fn handle_element_capture(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(q): Query<crate::mcp::ui_bridge::misc::CaptureQuery>,
+) -> Json<serde_json::Value> {
+    let props = crate::mcp::ui_bridge::misc::props_opt_in(q.props.as_deref());
+    let path = if props {
+        format!("/control/element/{}/capture?props=true", id)
+    } else {
+        format!("/control/element/{}/capture", id)
+    };
+    match dispatch_app_request(
+        &state,
+        "getElementCapture",
+        serde_json::json!({ "id": id, "props": props }),
+        Method::GET,
+        &path,
+        None,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 /// POST /ui-bridge/sdk/component/:id/action/:actionId — Execute component action
 ///
 /// When `?app_id=<...>` is present, dispatch directly to that registered app
@@ -7766,6 +7824,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(handle_component_state),
         )
         .route(
+            "/ui-bridge/sdk/component/{id}/capture",
+            get(handle_component_capture),
+        )
+        .route(
+            "/ui-bridge/sdk/element/{id}/capture",
+            get(handle_element_capture),
+        )
+        .route(
             "/ui-bridge/sdk/component/{id}/action/{actionId}",
             post(handle_component_action),
         )
@@ -8042,6 +8108,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/control/component/{id}/state",
             get(handle_component_state),
+        )
+        .route(
+            "/ui-bridge/sdk/control/component/{id}/capture",
+            get(handle_component_capture),
+        )
+        .route(
+            "/ui-bridge/sdk/control/element/{id}/capture",
+            get(handle_element_capture),
         )
         .route(
             "/ui-bridge/sdk/control/component/{id}/action/{actionId}",

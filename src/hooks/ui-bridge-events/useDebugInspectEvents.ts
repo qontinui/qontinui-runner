@@ -181,7 +181,8 @@ const errorBaselines = new Map<string, ErrorBaseline>();
  *          get_error_sessions, capture_error_baseline, compare_error_baseline,
  *          get_error_report, get_action_history, get_interaction_metrics,
  *          get_performance_entries, clear_performance_entries,
- *          get_element_tree, highlight_element, run_spec
+ *          get_element_tree, highlight_element, run_spec,
+ *          get_component_capture, get_element_capture
  */
 export function useDebugInspectEvents(
   context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
@@ -614,6 +615,56 @@ export function useDebugInspectEvents(
             },
             timestamp: Date.now(),
           });
+          return true;
+        }
+
+        case "get_component_capture":
+        case "get_element_capture": {
+          // The SDK's own capture (`captureComponent`), so the runner's webview
+          // answers byte-for-byte what an SDK-mounted server answers on
+          // `GET /control/{component,element}/:id/capture`. A refusal keeps the
+          // SDK's typed shape: `error: "component_capture_refused"` with the
+          // `reason` under `data`, which the Rust handler maps to 404 / 422.
+          // `props: true` is the route's `?props=true` opt-in; props are left
+          // out of a capture unless asked for.
+          const { id, props } = (payload.params || {}) as { id?: string; props?: boolean };
+          if (!id) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "id is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const { captureComponent } = await import("@qontinui/ui-bridge");
+          const result = captureComponent(
+            currentBridge.registry ?? currentBridge,
+            {
+              kind: type === "get_component_capture" ? "component" : "element",
+              id,
+            },
+            { props: props === true },
+          );
+          if (result.ok) {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: result.capture,
+              timestamp: Date.now(),
+            });
+          } else {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: result.refusal.error,
+              data: result.refusal,
+              timestamp: Date.now(),
+            });
+          }
           return true;
         }
 

@@ -2731,6 +2731,12 @@ fn evaluate_assertions(
     ocr_blocks: Option<&[qontinui_vision_core::OcrBlockRef<'_>]>,
     baselines: Option<&std::collections::HashMap<String, qontinui_vision_core::BaselineEntry>>,
     timeline: Option<&qontinui_vision_core::ChangeTimeline>,
+    component_baselines: Option<
+        &std::collections::HashMap<String, qontinui_vision_core::ComponentBaseline>,
+    >,
+    component_captures: Option<
+        &std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>,
+    >,
 ) -> Vec<qontinui_vision_core::AssertionResult> {
     let ctx = qontinui_vision_core::EvalContext {
         snapshot,
@@ -2740,10 +2746,8 @@ fn evaluate_assertions(
         ocr_blocks,
         baselines,
         timeline,
-        // Filled by plan 2026-11-13-ui-bridge-matches-isolated-render-assertion
-        // Phase 3 (the component-baseline store and the in-situ capture).
-        component_baselines: None,
-        component_captures: None,
+        component_baselines,
+        component_captures,
     };
     assertions
         .iter()
@@ -3178,6 +3182,15 @@ pub struct AssertRequest {
     /// `capability_unavailable_in_build`, reported in `textHiddenFrameError`.
     #[serde(default)]
     pub capture_text_hidden: bool,
+    /// Optional, for `matches_isolated_render`: in-situ captures keyed by the
+    /// assertion's `component` id — the SDK's
+    /// `GET /control/component/:id/capture` answer. A component it does not
+    /// carry is fetched from `target` (the runner's own webview when absent);
+    /// a capture neither supplied nor fetchable leaves that assertion
+    /// `unknown{input_missing}`, explained in `componentInputs`.
+    #[serde(default)]
+    pub component_captures:
+        Option<std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>>,
 }
 
 impl RequestHints for AssertRequest {
@@ -3196,8 +3209,7 @@ impl RequestHints for AssertRequest {
              image_dims_reserved, lcp_image_prioritized, image_has_text_alternative, \
              image_not_oversized, image_weight_within, offscreen_image_lazy, \
              no_duplicate_images, settled_within, state_entered_within, \
-             text_over_image_contrast, matches_isolated_render (answers unknown \
-             input_missing on this runner until component baselines are wired)."
+             text_over_image_contrast, matches_isolated_render."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
              `ocr_blocks` (from /vision/extract), `target` (device/app id), \
@@ -3210,7 +3222,11 @@ impl RequestHints for AssertRequest {
              UI only — 2 MiB from any other) with an optional `textHiddenIds`, or \
              `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
              only with a text_over_image_contrast assertion, which reads it, and a \
-             `snapshot`)."
+             `snapshot`). For matches_isolated_render: `componentCaptures` \
+             ({<componentId>: ComponentCapture}, the SDK's `control/component/:id/capture` \
+             answer); omitted, the runner fetches the in-situ capture from `target` (its own \
+             webview when absent). The named baseline is read from the durable \
+             `vision/component-baseline` store."
                 .to_string(),
         ])
     }
@@ -3364,6 +3380,10 @@ pub struct AssertResponse {
     /// hide and the restore, and whether the page ended restored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_visibility: Option<super::text_visibility::TextVisibilityRun>,
+    /// One entry per `matches_isolated_render` assertion: what its baseline
+    /// and in-situ capture resolved to. Omitted when the request has none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub component_inputs: Vec<ComponentInputReport>,
 }
 
 /// How a `/vision/assert` `timelineRef` resolved.
@@ -3501,6 +3521,7 @@ impl AssertResponse {
             text_hidden_frame: None,
             text_hidden_frame_error: None,
             text_visibility: None,
+            component_inputs: Vec::new(),
         }
     }
 
@@ -3682,7 +3703,7 @@ async fn vision_analyze_handler(
 async fn vision_assert_handler(
     State(state): State<Arc<ApiState>>,
     principal: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
-    UiBridgeJson(req): UiBridgeJson<AssertRequest>,
+    UiBridgeJson(mut req): UiBridgeJson<AssertRequest>,
 ) -> Result<Json<ApiResponse<AssertResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target. visual-audit relies
@@ -3739,6 +3760,17 @@ async fn vision_assert_handler(
             .collect()
     };
 
+    // `matches_isolated_render`: the named baselines from the durable store,
+    // and the in-situ captures from `componentCaptures` or a fetch from
+    // `target`. Missing either leaves that assertion unknown{input_missing}.
+    let (component_baselines, component_captures, component_inputs) = gather_component_inputs(
+        &state,
+        &req.assertions,
+        req.component_captures.take(),
+        req.target.as_deref(),
+    )
+    .await;
+
     // `timelineRef`: the timeline stored on that journey edge row (plan
     // 2026-09-20 Phase 4). Unresolved, the timeline assertions stay unknown.
     // Read before the blocking hop, which only evaluates.
@@ -3771,6 +3803,8 @@ async fn vision_assert_handler(
         text_hidden_frame: _,
         text_hidden_ids: _,
         capture_text_hidden: _,
+        // Taken above by `gather_component_inputs`.
+        component_captures: _,
     } = req;
     let (mut results, evaluated_at, frame, snapshot, text_hidden) =
         spawn_blocking_tracked(move || {
@@ -3803,6 +3837,8 @@ async fn vision_assert_handler(
                 ocr_borrowed.as_deref(),
                 Some(&baselines_owned),
                 timeline.as_deref(),
+                component_baselines.as_ref(),
+                component_captures.as_ref(),
             );
             // See the analyze handler: stamped when evaluation finishes, not at
             // response assembly.
@@ -3837,6 +3873,7 @@ async fn vision_assert_handler(
     )
     .with_text_hidden(text_hidden);
     response.timeline_ref = timeline_ref;
+    response.component_inputs = component_inputs;
     Ok(Json(ApiResponse::success(response)))
 }
 
@@ -3964,6 +4001,434 @@ async fn vision_baselines_list_handler(
     })))
 }
 
+// ============================================================================
+// matches_isolated_render inputs: the durable baselines and in-situ captures
+// (plan 2026-11-13-ui-bridge-matches-isolated-render-assertion, Phase 3)
+// ============================================================================
+
+/// Timeout for fetching an in-situ capture from a remote target.
+const COMPONENT_CAPTURE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where a `matches_isolated_render` assertion's in-situ capture came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentCaptureSource {
+    /// The request's `componentCaptures` carried it.
+    Supplied,
+    /// The runner fetched it from the request's target.
+    Fetched,
+    /// Neither: the assertion answers `unknown{input_missing}`, and
+    /// `captureError` says why.
+    Absent,
+}
+
+/// What the named baseline resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentBaselineStatus {
+    Loaded,
+    /// No baseline is stored under the name.
+    NotRegistered,
+    /// The name was refused or the file could not be read; `baselineError`
+    /// says which.
+    Unreadable,
+}
+
+/// Per `matches_isolated_render` assertion: what its two inputs resolved to.
+/// An `unknown{input_missing}` verdict is explained here, never left to guess.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentInputReport {
+    pub component: String,
+    pub baseline: String,
+    pub baseline_status: ComponentBaselineStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_error: Option<String>,
+    pub capture: ComponentCaptureSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
+}
+
+/// The `(component, baseline)` pairs of every `matches_isolated_render`
+/// assertion, in request order, deduplicated.
+fn isolated_render_pairs(assertions: &[qontinui_vision_core::Assertion]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for a in assertions {
+        if let qontinui_vision_core::Assertion::MatchesIsolatedRender {
+            component,
+            baseline,
+            ..
+        } = a
+        {
+            let pair = (component.to_string(), baseline.to_string());
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+        }
+    }
+    pairs
+}
+
+/// The components some `matches_isolated_render` compares props for
+/// (`compare_props: true`). Their in-situ capture is fetched with props: the
+/// capture routes leave props out unless asked (`?props=true`).
+fn components_needing_props(
+    assertions: &[qontinui_vision_core::Assertion],
+) -> std::collections::HashSet<String> {
+    assertions
+        .iter()
+        .filter_map(|a| match a {
+            qontinui_vision_core::Assertion::MatchesIsolatedRender {
+                component,
+                compare_props: true,
+                ..
+            } => Some(component.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Load every baseline the pairs name from the durable store. A name with no
+/// stored baseline is left out of the map, so the evaluator answers
+/// `unknown{input_missing}` for it.
+fn load_component_baselines(
+    store: &super::component_baseline_store::ComponentBaselineStore,
+    pairs: &[(String, String)],
+) -> (
+    std::collections::HashMap<String, qontinui_vision_core::ComponentBaseline>,
+    std::collections::HashMap<String, (ComponentBaselineStatus, Option<String>)>,
+) {
+    let mut loaded = std::collections::HashMap::new();
+    let mut status = std::collections::HashMap::new();
+    for (_, name) in pairs {
+        if status.contains_key(name) {
+            continue;
+        }
+        let s = match store.get(name) {
+            Ok(Some(b)) => {
+                loaded.insert(name.clone(), b);
+                (ComponentBaselineStatus::Loaded, None)
+            }
+            Ok(None) => (ComponentBaselineStatus::NotRegistered, None),
+            Err(e) => (ComponentBaselineStatus::Unreadable, Some(e.to_string())),
+        };
+        status.insert(name.clone(), s);
+    }
+    (loaded, status)
+}
+
+/// Read a `ComponentCapture` out of a capture route's answer: the SDK's
+/// `{success, data}` envelope, or the flat capture the runner's IPC layer
+/// returns. A `success:false` answer (the typed `component_capture_refused`
+/// refusal among them) is an error naming its reason.
+fn capture_from_answer(
+    answer: &serde_json::Value,
+) -> Result<qontinui_vision_core::ComponentCapture, String> {
+    if answer.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        let error = answer
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("capture failed");
+        let reason = answer
+            .get("data")
+            .and_then(|d| d.get("reason"))
+            .or_else(|| answer.get("reason"))
+            .and_then(|v| v.as_str());
+        return Err(match reason {
+            Some(r) => format!("{error}: {r}"),
+            None => error.to_string(),
+        });
+    }
+    let payload = match answer.get("data") {
+        Some(d) if answer.get("success").is_some() => d,
+        _ => answer,
+    };
+    serde_json::from_value(payload.clone()).map_err(|e| format!("capture did not parse: {e}"))
+}
+
+/// Fetch the in-situ capture of `component` from `target` (with the owning
+/// component's scrubbed props only when `props`): the runner's own
+/// webview over IPC when `target` is absent (the same frontend handler
+/// `GET /ui-bridge/control/component/{id}/capture` reaches), else the
+/// registered device's or app's UI Bridge capture route over HTTP — the same
+/// target resolution the frame source uses.
+async fn fetch_component_capture(
+    state: &Arc<ApiState>,
+    target: Option<&str>,
+    component: &str,
+    props: bool,
+) -> Result<qontinui_vision_core::ComponentCapture, String> {
+    let Some(target) = target else {
+        let answer = super::ui_bridge_request_sync(
+            state,
+            "get_component_capture",
+            serde_json::json!({ "params": { "id": component, "props": props } }),
+        )
+        .await?;
+        return capture_from_answer(&answer);
+    };
+    let base_url = match state
+        .physical_device_registry
+        .get_active_proxy_url(target)
+        .await
+    {
+        Some(url) => url,
+        None => match state.app_registry.get_live(target).await {
+            Some(entry) => entry.app.url.clone(),
+            None => {
+                return Err(format!(
+                    "target '{target}' is neither a registered device nor a live app, so no \
+                     capture route was reachable"
+                ))
+            }
+        },
+    };
+    let url = format!(
+        "{}/ui-bridge/control/component/{}/capture{}",
+        base_url.trim_end_matches('/'),
+        urlencoding::encode(component),
+        if props { "?props=true" } else { "" }
+    );
+    let client = reqwest::Client::builder()
+        .timeout(COMPONENT_CAPTURE_HTTP_TIMEOUT)
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("build capture client: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("capture request to {url}: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("capture {url} answered HTTP {status} with a non-JSON body: {e}"))?;
+    capture_from_answer(&body).map_err(|e| format!("{url} (HTTP {status}): {e}"))
+}
+
+/// Resolve both inputs of every `matches_isolated_render` assertion: the
+/// named baselines from the durable store, and the in-situ captures from the
+/// request's `componentCaptures` or, for a component it does not carry, a
+/// fetch from the request's target.
+async fn gather_component_inputs(
+    state: &Arc<ApiState>,
+    assertions: &[qontinui_vision_core::Assertion],
+    supplied: Option<std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>>,
+    target: Option<&str>,
+) -> (
+    Option<std::collections::HashMap<String, qontinui_vision_core::ComponentBaseline>>,
+    Option<std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>>,
+    Vec<ComponentInputReport>,
+) {
+    let pairs = isolated_render_pairs(assertions);
+    if pairs.is_empty() {
+        return (None, None, Vec::new());
+    }
+    let wants_props = components_needing_props(assertions);
+    let store = state.vision_component_baselines.clone();
+    let lookup_pairs = pairs.clone();
+    let (baselines, baseline_status) =
+        tokio::task::spawn_blocking(move || load_component_baselines(&store, &lookup_pairs))
+            .await
+            .unwrap_or_else(|e| {
+                let err = format!("baseline store read task failed: {e}");
+                let status = pairs
+                    .iter()
+                    .map(|(_, b)| {
+                        (
+                            b.clone(),
+                            (ComponentBaselineStatus::Unreadable, Some(err.clone())),
+                        )
+                    })
+                    .collect();
+                (std::collections::HashMap::new(), status)
+            });
+
+    let mut captures = supplied.unwrap_or_default();
+    let mut capture_status: std::collections::HashMap<
+        String,
+        (ComponentCaptureSource, Option<String>),
+    > = std::collections::HashMap::new();
+    for (component, _) in &pairs {
+        if capture_status.contains_key(component) {
+            continue;
+        }
+        let s = if captures.contains_key(component) {
+            (ComponentCaptureSource::Supplied, None)
+        } else {
+            let props = wants_props.contains(component);
+            match fetch_component_capture(state, target, component, props).await {
+                Ok(c) => {
+                    captures.insert(component.clone(), c);
+                    (ComponentCaptureSource::Fetched, None)
+                }
+                Err(e) => (ComponentCaptureSource::Absent, Some(e)),
+            }
+        };
+        capture_status.insert(component.clone(), s);
+    }
+
+    let reports = pairs
+        .iter()
+        .map(|(component, baseline)| {
+            let (b_status, b_err) = baseline_status
+                .get(baseline)
+                .cloned()
+                .unwrap_or((ComponentBaselineStatus::NotRegistered, None));
+            let (c_src, c_err) = capture_status
+                .get(component)
+                .cloned()
+                .unwrap_or((ComponentCaptureSource::Absent, None));
+            ComponentInputReport {
+                component: component.clone(),
+                baseline: baseline.clone(),
+                baseline_status: b_status,
+                baseline_error: b_err,
+                capture: c_src,
+                capture_error: c_err,
+            }
+        })
+        .collect();
+    (Some(baselines), Some(captures), reports)
+}
+
+/// `POST /ui-bridge/vision/component-baseline` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentBaselineRequest {
+    /// Conventionally `<story-id>@<sha>`. At most 256 bytes, no control
+    /// characters; never used as a path.
+    pub name: String,
+    #[serde(default)]
+    pub story_id: Option<String>,
+    #[serde(default)]
+    pub source_sha: Option<String>,
+    /// The SDK's `control/component/:id/capture` (or element) answer for the
+    /// isolated render.
+    pub capture: qontinui_vision_core::ComponentCapture,
+}
+
+impl RequestHints for ComponentBaselineRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required: `name` (string, <= 256 bytes, no control characters; conventionally \
+             `<story-id>@<sha>`) and `capture` (the ComponentCapture the SDK's \
+             `GET /control/component/:id/capture` answered for the isolated render). \
+             Optional: `storyId`, `sourceSha`."
+                .to_string(),
+        ])
+    }
+}
+
+/// `GET /ui-bridge/vision/component-baseline?name=` query.
+#[derive(Debug, Deserialize)]
+pub struct ComponentBaselineQuery {
+    pub name: String,
+}
+
+fn component_store_error(
+    e: super::component_baseline_store::StoreError,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    use super::component_baseline_store::StoreError;
+    match e {
+        StoreError::InvalidName(r) => (StatusCode::BAD_REQUEST, Json(api_error(r.to_string()))),
+        StoreError::Io(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("component baseline store: {msg}"))),
+        ),
+    }
+}
+
+/// `POST /ui-bridge/vision/component-baseline` — store a component baseline
+/// durably under its name (replacing any earlier one). Read back by
+/// `matches_isolated_render` in `vision/assert`, and it survives a restart.
+async fn vision_component_baseline_store_handler(
+    State(state): State<Arc<ApiState>>,
+    UiBridgeJson(req): UiBridgeJson<ComponentBaselineRequest>,
+) -> Result<
+    Json<ApiResponse<super::component_baseline_store::ComponentBaselineSummary>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let baseline = qontinui_vision_core::ComponentBaseline {
+        name: req.name,
+        story_id: req.story_id,
+        source_sha: req.source_sha,
+        captured_at: Some(chrono::Utc::now()),
+        capture: req.capture,
+    };
+    let store = state.vision_component_baselines.clone();
+    let summary = super::component_baseline_store::ComponentBaselineSummary::from(&baseline);
+    tokio::task::spawn_blocking(move || store.put(&baseline))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("component baseline write task: {e}"))),
+            )
+        })?
+        .map_err(component_store_error)?;
+    info!(
+        "vision/component-baseline: stored '{}' ({} nodes)",
+        summary.name, summary.node_count
+    );
+    Ok(Json(ApiResponse::success(summary)))
+}
+
+/// `GET /ui-bridge/vision/component-baseline?name=<name>` — read one stored
+/// baseline whole. A query parameter, not a path segment, because names
+/// contain `/`. 404 when none is stored under the name.
+async fn vision_component_baseline_get_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<ComponentBaselineQuery>,
+) -> Result<
+    Json<ApiResponse<qontinui_vision_core::ComponentBaseline>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let store = state.vision_component_baselines.clone();
+    let name = q.name.clone();
+    let found = tokio::task::spawn_blocking(move || store.get(&name))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("component baseline read task: {e}"))),
+            )
+        })?
+        .map_err(component_store_error)?;
+    match found {
+        Some(b) => Ok(Json(ApiResponse::success(b))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!(
+                "no component baseline is stored under '{}'",
+                q.name
+            ))),
+        )),
+    }
+}
+
+/// `GET /ui-bridge/vision/component-baselines` — list the stored baselines
+/// (provenance only, no capture bodies) plus any file that could not be read.
+async fn vision_component_baselines_list_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<
+    Json<ApiResponse<super::component_baseline_store::ComponentBaselineListing>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let store = state.vision_component_baselines.clone();
+    let listing = tokio::task::spawn_blocking(move || store.list())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("component baseline list task: {e}"))),
+            )
+        })?
+        .map_err(component_store_error)?;
+    Ok(Json(ApiResponse::success(listing)))
+}
+
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/ui-bridge/vision/capture", post(vision_capture_handler))
@@ -3988,6 +4453,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
                 .layer(axum::middleware::from_fn(limit_untrusted_vision_body)),
         )
         .route("/ui-bridge/vision/baseline", post(vision_baseline_handler))
+        .route(
+            "/ui-bridge/vision/component-baseline",
+            post(vision_component_baseline_store_handler)
+                .get(vision_component_baseline_get_handler),
+        )
+        .route(
+            "/ui-bridge/vision/component-baselines",
+            get(vision_component_baselines_list_handler),
+        )
         .route(
             "/ui-bridge/vision/baselines",
             get(vision_baselines_list_handler),
@@ -4015,6 +4489,9 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/vision/assert"),
         ("POST", "/ui-bridge/vision/baseline"),
         ("GET", "/ui-bridge/vision/baselines"),
+        ("POST", "/ui-bridge/vision/component-baseline"),
+        ("GET", "/ui-bridge/vision/component-baseline"),
+        ("GET", "/ui-bridge/vision/component-baselines"),
         ("GET", "/ui-bridge/vision/cache/{sha256}"),
         ("GET", "/ui-bridge/vision/health"),
         ("POST", "/ui-bridge/vision/mutation-occurred"),
@@ -4313,7 +4790,8 @@ mod tests {
     /// image assertions (image plan Phase 15) from 12 to 20, the timeline
     /// assertions (plan 2026-09-20 Phase 4) to 22, and
     /// `text_over_image_contrast` (image plan Phase 16) to 23, and the L0 image
-    /// assertions (image plan Phase 8) to 33; without a pin,
+    /// assertions (image plan Phase 8) to 33, and
+    /// `matches_isolated_render` (plan 2026-11-13) to 34; without a pin,
     /// a variant added upstream stays undiscoverable while
     /// `evaluate_assertion` (which is variant-agnostic) handles it fine.
     ///
@@ -6346,6 +6824,8 @@ mod text_hidden_tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert_eq!(
             with_b[0].outcome,
@@ -6363,6 +6843,8 @@ mod text_hidden_tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert_eq!(without_b[0].outcome, AssertionOutcome::Unknown);
         assert_eq!(without_b[0].code, Some(UnknownCode::NeedsMultiFrameInput));
@@ -6375,6 +6857,8 @@ mod text_hidden_tests {
             Some(&a),
             Some(&b),
             Some(&others),
+            None,
+            None,
             None,
             None,
             None,
@@ -6493,5 +6977,294 @@ mod text_hidden_tests {
         for key in ["textHiddenFrame", "textHiddenFrameError", "textVisibility"] {
             assert!(plain.get(key).is_none(), "{key}: {plain}");
         }
+    }
+}
+
+/// `matches_isolated_render` through the runner (plan
+/// 2026-11-13-ui-bridge-matches-isolated-render-assertion, Phase 3): a
+/// baseline stored in the durable store, read back the way `vision/assert`
+/// reads it, evaluated through the one `EvalContext` construction site.
+#[cfg(test)]
+mod component_input_tests {
+    use super::super::component_baseline_store::{ComponentBaselineStore, StoreError};
+    use super::*;
+    use qontinui_vision_core::{
+        AssertionOutcome, CaptureRect, CaptureRoot, ComponentBaseline, ComponentCapture,
+        ComponentCaptureNode, UnknownCode,
+    };
+    use std::collections::HashMap;
+
+    const NAME: &str = "storybook/DateRangePicker--default@abc123";
+    const COMPONENT: &str = "date-range-picker";
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> CaptureRect {
+        CaptureRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn capture(root: CaptureRect, parent: CaptureRect) -> ComponentCapture {
+        ComponentCapture {
+            schema_version: 1,
+            source_sha: Some("abc123".to_string()),
+            root: Some(CaptureRoot {
+                bbox: Some(root),
+                parent_content_box: Some(parent),
+            }),
+            nodes: vec![ComponentCaptureNode {
+                path: String::new(),
+                tag: "div".to_string(),
+                component_name: Some("DateRangePicker".to_string()),
+                bbox: Some(rect(0.0, 0.0, root.width, root.height)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn assertion() -> qontinui_vision_core::Assertion {
+        serde_json::from_value(serde_json::json!({
+            "type": "matches_isolated_render",
+            "component": COMPONENT,
+            "baseline": NAME,
+        }))
+        .unwrap()
+    }
+
+    fn store_baseline(store: &ComponentBaselineStore, c: ComponentCapture) {
+        store
+            .put(&ComponentBaseline {
+                name: NAME.to_string(),
+                story_id: Some("DateRangePicker--default".to_string()),
+                source_sha: None,
+                captured_at: Some(chrono::Utc::now()),
+                capture: c,
+            })
+            .unwrap();
+    }
+
+    /// What `vision/assert` does with a request carrying `componentCaptures`:
+    /// load the named baselines from the store, then evaluate.
+    fn assert_via_store(
+        store: &ComponentBaselineStore,
+        in_situ: ComponentCapture,
+    ) -> (
+        qontinui_vision_core::AssertionResult,
+        HashMap<String, (ComponentBaselineStatus, Option<String>)>,
+    ) {
+        let assertions = vec![assertion()];
+        let pairs = isolated_render_pairs(&assertions);
+        assert_eq!(pairs, vec![(COMPONENT.to_string(), NAME.to_string())]);
+        let (baselines, status) = load_component_baselines(store, &pairs);
+        let captures = HashMap::from([(COMPONENT.to_string(), in_situ)]);
+        let mut results = evaluate_assertions(
+            &assertions,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&baselines),
+            Some(&captures),
+        );
+        (results.remove(0), status)
+    }
+
+    #[test]
+    fn stored_baseline_round_trips_to_passed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ComponentBaselineStore::under_vision_cache_root(tmp.path());
+        let page = rect(100.0, 300.0, 400.0, 40.0);
+        store_baseline(&store, capture(page, rect(100.0, 300.0, 400.0, 600.0)));
+        let (r, status) = assert_via_store(&store, capture(page, rect(100.0, 300.0, 400.0, 600.0)));
+        assert_eq!(r.outcome, AssertionOutcome::Passed, "{:?}", r.detail);
+        assert_eq!(status[NAME].0, ComponentBaselineStatus::Loaded);
+    }
+
+    #[test]
+    fn stored_baseline_round_trips_to_a_failed_size_finding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ComponentBaselineStore::under_vision_cache_root(tmp.path());
+        // Isolation: 200 wide in a 400-wide parent; in situ: 1000 in 1000.
+        store_baseline(
+            &store,
+            capture(rect(0.0, 0.0, 200.0, 40.0), rect(0.0, 0.0, 400.0, 40.0)),
+        );
+        let (r, _) = assert_via_store(
+            &store,
+            capture(rect(0.0, 0.0, 1000.0, 40.0), rect(0.0, 0.0, 1000.0, 40.0)),
+        );
+        assert_eq!(r.outcome, AssertionOutcome::Failed, "{:?}", r.detail);
+        let report: serde_json::Value =
+            serde_json::from_str(r.detail.as_deref().expect("detail")).unwrap();
+        let kinds: Vec<&str> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"size"), "{report}");
+    }
+
+    #[test]
+    fn unregistered_baseline_is_unknown_input_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ComponentBaselineStore::under_vision_cache_root(tmp.path());
+        let page = rect(0.0, 0.0, 400.0, 40.0);
+        let (r, status) = assert_via_store(&store, capture(page, page));
+        assert_eq!(r.outcome, AssertionOutcome::Unknown);
+        assert_eq!(r.code, Some(UnknownCode::InputMissing));
+        assert_eq!(status[NAME].0, ComponentBaselineStatus::NotRegistered);
+    }
+
+    #[test]
+    fn missing_in_situ_capture_is_unknown_input_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ComponentBaselineStore::under_vision_cache_root(tmp.path());
+        let page = rect(0.0, 0.0, 400.0, 40.0);
+        store_baseline(&store, capture(page, page));
+        let assertions = vec![assertion()];
+        let (baselines, _) = load_component_baselines(&store, &isolated_render_pairs(&assertions));
+        let empty = HashMap::new();
+        let r = evaluate_assertions(
+            &assertions,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&baselines),
+            Some(&empty),
+        );
+        assert_eq!(r[0].outcome, AssertionOutcome::Unknown);
+        assert_eq!(r[0].code, Some(UnknownCode::InputMissing));
+    }
+
+    /// The store is durable: a fresh instance over the same root — what a
+    /// restarted runner builds — reads the baseline back and still decides.
+    #[test]
+    fn a_restarted_store_still_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page = rect(10.0, 10.0, 300.0, 40.0);
+        let parent = rect(10.0, 10.0, 300.0, 400.0);
+        store_baseline(
+            &ComponentBaselineStore::under_vision_cache_root(tmp.path()),
+            capture(page, parent),
+        );
+        let restarted = ComponentBaselineStore::under_vision_cache_root(tmp.path());
+        let (r, _) = assert_via_store(&restarted, capture(page, parent));
+        assert_eq!(r.outcome, AssertionOutcome::Passed, "{:?}", r.detail);
+    }
+
+    #[test]
+    fn an_unsafe_baseline_name_reads_as_unreadable_not_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ComponentBaselineStore::under_vision_cache_root(tmp.path());
+        let bad = format!("evil\n{}", "x".repeat(10));
+        let (_, status) = load_component_baselines(&store, &[(COMPONENT.to_string(), bad.clone())]);
+        assert_eq!(status[&bad].0, ComponentBaselineStatus::Unreadable);
+        assert!(matches!(store.get(&bad), Err(StoreError::InvalidName(_))));
+    }
+
+    #[test]
+    fn the_assert_request_accepts_component_captures() {
+        let req: AssertRequest = serde_json::from_value(serde_json::json!({
+            "assertions": [{"type":"matches_isolated_render","component":COMPONENT,"baseline":NAME}],
+            "componentCaptures": {
+                COMPONENT: {
+                    "schemaVersion": 1,
+                    "root": {"bbox": {"x":0,"y":0,"width":10,"height":10}},
+                    "nodes": [],
+                    "someFutureField": true
+                }
+            }
+        }))
+        .unwrap();
+        let captures = req.component_captures.expect("componentCaptures parsed");
+        assert!(captures[COMPONENT].root_bbox().is_some());
+    }
+
+    #[test]
+    fn capture_answers_parse_from_every_shape() {
+        let cap = serde_json::json!({"schemaVersion":1,"root":{"bbox":{"x":0,"y":0,"width":5,"height":5}}});
+        // Flat (the runner's IPC answer) and enveloped (the SDK route).
+        assert!(capture_from_answer(&cap).unwrap().root_bbox().is_some());
+        let env = serde_json::json!({"success": true, "data": cap});
+        assert!(capture_from_answer(&env).unwrap().root_bbox().is_some());
+        // The SDK's typed refusal, enveloped and flattened.
+        let refused = serde_json::json!({
+            "success": false, "error": "component_capture_refused",
+            "data": {"error": "component_capture_refused", "reason": "no_mounted_elements"}
+        });
+        assert_eq!(
+            capture_from_answer(&refused).unwrap_err(),
+            "component_capture_refused: no_mounted_elements"
+        );
+        let flattened = serde_json::json!({
+            "success": false, "error": "component_capture_refused", "reason": "not_found"
+        });
+        assert_eq!(
+            capture_from_answer(&flattened).unwrap_err(),
+            "component_capture_refused: not_found"
+        );
+    }
+
+    /// Props are opt-in on the capture routes, so only a component some
+    /// assertion compares props for is fetched with `props=true`.
+    #[test]
+    fn props_are_requested_only_for_compare_props_components() {
+        let assertions: Vec<qontinui_vision_core::Assertion> =
+            serde_json::from_value(serde_json::json!([
+                {"type":"matches_isolated_render","component":"a","baseline":"x"},
+                {"type":"matches_isolated_render","component":"b","baseline":"y",
+                 "compare_props":true},
+                {"type":"no_clipping"}
+            ]))
+            .unwrap();
+        let wants = components_needing_props(&assertions);
+        assert!(wants.contains("b"));
+        assert!(!wants.contains("a"));
+        assert_eq!(isolated_render_pairs(&assertions).len(), 2);
+
+        use super::super::misc::props_opt_in;
+        assert!(props_opt_in(Some("true")));
+        assert!(props_opt_in(Some("1")));
+        assert!(!props_opt_in(Some("false")));
+        assert!(!props_opt_in(None));
+    }
+
+    #[test]
+    fn the_ipc_capture_refusal_maps_to_the_sdk_statuses() {
+        use super::super::misc::capture_refusal;
+        let not_found = serde_json::json!({
+            "success": false, "error": "component_capture_refused", "reason": "not_found"
+        });
+        assert_eq!(
+            capture_refusal(&not_found),
+            Some(("not_found", StatusCode::NOT_FOUND))
+        );
+        let unmounted = serde_json::json!({
+            "success": false, "error": "component_capture_refused",
+            "data": {"reason": "no_mounted_elements"}
+        });
+        assert_eq!(
+            capture_refusal(&unmounted),
+            Some(("no_mounted_elements", StatusCode::UNPROCESSABLE_ENTITY))
+        );
+        assert_eq!(
+            capture_refusal(&serde_json::json!({"success": false, "error": "other"})),
+            None
+        );
+        assert_eq!(
+            capture_refusal(&serde_json::json!({"schemaVersion": 1})),
+            None
+        );
     }
 }
