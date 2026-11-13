@@ -375,32 +375,35 @@ def teardown(r: Runner | None, owned: bool, log: Log, scratch: list[Path]) -> No
     (`owned`), and the root only once the stop is CONFIRMED. A runner that was
     never verified is stopped by id alone (the id came from this process's own
     spawn reply) and otherwise left alone and reported."""
-    if r is not None:
-        s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/stop", {}, timeout=120)
-        log.rec("teardown.stop", status=s, body=v, owned=owned)
-        if not owned:
-            log.rec("teardown.unverified_left_alone", runner_id=r.id, port=r.port,
-                    root=str(r.root), root_exists=r.root.exists(), record=r.supervisor_record(),
-                    why="never verified as this run's temp runner: no holder kill, no rmtree")
-        else:
-            kill_our_holders(r.root, log, "teardown")
-            stop = await_stopped(r)
-            holders_left: list[int] = []
-            if stop == "stopped":
-                # A holder the runner spawned while it was going down.
-                holders_left = kill_our_holders(r.root, log, "teardown-after-stop")
-                if not holders_left and r.root.exists():
-                    shutil.rmtree(r.root, ignore_errors=True)
+    try:
+        if r is not None:
+            s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/stop", {}, timeout=120)
+            log.rec("teardown.stop", status=s, body=v, owned=owned)
+            if not owned:
+                log.rec("teardown.unverified_left_alone", runner_id=r.id, port=r.port,
+                        root=str(r.root), root_exists=r.root.exists(), record=r.supervisor_record(),
+                        why="never verified as this run's temp runner: no holder kill, no rmtree")
             else:
-                holders_left = our_holders(r.root)
-            log.rec("teardown.root", root=str(r.root), stop=stop,
-                    removed=stop == "stopped" and not holders_left,
-                    exists=r.root.exists(), record=r.supervisor_record(),
-                    holders_left=holders_left)
-    for d in scratch:
-        shutil.rmtree(d, ignore_errors=True)
-    log.rec("teardown.scratch_removed", dirs=[str(d) for d in scratch],
-            remaining=[str(d) for d in scratch if d.exists()])
+                kill_our_holders(r.root, log, "teardown")
+                stop = await_stopped(r)
+                holders_left: list[int] = []
+                if stop == "stopped":
+                    # A holder the runner spawned while it was going down.
+                    holders_left = kill_our_holders(r.root, log, "teardown-after-stop")
+                    if not holders_left and r.root.exists():
+                        shutil.rmtree(r.root, ignore_errors=True)
+                else:
+                    holders_left = our_holders(r.root)
+                log.rec("teardown.root", root=str(r.root), stop=stop,
+                        removed=stop == "stopped" and not holders_left,
+                        exists=r.root.exists(), record=r.supervisor_record(),
+                        holders_left=holders_left)
+    finally:
+        # Scratch removal runs even when the runner half raises.
+        for d in scratch:
+            shutil.rmtree(d, ignore_errors=True)
+        log.rec("teardown.scratch_removed", dirs=[str(d) for d in scratch],
+                remaining=[str(d) for d in scratch if d.exists()])
 
 
 # ---------------------------------------------------------------------------
