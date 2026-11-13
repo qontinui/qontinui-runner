@@ -60,7 +60,7 @@ const END_SENTINEL: &str = "__QONTINUI_CHILD_PATH_END__";
 /// rather than `"$PATH"`, because fish joins a quoted list with spaces; the
 /// exported variable is `:`-joined in sh, bash, zsh and fish alike.
 fn login_shell_script() -> String {
-    format!("echo {BEGIN_SENTINEL}; printenv PATH; echo {END_SENTINEL}")
+    format!("echo {BEGIN_SENTINEL} && printenv PATH && echo {END_SENTINEL}")
 }
 
 /// The login-shell read's result for this process: unset while pending,
@@ -183,6 +183,10 @@ fn read_login_shell_dirs(_shell: &Path, _script: &str, _timeout: Duration) -> Op
 fn parse_sentinel_path(stdout: &str) -> Option<Vec<PathBuf>> {
     let (_, after_begin) = stdout.split_once(BEGIN_SENTINEL)?;
     let (path, _) = after_begin.split_once(END_SENTINEL)?;
+    // An empty pair is a read that printed no PATH, not an answer.
+    if path.trim().is_empty() {
+        return None;
+    }
     let sep = if cfg!(windows) { ';' } else { ':' };
     Some(keep_usable(path.trim().split(sep).map(PathBuf::from)))
 }
@@ -522,6 +526,10 @@ mod tests {
         assert_eq!(parse_sentinel_path(&out), Some(vec![good]));
         // No sentinel pair: not an answer.
         assert_eq!(parse_sentinel_path("just garbage"), None);
+        assert_eq!(
+            parse_sentinel_path(&format!("{BEGIN_SENTINEL}\n{END_SENTINEL}")),
+            None
+        );
         assert_eq!(
             parse_sentinel_path(&format!("{BEGIN_SENTINEL}/usr/bin")),
             None
