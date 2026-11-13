@@ -1150,6 +1150,15 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
                 .await?
             }
         };
+        // Whose policy body the respawn's system-prompt file carries: the
+        // tenant a session in its working dir resolves to, awaited HERE because
+        // the spawn seam below is synchronous (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Resolved per attempt: a retry spawns afresh.
+        let policy_tenant = crate::mcp::policy_tenant::new_session_policy_tenant(
+            std::path::Path::new(self.working_dir),
+        )
+        .await;
         crate::terminal::account_migration::spawn_resumed_pane(
             &self.app,
             &self.terminal_manager,
@@ -1181,6 +1190,7 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
                 // box's to carry.
                 gate_identity: None,
                 origin: crate::coord_drain_state::SpawnOrigin::Respawn,
+                policy_tenant,
             },
         )
         .map(|(terminal_id, _coord_id)| terminal_id)
