@@ -4118,11 +4118,13 @@ mod tests {
         let own = fresh_database().await;
         let client = connect_to(&own).await;
         let nonce = process_nonce();
-        let other = if nonce == "0badc0de" {
-            "0badc0df"
-        } else {
-            "0badc0de"
-        };
+        // Another nonce of this run's own: fixed names would collide with a
+        // concurrent run's on a shared external server, and a run killed before
+        // its drops would leave them to fail every later run there.
+        let other =
+            std::iter::repeat_with(|| format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32))
+                .find(|other| other != nonce)
+                .expect("an endless supply of candidates");
         let planted = [format!("qtest_{other}_1"), format!("qtpl_{other}")];
         for name in &planted {
             // From `template0`, which nothing connects to: a session open on the
