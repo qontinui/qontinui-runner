@@ -400,11 +400,65 @@ fn a_closed_window_keeps_its_restores_and_drops_its_deferrals() {
     assert_eq!(reports.pages(Ran).has_run("p2"), Some(true));
 }
 
+/// A closing window's webview outlives the forget until its asynchronous
+/// `destroy()` lands, and a report it sends in between is refused: it cannot
+/// re-pin the deferral the forget dropped. A window built again under the
+/// same label reports normally. Mutations: `record` ignoring the tombstone;
+/// `forget` not tombstoning; `reopen` a no-op.
+#[test]
+fn a_closed_windows_late_report_is_refused_until_the_label_is_reopened() {
+    use BootRestorePhase::Ran;
+    let mut reports = WindowReports::default();
+    reports.record("main", Some(report(&["default"], &[])));
+    reports.record("term-a", Some(report(&["p2"], &[])));
+    reports.forget("term-a");
+
+    reports.record("term-a", Some(report(&["p2"], &["p2"])));
+    assert_eq!(
+        reports.pages(Ran).has_run("p2"),
+        Some(true),
+        "the late report after the forget is refused"
+    );
+
+    reports.reopen("term-a");
+    reports.record("term-a", Some(report(&["p2"], &["p2"])));
+    assert_eq!(
+        reports.pages(Ran).has_run("p2"),
+        Some(false),
+        "a rebuilt term-a's deferral counts"
+    );
+}
+
+/// A closed window's `known` set is not kept: the open windows report the
+/// whole layout, so a page only the closed window listed is no longer a layout
+/// page, and its rows are orphans the first restore adopted. Mutation: `forget`
+/// retaining `known` (the page then reads as a layout page that never ran).
+#[test]
+fn a_closed_windows_known_pages_are_not_kept() {
+    use BootRestorePhase::Ran;
+    let progress = |complete: &[&str], known: &[&str]| PageRestoreProgress {
+        complete: complete.iter().map(|p| p.to_string()).collect(),
+        deferred: HashSet::new(),
+        known: known.iter().map(|p| p.to_string()).collect(),
+    };
+    let mut reports = WindowReports::default();
+    reports.record("main", Some(progress(&["default"], &["default"])));
+    reports.record("term-a", Some(progress(&[], &["default", "gone-page"])));
+    assert_eq!(reports.pages(Ran).has_run("gone-page"), Some(false));
+
+    reports.forget("term-a");
+    assert_eq!(
+        reports.pages(Ran).has_run("gone-page"),
+        Some(true),
+        "no open window lists it: an orphan, adopted by main's restore"
+    );
+}
+
 /// A window's report is bounded: ids are trimmed and blank ones dropped, and
 /// a list over the cap, or an id over the length cap, makes the report
 /// unreadable rather than silently orphaning the pages past the cap.
-/// Mutations: the trim removed; the count cap applied by truncation; the
-/// length check removed.
+/// Mutations: the trim removed; the count cap applied by truncation, or
+/// before de-duplication; the length check removed.
 #[test]
 fn a_report_is_trimmed_and_an_oversized_one_is_unreadable() {
     let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -417,6 +471,11 @@ fn a_report_is_trimmed_and_an_oversized_one_is_unreadable() {
     assert_eq!(PageRestoreProgress::from_report(vec![], vec![], many), None);
     let at_cap: Vec<String> = (0..MAX_REPORTED_PAGES).map(|i| format!("p{i}")).collect();
     assert!(PageRestoreProgress::from_report(vec![], vec![], at_cap).is_some());
+    let repeated: Vec<String> = (0..=MAX_REPORTED_PAGES).map(|_| "p".to_string()).collect();
+    assert!(
+        PageRestoreProgress::from_report(vec![], vec![], repeated).is_some(),
+        "the cap counts distinct ids, as stored"
+    );
     let long = "x".repeat(MAX_PAGE_ID_LEN + 1);
     assert_eq!(
         PageRestoreProgress::from_report(vec![long], vec![], vec![]),

@@ -147,24 +147,25 @@ impl PageRestoreProgress {
     }
 
     /// A window's report as the webview sent it, bounded: ids are trimmed and
-    /// blank ones skipped, each at most [`MAX_PAGE_ID_LEN`] bytes. `None` when a
-    /// list holds more than [`MAX_REPORTED_PAGES`] ids or an id is too long:
-    /// dropping the excess would silently turn a layout page into an orphan (or
-    /// a deferred page into a run one), so such a report cannot be read.
+    /// blank ones skipped and duplicates folded. What is stored is bounded:
+    /// `None` when a list holds more than [`MAX_REPORTED_PAGES`] distinct ids
+    /// or an id is longer than [`MAX_PAGE_ID_LEN`] bytes. Dropping the excess
+    /// would silently turn a layout page into an orphan (or a deferred page
+    /// into a run one), so such a report cannot be read.
     pub fn from_report(
         complete: Vec<String>,
         deferred: Vec<String>,
         known: Vec<String>,
     ) -> Option<Self> {
         let pages = |ids: Vec<String>| -> Option<HashSet<String>> {
-            let ids: Vec<String> = ids
+            let ids: HashSet<String> = ids
                 .iter()
                 .map(|id| id.trim())
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .collect();
             (ids.len() <= MAX_REPORTED_PAGES && ids.iter().all(|id| id.len() <= MAX_PAGE_ID_LEN))
-                .then(|| ids.into_iter().collect())
+                .then_some(ids)
         };
         Some(Self {
             complete: pages(complete)?,
@@ -174,7 +175,7 @@ impl PageRestoreProgress {
     }
 }
 
-/// The most page ids one list of a window's report may hold. A layout holds a
+/// The most distinct page ids one list of a window's report may hold. A layout holds a
 /// handful of pages; this only caps a runaway caller.
 pub const MAX_REPORTED_PAGES: usize = 1024;
 
@@ -189,19 +190,36 @@ struct WindowReports {
     /// Each open window's latest report, by label. `None` for a report that
     /// could not be read ([`PageRestoreProgress::from_report`]).
     live: BTreeMap<String, Option<PageRestoreProgress>>,
-    /// The completed (and not deferred) and known pages of windows that have
-    /// closed. A restore a closed window ran still ran; its deferrals are
-    /// dropped, because the pages move to another window, which restores them
-    /// itself.
+    /// The completed (and not deferred) pages of windows that have closed,
+    /// in `complete` alone. A restore a closed window ran still ran; its
+    /// deferrals are dropped, because the pages move to another window, which
+    /// restores them itself. Its `known` set is not kept: every open window
+    /// reports the whole persisted layout, and a retained copy only goes stale.
     closed: PageRestoreProgress,
+    /// Labels of windows that have closed. A closing window's webview lives on
+    /// until its asynchronous `destroy()` lands, and may report in between; a
+    /// tombstoned label's report is refused, under the same lock as the
+    /// forget, so it cannot re-pin the deferrals the forget dropped. Cleared
+    /// when a window with that label is built again ([`Self::reopen`]).
+    tombstones: HashSet<String>,
 }
 
 impl WindowReports {
+    /// Record `window`'s report, unless the window has closed.
     fn record(&mut self, window: &str, report: Option<PageRestoreProgress>) {
+        if self.tombstones.contains(window) {
+            return;
+        }
         self.live.insert(window.to_string(), report);
     }
 
+    /// A window with this label is being built: its reports count again.
+    fn reopen(&mut self, window: &str) {
+        self.tombstones.remove(window);
+    }
+
     fn forget(&mut self, window: &str) {
+        self.tombstones.insert(window.to_string());
         if let Some(Some(report)) = self.live.remove(window) {
             // A deferred page is in `complete` too (the webview opens its
             // auto-save gate) though it restored nothing: not retained.
@@ -211,7 +229,6 @@ impl WindowReports {
                     .into_iter()
                     .filter(|p| !report.deferred.contains(p)),
             );
-            self.closed.known.extend(report.known);
         }
     }
 
@@ -221,8 +238,7 @@ impl WindowReports {
         if self.live.values().any(Option::is_none) {
             return PagesRestored::Unknown;
         }
-        let closed = (!self.closed.complete.is_empty() || !self.closed.known.is_empty())
-            .then_some(&self.closed);
+        let closed = (!self.closed.complete.is_empty()).then_some(&self.closed);
         PagesRestored::from_parts(self.live.values().flatten().chain(closed), phase)
     }
 }
@@ -239,10 +255,19 @@ pub fn record_page_restore_progress(window: &str, report: Option<PageRestoreProg
 }
 
 /// A window closed: keep the restores it ran, drop its deferrals (see
-/// [`WindowReports::closed`]). Idempotent.
+/// [`WindowReports::closed`]), and refuse its later reports until a window
+/// with this label is built again. Idempotent.
 pub fn forget_page_restore_progress(window: &str) {
     if let Ok(mut reports) = WINDOW_REPORTS.lock() {
         reports.forget(window);
+    }
+}
+
+/// A window with this label is being built: accept its reports again (see
+/// [`WindowReports::tombstones`]).
+pub fn reopen_page_restore_progress(window: &str) {
+    if let Ok(mut reports) = WINDOW_REPORTS.lock() {
+        reports.reopen(window);
     }
 }
 
