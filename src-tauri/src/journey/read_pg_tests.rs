@@ -119,8 +119,8 @@ fn withdrawn(mut e: JourneyEdgeObservation) -> JourneyEdgeObservation {
 ///
 /// The older rows' ids are chosen so that the groups' smallest ids run
 /// OPPOSITE to the order their transitions sort in (A's group has the largest,
-/// Z's the smallest) and to the order they are written in, so only the SQL's
-/// `ORDER BY min(e.id::text)` puts them in id order.
+/// Z's the smallest), so only the SQL's `ORDER BY min(e.id::text)` puts them in
+/// id order.
 fn subject_rows() -> Vec<JourneyEdgeObservation> {
     let a_b = edge(0, "a", Some("b"), "affordance", "changed", "fp-a1");
     let a_d = edge(0, "a", Some("d"), "affordance", "changed", "fp-a2");

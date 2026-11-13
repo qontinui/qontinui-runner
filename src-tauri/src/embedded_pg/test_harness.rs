@@ -7,8 +7,9 @@
 //! # Why
 //!
 //! Until this existed, the runner's `DATABASE_URL`-backed tests were
-//! `#[ignore]`d, most behind a silent localhost fallback, so no CI lane ran them
-//! and SQL verified by hand was retained nowhere. The harness boots the
+//! `#[ignore]`d, or compiled only under the `pg_integration_tests` feature, most
+//! behind a silent localhost fallback, so no CI lane ran them and SQL verified
+//! by hand was retained nowhere. The harness boots the
 //! runner's OWN bundled server — the end user's production database — inside
 //! the test process, so a Postgres test runs wherever tests run: both CI legs,
 //! `cargo-guard.sh test`, nextest.
@@ -1712,12 +1713,15 @@ fn harness_dir() -> Result<PathBuf, String> {
 /// host's own triple named explicitly — puts the binary in
 /// `<target>/<triple>/<profile>/deps/`, and cargo tags `<target>/<triple>/` as
 /// well when it creates it, so the harness lands in
-/// `<target>/<triple>/qontinui-test-pg`. That is intended: the template cache
-/// holds the extracted bundled PostgreSQL, which `postgresql_embedded` bundles
-/// for the target triple, and the cache key names only the triple's OS and
-/// architecture ([`PLATFORM`]), not its environment (`gnu` or `musl`). Found
-/// from the binary rather than `CARGO_TARGET_TMPDIR`, which cargo sets for
-/// integration tests and benches only — this module serves every test binary.
+/// `<target>/<triple>/qontinui-test-pg`. That is intended: each triple's test
+/// binaries get caches of their own. The bundled PostgreSQL a cache extracts is
+/// the one `postgresql_embedded` chooses in its build script, through a
+/// build-dependency, so it follows the HOST triple, which is the target's only
+/// when the two are the same; and the cache key names only the test binary's
+/// OS and architecture ([`PLATFORM`]), not its environment (`gnu` or `musl`).
+/// Found from the binary rather than `CARGO_TARGET_TMPDIR`, which cargo sets
+/// for integration tests and benches only — this module serves every test
+/// binary.
 fn cargo_target_dir_of(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
         .skip(1)
