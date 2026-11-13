@@ -230,6 +230,12 @@ describe("page restore settlement", () => {
     expect(pageRestoreSettled("gone", ctx({ complete: ["p1"] }).progress)).toBe(true);
     expect(pageRestoreSettled("gone", ctx({ complete: [] }).progress)).toBe(false);
   });
+  it("does not settle an orphan page on a page the drain deferred — nothing was adopted", () => {
+    const deferredOnly = ctx({ complete: ["p1"], deferred: ["p1"] }).progress;
+    expect(pageRestoreSettled("gone", deferredOnly)).toBe(false);
+    const oneRan = ctx({ complete: ["p1", "p2"], deferred: ["p1"] }).progress;
+    expect(pageRestoreSettled("gone", oneRan)).toBe(true);
+  });
 });
 
 describe("rows", () => {

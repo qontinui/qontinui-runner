@@ -120,8 +120,11 @@ impl PageRestoreProgress {
     /// Has `page_id`'s boot restore run in this process? A deferred page has
     /// not, whatever else says so. A page in the layout has once its own restore
     /// completed. A page in NO layout holds orphans, which the first page to
-    /// restore adopts, so it has once any page has. A blank page id is
-    /// `default`, as the webview reads it.
+    /// restore adopts, so it has once any page's restore ran — not merely
+    /// completed: a page the drain deferred is in `complete` too (the webview
+    /// opens its auto-save gate), yet it restored nothing and released the
+    /// orphan-adoption claim. A blank page id is `default`, as the webview reads
+    /// it.
     fn has_run(&self, page_id: &str) -> bool {
         let page = if page_id.is_empty() {
             "default"
@@ -131,7 +134,9 @@ impl PageRestoreProgress {
         if self.deferred.contains(page) {
             return false;
         }
-        self.complete.contains(page) || (!self.known.contains(page) && !self.complete.is_empty())
+        self.complete.contains(page)
+            || (!self.known.contains(page)
+                && self.complete.iter().any(|p| !self.deferred.contains(p)))
     }
 
     fn merge(mut self, other: &PageRestoreProgress) -> Self {
