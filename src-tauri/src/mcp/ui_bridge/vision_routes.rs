@@ -4754,8 +4754,11 @@ mod tests {
             element_bboxes: bboxes,
             snapshot_id: None,
         };
-        let baselines: std::collections::HashMap<String, qontinui_vision_core::BaselineEntry> =
-            [(entry.name.clone(), qontinui_vision_core::BaselineEntry::from(&entry))].into();
+        let baselines: std::collections::HashMap<String, qontinui_vision_core::BaselineEntry> = [(
+            entry.name.clone(),
+            qontinui_vision_core::BaselineEntry::from(&entry),
+        )]
+        .into();
         let result = qontinui_vision_core::evaluate_assertion(
             &qontinui_vision_core::Assertion::NoLayoutShiftSince {
                 baseline: "fractional".to_string(),
