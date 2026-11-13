@@ -5939,25 +5939,22 @@ mod device_jwt_tests {
     /// true. The device-JWT constant (4_800s) violates it, which is exactly
     /// why Cognito may not borrow it.
     ///
-    /// Both operands are constants, so the check is a `const` block: a
-    /// violation fails the test target's COMPILATION rather than a test run
-    /// (a const panic message cannot interpolate, so the values are named in
-    /// the compile error's source line instead).
-    #[test]
-    fn cognito_threshold_is_below_token_ttl() {
-        const {
-            assert!(
-                COGNITO_REFRESH_BEFORE_EXPIRY_SECS < COGNITO_ACCESS_TOKEN_TTL_SECS,
-                "a refresh threshold >= the token TTL makes every freshly-minted \
-                 token instantly stale"
-            );
-            assert!(
-                REFRESH_BEFORE_EXPIRY_SECS >= COGNITO_ACCESS_TOKEN_TTL_SECS,
-                "regression guard: the device-JWT threshold exceeds the Cognito \
-                 TTL, so reusing it for Cognito reintroduces the always-stale loop"
-            );
-        }
-    }
+    /// Every operand is a constant, so this is a `const` item: a violation
+    /// fails `cargo check` / `clippy` of the test target, not a test run. (A
+    /// const panic message cannot interpolate; the constants are named in the
+    /// failing source line the compiler prints.)
+    const _: () = {
+        assert!(
+            COGNITO_REFRESH_BEFORE_EXPIRY_SECS < COGNITO_ACCESS_TOKEN_TTL_SECS,
+            "a refresh threshold >= the token TTL makes every freshly-minted \
+             token instantly stale"
+        );
+        assert!(
+            REFRESH_BEFORE_EXPIRY_SECS >= COGNITO_ACCESS_TOKEN_TTL_SECS,
+            "regression guard: the device-JWT threshold exceeds the Cognito \
+             TTL, so reusing it for Cognito reintroduces the always-stale loop"
+        );
+    };
 
     /// The reported symptom, at the unit level: store tokens exactly as
     /// `refresh_cognito_bearer` does after a successful grant
