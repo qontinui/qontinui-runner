@@ -109,6 +109,16 @@ struct AskQuestionReply {
     /// coord's reason, beside `recommendation_recorded`.
     #[serde(default)]
     recommendation_note: Option<JsonValue>,
+    /// coord's ask-time advisory `warnings[]` (qontinui-coord#4092): one
+    /// `{code, field, value, enforcement, message}` entry per cited
+    /// `evidence_refs` reference the auto-retire sweep can never retire this
+    /// question on — `evidence_ref_terminal_at_ask` (already terminal when
+    /// asked, so it is context) or `evidence_ref_unknown_at_ask` (unreadable).
+    /// coord sends the key only when there are warnings. Kept raw, like the
+    /// disclosure keys, so a malformed value cannot fail the decode of a
+    /// question coord HAS recorded; [`ask_warnings`] renders it.
+    #[serde(default)]
+    warnings: Option<JsonValue>,
 }
 
 /// Whether coord recorded the `recommendation` / `if_overturned` a question
@@ -143,6 +153,11 @@ pub enum RecommendationRecorded {
 pub struct PostedQuestion {
     pub question_id: Uuid,
     pub recommendation: RecommendationRecorded,
+    /// coord's ask-time advisory warnings, rendered by [`ask_warnings`]. Empty
+    /// when coord sent none. A coord predating qontinui-coord#4092 never
+    /// sends any, so empty is not proof that every cited reference can
+    /// retire the question.
+    pub warnings: Vec<String>,
 }
 
 /// What [`ask_via_coord`] returns: the operator's answer, plus whether the
@@ -152,7 +167,37 @@ pub struct PostedQuestion {
 pub struct AnsweredQuestion {
     pub question_id: Uuid,
     pub recommendation: RecommendationRecorded,
+    /// [`PostedQuestion::warnings`], carried through to the answer.
+    pub warnings: Vec<String>,
     pub response: String,
+}
+
+/// Render coord's ask-time `warnings[]` as one `<code>: <message>` line per
+/// entry. PURE: [`post_question`] does the logging. An absent key is no
+/// warnings. A value that is not an array, or an entry without a string
+/// `code`, still yields a line that names it, never a silent drop.
+fn ask_warnings(reply: &AskQuestionReply) -> Vec<String> {
+    let entries = match &reply.warnings {
+        None | Some(JsonValue::Null) => return Vec::new(),
+        Some(JsonValue::Array(entries)) => entries,
+        Some(other) => {
+            return vec![format!(
+                "unrecognised: the reply's warnings is not an array: {other}"
+            )]
+        }
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let code = entry.get("code").and_then(JsonValue::as_str);
+            let message = entry.get("message").and_then(JsonValue::as_str);
+            match (code, message) {
+                (Some(code), Some(message)) => format!("{code}: {message}"),
+                (Some(code), None) => code.to_string(),
+                _ => format!("unrecognised: {entry}"),
+            }
+        })
+        .collect()
 }
 
 /// A blank value is no value. It is sent as `None` (omitted from the wire),
@@ -320,6 +365,13 @@ pub async fn post_question(
                     })?;
                     let question_id = parsed.question_id;
                     let recorded = recommendation_recorded(recommendation, if_overturned, &parsed);
+                    let warnings = ask_warnings(&parsed);
+                    for w in &warnings {
+                        warn!(
+                            "coord_questions::post_question: question {question_id} (agent \
+                             {agent_id}): coord warned at ask time: {w}"
+                        );
+                    }
                     match &recorded {
                         RecommendationRecorded::NotSupplied
                         | RecommendationRecorded::Yes { note: None } => {}
@@ -348,6 +400,7 @@ pub async fn post_question(
                     return Ok(PostedQuestion {
                         question_id,
                         recommendation: recorded,
+                        warnings,
                     });
                 }
             }
@@ -486,6 +539,7 @@ pub async fn ask_via_coord(
     Ok(AnsweredQuestion {
         question_id: posted.question_id,
         recommendation: posted.recommendation,
+        warnings: posted.warnings,
         response,
     })
 }
@@ -742,6 +796,84 @@ mod tests {
         assert_not_warned(&log);
     }
 
+    /// A reply carrying coord's ask-time `warnings[]` (qontinui-coord#4092):
+    /// each entry is rendered `<code>: <message>`, carried on the returned
+    /// [`PostedQuestion`] and warned, naming the question.
+    #[tokio::test]
+    async fn ask_time_warnings_are_carried_and_warned() {
+        let _amb = crate::test_env::isolated_ambient();
+        let qid = Uuid::parse_str(FORK_QID).unwrap();
+        let reply = serde_json::json!({
+            "question_id": qid,
+            "response": null,
+            "responded_at": null,
+            "shape": "open_question",
+            "warnings": [{
+                "code": "evidence_ref_terminal_at_ask",
+                "field": "evidence_refs.gate_id",
+                "value": "7c17f033-e659-429a-920b-a3a4e4a24066",
+                "enforcement": "warn",
+                "message": "gate already cleared when asked",
+            }],
+        });
+        let (base, _) = spawn_ask_coord(reply).await;
+        let (guard, logs) = capture_warnings();
+        let out = post_question(
+            &base,
+            Uuid::new_v4(),
+            None,
+            "Q?",
+            &serde_json::json!(["a", "b"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("post_question");
+        drop(guard);
+        assert_eq!(
+            out.warnings,
+            vec!["evidence_ref_terminal_at_ask: gate already cleared when asked".to_string()]
+        );
+        let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_warned(&log, "coord warned at ask time: evidence_ref_terminal_at_ask");
+    }
+
+    /// Malformed `warnings` never vanish: a non-array value and an entry with
+    /// no string `code` each still yield a line that names them.
+    #[test]
+    fn malformed_ask_warnings_are_named_not_dropped() {
+        let reply = |w: serde_json::Value| AskQuestionReply {
+            question_id: Uuid::nil(),
+            shape: None,
+            recommendation_recorded: None,
+            recommendation_note: None,
+            warnings: Some(w),
+        };
+        let not_array = ask_warnings(&reply(serde_json::json!("oops")));
+        assert_eq!(not_array.len(), 1);
+        assert!(not_array[0].contains("not an array"), "{not_array:?}");
+        let no_code = ask_warnings(&reply(serde_json::json!([{ "message": "m" }])));
+        assert_eq!(no_code.len(), 1);
+        assert!(no_code[0].starts_with("unrecognised:"), "{no_code:?}");
+        let code_only = ask_warnings(&reply(serde_json::json!([{ "code": "c" }])));
+        assert_eq!(code_only, vec!["c".to_string()]);
+        let not_object = ask_warnings(&reply(serde_json::json!(["str"])));
+        assert_eq!(not_object.len(), 1);
+        assert!(not_object[0].starts_with("unrecognised:"), "{not_object:?}");
+        assert!(ask_warnings(&reply(serde_json::Value::Null)).is_empty());
+        assert!(ask_warnings(&reply(serde_json::json!([]))).is_empty());
+        // No `warnings` key at all (coord's warning-free reply, or a coord
+        // predating qontinui-coord#4092) is no warnings.
+        let absent = AskQuestionReply {
+            warnings: None,
+            ..reply(serde_json::Value::Null)
+        };
+        assert!(ask_warnings(&absent).is_empty());
+    }
+
     /// `recommendation_recorded: false`: nothing was written, the operator is
     /// shown an open question, and coord's note is carried and warned.
     #[tokio::test]
@@ -949,6 +1081,7 @@ mod tests {
             AnsweredQuestion {
                 question_id: qid,
                 recommendation: RecommendationRecorded::Yes { note: None },
+                warnings: Vec::new(),
                 response: "b".to_string(),
             }
         );
