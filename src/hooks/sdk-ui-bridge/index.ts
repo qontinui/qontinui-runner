@@ -15,6 +15,7 @@ export { useStateExploration } from "./useStateExploration";
 export type {
   SdkAppInfo,
   SdkConnectionInfo,
+  SdkConnectionBearer,
   CommandHistoryEntry,
   ExplorationProgress,
   UseSdkUIBridgeReturn,
