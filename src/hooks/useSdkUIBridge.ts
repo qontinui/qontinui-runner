@@ -32,6 +32,7 @@ import type { SdkAppInfo, UseSdkUIBridgeReturn } from "./sdk-ui-bridge";
 export type {
   SdkAppInfo,
   SdkConnectionInfo,
+  SdkConnectionBearer,
   ExplorationProgress,
   UseSdkUIBridgeReturn,
 } from "./sdk-ui-bridge";
