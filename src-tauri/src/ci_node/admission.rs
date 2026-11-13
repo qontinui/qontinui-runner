@@ -701,8 +701,13 @@ fn room_opened(last_cap: u32, cap: u32, running: usize, queued: usize) -> usize 
 /// is drained rather than waiting for the running set to empty.
 static LAST_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
-/// Record that a dispatch was deferred at `cap`, so the next cap-rise drain
-/// measures its rise from there ([`LAST_CAP`]).
+/// Record that a dispatch was deferred while the cap read `cap` — at the cap,
+/// or for headroom, or a drained re-submit deferring again — so the next
+/// cap-rise drain measures its rise from there ([`LAST_CAP`]). A deferral at a
+/// cap the next tick does not exceed drains nothing; one the tick exceeds is
+/// re-tested, which admission re-checks, so a wobbling cap costs a re-queue,
+/// never an over-admission. Call it under `ci_state`'s lock, in the same
+/// critical section as the `push_back`.
 fn note_deferred_at_cap(cap: u32) {
     LAST_CAP.fetch_min(cap, std::sync::atomic::Ordering::Relaxed);
 }
@@ -812,11 +817,13 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
     match decision {
         Admission::Reject(reason) => reject(&payload, reason),
         Admission::Defer => {
-            note_deferred_at_cap(max_concurrent);
             let (dispatch_id, repo) = (payload.dispatch_id.clone(), payload.repo.clone());
             let (depth, needs_waker) = {
                 let mut state = ci_state().lock().unwrap();
                 state.queued.push_back(payload);
+                // Under the same lock as the push, so a tick cannot consume
+                // the lowered cap before the dispatch is in the queue.
+                note_deferred_at_cap(max_concurrent);
                 // An at-cap defer is drained by `on_build_finished` — something
                 // is running, so something will finish. A HEADROOM defer has no
                 // such guarantee: with nothing running, nothing will ever
@@ -957,12 +964,14 @@ fn start_build(
         // in-between for the disk probe).
         if state.running.len() >= max_concurrent.max(1) as usize {
             drop(state);
-            note_deferred_at_cap(max_concurrent);
             info!(
                 "ci_node: slot taken while gating — deferring dispatch {}",
                 payload.dispatch_id
             );
-            ci_state().lock().unwrap().queued.push_back(payload);
+            let mut state = ci_state().lock().unwrap();
+            state.queued.push_back(payload);
+            note_deferred_at_cap(max_concurrent);
+            drop(state);
             return;
         }
         state
@@ -1128,6 +1137,13 @@ mod tests {
         assert_eq!(room_opened(5, 3, 0, 4), 0, "a fall drains nothing");
         assert_eq!(room_opened(u32::MAX, 5, 0, 4), 0, "the first tick");
         assert_eq!(room_opened(3, 5, 9, 4), 0, "still over the new cap");
+        // A dip between two ticks: the last tick saw 4; a build finished,
+        // lowering the cap and `running` together, so the queue head deferred
+        // at 3 (the deferral lowers the remembered cap with `fetch_min`); the
+        // next read restores 4. Measured from the tick alone there is no rise;
+        // from the deferral there is, and the dispatch drains.
+        assert_eq!(room_opened(4, 4, 3, 1), 0, "from the tick's cap: missed");
+        assert_eq!(room_opened(4u32.min(3), 4, 3, 1), 1, "from the deferral's cap");
     }
 
     /// The sizing counts only the dispatches that had started by the sample's

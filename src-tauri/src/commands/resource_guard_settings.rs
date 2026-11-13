@@ -288,7 +288,10 @@ fn host_suggestion_json(cap: crate::ci_node::host_sizing::HostCapacity) -> serde
     let (suggested, limiting_term) = crate::ci_node::host_sizing::suggestion_with_limit(cap);
     // What an unset value resolves to NOW (plan 2026-11-05 Phase 7): the
     // capacity model's Lane B total when it answers, else the static
-    // suggestion above — labelled, with why the model did not answer.
+    // suggestion above — labelled, with why the model did not answer. Read
+    // even when the node is off or capped explicitly, deliberately: the panel
+    // shows what clearing the cap WOULD give, and it is an operator-opened
+    // read, not a periodic one, so its D9 record is one line per open.
     let (effective, source) = crate::ci_node::host_sizing::suggested_concurrent_builds_now(cap);
     let effective = match &source {
         crate::ci_node::host_sizing::ConcurrencySource::Model {

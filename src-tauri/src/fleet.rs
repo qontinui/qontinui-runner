@@ -1188,13 +1188,14 @@ async fn publish_budget_with(
     let ci = crate::settings::get_ci_node_settings();
     let host = crate::ci_node::host_sizing::probe();
     // The capacity model is read only when its answer is used: a CI node
-    // with no explicit capacity. Elsewhere `build_budget_request` ignores
-    // `suggested`, and reading the model would log D9 records for a consumer
-    // that is off on this box.
-    let suggested = if ci.enabled && ci.max_concurrent_builds.is_none() {
-        crate::ci_node::host_sizing::suggested_concurrent_builds_now(host).0
+    // with no explicit capacity (`configured_or_suggested_builds` reads
+    // nothing for an explicit one). A disabled node publishes 0 CI jobs and
+    // `build_budget_request` ignores `suggested`, so it reads no model and logs
+    // no D9 records for a consumer that is off on this box.
+    let suggested = if ci.enabled {
+        ci.configured_or_suggested_builds(host)
     } else {
-        crate::ci_node::host_sizing::suggested_concurrent_builds(host)
+        0
     };
     let body = build_budget_request(
         &device.hostname,
