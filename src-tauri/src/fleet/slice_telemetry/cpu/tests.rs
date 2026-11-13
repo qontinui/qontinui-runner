@@ -2234,6 +2234,50 @@ fn a_name_that_is_not_utf8_leaves_its_listing_unknown() {
     assert_eq!(usec(&r, "runner_unit_usec"), Some(5_000_000));
 }
 
+/// A `user-N.slice` that could not be listed, and whose name is not UTF-8 so
+/// cannot be named in a path here, still stands for a place a CI slice could
+/// be: it is taken as `user.slice` itself. With `ci-runners.slice` not found,
+/// the CI total (`ci.slice`'s, here), the `user.slice` remainder and
+/// `unattributed_usec` are withheld, while session work, which is looked for
+/// by name, is not.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unlisted_user_directory_that_cannot_be_named_stands_for_user_slice() {
+    use std::os::unix::ffi::OsStrExt;
+    let u = unit();
+    let m = Machine::new(Some(&u));
+    let odd = m
+        .root
+        .join("user.slice")
+        .join(std::ffi::OsStr::from_bytes(b"user-\xff.slice"));
+    if let Err(e) = fs::create_dir_all(&odd) {
+        eprintln!("SKIPPED: this filesystem refuses a name that is not UTF-8: {e}");
+        return;
+    }
+    let Some(_restore) = unlistable(&odd) else {
+        return;
+    };
+    assert_eq!(m.placement().users_unlisted, ["user.slice"]);
+    let r = m.two_reads(
+        &[("", 0), ("user.slice", 0), ("ci.slice", 0), (u.as_str(), 0)],
+        &[
+            ("", 50_000_000),
+            ("user.slice", 40_000_000),
+            ("ci.slice", 5_000_000),
+            (u.as_str(), 10_000_000),
+        ],
+    );
+    assert_eq!(
+        usec(&r, "session_usec"),
+        Some(10_000_000),
+        "session work is found by name"
+    );
+    for key in ["ci_usec", "user_slice_remainder_usec", "unattributed_usec"] {
+        assert!(r.attribution.get(key).is_none(), "{key}");
+    }
+    assert_eq!(r.attribution["withheld"], json!(["user_slice_unlisted"]));
+}
+
 /// A session-class slice under another user's manager is that user's work,
 /// not this runner's: it keeps its own `cpu` object, and its time is in the
 /// `user.slice` remainder.
@@ -2621,6 +2665,165 @@ fn a_read_that_finds_no_unit_for_the_runner_publishes_no_session_total() {
             usec(&r, "unattributed_usec"),
             unattributed,
             "{own_cgroup:?}"
+        );
+    }
+}
+
+/// The runner's unit is named only when it is a cgroup under the root: a
+/// `self/cgroup` naming a unit with no cgroup under this root names none. No
+/// `runner_unit` key or session total is published, and the holder scopes are
+/// looked for under the manager of the user the runner runs as, not under the
+/// one that unit's path names.
+#[test]
+fn a_runner_unit_that_is_not_a_cgroup_under_the_root_is_not_named() {
+    let theirs = "user.slice/user-1001.slice/user@1001.service/app.slice/qontinui-runner.service";
+    let a = holder("a");
+    let m = Machine::new(Some(theirs));
+    let r = m.two_reads(
+        &[("", 0), ("user.slice", 0), (a.as_str(), 0)],
+        &[
+            ("", 50_000_000),
+            ("user.slice", 30_000_000),
+            (a.as_str(), 20_000_000),
+        ],
+    );
+    let placed = m.placement();
+    assert_eq!(placed.runner_unit, None);
+    assert_eq!(placed.manager.as_deref(), Some(MGR), "uid 1000's manager");
+    for key in ["runner_unit", "runner_unit_usec", "session_usec"] {
+        assert!(r.attribution.get(key).is_none(), "{key}");
+    }
+    assert_eq!(r.attribution["pty_holder_scopes_seen"], json!(1));
+    assert_eq!(usec(&r, "pty_holder_scopes_usec"), Some(20_000_000));
+    assert!(r.attribution.get("withheld").is_none(), "nothing withheld");
+}
+
+/// The keys a read that finds no runner unit and no holder scope publishes
+/// none of.
+const RUNNER_KEYS: [&str; 7] = [
+    "session_usec",
+    "runner_unit",
+    "runner_unit_usec",
+    "pty_holder_scopes_usec",
+    "pty_holder_scopes_seen",
+    "pty_holder_scopes_measured",
+    "pty_holder_scopes_ended",
+];
+
+/// Two reads of `m` 30 s apart with no `/proc` ([`measure`]'s `procfs` is
+/// `None`), so neither finds the runner's unit, its user or its own cgroup.
+fn two_reads_without_procfs(m: &Machine) -> CpuReport {
+    let (u, a) = (unit(), holder("a"));
+    let at = |k: u64| {
+        [
+            ("", 100_000_000 * k),
+            ("user.slice", 60_000_000 * k),
+            ("system.slice", 10_000_000 * k),
+            ("ci.slice", 20_000_000 * k),
+            (u.as_str(), 30_000_000 * k),
+            (a.as_str(), 10_000_000 * k),
+        ]
+    };
+    let (ci_root, t0) = (m.ci_root.as_deref(), Instant::now());
+    m.usages(&at(0));
+    let dirs = m.memory_dirs();
+    let (s, r) = measure(
+        &m.root,
+        None,
+        ci_root,
+        &dirs,
+        DispatchCounts::default,
+        None,
+        || t0,
+    );
+    assert_eq!(r, None, "a first read has nothing to subtract");
+    m.usages(&at(1));
+    let (dirs, later) = (m.memory_dirs(), t0 + Duration::from_secs(30));
+    measure(
+        &m.root,
+        None,
+        ci_root,
+        &dirs,
+        DispatchCounts::default,
+        Some(&s),
+        || later,
+    )
+    .1
+    .expect("a second read reports")
+}
+
+/// A read with no `/proc` finds no runner unit, holder scope or own cgroup:
+/// it publishes no session total and no runner or holder key. A dispatch
+/// cgroup could then be anywhere, so no CI total, remainder or
+/// `unattributed_usec` is published either.
+#[test]
+fn a_read_with_no_procfs_finds_no_runner_and_withholds_what_a_dispatch_could_be_part_of() {
+    let r = two_reads_without_procfs(&Machine::new(Some(&unit())));
+    let withheld = [
+        "ci_usec",
+        "unattributed_usec",
+        "user_slice_remainder_usec",
+        "system_slice_remainder_usec",
+    ];
+    for key in RUNNER_KEYS.iter().chain(&withheld) {
+        assert!(r.attribution.get(*key).is_none(), "{key}");
+    }
+    assert_eq!(usec(&r, "host_usec"), Some(100_000_000));
+    assert_eq!(r.attribution["withheld"], json!(["own_cgroup_unknown"]));
+}
+
+/// With no `/proc` but an operator's `QONTINUI_CI_CGROUP_ROOT` that is
+/// followed, every dispatch cgroup is where that root says, so the CI total,
+/// the remainders and `unattributed_usec` are published, and still no session
+/// total or runner or holder key.
+#[test]
+fn a_read_with_no_procfs_under_a_followed_ci_cgroup_root_publishes_all_but_session_work() {
+    let mut m = Machine::new(Some(&unit()));
+    m.ci_root = Some(m.root.join("ci.slice/dispatches"));
+    let r = two_reads_without_procfs(&m);
+    for key in RUNNER_KEYS {
+        assert!(r.attribution.get(key).is_none(), "{key}");
+    }
+    assert_eq!(usec(&r, "ci_usec"), Some(20_000_000));
+    assert_eq!(usec(&r, "unattributed_usec"), Some(80_000_000));
+    assert_eq!(usec(&r, "user_slice_remainder_usec"), Some(60_000_000));
+    assert_eq!(usec(&r, "system_slice_remainder_usec"), Some(10_000_000));
+    assert!(r.attribution.get("withheld").is_none(), "nothing withheld");
+}
+
+/// A `self/cgroup` that is read but names no own cgroup this module follows,
+/// one with no `0::` line (a cgroup v1 host) or one naming the path through
+/// `..`, leaves the runner's own cgroup unknown, as an unreadable one does: a
+/// dispatch cgroup beside it could be anywhere, so no value one could be part
+/// of is published.
+#[test]
+fn a_self_cgroup_naming_no_followed_own_cgroup_leaves_it_unknown() {
+    for body in ["12:pids:/user.slice\n", "0::/user.slice/../x.service\n"] {
+        let m = Machine::new(None);
+        write(&m.procfs, "self/cgroup", body);
+        assert_eq!(m.placement().own, None, "{body:?}");
+        let r = m.two_reads(
+            &[("", 0), ("user.slice", 0), ("ci.slice", 0)],
+            &[
+                ("", 50_000_000),
+                ("user.slice", 30_000_000),
+                ("ci.slice", 10_000_000),
+            ],
+        );
+        for key in [
+            "session_usec",
+            "runner_unit",
+            "ci_usec",
+            "unattributed_usec",
+            "user_slice_remainder_usec",
+        ] {
+            assert!(r.attribution.get(key).is_none(), "{key}: {body:?}");
+        }
+        assert_eq!(usec(&r, "host_usec"), Some(50_000_000), "{body:?}");
+        assert_eq!(
+            r.attribution["withheld"],
+            json!(["own_cgroup_unknown"]),
+            "{body:?}"
         );
     }
 }
