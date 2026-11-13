@@ -885,8 +885,10 @@ mod tests {
             nested_under_claude: false,
             session_id: None,
             session_status: None,
+            session_status_since: None,
             blocks_restart: true,
             wind_down: None,
+            stray_wait_shells: 0,
         }
     }
 
