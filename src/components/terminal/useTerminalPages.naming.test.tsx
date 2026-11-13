@@ -19,7 +19,12 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(()
 import { instanceStorage } from "@/lib/instance-storage";
 import { setPageBindings } from "@/lib/pageBindings";
 import { TerminalPageTabBar } from "./TerminalPageTabBar";
-import { PAGES_STORAGE_KEY, useTerminalPages, type TerminalPageConfig } from "./useTerminalPages";
+import {
+  PAGES_STORAGE_KEY,
+  TERMINAL_PAGE_REMOVED_EVENT,
+  useTerminalPages,
+  type TerminalPageConfig,
+} from "./useTerminalPages";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -194,5 +199,34 @@ describe("rename", () => {
     act(() => void (ok = hook().renamePage("b", "  agentic  ")));
     expect(ok).toBe(true);
     expect(persisted().map((p) => p.name)).toEqual(["tmux", "agentic"]);
+  });
+});
+
+describe("removePage announces the removal", () => {
+  let seen: string[] = [];
+  const on = (e: Event) => seen.push((e as CustomEvent<{ pageId: string }>).detail.pageId);
+  beforeEach(() => {
+    seen = [];
+    window.addEventListener(TERMINAL_PAGE_REMOVED_EVENT, on);
+  });
+  afterEach(() => window.removeEventListener(TERMINAL_PAGE_REMOVED_EVENT, on));
+
+  it("dispatches the page's id once it leaves the layout", async () => {
+    seed([
+      { id: "p1", name: "Page 1", createdAt: 1 },
+      { id: "p2", name: "Page 2", createdAt: 2 },
+    ]);
+    const { hook } = mount();
+    await act(async () => hook().removePage("p2"));
+    expect(persisted().map((p) => p.id)).toEqual(["p1"]);
+    expect(seen).toEqual(["p2"]);
+  });
+
+  it("does not announce the last page, which is never removed", async () => {
+    seed([{ id: "p1", name: "Page 1", createdAt: 1 }]);
+    const { hook } = mount();
+    await act(async () => hook().removePage("p1"));
+    expect(hook().visiblePages.map((p) => p.id)).toEqual(["p1"]);
+    expect(seen).toEqual([]);
   });
 });

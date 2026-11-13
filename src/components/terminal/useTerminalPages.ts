@@ -93,6 +93,16 @@ export function loadPages(): TerminalPageConfig[] {
  * "default" on a layout that replaced the default page) — which would
  * otherwise never restore and be closed `no-terminal` by the orphan sweep.
  */
+/**
+ * Window event `removePage` dispatches once a page has left the layout, with
+ * detail `{ pageId }`. The restore hook (`useTerminalInitialization`) prunes
+ * the page from what it reports as drain-deferred: a deferred page's owed
+ * sessions never got a pane, so closing the page's live terminals does not
+ * close them, and without the prune the page would be reported as owed a
+ * restore for as long as the window lives.
+ */
+export const TERMINAL_PAGE_REMOVED_EVENT = "terminal-page-removed";
+
 export function loadKnownPageIds(): string[] {
   return loadPages().map((p) => p.id);
 }
@@ -640,12 +650,21 @@ export function useTerminalPages() {
       instanceStorage.removeByPrefix(prefix);
     }
 
+    // Decided from the roster as it stands, the same rule the updater applies:
+    // the last page is never removed, so it is never announced as removed.
+    const roster = allPagesRef.current;
+    const removed = roster.length > 1 && roster.some((p) => p.id === id);
     setPages((prev) => {
       if (prev.length <= 1) return prev; // Can't remove last page
       const updated = prev.filter((p) => p.id !== id);
       savePages(updated);
       return updated;
     });
+    if (removed) {
+      window.dispatchEvent(
+        new CustomEvent(TERMINAL_PAGE_REMOVED_EVENT, { detail: { pageId: id } }),
+      );
+    }
 
     // Switch to another page if active was deleted
     setActivePageIdState((currentActive) => {

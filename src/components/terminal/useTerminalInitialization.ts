@@ -26,7 +26,11 @@ import {
   type SessionOpenArgs,
 } from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
-import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
+import {
+  loadKnownPageIds,
+  readPinnedPageId,
+  TERMINAL_PAGE_REMOVED_EVENT,
+} from "./useTerminalPages";
 import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
@@ -1665,10 +1669,15 @@ export function useTerminalInitialization({
   // A retry that aborts on an indeterminate reconnect, or throws, learned
   // nothing about the drain, so the page stays held — the honest reading is
   // still "the drain deferred it and nothing has restored it". A page removed
-  // from the layout is not pruned either: `removePage` closes every terminal on
-  // it, so its rows close and no restore is owed them, and a waiting row is
-  // what the strip and `restoreOwed` count — never the set's size.
+  // from the layout IS pruned (`TERMINAL_PAGE_REMOVED_EVENT`, below):
+  // `removePage` closes only the page's LIVE terminals, and a drain-held page's
+  // owed sessions never got a pane, so nothing closes their rows. Kept, the page
+  // would be reported deferred — and its rows owed — for as long as the window
+  // lives, with no tab left to restore them into.
   const drainHeldPages = useRef<Set<string>>(new Set());
+  // Pages removed from the layout while this hook lived. Page ids are minted
+  // unique, so a removed id never comes back.
+  const removedPages = useRef<Set<string>>(new Set());
   // Each page's newest restore run. A re-run can start before an earlier run's
   // drain timer fires, and that timer must not release the hold the newer run
   // still needs.
@@ -1699,6 +1708,18 @@ export function useTerminalInitialization({
       console.warn("[TerminalPage] terminal_report_restore_progress failed:", err);
     });
   }, []);
+  // Prune a removed page from the drain hold and re-publish, so neither the
+  // strip nor the backend's `restoreOwed` keeps counting a page that is gone.
+  useEffect(() => {
+    const onRemoved = (e: Event) => {
+      const pageId = (e as CustomEvent<{ pageId?: string }>).detail?.pageId;
+      if (!pageId) return;
+      removedPages.current.add(pageId);
+      if (drainHeldPages.current.delete(pageId)) publishRestorePages();
+    };
+    window.addEventListener(TERMINAL_PAGE_REMOVED_EVENT, onRemoved);
+    return () => window.removeEventListener(TERMINAL_PAGE_REMOVED_EVENT, onRemoved);
+  }, [publishRestorePages]);
   // Live tabs, for the re-run's "already open" check (the init effect does not
   // re-run on every tab change, so it cannot close over `tabs`).
   const liveTabsRef = useRef(tabs);
@@ -1926,7 +1947,8 @@ export function useTerminalInitialization({
           restoreDeferred = true;
           deferredRetryPages.current.add(initPageId);
           drainDeferredPages.current.add(initPageId);
-          drainHeldPages.current.add(initPageId);
+          // A run still in flight when its page was removed must not hold it again.
+          if (!removedPages.current.has(initPageId)) drainHeldPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
           console.warn(

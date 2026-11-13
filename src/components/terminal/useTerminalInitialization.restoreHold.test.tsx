@@ -48,6 +48,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { useZoneLayout, zoneLayoutStorageKey } from "./useZoneLayout";
 import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
 import { useTerminalInitialization } from "./useTerminalInitialization";
+import { TERMINAL_PAGE_REMOVED_EVENT } from "./useTerminalPages";
 
 const PAGE = "hold-test";
 const NOOP = () => {};
@@ -504,9 +505,44 @@ describe("restore runs and the trim hold", () => {
     await until("the first deferral report", () => reports.some((r) => r.includes(PAGE)));
     reconnectIndeterminate = true;
     const before = reconnectRuns;
+    const reportsBefore = reports.length;
     await renderUntil("an aborted retry", api, () => reconnectRuns >= before + 1);
     await settle(100);
+    // The retry published, so the loop below has a post-abort report to check.
+    expect(reports.length).toBeGreaterThan(reportsBefore);
     const first = reports.findIndex((r) => r.includes(PAGE));
     for (const r of reports.slice(first)) expect(r).toContain(PAGE);
+  }, 30_000);
+
+  // A drain-held page's owed sessions never got a pane, so `removePage`
+  // (which closes only live terminals) closes none of them: the hold must be
+  // pruned when the page leaves the layout, or it is reported owed forever.
+  it("stops reporting a drain-deferred page once the page is removed", async () => {
+    const reports: string[][] = [];
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_report_restore_progress") {
+        reports.push([
+          ...((args as { deferredPages?: string[] } | undefined)?.deferredPages ?? []),
+        ]);
+        return { success: true, data: null };
+      }
+      await settle(5);
+      if (cmd === "terminal_session_list_open") {
+        return { success: true, data: { sessions: [], deferredByDrain: { reason: "drain" } } };
+      }
+      return { success: true, data: { settled: true, held: [] } };
+    };
+    mount();
+    await until("the first deferral report", () => reports.some((r) => r.includes(PAGE)));
+    const reportsBefore = reports.length;
+    window.dispatchEvent(
+      new CustomEvent(TERMINAL_PAGE_REMOVED_EVENT, { detail: { pageId: PAGE } }),
+    );
+    await until("a report after the removal", () => reports.length > reportsBefore);
+    expect(reports.at(-1)).not.toContain(PAGE);
+    // A retry still in flight for the removed page does not hold it again.
+    await renderUntil("a later retry", api, () => reconnectRuns >= 3);
+    await settle(100);
+    for (const r of reports.slice(reportsBefore)) expect(r).not.toContain(PAGE);
   }, 30_000);
 });
