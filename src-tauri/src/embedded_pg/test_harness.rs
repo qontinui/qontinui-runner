@@ -4327,10 +4327,15 @@ mod tests {
         let crashed = cache("crashed", false, None);
         let root = dir.join(format!("{RUN_PREFIX}live"));
         std::fs::create_dir(&root).expect("plant a live process's root");
+        // The record names that live process with its own start, as the
+        // process would have recorded itself: `this_process` supplies this
+        // process's start, which no other pid shares.
+        let live = a_live_pid_not_ours();
         write_owner(
             &root,
             &Owner {
-                pid: a_live_pid_not_ours(),
+                pid: live,
+                started: process_start(live),
                 ..Owner::this_process("in-use", None)
             },
         )
