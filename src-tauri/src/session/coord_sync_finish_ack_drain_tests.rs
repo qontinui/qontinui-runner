@@ -325,10 +325,12 @@ async fn a_quarantined_sessions_unconfirmed_finish_still_reaches_the_bound() {
     );
 }
 
-/// Review A3: an unconfirmed 2xx is still coord ANSWERING — it moves the
-/// coord-is-serving signals, without stamping or dequeuing the finish.
+/// Review A3, as split by the re-review: an unconfirmed 2xx is coord
+/// ANSWERING — no outage, `has_been_online` — but not a row coord TOOK, so
+/// `last_ack` / `ack_ticks` (the quarantine's "coord is serving rows"
+/// evidence) do not move.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unconfirmed_answer_counts_as_coord_serving() {
+async fn an_unconfirmed_answer_is_reachability_not_a_taken_row() {
     let (_d, outbox, coord, _rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
     let s = Uuid::new_v4();
@@ -336,12 +338,62 @@ async fn an_unconfirmed_answer_counts_as_coord_serving() {
     let mut state = DrainState::default();
     assert!(!coord.inner.has_been_online.load(Ordering::Relaxed));
     let tick = drain_tick(&coord.inner, &mut state).await;
-    assert!(state.last_ack.is_some(), "coord answered: last_ack moved");
-    assert_eq!(state.ack_ticks, 1);
+    assert!(!tick.outage, "coord answered: not an outage");
     assert!(coord.inner.has_been_online.load(Ordering::Relaxed));
-    assert!(!tick.outage);
+    assert_eq!(state.last_ack, None, "coord took no row");
+    assert_eq!(state.ack_ticks, 0, "coord took no row");
     assert!(acks.lock().unwrap().is_empty(), "never stamped");
     assert_eq!(kinds(&pending_of(&outbox, s)), vec!["finished"]);
+}
+
+/// Re-review 1: a session blocked on an unconfirmed finish (held for at least
+/// the 10-minute floor, which is coord's Active→Stale threshold) still gets
+/// its newest heartbeat out as a front keep-alive, inside its own backoff,
+/// while the finish stays queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_held_on_an_unconfirmed_finish_keeps_its_heartbeat_flowing() {
+    let (_d, outbox, coord, rec, acks) =
+        finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-keepalive", 42);
+    let mut state = DrainState::default();
+    drain_tick(&coord.inner, &mut state).await;
+    assert!(state.retry[&s].unconfirmed_finish.is_some());
+    assert!(
+        state.retry[&s].next_attempt_at > Instant::now(),
+        "the finish is inside its backoff"
+    );
+
+    let machine = Uuid::from_u128(0xeb2155ed_4152_4a91_be82_5d4346f717fc);
+    for _ in 0..2 {
+        outbox
+            .record(machine, s, SessionEventKind::Heartbeat, json!({ "id": s }))
+            .unwrap();
+    }
+    let patches_before = rec.lock().await.patches.len();
+    drain_tick(&coord.inner, &mut state).await;
+
+    assert_eq!(
+        kinds(&pending_of(&outbox, s)),
+        vec!["finished"],
+        "the heartbeats left the queue (newest sent, older superseded); the finish is still held"
+    );
+    let recorder = rec.lock().await;
+    let sent: Vec<_> = recorder.patches[patches_before..]
+        .iter()
+        .filter(|(id, _)| *id == s)
+        .collect();
+    assert_eq!(sent.len(), 1, "exactly the newest heartbeat went out: {sent:?}");
+    assert_ne!(
+        sent[0].1["progress"]["session_status"], "finished",
+        "the finish was not retried inside its backoff"
+    );
+    drop(recorder);
+    assert!(acks.lock().unwrap().is_empty(), "never stamped");
+    assert!(
+        state.retry[&s].unconfirmed_finish.is_some(),
+        "the keep-alive leaves the finish's retry state alone"
+    );
 }
 
 /// Phase 3's coord answer to a swallowed progress write is an ordinary

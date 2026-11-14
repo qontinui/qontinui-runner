@@ -1719,16 +1719,20 @@ impl AiCoordRegistrar {
     }
 
     /// Whether a `Finished` outbox row for `claude_session_id` carrying
-    /// `finished_at` is still pending (undelivered). `None` when the outbox
-    /// cannot be read — UNKNOWN, never "not queued".
+    /// `finished_at` and addressed to coord row `row` is still pending
+    /// (undelivered). A row queued to a DIFFERENT coord row does not count:
+    /// it will not finish this one. `None` when the outbox cannot be read —
+    /// UNKNOWN, never "not queued".
     pub(crate) fn finished_row_pending(
         &self,
         claude_session_id: &str,
         finished_at: i64,
+        row: Uuid,
     ) -> Option<bool> {
         match self.inner.outbox.pending() {
             Ok(rows) => Some(rows.iter().any(|r| {
-                r.event_kind == SessionEventKind::Finished.as_str()
+                r.session_id == row
+                    && r.event_kind == SessionEventKind::Finished.as_str()
                     && r.payload["claude_session_id"].as_str() == Some(claude_session_id)
                     && r.payload["finished_at"].as_i64() == Some(finished_at)
             })),

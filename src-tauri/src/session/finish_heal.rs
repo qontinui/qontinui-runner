@@ -236,9 +236,10 @@ pub trait HealPort: Send + Sync {
     /// Re-send the mark through the serialized late-delivery body; `None`
     /// when the mark is no longer finished-and-unsynced at `finished_at`.
     fn redeliver(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<FinishSync>;
-    /// Whether a `Finished` row for this mark (`csid` at `finished_at`) is
-    /// still pending in the outbox; `None` when the outbox cannot be read.
-    fn finish_queued(&self, csid: &str, finished_at: i64) -> Option<bool>;
+    /// Whether a `Finished` row for this mark (`csid` at `finished_at`),
+    /// addressed to coord row `row`, is still pending in the outbox; `None`
+    /// when the outbox cannot be read.
+    fn finish_queued(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<bool>;
 }
 
 impl HealPort for AiCoordRegistrar {
@@ -249,8 +250,8 @@ impl HealPort for AiCoordRegistrar {
     fn redeliver(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<FinishSync> {
         self.redeliver_finish(csid, finished_at, row)
     }
-    fn finish_queued(&self, csid: &str, finished_at: i64) -> Option<bool> {
-        self.finished_row_pending(csid, finished_at)
+    fn finish_queued(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<bool> {
+        self.finished_row_pending(csid, finished_at, row)
     }
 }
 
@@ -393,7 +394,7 @@ pub fn apply_heal_observed(
             // outbox is not lost — the drain still owes it — so the boot
             // sweep does not queue a second one beside it (review A6).
             (HealDecision::Resend { row }, false) => match port {
-                Some(p) => match p.finish_queued(&rec.claude_session_id, at) {
+                Some(p) => match p.finish_queued(&rec.claude_session_id, at, row) {
                     Some(false) => redelivered(p, rec, at, row, true),
                     Some(true) => HealOutcome::Left(HealSkip::FinishStillQueued),
                     None => HealOutcome::Left(HealSkip::OutboxUnreadable),

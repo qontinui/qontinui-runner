@@ -1495,11 +1495,20 @@ struct ChainOutcome {
     session_id: Uuid,
     /// Rows to ACK out of the outbox — delivered OR deliberately dropped.
     succeeded: Vec<(Uuid, i64)>,
-    /// Coord itself took at least one row (2xx or a 409 on create). The ONLY
-    /// evidence the drain treats as "coord is serving": `succeeded` also holds
-    /// rows ACK-dropped after a spent best-effort budget or a 4xx, and those
-    /// say nothing about whether coord is up.
+    /// Coord itself TOOK at least one row — it left the queue as delivered,
+    /// a create's 409, or coord's typed re-key refusal. The drain's "coord is
+    /// serving rows" evidence: it moves `last_ack` / `ack_ticks` (which decide
+    /// whether another session's failure counts toward quarantine) and
+    /// `/health` `lastAckAt`. `succeeded` also holds rows ACK-dropped after a
+    /// spent best-effort budget or a 4xx, and those say nothing about whether
+    /// coord is up. An unconfirmed `finished` answer does NOT set this: coord
+    /// answered without applying the write, so it took nothing.
     acked_by_coord: bool,
+    /// Coord ANSWERED at least one request of this chain — every case that sets
+    /// [`Self::acked_by_coord`], plus an unconfirmed `finished` answer. Moves
+    /// only the reachability signals: no outage verdict for the tick, and
+    /// `has_been_online`.
+    answered_by_coord: bool,
     /// Updated best-effort attempt counters for this session's records.
     attempts: HashMap<(Uuid, i64), u32>,
     /// Keys whose best-effort budget should be forgotten (delivered/dropped).
@@ -1543,6 +1552,7 @@ async fn push_chain(
         session_id: records.first().map(|r| r.session_id).unwrap_or_default(),
         succeeded: Vec::with_capacity(records.len()),
         acked_by_coord: false,
+        answered_by_coord: false,
         attempts: HashMap::new(),
         cleared: Vec::new(),
         had_transport_error: false,
@@ -1680,11 +1690,15 @@ async fn push_chain(
                     // The row stays queued and blocks THIS session's chain
                     // (seq order); `drain_tick` bounds its retries.
                     //
-                    // It IS a coord answer, so it moves the coord-is-serving
-                    // signals (`last_ack`, `ack_ticks`, `has_been_online`, and
-                    // no outage verdict for this tick) exactly as an ACK would
-                    // — without stamping the finish or leaving the queue.
-                    out.acked_by_coord = true;
+                    // It IS a coord answer, so it moves the reachability
+                    // signals (no outage verdict for this tick,
+                    // `has_been_online`). It is NOT a row coord took: `last_ack`
+                    // / `ack_ticks` / `lastAckAt` stay put, because coord
+                    // answering while its writes are not applying (the
+                    // swallowed-write case) is no evidence that ANOTHER
+                    // session's 5xx is about that session's row — counting it
+                    // would push healthy sessions toward quarantine.
+                    out.answered_by_coord = true;
                     tracing::warn!(
                         session = %rec.session_id,
                         seq = rec.seq,
@@ -1959,10 +1973,23 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     //    its keep-alive while that row is retried.
     let started_kind = SessionEventKind::Started.as_str();
     let closed_kind = SessionEventKind::Closed.as_str();
+    //
+    // The same keep-alive applies to a session whose chain is blocked on an
+    // UNCONFIRMED `finished` row: that row is held for at least
+    // `FINISHED_UNCONFIRMED_MIN_AGE` (600 s), which is coord's Active→Stale
+    // threshold, so heartbeats queued behind it would let coord report a live
+    // session as Stale.
+    let front_eligible = |state: &DrainState, sid: &Uuid| {
+        state.quarantined.contains(sid)
+            || state
+                .retry
+                .get(sid)
+                .is_some_and(|r| r.unconfirmed_finish.is_some())
+    };
     let seq_ordered_heartbeats: HashSet<Uuid> = pending
         .iter()
         .filter(|r| {
-            state.quarantined.contains(&r.session_id)
+            front_eligible(state, &r.session_id)
                 && (r.event_kind == started_kind || r.event_kind == closed_kind)
         })
         .map(|r| r.session_id)
@@ -1970,7 +1997,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     let mut front_heartbeat: HashMap<Uuid, OutboxRecord> = HashMap::new();
     let is_front_candidate = |state: &DrainState, r: &OutboxRecord| {
         r.event_kind == heartbeat_kind
-            && state.quarantined.contains(&r.session_id)
+            && front_eligible(state, &r.session_id)
             && !seq_ordered_heartbeats.contains(&r.session_id)
     };
     for rec in &pending {
@@ -1991,13 +2018,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         if held.contains(&rec.session_id) {
             continue;
         }
+        // A front-eligible session's heartbeats are placed above.
+        if is_front_candidate(state, &rec) {
+            continue; // in `front_heartbeat` (newest) or superseded
+        }
         // A quarantined session's lifecycle rows stay in its chain (a
         // lifecycle row is never disposable); only its other rows go to the
-        // sidecar. Its heartbeats are placed above.
+        // sidecar.
         if state.quarantined.contains(&rec.session_id) {
-            if is_front_candidate(state, &rec) {
-                continue; // in `front_heartbeat` (newest) or superseded
-            }
             if rec.event_kind != heartbeat_kind && !is_lifecycle_kind(&rec.event_kind) {
                 to_quarantine.push(rec);
                 continue;
@@ -2028,9 +2056,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             .get(&chain[0].session_id)
             .is_none_or(|r| r.next_attempt_at <= now)
     });
-    // A quarantined session's keep-alive heartbeat is its OWN one-row chain,
-    // outside the lifecycle backoff above: that backoff is pinned at
-    // MAX_BACKOFF, and coord's stale threshold is shorter, so gating the
+    // A quarantined (or unconfirmed-finish-blocked) session's keep-alive
+    // heartbeat is its OWN one-row chain, outside the session backoff above:
+    // that backoff holds the chain for minutes, and coord's stale threshold
+    // is not longer, so gating the
     // heartbeat behind it would let the live session's coord row lapse.
     let ran_any = !chains.is_empty() || !front_heartbeat.is_empty();
     let chains: Vec<(bool, Vec<OutboxRecord>)> = chains
@@ -2067,10 +2096,12 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     let mut had_transport_error = false;
     let mut delivered = false;
+    let mut answered = false;
     let mut blocked: Vec<(Uuid, String, Option<OutboxRecord>)> = Vec::new();
     let mut heartbeat_failure_drops: Vec<&'static str> = Vec::new();
     for outcome in outcomes {
         delivered |= outcome.acked_by_coord;
+        answered |= outcome.acked_by_coord || outcome.answered_by_coord;
         heartbeat_failure_drops.extend(outcome.heartbeat_failure_drops);
         succeeded.extend(outcome.succeeded);
         had_transport_error |= outcome.had_transport_error;
@@ -2242,8 +2273,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             Err(e) => tracing::warn!(error = %e, "coord_sync: ack write failed"),
         }
     }
-    if delivered {
+    if answered {
         inner.has_been_online.store(true, Ordering::Relaxed);
+    }
+    if delivered {
+        // `lastAckAt` is "a row coord accepted", never a bare answer.
         note_outbox_ack();
     }
 
@@ -2273,7 +2307,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // nothing. A lone session failing on its own row does not trip it, so
         // it can no longer push the whole loop into the 60 s backoff and
         // delay every healthy row behind it.
-        outage: abort.load(Ordering::Relaxed) && !delivered && had_transport_error,
+        outage: abort.load(Ordering::Relaxed) && !answered && had_transport_error,
         idle: false,
         ran_any,
         heartbeats_superseded,
