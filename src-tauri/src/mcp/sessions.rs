@@ -816,9 +816,13 @@ pub struct FinishSessionRequest {
 /// `coord.observedReason` when coord could not be read) and `coord.heal:
 /// {outcome}`. `session.finishSynced` is then `true` only when the stored
 /// stamp is AND coord's own row reads `finished`; unreadable, it keeps the
-/// stored value. A synced mark coord's own row contradicts (not finished,
-/// `since` before the finish) is healed in the same call — its stamp
-/// withdrawn and the finish re-queued (`coord.queued: true`).
+/// stored value. A synced mark is healed in the same call — its stamp
+/// withdrawn and the finish re-queued (`coord.queued: true`) — ONLY when the
+/// mark's own coord row reads `session_status` NULL with a `since` that is
+/// null or earlier than the finish (`session::finish_heal::heal_decision`).
+/// A row reading `working` is never re-offered, whatever its `since`
+/// (`coord.heal.outcome: "working_revival_unprovable"`): coord can be told
+/// `working` without its `since` moving, so it cannot rule out a revival.
 ///
 /// [`FinishOutcome::response_json`]: crate::session::session_lifecycle_store::FinishOutcome::response_json
 async fn finish_session(
