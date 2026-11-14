@@ -9,18 +9,24 @@ sanctioned routes are ``EventManager.emit_log`` and a module
 ``logging.getLogger(__name__)`` logger.
 
 This is a source scan (``ast``, stdlib only), so it runs in the command-table CI
-job without the qontinui library. It scans every non-test ``*.py`` under
-python-bridge.
+job without the qontinui library. It scans every ``*.py`` under python-bridge
+except ``tests/``, ``conftest.py`` and script-style test modules (a ``test_*.py``
+that defines a ``test_*`` function); a production module whose name merely starts
+with ``test_`` (``services/test_analysis_service.py``) IS scanned.
 
 **Sources** (a temp or home path):
 
 - ``gettempdir()``;
-- the ``TEMP`` / ``TMP`` / ``TMPDIR`` environment names, and a ``"/tmp"`` literal;
-- ``expanduser("~...")``, ``Path.home()``, and ``<x>.expanduser()`` whose
-  receiver contains a ``"~"`` literal (``Path("~/x").expanduser()``).
+- the ``TEMP`` / ``TMP`` / ``TMPDIR`` and ``HOME`` / ``USERPROFILE`` environment
+  names (any string literal equal to one), and a ``"/tmp"`` literal;
+- ``expanduser("~...")``, ``Path.home()`` (also ``pathlib.Path.home()``), and
+  ``<x>.expanduser()`` whose receiver contains a ``"~"`` literal
+  (``Path("~/x").expanduser()``).
 
-Imports are resolved per file, so ``from tempfile import gettempdir as g`` makes
-``g()`` a source and ``from pathlib import Path as P`` makes ``P.home()`` one.
+Imports are resolved per file, dotted receivers included, so
+``from tempfile import gettempdir as g`` makes ``g()`` a source and
+``from pathlib import Path as P`` / ``import pathlib as pl`` make ``P.home()`` /
+``pl.Path.home()`` one.
 
 **Sinks** (a write):
 
@@ -37,12 +43,23 @@ site reached ``open()`` through a variable such as ``debug_log_path``.
 (b) an assignment whose value contains a source and a ``.log`` string literal
 (a log path parked in a variable or constant).
 
-**Known limits** (not followed, so not caught): a path stored on an attribute
-(``self.log_path = ...`` then ``open(self.log_path, "a")``), a path returned by a
-helper function, and a path passed in as a parameter. Arm (b) still catches the
-first two when the assignment builds a ``.log`` path from a source. The
-``self_attribute_not_followed`` shape below pins that limit, so widening the
-scanner shows up as a deliberate test change.
+**Known limits** (not followed, so not caught). Each has a ``*_not_followed`` shape
+below expecting no (or only the stated) offenders, so widening the scanner shows up
+as a deliberate test change:
+
+- a path stored on an attribute (``self.log_path = ...`` then
+  ``open(self.log_path, "a")``); arm (b) still flags the assignment when it builds
+  a ``.log`` path from a source;
+- a path returned by a helper function;
+- a path passed in as a parameter, including a parameter DEFAULT built from a
+  source (defaults are not assignments);
+- ``for`` and ``with ... as`` targets (only assignments are resolved);
+- ``tempfile.mkdtemp`` / ``mkstemp`` / ``NamedTemporaryFile`` / ``TemporaryFile``
+  outputs. Deliberately not sources: the bridge uses ``mkdtemp`` legitimately
+  (``executor_core.py`` ``self.temp_dir``, ``qontinui_executor.py`` ``run_dir``)
+  and ``NamedTemporaryFile`` for real temp files;
+- ``os.open`` (the low-level fd API) is not a sink;
+- ``shutil.copy*`` / ``shutil.move`` into a temp or home dir are not sinks.
 
 Legitimate temp-dir writes are allow-listed by (file, function, arm, path
 expression), so a NEW write inside an allow-listed function is still flagged.
@@ -63,6 +80,10 @@ BRIDGE_ROOT = Path(__file__).resolve().parent.parent
 _SKIP_DIRS = {"tests", ".venv", "venv", "build", "dist", "__pycache__", ".pytest_cache"}
 
 TEMP_ENV_NAMES = {"TEMP", "TMP", "TMPDIR"}
+HOME_ENV_NAMES = {"HOME", "USERPROFILE"}
+_ENV_SOURCE_NAMES = TEMP_ENV_NAMES | HOME_ENV_NAMES
+# A receiver of .home() that is pathlib's Path (bare when its import is not seen).
+_PATH_CLASS_NAMES = {"Path", "pathlib.Path", "pathlib.PosixPath", "pathlib.WindowsPath"}
 _OPEN_MODULES = {"io", "codecs", "builtins", "gzip", "bz2", "lzma"}
 _PATH_WRITERS = {"write_text", "write_bytes"}
 _FILE_HANDLERS = {
@@ -125,12 +146,27 @@ class Offender:
         return f"{self.path}:{self.line} in {self.function} [{self.arm}] {self.expr}"
 
 
+def _is_test_module(path: Path) -> bool:
+    """A ``test_*.py`` that defines at least one ``test_*`` function or method.
+
+    The name alone is not enough: ``services/test_analysis_service.py`` is a
+    production module (the Test Builder's analysis service) and must be scanned.
+    """
+    if not path.name.startswith("test_"):
+        return False
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+        for n in ast.walk(tree)
+    )
+
+
 def iter_source_files(root: Path) -> Iterator[Path]:
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root)
         if any(part in _SKIP_DIRS for part in rel.parts[:-1]):
             continue
-        if rel.name.startswith("test_") or rel.name == "conftest.py":
+        if rel.name == "conftest.py" or _is_test_module(path):
             continue
         yield path
 
@@ -219,14 +255,25 @@ class _FileScanner:
             module, name = self.aliases.get(func.id, (None, func.id))
             return module, name or func.id
         if isinstance(func, ast.Attribute):
-            receiver = func.value
-            qualifier = None
-            if isinstance(receiver, ast.Name):
-                # `from pathlib import Path as P` -> "Path"; `import gzip as gz` -> "gzip"
-                module, name = self.aliases.get(receiver.id, (None, receiver.id))
-                qualifier = name or module
-            return qualifier, func.attr
+            return self._dotted(func.value), func.attr
         return None, None
+
+    def _dotted(self, expr: ast.expr) -> str | None:
+        """Dotted name of a receiver with its root import resolved, else None.
+
+        ``P`` (``from pathlib import Path as P``) -> ``pathlib.Path``;
+        ``pl.Path`` (``import pathlib as pl``) -> ``pathlib.Path``;
+        ``gz`` (``import gzip as gz``) -> ``gzip``; an unimported name -> itself.
+        """
+        if isinstance(expr, ast.Name):
+            module, name = self.aliases.get(expr.id, (None, expr.id))
+            if module is None:
+                return name
+            return f"{module}.{name}" if name else module
+        if isinstance(expr, ast.Attribute):
+            root = self._dotted(expr.value)
+            return f"{root}.{expr.attr}" if root else None
+        return None
 
     # -- sources -----------------------------------------------------------
     def _is_direct_source(self, node: ast.AST) -> bool:
@@ -234,7 +281,7 @@ class _FileScanner:
             qualifier, name = self._canonical(node.func)
             if name == "gettempdir":
                 return True
-            if name == "home" and qualifier == "Path":
+            if name == "home" and qualifier in _PATH_CLASS_NAMES:
                 return True
             if name == "expanduser":
                 if node.args and (_str_const(node.args[0]) or "").startswith("~"):
@@ -249,7 +296,7 @@ class _FileScanner:
                     return True
         value = _str_const(node)
         if value is not None:
-            return value in TEMP_ENV_NAMES or value == "/tmp" or value.startswith("/tmp/")
+            return value in _ENV_SOURCE_NAMES or value == "/tmp" or value.startswith("/tmp/")
         return False
 
     def _contains_source(self, expr: ast.AST) -> bool:
@@ -490,6 +537,19 @@ with open(debug_log_path, "a", encoding="utf-8") as f:
         "import logging, tempfile\nlogging.FileHandler(tempfile.gettempdir() + '/bridge')\n",
         ["a:write"],
     ),
+    "dotted_pathlib_path_home": (
+        "import pathlib\npathlib.Path.home().joinpath('x').open('a')\n",
+        ["a:write"],
+    ),
+    "aliased_module_path_home": (
+        "import pathlib as pl\n(pl.Path.home() / 'x').write_text('x')\n",
+        ["a:write"],
+    ),
+    "home_env": ("import os\nopen(os.environ['HOME'] + '/x', 'a')\n", ["a:write"]),
+    "userprofile_env_log_path": (
+        "import os\nLOG = os.path.join(os.getenv('USERPROFILE'), 'debug.log')\n",
+        ["b:log-path"],
+    ),
     "rotating_handler_imported": (
         "from logging.handlers import RotatingFileHandler\nRotatingFileHandler('/tmp/x')\n",
         ["a:write"],
@@ -503,8 +563,9 @@ with open(debug_log_path, "a", encoding="utf-8") as f:
         "from pathlib import Path\nCACHE = Path.home() / '.cache'\n",
         [],
     ),
-    # Documented limit: a path parked on an attribute is not followed by arm (a).
-    # Arm (b) still flags the assignment because it builds a .log path.
+    # ---- documented limits (see "Known limits"): pinned, not endorsed ----
+    # A path parked on an attribute is not followed by arm (a). Arm (b) still
+    # flags the assignment because it builds a .log path.
     "self_attribute_not_followed": (
         """
 import tempfile
@@ -517,6 +578,47 @@ class C:
         open(self.q, "a")
 """,
         ["b:log-path"],
+    ),
+    "helper_return_not_followed": (
+        "import tempfile\n"
+        "def where():\n    return tempfile.gettempdir() + '/x'\n"
+        "def w():\n    open(where(), 'a')\n",
+        [],
+    ),
+    "parameter_not_followed": ("def w(p):\n    open(p, 'a')\n", []),
+    "parameter_default_not_followed": (
+        "import tempfile\ndef w(p=tempfile.gettempdir() + '/x'):\n    open(p, 'a')\n",
+        [],
+    ),
+    "for_target_not_followed": (
+        "import tempfile\nfor d in [tempfile.gettempdir()]:\n    open(d + '/x', 'a')\n",
+        [],
+    ),
+    "with_target_not_followed": (
+        "import tempfile\nwith tempfile.TemporaryDirectory() as d:\n    open(d + '/x', 'a')\n",
+        [],
+    ),
+    "mkdtemp_not_followed": (
+        "import tempfile\nd = tempfile.mkdtemp()\nopen(d + '/x.log', 'a')\n",
+        [],
+    ),
+    "mkstemp_not_followed": (
+        "import tempfile\nfd, p = tempfile.mkstemp(suffix='.log')\nopen(p, 'a')\n",
+        [],
+    ),
+    "named_temporary_file_not_followed": (
+        "import tempfile\n"
+        "with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as f:\n"
+        "    f.write('x')\n",
+        [],
+    ),
+    "os_open_not_followed": (
+        "import os, tempfile\nos.open(tempfile.gettempdir() + '/x', os.O_WRONLY | os.O_CREAT)\n",
+        [],
+    ),
+    "shutil_copy_not_followed": (
+        "import shutil, tempfile\nshutil.copy('a.txt', tempfile.gettempdir())\n",
+        [],
     ),
 }
 
