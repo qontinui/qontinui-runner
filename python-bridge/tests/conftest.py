@@ -252,13 +252,20 @@ def action_record_builder():
 
 
 @pytest.fixture
-def mock_screenshot_service():
+def mock_screenshot_service(temp_storage_dir):
     """Provide a mock ScreenshotService.
+
+    ``storage_dir`` is a real directory, because UnifiedDataCollector joins it
+    with each returned reference to build the absolute paths it hands back.
+
+    Args:
+        temp_storage_dir: Temporary storage directory fixture
 
     Returns:
         Mock object with screenshot service methods
     """
     mock = Mock()
+    mock.storage_dir = temp_storage_dir
     mock.store_screenshot.return_value = "screenshots/screenshot-0001.png"
     mock.store_debug_visual.return_value = "debug_visuals/debug-0001-action-test.png"
     mock.get_screenshot.return_value = b"PNG_DATA"

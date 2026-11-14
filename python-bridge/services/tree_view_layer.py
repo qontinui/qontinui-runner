@@ -13,6 +13,9 @@ from typing import Any
 
 from models.action_execution_record import ActionExecutionRecord
 
+# Label icon for each ActionExecutionRecord.status value.
+_STATUS_ICONS = {"success": "✓", "failed": "✗", "running": "⟳"}
+
 
 @dataclass
 class TreeNode:
@@ -94,8 +97,6 @@ class TreeViewLayer:
 
         # First pass: Create nodes for all records
         for record in records:
-            status = "success" if record.success else "failed" if record.end_time else "running"
-
             node = TreeNode(
                 id=record.action_id,
                 type="action",
@@ -104,7 +105,7 @@ class TreeViewLayer:
                     "action_type": record.action_type,
                     "timestamp": record.start_time,
                     "duration": record.duration_seconds,
-                    "status": status,
+                    "status": record.status,
                     "error": record.error_message,
                 },
                 metadata={
@@ -179,8 +180,6 @@ class TreeViewLayer:
 
         nodes = []
         for record in sorted_records:
-            status = "success" if record.success else "failed" if record.end_time else "running"
-
             node = TreeNode(
                 id=record.action_id,
                 type="action",
@@ -189,7 +188,7 @@ class TreeViewLayer:
                     "action_type": record.action_type,
                     "timestamp": record.start_time,
                     "duration": record.duration_seconds,
-                    "status": status,
+                    "status": record.status,
                     "error": record.error_message,
                 },
                 metadata={
@@ -268,9 +267,6 @@ class TreeViewLayer:
                 )
 
                 for record in sorted(state_records, key=lambda r: r.start_time):
-                    status = (
-                        "success" if record.success else "failed" if record.end_time else "running"
-                    )
                     action_node = TreeNode(
                         id=record.action_id,
                         type="action",
@@ -278,7 +274,7 @@ class TreeViewLayer:
                         data={
                             "action_type": record.action_type,
                             "timestamp": record.start_time,
-                            "status": status,
+                            "status": record.status,
                         },
                     )
                     state_node.children.append(action_node)
@@ -305,9 +301,6 @@ class TreeViewLayer:
                 )
 
                 for record in sorted(state_records, key=lambda r: r.start_time):
-                    status = (
-                        "success" if record.success else "failed" if record.end_time else "running"
-                    )
                     action_node = TreeNode(
                         id=record.action_id,
                         type="action",
@@ -315,7 +308,7 @@ class TreeViewLayer:
                         data={
                             "action_type": record.action_type,
                             "timestamp": record.start_time,
-                            "status": status,
+                            "status": record.status,
                         },
                     )
                     state_node.children.append(action_node)
@@ -334,7 +327,6 @@ class TreeViewLayer:
             )
 
             for record in sorted(no_change_actions, key=lambda r: r.start_time):
-                status = "success" if record.success else "failed" if record.end_time else "running"
                 action_node = TreeNode(
                     id=record.action_id,
                     type="action",
@@ -342,7 +334,7 @@ class TreeViewLayer:
                     data={
                         "action_type": record.action_type,
                         "timestamp": record.start_time,
-                        "status": status,
+                        "status": record.status,
                     },
                 )
                 no_change_node.children.append(action_node)
@@ -385,8 +377,6 @@ class TreeViewLayer:
 
         for record in sorted_records:
             relative_time = record.start_time - start_time
-            status = "success" if record.success else "failed" if record.end_time else "running"
-
             node = TreeNode(
                 id=record.action_id,
                 type="action",
@@ -396,7 +386,7 @@ class TreeViewLayer:
                     "timestamp": record.start_time,
                     "relative_time": relative_time,
                     "duration": record.duration_seconds,
-                    "status": status,
+                    "status": record.status,
                 },
                 metadata={
                     "workflow_id": record.workflow_id,
@@ -477,8 +467,6 @@ class TreeViewLayer:
 
             # Add actions to group
             for record in sorted(group_records, key=lambda r: r.start_time):
-                status = "success" if record.success else "failed" if record.end_time else "running"
-
                 # Build state_changes dict from properties
                 state_changes = {}
                 for state in record.states_activated:
@@ -494,7 +482,7 @@ class TreeViewLayer:
                         "action_type": record.action_type,
                         "timestamp": record.start_time,
                         "duration": record.duration_seconds,
-                        "status": status,
+                        "status": record.status,
                         "state_changes": state_changes,
                     },
                     metadata={
@@ -522,12 +510,7 @@ class TreeViewLayer:
         label = record.action_type
 
         # Add status indicator
-        if record.success:
-            status_icon = "✓"
-        elif record.end_time:
-            status_icon = "✗"
-        else:
-            status_icon = "⟳"
+        status_icon = _STATUS_ICONS[record.status]
 
         # Add duration if available
         duration_str = ""

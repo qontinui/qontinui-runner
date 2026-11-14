@@ -128,6 +128,15 @@ class TestActionExecutionRecordImmutability:
         # Record should be unaffected (defensive copy)
         assert record.config["x"] == 100
 
+    def test_metadata_dict_is_separate_instance(self):
+        """Test that modifying the source metadata dict doesn't affect record."""
+        metadata = {"source": "library"}
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK", metadata=metadata)
+
+        metadata["source"] = "mutated"
+
+        assert record.metadata["source"] == "library"
+
 
 class TestComputedProperties:
     """Test computed properties of ActionExecutionRecord."""
