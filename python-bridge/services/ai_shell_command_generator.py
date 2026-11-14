@@ -307,22 +307,10 @@ class AiShellCommandGeneratorService:
         Returns:
             Dict with success, command, description, and error fields
         """
-        import datetime
-        import os
         import sys
 
-        # Debug log file (same as executor). ~ expands from USERPROFILE on
-        # Windows and HOME elsewhere; the old literal fallback named one
-        # machine's Windows account.
-        debug_log = os.path.join(
-            os.path.expanduser("~"), ".qontinui", "ai-shell-debug.log"
-        )
-
         def debug(msg):
-            ts = datetime.datetime.now().isoformat()
-            line = f"[{ts}] [SERVICE] {msg}\n"
-            with open(debug_log, "a", encoding="utf-8") as f:
-                f.write(line)
+            logger.debug("[SERVICE] %s", msg)
             print(f"[DEBUG SERVICE] {msg}", file=sys.stderr, flush=True)
 
         debug("generate_command() CALLED")

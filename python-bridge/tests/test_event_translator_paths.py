@@ -8,8 +8,11 @@ with screenshot data, it:
 """
 
 import base64
+import os
 import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 
@@ -18,6 +21,8 @@ import pytest
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import event_translator
+from event_manager import EventManager
 from event_translator import EventTranslator
 
 if TYPE_CHECKING:
@@ -228,6 +233,83 @@ class TestEventTranslatorPathIntegration:
         assert event_data["image_data"] == sample_png_base64  # From lookup
         assert event_data["screenshot_path"] == "/absolute/path/screenshots/test-0001.png"
         assert event_data["template_path"] == "/absolute/path/debug/test-0001.png"
+
+
+@pytest.fixture
+def isolated_temp_dir(tmp_path, monkeypatch):
+    """Point every temp-dir source at an empty ``tmp_path`` subdirectory.
+
+    Covers ``tempfile.gettempdir()`` (via ``tempfile.tempdir``) and the
+    ``TEMP``/``TMP``/``TMPDIR`` environment names, which the deleted debug writes
+    read (plan 2026-11-14-one-xlib-distribution-and-no-tmp-debug-logs-in-the-
+    python-bridge, Phase 4).
+    """
+    temp = tmp_path / "os-temp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        monkeypatch.setenv(name, str(temp))
+    return temp
+
+
+class TestNoTempDirDebugLogs:
+    """The event path writes nothing into the OS temp dir.
+
+    These tests do not import qontinui: the event is a stand-in carrying only
+    ``data`` (all ``on_match_attempted`` reads), and ``QONTINUI_AVAILABLE`` is
+    forced on, so they need no X display and no collection-order luck.
+    """
+
+    def test_on_match_attempted_writes_nothing_to_temp_dir(
+        self, isolated_temp_dir, monkeypatch, mock_emitter, sample_png_base64
+    ):
+        monkeypatch.setattr(event_translator, "QONTINUI_AVAILABLE", True)
+        translator = EventTranslator(emitter=mock_emitter, collector=None)
+
+        translator.on_match_attempted(
+            SimpleNamespace(
+                data={
+                    "image_id": "button.png",
+                    "similarity_threshold": 0.8,
+                    "best_match_confidence": 0.95,
+                    "best_match_location": {"x": 1, "y": 2},
+                    "threshold_passed": True,
+                    "screenshot_base64": sample_png_base64,
+                }
+            )
+        )
+
+        mock_emitter.assert_called_once()
+        assert list(isolated_temp_dir.iterdir()) == []
+
+    @staticmethod
+    def _node() -> Mock:
+        node = Mock()
+        node.to_dict.return_value = {"id": "n1", "status": "running"}
+        node.get_depth.return_value = 0
+        node.node_type = "action"
+        node.id = "n1"
+        node.status = "running"
+        node.get_path_from_root.return_value = ["n1"]
+        return node
+
+    def test_emit_tree_event_writes_nothing_to_temp_dir(self, isolated_temp_dir, capsys):
+        EventManager().emit_tree_event("action_started", self._node())
+
+        assert list(isolated_temp_dir.iterdir()) == []
+        assert '"event_type": "action_started"' in capsys.readouterr().out
+
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory modes"
+    )
+    def test_emit_tree_event_survives_read_only_temp_dir(self, isolated_temp_dir, capsys):
+        isolated_temp_dir.chmod(0o555)
+        try:
+            EventManager().emit_tree_event("action_started", self._node())
+        finally:
+            isolated_temp_dir.chmod(0o755)
+
+        assert '"event_type": "action_started"' in capsys.readouterr().out
 
 
 if __name__ == "__main__":
