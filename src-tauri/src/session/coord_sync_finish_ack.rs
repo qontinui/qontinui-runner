@@ -78,9 +78,9 @@ pub(crate) const FINISHED_UNCONFIRMED_MAX_ATTEMPTS: u32 = 5;
 /// runner lives. The ASSUMPTION (not measured) is that ten minutes outlasts a
 /// coord rolling deploy and a burst of transient prepare failures — the cause
 /// of the swallowed writes this module exists for was one coord build. The
-/// cost is about 16 PATCHes per finish (at 0, 1, 3, 7, 15 and 31 s on the
-/// doubling backoff, then one a minute at the cap until the floor is passed
-/// at ~603 s): cheap, and still bounded.
+/// cost is about 16 PATCHes per finish (at 0, 1, 3, 7, 15, 31 and 63 s on
+/// the doubling backoff, then one a minute at the cap until the floor is
+/// passed at ~603 s): cheap, and still bounded.
 ///
 /// While the finish is held its session's chain is blocked, and this floor
 /// equals coord's Active→Stale threshold, so the drain gives such a session
