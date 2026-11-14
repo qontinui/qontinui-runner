@@ -33,6 +33,12 @@ pub(crate) const KIND_GH_ACTIONS_RUNNER: &str = "gh_actions_runner";
 pub(crate) const KIND_QONTINUI_RUNNER: &str = "qontinui_runner";
 pub(crate) const KIND_OTHER_WATCHED: &str = "other_watched";
 
+/// The kinds some instrument can report COMPLETE (contract amendment A2):
+/// the Linux buses ([`linux_complete_kinds`]), the Windows `sc` listing and
+/// the WSL guest probe. A kind outside this list is never in any scan's
+/// complete kinds, so nothing may wait for a complete scan of it.
+pub(crate) const COMPLETABLE_KINDS: &[&str] = &[KIND_GH_ACTIONS_RUNNER, KIND_QONTINUI_RUNNER];
+
 /// Unit-name patterns the Linux watcher asks systemd for, on both buses.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const WATCHED_PATTERNS: &[&str] =
@@ -1302,6 +1308,20 @@ DISPLAY_NAME: Print Spooler\r
         assert!(linux_complete_kinds(true, SessionBus::Failed).is_empty());
         // No system bus: neither kind is known complete.
         assert!(linux_complete_kinds(false, SessionBus::Ok).is_empty());
+    }
+
+    /// Every kind an instrument can claim complete is in
+    /// `COMPLETABLE_KINDS` (the Windows listing and the WSL guest probe claim
+    /// only the GitHub-runner kind), and the catch-all kind is not.
+    #[test]
+    fn completable_kinds_cover_every_instruments_complete_claim() {
+        for k in linux_complete_kinds(true, SessionBus::Ok)
+            .into_iter()
+            .chain([KIND_GH_ACTIONS_RUNNER])
+        {
+            assert!(COMPLETABLE_KINDS.contains(&k), "{k}");
+        }
+        assert!(!COMPLETABLE_KINDS.contains(&KIND_OTHER_WATCHED));
     }
 
     #[test]

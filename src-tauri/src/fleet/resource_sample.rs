@@ -2046,6 +2046,7 @@ pub(crate) async fn publish_once() {
         Ok(resp) if resp.status().is_success() => {
             // A 200 is not "stored": coord drops invalid items and unknown
             // fields INSIDE a 200 and says so only in the body.
+            refill_failure_warns();
             let text = resp.text().await.ok();
             log_sample_ack(sample_ack(text.as_deref(), body.samples.len()));
         }
@@ -2298,16 +2299,33 @@ pub(crate) fn warn_budget_admits(budget: &mut BTreeMap<String, u32>, class: &str
     *spent <= WARNS_PER_FAILURE_CLASS
 }
 
+/// A delivered POST ends the outage: every class gets its full budget back,
+/// so the NEXT outage is diagnosable too. PURE.
+pub(crate) fn warn_budget_refill(budget: &mut BTreeMap<String, u32>) {
+    budget.clear();
+}
+
+/// The per-process, per-class WARN budget [`warn_once`] spends.
+static FAILURE_WARN_BUDGET: std::sync::Mutex<BTreeMap<String, u32>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Refill [`FAILURE_WARN_BUDGET`] after a 2xx.
+fn refill_failure_warns() {
+    if let Ok(mut b) = FAILURE_WARN_BUDGET.lock() {
+        warn_budget_refill(&mut b);
+    }
+}
+
 /// Log a publish failure loudly the first few times PER CLASS, then quietly.
 ///
 /// A 30s sampler against a coord that is down for an hour would otherwise emit
 /// 120 identical WARNs and bury whatever the operator is actually reading. The
 /// first ones are the diagnosis; the rest are noise. The budget is per failure
 /// class, so a NEW kind of failure (a 422 after three 503s, a refused connect
-/// after three 5xx) is WARNed rather than lost under the first kind's budget.
+/// after three 5xx) is WARNed rather than lost under the first kind's budget,
+/// and a 2xx refills every class.
 fn warn_once(class: &str, msg: String) {
-    static BUDGET: std::sync::Mutex<BTreeMap<String, u32>> = std::sync::Mutex::new(BTreeMap::new());
-    let loud = BUDGET
+    let loud = FAILURE_WARN_BUDGET
         .lock()
         .map(|mut b| warn_budget_admits(&mut b, class))
         .unwrap_or(true);
@@ -2382,6 +2400,22 @@ mod tests {
             "{ack:?}"
         );
         assert_eq!(sample_ack_line(&ack), None);
+    }
+
+    /// Review round 2, A5: a 2xx refills the budget, so the next outage's
+    /// first failures are WARNed again.
+    #[test]
+    fn a_delivered_post_refills_the_warn_budget() {
+        let mut budget = BTreeMap::new();
+        for _ in 0..3 {
+            assert!(warn_budget_admits(&mut budget, "http:503"));
+        }
+        assert!(!warn_budget_admits(&mut budget, "http:503"));
+        warn_budget_refill(&mut budget);
+        assert!(
+            warn_budget_admits(&mut budget, "http:503"),
+            "a 503 after a 2xx is a new outage and is WARNed"
+        );
     }
 
     /// Phase 2: each failure class has its own budget of three WARNs.

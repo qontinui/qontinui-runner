@@ -1026,38 +1026,44 @@ impl Reporter {
                 .as_ref()
                 .map(|u| u.iter().map(|w| w.row.clone()).collect());
             let cut = observed_rows.as_deref().map(services_bound::services_cut);
+            let counts = observed_rows
+                .as_deref()
+                .map(services_bound::kind_counts)
+                .unwrap_or_default();
+            let scan = cut.as_ref().map(|cut| services_bound::Scan {
+                cut,
+                counts: &counts,
+                complete_kinds: &o.scan.complete_kinds,
+            });
             let previous = self.over_bound.get(id).cloned().unwrap_or_default();
-            let (next_bound, actions) = previous.step(cut.as_ref(), &o.scan.complete_kinds, now);
-            let over_kinds = match &next_bound {
-                services_bound::OverBound::Over { kinds, .. } => kinds.clone(),
-                services_bound::OverBound::Within => std::collections::BTreeSet::new(),
-            };
-            let rows = observed_rows.as_deref().unwrap_or_default();
-            let counts = services_bound::kind_counts(rows);
+            let (next_bound, actions) = previous.step(scan, now);
             let total: usize = counts.values().sum();
             for action in actions {
-                match action {
-                    services_bound::Action::Emit => {
-                        evs.push(services_bound::over_bound_event(
-                            id,
-                            &counts,
-                            &over_kinds,
-                            now,
-                        ));
+                match (action, &next_bound) {
+                    (services_bound::Action::Emit, services_bound::OverBound::Over(over)) => {
+                        evs.push(services_bound::over_bound_event(id, &counts, over, now));
                     }
-                    services_bound::Action::Warn => warn!(
-                        "fleet::computer: computer {} watches {total} services, over coord's \
-                         bound of {MAX_SERVICES_PER_COMPUTER}; full reports cut kind(s) {:?} to \
-                         fit, and coord does not apply removals of those kinds while they stay \
-                         over (a services_over_bound telemetry_gap records it)",
-                        short_id(id),
-                        over_kinds,
-                    ),
-                    services_bound::Action::Info => info!(
+                    (services_bound::Action::Warn, services_bound::OverBound::Over(over)) => {
+                        warn!(
+                            "fleet::computer: computer {} is over coord's bound of \
+                             {MAX_SERVICES_PER_COMPUTER} services ({total} in this scan); full \
+                             reports cut kind(s) {:?} to fit, and coord does not apply removals \
+                             of those kinds while they stay over (a services_over_bound \
+                             telemetry_gap records it); held over because this scan did not see \
+                             them completely: {:?}, last vouched counts {:?}",
+                            short_id(id),
+                            over.kinds,
+                            over.held,
+                            over.last_counts,
+                        )
+                    }
+                    (services_bound::Action::Info, _) => info!(
                         "fleet::computer: computer {} watches {total} services, back within \
                          coord's bound of {MAX_SERVICES_PER_COMPUTER}",
                         short_id(id),
                     ),
+                    // Emit and Warn come only with an Over state.
+                    (_, services_bound::OverBound::Within) => {}
                 }
             }
             self.over_bound.insert(id.clone(), next_bound);
@@ -1838,7 +1844,7 @@ mod tests {
         assert!(
             matches!(
                 r.over_bound.get(HOST_ID),
-                Some(services_bound::OverBound::Over { .. })
+                Some(services_bound::OverBound::Over(_))
             ),
             "a 44-row delta must not read as back within the bound"
         );
@@ -1846,26 +1852,43 @@ mod tests {
 
     /// Review A3: when `events::prune` forgets a computer, its over-bound
     /// state is forgotten with it rather than kept for the process lifetime.
+    /// The forgotten computer is one `events::prune` itself removes (unseen
+    /// for over a week), so the test fails if the over-bound state is
+    /// reconciled before the prune rather than after it.
     #[test]
     fn a_forgotten_computer_takes_its_over_bound_state_with_it() {
+        let gone = "c".repeat(64);
+        let mut state = ObserverState::default();
+        state.computers.insert(
+            gone.clone(),
+            events::ComputerObs {
+                last_seen_at: Some("2026-11-01T00:00:00Z".into()),
+                ..events::ComputerObs::default()
+            },
+        );
         let mut r = Reporter {
             state_path: None,
             ..Reporter::new()
         };
-        r.state = Some(ObserverState::default());
-        let gone = "c".repeat(64);
-        r.over_bound.insert(
-            gone.clone(),
-            services_bound::OverBound::Over {
-                kinds: [services::KIND_GH_ACTIONS_RUNNER].into_iter().collect(),
-                emitted_at: at("2026-11-01T00:00:00Z"),
-            },
-        );
+        r.state = Some(state);
+        let over = services_bound::Over {
+            kinds: [services::KIND_GH_ACTIONS_RUNNER].into_iter().collect(),
+            held: Default::default(),
+            last_counts: Default::default(),
+            emitted_at: at("2026-11-01T00:00:00Z"),
+            within_scans: 0,
+        };
+        r.over_bound
+            .insert(gone.clone(), services_bound::OverBound::Over(over));
         let obs = observed(svc::HEALTHY_SHOW);
         r.derive_events(
             std::slice::from_ref(&obs),
             HOST_ID,
             at("2026-11-14T00:00:00Z"),
+        );
+        assert!(
+            !r.state.as_ref().unwrap().computers.contains_key(&gone),
+            "events::prune forgot the computer"
         );
         assert!(
             !r.over_bound.contains_key(&gone),
