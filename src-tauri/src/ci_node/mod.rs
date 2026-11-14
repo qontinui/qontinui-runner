@@ -154,11 +154,13 @@ impl CiDispatchPayload {
     /// creation as it always did.
     ///
     /// That is NOT "behaves as before" for such a dispatch: the admission queue
-    /// now RELEASES it as `cancelled`/`deferred_past_lease` at
-    /// `admission::UNRENEWED_HOLD` (10 minutes) after arrival. Previously it was
-    /// held, and could still build if a slot freed between minutes 10 and 15;
-    /// now a dispatch still queued at minute 10 is handed back with a reason in
-    /// the ledger instead of ending as a reason-free `lost` at minute 15.
+    /// now RELEASES it as `cancelled`/`deferred_past_lease` at most
+    /// `admission::UNRENEWED_HOLD` (10 minutes) after arrival (earlier, as
+    /// `queued_renewal_lapsed`, when the payload's `lease_expires_at` is
+    /// sooner). Previously it was held, and could still build if a slot freed
+    /// before coord swept it; now a dispatch still queued at that point is
+    /// handed back with a reason in the ledger instead of ending as a
+    /// reason-free `lost`.
     pub(crate) fn coord_accepts_queue_heartbeat(&self) -> bool {
         self.progress_phases
             .iter()
