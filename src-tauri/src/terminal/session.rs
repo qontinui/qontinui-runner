@@ -4732,13 +4732,20 @@ impl TerminalSession {
         slot.map(|id| (id, self.coord_bound_seq.load(Ordering::Relaxed)))
     }
 
-    /// The coord row and its bind instant (unix ms, the unit of a lifecycle
-    /// record's `finished_at`) in one read under the slot lock:
-    /// `Some(Some((row, at)))` when bound, `Some(None)` when not, and `None`
-    /// when the slot's lock is poisoned — UNKNOWN, never "not bound".
-    pub fn coord_row_with_bound_at(&self) -> Option<Option<(uuid::Uuid, i64)>> {
+    /// The coord row, its bind instant (unix ms, the unit of a lifecycle
+    /// record's `finished_at`) and its bind sequence ([`Self::coord_binding`])
+    /// in one read under the slot lock: `Some(Some((row, at, seq)))` when
+    /// bound, `Some(None)` when not, and `None` when the slot's lock is
+    /// poisoned — UNKNOWN, never "not bound".
+    pub fn coord_row_with_bound_at(&self) -> Option<Option<(uuid::Uuid, i64, u64)>> {
         let slot = self.coord_session_id.lock().ok()?;
-        Some(slot.map(|id| (id, self.coord_bound_at_ms.load(Ordering::Relaxed))))
+        Some(slot.map(|id| {
+            (
+                id,
+                self.coord_bound_at_ms.load(Ordering::Relaxed),
+                self.coord_bound_seq.load(Ordering::Relaxed),
+            )
+        }))
     }
 
     /// Test-only: poison this terminal's coord slot lock.

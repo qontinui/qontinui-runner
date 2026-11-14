@@ -4428,7 +4428,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         else {
                             return PaneRowLookup::Unknown;
                         };
-                        let Some(bound_at_ms) = binding else {
+                        let Some((bound_at_ms, bind_seq)) = binding else {
                             return PaneRowLookup::Gone;
                         };
                         let Some(scope) = sreg.upgrade().map(|s| s.tenant_scope_of(row)) else {
@@ -4437,6 +4437,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         PaneRowLookup::Live(PaneRowFacts {
                             tenant: tenant_from_scope(scope),
                             bound_at_ms: Some(bound_at_ms),
+                            bind_seq: Some(bind_seq),
                         })
                     });
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
