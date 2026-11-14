@@ -746,6 +746,25 @@ pub(crate) fn classify_queue_heartbeat(status: u16, body: &str) -> QueueHeartbea
     }
 }
 
+/// The one HTTP client every queue heartbeat shares (10 s request timeout).
+///
+/// The keeper renews up to [`super::admission::QUEUE_HEARTBEAT_CONCURRENCY`]
+/// dispatches every minute for as long as anything is queued; a client per
+/// heartbeat would rebuild the TLS config and connection pool each time and
+/// never reuse a connection to coord. `None` if the build failed — a TLS
+/// backend that cannot initialise will not succeed on a retry either.
+fn queue_heartbeat_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
 /// Renew coord's lease on a dispatch this runner holds in its admission queue.
 /// One attempt, 10 s bound: the admission queue-keeper calls this on a timer
 /// far shorter than the lease, so a miss is retried by the next tick rather
@@ -756,10 +775,7 @@ pub(crate) async fn post_queued_heartbeat(coord_base: &str, dispatch_id: &str) -
         coord_base.trim_end_matches('/'),
         dispatch_id
     );
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    else {
+    let Some(client) = queue_heartbeat_client() else {
         return QueueHeartbeat::Failed("reqwest client build failed".to_string());
     };
     let Some(bearer) = device_bearer().await else {
