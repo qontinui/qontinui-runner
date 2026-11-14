@@ -173,7 +173,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // ops lane (plan 2026-10-19 Phase 4): the result POST is authorised by the
     // device JWT the subscriber already holds; see the annotation at the call site.
     ("ci_node/ops.rs", "device-jwt-required", 1),
-    ("ci_node/reporting.rs", "device-jwt-required", 2),
+    // The progress flusher, `post_result`, and the queued-lease heartbeat
+    // (`post_queued_heartbeat`): all three send the device JWT from the
+    // remint-awaiting resolver, and coord authorises each against the
+    // dispatch's assignee, so none may go anonymous.
+    ("ci_node/reporting.rs", "device-jwt-required", 3),
     // Shrank 3 -> 1 (plan 2026-10-09-spec-front-end-of-the-software-factory
     // Phase 9): the Claude connection test and the usage probe now build their
     // requests through `model_gateway::ModelCall`, which has no `.post(` here and
