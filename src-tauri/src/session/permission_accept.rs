@@ -468,9 +468,16 @@ mod tests {
         p
     }
 
+    /// Every mode a session runs prompts in is answered when the dial is
+    /// answered `on`; only the restrictive modes, and a payload with no mode,
+    /// are refused (their own tests).
     #[test]
     fn answered_on_allows() {
-        for mode in ["default", "bypassPermissions", "acceptEdits"] {
+        // `auto`: a runner terminal on CLI 2.1.321 started in this mode in the
+        // plan's Phase 5 run (2026-11-12), and its safety-check prompt raised
+        // `PermissionRequest` with `"permission_mode": "auto"`. Pinned so the
+        // verdict cannot become an allow-list that silently stops answering it.
+        for mode in ["default", "bypassPermissions", "acceptEdits", "auto"] {
             assert_eq!(
                 permission_accept_verdict(true, "on", &payload("Bash", Some(mode))),
                 AcceptVerdict::Allow,

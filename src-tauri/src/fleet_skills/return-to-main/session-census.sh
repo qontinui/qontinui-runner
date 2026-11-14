@@ -24,7 +24,7 @@
 # The process table cannot be stale and cannot be wedged. It is ground truth.
 #
 # THE SOURCE, PER OS (one normalized table, one classifier):
-#   linux    ps -eo pid=,ppid=,etime=,args=      (+ /proc/<pid>/environ, cwd)
+#   linux    ps -eo pid=,ppid=,etime=,args=      (+ /proc/<pid>/environ, cwd, fd/*)
 #   macos    ps -axo pid=,ppid=,etime=,args=
 #   windows  powershell -NoProfile, ONE pass emitting
 #            {Processes, Services, ServicesError}:
@@ -213,10 +213,15 @@
 #                name, origin, age_s, nested_under_agent, launched_by,
 #                ide_check (true | false on a build row, null otherwise),
 #                build_attribution (a non-IDE build row: {pid, name, cwd,
-#                manifest_path, target_dir, target_dir_source, env_read} of
-#                its build ROOT -- see build_attribution(); null otherwise),
-#                ancestry, account, cwd, idle_min, session_id, activity,
-#                activity_evidence}], activity:{status (ok |
+#                manifest_path, target_dir, target_dir_source, env_read,
+#                fd_session_ids ([{id, source (build_fd | shell_fd:<pid> |
+#                cwd)}], every distinct id), fd_session_id /
+#                fd_session_source (its first entry, or null)} of its build
+#                ROOT -- see build_attribution() and build_fd_sessions(); null
+#                otherwise),
+#                ancestry, account, cwd, idle_min, session_id,
+#                argv_session_id (a claude row's `--session-id`; else null),
+#                activity, activity_evidence}], activity:{status (ok |
 #                not_observable_on_this_os), counts:{working, idle, stale,
 #                unknown} over non-self agents, active_minutes,
 #                cpu_sample_seconds, cpu_floor_pct, cpu_sampled,
@@ -707,6 +712,28 @@ def linux_fd_session_id(pid):
     return None
 
 
+def linux_fd_session_ids(pid):
+    """EVERY distinct session id the fd targets of `pid` name, in fd order --
+    the build attribution's reader (a build can hold several scratchpads open;
+    stopping at the first could name a dead session while a live one is also
+    there). A claude row keeps linux_fd_session_id (the first match)."""
+    fd_dir = os.path.join(proc_root, str(pid), "fd")
+    try:
+        fds = sorted(os.listdir(fd_dir), key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else 0, x))
+    except OSError:
+        return []
+    out = []
+    for fd in fds:
+        try:
+            tgt = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        m = SCRATCH_SID_RE.search(tgt)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
 def linux_idle_min(sid, acct):
     """Minutes since the transcript file was last WRITTEN (mtime). Kept as-is
     for its readers; the activity axis uses the last MESSAGE instead, because
@@ -976,11 +1003,51 @@ def _flag_value(tokens, flag):
     return None
 
 
-def build_attribution(p, anc):
-    top = p
-    for a in anc:
+# A build's SESSION, from fd targets and cwd only (plan 2026-11-09-devops-
+# orphan-build-reaper-reads-a-live-sessions, D1). A session that detaches its
+# own build (`nohup cargo-guard.sh test > <scratchpad>/test1.log &`) leaves it
+# reparented to init or the per-user systemd, with no agent in its ancestry --
+# but its stdout/stderr still name the session's scratchpad, whose path carries
+# the session id (SCRATCH_SID_RE). EVERY distinct id is collected, in this
+# order: the build ROOT's fd targets (`build_fd`), each launcher shell on its
+# ancestry above the root, nearest first (`shell_fd:<pid>`; the walk ends at
+# the first hop that is neither a build hop nor a launcher shell), then the
+# build root's cwd (`cwd`). `fd_session_ids` is the whole list of {id, source};
+# `fd_session_id` / `fd_session_source` are its FIRST entry. A consumer must
+# read the list: the first id can be a dead session while a later one is live.
+# Empty / null when nothing matches, and always so off Linux. Never
+# /proc/<pid>/environ: a readlink names a path, not a secret.
+LAUNCHER_SHELLS = {"bash", "sh", "dash", "zsh", "env", "timeout", "nohup", "setsid",
+                   "flock", "xargs", "git", "make", "nice", "ionice", "stdbuf", "tee",
+                   "time"}
+
+
+def build_fd_sessions(top, above, cwd):
+    """[{id, source}] -- every distinct id, first source wins for an id."""
+    if os_name != "linux":
+        return []
+    found = [(sid, "build_fd") for sid in linux_fd_session_ids(top["pid"])]
+    for a in above:
         if a["kind"] == "build" or a["norm"] in BUILD_HOPS or a["norm"].startswith("build-script-"):
-            top = a
+            continue
+        if a["norm"] not in LAUNCHER_SHELLS:
+            break
+        found += [(sid, "shell_fd:%d" % a["pid"]) for sid in linux_fd_session_ids(a["pid"])]
+    m = SCRATCH_SID_RE.search(cwd or "")
+    if m:
+        found.append((m.group(1), "cwd"))
+    out = []
+    for sid, src in found:
+        if sid not in [e["id"] for e in out]:
+            out.append({"id": sid, "source": src})
+    return out  # every-id
+
+
+def build_attribution(p, anc):
+    top, above = p, anc
+    for i, a in enumerate(anc):
+        if a["kind"] == "build" or a["norm"] in BUILD_HOPS or a["norm"].startswith("build-script-"):
+            top, above = a, anc[i + 1:]
             continue
         break
     try:
@@ -997,13 +1064,18 @@ def build_attribution(p, anc):
             if env.get(k):
                 target, source = env[k], "env:" + k
                 break
+    cwd = linux_cwd(top["pid"]) if os_name == "linux" else None
+    fd_sids = build_fd_sessions(top, above, cwd)
     return {"pid": top["pid"], "name": top["name"],
-            "cwd": linux_cwd(top["pid"]) if os_name == "linux" else None,
+            "cwd": cwd,
             "manifest_path": _flag_value(toks, "--manifest-path"),
             "target_dir": target, "target_dir_source": source,
             # Whether the ENVIRONMENT was readable at all: a null target_dir
             # with env_read true means cargo's default (<workspace>/target).
-            "env_read": bool(env) if os_name == "linux" else False}
+            "env_read": bool(env) if os_name == "linux" else False,
+            "fd_session_id": fd_sids[0]["id"] if fd_sids else None,
+            "fd_session_source": fd_sids[0]["source"] if fd_sids else None,
+            "fd_session_ids": fd_sids}
 
 
 rows = []
@@ -1066,6 +1138,10 @@ for p in sorted(procs.values(), key=lambda x: x["pid"]):
         "cwd": linux_cwd(p["pid"]) if os_name == "linux" and kind in AGENTS else None,
         "idle_min": linux_idle_min(fd_sid, acct) if os_name == "linux" and kind == "claude" else None,
         "session_id": None,
+        # `--session-id <uuid>` off a claude row's own command line, exported so
+        # a consumer can match a build's fd_session_id against it (D2); null on
+        # every other kind.
+        "argv_session_id": argv_sid,
         "activity": None,
         "activity_evidence": None,
         "_acct": acct,
