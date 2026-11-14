@@ -2786,6 +2786,14 @@ async fn health(
         // is a PowerShell process creation), and when an open fallback
         // circuit closes.
         "processTable": crate::process_capture::process_table::health_json(),
+        // Operator-input emitter (plan 2026-09-20-agents-sustained-per-
+        // operator-hour-needs-an-operator-touch-record, Phase 2): `emitter:
+        // true` is what the plan's coord coverage block (Phase 3, not yet
+        // built) is specified to count as an emitting device;
+        // `by_caller_class.automated` climbing while nothing is emitted for it
+        // is the proof automated writers are seen and not recorded. No kill
+        // switch and no enable flag — see `crate::terminal::operator_input`.
+        "operatorInput": crate::terminal::operator_input::health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
