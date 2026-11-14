@@ -1421,7 +1421,7 @@ pub async fn run_at_boot(
     // restore read, so the read itself is made collision-immune independently by
     // the one-live-session-per-terminal dedupe inside
     // `SessionLifecycleStore::restorable_records` (both rank the same contenders
-    // — open rows bound to a terminal — by `open_authority_key`, so they agree on
+    // — unfinished open rows bound to a terminal — by `open_authority_key`, so they agree on
     // which row to keep; a row held for an account choice is unbound, so it is a
     // contender in neither). Idempotent — a healthy registry closes
     // nothing. Runs before the nothing-to-do fast path so a registry that holds
