@@ -251,7 +251,7 @@ pub(crate) struct NonceBinding {
     /// Its one job is to give [`device_nonce_snapshot`]'s bound a total,
     /// oldest-first eviction order. Before that bound existed, the persisted
     /// device set had exactly one production reaper —
-    /// [`release_workdir_on_session_close`], on the last open record for a
+    /// [`release_workdir_proxy_nonces`], on the last open record for a
     /// workdir closing — **and it returns early on the `qontinui-root`
     /// workdir**. Nothing else reached it: `revoke_proxy_nonce` has no
     /// production caller, `evict_proxy_nonces_for_workdir` fires only on
@@ -1890,6 +1890,15 @@ struct NonceRevocation {
     snapshot: Option<HashMap<String, NonceBinding>>,
 }
 
+/// What [`NonceState::release_workdir`] removed: every live binding for the
+/// workdir (any class) and every graced key whose workdir matched, plus the
+/// survivors to persist when anything was removed.
+struct WorkdirRelease {
+    revoked: Vec<(String, NonceBinding)>,
+    graced: Vec<(String, GracedNonce)>,
+    snapshot: Option<HashMap<String, NonceBinding>>,
+}
+
 /// What [`NonceState::evict_workdir`] removed, split by how each class dies.
 struct WorkdirEviction {
     snapshot: HashMap<String, NonceBinding>,
@@ -2149,15 +2158,7 @@ impl NonceRegistry {
     }
 
     /// [`NonceState::release_workdir`] under the lock.
-    #[allow(clippy::type_complexity)]
-    fn release_workdir(
-        &self,
-        workdir: &str,
-        cause: &str,
-    ) -> (
-        Vec<(String, NonceBinding)>,
-        Option<HashMap<String, NonceBinding>>,
-    ) {
+    fn release_workdir(&self, workdir: &str, cause: &str) -> WorkdirRelease {
         self.state().release_workdir(workdir, cause)
     }
 
@@ -2807,20 +2808,17 @@ impl NonceState {
         (revoked, self.live.clone())
     }
 
-    /// Remove every binding for `workdir` on session close and tombstone them.
-    /// Returns the removed pairs (the terminal id rides along so the caller's
-    /// forensics line can carry the Phase 4 join key — the binding is gone the
-    /// moment `retain` returns) and, when anything was removed, the survivors
-    /// to persist.
-    #[allow(clippy::type_complexity)]
-    fn release_workdir(
-        &mut self,
-        workdir: &str,
-        cause: &str,
-    ) -> (
-        Vec<(String, NonceBinding)>,
-        Option<HashMap<String, NonceBinding>>,
-    ) {
+    /// Revoke every credential for `workdir` — see
+    /// [`release_workdir_proxy_nonces`]. Removes every live binding for the
+    /// workdir (every class) AND every graced key whose workdir matches, and
+    /// tombstones both as `Revoked`, in ONE critical section: revocation is
+    /// total, so no reader can find one of the workdir's keys still graced
+    /// after its live siblings are gone. The live pairs carry the terminal id
+    /// so the caller's forensics line can carry the Phase 4 join key (the
+    /// binding is gone the moment `retain` returns); the snapshot of survivors
+    /// is present when anything was removed, graced included, because the
+    /// persisted store mirrors the grace map too.
+    fn release_workdir(&mut self, workdir: &str, cause: &str) -> WorkdirRelease {
         let mut revoked: Vec<(String, NonceBinding)> = Vec::new();
         self.live.retain(|n, b| {
             if b.workdir == workdir {
@@ -2830,8 +2828,35 @@ impl NonceState {
             true
         });
         self.tombstone_all(&revoked, TombstoneKind::Revoked, false, cause);
-        let snapshot = (!revoked.is_empty()).then(|| self.live.clone());
-        (revoked, snapshot)
+        let mut graced: Vec<(String, GracedNonce)> = Vec::new();
+        self.graced.retain(|n, g| {
+            if g.workdir == workdir {
+                graced.push((n.clone(), g.clone()));
+                return false;
+            }
+            true
+        });
+        let now = std::time::SystemTime::now();
+        for (nonce, g) in &graced {
+            self.tombstone(
+                nonce,
+                NonceTombstone {
+                    workdir: g.workdir.clone(),
+                    terminal_id: g.terminal_id.clone(),
+                    principal: "device",
+                    kind: TombstoneKind::Revoked,
+                    evicted_at: now,
+                    grace_until: None,
+                    cause: cause.to_string(),
+                },
+            );
+        }
+        let snapshot = (!revoked.is_empty() || !graced.is_empty()).then(|| self.live.clone());
+        WorkdirRelease {
+            revoked,
+            graced,
+            snapshot,
+        }
     }
 
     /// Register an on-disk nonce for `workdir`, evicting the workdir's prior
@@ -4176,10 +4201,13 @@ pub(crate) fn spawn_log_proxy_upstream_unreachable(
 /// is otherwise evicted only by a re-mint for its own `(workdir, terminal_id)`
 /// slot — and terminal ids are per-PTY, so that slot is never reused.
 ///
-/// The one production reaper is [`release_workdir_on_session_close`], via
+/// The one production reaper is [`release_workdir_proxy_nonces`], via
 /// `session_lifecycle_store::record_close`: when the LAST open record for a
-/// workdir closes it drops every nonce bound to that workdir and mirrors the
-/// shrunken set. That is real coverage and this doc used to deny it. What it
+/// workdir closes it drops every nonce bound to that workdir (graced keys
+/// included) and mirrors the shrunken set. The same fn also runs when a
+/// never-spawned agent tree is removed (`agent_worktree::remove_unspawned`),
+/// which covers only trees that never reached a session. That is real
+/// coverage and this doc used to deny it. What it
 /// does NOT cover is the accumulator that actually matters:
 ///
 /// * **the `qontinui-root` workdir, which that reaper returns early on by
@@ -4288,7 +4316,7 @@ fn device_nonce_snapshot(
 ///
 /// **The bound is against CUMULATIVE terminal spawns, not the concurrent
 /// working set.** One production path does reap the persisted set —
-/// [`release_workdir_on_session_close`], on the last open record for a workdir
+/// [`release_workdir_proxy_nonces`], on the last open record for a workdir
 /// closing — but it returns early on the `qontinui-root` workdir by design, and
 /// never runs for a session that dies without a `record_close`. Root is where
 /// the most terminals are spawned and every one takes its own per-PTY
@@ -9163,19 +9191,41 @@ pub(crate) mod teardown_poison_tests {
     }
 }
 
-/// Session-close credential release for a DEVICE session's workdir: revoke the
-/// workdir's registered nonce(s) and reap the app-data
-/// `session-restore/coord-mcp` config file that carried the nonce. The caller
-/// is responsible for the "last session in this workdir" check (two tabs can
-/// share a workdir); this fn additionally refuses to touch the long-lived
-/// `qontinui-root` ROOT config, whose nonce serves every root-launched session
-/// and is healed at boot, not per-session.
+#[cfg(test)]
+#[path = "coord_mcp/release_workdir_proxy_nonces_tests.rs"]
+mod release_workdir_proxy_nonces_tests;
+
+/// Test-only: mint a persistent DEVICE proxy nonce for `workdir` exactly as a
+/// runner spawn does (a second mint for the same workdir supersedes the first
+/// into grace) — for callers of [`release_workdir_proxy_nonces`] outside this
+/// module that must prove what it revokes.
+#[cfg(test)]
+pub(crate) fn register_device_proxy_nonce_for_test(workdir: &str) -> String {
+    register_proxy_nonce(workdir, None, None)
+}
+
+/// The `cause` [`release_workdir_proxy_nonces`] records when the last open
+/// session for a workdir closes.
+pub(crate) const RELEASE_CAUSE_SESSION_CLOSE: &str =
+    "session close (last open session for this workdir)";
+
+/// Total, immediate revoke of every coord-mcp proxy credential bound to
+/// `workdir`, for a workdir that will never be re-provisioned: revoke the
+/// workdir's live nonce(s) of EVERY class (device, ephemeral, agent) AND any
+/// graced (superseded) key whose workdir matches, then reap the app-data
+/// `session-restore/coord-mcp` config files that carried them. `cause` lands
+/// in each tombstone, each `revoke` forensics line and the summary log.
 ///
-/// Any graced predecessor of the revoked nonce is left to expire on its own
-/// [`NONCE_GRACE_TTL`] (≤90s, DEVICE-only, process-local) — the grace registry
-/// is keyed only by nonce, and a superseded nonce riding grace is already
-/// evicted from the live map.
-pub(crate) fn release_workdir_on_session_close(workdir: &str) {
+/// Two callers: session close (`session_lifecycle_store::record_close`, cause
+/// [`RELEASE_CAUSE_SESSION_CLOSE`]), which owns the "last session in this
+/// workdir" check (two tabs can share a workdir); and the removal of a
+/// never-spawned tree (`agent_worktree::remove_unspawned`), whose nonce no
+/// session will ever present again. Unlike [`evict_proxy_nonces_for_workdir`],
+/// nothing rides grace: grace exists for runner-initiated re-provisions, and
+/// neither caller's workdir is re-provisioned. This fn refuses to touch the
+/// long-lived `qontinui-root` ROOT config, whose nonce serves every
+/// root-launched session and is healed at boot, not per-session.
+pub(crate) fn release_workdir_proxy_nonces(workdir: &str, cause: &str) {
     if workdir.trim().is_empty() {
         return;
     }
@@ -9196,11 +9246,12 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
     // Phase 4 join key — the binding is gone from the map the moment the
     // removal returns, so a later `terminal_id_for_nonce` would find nothing
     // and report every session-close revoke as unknown.
-    let (revoked_bindings, snapshot) = NonceRegistry::global().release_workdir(
-        workdir,
-        "session close (last open session for this workdir)",
-    );
-    let revoked = revoked_bindings.len();
+    let WorkdirRelease {
+        revoked: revoked_bindings,
+        graced: revoked_graced,
+        snapshot,
+    } = NonceRegistry::global().release_workdir(workdir, cause);
+    let revoked = revoked_bindings.len() + revoked_graced.len();
     // Rotation forensics: session close is the LARGEST revoke path in
     // production, and until now the only one that emitted nothing. Plan
     // 2026-08-20 Phase 3 gave `revoke_proxy_nonce` and
@@ -9217,20 +9268,30 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
     //
     // Emitted AFTER the map lock is released (the emitter does file I/O) and
     // BEFORE the persist, matching `revoke_agent_proxy_nonces`' discipline.
-    for (nonce, b) in &revoked_bindings {
+    let live_cause =
+        format!("{cause} (live registry, and the shrunken set is mirrored to the encrypted store)");
+    let graced_cause = format!("{cause} (grace registry — revocation is total)");
+    let revoked_lines = revoked_bindings
+        .iter()
+        .map(|(nonce, b)| (nonce, &b.terminal_id, &live_cause))
+        .chain(
+            revoked_graced
+                .iter()
+                .map(|(nonce, g)| (nonce, &g.terminal_id, &graced_cause)),
+        );
+    for (nonce, terminal_id, line_cause) in revoked_lines {
         log_rotation_event_with(
             "revoke",
             workdir,
             nonce,
-            "session close (last open session for this workdir; live registry, \
-             and the shrunken set is mirrored to the encrypted store)",
+            line_cause,
             &[(
                 "terminal_id",
                 serde_json::Value::from(
                     // Same spelling as the `reject` line's field: a
                     // terminal-less binding is the string "none", never JSON
                     // null, so the two lines join on one shape.
-                    b.terminal_id.clone().unwrap_or_else(|| "none".to_string()),
+                    terminal_id.clone().unwrap_or_else(|| "none".to_string()),
                 ),
             )],
         );
@@ -9238,6 +9299,7 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
     let revoked_nonces: Vec<String> = revoked_bindings
         .into_iter()
         .map(|(nonce, _)| nonce)
+        .chain(revoked_graced.into_iter().map(|(nonce, _)| nonce))
         .collect();
     if let Some(snapshot) = snapshot {
         persist_proxy_nonces(&snapshot);
@@ -9262,7 +9324,7 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
         &revoked_nonces,
     );
     if revoked > 0 {
-        info!("coord_mcp: session close revoked {revoked} proxy nonce(s) for {workdir}");
+        info!("coord_mcp: {cause}: revoked {revoked} proxy nonce(s) for {workdir}");
     }
 }
 
@@ -9270,7 +9332,7 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
 /// `revoked`. Injectable `dir` so tests never touch the real app-data path.
 ///
 /// Nonce-keyed rather than name-keyed on purpose — see the call site in
-/// [`release_workdir_on_session_close`]: per-TERMINAL config filenames are
+/// [`release_workdir_proxy_nonces`]: per-TERMINAL config filenames are
 /// derived from the terminal id, which that entry point does not have, so
 /// recomputing a name would reap only the workdir-derived file. Returns the
 /// number of files removed. Best-effort throughout: an unreadable dir, an
@@ -9321,7 +9383,7 @@ fn loopback_port_alive(port: u16) -> bool {
 /// (credential-hygiene Task 5): these files each carry a live proxy nonce and
 /// were historically never deleted. Called on runner start (after the nonce
 /// restore, so the registered set is authoritative) and — per-file — on
-/// session close ([`release_workdir_on_session_close`]). Returns the number of
+/// session close ([`release_workdir_proxy_nonces`]). Returns the number of
 /// files removed. Decision per file:
 ///
 /// - unparseable / not the proxy shape → reap (not a working credential file);
@@ -21434,7 +21496,7 @@ mod tests {
         let shared = register_proxy_nonce(&wd, None, None);
         let per_terminal = register_proxy_nonce(&wd, Some("terminal-rot-close"), None);
 
-        release_workdir_on_session_close(&wd);
+        release_workdir_proxy_nonces(&wd, RELEASE_CAUSE_SESSION_CLOSE);
 
         let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
         let revokes: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
@@ -21598,7 +21660,7 @@ mod tests {
     /// this entry point cannot recompute (it has no terminal id) and which a
     /// name-keyed reap therefore missed.
     #[test]
-    fn release_workdir_on_session_close_revokes_and_reaps() {
+    fn release_workdir_proxy_nonces_on_session_close_revokes_and_reaps() {
         let _amb = crate::test_env::isolated_ambient();
         let cfg_body = |nonce: &str| {
             format!(
@@ -21620,7 +21682,7 @@ mod tests {
         std::fs::write(&cfg, cfg_body(&current)).unwrap();
         std::fs::write(&cfg_terminal, cfg_body(&per_terminal)).unwrap();
 
-        release_workdir_on_session_close(&wd);
+        release_workdir_proxy_nonces(&wd, RELEASE_CAUSE_SESSION_CLOSE);
 
         assert!(
             !proxy_nonce_is_valid(&current),
@@ -21698,7 +21760,7 @@ mod tests {
 
     /// Session close must reap the config file of EVERY nonce it revoked —
     /// including per-TERMINAL ones, whose filename is derived from the terminal
-    /// id that `release_workdir_on_session_close` does not have. This is the
+    /// id that `release_workdir_proxy_nonces` does not have. This is the
     /// regression guard for the name-keyed reap that per-terminal nonces broke:
     /// a name-based lookup finds only the workdir-derived file and silently
     /// leaves every terminal-keyed sibling on disk.
@@ -23278,7 +23340,7 @@ mod reject_row_workdir_sentinel_tests {
         assert!(!proxy_nonce_is_valid(&dead));
 
         // Leave the process-global maps as we found them.
-        release_workdir_on_session_close(&wd);
+        release_workdir_proxy_nonces(&wd, RELEASE_CAUSE_SESSION_CLOSE);
         NonceRegistry::global().test_graced().remove(&old);
         NonceRegistry::global().test_tombstones().remove(&old);
         let _ = std::fs::remove_dir_all(&store_dir);

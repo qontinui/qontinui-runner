@@ -2067,7 +2067,7 @@ impl SessionLifecycleStore {
     /// Credential hygiene (Task 5): when this close ends the LAST open session
     /// for its workdir, the workdir's coord-mcp proxy nonce is revoked and its
     /// app-data session-restore config is reaped
-    /// ([`crate::coord_mcp::release_workdir_on_session_close`]) — a closed
+    /// ([`crate::coord_mcp::release_workdir_proxy_nonces`]) — a closed
     /// session's credential must not stay live. Skipped for account-migration
     /// closes (the session continues under a new record with the same workdir)
     /// and when a sibling open session still shares the workdir.
@@ -2375,7 +2375,10 @@ impl SessionLifecycleStore {
         // the nonce the resumed pane still uses is never released under it.
         if let Some(wd) = closed_workdir {
             if !workdir_still_in_use {
-                crate::coord_mcp::release_workdir_on_session_close(&wd);
+                crate::coord_mcp::release_workdir_proxy_nonces(
+                    &wd,
+                    crate::coord_mcp::RELEASE_CAUSE_SESSION_CLOSE,
+                );
             }
         }
         outcome

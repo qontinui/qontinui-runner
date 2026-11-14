@@ -318,9 +318,14 @@ where
             // is keyed by the workdir string the provisioning chokepoint minted
             // under — the worktree path's lossy string. Its only other reaper
             // fires on SESSION close, which a spawn that never started never
-            // reaches. Evicted here, on the blocking pool, because eviction
-            // rewrites a file synchronously.
-            crate::coord_mcp::evict_proxy_nonces_for_workdir(&base.worktree_path.to_string_lossy());
+            // reaches. Revoked TOTALLY here — every class, and any graced key
+            // too — because no session will ever re-provision a removed tree,
+            // so grace would only keep a dead tree's credential live. On the
+            // blocking pool because the release persists and reaps files.
+            crate::coord_mcp::release_workdir_proxy_nonces(
+                &base.worktree_path.to_string_lossy(),
+                RELEASE_CAUSE_UNSPAWNED_TREE,
+            );
         }
         outcome
     })
@@ -428,6 +433,11 @@ fn judge_and_remove(
     }
     TreeOutcome::Removed
 }
+
+/// The `cause` the proxy-nonce release records for a removed never-spawned
+/// tree (tombstones, `revoke` forensics lines, the summary log).
+const RELEASE_CAUSE_UNSPAWNED_TREE: &str =
+    "never-spawned tree removed (no session will ever re-provision it)";
 
 /// `git status` porcelain with EVERY untracked file listed, whatever the
 /// repo's `status.showUntrackedFiles` says — `no` would otherwise hide an
