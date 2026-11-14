@@ -96,10 +96,18 @@ pub(crate) enum MoveOutcome {
     Unbound,
     /// The entry already names the row.
     Unchanged,
-    /// The row is not the id's live pane row: an owner entry on it names
-    /// another id (or, for the seam and the repair, no live terminal holds
-    /// it). Nothing moves; counted.
+    /// An owner entry on the row names ANOTHER id. Nothing moves; counted in
+    /// `registrarPaneRowMovesNotOwner` (and nothing else is).
     NotOwner,
+    /// The row is not the id's live pane row by the owner rule: no live
+    /// terminal holds it, or a newer-bound pane pinned to the id outranks it
+    /// (the seam only). Nothing moves; not counted.
+    NotLivePane,
+    /// Other keys are bound to the row and no owner ENTRY names the id — its
+    /// claim on the row is the pin seed alone, which is not evidence of what
+    /// the pane runs (a `/clear` successor may hold the row). Nothing moves,
+    /// nothing is evicted.
+    Contested,
     /// The entry was registered through a door this mover may not move (a
     /// sniffed typed resume or the pinned AI plane, for the seam and the
     /// repair). Nothing moves.
@@ -142,7 +150,8 @@ impl AiCoordRegistrar {
     /// The live pane row `claude_session_id` owns, by the pane-row owner rule
     /// ([`pane_row_owner::live_terminal_row`]): an owner entry naming the id,
     /// else the newest-bound live pane PINNED to it whose row no entry gives
-    /// to another id. Reads the terminal plane, so never call it while holding
+    /// to another id — and that pin over the entry when its pane was bound
+    /// after the entry's ownership began. Reads the terminal plane, so never call it while holding
     /// a registrar map, the `TerminalManager` `sessions` lock or the
     /// `SessionRegistry` map.
     pub(crate) fn live_terminal_row(&self, claude_session_id: &str) -> Option<LivePaneRow> {
@@ -209,9 +218,12 @@ impl AiCoordRegistrar {
     /// the live pane row `row`, stamping `row` with `tenant` (plan D3).
     ///
     /// 1. **Owner precondition.** No owner entry on `row` may name another id
-    ///    ([`MoveOutcome::NotOwner`], counted). The live-terminal half of the
-    ///    owner rule is the CALLER's (it reads the terminal plane, so it runs
-    ///    before this section).
+    ///    ([`MoveOutcome::NotOwner`], counted). Evicting OTHER keys on `row`
+    ///    further needs an owner entry naming THIS id — the seam's pid-exact
+    ///    evidence; a claim by the pin seed alone answers
+    ///    [`MoveOutcome::Contested`] and evicts nothing. The live-terminal
+    ///    half of the owner rule is the CALLER's (it reads the terminal plane,
+    ///    so it runs before this section).
     /// 2. **One critical section** under `reverse`, taking `tenants`,
     ///    `undecided`, `adopted`, the pane-row leaf and `forward` inside it in
     ///    that order; `reverse` is never taken while holding another.
@@ -264,6 +276,22 @@ impl AiCoordRegistrar {
                     mover.as_str()
                 );
                 return MoveOutcome::NotOwner;
+            }
+            let contested = rev
+                .iter()
+                .any(|(k, v)| *v == row && k.as_str() != claude_session_id);
+            if contested
+                && self.inner.pane_rows.owner_of(row).as_deref() != Some(claude_session_id.trim())
+            {
+                debug!(
+                    "ai_coord_register: not moving {} onto {} ({}) — other keys hold that row \
+                     and only the pin seed says the pane runs {}",
+                    claude_session_id,
+                    row,
+                    mover.as_str(),
+                    claude_session_id
+                );
+                return MoveOutcome::Contested;
             }
             self.evict_other_keys_on(&mut rev, row, claude_session_id);
             rev.insert(claude_session_id.to_string(), row);
@@ -344,14 +372,26 @@ impl AiCoordRegistrar {
     /// row `coord_session_id` (a fresh pane, a respawn, an account migration,
     /// the resume door — each mints a new row).
     ///
-    /// 1. The bind is evidence that the row hosts the pinned id, so — unless
-    ///    an owner entry on the row already names another id — the row's owner
-    ///    advances to it, dropping the id's entry on any older pane's row.
-    /// 2. The registrar's entry for the id is moved onto the row
+    /// 1. The registrar's entry for the id is moved onto the row
     ///    ([`Mover::Bind`]: any entry), stamped with the row's tenant.
-    /// 3. THEN the finished marks owed to the row are delivered
+    /// 2. THEN the finished marks owed to the row are delivered
     ///    ([`Self::deliver_owed_finish`]), so an owed mark resolves to the new
     ///    row, never the dead one.
+    ///
+    /// **The bind does NOT advance the row's owner** (plan D1: only the seam
+    /// advances it; D4: the bind trigger checks the owner half only). A pin is
+    /// the id the pane was SPAWNED with, not evidence of what it runs after a
+    /// `/clear` or an in-pane `/resume`, and an owner entry is what licenses a
+    /// transfer to EVICT other keys on a row — so minting one here would let a
+    /// stale pin evict the session the pane actually runs. The case an advance
+    /// was meant to cover — a migration overlap, where the OLD pane's row
+    /// still carries a seam entry naming the id while a NEW pane pinned to the
+    /// id is bound to a fresh row — is covered by the owner rule instead
+    /// ([`pane_row_owner::live_terminal_row`]): a pin seed whose pane was
+    /// bound AFTER the entry's ownership began outranks that entry, using the
+    /// bind instant the facts already carry, without minting an entry. The
+    /// seam's re-confirmation of the old pane then answers
+    /// [`MoveOutcome::NotLivePane`] and cannot pull the entry back.
     ///
     /// Same lock rules as [`Self::deliver_owed_finish`].
     pub fn on_terminal_coord_bind(
@@ -365,24 +405,16 @@ impl AiCoordRegistrar {
             // the registrar could follow.
             return self.deliver_owed_finish(pinned_session_id, terminal_id, coord_session_id);
         }
-        let facts = self.pane_row_facts(coord_session_id);
-        if self
-            .inner
-            .pane_rows
-            .admits(coord_session_id, pinned_session_id)
-        {
-            let at = facts.and_then(|f| f.bound_at_ms).unwrap_or_else(now_ms);
-            self.inner
-                .pane_rows
-                .advance(coord_session_id, pinned_session_id, at);
-        }
-        let tenant = facts
-            .map(|f| f.tenant)
-            .unwrap_or(NewSessionTenant::Undetermined);
+        let tenant = self.pane_row_tenant(coord_session_id);
         match self.move_onto_pane_row(pinned_session_id, coord_session_id, Mover::Bind, tenant) {
             MoveOutcome::NotOwner => warn!(
                 "ai_coord_register: terminal {} (pinned {}) bound to coord session {}, but \
                  another session owns that row — the registrar's entry stays where it is",
+                terminal_id, pinned_session_id, coord_session_id
+            ),
+            MoveOutcome::Contested => info!(
+                "ai_coord_register: terminal {} (pinned {}) bound to coord session {}, but \
+                 another key already holds that row — not evicting it on the pin alone",
                 terminal_id, pinned_session_id, coord_session_id
             ),
             MoveOutcome::Disabled => warn!(
@@ -402,9 +434,12 @@ impl AiCoordRegistrar {
     /// undoes it: the stale row stays active only while this runner keeps
     /// writing to it, and the move stops those writes.
     ///
-    /// 1. Advances `row`'s owner to the id (forward-only; drops any other
-    ///    row's entry naming it).
-    /// 2. When a live terminal holds `row`, moves the id's
+    /// 1. Sweeps owner entries whose row no live terminal holds any more (a
+    ///    closed pane), then advances `row`'s owner to the id (forward-only;
+    ///    drops any other row's entry naming it).
+    /// 2. When `row` is the id's live pane row by the owner rule (a live
+    ///    terminal holds it, and no newer-bound pane pinned to the id
+    ///    outranks it — [`MoveOutcome::NotLivePane`] otherwise), moves the id's
     ///    `bind_transcript_session` entry — adopted or minted — onto it
     ///    ([`Mover::Seam`]). A minted old row is `Closed`; an adopted one is
     ///    not. A sniffed or pinned-plane entry is never moved, and an absent
@@ -417,11 +452,16 @@ impl AiCoordRegistrar {
         let claude_session_id = claude_session_id.trim();
         self.inner
             .pane_rows
+            .sweep(|r| self.pane_row_facts(r).is_some());
+        self.inner
+            .pane_rows
             .advance(row, claude_session_id, now_ms());
-        let Some(facts) = self.pane_row_facts(row) else {
-            return MoveOutcome::NotOwner;
-        };
-        self.move_onto_pane_row(claude_session_id, row, Mover::Seam, facts.tenant)
+        match self.live_terminal_row(claude_session_id) {
+            Some(live) if live.row == row => {
+                self.move_onto_pane_row(claude_session_id, row, Mover::Seam, live.tenant)
+            }
+            _ => MoveOutcome::NotLivePane,
+        }
     }
 
     /// The finish-time repair (plan D4): when `claude_session_id`'s entry is
