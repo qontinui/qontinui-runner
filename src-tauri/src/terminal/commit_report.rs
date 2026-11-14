@@ -25,7 +25,10 @@
 //! The existing `CoordSync` drain loop POSTs it to
 //! `POST /coord/commits/report {repo, branch, shas[]}`. Coord resolves the
 //! session **server-side** from `(repo, branch)`; the body carries NO session
-//! id (plan §Population path 2).
+//! id (plan §Population path 2). The POST carries the device bearer and NO
+//! tenant header: coord takes the tenant from the verified claim and refuses
+//! an unauthenticated report `401`, which the drain Ack-drops (plan
+//! `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`).
 //!
 //! ## Dedup
 //!
