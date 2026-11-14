@@ -234,10 +234,11 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
             ServiceScan {
                 units: Some(units),
                 complete_kinds: if g.inventory_complete() && g.runner_active != Some(true) {
-                    vec![services::KIND_GH_ACTIONS_RUNNER]
+                    services::GUEST_COMPLETABLE_KINDS.to_vec()
                 } else {
                     Vec::new()
                 },
+                completable_kinds: services::GUEST_COMPLETABLE_KINDS,
             }
         } else {
             ServiceScan::default()
@@ -1034,6 +1035,7 @@ impl Reporter {
                 cut,
                 counts: &counts,
                 complete_kinds: &o.scan.complete_kinds,
+                completable_kinds: o.scan.completable_kinds,
             });
             let previous = self.over_bound.get(id).cloned().unwrap_or_default();
             let (next_bound, actions) = previous.step(scan, now);
@@ -1056,6 +1058,9 @@ impl Reporter {
                             over.held,
                             over.last_counts,
                         )
+                    }
+                    (services_bound::Action::Clear, _) => {
+                        evs.push(services_bound::cleared_event(id, &counts, now));
                     }
                     (services_bound::Action::Info, _) => info!(
                         "fleet::computer: computer {} watches {total} services, back within \
@@ -1334,6 +1339,7 @@ mod tests {
                         .collect(),
                 ),
                 complete_kinds: vec!["gh_actions_runner", "qontinui_runner"],
+                completable_kinds: services::LINUX_COMPLETABLE_KINDS,
             },
         }
     }
@@ -1850,6 +1856,73 @@ mod tests {
         );
     }
 
+    /// Review round 3, A2: leaving the over-bound state queues exactly one
+    /// CLOSING `services_over_bound` event, so the newest event coord serves
+    /// says "within" instead of reading "over" until it ages out.
+    #[test]
+    fn leaving_the_bound_queues_exactly_one_closing_event() {
+        let units = |n: usize| -> Observed {
+            let mut obs = observed(svc::HEALTHY_SHOW);
+            let template = obs.scan.units.as_ref().unwrap()[0].clone();
+            obs.scan.units = Some(
+                (0..n)
+                    .map(|i| {
+                        let mut w = template.clone();
+                        w.row.unit = format!("actions.runner.r{i}.service");
+                        w.row.kind = services::KIND_GH_ACTIONS_RUNNER.to_string();
+                        w
+                    })
+                    .collect(),
+            );
+            obs
+        };
+        let gaps = |r: &Reporter, cleared: bool| -> usize {
+            r.state.as_ref().unwrap().pending[HOST_ID]
+                .iter()
+                .filter(|e| {
+                    e.detail["reason"] == "services_over_bound" && e.detail["cleared"] == cleared
+                })
+                .count()
+        };
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(ObserverState::default());
+        let over = units(300);
+        r.derive_events(
+            std::slice::from_ref(&over),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        assert_eq!(gaps(&r, false), 1);
+
+        let within = units(10);
+        for (i, t) in [
+            "2026-11-14T00:00:30Z",
+            "2026-11-14T00:01:00Z",
+            "2026-11-14T00:01:30Z",
+            "2026-11-14T00:02:00Z",
+            "2026-11-14T00:02:30Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            r.derive_events(std::slice::from_ref(&within), HOST_ID, at(t));
+            assert_eq!(gaps(&r, true), usize::from(i >= 2), "scan {}", i + 1);
+        }
+        let closing = r.state.as_ref().unwrap().pending[HOST_ID]
+            .iter()
+            .find(|e| e.detail["cleared"] == true)
+            .unwrap()
+            .clone();
+        assert_eq!(closing.detail["truncated_kinds"], serde_json::json!([]));
+        assert_eq!(
+            r.over_bound.get(HOST_ID),
+            Some(&services_bound::OverBound::Within)
+        );
+    }
+
     /// Review A3: when `events::prune` forgets a computer, its over-bound
     /// state is forgotten with it rather than kept for the process lifetime.
     /// The forgotten computer is one `events::prune` itself removes (unseen
@@ -1876,7 +1949,7 @@ mod tests {
             held: Default::default(),
             last_counts: Default::default(),
             emitted_at: at("2026-11-01T00:00:00Z"),
-            within_scans: 0,
+            proposed: None,
         };
         r.over_bound
             .insert(gone.clone(), services_bound::OverBound::Over(over));

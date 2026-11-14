@@ -7,14 +7,19 @@
 //! `services_complete_kinds`. That keeps the report deliverable, but on its own
 //! it is silent: coord would serve 256 rows as if they were the whole
 //! inventory. [`OverBound`] is the transition machine that puts the cut on
-//! coord's read surface — one `telemetry_gap` with `reason:
+//! coord's read surface — a `telemetry_gap` with `reason:
 //! "services_over_bound"` on entering the state, again whenever the truncated
-//! kinds change, and every [`REEMIT_AFTER_SECS`] while it persists.
+//! kinds change, every [`REEMIT_EVERY_SECS`] while it persists, and one
+//! CLOSING event (`cleared: true`, no truncated kinds) on leaving it.
 //!
-//! **Reading it:** a `services_over_bound` event younger than its
-//! `reemit_after_secs` reads "over". An older one, or none, reads "no longer
-//! over" only when coord served fewer events than its `EVENTS_LIMIT`; at the
-//! limit it is UNKNOWN.
+//! **Reading it:** take the newest `services_over_bound` event. `cleared:
+//! true` reads "within the bound". Otherwise, younger than its
+//! `reemit_after_secs` reads "over" — that window is the re-emit period plus a
+//! margin ([`REEMIT_MARGIN_SECS`]) for a jittered tick and delivery back-off,
+//! so a standing condition never reads stale between re-emits. An older one,
+//! or none, reads "no longer over" only when coord served fewer events than
+//! its `EVENTS_LIMIT`; at the limit, or when the reporter stopped reporting,
+//! it is UNKNOWN.
 //!
 //! What the event says: the named kinds exceed coord's bound on this
 //! computer, so every FULL report truncates them and coord cannot apply
@@ -26,11 +31,14 @@
 //!
 //! A PARTIAL scan (a bus that did not answer, a truncated `sc query`) cannot
 //! say a kind it did not see completely is back within the bound, so a kind
-//! already over stays over (HELD) until a scan sees that kind completely, and
-//! the event reports a held kind's last count a scan could vouch for, apart
-//! from this scan's counts. Leaving takes [`LEAVE_AFTER_WITHIN_SCANS`]
-//! consecutive complete in-bound scans, so a computer at the edge is one entry,
-//! not one per crossing.
+//! already over stays over (HELD) until a scan sees that kind completely —
+//! but only a kind THIS instrument can ever report complete
+//! (`ServiceScan::completable_kinds`). The event reports a held kind's last
+//! count a scan could vouch for, apart from this scan's counts. Any change of
+//! the over-bound kind set — leaving included — is adopted only after
+//! [`SETTLE_SCANS`] consecutive scans propose the same new set, so a computer
+//! at the edge (256 ↔ 257, or two kinds trading the "largest" slot) is one
+//! entry, not one per crossing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,9 +49,18 @@ use super::{MAX_SERVICES_PER_COMPUTER, MAX_UNIT_LEN};
 /// The `telemetry_gap` reason this module emits.
 pub(crate) const OVER_BOUND_REASON: &str = "services_over_bound";
 
-/// While a computer stays over the bound, the event is re-sent this often, so
-/// a reader can tell a standing condition from a stale one.
-pub(crate) const REEMIT_AFTER_SECS: i64 = 86_400;
+/// While a computer stays over the bound, the event is re-sent this often.
+pub(crate) const REEMIT_EVERY_SECS: i64 = 86_400;
+
+/// How much later than [`REEMIT_EVERY_SECS`] a successor may land: the
+/// re-emit is decided on the first ±20%-jittered 30 s tick past the period,
+/// and the report carrying it can sit behind a 404/503 or 5xx back-off of up
+/// to 360 s per attempt and a 300 s strip window. One hour covers several of
+/// those in a row.
+pub(crate) const REEMIT_MARGIN_SECS: i64 = 3_600;
+
+/// The freshness window the event advertises as `reemit_after_secs`.
+pub(crate) const REEMIT_AFTER_SECS: i64 = REEMIT_EVERY_SECS + REEMIT_MARGIN_SECS;
 
 /// A row coord can accept at all: its unit name is within `MAX_UNIT_LEN`.
 /// `presanitize` drops the others before they take a slot.
@@ -93,22 +110,27 @@ pub(crate) fn kind_counts(rows: &[ServiceRow]) -> BTreeMap<&'static str, usize> 
 /// What one [`OverBound::step`] asks the reporter to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// Queue a `services_over_bound` `telemetry_gap` event.
+    /// Queue a `services_over_bound` `telemetry_gap` event for the Over state.
     Emit,
     /// WARN: the computer entered the state, or its truncated kinds changed.
     Warn,
+    /// Queue the CLOSING `services_over_bound` event: the computer left the
+    /// state, so the newest event says "within".
+    Clear,
     /// INFO: the computer is back within the bound.
     Info,
 }
 
-/// Leaving the over-bound state takes this many CONSECUTIVE complete scans
-/// within the bound. A computer sitting at the edge (a runner unit being
-/// re-registered moves the count 256 ↔ 257) would otherwise emit an event and
-/// a WARN on every crossing back over, every tick. Three scans is 90 s at the
-/// default 30 s cadence: long enough to ride out a unit re-registering, short
-/// beside the 24 h re-emit, and the only cost of the dwell is an INFO that
-/// arrives 60 s later than the first in-bound scan.
-pub(crate) const LEAVE_AFTER_WITHIN_SCANS: u32 = 3;
+/// A change of the over-bound kind set — leaving the state included — is
+/// adopted only after this many CONSECUTIVE scans propose the same new set.
+/// A computer at the edge (a runner unit being re-registered moves the count
+/// 256 ↔ 257; two kinds of near-equal size trade the "largest" slot) would
+/// otherwise emit an event and a WARN on every tick. Three scans is 90 s at
+/// the default 30 s cadence: long enough to ride out a unit re-registering,
+/// short beside the 24 h re-emit, and the only cost is a change reported 60 s
+/// later than the first scan that showed it. ENTERING is not delayed: the
+/// first truncated report must carry its event.
+pub(crate) const SETTLE_SCANS: u32 = 3;
 
 /// One tick's observed scan, as the machine needs it.
 #[derive(Debug, Clone, Copy)]
@@ -119,14 +141,16 @@ pub(crate) struct Scan<'a> {
     pub(crate) counts: &'a BTreeMap<&'static str, usize>,
     /// The kinds the scan saw completely.
     pub(crate) complete_kinds: &'a [&'static str],
+    /// The kinds the instrument that took the scan can EVER report complete.
+    pub(crate) completable_kinds: &'a [&'static str],
 }
 
 /// The over-bound state of one computer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Over {
-    /// The kinds over the bound: cut by this scan, or HELD.
+    /// The kinds over the bound, as last adopted (and last emitted).
     pub(crate) kinds: BTreeSet<&'static str>,
-    /// Kinds kept over because this scan did not see them completely.
+    /// Kinds this scan kept over because it did not see them completely.
     pub(crate) held: BTreeSet<&'static str>,
     /// Per kind, the last count a scan could vouch for: one that saw the kind
     /// completely, or — for a kind no scan has yet seen completely — the scan
@@ -136,9 +160,9 @@ pub(crate) struct Over {
     /// When the last event was queued (in-memory: a reporter rebuild re-emits
     /// on entering, which can add an event but never lose one).
     pub(crate) emitted_at: chrono::DateTime<chrono::Utc>,
-    /// Consecutive complete scans within the bound (see
-    /// [`LEAVE_AFTER_WITHIN_SCANS`]).
-    pub(crate) within_scans: u32,
+    /// A different kind set (empty = leaving) proposed by the last
+    /// consecutive scans, and how many (see [`SETTLE_SCANS`]).
+    pub(crate) proposed: Option<(BTreeSet<&'static str>, u32)>,
 }
 
 /// One computer's over-bound state.
@@ -155,12 +179,10 @@ impl OverBound {
     ///
     /// A kind already over that this scan did NOT see completely is HELD
     /// over — a partial scan's smaller count is not evidence it shrank — but
-    /// only a kind some instrument can report complete
-    /// ([`services::COMPLETABLE_KINDS`]): a kind no scan can ever vouch for
-    /// would otherwise be held for ever, so its own count decides. Leaving
-    /// takes [`LEAVE_AFTER_WITHIN_SCANS`] consecutive complete scans within
-    /// the bound, and crossing back over during that dwell is not a new
-    /// entry. PURE.
+    /// only when the scan's instrument could ever report it complete; a kind
+    /// it never can would otherwise be held for ever, so its own count
+    /// decides. Any change of the kind set is adopted after [`SETTLE_SCANS`]
+    /// consecutive scans propose it. PURE.
     pub(crate) fn step(
         &self,
         scan: Option<Scan<'_>>,
@@ -178,7 +200,7 @@ impl OverBound {
                 held: BTreeSet::new(),
                 last_counts: scan.counts.clone(),
                 emitted_at: now,
-                within_scans: 0,
+                proposed: None,
             };
             return (OverBound::Over(entered), vec![Action::Emit, Action::Warn]);
         };
@@ -187,12 +209,12 @@ impl OverBound {
             .iter()
             .copied()
             .filter(|k| {
-                services::COMPLETABLE_KINDS.contains(k)
+                scan.completable_kinds.contains(k)
                     && !scan.complete_kinds.contains(k)
                     && !scan.cut.contains(k)
             })
             .collect();
-        let kinds: BTreeSet<&'static str> = scan.cut.union(&held).copied().collect();
+        let observed: BTreeSet<&'static str> = scan.cut.union(&held).copied().collect();
         let mut last_counts = prev.last_counts.clone();
         for (k, n) in scan.counts {
             if !held.contains(k) {
@@ -200,27 +222,29 @@ impl OverBound {
             }
         }
         let mut next = Over {
-            kinds,
+            kinds: prev.kinds.clone(),
             held,
             last_counts,
             emitted_at: prev.emitted_at,
-            within_scans: 0,
+            proposed: None,
         };
-        if next.kinds.is_empty() {
-            let within_scans = prev.within_scans.saturating_add(1);
-            if within_scans >= LEAVE_AFTER_WITHIN_SCANS {
-                return (OverBound::Within, vec![Action::Info]);
+        if observed != prev.kinds {
+            let seen = match &prev.proposed {
+                Some((set, n)) if *set == observed => n.saturating_add(1),
+                _ => 1,
+            };
+            if seen >= SETTLE_SCANS {
+                if observed.is_empty() {
+                    return (OverBound::Within, vec![Action::Clear, Action::Info]);
+                }
+                next.kinds = observed;
+                next.emitted_at = now;
+                return (OverBound::Over(next), vec![Action::Emit, Action::Warn]);
             }
-            // The dwell: still over, naming the kinds it last named.
-            next.kinds = prev.kinds.clone();
-            next.within_scans = within_scans;
-            return (OverBound::Over(next), Vec::new());
+            // Not settled yet: the adopted set stands (and keeps its re-emit).
+            next.proposed = Some((observed, seen));
         }
-        if next.kinds != prev.kinds {
-            next.emitted_at = now;
-            return (OverBound::Over(next), vec![Action::Emit, Action::Warn]);
-        }
-        if (now - prev.emitted_at).num_seconds() >= REEMIT_AFTER_SECS {
+        if (now - prev.emitted_at).num_seconds() >= REEMIT_EVERY_SECS {
             next.emitted_at = now;
             return (OverBound::Over(next), vec![Action::Emit]);
         }
@@ -239,7 +263,6 @@ pub(crate) fn over_bound_event(
     over: &Over,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ComputerEvent {
-    let at = events::rfc3339(now);
     let observed: BTreeMap<&'static str, usize> = scan_counts
         .iter()
         .filter(|(k, _)| !over.held.contains(*k))
@@ -250,12 +273,12 @@ pub(crate) fn over_bound_event(
         .iter()
         .map(|k| (*k, over.last_counts.get(k).copied()))
         .collect();
-    ComputerEvent {
-        client_event_id: events::event_id("telemetry_gap", &[OVER_BOUND_REASON, identity, &at]),
-        kind: "telemetry_gap".into(),
-        observed_at: at,
-        detail: serde_json::json!({
+    gap_event(
+        identity,
+        now,
+        serde_json::json!({
             "reason": OVER_BOUND_REASON,
+            "cleared": false,
             "bound": MAX_SERVICES_PER_COMPUTER,
             "observed": observed,
             "held_kinds": over.held,
@@ -263,8 +286,51 @@ pub(crate) fn over_bound_event(
             "truncated_kinds": over.kinds,
             "reemit_after_secs": REEMIT_AFTER_SECS,
         }),
+    )
+}
+
+/// The CLOSING `services_over_bound` event: the computer is back within the
+/// bound, so no kind is truncated any more. PURE.
+pub(crate) fn cleared_event(
+    identity: &str,
+    scan_counts: &BTreeMap<&'static str, usize>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ComputerEvent {
+    gap_event(
+        identity,
+        now,
+        serde_json::json!({
+            "reason": OVER_BOUND_REASON,
+            "cleared": true,
+            "bound": MAX_SERVICES_PER_COMPUTER,
+            "observed": scan_counts,
+            "truncated_kinds": [],
+        }),
+    )
+}
+
+fn gap_event(
+    identity: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    detail: serde_json::Value,
+) -> ComputerEvent {
+    let at = events::rfc3339(now);
+    let cleared = if detail["cleared"] == true {
+        "cleared"
+    } else {
+        "over"
+    };
+    ComputerEvent {
+        client_event_id: events::event_id(
+            "telemetry_gap",
+            &[OVER_BOUND_REASON, cleared, identity, &at],
+        ),
+        kind: "telemetry_gap".into(),
+        observed_at: at,
+        detail,
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,17 +432,21 @@ mod tests {
     const GH: &str = "gh_actions_runner";
     const QR: &str = "qontinui_runner";
     const OTHER: &str = "other_watched";
+    /// What the Linux buses can report complete.
+    const LINUX: &[&str] = &["gh_actions_runner", "qontinui_runner"];
 
     fn counts(c: &[(&'static str, usize)]) -> BTreeMap<&'static str, usize> {
         c.iter().copied().collect()
     }
 
-    /// Step `s` with a scan of these counts, seen completely for `complete`;
-    /// the cut is what [`services_cut`] would make of those counts.
-    fn step_with(
+    /// Step `s` with a scan of these counts, seen completely for `complete`,
+    /// by an instrument that can complete `completable`; the cut is what
+    /// [`services_cut`] makes of those counts.
+    fn step_by(
         s: &OverBound,
         c: &[(&'static str, usize)],
         complete: &[&'static str],
+        completable: &[&'static str],
         now: chrono::DateTime<chrono::Utc>,
     ) -> (OverBound, Vec<Action>) {
         let counts = counts(c);
@@ -395,9 +465,39 @@ mod tests {
                 cut: &cut,
                 counts: &counts,
                 complete_kinds: complete,
+                completable_kinds: completable,
             }),
             now,
         )
+    }
+
+    /// [`step_by`] with the Linux instrument.
+    fn step_with(
+        s: &OverBound,
+        c: &[(&'static str, usize)],
+        complete: &[&'static str],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (OverBound, Vec<Action>) {
+        step_by(s, c, complete, LINUX, now)
+    }
+
+    /// Step `n` times with the same scan, returning the last state and every
+    /// step's actions.
+    fn step_n(
+        s: &OverBound,
+        n: usize,
+        c: &[(&'static str, usize)],
+        complete: &[&'static str],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (OverBound, Vec<Vec<Action>>) {
+        let mut s = s.clone();
+        let mut all = Vec::new();
+        for _ in 0..n {
+            let (next, a) = step_with(&s, c, complete, now);
+            s = next;
+            all.push(a);
+        }
+        (s, all)
     }
 
     fn over(s: &OverBound) -> &Over {
@@ -408,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn the_over_bound_machine_emits_on_enter_change_and_daily_and_informs_on_return() {
+    fn the_over_bound_machine_emits_on_enter_change_and_daily_and_clears_on_return() {
         let t0 = at("2026-11-14T00:00:00Z");
         let t1 = at("2026-11-14T00:00:30Z");
 
@@ -416,7 +516,7 @@ mod tests {
         let (s, a) = step_with(&OverBound::Within, &[(GH, 256)], ALL, t0);
         assert_eq!((s, a), (OverBound::Within, vec![]));
 
-        // Enter: event + WARN.
+        // Enter: event + WARN at once.
         let (s1, a) = step_with(&OverBound::Within, &[(GH, 300)], ALL, t0);
         assert_eq!(a, vec![Action::Emit, Action::Warn]);
         assert_eq!(over(&s1).kinds, set(&[GH]));
@@ -427,13 +527,13 @@ mod tests {
         assert_eq!(a, vec![]);
         assert_eq!(s2, s1);
 
-        // Changed kinds: event + WARN.
-        let (s3, a) = step_with(&s2, &[(GH, 300), (QR, 300)], ALL, t1);
-        assert_eq!(a, vec![Action::Emit, Action::Warn]);
+        // Changed kinds: adopted on the third consecutive scan.
+        let both = [(GH, 300), (QR, 300)];
+        let (s3, a) = step_n(&s2, 3, &both, ALL, t1);
+        assert_eq!(a, vec![vec![], vec![], vec![Action::Emit, Action::Warn]]);
         assert_eq!(over(&s3).kinds, set(&[GH, QR]));
 
-        // Just under 24 h later: nothing; at 24 h: event, no WARN.
-        let both = [(GH, 300), (QR, 300)];
+        // One second short of 24 h: nothing; at 24 h: event, no WARN.
         let (s4, a) = step_with(&s3, &both, ALL, at("2026-11-14T23:59:59Z"));
         assert_eq!(a, vec![]);
         let day = at("2026-11-15T00:00:30Z");
@@ -441,17 +541,12 @@ mod tests {
         assert_eq!(a, vec![Action::Emit]);
         assert_eq!(over(&s5).emitted_at, day);
 
-        // Back within: INFO only after three complete in-bound scans.
-        let (s6, a) = step_with(&s5, &[(GH, 10)], ALL, day);
-        assert_eq!(a, vec![]);
-        let (s7, a) = step_with(&s6, &[(GH, 10)], ALL, day);
-        assert_eq!(a, vec![]);
-        assert_eq!(over(&s7).within_scans, 2);
-        let (s8, a) = step_with(&s7, &[(GH, 10)], ALL, day);
-        assert_eq!((s8, a), (OverBound::Within, vec![Action::Info]));
+        // Back within: the closing event and INFO after three in-bound scans.
+        let (s6, a) = step_n(&s5, 3, &[(GH, 10)], ALL, day);
+        assert_eq!(a, vec![vec![], vec![], vec![Action::Clear, Action::Info]]);
+        assert_eq!(s6, OverBound::Within);
 
-        // Over → no scan → over: the gap holds the state, so no INFO and no
-        // second event.
+        // Over → no scan → over: the gap holds the state.
         let (o, _) = step_with(&OverBound::Within, &[(GH, 300)], ALL, t0);
         let (gap, a) = o.step(None, t1);
         assert_eq!(a, vec![]);
@@ -461,31 +556,106 @@ mod tests {
         assert_eq!(again, o);
     }
 
+    /// Review round 3, A1: the advertised freshness window outlasts the
+    /// re-emit period by a margin, so the newest event of a standing
+    /// condition never reads stale while its successor is on the way.
+    #[test]
+    fn the_advertised_freshness_outlasts_the_reemit_period_by_an_hour() {
+        assert_eq!(REEMIT_EVERY_SECS, 86_400);
+        assert_eq!(REEMIT_AFTER_SECS, 90_000);
+        assert_eq!(REEMIT_AFTER_SECS - REEMIT_EVERY_SECS, 3_600, "the margin");
+        let (s, _) = step_with(
+            &OverBound::Within,
+            &[(GH, 300)],
+            ALL,
+            at("2026-11-14T00:00:00Z"),
+        );
+        let e = over_bound_event(
+            "h",
+            &counts(&[(GH, 300)]),
+            over(&s),
+            at("2026-11-14T00:00:00Z"),
+        );
+        assert_eq!(e.detail["reemit_after_secs"], 90_000);
+    }
+
     /// A PARTIAL scan (a bus that did not answer, a truncated `sc query`)
     /// that happens to list fewer than 256 units must not read as "back
     /// within" — the next complete scan would re-enter, and the state would
-    /// flap with an INFO and a fresh event every time.
+    /// flap.
     #[test]
     fn a_partial_scan_under_the_bound_does_not_read_as_back_within() {
         let t0 = at("2026-11-14T00:00:00Z");
         let t1 = at("2026-11-14T00:00:30Z");
         let (o, _) = step_with(&OverBound::Within, &[(GH, 300)], ALL, t0);
 
-        // Over → partial scan under 256 → over: no INFO, no second event.
         let (held, a) = step_with(&o, &[(GH, 12)], &[QR], t1);
         assert_eq!(a, vec![], "a partial scan cannot say the kind shrank");
         assert_eq!(over(&held).kinds, set(&[GH]));
         assert_eq!(over(&held).held, set(&[GH]));
-        assert_eq!(over(&held).within_scans, 0, "a held scan is not in-bound");
+        assert_eq!(over(&held).proposed, None, "a held scan proposes nothing");
         let (again, a) = step_with(&held, &[(GH, 300)], ALL, t1);
         assert_eq!(a, vec![]);
         assert!(over(&again).held.is_empty());
 
         // A partial scan that drops one of two over kinds is no change either.
         let (two, _) = step_with(&OverBound::Within, &[(GH, 300), (QR, 300)], ALL, t0);
-        let (kept, a) = step_with(&two, &[(GH, 300), (QR, 5)], &[GH], t1);
-        assert_eq!(a, vec![]);
+        let (kept, a) = step_n(&two, 5, &[(GH, 300), (QR, 5)], &[GH], t1);
+        assert!(a.iter().all(Vec::is_empty));
         assert_eq!(over(&kept).kinds, set(&[GH, QR]));
+    }
+
+    /// Review round 3, A8: a held scan in the middle of the leave dwell
+    /// restarts it — the dwell counts CONSECUTIVE complete in-bound scans.
+    #[test]
+    fn a_held_scan_during_the_leave_dwell_restarts_it() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let (o, _) = step_with(&OverBound::Within, &[(GH, 300)], ALL, t0);
+        let (two_in, a) = step_n(&o, 2, &[(GH, 10)], ALL, t0);
+        assert!(a.iter().all(Vec::is_empty));
+        assert_eq!(over(&two_in).proposed, Some((BTreeSet::new(), 2)));
+
+        let (held, a) = step_with(&two_in, &[(GH, 12)], &[QR], t0);
+        assert_eq!(a, vec![]);
+        assert_eq!(
+            over(&held).proposed,
+            None,
+            "the held scan restarts the dwell"
+        );
+
+        let (s, a) = step_n(&held, 2, &[(GH, 10)], ALL, t0);
+        assert!(
+            a.iter().all(Vec::is_empty),
+            "two scans are not three: {a:?}"
+        );
+        let (s, a) = step_with(&s, &[(GH, 10)], ALL, t0);
+        assert_eq!(
+            (s, a),
+            (OverBound::Within, vec![Action::Clear, Action::Info])
+        );
+    }
+
+    /// Review round 3, A8: a kind-set change proposed while a kind is held
+    /// is adopted only when the same set is seen three scans in a row, and
+    /// the adopted state still knows which kind is held.
+    #[test]
+    fn a_kind_set_change_while_a_kind_is_held_settles_like_any_other() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let (two, _) = step_with(&OverBound::Within, &[(GH, 300), (QR, 300)], ALL, t0);
+        let partial = [(GH, 12), (QR, 200)];
+
+        let (s, a) = step_n(&two, 2, &partial, &[QR], t0);
+        assert!(a.iter().all(Vec::is_empty));
+        assert_eq!(over(&s).proposed, Some((set(&[GH]), 2)));
+        // The old set comes back once: the proposal is dropped.
+        let (s, a) = step_with(&s, &[(GH, 12), (QR, 300)], &[QR], t0);
+        assert_eq!(a, vec![]);
+        assert_eq!(over(&s).proposed, None);
+
+        let (s, a) = step_n(&s, 3, &partial, &[QR], t0);
+        assert_eq!(a, vec![vec![], vec![], vec![Action::Emit, Action::Warn]]);
+        assert_eq!(over(&s).kinds, set(&[GH]));
+        assert_eq!(over(&s).held, set(&[GH]));
     }
 
     /// Review round 2, A1: an event decided while a kind is HELD reports the
@@ -498,8 +668,8 @@ mod tests {
         let (two, _) = step_with(&OverBound::Within, &[(GH, 300), (QR, 300)], ALL, t0);
         // Only the runner kind seen completely, and it is within; the GitHub
         // runner kind answered partially with 12 rows.
-        let (s, a) = step_with(&two, &[(GH, 12), (QR, 200)], &[QR], t1);
-        assert_eq!(a, vec![Action::Emit, Action::Warn], "the kinds changed");
+        let (s, a) = step_n(&two, 3, &[(GH, 12), (QR, 200)], &[QR], t1);
+        assert_eq!(a.last(), Some(&vec![Action::Emit, Action::Warn]));
         let o = over(&s);
         assert_eq!(o.kinds, set(&[GH]));
         assert_eq!(o.held, set(&[GH]));
@@ -509,12 +679,13 @@ mod tests {
             e.detail,
             serde_json::json!({
                 "reason": "services_over_bound",
+                "cleared": false,
                 "bound": 256,
                 "observed": {"qontinui_runner": 200},
                 "held_kinds": ["gh_actions_runner"],
                 "held_last_counts": {"gh_actions_runner": 300},
                 "truncated_kinds": ["gh_actions_runner"],
-                "reemit_after_secs": 86400,
+                "reemit_after_secs": 90000,
             })
         );
     }
@@ -533,35 +704,72 @@ mod tests {
             assert_eq!(over(&next).kinds, set(&[GH]), "tick {i}");
             s = next;
         }
-        for _ in 0..2 {
-            let (next, a) = step_with(&s, &[(GH, 256)], ALL, t0);
-            assert_eq!(a, vec![]);
+        let (s, a) = step_n(&s, 3, &[(GH, 256)], ALL, t0);
+        assert_eq!(a, vec![vec![], vec![], vec![Action::Clear, Action::Info]]);
+        assert_eq!(s, OverBound::Within);
+    }
+
+    /// Review round 3, A4: two kinds of near-equal size trading the
+    /// "largest" slot every tick flip the cut kind every tick; the adopted
+    /// kind set does not follow, so there is no event or WARN per tick.
+    #[test]
+    fn two_kinds_trading_the_largest_slot_do_not_flap() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let (mut s, a) = step_with(&OverBound::Within, &[(GH, 200), (QR, 200)], ALL, t0);
+        assert_eq!(a, vec![Action::Emit, Action::Warn]);
+        let first = over(&s).kinds.clone();
+        for i in 1..=20 {
+            let c = if i % 2 == 1 {
+                [(GH, 201), (QR, 200)]
+            } else {
+                [(GH, 200), (QR, 200)]
+            };
+            let (next, a) = step_with(&s, &c, ALL, t0);
+            assert_eq!(a, vec![], "tick {i}");
+            assert_eq!(over(&next).kinds, first, "tick {i}");
             s = next;
         }
-        let (s, a) = step_with(&s, &[(GH, 256)], ALL, t0);
-        assert_eq!((s, a), (OverBound::Within, vec![Action::Info]));
     }
 
     /// Review round 2, A3: a kind no instrument can report complete is never
     /// held by the partial-scan rule, or it could never leave.
     #[test]
     fn a_kind_no_scan_can_complete_is_not_held() {
-        assert!(!services::COMPLETABLE_KINDS.contains(&OTHER));
         let t0 = at("2026-11-14T00:00:00Z");
-        let (mut s, _) = step_with(&OverBound::Within, &[(OTHER, 300)], ALL, t0);
+        let (s, _) = step_with(&OverBound::Within, &[(OTHER, 300)], ALL, t0);
         assert_eq!(over(&s).kinds, set(&[OTHER]));
-        for _ in 0..2 {
-            let (next, a) = step_with(&s, &[(OTHER, 10)], ALL, t0);
-            assert_eq!(a, vec![]);
-            assert!(over(&next).held.is_empty());
+        let (s, a) = step_n(&s, 3, &[(OTHER, 10)], ALL, t0);
+        assert_eq!(a, vec![vec![], vec![], vec![Action::Clear, Action::Info]]);
+        assert_eq!(s, OverBound::Within);
+    }
+
+    /// Review round 3, A5: completability is per instrument — the Windows
+    /// `sc` listing never reports the runner kind complete, so a runner kind
+    /// over the bound there is decided by its count, not held for ever.
+    #[test]
+    fn only_kinds_this_instrument_can_complete_are_held() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let sc: &[&str] = &["gh_actions_runner"];
+        let (mut s, _) = step_by(&OverBound::Within, &[(QR, 300)], sc, sc, t0);
+        let mut acts = Vec::new();
+        for _ in 0..3 {
+            let (next, a) = step_by(&s, &[(QR, 10)], sc, sc, t0);
+            assert!(!matches!(&next, OverBound::Over(o) if !o.held.is_empty()));
+            acts.push(a);
             s = next;
         }
-        let (s, a) = step_with(&s, &[(OTHER, 10)], ALL, t0);
-        assert_eq!((s, a), (OverBound::Within, vec![Action::Info]));
+        assert_eq!(
+            acts,
+            vec![vec![], vec![], vec![Action::Clear, Action::Info]]
+        );
+        // The Linux instrument CAN complete it, so there it is held.
+        let (o, _) = step_with(&OverBound::Within, &[(QR, 300)], ALL, t0);
+        let (held, _) = step_with(&o, &[(QR, 10)], &[GH], t0);
+        assert_eq!(over(&held).held, set(&[QR]));
     }
 
     #[test]
-    fn the_event_carries_the_bound_the_counts_and_the_truncated_kinds() {
+    fn the_events_carry_the_bound_the_counts_and_the_truncated_kinds() {
         let now = at("2026-11-14T00:00:00Z");
         let (s, _) = step_with(&OverBound::Within, &[(GH, 300), (QR, 3)], ALL, now);
         let e = over_bound_event("h", &counts(&[(GH, 300), (QR, 3)]), over(&s), now);
@@ -571,12 +779,30 @@ mod tests {
             e.detail,
             serde_json::json!({
                 "reason": "services_over_bound",
+                "cleared": false,
                 "bound": 256,
                 "observed": {"gh_actions_runner": 300, "qontinui_runner": 3},
                 "held_kinds": [],
                 "held_last_counts": {},
                 "truncated_kinds": ["gh_actions_runner"],
-                "reemit_after_secs": 86400,
+                "reemit_after_secs": 90000,
+            })
+        );
+
+        let c = cleared_event("h", &counts(&[(GH, 10)]), now);
+        assert_eq!(c.kind, "telemetry_gap");
+        assert_ne!(
+            c.client_event_id, e.client_event_id,
+            "same instant, distinct ids"
+        );
+        assert_eq!(
+            c.detail,
+            serde_json::json!({
+                "reason": "services_over_bound",
+                "cleared": true,
+                "bound": 256,
+                "observed": {"gh_actions_runner": 10},
+                "truncated_kinds": [],
             })
         );
     }

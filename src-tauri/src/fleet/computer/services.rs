@@ -33,11 +33,15 @@ pub(crate) const KIND_GH_ACTIONS_RUNNER: &str = "gh_actions_runner";
 pub(crate) const KIND_QONTINUI_RUNNER: &str = "qontinui_runner";
 pub(crate) const KIND_OTHER_WATCHED: &str = "other_watched";
 
-/// The kinds some instrument can report COMPLETE (contract amendment A2):
-/// the Linux buses ([`linux_complete_kinds`]), the Windows `sc` listing and
-/// the WSL guest probe. A kind outside this list is never in any scan's
-/// complete kinds, so nothing may wait for a complete scan of it.
-pub(crate) const COMPLETABLE_KINDS: &[&str] = &[KIND_GH_ACTIONS_RUNNER, KIND_QONTINUI_RUNNER];
+/// The kinds each instrument can EVER report complete (contract amendment
+/// A2) — a scan claims completeness only from its own list, and a kind
+/// outside it is never complete in that instrument's scans, so nothing may
+/// wait for a complete scan of it there. The Linux buses see both kinds; the
+/// Windows `sc` listing and a host-probed WSL guest see only GitHub runners
+/// (the runner's own units are invisible to them).
+pub(crate) const LINUX_COMPLETABLE_KINDS: &[&str] = &[KIND_GH_ACTIONS_RUNNER, KIND_QONTINUI_RUNNER];
+pub(crate) const SC_COMPLETABLE_KINDS: &[&str] = &[KIND_GH_ACTIONS_RUNNER];
+pub(crate) const GUEST_COMPLETABLE_KINDS: &[&str] = &[KIND_GH_ACTIONS_RUNNER];
 
 /// Unit-name patterns the Linux watcher asks systemd for, on both buses.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -345,6 +349,9 @@ pub(crate) struct ServiceScan {
     /// so a missing row of that kind is a unit that is really gone. Kinds not
     /// listed are a delta for that kind and delete nothing.
     pub(crate) complete_kinds: Vec<&'static str>,
+    /// The kinds the instrument that took this scan can EVER report complete
+    /// (a superset of `complete_kinds`). Empty = no instrument.
+    pub(crate) completable_kinds: &'static [&'static str],
 }
 
 /// How the session (user) bus fared this scan.
@@ -423,7 +430,7 @@ pub(crate) fn unit_file_name(path: &str, state: &str) -> Option<String> {
 /// design. PURE.
 pub(crate) fn linux_complete_kinds(system_ok: bool, session: SessionBus) -> Vec<&'static str> {
     if system_ok && session != SessionBus::Failed {
-        vec![KIND_GH_ACTIONS_RUNNER, KIND_QONTINUI_RUNNER]
+        LINUX_COMPLETABLE_KINDS.to_vec()
     } else {
         Vec::new()
     }
@@ -450,7 +457,10 @@ pub(crate) mod linux {
     use tracing::debug;
     use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-    use super::{linux_complete_kinds, ServiceScan, SessionBus, UnitProps, WATCHED_PATTERNS};
+    use super::{
+        linux_complete_kinds, ServiceScan, SessionBus, UnitProps, LINUX_COMPLETABLE_KINDS,
+        WATCHED_PATTERNS,
+    };
 
     const DEST: &str = "org.freedesktop.systemd1";
     const MGR_PATH: &str = "/org/freedesktop/systemd1";
@@ -570,6 +580,7 @@ pub(crate) mod linux {
             ServiceScan {
                 units: Some(units),
                 complete_kinds: linux_complete_kinds(system_ok, session),
+                completable_kinds: LINUX_COMPLETABLE_KINDS,
             }
         }
     }
@@ -931,7 +942,7 @@ pub(crate) mod windows {
 
     use super::{
         parse_sc_qc_binary_path, parse_sc_query, props_from_sc, read_runner_file, row_from_props,
-        sc_listing_complete, windows_runner_dir, ServiceScan, WatchedUnit, KIND_GH_ACTIONS_RUNNER,
+        sc_listing_complete, windows_runner_dir, ServiceScan, WatchedUnit, SC_COMPLETABLE_KINDS,
     };
 
     const SC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1013,10 +1024,11 @@ pub(crate) mod windows {
         ServiceScan {
             units: Some(units),
             complete_kinds: if complete {
-                vec![KIND_GH_ACTIONS_RUNNER]
+                SC_COMPLETABLE_KINDS.to_vec()
             } else {
                 Vec::new()
             },
+            completable_kinds: SC_COMPLETABLE_KINDS,
         }
     }
 }
@@ -1310,18 +1322,28 @@ DISPLAY_NAME: Print Spooler\r
         assert!(linux_complete_kinds(false, SessionBus::Ok).is_empty());
     }
 
-    /// Every kind an instrument can claim complete is in
-    /// `COMPLETABLE_KINDS` (the Windows listing and the WSL guest probe claim
-    /// only the GitHub-runner kind), and the catch-all kind is not.
+    /// Each instrument's completable kinds: the Linux buses can complete
+    /// both kinds, the Windows listing and the WSL guest probe only GitHub
+    /// runners, and no instrument the catch-all kind.
     #[test]
-    fn completable_kinds_cover_every_instruments_complete_claim() {
-        for k in linux_complete_kinds(true, SessionBus::Ok)
-            .into_iter()
-            .chain([KIND_GH_ACTIONS_RUNNER])
-        {
-            assert!(COMPLETABLE_KINDS.contains(&k), "{k}");
+    fn completable_kinds_are_per_instrument() {
+        assert_eq!(
+            linux_complete_kinds(true, SessionBus::Ok),
+            LINUX_COMPLETABLE_KINDS.to_vec()
+        );
+        assert_eq!(
+            LINUX_COMPLETABLE_KINDS,
+            &["gh_actions_runner", "qontinui_runner"]
+        );
+        assert_eq!(SC_COMPLETABLE_KINDS, &["gh_actions_runner"]);
+        assert_eq!(GUEST_COMPLETABLE_KINDS, &["gh_actions_runner"]);
+        for list in [
+            LINUX_COMPLETABLE_KINDS,
+            SC_COMPLETABLE_KINDS,
+            GUEST_COMPLETABLE_KINDS,
+        ] {
+            assert!(!list.contains(&KIND_OTHER_WATCHED));
         }
-        assert!(!COMPLETABLE_KINDS.contains(&KIND_OTHER_WATCHED));
     }
 
     #[test]

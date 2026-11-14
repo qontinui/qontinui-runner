@@ -603,16 +603,36 @@ pub(crate) fn load(path: &Path) -> ObserverState {
     }
 }
 
-/// Atomic, durable write: temp file, `fsync`, rename. Best-effort: a failure
-/// costs this tick's persistence, which the content-derived ids make safe.
+/// A temp path for one [`save`], unique per process and per write: two saves
+/// in flight at once (a cancelled reporter's blocking write still finishing
+/// beside its rebuilt successor's) must never write the same temp file, or
+/// one could rename the other's half-written bytes into place.
+pub(crate) fn temp_path(path: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("json.{}.{n}.tmp", std::process::id()))
+}
+
+/// Atomic, durable write: a temp file of its own ([`temp_path`]), `fsync`,
+/// rename. Best-effort: a failure costs this tick's persistence, which the
+/// content-derived ids make safe, and removes the temp file it left.
 pub(crate) fn save(path: &Path, state: &ObserverState) -> std::io::Result<()> {
-    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = temp_path(path);
+    let written = write_synced_then_rename(&tmp, path, state);
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn write_synced_then_rename(tmp: &Path, path: &Path, state: &ObserverState) -> std::io::Result<()> {
+    use std::io::Write;
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::File::create(tmp)?;
         f.write_all(&serde_json::to_vec(state)?)?;
         f.sync_all()?;
     }
@@ -623,6 +643,54 @@ pub(crate) fn save(path: &Path, state: &ObserverState) -> std::io::Result<()> {
 mod tests {
     use super::super::services::{parse_systemctl_show, row_from_props, tests as svc};
     use super::*;
+
+    /// Review round 3, A6: every save writes a temp file of its own.
+    #[test]
+    fn every_save_gets_its_own_temp_file() {
+        let path = Path::new("/state/computer-observer.json");
+        let a = temp_path(path);
+        let b = temp_path(path);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), path.parent());
+        assert!(a.to_string_lossy().ends_with(".tmp"), "{a:?}");
+    }
+
+    /// Review round 3, A6: two saves racing on one path (a cancelled
+    /// reporter's write finishing beside its successor's) always leave a
+    /// file that parses as one of the two states, and no temp file behind.
+    #[test]
+    fn concurrent_saves_never_leave_an_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("computer-observer.json");
+        let state = |tick: &str| ObserverState {
+            last_tick_at: Some(tick.into()),
+            ..ObserverState::default()
+        };
+        let (a, b) = (state("2026-11-14T00:00:00Z"), state("2026-11-14T00:00:30Z"));
+        let writers: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|s| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        save(&path, &s).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let loaded = load(&path);
+        assert!(loaded == a || loaded == b, "{loaded:?}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .filter(|n| n != "computer-observer.json")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
