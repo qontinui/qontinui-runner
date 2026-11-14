@@ -882,3 +882,35 @@ async fn an_ignored_node_modules_dir_or_link_keeps_the_tree() {
         );
     }
 }
+
+/// Edge 4253717f: removing a never-spawned tree revokes its coord-mcp proxy
+/// nonces TOTALLY — the live device key AND a superseded key still riding
+/// grace — so the proxy refuses both at once. The grace-preserving eviction
+/// this replaced left the live key graced, i.e. still accepted.
+#[tokio::test]
+async fn a_removed_trees_proxy_nonces_are_revoked_with_no_grace() {
+    let _amb = crate::test_env::isolated_ambient();
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    let wd = tree.to_string_lossy().to_string();
+    let superseded = crate::coord_mcp::register_device_proxy_nonce_for_test(&wd);
+    let live = crate::coord_mcp::register_device_proxy_nonce_for_test(&wd);
+    assert!(
+        crate::coord_mcp::proxy_nonce_is_valid(&superseded),
+        "fixture: the superseded key rides grace"
+    );
+    assert!(crate::coord_mcp::proxy_nonce_is_valid(&live));
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+    assert!(
+        !crate::coord_mcp::proxy_nonce_is_valid(&live),
+        "the removed tree's live key is refused immediately"
+    );
+    assert!(
+        !crate::coord_mcp::proxy_nonce_is_valid(&superseded),
+        "the removed tree's graced key is refused immediately"
+    );
+}
