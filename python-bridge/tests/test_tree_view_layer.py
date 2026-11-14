@@ -7,14 +7,24 @@ This module tests the TreeViewLayer service:
 - timeline_tree_view() adds relative timestamps
 - state_grouped_tree_view() groups by state sets
 - _format_action_label() for different action types
+- every view reports an unfinished action (no end_time) as running
 - TreeNode.to_dict() serialization
 """
 
 import time
+from collections.abc import Iterator
 
 import pytest
 
 from services.tree_view_layer import TreeNode, TreeViewLayer
+
+
+def _action_nodes(nodes: list[TreeNode]) -> Iterator[TreeNode]:
+    """Yield every action node in a forest of TreeNodes, depth first."""
+    for node in nodes:
+        if node.type == "action":
+            yield node
+        yield from _action_nodes(node.children)
 
 
 class TestTreeNodeSerialization:
@@ -479,6 +489,49 @@ class TestFormatActionLabel:
         # Should not have state change indicators
         assert "+" not in label
         assert "-" not in label
+
+
+class TestRunningActionStatus:
+    """An unfinished action (no end_time) reports "running" in every view."""
+
+    @pytest.mark.parametrize(
+        "view",
+        [
+            TreeViewLayer.execution_tree_view,
+            TreeViewLayer.action_only_tree_view,
+            TreeViewLayer.state_transition_tree_view,
+            TreeViewLayer.timeline_tree_view,
+            TreeViewLayer.state_grouped_tree_view,
+        ],
+        ids=lambda view: view.__name__,
+    )
+    def test_running_action_is_running_in_every_view(self, view, action_record_builder):
+        """success defaults to True, so only end_time may say an action finished."""
+        running = {"end_time": None, "duration_ms": None}
+        records = [
+            # One record per state_transition_tree_view group: entered, exited, no change.
+            action_record_builder(
+                action_id="entering",
+                start_time=100.0,
+                active_states_after=frozenset(["Dashboard"]),
+                **running,
+            ),
+            action_record_builder(
+                action_id="exiting",
+                start_time=200.0,
+                active_states_before=frozenset(["Login"]),
+                **running,
+            ),
+            action_record_builder(action_id="unchanged", start_time=300.0, **running),
+        ]
+
+        action_nodes = list(_action_nodes(view(records)))
+
+        assert {node.id for node in action_nodes} == {"entering", "exiting", "unchanged"}
+        for node in action_nodes:
+            assert node.data["status"] == "running"
+            assert "⟳" in node.label
+            assert "✓" not in node.label
 
 
 class TestFormatTimelineLabel:
