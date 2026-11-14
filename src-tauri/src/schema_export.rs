@@ -678,7 +678,6 @@ pub fn export_all_schemas() -> Value {
     add!("WorkerSignal", qv::WorkerSignal);
     add!("Finding", qv::Finding);
     add!("Confidence", qv::Confidence);
-    add!("VerificationAgentContext", qv::VerificationAgentContext);
     add!("ExtendIterationsRequest", qv::ExtendIterationsRequest);
     add!("CriterionOverride", qv::CriterionOverride);
     add!("OverrideCollection", qv::OverrideCollection);
@@ -1107,15 +1106,19 @@ mod tests {
         // verifier that alone filled them, plan
         // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
         // Phase 6) = 620.
-        // The codegen's "Processing N top-level types" line should read 620 here.
-        assert_eq!(obj.len(), 620, "Expected 620 schema entries");
-        // Nothing in the product fills those four any more, so registering
-        // one again would export a verdict DTO that has no producer.
+        // - VerificationAgentContext (its only producer, the orchestrator
+        // verifier's context builder, went with the types above; coord
+        // finding 7c536351) = 619.
+        // The codegen's "Processing N top-level types" line should read 619 here.
+        assert_eq!(obj.len(), 619, "Expected 619 schema entries");
+        // Nothing in the product fills these any more, so registering one
+        // again would export a DTO that has no producer.
         for removed in [
             "DomainVerificationResult",
             "VerificationResult",
             "IterationVerificationResults",
             "TaskCompletionResult",
+            "VerificationAgentContext",
         ] {
             assert!(
                 !obj.contains_key(removed),
