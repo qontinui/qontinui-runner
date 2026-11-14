@@ -14,9 +14,10 @@
 //! One entry per coord row, `row → harness id`, with the instant the ownership
 //! began:
 //!
-//! - **An entry** is written by [`PaneRowOwners::advance`] — the re-key seam
-//!   confirming (pid-exact) that the pane's process runs that id, or a pane
-//!   being bound to a row for the id it is pinned to. It is forward-only: a
+//! - **An entry** is written by [`PaneRowOwners::advance`] — ONLY the re-key
+//!   seam, confirming (pid-exact) that the pane's process runs that id. A pin
+//!   never writes one: the id a pane was spawned with says nothing about what
+//!   it runs after `/clear` or an in-pane `/resume`. It is forward-only: a
 //!   coord decline never rolls it back. Advancing a row to X drops every OTHER
 //!   row's entry naming X, so one id never has two explicit rows (the latest
 //!   confirmation wins).
@@ -24,8 +25,12 @@
 //!   newest-bound live pane PINNED to the id (the registrar's terminal lookup,
 //!   which takes the newest bind).
 //!
-//! An entry outranks a pin seed. Entries whose row no live terminal holds are
-//! pruned when read. [`live_terminal_row`] is the one rule over both, with the
+//! An entry outranks a pin seed — unless the pin seed's pane was BOUND AFTER
+//! the entry's ownership began (a migration or respawn of the session onto a
+//! new pane while the old one is still open): a newer bind for the id outranks
+//! an older confirmation. Only an entry licenses a transfer to EVICT other
+//! keys on a row. Entries whose row no live terminal holds are pruned when read
+//! and swept on every seam advance ([`PaneRowOwners::sweep`]). [`live_terminal_row`] is the one rule over both, with the
 //! live-terminal check injected so it is unit-testable without a PTY.
 //!
 //! ## The bind door
@@ -182,6 +187,20 @@ impl PaneRowOwners {
         }
     }
 
+    /// Drop every entry whose row `live` says no live terminal holds (a
+    /// closed pane). `live` is called with the lock RELEASED.
+    pub(crate) fn sweep(&self, live: impl Fn(Uuid) -> bool) {
+        let rows: Vec<Uuid> = self.lock().owners.keys().copied().collect();
+        let dead: Vec<Uuid> = rows.into_iter().filter(|r| !live(*r)).collect();
+        if dead.is_empty() {
+            return;
+        }
+        let mut s = self.lock();
+        for r in dead {
+            s.owners.remove(&r);
+        }
+    }
+
     /// Tag `row` with the door that registered it.
     pub(crate) fn set_door(&self, row: Uuid, door: BindDoor) {
         self.lock().doors.insert(row, door);
@@ -209,11 +228,13 @@ impl PaneRowOwners {
 /// THE rule: the live pane row `harness_id` owns, if any.
 ///
 /// 1. An ENTRY naming `harness_id` answers its row while `live` says a
-///    terminal still holds it; a dead entry is pruned and the rule falls
-///    through.
-/// 2. Else the PIN SEED: `pin_row` (the newest-bound live pane pinned to the
-///    id), but only while no entry on that row names another id — a pin whose
-///    row another id has taken answers `None`.
+///    terminal still holds it; a dead entry is pruned.
+/// 2. The PIN SEED: `pin_row` (the newest-bound live pane pinned to the id),
+///    only while no entry on that row names another id — a pin whose row
+///    another id has taken answers nothing.
+/// 3. With both, the entry wins unless the pin's pane was bound strictly
+///    AFTER the entry's ownership began (a newer pane for the id: migration
+///    overlap). An unknown bind instant never outranks an entry.
 ///
 /// `live` answers a row's [`PaneRowFacts`] when some live terminal holds it.
 /// Neither closure is called with the owner lock held.
@@ -227,28 +248,38 @@ pub(crate) fn live_terminal_row(
     if harness_id.is_empty() {
         return None;
     }
-    if let Some((row, since)) = owners.entry_for(harness_id) {
-        match live(row) {
-            Some(f) => {
-                return Some(LivePaneRow {
-                    row,
-                    tenant: f.tenant,
-                    owned_since_ms: Some(since),
-                })
+    let entry = owners
+        .entry_for(harness_id)
+        .and_then(|(row, since)| match live(row) {
+            Some(f) => Some(LivePaneRow {
+                row,
+                tenant: f.tenant,
+                owned_since_ms: Some(since),
+            }),
+            None => {
+                owners.prune(row, harness_id);
+                None
             }
-            None => owners.prune(row, harness_id),
+        });
+    let seed = pin_row(harness_id)
+        .filter(|row| owners.admits(*row, harness_id))
+        .and_then(|row| {
+            live(row).map(|f| LivePaneRow {
+                row,
+                tenant: f.tenant,
+                owned_since_ms: f.bound_at_ms,
+            })
+        });
+    match (entry, seed) {
+        (Some(e), Some(p)) if p.row != e.row => {
+            let newer_bind = matches!(
+                (p.owned_since_ms, e.owned_since_ms),
+                (Some(bound), Some(since)) if bound > since
+            );
+            Some(if newer_bind { p } else { e })
         }
+        (e, p) => e.or(p),
     }
-    let row = pin_row(harness_id)?;
-    if !owners.admits(row, harness_id) {
-        return None;
-    }
-    let f = live(row)?;
-    Some(LivePaneRow {
-        row,
-        tenant: f.tenant,
-        owned_since_ms: f.bound_at_ms,
-    })
 }
 
 #[cfg(test)]
@@ -340,6 +371,51 @@ mod tests {
             );
             assert_eq!(live_terminal_row(&o, P, |_| Some(r), live), None);
         }
+    }
+
+    /// Migration overlap: the old pane's row carries a seam entry for X; a
+    /// NEW pane pinned to X bound after it outranks the entry, while a pin
+    /// bound before it does not.
+    #[test]
+    fn a_pane_bound_after_the_entry_outranks_it() {
+        let o = PaneRowOwners::default();
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        o.advance(old, X, 100);
+        let at =
+            |bound: i64| move |row: Uuid| Some(if row == new { facts(bound) } else { facts(1) });
+        assert_eq!(
+            live_terminal_row(&o, X, |_| Some(new), at(200)).map(|l| l.row),
+            Some(new),
+            "a newer bind outranks the older confirmation"
+        );
+        assert_eq!(
+            live_terminal_row(&o, X, |_| Some(new), at(50)).map(|l| l.row),
+            Some(old),
+            "an older bind does not"
+        );
+        assert_eq!(o.owner_of(new), None, "no entry is minted for the pin");
+        let unknown = |row: Uuid| {
+            Some(PaneRowFacts {
+                tenant: NewSessionTenant::Undetermined,
+                bound_at_ms: (row != new).then_some(1),
+            })
+        };
+        assert_eq!(
+            live_terminal_row(&o, X, |_| Some(new), unknown).map(|l| l.row),
+            Some(old),
+            "an unknown bind instant never outranks an entry"
+        );
+    }
+
+    #[test]
+    fn a_sweep_drops_entries_of_closed_panes() {
+        let o = PaneRowOwners::default();
+        let (open, closed) = (Uuid::new_v4(), Uuid::new_v4());
+        o.advance(open, X, 1);
+        o.advance(closed, P, 1);
+        o.sweep(|r| r == open);
+        assert_eq!(o.owner_of(open).as_deref(), Some(X));
+        assert_eq!(o.owner_of(closed), None);
     }
 
     #[test]

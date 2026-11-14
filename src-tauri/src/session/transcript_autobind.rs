@@ -477,7 +477,8 @@ where
             match local_decision(tailer, &identity.claude_session_id) {
                 Some(local) => {
                     info!(
-                        "transcript_autobind: {} — a live pane was bound while coord answered;                          adopting the pane's row instead of {:?}",
+                        "transcript_autobind: {} — a live pane was bound while coord answered; \
+                         adopting the pane's row instead of {:?}",
                         identity.claude_session_id, settled
                     );
                     local
