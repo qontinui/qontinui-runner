@@ -27,21 +27,29 @@
 //!   ([`TrackedPaths::is_answered`]): outside a work tree there is no exclude
 //!   file, and an unanswered probe inside one cannot say which paths are tracked.
 //!
-//! **Stale lines are pruned.** A line this module wrote can go stale when the
-//! repository later starts tracking what it names (a pull vendors the skill, or
-//! a person commits the command). A stale DIRECTORY line would then hide a
-//! person's new file beside the now-tracked ones, because git does not look
-//! inside an excluded directory. So each pass also removes, from the lines in
-//! its OWN marker block anchored under its provisioned root, every line naming
-//! a tracked file or a directory with anything tracked beneath it; the same
-//! pass re-adds the per-file lines that still apply. "The block" is every line
-//! from this module's marker up to the next comment line, so a person's own
-//! lines are never touched provided they sit outside it — before the marker, or
-//! under a comment header of their own. (An uncommented line a person appends
-//! at the end of the file joins the block; only a stale one is pruned, and for
-//! a file line that changes nothing, since exclusion has no effect on a tracked
-//! file.) A per-file line for a path that later goes ABSENT and untracked (a
-//! builtin withheld as `RootVersioned`) is not pruned.
+//! **Stale lines are pruned.** Each pass removes, from the lines in its OWN
+//! marker block anchored under its provisioned root, every line this pass did
+//! not produce AND has positive evidence is stale: the path it names is now
+//! tracked (a file git tracks, or a directory with anything tracked beneath
+//! it), or the path is absent from disk. That covers a path the repository
+//! started tracking (a pull vendors the skill, or a person commits the command)
+//! — where a stale DIRECTORY line would otherwise hide a person's new file
+//! beside the now-tracked ones, because git does not look inside an excluded
+//! directory — and a command or skill the provisioner now HOLDS BACK
+//! (`RootVersioned`, once the repository versions the provisioned tree; such a
+//! path is absent by construction), whose stale line would hide a file a person
+//! later creates at that path. A line for a runner-written file that is still
+//! on disk and untracked is KEPT even when this pass did not write it (another
+//! account's override-only command, a skill this pass refused, a failed write),
+//! so that file never reads dirty again and alternating passes do not
+//! flip-flop the file. Accepted cost: linked worktrees share one
+//! `info/exclude`, so a path absent in one worktree and present in another can
+//! lose its line until the next pass in the other worktree re-adds it. "The
+//! block" is every line from this module's marker up to the next comment line,
+//! so a person's own lines are never touched provided they sit outside it —
+//! before the marker, or under a comment header of their own. (An uncommented
+//! line a person appends at the end of the file joins the block, and is pruned
+//! only on the same evidence.)
 //!
 //! The exclude file is resolved with `git rev-parse --git-path info/exclude`,
 //! so a linked worktree writes to its COMMON dir's `info/exclude` (the one git
@@ -148,21 +156,44 @@ fn unescape(pattern: &str) -> String {
     out
 }
 
-/// True iff `line` is an anchored pattern under `root_pattern` (the escaped,
-/// anchored provisioned root, ending in `/`) that names something git now
-/// tracks: a file it tracks, or a directory with anything tracked beneath it.
-fn is_stale(line: &str, root_pattern: &str, tracked: &TrackedPaths) -> bool {
+/// True iff `line` (trimmed) is an anchored pattern under `root_pattern` (the
+/// escaped, anchored provisioned root, ending in `/`) that this pass did NOT
+/// produce and that is provably stale: the path it names, relative to `base`,
+/// is tracked (a tracked file, or a directory with anything tracked beneath
+/// it) or absent from disk — which is also every path held back as
+/// `RootVersioned`. Only ever asked about lines inside this module's own
+/// marker block (see [`update_exclude`]).
+fn is_stale(
+    line: &str,
+    root_pattern: &str,
+    current: &std::collections::HashSet<&str>,
+    base: &Path,
+    tracked: &TrackedPaths,
+) -> bool {
     let Some(rest) = line.strip_prefix(root_pattern) else {
         return false;
     };
-    if rest.is_empty() {
+    if rest.is_empty() || current.contains(line) {
         return false;
     }
-    let rel = unescape(rest);
-    match rel.strip_suffix('/') {
-        Some(dir) => tracked.tracks_any_under(Path::new(dir)),
-        None => tracked.contains(Path::new(&rel)),
+    // The runner only writes literal paths; a line with an unescaped glob
+    // metacharacter is a person's pattern, never pruned.
+    let mut escaped = false;
+    for c in rest.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if matches!(c, '*' | '?' | '[') {
+            return false;
+        }
     }
+    let rel = unescape(rest);
+    let (rel_path, is_tracked) = match rel.strip_suffix('/') {
+        Some(dir) => (Path::new(dir), tracked.tracks_any_under(Path::new(dir))),
+        None => (Path::new(rel.as_str()), tracked.contains(Path::new(&rel))),
+    };
+    is_tracked || !base.join(rel_path).exists()
 }
 
 /// Where `base`'s repository keeps its `info/exclude`, and `base`'s path
@@ -249,7 +280,7 @@ fn update_exclude(
     let present: std::collections::HashSet<&str> = kept.iter().map(|l| l.trim()).collect();
     let missing: Vec<&String> = patterns
         .iter()
-        .filter(|p| !present.contains(p.as_str()))
+        .filter(|p| !present.contains(p.trim()))
         .collect();
     if missing.is_empty() && pruned == 0 {
         return Ok((0, 0));
@@ -342,7 +373,8 @@ fn update_exclude(
 
 /// Exclude what one provisioning pass wrote under `base` (the provisioned root,
 /// e.g. `<cwd>/.claude/skills`) from `git status` of the enclosing repository,
-/// and prune lines under that root that git now tracks.
+/// and prune lines under that root that this pass did not produce and that
+/// name a now-tracked or absent path.
 ///
 /// `written` are paths relative to `base`; `tracked` is the probe the pass
 /// already ran over `base` BEFORE writing. Best-effort: never panics, never
@@ -375,13 +407,16 @@ pub(crate) fn exclude_written_paths(
         .iter()
         .filter_map(|e| escape_pattern(&format!("{prefix}{e}")))
         .collect();
+    // Trimmed, because `update_exclude` asks about trimmed lines; a pattern
+    // ending in an escaped space would otherwise never match itself.
+    let current: std::collections::HashSet<&str> = patterns.iter().map(|p| p.trim()).collect();
     match update_exclude(&exclude_path, &patterns, |line| {
-        is_stale(line, &root_pattern, tracked)
+        is_stale(line, &root_pattern, &current, base, tracked)
     }) {
         Ok((0, 0)) => {}
         Ok((added, pruned)) => info!(
             "{provisioner}: excluded {added} provisioned path(s) from git status, pruned \
-             {pruned} now-tracked line(s), in {}",
+             {pruned} line(s) this pass no longer writes, in {}",
             exclude_path.display()
         ),
         Err(e) => warn!(
@@ -584,6 +619,57 @@ mod tests {
                 .exists(),
             "the atomic-replace temp file is renamed away"
         );
+    }
+
+    /// A commands pass prunes only under its own root, and only on positive
+    /// evidence: a line for a command it did not write this pass is dropped
+    /// when that file is ABSENT, kept when the file is still on disk untracked
+    /// (another account's override-only command), and the skills lines in the
+    /// same marker block are never touched.
+    #[test]
+    fn a_pass_prunes_only_absent_or_tracked_paths_under_its_own_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let commands = tmp.path().join(".claude").join("commands");
+        let skills = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        provision(&commands, &["gate.md", "acct-only.md", "gone.md"]);
+        provision(&skills, &["preflight/SKILL.md"]);
+
+        // Next pass writes only gate.md: acct-only.md stays on disk (another
+        // account's command), gone.md is absent (held back).
+        std::fs::remove_file(commands.join("gone.md")).unwrap();
+        // A person's glob appended at the end of the file lands inside the
+        // runner's block; it names no literal path and is never pruned.
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let mut text = std::fs::read_to_string(&exclude).unwrap();
+        text.push_str("/.claude/commands/*.tmp\n");
+        std::fs::write(&exclude, text).unwrap();
+        provision(&commands, &["gate.md"]);
+
+        let lines = exclude_lines(tmp.path());
+        assert!(
+            lines.contains(&"/.claude/commands/gate.md".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"/.claude/commands/acct-only.md".to_string()),
+            "an untracked file still on disk keeps its line: {lines:?}"
+        );
+        assert!(
+            !lines.contains(&"/.claude/commands/gone.md".to_string()),
+            "an absent path loses its line: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"/.claude/skills/preflight/".to_string()),
+            "a commands pass never touches skills lines: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"/.claude/commands/*.tmp".to_string()),
+            "a person's glob line is kept: {lines:?}"
+        );
+        assert_eq!(untracked(tmp.path()), "");
     }
 
     #[test]
