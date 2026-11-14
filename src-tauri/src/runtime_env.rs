@@ -574,6 +574,10 @@ mod tests {
 
     #[test]
     fn test_detect_environment() {
+        // `IsolatedAmbient` sets QONTINUI_ENV to a no-such-profile sentinel for
+        // its whole life, under this lock; reading it unlocked races every test
+        // that holds one of those fixtures.
+        let _env = crate::test_env::env_lock();
         let env = detect_environment();
         // In test builds, should be "development"
         assert!(env == "development" || env == "production");

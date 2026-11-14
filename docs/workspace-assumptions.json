@@ -400,7 +400,7 @@
       "class": "os_bound_tooling",
       "file": "src/ci_node/tools.rs",
       "symbol": "run_capture_env",
-      "excerpt": "let mut shim = build(\"cmd.exe\", &argv_ref, path_dir, envs);",
+      "excerpt": "let mut shim = build(\"cmd.exe\", &argv_ref, path_dir, policy, envs);",
       "count": 1,
       "disposition": "unreviewed"
     },
