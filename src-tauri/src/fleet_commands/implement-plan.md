@@ -907,12 +907,19 @@ send an empty string.)
 #### Branch on the result
 
 - **`granted` / `claimed`** — a fresh reservation. **This run is the OWNER and
-  therefore the releaser** (see below). Proceed to Step 0.5.
+  therefore the releaser** (see below). Proceed to Step 0.5. This is the normal
+  outcome under `/vet-imp` too, once its `/vet-plan` has armed a vet→implement
+  net: `/vet-imp` Step 3 then hands the reserve off (releases it) before
+  invoking this skill, so this run owns the heartbeat and the release.
 - **`renewed`**, or a **`held` whose `current_holder_session` equals your own
-  `$AGENT_SESSION_ID`** — this session already holds the reserve. This is the
-  normal, expected outcome under `/vet-imp`, which reserves at its Step 1.1 and
-  then invokes `/vet-plan` and `/implement-plan`, both of which re-issue this
-  same call on this same key inside the same harness session. **A re-reserve by
+  `$AGENT_SESSION_ID`** — this session already holds the reserve. Under
+  `/vet-imp` this is the outcome when no net was armed and the chain kept its
+  Step 1.1 reserve; it re-issues this same call on this same key inside the same
+  harness session. If `/vet-imp` Step 3 attempted a hand-off (it recorded
+  `RESERVE_HANDED_OFF` or `RESERVE_HANDOFF_UNKNOWN`), a `renewed` here means the
+  hand-off release did NOT land and nothing is heartbeating the key: run
+  `/vet-imp` Step 3's `renewed` recovery (re-`add` + `start`, require `LIVE`)
+  NOW, before Step 0.5. **A re-reserve by
   the same owner token is a renewal, not a conflict** — proceed, and do **not**
   release at the end of this run; the acquirer releases.
   **`renewed` is only as narrow as the door's owner token, and the MCP result
@@ -957,6 +964,13 @@ send an empty string.)
   This is the signal that was absent in both documented incidents. It is a STOP,
   not a warning: the whole point of moving the reserve ahead of the stamp is that
   nothing has been written yet, so aborting here leaves no trail.
+  **Under a `/vet-imp` that recorded `RESERVE_HANDED_OFF` or
+  `RESERVE_HANDOFF_UNKNOWN`** (promote the latter to `RESERVE_HANDED_OFF`, per
+  `/vet-imp` Step 3), a `held` here means
+  the vet→implement net's rescue (or a sweep or peer) took the plan while the
+  chain was parked: take `/vet-imp` Step 4's late-chain arm — stand down with no
+  conflict flow and no **Steal** — instead of this STOP's operator question.
+  Nothing has been written, so skip Steps 0.5–6.5 and go straight to Step 7.
 - **`fork_risk`, or a non-empty `forking_siblings`** — **the reserve no longer
   carries this.** Reserve answers **exclusion only**: `granted` / `claimed`,
   `renewed`, or `held` plus the `holder`. The fleet-wide collision scan that
@@ -1023,9 +1037,9 @@ release, hours after the plan actually stopped being protected.
 
 `scripts/coord-claim-heartbeat.sh` owns that loop. Start it **only when this
 step returned `claimed` / `granted`** — the acquirer owns the heartbeat exactly
-as it owns the release. On `renewed` (the normal outcome under `/vet-imp`, which
-reserved at its Step 1.1) do **nothing** here: that chain is already heartbeating
-this key, and a second loop only doubles the request rate against it.
+as it owns the release. On `renewed` (under `/vet-imp`, a chain that armed no
+net and so kept its Step 1.1 reserve) do **nothing** here: that chain is already
+heartbeating this key, and a second loop only doubles the request rate against it.
 
 ```bash
 # Ledger path — resolve ONCE here; Step 0.6, Step 1 and Step 6 all reuse it.
@@ -3187,7 +3201,8 @@ from urllib.parse import urlsplit
 cwd = pathlib.Path.cwd()
 dirs = [cwd, *cwd.parents]
 try:
-    common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True).strip()
+    # bytes, one strict decode: a misdecoded path takes the except arm, never a wrong dir
+    common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]).decode("utf-8").strip()
     dirs.append(pathlib.Path(common).parent)
 except Exception:
     pass
@@ -3326,7 +3341,8 @@ from urllib.parse import urlsplit
 cwd = pathlib.Path.cwd()
 dirs = [cwd, *cwd.parents]
 try:
-    common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True).strip()
+    # bytes, one strict decode: a misdecoded path takes the except arm, never a wrong dir
+    common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]).decode("utf-8").strip()
     dirs.append(pathlib.Path(common).parent)
 except Exception:
     pass

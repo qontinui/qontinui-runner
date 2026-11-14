@@ -868,7 +868,7 @@ def selftest_prepare():
         server.shutdown()
         server.server_close()
     verdicts = [
-        ({"safe_to_restart": True}, "clear"),            # a build that predates the prepare
+        ({"safe_to_restart": True}, "clear"),            # no restart_prep field: every build from main until runner#2796
         ({"restart_prep": None}, "clear"),
         ({"restart_prep": {"state": "done"}}, "clear"),
         ({"restart_prep": {"state": "cancelled"}}, "clear"),
