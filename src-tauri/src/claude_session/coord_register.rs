@@ -1389,10 +1389,95 @@ impl AiCoordRegistrar {
     /// the `QONTINUI_SESSION_AUTOMATION_REGISTER` kill switch disables it: a
     /// disabled session has no R4 index entry, so this resolves to `None`.
     /// Best-effort throughout — a write failure never disturbs the live session.
+    ///
+    /// **An interaction REVIVES a finished session**, and coord already reads
+    /// it that way (a `working` report moves its row off `finished`). So a
+    /// local finished mark is cleared FIRST, through `set_finished`, before
+    /// the `working` row is queued: a mark left finished locally while coord
+    /// reads `working` is exactly what the finish heal
+    /// (`session::finish_heal`) would re-finish, since a `working` re-assertion
+    /// over a row the lost finish never moved does not advance coord's
+    /// `since` (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// D3). A planned-restart drain is NOT an interaction — it calls
+    /// [`Self::progress_on_drain`].
     pub fn progress_on_interaction(&self, task_run_id: &str) {
         let Some(session_id) = self.session_id_for(task_run_id) else {
             return;
         };
+        // The unmark's own observer already queues the `working` row to the
+        // same coord row; queue a second only when it did not (no store, no
+        // finished mark, a failed write, or a different/unresolved row).
+        if self.revive_local_mark(task_run_id) == Some(session_id) {
+            return;
+        }
+        self.enqueue_working(task_run_id, session_id);
+    }
+
+    /// The drain's progress bump for a session preserved across a planned
+    /// restart (`drain.rs`). Unlike [`Self::progress_on_interaction`] it is no
+    /// revival: a session whose local mark is FINISHED gets no `working` row
+    /// at all (it would revive coord's row behind the operator's back), and
+    /// its mark is left alone. No-op for an unregistered session.
+    pub fn progress_on_drain(&self, task_run_id: &str) {
+        let Some(session_id) = self.session_id_for(task_run_id) else {
+            return;
+        };
+        if self.local_mark_finished(task_run_id) {
+            debug!(
+                "ai_coord_register: drain progress skipped for {} — its local mark is finished",
+                task_run_id
+            );
+            return;
+        }
+        self.enqueue_working(task_run_id, session_id);
+    }
+
+    /// Whether the attached lifecycle store holds a finished mark for `id`.
+    fn local_mark_finished(&self, claude_session_id: &str) -> bool {
+        self.inner
+            .lifecycle_store
+            .get()
+            .and_then(|s| s.get(claude_session_id))
+            .is_some_and(|r| r.finished_at.is_some())
+    }
+
+    /// Clear a local finished mark on revival, through the one funnel
+    /// (`set_finished`), whose finish observer queues the unmark's own
+    /// `working` row. Returns the coord row that `working` row was queued to,
+    /// or `None` when none was (no store, no finished mark, a failed clear, or
+    /// the unmark stayed local-only) — so the caller queues exactly one.
+    /// Lock order: takes the store's `finish_forward`, so it must not run
+    /// under any store or registrar lock — the interaction callers hold none.
+    fn revive_local_mark(&self, claude_session_id: &str) -> Option<Uuid> {
+        let store = self.inner.lifecycle_store.get()?;
+        if !self.local_mark_finished(claude_session_id) {
+            return None;
+        }
+        match store.set_finished(claude_session_id, false, None) {
+            Ok(out) => {
+                info!(
+                    "ai_coord_register: interaction revived {} — its local finished mark is \
+                     cleared before the working report",
+                    claude_session_id
+                );
+                match out.coord {
+                    FinishSync::Queued { coord_session_id } => Some(coord_session_id),
+                    _ => None,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: could not clear the finished mark of revived {}: {:?}",
+                    claude_session_id, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Queue the `working` progress row for an interaction / drain bump.
+    fn enqueue_working(&self, task_run_id: &str, session_id: Uuid) {
         // Minimal body: `session_status="working"`. Coord stamps
         // `last_progress_at=now()` on receipt (no explicit `last_progress_at`
         // or `progress_detail` sent — the interaction itself is the signal).
@@ -1592,6 +1677,83 @@ impl AiCoordRegistrar {
                 })
                 .collect()
         })
+    }
+
+    /// Re-send ONE finished mark the heal found coord's own row contradicting
+    /// (`session::finish_heal`, plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// Phase 5), addressed to `target` — the mark's own coord row. Goes
+    /// through the serialized late-delivery body exactly as
+    /// [`Self::deliver_owed_to`] does: the read of the still-unsynced mark and
+    /// the enqueue share `finish_forward`, so an unmark that won the race
+    /// leaves nothing to send and a `Finished` can never land after its
+    /// `working`. `None` when the mark is no longer finished-and-unsynced at
+    /// `finished_at` (unmarked, restamped, or no store attached).
+    pub fn redeliver_finish(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+        target: Uuid,
+    ) -> Option<FinishSync> {
+        let store = self.inner.lifecycle_store.get()?;
+        store.with_unsynced_finished_records(|records| {
+            records
+                .into_iter()
+                .find(|r| {
+                    r.claude_session_id == claude_session_id && r.finished_at == Some(finished_at)
+                })
+                .map(|r| {
+                    info!(
+                        "ai_coord_register: coord's row for {} does not read finished — \
+                         re-sending its finished mark to coord session {}",
+                        r.claude_session_id, target
+                    );
+                    self.enqueue_finished(
+                        &r.claude_session_id,
+                        target,
+                        r.finished_at,
+                        r.finish_reason.as_deref(),
+                    )
+                })
+        })
+    }
+
+    /// Whether a `Finished` outbox row for `claude_session_id` carrying
+    /// `finished_at` and addressed to coord row `row` is still pending
+    /// (undelivered). A row queued to a DIFFERENT coord row does not count:
+    /// it will not finish this one. `None` when the outbox cannot be read —
+    /// UNKNOWN, never "not queued".
+    pub(crate) fn finished_row_pending(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+        row: Uuid,
+    ) -> Option<bool> {
+        match self.inner.outbox.pending() {
+            Ok(rows) => Some(rows.iter().any(|r| {
+                r.session_id == row
+                    && r.event_kind == SessionEventKind::Finished.as_str()
+                    && r.payload["claude_session_id"].as_str() == Some(claude_session_id)
+                    && r.payload["finished_at"].as_i64() == Some(finished_at)
+            })),
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: could not read the outbox to check {}'s pending \
+                     finish: {}",
+                    claude_session_id, e
+                );
+                None
+            }
+        }
+    }
+
+    /// The coord row a lifecycle record's finished mark addresses, resolved
+    /// in-process ([`Self::resolve_record`]); `None` when nothing resolves.
+    pub(crate) fn finish_row_for(
+        &self,
+        rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> Option<Uuid> {
+        self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None)
     }
 
     /// Tell coord an operator UNMARKED this session's finished marker, so
@@ -3840,6 +4002,7 @@ mod tests {
                 wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_coord_session_id: None,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
@@ -3948,6 +4111,7 @@ mod tests {
                 wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_coord_session_id: None,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,

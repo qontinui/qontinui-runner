@@ -177,6 +177,17 @@ pub struct StatusFetch {
     /// wind-down's floor can sit earlier than it did before that change, by up
     /// to the outbox lag.
     pub finished_at_by_session_id: HashMap<String, i64>,
+    /// `claude_session_id` → the row coord served for it, RAW: every row in
+    /// `statuses`, including one whose `session_status` is `null` (which the
+    /// maps above leave out as UNKNOWN). The finish heal needs that null —
+    /// it is exactly what a lost finish leaves (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// Phase 5). Empty on a degraded read.
+    pub rows_by_session_id: HashMap<String, ObservedRow>,
+    /// Some ids were NOT asked about: coord cut the input list
+    /// (`input_truncated`), or the runner clamped it at [`MAX_IDS`]. An id
+    /// absent from the maps above is then UNKNOWN, not "no row".
+    pub input_truncated: bool,
     /// `"coord"` when the door answered, `"unavailable"` when it did not,
     /// `"not_needed"` when there was nothing to ask about.
     pub source: &'static str,
@@ -185,6 +196,20 @@ pub struct StatusFetch {
     pub note: String,
     pub requested: usize,
     pub resolved: usize,
+}
+
+/// One work-status row as coord served it — the status kept raw so a `null`
+/// (an unset axis) is told apart from an absent row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedRow {
+    /// `None` = coord's row exists and its work axis is unset.
+    pub session_status: Option<String>,
+    /// coord's `since`, verbatim (RFC 3339), when it served one.
+    pub since: Option<String>,
+    /// [`Self::since`] as unix millis; `None` when absent or unparseable.
+    pub since_ms: Option<i64>,
+    /// WHICH `coord.sessions` row answered; `None` on a coord predating it.
+    pub coord_session_id: Option<String>,
 }
 
 impl StatusFetch {
@@ -203,6 +228,8 @@ impl StatusFetch {
             by_session_id: HashMap::new(),
             since_by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
+            rows_by_session_id: HashMap::new(),
+            input_truncated: false,
             source: "unavailable",
             degraded: true,
             note: note.into(),
@@ -331,6 +358,75 @@ fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
             .is_some_and(|s| s == SessionWorkStatus::Finished)
     });
     since
+}
+
+/// `claude_session_id` → [`ObservedRow`] for EVERY row coord served, null
+/// status included. Pure. A body with `sessionBridgeColumnPresent: false`
+/// yields nothing.
+fn rows_from_body(body: &WireResponse) -> HashMap<String, ObservedRow> {
+    if !body.session_bridge_column_present {
+        return HashMap::new();
+    }
+    body.statuses
+        .iter()
+        .map(|(id, row)| {
+            let since = row
+                .since
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let since_ms = since
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis());
+            (
+                id.clone(),
+                ObservedRow {
+                    session_status: row
+                        .session_status
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    since,
+                    since_ms,
+                    coord_session_id: row
+                        .coord_session_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                },
+            )
+        })
+        .collect()
+}
+
+/// A clean [`StatusFetch`] built from a raw coord body — the test seam for
+/// consumers that need a real fetch result without the network.
+#[cfg(test)]
+pub(crate) fn fetch_from_body_for_test(json: serde_json::Value, requested: usize) -> StatusFetch {
+    let body: WireResponse = serde_json::from_value(json).expect("decode");
+    let (by_session_id, note) = map_from_body(&body);
+    StatusFetch {
+        since_by_session_id: since_from_body(&body),
+        finished_at_by_session_id: finished_at_from_body(&body),
+        rows_by_session_id: rows_from_body(&body),
+        input_truncated: body.input_truncated || requested > MAX_IDS,
+        resolved: by_session_id.len(),
+        by_session_id,
+        source: "coord",
+        degraded: false,
+        note,
+        requested,
+    }
+}
+
+/// A degraded [`StatusFetch`] (coord unreadable), for consumers' tests.
+#[cfg(test)]
+pub(crate) fn degraded_fetch_for_test(note: &str) -> StatusFetch {
+    StatusFetch::degraded(1, note.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +592,8 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
             by_session_id: HashMap::new(),
             since_by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
+            rows_by_session_id: HashMap::new(),
+            input_truncated: false,
             source: "not_needed",
             degraded: false,
             note: String::new(),
@@ -535,6 +633,8 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     StatusFetch {
         since_by_session_id: since_from_body(&body),
         finished_at_by_session_id: finished_at_from_body(&body),
+        rows_by_session_id: rows_from_body(&body),
+        input_truncated: body.input_truncated || requested > MAX_IDS,
         by_session_id,
         source: "coord",
         degraded: false,

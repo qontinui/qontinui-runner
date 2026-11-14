@@ -247,6 +247,11 @@ struct CoordSyncInner {
     /// permanent failure is ACK-dropped from the outbox but NOT synced.
     /// Unattached (tests, pre-wiring) → the flag is never stamped.
     finished_ack_observer: OnceLock<FinishedAckObserver>,
+    /// Told `(claude_session_id, finished_at, coord row)` when the drain
+    /// ACK-drops a `finished` row coord answered without its row reading
+    /// `finished` (the unconfirmed bound) — so the row it was SENT to is kept
+    /// on the mark, unstamped (review F3).
+    finished_unconfirmed_observer: OnceLock<FinishedAckObserver>,
     /// The outside observer of coord's OWN liveness (plan
     /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
     /// Phase 3b). `Some` in production, `None` under
@@ -276,7 +281,7 @@ struct CoordSyncInner {
 }
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
-struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>) + Send + Sync>);
+struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>, Uuid) + Send + Sync>);
 
 impl std::fmt::Debug for CoordSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -331,6 +336,7 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
                 finished_ack_observer: OnceLock::new(),
+                finished_unconfirmed_observer: OnceLock::new(),
                 outside_observer: Some(Arc::new(
                     crate::coord_outside_observer::CoordOutsideObserver::new(),
                 )),
@@ -365,6 +371,7 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
                 finished_ack_observer: OnceLock::new(),
+                finished_unconfirmed_observer: OnceLock::new(),
                 // Inert by construction under test: the heartbeat harness
                 // drives this loop on a millisecond cadence against a fake
                 // coord that serves no `/mcp`, and an observer here would
@@ -477,6 +484,36 @@ impl CoordSync {
     pub fn attach_finished_ack_observer(
         &self,
         f: impl Fn(&str, Option<i64>) + Send + Sync + 'static,
+    ) {
+        self.attach_finished_ack_observer_on(move |csid, at, _row| f(csid, at));
+    }
+
+    /// Attach the observer told about a `finished` row the drain ACK-drops
+    /// UNSTAMPED after the unconfirmed bound: `(claude_session_id,
+    /// finished_at, the coord row it was sent to)`. It records the sent row on
+    /// the mark without stamping it (review F3).
+    pub fn attach_finished_unconfirmed_observer(
+        &self,
+        f: impl Fn(&str, Option<i64>, Uuid) + Send + Sync + 'static,
+    ) {
+        if self
+            .inner
+            .finished_unconfirmed_observer
+            .set(FinishedAckObserver(Box::new(f)))
+            .is_err()
+        {
+            tracing::warn!("coord_sync: finished-unconfirmed observer already attached — ignoring");
+        }
+    }
+
+    /// [`Self::attach_finished_ack_observer`], also handing the observer the
+    /// coord row (`coord.sessions.id`) whose answer read `finished`, so the
+    /// stamp can record it durably (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// F2).
+    pub fn attach_finished_ack_observer_on(
+        &self,
+        f: impl Fn(&str, Option<i64>, Uuid) + Send + Sync + 'static,
     ) {
         if self
             .inner
@@ -847,6 +884,15 @@ fn classify_push_failure(msg: &str, permanent: bool) -> (&'static str, Option<u1
     if status.is_none() && msg.starts_with("[timeout]") {
         return ("timeout", None);
     }
+    // coord ANSWERED a `finished` PATCH but its row did not read finished
+    // (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-
+    // session-status, Phase 4) — never a `network` or `http_error` fault.
+    if super::coord_sync_finish_ack::is_unconfirmed_message(msg) {
+        return (
+            super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND,
+            status,
+        );
+    }
     let kind = match status {
         Some(429) => "rate_limited",
         Some(s) if s >= 500 => "server_error",
@@ -911,6 +957,9 @@ pub(crate) struct SessionOutboxHealth {
     pub heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
     /// [`QUARANTINE_ROTATIONS`] as of this snapshot.
     pub quarantine_rotations: u64,
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED`] as of
+    /// this snapshot.
+    pub finished_unconfirmed: u64,
 }
 
 /// Copy the heartbeat-drop totals and the sidecar rotation count into a health snapshot. Both snapshot
@@ -989,6 +1038,10 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         // Times the quarantine sidecar hit its cap and rotated to `.1`
         // (process lifetime). Rotation discards the previous `.1` generation.
         "quarantineRotations": counted(h.quarantine_rotations),
+        // `finished` rows coord answered 2xx without its row reading
+        // `finished`, retried to the bound and then ACK-dropped UNSTAMPED
+        // (process lifetime). The marks stay `finishSynced: false`.
+        "finishedUnconfirmed": counted(h.finished_unconfirmed),
         "observedAt": h.observed_at,
     })
 }
@@ -1086,6 +1139,22 @@ struct SessionRetry {
     /// events in one tick can never compare ambiguously the way two `Instant`s
     /// can.
     failed_at_ack_tick: u64,
+    /// The `finished` row this session is blocked on because coord answered
+    /// it without its row reading `finished`, and how many such answers that
+    /// row has had. Per ROW, so an earlier row's failures can never spend a
+    /// finish's budget; bounded by
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS`]
+    /// AND [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MIN_AGE`].
+    unconfirmed_finish: Option<UnconfirmedFinish>,
+}
+
+/// One `finished` row coord keeps answering without its row reading
+/// `finished`: which row, how many such answers, and when the first came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnconfirmedFinish {
+    row: (Uuid, i64),
+    attempts: u32,
+    first_at: Instant,
 }
 
 impl SessionRetry {
@@ -1426,11 +1495,20 @@ struct ChainOutcome {
     session_id: Uuid,
     /// Rows to ACK out of the outbox — delivered OR deliberately dropped.
     succeeded: Vec<(Uuid, i64)>,
-    /// Coord itself took at least one row (2xx or a 409 on create). The ONLY
-    /// evidence the drain treats as "coord is serving": `succeeded` also holds
-    /// rows ACK-dropped after a spent best-effort budget or a 4xx, and those
-    /// say nothing about whether coord is up.
+    /// Coord itself TOOK at least one row — it left the queue as delivered,
+    /// a create's 409, or coord's typed re-key refusal. The drain's "coord is
+    /// serving rows" evidence: it moves `last_ack` / `ack_ticks` (which decide
+    /// whether another session's failure counts toward quarantine) and
+    /// `/health` `lastAckAt`. `succeeded` also holds rows ACK-dropped after a
+    /// spent best-effort budget or a 4xx, and those say nothing about whether
+    /// coord is up. An unconfirmed `finished` answer does NOT set this: coord
+    /// answered without applying the write, so it took nothing.
     acked_by_coord: bool,
+    /// Coord ANSWERED at least one request of this chain — every case that sets
+    /// [`Self::acked_by_coord`], plus an unconfirmed `finished` answer. Moves
+    /// only the reachability signals: no outage verdict for the tick, and
+    /// `has_been_online`.
+    answered_by_coord: bool,
     /// Updated best-effort attempt counters for this session's records.
     attempts: HashMap<(Uuid, i64), u32>,
     /// Keys whose best-effort budget should be forgotten (delivered/dropped).
@@ -1439,6 +1517,8 @@ struct ChainOutcome {
     /// `Some(error)` when a NON-best-effort row failed and stopped this chain:
     /// the session is blocked on its head row and goes on its own backoff.
     blocked_on: Option<String>,
+    /// The row `blocked_on` is about.
+    blocked_row: Option<OutboxRecord>,
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
     aborted: bool,
@@ -1472,10 +1552,12 @@ async fn push_chain(
         session_id: records.first().map(|r| r.session_id).unwrap_or_default(),
         succeeded: Vec::with_capacity(records.len()),
         acked_by_coord: false,
+        answered_by_coord: false,
         attempts: HashMap::new(),
         cleared: Vec::new(),
         had_transport_error: false,
         blocked_on: None,
+        blocked_row: None,
         aborted: false,
         heartbeat_failure_drops: Vec::new(),
         keepalive: false,
@@ -1600,6 +1682,35 @@ async fn push_chain(
                     }
                     continue;
                 }
+                if fail_kind == super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND {
+                    // coord ANSWERED (2xx) but its row does not read
+                    // `finished`. Coord is serving, so this is evidence about
+                    // the row only: it neither counts as a transport error nor
+                    // trips the abort that would stall every other session.
+                    // The row stays queued and blocks THIS session's chain
+                    // (seq order); `drain_tick` bounds its retries.
+                    //
+                    // It IS a coord answer, so it moves the reachability
+                    // signals (no outage verdict for this tick,
+                    // `has_been_online`). It is NOT a row coord took: `last_ack`
+                    // / `ack_ticks` / `lastAckAt` stay put, because coord
+                    // answering while its writes are not applying (the
+                    // swallowed-write case) is no evidence that ANOTHER
+                    // session's 5xx is about that session's row — counting it
+                    // would push healthy sessions toward quarantine.
+                    out.answered_by_coord = true;
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        error = %snippet(&e),
+                        "coord_sync: coord answered the finished row without its row \
+                         reading finished — not stamping finish_synced; retrying on \
+                         this session's backoff"
+                    );
+                    out.blocked_on = Some(e);
+                    out.blocked_row = Some(rec.clone());
+                    break;
+                }
                 tracing::warn!(
                     session = %rec.session_id,
                     seq = rec.seq,
@@ -1611,6 +1722,7 @@ async fn push_chain(
                 );
                 out.had_transport_error = true;
                 out.blocked_on = Some(e);
+                out.blocked_row = Some(rec.clone());
                 // Stop THIS chain — preserves (session, seq) order on retry.
                 // The unACKed tail stays in the file for a later tick.
                 if trip_abort {
@@ -1810,6 +1922,8 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             h.retrying_sessions = 0;
             h.quarantined_sessions = quarantined;
             snapshot_heartbeat_drops(h);
+            h.finished_unconfirmed =
+                super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed);
         });
         return TickResult::idle();
     }
@@ -1859,10 +1973,23 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     //    its keep-alive while that row is retried.
     let started_kind = SessionEventKind::Started.as_str();
     let closed_kind = SessionEventKind::Closed.as_str();
+    //
+    // The same keep-alive applies to a session whose chain is blocked on an
+    // UNCONFIRMED `finished` row: that row is held for at least
+    // `FINISHED_UNCONFIRMED_MIN_AGE` (600 s), which is coord's Active→Stale
+    // threshold, so heartbeats queued behind it would let coord report a live
+    // session as Stale.
+    let front_eligible = |state: &DrainState, sid: &Uuid| {
+        state.quarantined.contains(sid)
+            || state
+                .retry
+                .get(sid)
+                .is_some_and(|r| r.unconfirmed_finish.is_some())
+    };
     let seq_ordered_heartbeats: HashSet<Uuid> = pending
         .iter()
         .filter(|r| {
-            state.quarantined.contains(&r.session_id)
+            front_eligible(state, &r.session_id)
                 && (r.event_kind == started_kind || r.event_kind == closed_kind)
         })
         .map(|r| r.session_id)
@@ -1870,7 +1997,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     let mut front_heartbeat: HashMap<Uuid, OutboxRecord> = HashMap::new();
     let is_front_candidate = |state: &DrainState, r: &OutboxRecord| {
         r.event_kind == heartbeat_kind
-            && state.quarantined.contains(&r.session_id)
+            && front_eligible(state, &r.session_id)
             && !seq_ordered_heartbeats.contains(&r.session_id)
     };
     for rec in &pending {
@@ -1891,13 +2018,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         if held.contains(&rec.session_id) {
             continue;
         }
+        // A front-eligible session's heartbeats are placed above.
+        if is_front_candidate(state, &rec) {
+            continue; // in `front_heartbeat` (newest) or superseded
+        }
         // A quarantined session's lifecycle rows stay in its chain (a
         // lifecycle row is never disposable); only its other rows go to the
-        // sidecar. Its heartbeats are placed above.
+        // sidecar.
         if state.quarantined.contains(&rec.session_id) {
-            if is_front_candidate(state, &rec) {
-                continue; // in `front_heartbeat` (newest) or superseded
-            }
             if rec.event_kind != heartbeat_kind && !is_lifecycle_kind(&rec.event_kind) {
                 to_quarantine.push(rec);
                 continue;
@@ -1928,9 +2056,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             .get(&chain[0].session_id)
             .is_none_or(|r| r.next_attempt_at <= now)
     });
-    // A quarantined session's keep-alive heartbeat is its OWN one-row chain,
-    // outside the lifecycle backoff above: that backoff is pinned at
-    // MAX_BACKOFF, and coord's stale threshold is shorter, so gating the
+    // A quarantined (or unconfirmed-finish-blocked) session's keep-alive
+    // heartbeat is its OWN one-row chain, outside the session backoff above:
+    // that backoff holds the chain for minutes, and coord's stale threshold
+    // is not longer, so gating the
     // heartbeat behind it would let the live session's coord row lapse.
     let ran_any = !chains.is_empty() || !front_heartbeat.is_empty();
     let chains: Vec<(bool, Vec<OutboxRecord>)> = chains
@@ -1966,11 +2095,27 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .await;
 
     let mut had_transport_error = false;
+    // `delivered`: coord took a row of some session's BACKLOG — the serving
+    // evidence (`last_ack`, `ack_ticks`). `took_any` also counts keep-alive
+    // heartbeats, for `/health` `lastAckAt` only.
     let mut delivered = false;
-    let mut blocked: Vec<(Uuid, String)> = Vec::new();
+    let mut took_any = false;
+    let mut answered = false;
+    let mut blocked: Vec<(Uuid, String, Option<OutboxRecord>)> = Vec::new();
     let mut heartbeat_failure_drops: Vec<&'static str> = Vec::new();
     for outcome in outcomes {
-        delivered |= outcome.acked_by_coord;
+        // A keep-alive heartbeat is never serving evidence. `ack_ticks` is ONE
+        // counter across sessions, so a held session's own keep-alive would
+        // otherwise read as "coord took another row" at its next failure (on
+        // this tick or any later one) and walk a run of 5xx on its own head
+        // row into quarantine. Excluding keep-alives for everyone is the
+        // conservative choice: they are held sessions' out-of-order probes,
+        // and any healthy session's ordinary rows still count.
+        if !outcome.keepalive {
+            delivered |= outcome.acked_by_coord;
+        }
+        took_any |= outcome.acked_by_coord;
+        answered |= outcome.acked_by_coord || outcome.answered_by_coord;
         heartbeat_failure_drops.extend(outcome.heartbeat_failure_drops);
         succeeded.extend(outcome.succeeded);
         had_transport_error |= outcome.had_transport_error;
@@ -1988,7 +2133,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             continue;
         }
         match outcome.blocked_on {
-            Some(err) => blocked.push((outcome.session_id, err)),
+            Some(err) => blocked.push((outcome.session_id, err, outcome.blocked_row)),
             None if !outcome.aborted => {
                 // Ran to the end: whatever blocked it before has cleared.
                 state.retry.remove(&outcome.session_id);
@@ -2002,7 +2147,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         state.ack_ticks += 1;
     }
     let last_ack = state.last_ack;
-    for (sid, err) in blocked {
+    // Unconfirmed `finished` rows that spent their bound this tick: ACK-dropped
+    // unstamped, counted once the ACK lands.
+    let mut finished_unconfirmed_dropped: u64 = 0;
+    for (sid, err, blocked_row) in blocked {
         // First failure: coord counts as serving if it took a row within the
         // window. Later failures: only if it took one since THIS session's
         // previous failure (this tick's rows included).
@@ -2015,18 +2163,72 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             serving_failures: 0,
             next_attempt_at: now,
             failed_at_ack_tick: ack_ticks_at_start,
+            unconfirmed_finish: None,
         });
         entry.failures += 1;
         entry.failed_at_ack_tick = ack_ticks_at_start;
+        // The recorded unconfirmed finish is no longer what blocks this
+        // session (it left the queue, or an earlier row now fails first):
+        // forget it, so it neither keeps the keep-alive on nor carries a
+        // stale count/age into a later finish.
+        let blocked_key = blocked_row.as_ref().map(|r| (r.session_id, r.seq));
+        if entry
+            .unconfirmed_finish
+            .is_some_and(|u| Some(u.row) != blocked_key)
+        {
+            entry.unconfirmed_finish = None;
+        }
         // A 429 on a kind that retries it (`output_chunk`, and the lifecycle
         // kinds of `is_lifecycle_kind`: `started` / `state_change` / `closed`
         // / `finished`) is coord pacing this runner, not
         // refusing the row — it never counts toward quarantine.
-        let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
-        if serving && !rate_limited {
+        let fail_kind = classify_push_failure(&err, false).0;
+        let rate_limited = fail_kind == "rate_limited";
+        // An unconfirmed finish has its own bound (below): it never counts
+        // toward the whole-session quarantine either.
+        let unconfirmed = fail_kind == super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND;
+        if serving && !rate_limited && !unconfirmed {
             entry.serving_failures += 1;
         }
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
+        if let (true, Some(blocked_rec)) = (unconfirmed, blocked_row) {
+            let row = (blocked_rec.session_id, blocked_rec.seq);
+            let (attempts, first_at) = match entry.unconfirmed_finish {
+                Some(u) if u.row == row => (u.attempts + 1, u.first_at),
+                _ => (1, now),
+            };
+            entry.unconfirmed_finish = Some(UnconfirmedFinish {
+                row,
+                attempts,
+                first_at,
+            });
+            // BOTH bounds: a count alone is spent in ~30 s on the 1-2-4-8-16 s
+            // backoff, which a coord deploy or a transient swallow outlasts.
+            let unconfirmed_for = now.saturating_duration_since(first_at);
+            if attempts >= super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS
+                && unconfirmed_for >= super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MIN_AGE
+            {
+                tracing::warn!(
+                    session = %sid,
+                    seq = row.1,
+                    attempts,
+                    unconfirmed_secs = unconfirmed_for.as_secs(),
+                    last_error = %snippet(&err),
+                    "coord_sync: coord answered this finished row {attempts} time(s) without \
+                     its row reading finished — ACK-dropping it UNSTAMPED (finish_synced stays \
+                     false; re-offered by a reason-less finish read-back, by the session's next \
+                     coord registration or terminal bind, and by the next runner start's heal \
+                     sweep only if coord's own row then reads session_status NULL)"
+                );
+                succeeded.push(row);
+                finished_unconfirmed_dropped += 1;
+                // Keep the row the finish was SENT to on the mark (unstamped),
+                // so the next runner start's heal sweep can re-offer it there.
+                notify_finished_unconfirmed(inner, &blocked_rec);
+                state.retry.remove(&sid);
+                continue;
+            }
+        }
         if state.quarantined.contains(&sid) {
             // Already quarantined: this is one of its lifecycle rows (the only
             // rows left in its chain). It retries once a minute, forever, and
@@ -2059,6 +2261,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                     state.in_sidecar.remove(key);
                 }
                 heartbeats_superseded = superseded_count;
+                if finished_unconfirmed_dropped > 0 {
+                    super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED
+                        .fetch_add(finished_unconfirmed_dropped, Ordering::Relaxed);
+                }
                 if superseded_count > 0 {
                     let total = HEARTBEATS_SUPERSEDED
                         .fetch_add(superseded_count, Ordering::Relaxed)
@@ -2092,8 +2298,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             Err(e) => tracing::warn!(error = %e, "coord_sync: ack write failed"),
         }
     }
-    if delivered {
+    if answered {
         inner.has_been_online.store(true, Ordering::Relaxed);
+    }
+    if took_any {
+        // `lastAckAt` is "a row coord accepted", never a bare answer.
         note_outbox_ack();
     }
 
@@ -2113,6 +2322,8 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         h.retrying_sessions = retrying;
         h.quarantined_sessions = quarantined;
         snapshot_heartbeat_drops(h);
+        h.finished_unconfirmed =
+            super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed);
     });
 
     TickResult {
@@ -2121,7 +2332,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // nothing. A lone session failing on its own row does not trip it, so
         // it can no longer push the whole loop into the 60 s backoff and
         // delay every healthy row behind it.
-        outage: abort.load(Ordering::Relaxed) && !delivered && had_transport_error,
+        outage: abort.load(Ordering::Relaxed) && !answered && had_transport_error,
         idle: false,
         ran_any,
         heartbeats_superseded,
@@ -2175,12 +2386,33 @@ fn notify_finished_ack(inner: &CoordSyncInner, rec: &OutboxRecord) {
         Some(csid) => (obs.0)(
             csid,
             rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+            rec.session_id,
         ),
         None => tracing::warn!(
             session = %rec.session_id,
             seq = rec.seq,
             "coord_sync: finished record ACKed without a claude_session_id — cannot mark synced"
         ),
+    }
+}
+
+/// Hand a `finished` row the drain ACK-drops unstamped (the unconfirmed
+/// bound) to the finished-unconfirmed observer, with the coord row it was sent
+/// to.
+fn notify_finished_unconfirmed(inner: &CoordSyncInner, rec: &OutboxRecord) {
+    let Some(obs) = inner.finished_unconfirmed_observer.get() else {
+        return;
+    };
+    if let Some(csid) = rec
+        .payload
+        .get("claude_session_id")
+        .and_then(|v| v.as_str())
+    {
+        (obs.0)(
+            csid,
+            rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+            rec.session_id,
+        );
     }
 }
 
@@ -2620,6 +2852,28 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 return PushOutcome::Transport(format!("{status}: {detail}"));
             }
             if status.is_success() {
+                if kind == "finished" {
+                    // A 2xx is not the finish: coord's answer is the row
+                    // re-hydrated after the write, and only a row reading
+                    // `finished` may stamp `finish_synced` (plan
+                    // 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-
+                    // move-session-status, Phase 4). Read here, inside the 2xx
+                    // arm, so every non-2xx keeps the ladder below.
+                    use super::coord_sync_finish_ack::{
+                        finished_ack_verdict, unconfirmed_message, FinishedAck,
+                    };
+                    let body = resp.text().await.unwrap_or_default();
+                    return match finished_ack_verdict(status.as_u16(), &body) {
+                        FinishedAck::Observed => PushOutcome::Acked,
+                        FinishedAck::Unconfirmed(reason) => {
+                            PushOutcome::Transport(unconfirmed_message(status.as_u16(), &reason))
+                        }
+                        // Unreachable for a 2xx; never a delivery either way.
+                        FinishedAck::Refused => {
+                            PushOutcome::PermanentFailure(format!("{status}: {}", snippet(&body)))
+                        }
+                    };
+                }
                 // `landed` moves ONLY here — coord accepted the id.
                 if let Some(id) = rekey_id(rec) {
                     if let Some(source) =
@@ -2744,6 +2998,47 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 if kind == "started" {
                     let row = resp.json::<JsonValue>().await.ok();
                     return PushOutcome::Conflict { row };
+                }
+                // Nor is a 409 on the `finished` PATCH a finish: "row gone"
+                // and "already finished" read the same here, and only a row
+                // OBSERVED reading `finished` may stamp `finish_synced`. A
+                // 409 body that carries the row reading `finished` is
+                // observed; anything else is unconfirmed and takes the
+                // bounded retry like an unconfirmed 2xx.
+                if kind == "finished" {
+                    use super::coord_sync_finish_ack::{
+                        finished_ack_verdict, unconfirmed_message, FinishedAck,
+                    };
+                    // coord ANSWERED (409); a body that cannot be read did
+                    // not show the row finished, so it takes the same bounded
+                    // unconfirmed arm — never a network-class transport fault.
+                    let body = match resp.text().await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            return PushOutcome::Transport(unconfirmed_message(
+                                status.as_u16(),
+                                &format!(
+                                    "a 409 answer whose body could not be read: {}",
+                                    transport_error(&e)
+                                ),
+                            ))
+                        }
+                    };
+                    // Judge the BODY as a row: the status is already known.
+                    return match finished_ack_verdict(200, &body) {
+                        FinishedAck::Observed => PushOutcome::Acked,
+                        FinishedAck::Unconfirmed(reason) => {
+                            PushOutcome::Transport(unconfirmed_message(
+                                status.as_u16(),
+                                &format!("a 409 answer: {reason}"),
+                            ))
+                        }
+                        // Unreachable for the 200 judged above.
+                        FinishedAck::Refused => PushOutcome::Transport(unconfirmed_message(
+                            status.as_u16(),
+                            "a 409 answer",
+                        )),
+                    };
                 }
                 // Except a re-key: acking a 409 as success voided the re-key
                 // silently while the local record claimed it. coord's refusal
@@ -4355,6 +4650,15 @@ mod tests {
     use super::*;
     use crate::session::transport::{DynTransport, Transport, TransportError, TransportHandle};
 
+    // Phase 4 of plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-
+    // not-move-session-status: drain-level tests of the observed finish ACK,
+    // kept out of this file.
+    // `include!` resolves beside this file (a `#[path]` inside an inline
+    // module would resolve under `coord_sync/tests/`, which does not exist).
+    mod finish_ack_drain_tests {
+        include!("coord_sync_finish_ack_drain_tests.rs");
+    }
+
     /// SOURCE GUARD: every session-outbox event kind has a dispatch arm.
     ///
     /// The drain matches on `&str`, not on [`SessionEventKind`], and its
@@ -4600,6 +4904,13 @@ mod tests {
         /// When set (and `patch_returns_404` is not), every PATCH answers
         /// this status instead of 200 — drives the resume-probe refusal arm.
         patch_status: Option<u16>,
+        /// When set, a PATCH carrying `progress.session_status: "finished"`
+        /// answers this `(status, raw JSON body)` instead of the default 200
+        /// whose body echoes the row as coord re-hydrates it — drives the
+        /// unconfirmed-finish arms (a row reading `working`, an absent
+        /// `session_status`, a 503, a 422 refusal). Still recorded in
+        /// `patches` (it was received).
+        finished_answer: Option<(u16, String)>,
         /// The `tenant_id` field of a 2xx PATCH answer: `None` omits it (the
         /// field-absent arm), `Some(v)` sends `v` verbatim (a non-UUID string
         /// drives the unparseable arm).
@@ -4804,9 +5115,29 @@ mod tests {
                             )
                                 .into_response();
                         }
+                        let reported = body
+                            .get("progress")
+                            .and_then(|p| p.get("session_status"))
+                            .cloned();
+                        if reported.as_ref().and_then(JsonValue::as_str) == Some("finished") {
+                            if let Some((code, raw)) = g.finished_answer.clone() {
+                                return (
+                                    AxumStatus::from_u16(code).unwrap(),
+                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                    raw,
+                                )
+                                    .into_response();
+                            }
+                        }
                         let mut answer = json!({"id": id});
                         if let Some(t) = g.patch_tenant.clone() {
                             answer["tenant_id"] = t;
+                        }
+                        // coord answers with the row re-hydrated after the
+                        // write, so a progress report that landed reads back
+                        // its own status.
+                        if let Some(status) = reported {
+                            answer["session_status"] = status;
                         }
                         (AxumStatus::OK, Json(answer)).into_response()
                     },
@@ -7307,6 +7638,7 @@ mod tests {
                 serving_failures: 0,
                 next_attempt_at: Instant::now() + Duration::from_secs(3600),
                 failed_at_ack_tick: 0,
+                unconfirmed_finish: None,
             },
         );
         let tick = drain_tick(&coord.inner, &mut state).await;
@@ -8224,6 +8556,7 @@ mod tests {
                 ("not_found", 1),
             ]),
             quarantine_rotations: 1,
+            finished_unconfirmed: 0,
         });
         for key in [
             "pending",
@@ -8236,6 +8569,7 @@ mod tests {
             "heartbeatsDroppedOnFailure",
             "heartbeatsDroppedOnFailureByKind",
             "quarantineRotations",
+            "finishedUnconfirmed",
             "observedAt",
         ] {
             assert!(

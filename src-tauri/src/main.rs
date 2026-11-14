@@ -4422,11 +4422,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
-                    coord_sync_facade.attach_finished_ack_observer(move |csid, finished_at| {
-                        if let Some(s) = store.upgrade() {
-                            s.mark_finish_synced(csid, finished_at);
-                        }
-                    });
+                    coord_sync_facade.attach_finished_ack_observer_on(
+                        move |csid, finished_at, coord_row| {
+                            if let Some(s) = store.upgrade() {
+                                // The row whose answer read `finished` is kept
+                                // with the stamp, so the finish heal knows the
+                                // mark's own row after a restart.
+                                s.mark_finish_synced_on(csid, finished_at, Some(coord_row));
+                            }
+                        },
+                    );
+                    // A finish the drain gave up on (coord answered, its row
+                    // never read `finished`) keeps the row it was SENT to on
+                    // the mark, unstamped, for the boot heal sweep.
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    coord_sync_facade.attach_finished_unconfirmed_observer(
+                        move |csid, finished_at, coord_row| {
+                            if let Some(s) = store.upgrade() {
+                                s.note_finish_sent_row(csid, finished_at, coord_row);
+                            }
+                        },
+                    );
+                    // Once per runner start: heal marks stamped synced over a
+                    // finish coord never applied (plan 2026-11-05-finish-
+                    // synced-is-stamped-on-a-2xx-that-did-not-move-session-
+                    // status, Phase 5). Delayed, bounded, and it only
+                    // re-sends a session's own finish.
+                    session::finish_heal::spawn_boot_sweep(
+                        std::sync::Arc::downgrade(&lifecycle_store),
+                        std::sync::Arc::downgrade(&ai_coord_registrar),
+                    );
                 }
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full
