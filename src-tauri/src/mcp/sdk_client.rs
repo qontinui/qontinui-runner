@@ -2210,11 +2210,13 @@ async fn handle_element_action(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let id = id.trim().to_string();
-    let action_name = body
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("click")
-        .to_string();
+    // A request with no action name is refused before anything is dispatched
+    // (to an SDK app or to the runner's own webview). It used to be recorded
+    // and dispatched as a click.
+    let action_name = match crate::mcp::ui_bridge::action_wire::require_action_name(&body) {
+        Ok(name) => name,
+        Err(missing) => return Json(missing.response()),
+    };
     let start = std::time::Instant::now();
 
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
@@ -2289,33 +2291,17 @@ async fn handle_element_action(
                     )
                 } else {
                     acted_via_ipc = true;
-                    // Fall back to IPC — wrap action in an object to match the format
-                    // expected by the TypeScript handler (action.action, action.params, etc.)
-                    let params = body
-                        .get("params")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(null));
-                    let wait_options = body
-                        .get("waitOptions")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(null));
-                    // Forward the D3 effect-calculus per-request opt-in so the IPC path
-                    // matches the WS/HTTP path (which forwards the body verbatim). Without
-                    // this, `effect_check` would never receive `effectVerification` when
-                    // the executor falls back to IPC.
-                    let verify_effect = body
-                        .get("verifyEffect")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(null));
-                    let payload = serde_json::json!({
-                        "elementId": id,
-                        "action": {
-                            "action": action_name,
-                            "params": params,
-                            "waitOptions": wait_options,
-                            "verifyEffect": verify_effect
-                        }
-                    });
+                    // Fall back to IPC. The body IS the SDK's `ControlActionRequest`
+                    // (the WS/HTTP arms above forward it whole), so this arm forwards
+                    // it whole too, through the one payload builder. It used to rebuild
+                    // `{action, params, waitOptions, verifyEffect}` and drop the rest.
+                    let payload = match crate::mcp::ui_bridge::action_wire::sdk_fallback_payload(
+                        &id, &body,
+                    ) {
+                        Ok(payload) => payload,
+                        // Unreachable past the check at the top; refuse rather than guess.
+                        Err(missing) => return Json(missing.response()),
+                    };
                     match ui_bridge_request_sync(&state, "execute_action", payload).await {
                         Ok(data) => {
                             let (data, success, err) = ipc_element_action_result(data);
@@ -2340,11 +2326,20 @@ async fn handle_element_action(
     // users-path-and-the-passage-of-time, D3): open a pending edge for the app
     // acted on. Only the action NAME and the element id are read — never the
     // body's `params`, which carries typed text.
-    // The IPC fallback acted on the runner's own webview (its main window),
-    // so the relay tab scope does not apply there.
+    // The IPC fallback acted on the runner's own webview, in the window the
+    // body's `windowLabel` names (the payload builder routes it there), so the
+    // scope is that window; the main window (no label, or `main`) is unscoped,
+    // which is how the snapshot cursor keys it. The control route still keys
+    // an explicit `main` as `Some("main")`, so the two routes are not yet one
+    // cursor for that spelling. The relay tab scope does not apply here.
     let (journey_app, app_version, scope) = match (acted_via_ipc, active_app) {
         (false, Some((app_id, version))) => (app_id, version, tab_id),
-        _ => (
+        (true, _) => (
+            crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+            None,
+            crate::mcp::ui_bridge::action_wire::sdk_fallback_window(&body),
+        ),
+        (false, None) => (
             crate::spec_api::storage::RUNNER_APP_ID.to_string(),
             None,
             None,
@@ -11069,6 +11064,99 @@ mod condition_secrets_dispatch_tests {
                     .to_string()
                     .contains(SECRET));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sdk_element_fallback_wire_tests {
+    //! `POST /ui-bridge/sdk/element/{id}/action` with no SDK app connected falls
+    //! back to the runner's own webview. The fallback forwards the request body
+    //! whole, and a body with no action name is refused before dispatch.
+    use crate::mcp::ui_bridge::action_wire::test_support::{
+        assert_reached_ipc_payload, one_test_per_control_field, sample_value,
+    };
+    use crate::mcp::ui_bridge::action_wire::{require_action_name, sdk_fallback_payload};
+    use serde_json::json;
+
+    fn field_check(key: &str) {
+        let mut body = serde_json::Map::new();
+        body.insert("action".into(), json!("type"));
+        body.insert(key.into(), sample_value(key));
+        let body = serde_json::Value::Object(body);
+        // The handler reads the name first, then builds the fallback payload.
+        assert!(require_action_name(&body).is_ok());
+        let payload = sdk_fallback_payload("e1", &body).expect("body names an action");
+        assert_eq!(payload["elementId"], json!("e1"));
+        assert_reached_ipc_payload("sdk element fallback", key, &payload);
+    }
+    one_test_per_control_field!(field_check);
+
+    #[test]
+    fn a_body_with_no_action_name_is_refused_before_dispatch() {
+        for body in [
+            json!({}),
+            json!({"action": null}),
+            json!({"action": 42}),
+            json!({"action": {"params": {}}}),
+        ] {
+            let err = require_action_name(&body).expect_err("nameless body");
+            assert_eq!(err.response()["code"], json!("action_missing"), "{body}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sdk_element_fallback_source_guard {
+    //! The handler's IPC fallback must dispatch exactly what
+    //! `action_wire::sdk_fallback_payload` returns. The handler needs an
+    //! `ApiState` with a Tauri app handle, so this guards its source: it fails
+    //! if the fallback goes back to hand-rebuilding the four-field envelope.
+    fn handler_source() -> &'static str {
+        const SRC: &str = include_str!("sdk_client.rs");
+        let start = SRC
+            .find("async fn handle_element_action(")
+            .expect("handle_element_action present");
+        let rest = SRC.get(start..).expect("`find` returns a char boundary");
+        let end = rest.find("\nasync fn ").expect("another handler follows");
+        rest.get(..end).expect("`find` returns a char boundary")
+    }
+
+    #[test]
+    fn the_fallback_dispatches_the_action_wire_payload() {
+        let src = handler_source();
+        assert!(src.contains("action_wire::sdk_fallback_payload("), "{src}");
+        assert!(
+            src.contains("ui_bridge_request_sync(&state, \"execute_action\", payload)"),
+            "{src}"
+        );
+    }
+
+    /// The fallback acts in the window the body's `windowLabel` names, so the
+    /// journey ledger must key its scope by that window, not the main one.
+    #[test]
+    fn the_fallback_journey_scope_is_the_window_it_acted_in() {
+        let src = handler_source();
+        assert!(
+            src.contains("action_wire::sdk_fallback_window(&body)"),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn the_fallback_does_not_rebuild_the_envelope_by_hand() {
+        let src = handler_source();
+        for forbidden in [
+            "\"waitOptions\"",
+            "\"verifyEffect\"",
+            "\"elementId\": id",
+            "wait_options",
+            "verify_effect",
+        ] {
+            assert!(
+                !src.contains(forbidden),
+                "fallback reintroduced `{forbidden}`"
+            );
         }
     }
 }

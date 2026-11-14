@@ -135,7 +135,11 @@ mod tests {
             // deleted with its 2 attributes; `split_frontmatter`'s moved into
             // prompt_library.rs (plan
             // 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran, 7).
-            baseline: 423,
+            // 423 -> 419: `execute_element_action` (step_executor ui_bridge)
+            // lost its only slice when the snapshot target root moved to a
+            // parsed port (`action_wire::snapshot_target_root`); the other 3
+            // were slack (420 measured at main by this walk, 419 after).
+            baseline: 419,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (

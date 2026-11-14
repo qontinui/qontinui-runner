@@ -33,9 +33,10 @@
 //!
 //! The UI Bridge `bbox` field is viewport-relative CSS pixels (the
 //! return value of `Element.getBoundingClientRect()`). The runner
-//! dispatches clicks through the SDK's `/control/elements/{id}/action`
-//! endpoint, which performs a synthetic DOM click inside the webview —
-//! no OS-level cursor movement, no DPR scaling required. This module
+//! dispatches clicks through the singular `/control/element/{id}/action`
+//! route (or the `sdk` / `proxy:PORT` twin the step's snapshot target
+//! names), which performs a synthetic DOM click inside the webview — no
+//! OS-level cursor movement, no DPR scaling required. This module
 //! therefore returns CSS pixels as-is. If a future caller dispatches
 //! OS-level clicks, it should scale the returned point by the webview's
 //! device pixel ratio before feeding it to the native input API.

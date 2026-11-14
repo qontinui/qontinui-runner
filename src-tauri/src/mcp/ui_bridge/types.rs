@@ -28,8 +28,10 @@ pub struct UIBridgeActionRequest {
     /// delay before the second snapshot.
     #[serde(default)]
     pub(crate) expect_change: Option<serde_json::Value>,
-    /// Capture any extra top-level fields (e.g., targetPosition, text, clear)
-    /// so they can be merged into params for actions that accept flat format.
+    /// Capture any extra top-level fields. The SDK's listed request fields
+    /// (`verifyEffect`, `requestId`, ...) are hoisted onto the action envelope;
+    /// the rest (e.g., targetPosition, text, clear) are merged into params for
+    /// actions that accept flat format — `action_wire::control_element_action`.
     #[serde(flatten)]
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }

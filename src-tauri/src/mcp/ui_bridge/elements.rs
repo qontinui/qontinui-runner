@@ -576,10 +576,12 @@ pub async fn ui_bridge_batch_actions_handler(
         // "elementId and action are required"), and it reads `params` off the
         // action envelope, never as a top-level sibling — so the parameters
         // were unreachable even once the id was fixed. See
-        // `request::element_action_payload` for the full contract.
-        let payload = super::request::step_action_payload(step);
-
-        let result = ui_bridge_request_sync(&state, "execute_action", payload).await;
+        // `action_wire::element_action_payload` for the full contract. A step
+        // with no action name is refused and nothing is dispatched.
+        let result = match super::action_wire::step_action_payload(step) {
+            Ok(payload) => ui_bridge_request_sync(&state, "execute_action", payload).await,
+            Err(missing) => Ok(missing.response()),
+        };
 
         let (success, response) = match result {
             Ok(data) => {
@@ -1316,6 +1318,17 @@ async fn execute_action_dispatch(
         }
     };
 
+    // ── Action-name gate ────────────────────────────────────────────────
+    // A request that names no action is refused here, before the element
+    // probes, the expectChange pre-snapshot or any IPC, so the refusal's
+    // "Nothing was dispatched" holds. Same rule as every other hop
+    // (`action_wire::require_action_name`); it used to be dispatched.
+    if let Err(missing) = super::action_wire::require_action_name(&serde_json::json!({
+        "action": &request.action
+    })) {
+        return Err((StatusCode::BAD_REQUEST, Json(missing.error_response())));
+    }
+
     // Target pop-out window (`?windowLabel=term-1`); scopes the action AND its
     // detector/validation queries below so the element id resolves in the right
     // window's registry. Owned so it survives the awaits without borrowing query.
@@ -1325,14 +1338,10 @@ async fn execute_action_dispatch(
     // body field. The SDK's `ControlActionRequest` and the `windowScope` facade
     // send the label in the body (like `page_evaluate` and the read/convenience
     // family), so without this fallback a body-only label would silently run in
-    // the main window. Removed from `extra` so it never leaks into the merged
-    // action params.
-    let window_label = query.window_label.clone().or_else(|| {
-        request
-            .extra
-            .remove("windowLabel")
-            .and_then(|v| v.as_str().map(String::from))
-    });
+    // the main window. Always removed from `extra` (even when the query wins)
+    // so it never leaks into the merged action params.
+    let body_window_label = super::action_wire::take_body_window_label(&mut request.extra);
+    let window_label = query.window_label.clone().or(body_window_label);
     let window_label = window_label.as_deref().filter(|s| !s.is_empty());
 
     // ── Unknown-window gate ─────────────────────────────────────────────
@@ -1576,35 +1585,26 @@ async fn execute_action_dispatch(
             None
         };
 
-    // Merge flat top-level fields into params so actions like drag work with
-    // both {"action":"drag","params":{"targetPosition":{...}}} and
-    // {"action":"drag","targetPosition":{...}} formats.
-    let merged_params = if request.extra.is_empty() {
-        request.params
-    } else {
-        let mut base = match request.params {
-            Some(serde_json::Value::Object(m)) => m,
-            _ => serde_json::Map::new(),
-        };
-        for (k, v) in request.extra {
-            base.entry(k).or_insert(v);
-        }
-        Some(serde_json::Value::Object(base))
-    };
-
-    let action_obj = serde_json::json!({
-        "action": action_name,
-        "params": merged_params,
-        "waitOptions": request.wait_options
-    });
-
-    let payload = super::request::target_window_payload(
-        serde_json::json!({
-            "elementId": id,
-            "action": action_obj.clone()
-        }),
+    // Hoist the SDK's listed request fields (`verifyEffect`, `captureAfter`,
+    // `requestId`, ...) onto the envelope and merge only the remaining flat
+    // top-level fields into params, so actions like drag work with both
+    // {"action":"drag","params":{"targetPosition":{...}}} and
+    // {"action":"drag","targetPosition":{...}} formats. See
+    // `action_wire::control_element_action`.
+    let split = super::action_wire::control_element_action(
+        &action_name,
+        request.params,
+        request.wait_options,
         window_label,
+        request.extra,
     );
+    let merged_params = split.params;
+    let payload = match super::action_wire::element_action_payload(&id, split.envelope) {
+        Ok(payload) => payload,
+        // Unreachable past the action-name gate at the top; refuse rather
+        // than guess.
+        Err(missing) => return Err((StatusCode::BAD_REQUEST, Json(missing.error_response()))),
+    };
 
     // ── Issue 2: Disabled-state detection ──────────────────────────────
     // Before dispatching the action, fetch the element state and reject
@@ -1933,13 +1933,14 @@ async fn execute_action_dispatch(
                             {
                                 info!("execute_action: stable ref resolved {} -> {}", id, new_id);
                                 // Retry with the resolved ID
-                                let retry_payload = super::request::target_window_payload(
-                                    serde_json::json!({
-                                        "elementId": new_id,
-                                        "action": action_obj
-                                    }),
-                                    window_label,
-                                );
+                                // The same dispatched payload, re-addressed.
+                                let mut retry_payload = payload.clone();
+                                if let Some(obj) = retry_payload.as_object_mut() {
+                                    obj.insert(
+                                        "elementId".to_string(),
+                                        serde_json::Value::String(new_id.to_string()),
+                                    );
+                                }
                                 let retry_result = wrap_ipc_result(
                                     ui_bridge_request_sync(&state, "execute_action", retry_payload)
                                         .await,

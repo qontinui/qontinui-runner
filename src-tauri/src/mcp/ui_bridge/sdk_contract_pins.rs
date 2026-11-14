@@ -1079,3 +1079,128 @@ fn the_sdk_path_literal_matches_the_one_mod_rs_scans() {
          with nothing reporting it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CONTROL_ACTION_REQUEST_FIELDS — the request field list the runner mirrors
+// ---------------------------------------------------------------------------
+
+/// Where the SDK spells `CONTROL_ACTION_REQUEST_FIELDS`, relative to this
+/// crate's manifest — the same sibling layout `SDK_TYPES_RELATIVE` assumes.
+const SDK_REQUEST_FIELDS_RELATIVE: &str =
+    "../../ui-bridge/packages/ui-bridge/src/control/request-fields.ts";
+
+/// The keys of the SDK's `CONTROL_ACTION_REQUEST_FIELDS` object literal, in
+/// source order: each `<ident>: true` entry between its `= {` and the closing
+/// `}`. Comment lines are ignored.
+fn sdk_control_action_request_fields(src: &str) -> Vec<String> {
+    let decl = src
+        .find("export const CONTROL_ACTION_REQUEST_FIELDS")
+        .expect("request-fields.ts declares no `export const CONTROL_ACTION_REQUEST_FIELDS`");
+    let rest = src.get(decl..).expect("`find` returns a char boundary");
+    let open = rest
+        .find("= {")
+        .expect("CONTROL_ACTION_REQUEST_FIELDS is not an object literal (`= {`)");
+    let body = rest
+        .get(open + "= {".len()..)
+        .expect("`find` returns a char boundary");
+    let close = body
+        .find("};")
+        .expect("CONTROL_ACTION_REQUEST_FIELDS object literal is not closed");
+    let body = body.get(..close).expect("`find` returns a char boundary");
+    let entry = regex::Regex::new(r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*true\s*,?\s*$").unwrap();
+    body.lines()
+        .filter(|line| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('*')
+        })
+        .map(|line| {
+            entry
+                .captures(line)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "unparseable CONTROL_ACTION_REQUEST_FIELDS entry `{line}` — \
+                         the SDK changed the list's shape; update this scrape"
+                    )
+                })
+        })
+        .collect()
+}
+
+/// The runner's `action_wire::CONTROL_ACTION_REQUEST_FIELDS` mirror must equal
+/// the SDK's list key for key. The control element route hoists exactly the
+/// mirrored keys onto the envelope and folds every other flat key into
+/// `params`, so a field the SDK adds and the mirror lacks is silently misrouted
+/// into `params` — the class plan
+/// `2026-11-11-ui-bridge-request-path-loses-fields-successor-runner-twins-and-non-recurrence`
+/// closes. This test turns that drift red.
+///
+/// An unreadable sibling FAILS under CI (both lanes check ui-bridge out); outside
+/// CI it prints a `skip` line to the process's stderr (bypassing the capture, as
+/// `sdk_sibling_checkout_is_present_and_parseable` does) and returns.
+#[test]
+fn control_action_request_fields_match_the_sdk() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SDK_REQUEST_FIELDS_RELATIVE);
+    let src = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            let truthy = |k: &str| {
+                std::env::var(k)
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        !v.is_empty() && v != "false" && v != "0"
+                    })
+                    .unwrap_or(false)
+            };
+            assert!(
+                !(truthy("CI") || truthy("GITHUB_ACTIONS")),
+                "UI BRIDGE SDK CHECKOUT MISSING: {} ({e}). Under CI the sibling is \
+                 checked out, so the CONTROL_ACTION_REQUEST_FIELDS parity pin must \
+                 read it rather than pass vacuously.",
+                path.display()
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "skip control_action_request_fields_match_the_sdk: {} unreadable ({e}); \
+                 the runner's CONTROL_ACTION_REQUEST_FIELDS mirror is UNVERIFIED in this run",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    let sdk = sdk_control_action_request_fields(&src);
+    assert!(
+        !sdk.is_empty(),
+        "{} parsed to an empty CONTROL_ACTION_REQUEST_FIELDS — a vacuous pin",
+        path.display()
+    );
+    let mut sdk_sorted = sdk.clone();
+    sdk_sorted.sort();
+    sdk_sorted.dedup();
+    assert_eq!(sdk_sorted.len(), sdk.len(), "duplicate SDK keys: {sdk:?}");
+
+    let mut runner: Vec<String> = super::action_wire::CONTROL_ACTION_REQUEST_FIELDS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    runner.sort();
+    runner.dedup();
+    assert_eq!(
+        runner.len(),
+        super::action_wire::CONTROL_ACTION_REQUEST_FIELDS.len(),
+        "duplicate keys in the runner's CONTROL_ACTION_REQUEST_FIELDS mirror"
+    );
+
+    let missing: Vec<&String> = sdk_sorted.iter().filter(|k| !runner.contains(k)).collect();
+    let extra: Vec<&String> = runner.iter().filter(|k| !sdk_sorted.contains(k)).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "action_wire::CONTROL_ACTION_REQUEST_FIELDS drifted from the SDK ({}).\n\
+         In the SDK, not the runner (the control element route would fold these into \
+         params): {missing:?}\n\
+         In the runner, not the SDK: {extra:?}",
+        path.display()
+    );
+}
