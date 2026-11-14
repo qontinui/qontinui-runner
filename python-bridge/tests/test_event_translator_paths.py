@@ -10,6 +10,7 @@ with screenshot data, it:
 import base64
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 
 import pytest
@@ -18,6 +19,26 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from event_translator import EventTranslator
+
+if TYPE_CHECKING:
+    from qontinui.reporting import Event
+
+
+def match_attempted(data: dict[str, Any]) -> "Event":
+    """Wrap a MATCH_ATTEMPTED payload as qontinui's event registry delivers it.
+
+    The import is deferred to call time, mirroring event_translator's own guarded
+    import, so a box with no usable X display (pynput, imported by the qontinui
+    package) still collects this module. On such a box these tests fail in
+    ``EventTranslator.__init__`` unless an earlier module has already
+    half-imported qontinui and left ``qontinui.reporting`` cached; in a full
+    ``pytest tests`` run ``tests/services/test_trajectory_logger_wsm.py`` does
+    exactly that and they pass. Run the suite under ``xvfb-run`` for a verdict
+    that does not depend on collection order.
+    """
+    from qontinui.reporting import Event, EventType
+
+    return Event(type=EventType.MATCH_ATTEMPTED, data=data)
 
 
 @pytest.fixture
@@ -78,7 +99,7 @@ class TestEventTranslatorPathIntegration:
         }
 
         # Trigger event handler
-        translator.on_match_attempted(library_event)
+        translator.on_match_attempted(match_attempted(library_event))
 
         # Verify collector was called with decoded data
         mock_collector.record_match_result.assert_called_once()
@@ -121,7 +142,7 @@ class TestEventTranslatorPathIntegration:
             "screenshot_base64": sample_png_base64,
         }
 
-        translator.on_match_attempted(library_event)
+        translator.on_match_attempted(match_attempted(library_event))
 
         # Verify emitter was called without paths
         mock_emitter.assert_called_once()
@@ -160,7 +181,7 @@ class TestEventTranslatorPathIntegration:
         }
 
         # Should not crash
-        translator.on_match_attempted(library_event)
+        translator.on_match_attempted(match_attempted(library_event))
 
         # Verify emitter was still called (without paths)
         mock_emitter.assert_called_once()
@@ -199,7 +220,7 @@ class TestEventTranslatorPathIntegration:
             "screenshot_base64": sample_png_base64,
         }
 
-        translator.on_match_attempted(library_event)
+        translator.on_match_attempted(match_attempted(library_event))
 
         # Verify both image_data and paths are present
         event_name, event_data = mock_emitter.call_args[0]

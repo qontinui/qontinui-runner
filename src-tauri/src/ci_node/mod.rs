@@ -48,6 +48,7 @@ pub(crate) mod executor;
 pub(crate) mod host_sizing;
 pub(crate) mod junit;
 pub(crate) mod manifest;
+pub(crate) mod ops;
 pub(crate) mod reporting;
 pub(crate) mod services;
 pub(crate) mod settings_directive;
@@ -151,10 +152,12 @@ pub fn spawn_ci_node_runtime() {
             "ci_node: ~/.qontinui/machine.json missing or device_id unparseable — \
              CI-node runtime disabled. Skipping."
         );
+        crate::sd_notify::mark_ci_subscription_not_applicable();
         return;
     };
     if qontinui_runner_lib::profiles::connected_coord_base().is_none() {
         info!("ci_node: runner is ISOLATED (no coord configured, not a hosted tier) — CI-node runtime disabled. Skipping.");
+        crate::sd_notify::mark_ci_subscription_not_applicable();
         return;
     }
     info!("ci_node: starting for device_id={device_id}");

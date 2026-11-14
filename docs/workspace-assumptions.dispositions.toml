@@ -69,6 +69,16 @@ unreviewed_ceiling = 212
 # (src-tauri/src/webview_recovery.rs module doc).
 
 [[disposition]]
+class = "repo_layout"
+file = "src/ci_node/ops.rs"
+symbol = "const DEFAULT_OPS_REPO"
+disposition = "fallback_correct"
+note = "Default repo for the D4 ops-lane script allowlist; overridden by OPS_REPO_ENV, and the lane is dark unless coord enables it."
+reviewed = [
+    "const DEFAULT_OPS_REPO: &str = \"qontinui/qontinui-claude-config\";",
+]
+
+[[disposition]]
 class = "machine_path"
 file = "src/commands/setup_wizard.rs"
 symbol = "const WINDOWS_MULTI_ACCOUNT_ROOT"
