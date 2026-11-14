@@ -2046,7 +2046,6 @@ pub(crate) async fn publish_once() {
         Ok(resp) if resp.status().is_success() => {
             // A 200 is not "stored": coord drops invalid items and unknown
             // fields INSIDE a 200 and says so only in the body.
-            refill_failure_warns();
             let text = resp.text().await.ok();
             log_sample_ack(sample_ack(text.as_deref(), body.samples.len()));
         }
@@ -2292,29 +2291,46 @@ pub(crate) fn transport_failure_class(is_connect: bool, is_timeout: bool) -> &'s
     }
 }
 
-/// Spend one WARN of `class`'s budget: `true` while it has one left. PURE.
-pub(crate) fn warn_budget_admits(budget: &mut BTreeMap<String, u32>, class: &str) -> bool {
-    let spent = budget.entry(class.to_string()).or_default();
-    *spent = spent.saturating_add(1);
-    *spent <= WARNS_PER_FAILURE_CLASS
+/// A failure arriving after this long with NO failure at all starts a new
+/// outage, and every class gets its full WARN budget back. A delivered POST
+/// alone does not: a coord answering 2xx and 503 by turns would otherwise
+/// refill the budget between every pair and WARN every failure.
+const FAILURE_QUIET_SECS: u64 = 600;
+
+/// The per-class WARN budget, refilled by a quiet period ([`FAILURE_QUIET_SECS`]).
+#[derive(Debug, Default)]
+pub(crate) struct FailureWarns {
+    spent: BTreeMap<String, u32>,
+    last_failure: Option<std::time::Instant>,
 }
 
-/// A delivered POST ends the outage: every class gets its full budget back,
-/// so the NEXT outage is diagnosable too. PURE.
-pub(crate) fn warn_budget_refill(budget: &mut BTreeMap<String, u32>) {
-    budget.clear();
-}
+impl FailureWarns {
+    pub(crate) const fn new() -> Self {
+        Self {
+            spent: BTreeMap::new(),
+            last_failure: None,
+        }
+    }
 
-/// The per-process, per-class WARN budget [`warn_once`] spends.
-static FAILURE_WARN_BUDGET: std::sync::Mutex<BTreeMap<String, u32>> =
-    std::sync::Mutex::new(BTreeMap::new());
-
-/// Refill [`FAILURE_WARN_BUDGET`] after a 2xx.
-fn refill_failure_warns() {
-    if let Ok(mut b) = FAILURE_WARN_BUDGET.lock() {
-        warn_budget_refill(&mut b);
+    /// Record one failure of `class` at `now`: `true` = WARN it, while the
+    /// class has budget left. PURE.
+    pub(crate) fn admit(&mut self, class: &str, now: std::time::Instant) -> bool {
+        let quiet = std::time::Duration::from_secs(FAILURE_QUIET_SECS);
+        if self
+            .last_failure
+            .is_some_and(|t| now.saturating_duration_since(t) >= quiet)
+        {
+            self.spent.clear();
+        }
+        self.last_failure = Some(now);
+        let spent = self.spent.entry(class.to_string()).or_default();
+        *spent = spent.saturating_add(1);
+        *spent <= WARNS_PER_FAILURE_CLASS
     }
 }
+
+/// The per-process budget [`warn_once`] spends.
+static FAILURE_WARNS: std::sync::Mutex<FailureWarns> = std::sync::Mutex::new(FailureWarns::new());
 
 /// Log a publish failure loudly the first few times PER CLASS, then quietly.
 ///
@@ -2323,11 +2339,12 @@ fn refill_failure_warns() {
 /// first ones are the diagnosis; the rest are noise. The budget is per failure
 /// class, so a NEW kind of failure (a 422 after three 503s, a refused connect
 /// after three 5xx) is WARNed rather than lost under the first kind's budget,
-/// and a 2xx refills every class.
+/// and it refills after [`FAILURE_QUIET_SECS`] without a failure, so the next
+/// outage is diagnosable too.
 fn warn_once(class: &str, msg: String) {
-    let loud = FAILURE_WARN_BUDGET
+    let loud = FAILURE_WARNS
         .lock()
-        .map(|mut b| warn_budget_admits(&mut b, class))
+        .map(|mut b| b.admit(class, std::time::Instant::now()))
         .unwrap_or(true);
     if loud {
         warn!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
@@ -2402,49 +2419,61 @@ mod tests {
         assert_eq!(sample_ack_line(&ack), None);
     }
 
-    /// Review round 2, A5: a 2xx refills the budget, so the next outage's
-    /// first failures are WARNed again.
+    /// Review round 3, A3: a coord answering 2xx and 503 by turns does not
+    /// refill the budget — the 503s stop WARNing after three — and a quiet
+    /// period of ten minutes without a failure does, so the next outage is
+    /// WARNed again.
     #[test]
-    fn a_delivered_post_refills_the_warn_budget() {
-        let mut budget = BTreeMap::new();
-        for _ in 0..3 {
-            assert!(warn_budget_admits(&mut budget, "http:503"));
-        }
-        assert!(!warn_budget_admits(&mut budget, "http:503"));
-        warn_budget_refill(&mut budget);
-        assert!(
-            warn_budget_admits(&mut budget, "http:503"),
-            "a 503 after a 2xx is a new outage and is WARNed"
+    fn only_a_quiet_period_refills_the_warn_budget() {
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let mut warns = FailureWarns::new();
+        // A 503 every other 30 s tick (a 2xx between each) for 40 minutes.
+        let loud = (0..40)
+            .filter(|i| warns.admit("http:503", at(i * 60)))
+            .count();
+        assert_eq!(
+            loud, 3,
+            "alternating 2xx/503 WARNs three 503s, not every one"
         );
+        // Ten minutes of 2xx since the last failure: a new outage.
+        assert!(warns.admit("http:503", at(39 * 60 + 600)));
+        // Just under ten minutes is not quiet enough.
+        let mut warns = FailureWarns::new();
+        for i in 0..3 {
+            assert!(warns.admit("http:503", at(i)));
+        }
+        assert!(!warns.admit("http:503", at(2 + 599)));
     }
 
     /// Phase 2: each failure class has its own budget of three WARNs.
     #[test]
     fn a_new_failure_class_is_warned_after_three_of_another() {
-        let mut budget = BTreeMap::new();
+        let now = std::time::Instant::now();
+        let mut warns = FailureWarns::new();
         for _ in 0..3 {
-            assert!(warn_budget_admits(&mut budget, &http_failure_class(503)));
+            assert!(warns.admit(&http_failure_class(503), now));
         }
         assert!(
-            !warn_budget_admits(&mut budget, &http_failure_class(503)),
+            !warns.admit(&http_failure_class(503), now),
             "a fourth 503 is quiet"
         );
         assert_eq!(http_failure_class(422), "http:422");
         assert!(
-            warn_budget_admits(&mut budget, &http_failure_class(422)),
+            warns.admit(&http_failure_class(422), now),
             "a 422 after three 503s is WARNed"
         );
 
-        let mut budget = BTreeMap::new();
+        let mut warns = FailureWarns::new();
         for status in [500, 502, 503] {
             for _ in 0..3 {
-                assert!(warn_budget_admits(&mut budget, &http_failure_class(status)));
+                assert!(warns.admit(&http_failure_class(status), now));
             }
         }
         let connect = transport_failure_class(true, false);
         assert_eq!(connect, "transport:connect");
         assert!(
-            warn_budget_admits(&mut budget, connect),
+            warns.admit(connect, now),
             "a refused connect after the 5xx is WARNed"
         );
         assert_eq!(transport_failure_class(false, true), "transport:timeout");
