@@ -207,6 +207,10 @@ impl HealPort for FakePort {
                 })
         })
     }
+    fn finish_queued(&self, _csid: &str, _finished_at: i64) -> Option<bool> {
+        // No outbox behind this port: nothing is ever still queued.
+        Some(false)
+    }
 }
 
 /// A store holding one finished mark for `csid`, stamped synced.
@@ -566,16 +570,15 @@ fn an_interaction_clears_the_local_mark_first_and_a_drain_does_not_revive() {
     assert!(rows(&outbox).is_empty(), "{:?}", rows(&outbox));
     assert_eq!(store.get(&trid).unwrap().finished_at, Some(at));
 
-    // The interaction: the mark is gone, and every row queued is a working.
+    // The interaction: the mark is gone, and exactly ONE working row is
+    // queued — the unmark's own, not a second from the interaction bump
+    // (review A5).
     reg.progress_on_interaction(&trid);
     assert_eq!(store.get(&trid).unwrap().finished_at, None);
-    let queued = rows(&outbox);
-    assert!(!queued.is_empty());
-    assert!(
-        queued
-            .iter()
-            .all(|(k, s)| k == "progress" && s == "working"),
-        "{queued:?}"
+    assert_eq!(
+        rows(&outbox),
+        vec![("progress".to_string(), "working".to_string())],
+        "a revival queues one working row"
     );
     assert!(
         outbox
@@ -1035,4 +1038,57 @@ fn an_id_missing_from_a_truncated_read_is_unreadable() {
     );
     let out = apply_heal(&store, Some(&p), &store.all_records(), &whole, at + 1_000);
     assert_eq!(out[0].1, HealOutcome::Left(HealSkip::NoCoordRow));
+}
+
+/// Review A6: the boot sweep does not re-offer an unsynced mark whose own
+/// `Finished` row is still pending in the outbox — the drain still owes it,
+/// and a second row would be a duplicate. Once that row has left the outbox
+/// (dropped unconfirmed, say) the same mark IS re-offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_skips_a_mark_whose_finish_is_still_queued() {
+    let (_d, outbox, reg, store) = wired();
+    store.record_open(test_open_record("queued"));
+    store
+        .set_finished("queued", true, Some("done".into()))
+        .unwrap();
+    assert_eq!(
+        rows(&outbox),
+        vec![("finished".to_string(), "queued".to_string())],
+        "the mark's own finish is pending"
+    );
+
+    let held = heal_sweep_with(
+        &store,
+        Some(reg.as_ref() as &dyn HealPort),
+        None,
+        true,
+        |ids| async move { null_rows(&ids) },
+    )
+    .await;
+    assert_eq!(
+        held,
+        vec![(
+            "queued".to_string(),
+            HealOutcome::Left(HealSkip::FinishStillQueued)
+        )]
+    );
+    assert_eq!(rows(&outbox).len(), 1, "no duplicate queued beside it");
+
+    drain_all(&outbox);
+    let reoffered = heal_sweep_with(
+        &store,
+        Some(reg.as_ref() as &dyn HealPort),
+        None,
+        true,
+        |ids| async move { null_rows(&ids) },
+    )
+    .await;
+    assert_eq!(
+        reoffered,
+        vec![("queued".to_string(), HealOutcome::Reoffered { row: row() })]
+    );
+    assert_eq!(
+        rows(&outbox),
+        vec![("finished".to_string(), "queued".to_string())]
+    );
 }

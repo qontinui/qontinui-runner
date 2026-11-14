@@ -1405,7 +1405,12 @@ impl AiCoordRegistrar {
         let Some(session_id) = self.session_id_for(task_run_id) else {
             return;
         };
-        self.revive_local_mark(task_run_id);
+        // The unmark's own observer already queues the `working` row to the
+        // same coord row; queue a second only when it did not (no store, no
+        // finished mark, a failed write, or a different/unresolved row).
+        if self.revive_local_mark(task_run_id) == Some(session_id) {
+            return;
+        }
         self.enqueue_working(task_run_id, session_id);
     }
 
@@ -1439,26 +1444,35 @@ impl AiCoordRegistrar {
 
     /// Clear a local finished mark on revival, through the one funnel
     /// (`set_finished`), whose finish observer queues the unmark's own
-    /// `working` row. Lock order: takes the store's `finish_forward`, so it
-    /// must not run under any store or registrar lock — the interaction
-    /// callers hold none.
-    fn revive_local_mark(&self, claude_session_id: &str) {
-        let Some(store) = self.inner.lifecycle_store.get() else {
-            return;
-        };
+    /// `working` row. Returns the coord row that `working` row was queued to,
+    /// or `None` when none was (no store, no finished mark, a failed clear, or
+    /// the unmark stayed local-only) — so the caller queues exactly one.
+    /// Lock order: takes the store's `finish_forward`, so it must not run
+    /// under any store or registrar lock — the interaction callers hold none.
+    fn revive_local_mark(&self, claude_session_id: &str) -> Option<Uuid> {
+        let store = self.inner.lifecycle_store.get()?;
         if !self.local_mark_finished(claude_session_id) {
-            return;
+            return None;
         }
         match store.set_finished(claude_session_id, false, None) {
-            Ok(_) => info!(
-                "ai_coord_register: interaction revived {} — its local finished mark is \
-                 cleared before the working report",
-                claude_session_id
-            ),
-            Err(e) => warn!(
-                "ai_coord_register: could not clear the finished mark of revived {}: {:?}",
-                claude_session_id, e
-            ),
+            Ok(out) => {
+                info!(
+                    "ai_coord_register: interaction revived {} — its local finished mark is \
+                     cleared before the working report",
+                    claude_session_id
+                );
+                match out.coord {
+                    FinishSync::Queued { coord_session_id } => Some(coord_session_id),
+                    _ => None,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: could not clear the finished mark of revived {}: {:?}",
+                    claude_session_id, e
+                );
+                None
+            }
         }
     }
 
@@ -1702,6 +1716,31 @@ impl AiCoordRegistrar {
                     )
                 })
         })
+    }
+
+    /// Whether a `Finished` outbox row for `claude_session_id` carrying
+    /// `finished_at` is still pending (undelivered). `None` when the outbox
+    /// cannot be read — UNKNOWN, never "not queued".
+    pub(crate) fn finished_row_pending(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+    ) -> Option<bool> {
+        match self.inner.outbox.pending() {
+            Ok(rows) => Some(rows.iter().any(|r| {
+                r.event_kind == SessionEventKind::Finished.as_str()
+                    && r.payload["claude_session_id"].as_str() == Some(claude_session_id)
+                    && r.payload["finished_at"].as_i64() == Some(finished_at)
+            })),
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: could not read the outbox to check {}'s pending \
+                     finish: {}",
+                    claude_session_id, e
+                );
+                None
+            }
+        }
     }
 
     /// The coord row a lifecycle record's finished mark addresses, resolved
