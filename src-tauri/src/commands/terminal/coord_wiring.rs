@@ -531,4 +531,57 @@ mod tests {
         assert_eq!(got, None);
         assert_eq!(session.coord_session_id(), None);
     }
+
+    /// Source pin for the doors no unit test can enter (plan
+    /// `2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session`
+    /// Phase 4): `POST /terminals`, steward start and the invoke proxy's arm all
+    /// need a live `AppHandle` to spawn, so a test cannot drive them to the
+    /// post-create wiring. Instead, each door's production code (before its
+    /// first `#[cfg(test)]`) must still call the shared wiring — and for the two
+    /// `acquire_for_terminal` doors, AFTER their `door-scan: spawn` marker, i.e.
+    /// on the success path of the real spawn. Deleting a call fails this test.
+    #[test]
+    fn every_create_door_still_calls_the_shared_coord_wiring() {
+        let doors: &[(&str, &str, Option<&str>, &str)] = &[
+            (
+                "mcp/tauri_proxy.rs",
+                include_str!("../../mcp/tauri_proxy.rs"),
+                Some("door-scan: spawn"),
+                "proxy_terminal_created(&door",
+            ),
+            (
+                "mcp/terminals.rs",
+                include_str!("../../mcp/terminals.rs"),
+                Some("door-scan: spawn"),
+                "coord_wiring::finish_terminal_create(",
+            ),
+            (
+                "mcp/steward.rs",
+                include_str!("../../mcp/steward.rs"),
+                None,
+                "coord_wiring::finish_terminal_create(",
+            ),
+            (
+                "commands/terminal.rs",
+                include_str!("../terminal.rs"),
+                None,
+                "finish_terminal_create(",
+            ),
+        ];
+        for (name, src, marker, call) in doors {
+            let production = src.split("#[cfg(test)]").next().unwrap_or_default();
+            let from = match marker {
+                Some(m) => production
+                    .find(m)
+                    .unwrap_or_else(|| panic!("{name}: no `{m}` marker in production code")),
+                None => 0,
+            };
+            assert!(
+                production[from..].contains(call),
+                "{name}: production code no longer calls `{call}`{} — the pane it \
+                 creates would have no terminal_shell coord row",
+                marker.map(|m| format!(" after `{m}`")).unwrap_or_default()
+            );
+        }
+    }
 }
