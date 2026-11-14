@@ -4411,7 +4411,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // instant) for the live-pane adoption and the movers;
                     // `on_terminal_coord_bind` moves the registrar's entry for
                     // the pinned id onto a newly bound row BEFORE it delivers
-                    // owed marks.
+                    // owed marks; the re-key seam moves a stale auto-bind
+                    // entry onto the row it confirms.
                     let tm = std::sync::Arc::downgrade(&term_for_session);
                     let sreg = std::sync::Arc::downgrade(&registry);
                     ai_coord_registrar.attach_pane_row_tenant(move |row| {
@@ -4430,6 +4431,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         },
                     );
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    registry.attach_rekey_observer(move |row, csid| {
+                        if let Some(r) = reg.upgrade() {
+                            r.note_pane_row(row, csid);
+                        }
+                    });
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     lifecycle_store.attach_finish_observer(move |rec| {
                         use session::session_lifecycle_store::{FinishSync, LocalOnlyReason};

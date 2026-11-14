@@ -592,7 +592,14 @@ pub struct SessionRegistry {
     sessions: Mutex<HashMap<Uuid, SessionRecord>>,
     transports: SessionTransports,
     coord_sync: coord_sync::CoordSync,
+    /// The re-key seam's observer ([`Self::attach_rekey_observer`]), told
+    /// `(coord row, harness id)` each time the seam answers `Queued` or
+    /// `AlreadyCurrent`.
+    rekey_observer: std::sync::OnceLock<RekeyObserver>,
 }
+
+/// See [`SessionRegistry::attach_rekey_observer`].
+type RekeyObserver = Box<dyn Fn(Uuid, &str) + Send + Sync>;
 
 /// Bag of per-kind transports.
 pub struct SessionTransports {
@@ -956,7 +963,32 @@ impl SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             transports,
             coord_sync,
+            rekey_observer: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the re-key seam's observer (once, at startup; plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D2). [`coord_identity`]'s seam calls it with `(coord row, harness id)`
+    /// whenever it answers `Queued` or `AlreadyCurrent` — through every door
+    /// that reaches it (`confirm_for_terminal`, and `confirm_for_session` from
+    /// the restored, deferred and resume retries) — AFTER
+    /// [`Self::confirm_claude_code_session_id`] has returned and outside every
+    /// registry lock, so the observer may read this registry. main.rs wires it
+    /// to `AiCoordRegistrar::note_pane_row`.
+    pub fn attach_rekey_observer(&self, f: impl Fn(Uuid, &str) + Send + Sync + 'static) {
+        if self.rekey_observer.set(Box::new(f)).is_err() {
+            tracing::warn!("session registry: re-key observer already attached — ignoring");
+        }
+    }
+
+    /// Tell the re-key observer, if one is attached, that the seam confirmed
+    /// `claude_id` on `coord_session_id`. Must be called with no registry lock
+    /// held (see [`Self::attach_rekey_observer`]).
+    pub(crate) fn notify_rekey_confirmed(&self, coord_session_id: Uuid, claude_id: &str) {
+        if let Some(f) = self.rekey_observer.get() {
+            f(coord_session_id, claude_id);
+        }
     }
 
     pub fn machine_id(&self) -> Uuid {
