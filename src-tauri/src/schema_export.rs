@@ -1111,8 +1111,8 @@ mod tests {
         // finding 7c536351) = 619.
         // The codegen's "Processing N top-level types" line should read 619 here.
         assert_eq!(obj.len(), 619, "Expected 619 schema entries");
-        // Nothing in the product fills those four any more, so registering
-        // one again would export a verdict DTO that has no producer.
+        // Nothing in the product fills these any more, so registering one
+        // again would export a DTO that has no producer.
         for removed in [
             "DomainVerificationResult",
             "VerificationResult",
