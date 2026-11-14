@@ -5,6 +5,11 @@ name: Python executor command table
 # and no mixin handler is decorated or declared twice. The file reads the executor
 # and its mixins as source (ast), so it needs only pytest, numpy and Pillow (what
 # tests/conftest.py imports) -- not the qontinui library or any GPU dependency.
+# Also runs python-bridge/tests/test_no_temp_debug_logs.py, the same kind of
+# stdlib-only ast guard: no bridge source writes a debug log under the OS temp
+# dir or ~ (plan 2026-11-14-one-xlib-distribution-and-no-tmp-debug-logs-in-the-python-bridge),
+# and tests/test_event_path_no_temp_writes.py, which exercises the event path with
+# its heavy imports stubbed so it too needs only these packages.
 #
 # Hermetic: no network, no credentials. NOT a merge gate (absent from the repo
 # ruleset's required contexts). It is inside ci-integrity.yml's scope
@@ -74,7 +79,7 @@ jobs:
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/venv/bin/python" -m pip install pytest numpy pillow
 
-      - name: Run the command-table guards
+      - name: Run the command-table and temp-debug-log guards
         # conftest.py imports `models`, so pytest must run from python-bridge/.
         working-directory: python-bridge
-        run: python -m pytest tests/test_executor_command_table.py -q
+        run: python -m pytest tests/test_executor_command_table.py tests/test_no_temp_debug_logs.py tests/test_event_path_no_temp_writes.py -q
