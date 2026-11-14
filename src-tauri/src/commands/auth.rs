@@ -1144,6 +1144,12 @@ pub struct CognitoSignInResponse {
     pub tenant_id: Option<String>,
     /// The paired device id.
     pub device_id: String,
+    /// `true` only when secure storage holds the device machine key (`dmk_`)
+    /// the pair returned, confirmed by read-back
+    /// (`pair::PairingPersisted::dmk_stored`). The same observable the
+    /// pair-code door (`redeem_pair_code`) and the CLI door
+    /// (`qontinui_profile device pair`) report.
+    pub dmk_stored: bool,
 }
 
 /// Sign in to the runner with a **Cognito** account via RFC 8252 (system
@@ -1326,18 +1332,19 @@ async fn finalize_signed_in(
     // 5. Persist the device JWT + paired-user file.
     //    Blocking file + lock I/O (it may wait on a heartbeat reconcile): off the runtime.
     let pair_resp_for_persist = pair_resp.clone();
-    spawn_blocking_tracked(move || persist_pairing(&pair_resp_for_persist, tenant_id))
-        .await
-        .map_err(|e| {
-            error!("finalize_signed_in: persist_pairing task panicked: {e}");
-            AppError::Raw(format!("persist pairing task panicked: {e}"))
-        })?
-        .map_err(|e| {
-            error!(
+    let persisted =
+        spawn_blocking_tracked(move || persist_pairing(&pair_resp_for_persist, tenant_id))
+            .await
+            .map_err(|e| {
+                error!("finalize_signed_in: persist_pairing task panicked: {e}");
+                AppError::Raw(format!("persist pairing task panicked: {e}"))
+            })?
+            .map_err(|e| {
+                error!(
                 "finalize_signed_in: step 5 (persist_pairing) failed AFTER a successful pair: {e}"
             );
-            AppError::Raw(format!("persist pairing: {e}"))
-        })?;
+                AppError::Raw(format!("persist pairing: {e}"))
+            })?;
 
     // 5a. A NEW credential is in `tenant_id`'s slot (and in the legacy slot when
     //     that tenant is the default), so every rejection coord recorded
@@ -1417,8 +1424,8 @@ async fn finalize_signed_in(
 
     let resp_device_id = pair_resp.device_id.clone().unwrap_or(device_id);
     info!(
-        "finalize_signed_in: signed in + device bound (sub={}, device={resp_device_id}) — Tier 2 active",
-        login.sub
+        "finalize_signed_in: signed in + device bound (sub={}, device={resp_device_id}, dmk_stored={}) — Tier 2 active",
+        login.sub, persisted.dmk_stored
     );
 
     Ok(CognitoSignInResponse {
@@ -1426,6 +1433,7 @@ async fn finalize_signed_in(
         email: login.email,
         tenant_id: tenant_id_str,
         device_id: resp_device_id,
+        dmk_stored: persisted.dmk_stored,
     })
 }
 
@@ -2236,6 +2244,22 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `finalize_signed_in`'s result reaches the FE and the UI-Bridge through
+    /// serde; `dmk_stored` must cross as `dmkStored`, like the pair-code door's.
+    #[test]
+    fn cognito_sign_in_response_serializes_dmk_stored_camel_case() {
+        let v = serde_json::to_value(CognitoSignInResponse {
+            user_id: "u".into(),
+            email: None,
+            tenant_id: None,
+            device_id: "d".into(),
+            dmk_stored: false,
+        })
+        .unwrap();
+        assert_eq!(v["dmkStored"], serde_json::json!(false));
+        assert_eq!(v["deviceId"], serde_json::json!("d"));
+    }
 
     /// Every [`RefreshClass`], as an array the tests iterate.
     ///
