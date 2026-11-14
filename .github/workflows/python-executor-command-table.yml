@@ -7,7 +7,9 @@ name: Python executor command table
 # tests/conftest.py imports) -- not the qontinui library or any GPU dependency.
 # Also runs python-bridge/tests/test_no_temp_debug_logs.py, the same kind of
 # stdlib-only ast guard: no bridge source writes a debug log under the OS temp
-# dir or ~ (plan 2026-11-14-one-xlib-distribution-and-no-tmp-debug-logs-in-the-python-bridge).
+# dir or ~ (plan 2026-11-14-one-xlib-distribution-and-no-tmp-debug-logs-in-the-python-bridge),
+# and tests/test_event_path_no_temp_writes.py, which exercises the event path with
+# its heavy imports stubbed so it too needs only these packages.
 #
 # Hermetic: no network, no credentials. NOT a merge gate (absent from the repo
 # ruleset's required contexts). It is inside ci-integrity.yml's scope
@@ -80,4 +82,4 @@ jobs:
       - name: Run the command-table and temp-debug-log guards
         # conftest.py imports `models`, so pytest must run from python-bridge/.
         working-directory: python-bridge
-        run: python -m pytest tests/test_executor_command_table.py tests/test_no_temp_debug_logs.py -q
+        run: python -m pytest tests/test_executor_command_table.py tests/test_no_temp_debug_logs.py tests/test_event_path_no_temp_writes.py -q
