@@ -2756,11 +2756,12 @@ async fn health(
         // Moves onto a pane row refused because another session owns it.
         "registrarPaneRowMovesNotOwner":
             crate::claude_session::coord_register::pane_row_moves_not_owner(),
-        // Distinct (row, session) pairs whose live-pane adoption was deferred
-        // because only the pane's pin says it runs the session and another key
-        // holds the row (each counted once, not per retry).
-        "registrarPinSeedTakesDeferred":
-            crate::claude_session::coord_register::pin_seed_takes_deferred(),
+        // Distinct (row, session) pairs whose live-pane adoption was EVER
+        // deferred because only the pane's pin says it runs the session and
+        // another key holds the row (cumulative; once per pair, not per
+        // retry, and not decremented when resolved).
+        "registrarPinSeedTakesEverDeferred":
+            crate::claude_session::coord_register::pin_seed_takes_ever_deferred(),
         // Browser-origin guard (plan 2026-09-17-runner-loopback-api-accepts-
         // any-origin): kill-switch state, route-policy mode, per-class refusal
         // and shadow counts, and the last 20 non-admit tuples — withheld from a
@@ -21768,7 +21769,7 @@ mod coord_provision_session_gate_tests {
             "{region}"
         );
         assert!(
-            region.contains("\"registrarPinSeedTakesDeferred\":"),
+            region.contains("\"registrarPinSeedTakesEverDeferred\":"),
             "{region}"
         );
     }

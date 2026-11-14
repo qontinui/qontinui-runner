@@ -82,7 +82,7 @@ use super::pane_row_owner::{BindDoor, PaneRowLookup, PaneRowOwners};
 /// widening them.
 mod pane_transfer;
 pub(crate) use pane_transfer::{
-    pane_row_moves_not_owner, pin_seed_takes_deferred, registrar_terminal_row_disagreements,
+    pane_row_moves_not_owner, pin_seed_takes_ever_deferred, registrar_terminal_row_disagreements,
     MoveOutcome, Mover,
 };
 
@@ -3725,6 +3725,7 @@ mod tests {
             r.lock().unwrap().get(&row).map(|t| PaneRowFacts {
                 tenant: *t,
                 bound_at_ms: Some(1_000),
+                bind_seq: Some(1),
             })
         });
         rows
@@ -4151,6 +4152,7 @@ mod tests {
                 rows.lock().unwrap().get(&row).map(|at| PaneRowFacts {
                     tenant: NewSessionTenant::Undetermined,
                     bound_at_ms: Some(*at),
+                    bind_seq: Some(*at as u64),
                 })
             });
         }
@@ -4302,7 +4304,7 @@ mod tests {
         let r = Uuid::new_v4();
         reg.bind_transcript_session("holder-y", Some(r), None, ResumeParams::default())
             .unwrap();
-        let before = pin_seed_takes_deferred();
+        let before = pin_seed_takes_ever_deferred();
         for _ in 0..3 {
             assert_eq!(
                 reg.bind_transcript_session_on_live_pane(
@@ -4314,7 +4316,7 @@ mod tests {
                 Err(TranscriptBindRefusal::CoordSessionInUse)
             );
         }
-        assert!(pin_seed_takes_deferred() > before);
+        assert!(pin_seed_takes_ever_deferred() > before);
         assert!(
             !pane_transfer::note_pin_seed_take_deferred(r, "pin-p"),
             "the pair was recorded once; retries add nothing"
@@ -4369,6 +4371,7 @@ mod tests {
                 rows.lock().unwrap().get(&row).map(|at| PaneRowFacts {
                     tenant: NewSessionTenant::Undetermined,
                     bound_at_ms: Some(*at),
+                    bind_seq: Some(*at as u64),
                 })
             });
         }
@@ -4780,6 +4783,7 @@ mod tests {
                     sreg.upgrade()?.tenant_scope_of(row),
                 ),
                 bound_at_ms: Some(1_000),
+                bind_seq: Some(1),
             })
         });
     }
