@@ -34,7 +34,10 @@ Imports are resolved per file, dotted receivers included, so
   ``lzma.open`` (path as ``args[0]`` or ``file=``/``filename=``) in a w/a/x/+ mode;
 - ``<path>.open(mode)`` in such a mode, and ``<path>.write_text`` /
   ``<path>.write_bytes``;
-- ``logging.FileHandler`` and its rotating/watched subclasses (append by default).
+- ``logging.FileHandler`` and its rotating/watched subclasses (append by default),
+  and ``logging.basicConfig(filename=...)`` (``filemode`` defaults to append);
+- ``tarfile.open(name, mode)`` and ``zipfile.ZipFile(file, mode)`` in a w/a/x mode
+  (both default to read).
 
 **Arms.** (a) a sink whose path expression reaches a source. A bare name in the
 path is resolved through its assignments in the enclosing function, every
@@ -53,13 +56,15 @@ as a deliberate test change:
 - a path returned by a helper function;
 - a path passed in as a parameter, including a parameter DEFAULT built from a
   source (defaults are not assignments);
-- ``for`` and ``with ... as`` targets (only assignments are resolved);
+- ``for`` and ``with ... as`` targets, even when the iterable or the context
+  manager's argument is a source (only assignments are resolved);
 - ``tempfile.mkdtemp`` / ``mkstemp`` / ``NamedTemporaryFile`` / ``TemporaryFile``
   outputs. Deliberately not sources: the bridge uses ``mkdtemp`` legitimately
   (``executor_core.py`` ``self.temp_dir``, ``qontinui_executor.py`` ``run_dir``)
   and ``NamedTemporaryFile`` for real temp files;
+- ``tempfile.TemporaryFile`` writes (no path to test);
 - ``os.open`` (the low-level fd API) is not a sink;
-- ``shutil.copy*`` / ``shutil.move`` into a temp or home dir are not sinks.
+- ``shutil.copy`` / ``shutil.move`` into a temp or home dir are not sinks.
 
 Legitimate temp-dir writes are allow-listed by (file, function, arm, path
 expression), so a NEW write inside an allow-listed function is still flagged.
@@ -77,7 +82,22 @@ from pathlib import Path
 BRIDGE_ROOT = Path(__file__).resolve().parent.parent
 
 # Directories that are not bridge source.
-_SKIP_DIRS = {"tests", ".venv", "venv", "build", "dist", "__pycache__", ".pytest_cache"}
+_SKIP_DIRS = {
+    "tests",
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "__pycache__",
+    "node_modules",
+    "build",
+    "dist",
+}
 
 TEMP_ENV_NAMES = {"TEMP", "TMP", "TMPDIR"}
 HOME_ENV_NAMES = {"HOME", "USERPROFILE"}
@@ -86,6 +106,7 @@ _ENV_SOURCE_NAMES = TEMP_ENV_NAMES | HOME_ENV_NAMES
 _PATH_CLASS_NAMES = {"Path", "pathlib.Path", "pathlib.PosixPath", "pathlib.WindowsPath"}
 _OPEN_MODULES = {"io", "codecs", "builtins", "gzip", "bz2", "lzma"}
 _PATH_WRITERS = {"write_text", "write_bytes"}
+_ZIP_CLASSES = {"ZipFile", "PyZipFile"}
 _FILE_HANDLERS = {
     "FileHandler",
     "RotatingFileHandler",
@@ -162,9 +183,13 @@ def _is_test_module(path: Path) -> bool:
 
 
 def iter_source_files(root: Path) -> Iterator[Path]:
+    # Any virtualenv, whatever its directory is called, carries a pyvenv.cfg.
+    venv_roots = {cfg.parent for cfg in root.rglob("pyvenv.cfg")}
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root)
         if any(part in _SKIP_DIRS for part in rel.parts[:-1]):
+            continue
+        if any(parent in venv_roots for parent in path.parents):
             continue
         if rel.name == "conftest.py" or _is_test_module(path):
             continue
@@ -324,6 +349,18 @@ class _FileScanner:
             path = call.args[0] if call.args else _kwarg(call, "filename")
             mode = call.args[1] if len(call.args) > 1 else _kwarg(call, "mode")
             return path if path is not None and _mode_is_write(mode, "a") else None
+        if name == "basicConfig":
+            path = _kwarg(call, "filename")
+            mode = _kwarg(call, "filemode")
+            return path if path is not None and _mode_is_write(mode, "a") else None
+        if name in _ZIP_CLASSES or (name == "open" and qualifier == "tarfile"):
+            if call.args:
+                path = call.args[0]
+                mode = call.args[1] if len(call.args) > 1 else _kwarg(call, "mode")
+            else:
+                path = _kwarg(call, "file", "name")
+                mode = _kwarg(call, "mode")
+            return path if path is not None and _mode_is_write(mode, "r") else None
         if name != "open":
             return None
         is_module_open = (isinstance(func, ast.Name) and qualifier in (None, *_OPEN_MODULES)) or (
@@ -550,6 +587,30 @@ with open(debug_log_path, "a", encoding="utf-8") as f:
         "import os\nLOG = os.path.join(os.getenv('USERPROFILE'), 'debug.log')\n",
         ["b:log-path"],
     ),
+    "basic_config_filename": (
+        "import logging, tempfile\n"
+        "logging.basicConfig(filename=tempfile.gettempdir() + '/b', level=10)\n",
+        ["a:write"],
+    ),
+    "basic_config_stream_is_fine": (
+        "import logging, sys\nlogging.basicConfig(stream=sys.stderr, level=10)\n",
+        [],
+    ),
+    "basic_config_untainted_file_is_fine": (
+        "import logging\nlogging.basicConfig(filename='run.out')\n",
+        [],
+    ),
+    "tarfile_write": (
+        "import tarfile, tempfile\ntarfile.open(tempfile.gettempdir() + '/a.tgz', 'w:gz')\n",
+        ["a:write"],
+    ),
+    "tarfile_read_is_fine": ("import tarfile\ntarfile.open('/tmp/a.tgz')\n", []),
+    "zipfile_append": (
+        "import zipfile\nfrom pathlib import Path\n"
+        "zipfile.ZipFile(Path.home() / 'a.zip', mode='a')\n",
+        ["a:write"],
+    ),
+    "zipfile_read_is_fine": ("from zipfile import ZipFile\nZipFile('/tmp/a.zip')\n", []),
     "rotating_handler_imported": (
         "from logging.handlers import RotatingFileHandler\nRotatingFileHandler('/tmp/x')\n",
         ["a:write"],
@@ -595,7 +656,17 @@ class C:
         [],
     ),
     "with_target_not_followed": (
-        "import tempfile\nwith tempfile.TemporaryDirectory() as d:\n    open(d + '/x', 'a')\n",
+        "import contextlib, tempfile\n"
+        "with contextlib.nullcontext(tempfile.gettempdir()) as d:\n"
+        "    open(d + '/x', 'a')\n",
+        [],
+    ),
+    "temporary_file_not_followed": (
+        "import tempfile\nwith tempfile.TemporaryFile('w') as f:\n    f.write('x')\n",
+        [],
+    ),
+    "shutil_move_not_followed": (
+        "import shutil, tempfile\nshutil.move('a.log', tempfile.gettempdir())\n",
         [],
     ),
     "mkdtemp_not_followed": (
