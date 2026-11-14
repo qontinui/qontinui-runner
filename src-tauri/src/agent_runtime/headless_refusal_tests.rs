@@ -4,9 +4,10 @@
 //! `remove_unspawned_continuation` arm, and the real remover — against a real
 //! repository and worktree under the isolated ambient workspace root.
 
-use std::collections::HashMap;
+#![cfg(test)]
+
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use super::{run_continuation_headless, AnchorReservation};
 use crate::agent_worktree::isolated_edit::IsolatedEditContext;
@@ -14,27 +15,34 @@ use crate::agent_worktree::remove_unspawned::{
     KeepReason, RemovalReport, TreeOutcome, TreeProvenance,
 };
 
-/// What the continuation remover reported, per allocation (`agent_id`) —
-/// recorded by `remove_unspawned_continuation`, so a test can read which
-/// guard kept a tree when the door itself discards the report.
-static REMOVAL_REPORTS: Mutex<Option<HashMap<String, RemovalReport>>> = Mutex::new(None);
-
-/// Record `report` for allocation `agent_id` (called from
-/// `remove_unspawned_continuation`).
-pub(super) fn record_continuation_removal(agent_id: String, report: RemovalReport) {
-    REMOVAL_REPORTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .insert(agent_id, report);
+tokio::task_local! {
+    /// What the headless arm's removal reported, for the ONE test future that
+    /// scoped this slot ([`refuse_headless`]). Task-local, not a process-global
+    /// map: a test reads only its own run, and nothing outlives the scope.
+    static OBSERVED_REMOVAL: RefCell<Option<Option<RemovalReport>>>;
 }
 
-fn removal_report(agent_id: &str) -> Option<RemovalReport> {
-    REMOVAL_REPORTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_mut()
-        .and_then(|m| m.remove(agent_id))
+/// Called by `run_continuation_headless`'s refusal arm with what
+/// `remove_unspawned_continuation` returned. A no-op outside a test future
+/// that scoped [`OBSERVED_REMOVAL`].
+pub(super) fn observe_removal(report: Option<&RemovalReport>) {
+    let _ = OBSERVED_REMOVAL.try_with(|slot| *slot.borrow_mut() = Some(report.cloned()));
+}
+
+/// The two worktree-root overrides `agent_worktree_root` honours when
+/// absolute. `isolated_ambient` captures and restores them but removes
+/// neither, so an exported one would put the fixture's `git worktree add`
+/// outside its tempdir.
+const WORKTREE_ROOT_OVERRIDES: &[&str] = &["QONTINUI_WORKTREE_ROOT", "COORD_WORKTREE_ROOT"];
+
+/// Remove both overrides for the test's lifetime; the guard restores them on
+/// drop. Taken under the ambient fixture's env lock.
+fn clear_worktree_root_overrides() -> crate::test_env::EnvVarRestore {
+    let restore = crate::test_env::EnvVarRestore::capture(WORKTREE_ROOT_OVERRIDES);
+    for key in WORKTREE_ROOT_OVERRIDES {
+        std::env::remove_var(key);
+    }
+    restore
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -67,7 +75,7 @@ struct Fixture {
     ctx: IsolatedEditContext,
 }
 
-fn fixture(provenance: impl FnOnce(&Path) -> TreeProvenance) -> Fixture {
+fn fixture(sandbox: &Path, provenance: impl FnOnce(&Path) -> TreeProvenance) -> Fixture {
     let ws = crate::workspace_paths::runner_workspace_root()
         .into_root()
         .expect("the isolated ambient workspace root");
@@ -82,6 +90,12 @@ fn fixture(provenance: impl FnOnce(&Path) -> TreeProvenance) -> Fixture {
     let tree = crate::agent_worktree::canonical_paths::agent_worktree_root(&canonical)
         .join(agent_id.to_string())
         .join("canon");
+    assert!(
+        tree.starts_with(sandbox),
+        "the fixture's worktree {} must sit inside its sandbox {}",
+        tree.display(),
+        sandbox.display()
+    );
     let branch = format!("agent/{agent_id}-canon");
     git(
         &canonical,
@@ -142,16 +156,29 @@ fn worktree_listed(canonical: &Path, tree: &Path) -> bool {
         })
 }
 
-async fn refuse_headless(f: Fixture) -> anyhow::Result<super::HeadlessExit> {
-    run_continuation_headless(
-        f.agent_id,
-        &f.tree.to_string_lossy(),
-        "p",
-        AnchorReservation::none(),
-        uuid::Uuid::new_v4(),
-        Some(f.ctx),
-    )
-    .await
+/// Run the refused continuation inside a scoped [`OBSERVED_REMOVAL`] slot and
+/// return its result with what the removal reported (`None` when the arm
+/// never reached the remover).
+async fn refuse_headless(
+    f: Fixture,
+) -> (
+    anyhow::Result<super::HeadlessExit>,
+    Option<Option<RemovalReport>>,
+) {
+    OBSERVED_REMOVAL
+        .scope(RefCell::new(None), async move {
+            let res = run_continuation_headless(
+                f.agent_id,
+                &f.tree.to_string_lossy(),
+                "p",
+                AnchorReservation::none(),
+                uuid::Uuid::new_v4(),
+                Some(f.ctx),
+            )
+            .await;
+            (res, OBSERVED_REMOVAL.with(|slot| slot.borrow_mut().take()))
+        })
+        .await
 }
 
 /// A headless continuation refused by an unresolved model gateway takes its
@@ -159,21 +186,24 @@ async fn refuse_headless(f: Fixture) -> anyhow::Result<super::HeadlessExit> {
 /// worktree list.
 #[tokio::test]
 async fn a_headless_continuation_refused_by_the_gateway_removes_its_fresh_tree() {
-    let _amb = crate::test_env::isolated_ambient();
-    let f = fixture(|canonical| TreeProvenance::FreshWorktree {
+    let amb = crate::test_env::isolated_ambient();
+    let _overrides = clear_worktree_root_overrides();
+    let f = fixture(amb.dir(), |canonical| TreeProvenance::FreshWorktree {
         canonical: canonical.to_path_buf(),
     });
-    let (canonical, tree, agent_id) = (f.canonical.clone(), f.tree.clone(), f.agent_id);
+    let (canonical, tree) = (f.canonical.clone(), f.tree.clone());
     assert!(worktree_listed(&canonical, &tree), "the fixture's worktree is listed");
 
-    let res = refuse_headless(f).await;
+    let (res, observed) = refuse_headless(f).await;
 
     let err = match res {
         Ok(exit) => panic!("an unresolved gateway must refuse the continuation: {exit:?}"),
         Err(e) => format!("{e:#}"),
     };
     assert!(err.contains("model gateway"), "{err}");
-    let report = removal_report(&agent_id.to_string()).expect("the remover ran");
+    let report = observed
+        .expect("the refusal arm reached the remover")
+        .expect("the continuation held a context, so the removal reported");
     assert_eq!(report.trees.len(), 1, "{report:?}");
     assert_eq!(report.trees[0].1, TreeOutcome::Removed, "{report:?}");
     assert!(!tree.exists(), "the fresh, unspawned tree was removed");
@@ -187,18 +217,21 @@ async fn a_headless_continuation_refused_by_the_gateway_removes_its_fresh_tree()
 /// the tree — still on disk, still listed — and says why (`NotFresh`).
 #[tokio::test]
 async fn a_headless_continuation_refused_by_the_gateway_keeps_a_shared_branch_tree() {
-    let _amb = crate::test_env::isolated_ambient();
-    let f = fixture(|_| TreeProvenance::SharedBranch);
-    let (canonical, tree, agent_id) = (f.canonical.clone(), f.tree.clone(), f.agent_id);
+    let amb = crate::test_env::isolated_ambient();
+    let _overrides = clear_worktree_root_overrides();
+    let f = fixture(amb.dir(), |_| TreeProvenance::SharedBranch);
+    let (canonical, tree) = (f.canonical.clone(), f.tree.clone());
 
-    let res = refuse_headless(f).await;
+    let (res, observed) = refuse_headless(f).await;
 
     let err = match res {
         Ok(exit) => panic!("an unresolved gateway must refuse the continuation: {exit:?}"),
         Err(e) => format!("{e:#}"),
     };
     assert!(err.contains("model gateway"), "{err}");
-    let report = removal_report(&agent_id.to_string()).expect("the remover ran");
+    let report = observed
+        .expect("the refusal arm reached the remover")
+        .expect("the continuation held a context, so the removal reported");
     assert_eq!(report.trees.len(), 1, "{report:?}");
     assert!(
         matches!(&report.trees[0].1, TreeOutcome::Kept(KeepReason::NotFresh(_))),

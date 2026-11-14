@@ -8265,20 +8265,20 @@ const CONTINUATION_DOOR: &str = "gate continuation";
 /// Phase 3). Awaited BEFORE the caller's own spawn-failed post, which is the
 /// allocation's one report — the context's `agent_id` is the continuation's —
 /// so this removes and never reports. `child_started == true` keeps every
-/// tree (logged). `None` (no worktree acquired) does nothing.
+/// tree (logged). `None` (no worktree acquired) does nothing and returns
+/// `None`; otherwise the removal's report is returned, which a door may
+/// ignore — the removal has already logged every tree's outcome.
 async fn remove_unspawned_continuation(
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     child_started: bool,
     reason: &str,
-) {
-    if let Some(ctx) = ctx {
-        #[cfg(test)]
-        let agent_id = ctx.agent_id.clone();
-        let _report = ctx
-            .remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
-            .await;
-        #[cfg(test)]
-        headless_refusal_tests::record_continuation_removal(agent_id, _report);
+) -> Option<crate::agent_worktree::remove_unspawned::RemovalReport> {
+    match ctx {
+        Some(ctx) => Some(
+            ctx.remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
+                .await,
+        ),
+        None => None,
     }
 }
 
@@ -9711,7 +9711,9 @@ async fn run_continuation_headless(
             // checks run before the spawn, and `spawn_tokio_with_retry` errs
             // only when no attempt produced a child (a spawned child is its
             // `Ok`). So the fresh tree is removed before the one report.
-            remove_unspawned_continuation(ctx, false, &reason).await;
+            let _removal = remove_unspawned_continuation(ctx, false, &reason).await;
+            #[cfg(test)]
+            headless_refusal_tests::observe_removal(_removal.as_ref());
             report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
             Err(e)
         }
