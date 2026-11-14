@@ -57,8 +57,9 @@ vi.mock("@/lib/pageBindings", () => ({ setPageBindings: vi.fn() }));
 
 // Imported after the mocks are registered (vi.mock is hoisted).
 const { invoke } = await import("@tauri-apps/api/core");
-const { MAIN_WINDOW_LABEL, bindingsFromWindows, isOwnedBy, ownedTabs, ownerOfSession } =
+const { bindingsFromWindows, isOwnedBy, ownedTabs, ownerOfSession } =
   await import("./WindowAssignmentsContext");
+const { MAIN_WINDOW_LABEL } = await import("./windowLabel");
 
 /** Read the snapshot the way the provider's `refresh()` does. */
 async function loadState() {

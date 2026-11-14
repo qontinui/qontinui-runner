@@ -67,7 +67,8 @@ import {
   type RefObject,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useWindowAssignments, ownedTabs, MAIN_WINDOW_LABEL } from "./WindowAssignmentsContext";
+import { useWindowAssignments, ownedTabs } from "./WindowAssignmentsContext";
+import { MAIN_WINDOW_LABEL } from "./windowLabel";
 import {
   subscribeTerminalOutputStream,
   subscribeTerminalActivityStream,

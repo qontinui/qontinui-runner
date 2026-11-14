@@ -261,6 +261,7 @@ pub mod task_sync; // renamed from ai_task_reporting
 pub mod tenant; // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 — active tenant resolver + per-machine pin
 pub mod terminal;
 pub mod terminal_analysis; // Terminal session analysis (session summary, architecture, change impact, etc.)
+pub mod terminal_pages; // The webview registers its tab labels + order (plan 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days, D2)
 pub mod terminal_windows; // Pop-out terminal windows: open/close/move-session + assignment events (Phase 1)
 pub mod test_orchestrator; // AI-driven multi-step API test orchestration
 pub mod testing;
