@@ -1262,7 +1262,7 @@ impl MultiAgentPipelineResult {
         } else {
             format!(
                 "Pipeline ended: {}/{} criteria passed after {} iteration(s)",
-                self.passed_criteria, self.total_iterations, self.total_criteria
+                self.passed_criteria, self.total_criteria, self.total_iterations
             )
         }
     }
@@ -1494,6 +1494,19 @@ mod tests {
         assert_eq!(
             result.summary(),
             "No acceptance criteria derived — nothing to verify, which is not a pass"
+        );
+    }
+
+    /// The fallthrough summary names passed/total criteria, then iterations
+    /// (the format arguments were once passed iterations-then-total).
+    #[test]
+    fn a_pipeline_that_ended_short_names_criteria_then_iterations() {
+        let mut result = pipeline_result(5, false);
+        result.passed_criteria = 2;
+        result.total_iterations = 7;
+        assert_eq!(
+            result.summary(),
+            "Pipeline ended: 2/5 criteria passed after 7 iteration(s)"
         );
     }
 
