@@ -2071,7 +2071,7 @@ const ACK_UNKNOWN_LINE: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SampleAck {
     /// The documented outcome naming no loss: coord stored `persisted` of the
-    /// `sent` lanes.
+    /// `sent` lanes, and `persisted` is not fewer than `sent`.
     Stored { persisted: u64, sent: usize },
     /// The documented outcome naming what coord did NOT store.
     Problems(Vec<String>),
@@ -2081,7 +2081,9 @@ pub(crate) enum SampleAck {
     Unknown,
 }
 
-/// Classify a 2xx body (`None` = it could not be read) for `sent` lanes. PURE.
+/// Classify a 2xx body (`None` = it could not be read) for `sent` lanes. A
+/// clean body that persisted fewer lanes than were sent is a loss, not a
+/// store. PURE.
 pub(crate) fn sample_ack(body: Option<&str>, sent: usize) -> SampleAck {
     let Some(body) = body else {
         return SampleAck::Unknown;
@@ -2092,9 +2094,14 @@ pub(crate) fn sample_ack(body: Option<&str>, sent: usize) -> SampleAck {
         Some(_) => serde_json::from_str::<serde_json::Value>(body)
             .ok()
             .and_then(|v| v.get("persisted")?.as_u64())
-            .map_or(SampleAck::Unknown, |persisted| SampleAck::Stored {
-                persisted,
-                sent,
+            .map_or(SampleAck::Unknown, |persisted| {
+                if persisted < sent as u64 {
+                    SampleAck::Problems(vec![format!(
+                        "coord persisted {persisted} of {sent} sent sample(s)"
+                    )])
+                } else {
+                    SampleAck::Stored { persisted, sent }
+                }
             }),
     }
 }
@@ -2352,6 +2359,20 @@ mod tests {
         assert_eq!(
             sample_ack_line(&ack).as_deref(),
             Some("coord stored 2/2 lane(s)")
+        );
+
+        // Review A2: a body naming no loss of its own but persisting fewer
+        // lanes than were sent is a loss, never a debug "stored" line — and
+        // its key masks the numbers, so a steady shortfall is logged once.
+        let short = sample_ack(Some(r#"{"persisted":1}"#), 2);
+        assert_eq!(
+            short,
+            SampleAck::Problems(vec!["coord persisted 1 of 2 sent sample(s)".to_string()])
+        );
+        assert_eq!(sample_ack_line(&short), None);
+        assert_eq!(
+            ack_problems_key(&["coord persisted 1 of 2 sent sample(s)".to_string()]),
+            ack_problems_key(&["coord persisted 3 of 4 sent sample(s)".to_string()])
         );
 
         let lossy = r#"{"received":2,"accepted":2,"persisted":1}"#;

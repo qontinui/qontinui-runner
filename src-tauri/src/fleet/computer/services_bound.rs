@@ -16,11 +16,17 @@
 //! over" only when coord served fewer events than its `EVENTS_LIMIT`; at the
 //! limit it is UNKNOWN.
 //!
-//! The cut and the over-bound decision are ONE computation
-//! ([`cut_to_bound`]), so the event can never name a kind the report did not
-//! truncate. The decision is taken from the OBSERVED scan, never from a
-//! delta's own (smaller) list: a delta of 44 changed rows says nothing about
-//! whether the computer still watches 300 units.
+//! What the event says: the named kinds exceed coord's bound on this
+//! computer, so every FULL report truncates them and coord cannot apply
+//! removals of them. It does not say the report it rides was truncated — a
+//! delta carrying it may list only a few changed rows. The decision uses the
+//! same cut ([`cut_to_bound`]) as `presanitize`, but over the OBSERVED scan,
+//! never a delta's own (smaller) list: a delta of 44 changed rows says nothing
+//! about whether the computer still watches 300 units.
+//!
+//! A PARTIAL scan (a bus that did not answer, a truncated `sc query`) cannot
+//! say a kind it did not see completely is back within the bound, so a kind
+//! already over stays over until a scan sees that kind completely.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -108,15 +114,23 @@ pub(crate) enum OverBound {
 impl OverBound {
     /// Advance on one tick's observation. `cut` is [`services_cut`] of the
     /// observed scan, or `None` when the scan produced no service information
-    /// — which keeps the previous state and does nothing. PURE.
+    /// — which keeps the previous state and does nothing. `complete_kinds`
+    /// are the kinds that scan saw completely: a kind already over that the
+    /// scan did NOT see completely stays over, since a partial scan's smaller
+    /// count is not evidence it shrank. PURE.
     pub(crate) fn step(
         &self,
         cut: Option<&BTreeSet<&'static str>>,
+        complete_kinds: &[&'static str],
         now: chrono::DateTime<chrono::Utc>,
     ) -> (OverBound, Vec<Action>) {
         let Some(cut) = cut else {
             return (self.clone(), Vec::new());
         };
+        let mut cut = cut.clone();
+        if let OverBound::Over { kinds, .. } = self {
+            cut.extend(kinds.iter().filter(|k| !complete_kinds.contains(k)));
+        }
         let entered = || OverBound::Over {
             kinds: cut.clone(),
             emitted_at: now,
@@ -125,7 +139,7 @@ impl OverBound {
             OverBound::Within if cut.is_empty() => (OverBound::Within, Vec::new()),
             OverBound::Within => (entered(), vec![Action::Emit, Action::Warn]),
             OverBound::Over { .. } if cut.is_empty() => (OverBound::Within, vec![Action::Info]),
-            OverBound::Over { kinds, .. } if kinds != cut => {
+            OverBound::Over { kinds, .. } if *kinds != cut => {
                 (entered(), vec![Action::Emit, Action::Warn])
             }
             OverBound::Over { emitted_at, .. }
@@ -201,6 +215,9 @@ mod tests {
         kinds.iter().copied().collect()
     }
 
+    /// A scan that saw both kinds completely.
+    const ALL: &[&str] = &["gh_actions_runner", "qontinui_runner"];
+
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(s)
             .unwrap()
@@ -266,11 +283,11 @@ mod tests {
         let none = BTreeSet::new();
 
         // Within, staying within: nothing.
-        let (s, a) = OverBound::Within.step(Some(&none), t0);
+        let (s, a) = OverBound::Within.step(Some(&none), ALL, t0);
         assert_eq!((s, a), (OverBound::Within, vec![]));
 
         // Enter: event + WARN.
-        let (s1, a) = OverBound::Within.step(Some(&gh_only), t0);
+        let (s1, a) = OverBound::Within.step(Some(&gh_only), ALL, t0);
         assert_eq!(a, vec![Action::Emit, Action::Warn]);
         assert_eq!(
             s1,
@@ -282,19 +299,19 @@ mod tests {
 
         // Same kinds on the next tick: nothing.
         let t1 = at("2026-11-14T00:00:30Z");
-        let (s2, a) = s1.step(Some(&gh_only), t1);
+        let (s2, a) = s1.step(Some(&gh_only), ALL, t1);
         assert_eq!(a, vec![]);
         assert_eq!(s2, s1, "the emit clock does not move without an emit");
 
         // Changed kinds: event + WARN.
-        let (s3, a) = s2.step(Some(&both), t1);
+        let (s3, a) = s2.step(Some(&both), ALL, t1);
         assert_eq!(a, vec![Action::Emit, Action::Warn]);
 
         // Just under 24 h later: nothing; at 24 h: event, no WARN.
-        let (s4, a) = s3.step(Some(&both), at("2026-11-14T23:59:59Z"));
+        let (s4, a) = s3.step(Some(&both), ALL, at("2026-11-14T23:59:59Z"));
         assert_eq!(a, vec![]);
         let day = at("2026-11-15T00:00:30Z");
-        let (s5, a) = s4.step(Some(&both), day);
+        let (s5, a) = s4.step(Some(&both), ALL, day);
         assert_eq!(a, vec![Action::Emit]);
         assert_eq!(
             s5,
@@ -305,18 +322,50 @@ mod tests {
         );
 
         // Back within: INFO, no event.
-        let (s6, a) = s5.step(Some(&none), day);
+        let (s6, a) = s5.step(Some(&none), ALL, day);
         assert_eq!((s6, a), (OverBound::Within, vec![Action::Info]));
 
         // Over → no scan → over: the gap holds the state, so no INFO and no
         // second event.
-        let (o, _) = OverBound::Within.step(Some(&gh_only), t0);
-        let (held, a) = o.step(None, t1);
+        let (o, _) = OverBound::Within.step(Some(&gh_only), ALL, t0);
+        let (held, a) = o.step(None, ALL, t1);
         assert_eq!(a, vec![]);
         assert_eq!(held, o);
-        let (again, a) = held.step(Some(&gh_only), t1);
+        let (again, a) = held.step(Some(&gh_only), ALL, t1);
         assert_eq!(a, vec![]);
         assert_eq!(again, o);
+    }
+
+    /// Review A1: a PARTIAL scan (a bus that did not answer, a truncated
+    /// `sc query`) that happens to list fewer than 256 units must not read as
+    /// "back within" — the next complete scan would re-enter, and the state
+    /// would flap with an INFO and a fresh event every time.
+    #[test]
+    fn a_partial_scan_under_the_bound_does_not_read_as_back_within() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let t1 = at("2026-11-14T00:00:30Z");
+        let t2 = at("2026-11-14T00:01:00Z");
+        let gh_only = set(&["gh_actions_runner"]);
+        let (over, _) = OverBound::Within.step(Some(&gh_only), ALL, t0);
+
+        // Over → partial scan under 256 (the GitHub-runner kind not seen
+        // completely) → over: no INFO, and no second event.
+        let (held, a) = over.step(Some(&BTreeSet::new()), &["qontinui_runner"], t1);
+        assert_eq!(a, vec![], "a partial scan cannot say the kind shrank");
+        assert_eq!(held, over);
+        let (again, a) = held.step(Some(&gh_only), ALL, t2);
+        assert_eq!(a, vec![]);
+        assert_eq!(again, over);
+
+        // A partial scan that drops one of two over kinds is no change either.
+        let both = set(&["gh_actions_runner", "qontinui_runner"]);
+        let (two, _) = OverBound::Within.step(Some(&both), ALL, t0);
+        let (kept, a) = two.step(Some(&gh_only), &["gh_actions_runner"], t1);
+        assert_eq!((kept, a), (two, vec![]));
+
+        // A scan that saw the kind completely may say it is back within.
+        let (within, a) = over.step(Some(&BTreeSet::new()), &["gh_actions_runner"], t1);
+        assert_eq!((within, a), (OverBound::Within, vec![Action::Info]));
     }
 
     #[test]

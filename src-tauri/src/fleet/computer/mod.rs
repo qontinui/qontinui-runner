@@ -528,10 +528,9 @@ fn too_long(v: &Option<String>) -> bool {
 /// lost rows leave `services_complete_kinds` — a truncated kind claimed
 /// complete would make coord delete the stored rows it omits, while a kind
 /// sent whole keeps its deletions. The cut rows are absent from `last_sent`,
-/// so the next delta carries them. Returns how many services the cap deferred. Timestamps are NOT
-/// checked here: coord is the authority on "now" and clamps a future
+/// so the next delta carries them. Timestamps are NOT checked here: coord is the authority on "now" and clamps a future
 /// timestamp itself (contract amendment A3). PURE.
-pub(crate) fn presanitize(c: &mut ComputerReport) -> usize {
+pub(crate) fn presanitize(c: &mut ComputerReport) {
     for f in [
         &mut c.hostname,
         &mut c.os,
@@ -544,12 +543,9 @@ pub(crate) fn presanitize(c: &mut ComputerReport) -> usize {
             *f = None;
         }
     }
-    let mut over_cap = 0;
     if let Some(rows) = c.services.as_mut() {
         rows.retain(services_bound::sendable);
-        let before = rows.len();
         let cut = services_bound::cut_to_bound(rows);
-        over_cap = before - rows.len();
         c.services_complete_kinds
             .retain(|k| !cut.contains(k.as_str()));
         for r in rows.iter_mut() {
@@ -568,7 +564,6 @@ pub(crate) fn presanitize(c: &mut ComputerReport) -> usize {
             }
         }
     }
-    over_cap
 }
 
 /// The fallback after a 422 that named no event: the same report with the
@@ -1032,25 +1027,31 @@ impl Reporter {
                 .map(|u| u.iter().map(|w| w.row.clone()).collect());
             let cut = observed_rows.as_deref().map(services_bound::services_cut);
             let previous = self.over_bound.get(id).cloned().unwrap_or_default();
-            let (next_bound, actions) = previous.step(cut.as_ref(), now);
+            let (next_bound, actions) = previous.step(cut.as_ref(), &o.scan.complete_kinds, now);
+            let over_kinds = match &next_bound {
+                services_bound::OverBound::Over { kinds, .. } => kinds.clone(),
+                services_bound::OverBound::Within => std::collections::BTreeSet::new(),
+            };
             let rows = observed_rows.as_deref().unwrap_or_default();
             let counts = services_bound::kind_counts(rows);
             let total: usize = counts.values().sum();
             for action in actions {
                 match action {
                     services_bound::Action::Emit => {
-                        let truncated = cut.clone().unwrap_or_default();
                         evs.push(services_bound::over_bound_event(
-                            id, &counts, &truncated, now,
+                            id,
+                            &counts,
+                            &over_kinds,
+                            now,
                         ));
                     }
                     services_bound::Action::Warn => warn!(
                         "fleet::computer: computer {} watches {total} services, over coord's \
-                         bound of {MAX_SERVICES_PER_COMPUTER}; the report cuts kind(s) {:?} to \
+                         bound of {MAX_SERVICES_PER_COMPUTER}; full reports cut kind(s) {:?} to \
                          fit, and coord does not apply removals of those kinds while they stay \
                          over (a services_over_bound telemetry_gap records it)",
                         short_id(id),
-                        cut.clone().unwrap_or_default(),
+                        over_kinds,
                     ),
                     services_bound::Action::Info => info!(
                         "fleet::computer: computer {} watches {total} services, back within \
@@ -1069,6 +1070,9 @@ impl Reporter {
         if pruned > 0 {
             debug!("fleet::computer: forgot {pruned} computer(s) unseen for a week");
         }
+        // A forgotten computer's over-bound state goes with it.
+        self.over_bound
+            .retain(|id, _| state.computers.contains_key(id));
     }
 
     /// This tick's report, ready to send: each observed computer's full or
@@ -1716,7 +1720,7 @@ mod tests {
         ];
 
         let mut c = plan_computer(&obs, true, None, &[]).unwrap();
-        assert_eq!(presanitize(&mut c), 3);
+        presanitize(&mut c);
         let rows = c.services.as_ref().unwrap();
         assert_eq!(rows.len(), MAX_SERVICES_PER_COMPUTER);
         assert!(
@@ -1761,7 +1765,11 @@ mod tests {
                 .map(|i| unit(format!("actions.runner.r{i}.service")).row)
                 .collect(),
         );
-        assert_eq!(presanitize(&mut ok), 0);
+        presanitize(&mut ok);
+        assert_eq!(
+            ok.services.as_ref().map(Vec::len),
+            Some(MAX_SERVICES_PER_COMPUTER)
+        );
         assert_eq!(ok.services_complete_kinds, kinds);
     }
 
@@ -1833,6 +1841,40 @@ mod tests {
                 Some(services_bound::OverBound::Over { .. })
             ),
             "a 44-row delta must not read as back within the bound"
+        );
+    }
+
+    /// Review A3: when `events::prune` forgets a computer, its over-bound
+    /// state is forgotten with it rather than kept for the process lifetime.
+    #[test]
+    fn a_forgotten_computer_takes_its_over_bound_state_with_it() {
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(ObserverState::default());
+        let gone = "c".repeat(64);
+        r.over_bound.insert(
+            gone.clone(),
+            services_bound::OverBound::Over {
+                kinds: [services::KIND_GH_ACTIONS_RUNNER].into_iter().collect(),
+                emitted_at: at("2026-11-01T00:00:00Z"),
+            },
+        );
+        let obs = observed(svc::HEALTHY_SHOW);
+        r.derive_events(
+            std::slice::from_ref(&obs),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        assert!(
+            !r.over_bound.contains_key(&gone),
+            "{:?}",
+            r.over_bound.keys()
+        );
+        assert_eq!(
+            r.over_bound.get(HOST_ID),
+            Some(&services_bound::OverBound::Within)
         );
     }
 
@@ -2221,11 +2263,14 @@ mod tests {
     }
 
     /// Phase 3: no blocking body escapes the house wrapper's lane accounting.
+    /// The banned substring is the bare `spawn_blocking(`, which
+    /// `spawn_blocking_tracked(` does not contain, so neither the
+    /// `tokio::task::` spelling nor an imported `spawn_blocking(` passes.
     #[test]
     fn the_reporter_never_spawns_an_untracked_blocking_body() {
         for (name, src) in REPORTER_SOURCES {
             assert!(
-                !prod_part(src).contains("tokio::task::spawn_blocking("),
+                !prod_part(src).contains("spawn_blocking("),
                 "{name} spawns an untracked blocking body"
             );
         }
