@@ -9,21 +9,44 @@ sanctioned routes are ``EventManager.emit_log`` and a module
 ``logging.getLogger(__name__)`` logger.
 
 This is a source scan (``ast``, stdlib only), so it runs in the command-table CI
-job without the qontinui library. It flags, in every non-test ``*.py`` under
-python-bridge:
+job without the qontinui library. It scans every non-test ``*.py`` under
+python-bridge.
 
-(a) a write (``open``/``io.open``/``codecs.open`` or ``<path>.open`` in a
-    w/a/x/+ mode, or ``<path>.write_text``/``write_bytes``) whose path
-    expression references ``gettempdir()``, the ``TEMP``/``TMP``/``TMPDIR``
-    environment names, a ``"/tmp"`` literal or ``expanduser("~...")``.
-    A bare name in the path is resolved through its assignments in the
-    enclosing function, every enclosing function (closures) and the module,
-    because nearly every historical site reached ``open()`` through a variable
-    such as ``debug_log_path``;
-(b) an assignment whose value calls one of those sources and also contains a
-    ``.log`` string literal (a log path parked in a variable or constant).
+**Sources** (a temp or home path):
 
-Legitimate temp-dir uses are allow-listed by ``file:function`` below.
+- ``gettempdir()``;
+- the ``TEMP`` / ``TMP`` / ``TMPDIR`` environment names, and a ``"/tmp"`` literal;
+- ``expanduser("~...")``, ``Path.home()``, and ``<x>.expanduser()`` whose
+  receiver contains a ``"~"`` literal (``Path("~/x").expanduser()``).
+
+Imports are resolved per file, so ``from tempfile import gettempdir as g`` makes
+``g()`` a source and ``from pathlib import Path as P`` makes ``P.home()`` one.
+
+**Sinks** (a write):
+
+- ``open`` / ``io.open`` / ``codecs.open`` / ``gzip.open`` / ``bz2.open`` /
+  ``lzma.open`` (path as ``args[0]`` or ``file=``/``filename=``) in a w/a/x/+ mode;
+- ``<path>.open(mode)`` in such a mode, and ``<path>.write_text`` /
+  ``<path>.write_bytes``;
+- ``logging.FileHandler`` and its rotating/watched subclasses (append by default).
+
+**Arms.** (a) a sink whose path expression reaches a source. A bare name in the
+path is resolved through its assignments in the enclosing function, every
+enclosing function (closures) and the module, because nearly every historical
+site reached ``open()`` through a variable such as ``debug_log_path``.
+(b) an assignment whose value contains a source and a ``.log`` string literal
+(a log path parked in a variable or constant).
+
+**Known limits** (not followed, so not caught): a path stored on an attribute
+(``self.log_path = ...`` then ``open(self.log_path, "a")``), a path returned by a
+helper function, and a path passed in as a parameter. Arm (b) still catches the
+first two when the assignment builds a ``.log`` path from a source. The
+``self_attribute_not_followed`` shape below pins that limit, so widening the
+scanner shows up as a deliberate test change.
+
+Legitimate temp-dir writes are allow-listed by (file, function, arm, path
+expression), so a NEW write inside an allow-listed function is still flagged.
+A temp dir used only as a subprocess cwd is not a write and needs no entry.
 """
 
 from __future__ import annotations
@@ -40,20 +63,54 @@ BRIDGE_ROOT = Path(__file__).resolve().parent.parent
 _SKIP_DIRS = {"tests", ".venv", "venv", "build", "dist", "__pycache__", ".pytest_cache"}
 
 TEMP_ENV_NAMES = {"TEMP", "TMP", "TMPDIR"}
-_OPEN_FUNCS = {"open"}  # builtin / io.open / codecs.open: path is args[0]
+_OPEN_MODULES = {"io", "codecs", "builtins", "gzip", "bz2", "lzma"}
 _PATH_WRITERS = {"write_text", "write_bytes"}
-
-# file:function -> why the write is not a debug log. Every entry must name a
-# function that exists (checked below), so the list cannot silently rot.
-ALLOWLIST: dict[str, str] = {
-    # Windows Claude CLI path: the prompt is handed to PowerShell via a temp file.
-    "services/claude_cli_runner.py:_run_native_windows_stdin": "prompt temp file",
-    # Temp dir used as the CLI's cwd so it picks up no CLAUDE.md (no write).
-    "services/ai_builder_generator.py:generate_via_claude_cli": "temp dir as CLI cwd",
-    "services/ai_shell_command_generator.py:generate_command_via_claude_cli": (
-        "temp dir as CLI cwd"
-    ),
+_FILE_HANDLERS = {
+    "FileHandler",
+    "RotatingFileHandler",
+    "TimedRotatingFileHandler",
+    "WatchedFileHandler",
 }
+
+
+@dataclass(frozen=True)
+class AllowEntry:
+    path: str
+    function: str  # qualname as the scanner reports it
+    arm: str
+    expr: str  # ast.unparse of the flagged path expression / assignment target
+    why: str
+
+
+# Every entry must still match a live raw offender (checked below), so the list
+# cannot silently rot, and it is narrow enough that a second write in the same
+# function is still reported.
+ALLOWLIST: tuple[AllowEntry, ...] = (
+    AllowEntry(
+        "services/claude_cli_runner.py",
+        "_run_native_windows_stdin",
+        "a:write",
+        "prompt_file",
+        "Windows Claude CLI path: the prompt is handed to PowerShell via a temp file",
+    ),
+    # The QA-results store under ~/.automation-results (AUTOMATION_RESULTS_DIR =
+    # Path.home() / ...): a bounded, read-back product artifact (the same module's
+    # readers load it), not a debug side log.
+    AllowEntry(
+        "automation_results.py",
+        "save_automation_results",
+        "a:write",
+        "execution_file",
+        "QA-results store: latest execution.json",
+    ),
+    AllowEntry(
+        "automation_results.py",
+        "save_automation_results",
+        "a:write",
+        "dst_log",
+        "QA-results store: copies of the run's dev logs beside execution.json",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -62,9 +119,10 @@ class Offender:
     line: int
     function: str
     arm: str
+    expr: str
 
     def __str__(self) -> str:
-        return f"{self.path}:{self.line} in {self.function} [{self.arm}]"
+        return f"{self.path}:{self.line} in {self.function} [{self.arm}] {self.expr}"
 
 
 def iter_source_files(root: Path) -> Iterator[Path]:
@@ -77,43 +135,26 @@ def iter_source_files(root: Path) -> Iterator[Path]:
         yield path
 
 
-def _call_name(func: ast.expr) -> str | None:
-    if isinstance(func, ast.Name):
-        return func.id
-    if isinstance(func, ast.Attribute):
-        return func.attr
+def _str_const(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
     return None
 
 
-def _is_direct_source(node: ast.AST) -> bool:
-    """True if ``node`` itself is one of the temp/home path sources."""
-    if isinstance(node, ast.Call):
-        name = _call_name(node.func)
-        if name == "gettempdir":
-            return True
-        if (
-            name == "expanduser"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and node.args[0].value.startswith("~")
-        ):
-            return True
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        value = node.value
-        return value in TEMP_ENV_NAMES or value == "/tmp" or value.startswith("/tmp/")
-    return False
+def _kwarg(call: ast.Call, *names: str) -> ast.expr | None:
+    for kw in call.keywords:
+        if kw.arg in names:
+            return kw.value
+    return None
 
 
-def _contains_source(expr: ast.AST) -> bool:
-    return any(_is_direct_source(n) for n in ast.walk(expr))
-
-
-def _contains_log_literal(expr: ast.AST) -> bool:
-    return any(
-        isinstance(n, ast.Constant) and isinstance(n.value, str) and ".log" in n.value
-        for n in ast.walk(expr)
-    )
+def _mode_is_write(mode: ast.expr | None, default: str) -> bool:
+    if mode is None:
+        return any(c in default for c in "wax+")
+    value = _str_const(mode)
+    if value is not None:
+        return any(c in value for c in "wax+")
+    return True  # a computed mode may write; the path test still has to match
 
 
 Scope = dict[str, list[ast.expr]]
@@ -146,108 +187,178 @@ def _collect_assignments(body_owner: ast.AST) -> Scope:
     return scope
 
 
-def _tainted(expr: ast.AST, scopes: list[Scope], seen: frozenset[str] = frozenset()) -> bool:
-    """True if ``expr`` reaches a temp/home source, resolving names through ``scopes``."""
-    if _contains_source(expr):
-        return True
-    for node in ast.walk(expr):
-        if isinstance(node, ast.Name) and node.id not in seen:
-            for scope in scopes:
-                for value in scope.get(node.id, ()):
-                    if _tainted(value, scopes, seen | {node.id}):
-                        return True
-    return False
+def _import_aliases(tree: ast.AST) -> dict[str, tuple[str, str]]:
+    """Local name -> (module, imported name), for every ``from m import n [as a]``.
+
+    ``import m as a`` maps ``a`` to ``(m, "")``. Collected file-wide: an import in a
+    function body is treated as visible everywhere, which only over-reports.
+    """
+    aliases: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = (node.module, alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    aliases[alias.asname] = (alias.name, "")
+    return aliases
 
 
-def _mode_is_write(mode: ast.expr | None, default: str) -> bool:
-    if mode is None:
-        return any(c in default for c in "wax+")
-    if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
-        return any(c in mode.value for c in "wax+")
-    return True  # a computed mode may write; the path test still has to match
+class _FileScanner:
+    def __init__(self, tree: ast.Module, rel_path: str) -> None:
+        self.tree = tree
+        self.rel_path = rel_path
+        self.aliases = _import_aliases(tree)
+        self.offenders: list[Offender] = []
 
+    # -- names -------------------------------------------------------------
+    def _canonical(self, func: ast.expr) -> tuple[str | None, str | None]:
+        """(module-ish qualifier, final name) of a call target, resolving imports."""
+        if isinstance(func, ast.Name):
+            module, name = self.aliases.get(func.id, (None, func.id))
+            return module, name or func.id
+        if isinstance(func, ast.Attribute):
+            receiver = func.value
+            qualifier = None
+            if isinstance(receiver, ast.Name):
+                # `from pathlib import Path as P` -> "Path"; `import gzip as gz` -> "gzip"
+                module, name = self.aliases.get(receiver.id, (None, receiver.id))
+                qualifier = name or module
+            return qualifier, func.attr
+        return None, None
 
-def _kwarg(call: ast.Call, name: str) -> ast.expr | None:
-    for kw in call.keywords:
-        if kw.arg == name:
-            return kw.value
-    return None
+    # -- sources -----------------------------------------------------------
+    def _is_direct_source(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Call):
+            qualifier, name = self._canonical(node.func)
+            if name == "gettempdir":
+                return True
+            if name == "home" and qualifier == "Path":
+                return True
+            if name == "expanduser":
+                if node.args and (_str_const(node.args[0]) or "").startswith("~"):
+                    return True
+                if (
+                    not node.args
+                    and isinstance(node.func, ast.Attribute)
+                    and any(
+                        (_str_const(n) or "").startswith("~") for n in ast.walk(node.func.value)
+                    )
+                ):
+                    return True
+        value = _str_const(node)
+        if value is not None:
+            return value in TEMP_ENV_NAMES or value == "/tmp" or value.startswith("/tmp/")
+        return False
 
+    def _contains_source(self, expr: ast.AST) -> bool:
+        return any(self._is_direct_source(n) for n in ast.walk(expr))
 
-def _write_target(call: ast.Call) -> ast.expr | None:
-    """The path expression of a write call, or None if ``call`` is not a write."""
-    func = call.func
-    name = _call_name(func)
-    if name in _PATH_WRITERS and isinstance(func, ast.Attribute):
-        return func.value
-    if name not in _OPEN_FUNCS:
-        return None
-    is_module_open = isinstance(func, ast.Name) or (
-        isinstance(func, ast.Attribute)
-        and isinstance(func.value, ast.Name)
-        and func.value.id in {"io", "codecs", "builtins"}
-    )
-    if is_module_open:
-        if not call.args:
-            path = _kwarg(call, "file")
-            mode = _kwarg(call, "mode")
-        else:
-            path = call.args[0]
+    def _tainted(self, expr: ast.AST, scopes: list[Scope], seen: frozenset[str]) -> bool:
+        if self._contains_source(expr):
+            return True
+        for node in ast.walk(expr):
+            if isinstance(node, ast.Name) and node.id not in seen:
+                for scope in scopes:
+                    for value in scope.get(node.id, ()):
+                        if self._tainted(value, scopes, seen | {node.id}):
+                            return True
+        return False
+
+    # -- sinks -------------------------------------------------------------
+    def _write_target(self, call: ast.Call) -> ast.expr | None:
+        """The path expression of a write call, or None if ``call`` is not a write."""
+        func = call.func
+        qualifier, name = self._canonical(func)
+        if name in _PATH_WRITERS and isinstance(func, ast.Attribute):
+            return func.value
+        if name in _FILE_HANDLERS:
+            path = call.args[0] if call.args else _kwarg(call, "filename")
             mode = call.args[1] if len(call.args) > 1 else _kwarg(call, "mode")
-        return path if path is not None and _mode_is_write(mode, "r") else None
-    if isinstance(func, ast.Attribute) and not (
-        isinstance(func.value, ast.Name) and func.value.id == "os"
-    ):
-        # Path(...).open(mode)
-        mode = call.args[0] if call.args else _kwarg(call, "mode")
-        return func.value if _mode_is_write(mode, "r") else None
-    return None
+            return path if path is not None and _mode_is_write(mode, "a") else None
+        if name != "open":
+            return None
+        is_module_open = (isinstance(func, ast.Name) and qualifier in (None, *_OPEN_MODULES)) or (
+            isinstance(func, ast.Attribute) and qualifier in _OPEN_MODULES
+        )
+        if is_module_open:
+            if call.args:
+                path = call.args[0]
+                mode = call.args[1] if len(call.args) > 1 else _kwarg(call, "mode")
+            else:
+                path = _kwarg(call, "file", "filename")
+                mode = _kwarg(call, "mode")
+            return path if path is not None and _mode_is_write(mode, "r") else None
+        if isinstance(func, ast.Attribute) and qualifier != "os":
+            # <path>.open(mode)
+            mode = call.args[0] if call.args else _kwarg(call, "mode")
+            return func.value if _mode_is_write(mode, "r") else None
+        return None
 
+    # -- walk --------------------------------------------------------------
+    def _flag(self, node: ast.AST, qualname: str, arm: str, expr: ast.AST) -> None:
+        self.offenders.append(
+            Offender(self.rel_path, node.lineno, qualname, arm, ast.unparse(expr))
+        )
 
-def scan_source(source: str, rel_path: str) -> list[Offender]:
-    tree = ast.parse(source, filename=rel_path)
-    offenders: list[Offender] = []
-    module_scope = _collect_assignments(tree)
-
-    def visit(owner: ast.AST, qualname: str, scopes: list[Scope]) -> None:
+    def _visit(self, owner: ast.AST, qualname: str, scopes: list[Scope]) -> None:
         stack = list(ast.iter_child_nodes(owner))
         while stack:
             node = stack.pop()
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 inner = f"{qualname}.{node.name}" if qualname != "<module>" else node.name
-                visit(node, inner, [_collect_assignments(node), *scopes])
+                self._visit(node, inner, [_collect_assignments(node), *scopes])
                 continue
             if isinstance(node, ast.ClassDef):
                 inner = f"{qualname}.{node.name}" if qualname != "<module>" else node.name
                 # Class bodies are not a closure scope for their methods.
-                visit(node, inner, scopes)
+                self._visit(node, inner, scopes)
                 continue
             if isinstance(node, ast.Call):
-                target = _write_target(node)
-                if target is not None and _tainted(target, scopes):
-                    offenders.append(Offender(rel_path, node.lineno, qualname, "a:write"))
+                target = self._write_target(node)
+                if target is not None and self._tainted(target, scopes, frozenset()):
+                    self._flag(node, qualname, "a:write", target)
             if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-                if _contains_source(node.value) and _contains_log_literal(node.value):
-                    offenders.append(Offender(rel_path, node.lineno, qualname, "b:log-path"))
+                if self._contains_source(node.value) and any(
+                    ".log" in (_str_const(n) or "") for n in ast.walk(node.value)
+                ):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    self._flag(node, qualname, "b:log-path", targets[0])
             stack.extend(ast.iter_child_nodes(node))
 
-    visit(tree, "<module>", [module_scope])
-    return offenders
+    def scan(self) -> list[Offender]:
+        self._visit(self.tree, "<module>", [_collect_assignments(self.tree)])
+        return self.offenders
 
 
-def _allowed(offender: Offender) -> bool:
-    function = offender.function.rsplit(".", 1)[-1]
-    return f"{offender.path}:{function}" in ALLOWLIST or (
-        f"{offender.path}:{offender.function}" in ALLOWLIST
-    )
+def scan_source(source: str, rel_path: str) -> list[Offender]:
+    """Every raw offender in ``source``, before the allowlist is applied."""
+    return _FileScanner(ast.parse(source, filename=rel_path), rel_path).scan()
 
 
-def scan_bridge(root: Path = BRIDGE_ROOT) -> list[Offender]:
+def _allow_entry(offender: Offender) -> AllowEntry | None:
+    for entry in ALLOWLIST:
+        if (entry.path, entry.function, entry.arm, entry.expr) == (
+            offender.path,
+            offender.function,
+            offender.arm,
+            offender.expr,
+        ):
+            return entry
+    return None
+
+
+def scan_bridge_raw(root: Path = BRIDGE_ROOT) -> list[Offender]:
     found: list[Offender] = []
     for path in iter_source_files(root):
         rel = path.relative_to(root).as_posix()
         found.extend(scan_source(path.read_text(encoding="utf-8"), rel))
-    return sorted((o for o in found if not _allowed(o)), key=lambda o: (o.path, o.line))
+    return sorted(found, key=lambda o: (o.path, o.line))
+
+
+def scan_bridge(root: Path = BRIDGE_ROOT) -> list[Offender]:
+    return [o for o in scan_bridge_raw(root) if _allow_entry(o) is None]
 
 
 # --------------------------------------------------------------------------- tests
@@ -262,7 +373,7 @@ def test_no_temp_or_home_debug_logs_in_bridge_source():
     assert dict(per_file) == {}, (
         "python-bridge writes a debug log under the OS temp dir or ~ -- route it to "
         "EventManager.emit_log or logging.getLogger(__name__) instead, or allow-list "
-        f"a genuine non-log use by file:function.\nper file:\n{summary}\n{report}"
+        f"a genuine non-log write by (file, function, arm, expr).\nper file:\n{summary}\n{report}"
     )
 
 
@@ -273,21 +384,18 @@ def test_scan_is_not_vacuous():
     assert {"qontinui_executor.py", "event_manager.py", "event_translator.py"} <= rels
 
 
-def test_allowlist_entries_name_existing_functions():
+def test_every_allowlist_entry_matches_exactly_one_live_offender():
+    raw = scan_bridge_raw()
     for entry in ALLOWLIST:
-        rel, function = entry.split(":", 1)
-        tree = ast.parse((BRIDGE_ROOT / rel).read_text(encoding="utf-8"))
-        names = {
-            n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        assert function in names, f"stale allowlist entry {entry}"
+        hits = [o for o in raw if _allow_entry(o) is entry]
+        assert len(hits) == 1, f"allowlist entry {entry} matches {len(hits)} offenders: {hits}"
 
 
-# Each historical shape the guard must keep catching, with its expected arms.
-_SHAPES = {
+# Each shape the guard must keep catching, with its expected arms.
+_SHAPES: dict[str, tuple[str, list[str]]] = {
     "closure_through_variable": (
         """
-import os, datetime
+import os
 def handler():
     debug_log = os.path.join(os.path.expanduser("~"), ".qontinui", "ai-shell-debug.log")
     def debug(msg):
@@ -296,6 +404,19 @@ def handler():
     debug("x")
 """,
         ["a:write", "b:log-path"],
+    ),
+    "two_level_closure": (
+        """
+import tempfile
+def outer():
+    p = tempfile.gettempdir() + "/x.txt"
+    def middle():
+        def inner():
+            open(p, "w").write("x")
+        inner()
+    middle()
+""",
+        ["a:write"],
     ),
     "env_temp_no_try": (
         """
@@ -317,45 +438,108 @@ with open(debug_log_path, "a", encoding="utf-8") as f:
 """,
         ["a:write", "b:log-path"],
     ),
-    "inline_gettempdir": (
-        """
-import os, tempfile
-def f():
-    with open(os.path.join(tempfile.gettempdir(), "m.log"), mode="a") as fh:
-        fh.write("x")
-""",
+    "inline_gettempdir_mode_kw": (
+        "import os, tempfile\nopen(os.path.join(tempfile.gettempdir(), 'm'), mode='a')\n",
+        ["a:write"],
+    ),
+    "file_keyword": (
+        "import tempfile\nopen(file=tempfile.gettempdir() + '/m', mode='w')\n",
+        ["a:write"],
+    ),
+    "io_open": ("import io, tempfile\nio.open(tempfile.gettempdir() + '/m', 'w')\n", ["a:write"]),
+    "codecs_open": (
+        "import codecs, tempfile\ncodecs.open(tempfile.gettempdir() + '/m', 'a', 'utf-8')\n",
+        ["a:write"],
+    ),
+    "gzip_open": ("import gzip\ngzip.open('/tmp/m.gz', 'wb')\n", ["a:write"]),
+    "gzip_open_default_read": ("import gzip\ngzip.open('/tmp/m.gz')\n", []),
+    "path_open": (
+        "import tempfile\nfrom pathlib import Path\nPath(tempfile.gettempdir()).open('a')\n",
         ["a:write"],
     ),
     "path_write_text": (
-        """
-import tempfile
-from pathlib import Path
-def f():
-    (Path(tempfile.gettempdir()) / "dump.json").write_text("x")
-""",
+        "import tempfile\nfrom pathlib import Path\n"
+        "(Path(tempfile.gettempdir()) / 'dump.json').write_text('x')\n",
+        ["a:write"],
+    ),
+    "path_write_bytes": (
+        "from pathlib import Path\n(Path('/tmp') / 'dump.bin').write_bytes(b'x')\n",
+        ["a:write"],
+    ),
+    "path_home": (
+        "from pathlib import Path\n(Path.home() / '.qontinui' / 'x').write_text('x')\n",
+        ["a:write"],
+    ),
+    "aliased_path_home": (
+        "from pathlib import Path as P\nP.home().joinpath('x').open('w')\n",
+        ["a:write"],
+    ),
+    "tilde_receiver_expanduser": (
+        "from pathlib import Path\nPath('~/.qontinui/x').expanduser().write_text('x')\n",
+        ["a:write"],
+    ),
+    "aliased_gettempdir": (
+        "from tempfile import gettempdir as g\nopen(g() + '/m', 'a')\n",
+        ["a:write"],
+    ),
+    "aliased_expanduser_log_path": (
+        "from os.path import expanduser as eu\nLOG = eu('~') + '/debug.log'\n",
+        ["b:log-path"],
+    ),
+    "file_handler": (
+        "import logging, tempfile\nlogging.FileHandler(tempfile.gettempdir() + '/bridge')\n",
+        ["a:write"],
+    ),
+    "rotating_handler_imported": (
+        "from logging.handlers import RotatingFileHandler\nRotatingFileHandler('/tmp/x')\n",
         ["a:write"],
     ),
     "read_is_fine": (
-        """
-import os, tempfile
-def f():
-    with open(os.path.join(tempfile.gettempdir(), "m.txt")) as fh:
-        return fh.read()
-""",
+        "import os, tempfile\nopen(os.path.join(tempfile.gettempdir(), 'm.txt')).read()\n",
         [],
     ),
-    "non_temp_write_is_fine": (
-        """
-def f(out_dir):
-    with open(out_dir + "/x.log", "w") as fh:
-        fh.write("x")
-""",
+    "non_temp_write_is_fine": ("def f(d):\n    open(d + '/x.log', 'w')\n", []),
+    "home_without_write_is_fine": (
+        "from pathlib import Path\nCACHE = Path.home() / '.cache'\n",
         [],
+    ),
+    # Documented limit: a path parked on an attribute is not followed by arm (a).
+    # Arm (b) still flags the assignment because it builds a .log path.
+    "self_attribute_not_followed": (
+        """
+import tempfile
+class C:
+    def __init__(self):
+        self.p = tempfile.gettempdir() + "/x.txt"
+        self.q = tempfile.gettempdir() + "/x.log"
+    def w(self):
+        open(self.p, "a")
+        open(self.q, "a")
+""",
+        ["b:log-path"],
     ),
 }
 
 
 def test_scanner_catches_known_shapes():
+    failures = []
     for name, (source, expected) in _SHAPES.items():
         arms = sorted(o.arm for o in scan_source(source, f"{name}.py"))
-        assert arms == sorted(expected), f"{name}: got {arms}, want {sorted(expected)}"
+        if arms != sorted(expected):
+            failures.append(f"{name}: got {arms}, want {sorted(expected)}")
+    assert not failures, "\n".join(failures)
+
+
+def test_allowlist_is_narrow():
+    """A second temp write in an allow-listed function is still reported."""
+    source = """
+import os, tempfile
+def _run_native_windows_stdin():
+    prompt_file = os.path.join(tempfile.gettempdir(), "p.txt")
+    open(prompt_file, "w")
+    open(os.path.join(tempfile.gettempdir(), "debug.txt"), "a")
+"""
+    raw = scan_source(source, "services/claude_cli_runner.py")
+    kept = [o for o in raw if _allow_entry(o) is None]
+    assert len(raw) == 2
+    assert [o.expr for o in kept] == ["os.path.join(tempfile.gettempdir(), 'debug.txt')"]
