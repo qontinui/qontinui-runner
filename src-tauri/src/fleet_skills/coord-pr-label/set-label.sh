@@ -126,14 +126,14 @@ COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 # Keeping the two in sync is a Phase 2 D2.6 requirement; coord's
 # validate_label is the spec, and this mirror follows it.
 #
-# Last reconciled against coord `origin/main` @ da36d08d (2026-08-22), which
-# closed four drifts this mirror had accumulated. Cite the REF, not a local
-# checkout, when you re-sync: the arms below are ordered as coord orders them,
-# because order is load-bearing (a bespoke arm must precede the generic
-# `parameterised labels need "=value"` fallthrough, or it never fires).
-# The `clears-red` REFUSAL mirrors coord's provenance-gate refusal of that key,
-# as authored for plan 2026-09-28-ccfg-bundle-parity-bound-outruns-runner-train-
-# latency Phase 5; re-check it against coord main once that lands.
+# Last reconciled against coord `origin/main` @ 5980f086d (2026-11-02): every
+# arm matches, including the priority / clears-red / destructive-attested
+# provenance refusals and the blast-radius-override flag. The one deliberate
+# divergence is `blocked` / `experimental`, refused here and accepted as inert
+# by coord. Cite the REF, not a local checkout, when you re-sync: the arms
+# below are ordered as coord orders them, because order is load-bearing (a
+# bespoke arm must precede the generic `parameterised labels need "=value"`
+# fallthrough, or it never fires).
 
 # Mirrors `labels_routes.rs::repo_segments_well_formed` -- a `<owner>/<repo>`
 # value must have BOTH segments non-empty. Without this the skill green-lit
@@ -258,17 +258,6 @@ validate_label() {
       ;;
   esac
 
-  # The destructive-migration attestation -- the same provenance gate, mirrored
-  # from coord's DESTRUCTIVE_ATTESTED_LABEL_ERR. Every value is refused, well
-  # formed or not. Without this arm the bare label reports `parameterised labels
-  # need "=value"` and adding a digest then reports `unknown coord:* label key`.
-  case "$rest" in
-    destructive-attested|destructive-attested=*)
-      echo "error: coord:destructive-attested=<digest12> must be set on the PR itself by a holder of repo write (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:destructive-attested=<digest12>'\`), then read back with \`gh api repos/<owner>/<repo>/issues/<n>/labels\`. coord honours only source='github' rows of this label and its door refuses a skill-set row." >&2
-      return 1
-      ;;
-  esac
-
   # The DECLARED cross-repo red-main-fix edge -- the same provenance gate as
   # `coord:priority`, mirrored from coord's refusal: coord honours
   # `coord:clears-red=[<owner>/]<repo>` ONLY from a GitHub-applied label
@@ -280,6 +269,17 @@ validate_label() {
   case "$rest" in
     clears-red|clears-red=*)
       echo "error: coord:clears-red must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:clears-red=<repo>'\`) — a skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github'" >&2
+      return 1
+      ;;
+  esac
+
+  # The destructive-migration attestation -- the same provenance gate, mirrored
+  # from coord's DESTRUCTIVE_ATTESTED_LABEL_ERR. Every value is refused, well
+  # formed or not. Without this arm the bare label reports `parameterised labels
+  # need "=value"` and adding a digest then reports `unknown coord:* label key`.
+  case "$rest" in
+    destructive-attested|destructive-attested=*)
+      echo "error: coord:destructive-attested=<digest12> must be set on the PR itself by a holder of repo write (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:destructive-attested=<digest12>'\`), then read back with \`gh api repos/<owner>/<repo>/issues/<n>/labels\`. coord honours only source='github' rows of this label and its door refuses a skill-set row." >&2
       return 1
       ;;
   esac

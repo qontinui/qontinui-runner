@@ -3859,7 +3859,10 @@ never read it as no flag); 4 is usage.
 armed or acknowledged as `seam_class: none` with a reason naming it. The patch
 arrives on STDIN, never in argv. `seam_class` is one of `gate`, `sentinel`,
 `detect_deliver` (proved by a RUN: `arming_test` `<path>::<name>` plus
-`enters_via`, the entry point the population calls), `sweep_narrowing` (a
+`enters_via`, the entry point the population calls -- for a hook that GitHub
+Actions, systemd or cron runs through a copy an installer wrote, declare
+`<repo-script>@<installed-abs-path>`, proved by a reach run; the contract is in
+the header of the script the `declare` call below runs), `sweep_narrowing` (a
 `count` probe, `expect_n: 0`), `convention` (an `absent_outside` probe),
 `counter` (two `metric-delta.sh` readings) or `none` (a reason). A diff that
 changes no production symbol declares `{"symbols": [], "reason": "<why>"}`,
