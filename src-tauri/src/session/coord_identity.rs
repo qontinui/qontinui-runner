@@ -1643,6 +1643,7 @@ pub(crate) mod tests {
                 (q == row).then(|| PaneRowFacts {
                     tenant: tenant_from_scope(sreg.upgrade().unwrap().tenant_scope_of(q)),
                     bound_at_ms: Some(1),
+                    bind_seq: Some(1),
                 })
             });
             registrar.attach_terminal_coord_lookup(move |c| (c == PIN).then_some(row));

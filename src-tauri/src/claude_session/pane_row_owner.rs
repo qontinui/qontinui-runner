@@ -12,7 +12,7 @@
 //! ## The owner of a row
 //!
 //! One entry per coord row, `row → harness id`, with the instant the ownership
-//! began and the instant the row's pane was bound:
+//! began and the row's pane's monotonic bind sequence:
 //!
 //! - **An entry** is written by [`PaneRowOwners::advance`] — ONLY the re-key
 //!   seam, and only for a source that reports the id the pane's process runs
@@ -32,7 +32,7 @@
 //!   session the pane runs after `/clear`, and a wrong eviction is worse than
 //!   a deferral. The state is visible: each such `(row, session)` pair is
 //!   logged once at info ("deferred: pin seed contested") and counted on
-//!   `/health` as `registrarPinSeedTakesDeferred`.
+//!   `/health` as `registrarPinSeedTakesEverDeferred`.
 //! - **A pin seed** answers for a row with no entry: the row of the
 //!   newest-bound live pane PINNED to the id (the registrar's terminal lookup,
 //!   which takes the newest bind).
@@ -42,9 +42,12 @@
 //! bound after the entry's pane, and an advance is refused while another row's
 //! entry for the id belongs to a later-bound pane (a migration or respawn of
 //! the session onto a new pane while the old one is still open). Comparing
-//! pane BIND instants, not confirmation times, is what keeps an old pane that
-//! still re-confirms the id from taking it back tick after tick. An unknown
-//! bind instant never outranks anything.
+//! the panes' BIND order, not confirmation times, is what keeps an old pane
+//! that still re-confirms the id from taking it back tick after tick. The
+//! order is the process-wide monotonic bind sequence, never the wall clock: a
+//! clock stepped backwards during a migration would rank the old pane later,
+//! and two binds in one millisecond would tie. An unknown sequence never
+//! outranks anything.
 //!
 //! Only an entry licenses a transfer to EVICT other keys on a row. Entries
 //! whose row no live terminal holds are swept ([`PaneRowOwners::sweep`]); a
@@ -94,8 +97,14 @@ pub(crate) struct PaneRowFacts {
     /// `Undetermined` — never the machine default.
     pub tenant: NewSessionTenant,
     /// When the terminal was bound to the row, unix milliseconds (the unit of
-    /// a lifecycle record's `finished_at`). `None` when not known.
+    /// a lifecycle record's `finished_at`). `None` when not known. Read only
+    /// for the finish re-offer's revival guard — NEVER to rank panes: a wall
+    /// clock can step backwards, and two binds can share a millisecond.
     pub bound_at_ms: Option<i64>,
+    /// The terminal's process-wide monotonic bind sequence
+    /// (`TerminalSession::coord_binding`): larger = bound later. THE key two
+    /// panes are ranked by. `None` when not known.
+    pub bind_seq: Option<u64>,
 }
 
 /// The answer of the registrar's injected pane-row lookup.
@@ -150,13 +159,14 @@ pub(crate) struct LivePaneRow {
     /// entry, the terminal's bind instant for a pin seed. Read by the finish
     /// re-offer's revival guard.
     pub owned_since_ms: Option<i64>,
-    /// When the row's pane was bound — the instant two panes are ranked by.
-    pub pane_bound_at_ms: Option<i64>,
+    /// The row's pane's monotonic bind sequence — what two panes are ranked
+    /// by ([`PaneRowFacts::bind_seq`]).
+    pub pane_bind_seq: Option<u64>,
 }
 
-/// Whether a pane bound at `a` was bound strictly after one bound at `b`. An
-/// unknown instant is never "after" anything.
-fn bound_after(a: Option<i64>, b: Option<i64>) -> bool {
+/// Whether a pane with bind sequence `a` was bound strictly after one with
+/// `b`. An unknown sequence is never "after" anything.
+fn bound_after(a: Option<u64>, b: Option<u64>) -> bool {
     matches!((a, b), (Some(a), Some(b)) if a > b)
 }
 
@@ -164,7 +174,7 @@ fn bound_after(a: Option<i64>, b: Option<i64>) -> bool {
 struct OwnerEntry {
     harness_id: String,
     since_ms: i64,
-    pane_bound_at_ms: Option<i64>,
+    pane_bind_seq: Option<u64>,
 }
 
 #[derive(Default)]
@@ -190,10 +200,10 @@ impl PaneRowOwners {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Make `harness_id` the owner of `row`, whose pane was bound at
-    /// `pane_bound_at_ms`, forward-only. Drops every OTHER row's entry naming
+    /// Make `harness_id` the owner of `row`, whose pane has bind sequence
+    /// `pane_bind_seq`, forward-only. Drops every OTHER row's entry naming
     /// `harness_id` — unless that entry's pane was bound AFTER this row's,
-    /// or this row's bind instant is unknown while that entry's is known, in
+    /// or this row's bind sequence is unknown while that entry's is known, in
     /// which case the advance is refused (the later-bound pane keeps the id;
     /// an unknown instant never displaces a known one). A row already owned
     /// by the id keeps its original instant.
@@ -203,15 +213,15 @@ impl PaneRowOwners {
         row: Uuid,
         harness_id: &str,
         now_ms: i64,
-        pane_bound_at_ms: Option<i64>,
+        pane_bind_seq: Option<u64>,
     ) -> bool {
         let harness_id = harness_id.trim();
         let mut s = self.lock();
         if s.owners.iter().any(|(r, e)| {
             *r != row
                 && e.harness_id == harness_id
-                && (bound_after(e.pane_bound_at_ms, pane_bound_at_ms)
-                    || (pane_bound_at_ms.is_none() && e.pane_bound_at_ms.is_some()))
+                && (bound_after(e.pane_bind_seq, pane_bind_seq)
+                    || (pane_bind_seq.is_none() && e.pane_bind_seq.is_some()))
         }) {
             return false;
         }
@@ -228,7 +238,7 @@ impl PaneRowOwners {
             OwnerEntry {
                 harness_id: harness_id.to_string(),
                 since_ms: now_ms,
-                pane_bound_at_ms,
+                pane_bind_seq,
             },
         );
         true
@@ -327,7 +337,8 @@ impl PaneRowOwners {
 ///    only while no entry on that row names another id — a pin whose row
 ///    another id has taken answers nothing.
 /// 3. With both, the entry wins unless the pin's pane was bound strictly
-///    AFTER the entry's pane. An unknown bind instant never outranks.
+///    AFTER the entry's pane, by the monotonic bind sequence. An unknown
+///    sequence never outranks.
 ///
 /// `live` answers a row's [`PaneRowFacts`] when some live terminal holds it.
 /// Neither closure is called with the owner lock held.
@@ -346,7 +357,7 @@ pub(crate) fn live_terminal_row(
             row,
             tenant: f.tenant,
             owned_since_ms: Some(e.since_ms),
-            pane_bound_at_ms: e.pane_bound_at_ms.or(f.bound_at_ms),
+            pane_bind_seq: e.pane_bind_seq.or(f.bind_seq),
         })
     });
     let seed = pin_row(harness_id)
@@ -356,12 +367,12 @@ pub(crate) fn live_terminal_row(
                 row,
                 tenant: f.tenant,
                 owned_since_ms: f.bound_at_ms,
-                pane_bound_at_ms: f.bound_at_ms,
+                pane_bind_seq: f.bind_seq,
             })
         });
     match (entry, seed) {
         (Some(e), Some(p)) if p.row != e.row => {
-            Some(if bound_after(p.pane_bound_at_ms, e.pane_bound_at_ms) {
+            Some(if bound_after(p.pane_bind_seq, e.pane_bind_seq) {
                 p
             } else {
                 e
@@ -379,10 +390,13 @@ mod tests {
     const P: &str = "0b5e0000-0000-4000-8000-00000000000b";
     const T: Uuid = Uuid::from_u128(0x7e7a_0000_0000_4000_8000_0000_0000_0001);
 
-    fn facts(bound_at_ms: i64) -> PaneRowFacts {
+    /// Facts for a pane bound with sequence `seq` (and, unless a test says
+    /// otherwise, at the same number of milliseconds).
+    fn facts(seq: u64) -> PaneRowFacts {
         PaneRowFacts {
             tenant: NewSessionTenant::Stated(T),
-            bound_at_ms: Some(bound_at_ms),
+            bound_at_ms: Some(seq as i64),
+            bind_seq: Some(seq),
         }
     }
 
@@ -398,7 +412,7 @@ mod tests {
                 row: q,
                 tenant: NewSessionTenant::Stated(T),
                 owned_since_ms: Some(5),
-                pane_bound_at_ms: Some(5),
+                pane_bind_seq: Some(5),
             })
         );
         // The seam confirms X on R (bound at the same instant): the entry
@@ -475,7 +489,7 @@ mod tests {
         // Confirmed very recently (since = 10_000), but its pane was bound at 100.
         o.advance(old, X, 10_000, Some(100));
         let at =
-            |bound: i64| move |row: Uuid| Some(if row == new { facts(bound) } else { facts(100) });
+            |bound: u64| move |row: Uuid| Some(if row == new { facts(bound) } else { facts(100) });
         assert_eq!(
             live_terminal_row(&o, X, |_| Some(new), at(200)).map(|l| l.row),
             Some(new),
@@ -490,14 +504,58 @@ mod tests {
         let unknown = |row: Uuid| {
             Some(PaneRowFacts {
                 tenant: NewSessionTenant::Undetermined,
-                bound_at_ms: (row != new).then_some(100),
+                bound_at_ms: Some(10_000),
+                bind_seq: (row != new).then_some(100),
             })
         };
         assert_eq!(
             live_terminal_row(&o, X, |_| Some(new), unknown).map(|l| l.row),
             Some(old),
-            "an unknown bind instant never outranks an entry"
+            "an unknown bind sequence never outranks an entry"
         );
+    }
+
+    /// Fourth review: panes are ranked by the monotonic bind SEQUENCE, not the
+    /// wall clock. A clock stepped backwards during a migration gives the new
+    /// pane EARLIER millis, and two binds can share a millisecond; the
+    /// sequence still says which pane was bound later.
+    #[test]
+    fn the_bind_sequence_ranks_panes_whatever_the_wall_clock_says() {
+        let at = |seq: u64, ms: i64| PaneRowFacts {
+            tenant: NewSessionTenant::Undetermined,
+            bound_at_ms: Some(ms),
+            bind_seq: Some(seq),
+        };
+        for (old_ms, new_ms, case) in [
+            (5_000, 1_000, "the clock stepped backwards"),
+            (5_000, 5_000, "both binds in one millisecond"),
+        ] {
+            let o = PaneRowOwners::default();
+            let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+            assert!(o.advance(old, X, 1, Some(7)));
+            let live = move |row: Uuid| {
+                Some(if row == new {
+                    at(8, new_ms)
+                } else {
+                    at(7, old_ms)
+                })
+            };
+            assert_eq!(
+                live_terminal_row(&o, X, |_| Some(new), live).map(|l| l.row),
+                Some(new),
+                "{case}: the later sequence wins"
+            );
+            assert!(o.advance(new, X, 2, Some(8)), "{case}");
+            assert!(
+                !o.advance(old, X, 3, Some(7)),
+                "{case}: the earlier sequence cannot take it back"
+            );
+            assert_eq!(
+                live_terminal_row(&o, X, |_| None, live).map(|l| l.owned_since_ms),
+                Some(Some(2)),
+                "{case}: the millis stay for the revival guard only"
+            );
+        }
     }
 
     /// The flip the second review found: once the later-bound pane holds the

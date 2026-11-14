@@ -370,28 +370,31 @@ impl TerminalManager {
         )
     }
 
-    /// When the live terminal holding coord row `row` was bound to it (unix
-    /// milliseconds): `Some(Some(at))`; `Some(None)` when no live terminal
+    /// When the live terminal holding coord row `row` was bound to it, as
+    /// `(unix milliseconds, bind sequence)`: `Some(Some((at, seq)))`;
+    /// `Some(None)` when no live terminal
     /// holds the row; `None` when the terminal map, or any terminal's coord
     /// slot, could not be read (a poisoned lock) and no readable terminal
-    /// holds the row — UNKNOWN, never "gone". The newest bind wins if several
-    /// hold the row. Read by the registrar's live-pane-row lookup
+    /// holds the row — UNKNOWN, never "gone". The newest bind by SEQUENCE
+    /// (never by the wall clock) wins if several hold the row. Read by the registrar's live-pane-row lookup
     /// (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
-    pub fn coord_row_bound_at(&self, row: uuid::Uuid) -> Option<Option<i64>> {
+    pub fn coord_row_bound_at(&self, row: uuid::Uuid) -> Option<Option<(i64, u64)>> {
         let sessions = self.sessions.lock().ok()?;
         let mut unreadable = false;
-        let mut newest: Option<i64> = None;
+        let mut newest: Option<(i64, u64)> = None;
         for s in sessions.values() {
             match s.coord_row_with_bound_at() {
                 None => unreadable = true,
-                Some(Some((r, at))) if r == row => {
-                    newest = Some(newest.map_or(at, |n| n.max(at)));
+                Some(Some((r, at, seq))) if r == row => {
+                    if newest.is_none_or(|(_, n)| seq > n) {
+                        newest = Some((at, seq));
+                    }
                 }
                 Some(_) => {}
             }
         }
         match (newest, unreadable) {
-            (Some(at), _) => Some(Some(at)),
+            (Some(binding), _) => Some(Some(binding)),
             (None, true) => None,
             (None, false) => Some(None),
         }
@@ -1558,10 +1561,6 @@ mod tests {
         );
     }
 
-    /// Plan `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
-    /// Phase 1: two live panes pinned to one harness id (a respawn or
-    /// migration whose old pane is still up) resolve to the row bound LAST,
-    /// whatever order the manager's map yields them in.
     /// Review 3, A5: a terminal whose coord slot lock is poisoned makes a row
     /// no readable terminal holds UNKNOWN (`None`), never "gone", so the
     /// registrar's sweep keeps its entry.
@@ -1590,6 +1589,10 @@ mod tests {
         );
     }
 
+    /// Plan `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+    /// Phase 1: two live panes pinned to one harness id (a respawn or
+    /// migration whose old pane is still up) resolve to the row bound LAST,
+    /// whatever order the manager's map yields them in.
     #[test]
     fn two_panes_pinned_to_one_id_resolve_to_the_newest_bound() {
         use super::resolve_pinned_coord;

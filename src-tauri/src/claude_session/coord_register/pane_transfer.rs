@@ -67,11 +67,13 @@ pub(crate) fn pane_row_moves_not_owner() -> u64 {
     PANE_ROW_MOVES_NOT_OWNER.load(Ordering::Relaxed)
 }
 
-/// The DISTINCT `(row, session)` pairs whose live-pane adoption was ever
+/// The DISTINCT `(row, session)` pairs whose live-pane adoption was EVER
 /// deferred in this process because another key holds the row and only the
-/// pane's PIN says the pane runs the session (no owner entry). Each pair is
-/// counted once however often auto-bind retries it. Served on `/health` as
-/// `registrarPinSeedTakesDeferred`.
+/// pane's PIN says the pane runs the session (no owner entry). Cumulative: a
+/// pair is counted once however often auto-bind retries it, and is NOT
+/// removed when a later take or seam resolves it — this says "ever
+/// deferred", not "deferred now". Served on `/health` as
+/// `registrarPinSeedTakesEverDeferred`.
 ///
 /// Such a deferral lasts until a running-id seam source (the provider
 /// registry, the SessionStart hook) names the session on the row. A pane with
@@ -83,7 +85,7 @@ static PIN_SEED_TAKES_DEFERRED: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// See [`PIN_SEED_TAKES_DEFERRED`].
-pub(crate) fn pin_seed_takes_deferred() -> u64 {
+pub(crate) fn pin_seed_takes_ever_deferred() -> u64 {
     PIN_SEED_TAKES_DEFERRED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -443,16 +445,20 @@ impl AiCoordRegistrar {
     /// was meant to cover — a migration overlap, where the OLD pane's row
     /// still carries a seam entry naming the id while a NEW pane pinned to the
     /// id is bound to a fresh row — is covered by the owner rule instead
-    /// ([`pane_row_owner`]): the two panes are ranked by their BIND instants,
-    /// never by when they last confirmed, so the later-bound pane's row wins
+    /// ([`pane_row_owner`]): the two panes are ranked by their BIND order —
+    /// the process-wide monotonic bind sequence, never the wall clock and
+    /// never when they last confirmed — so the later-bound pane's row wins
     /// without minting an entry. What that guarantees: while the later-bound
-    /// pane is live and its bind instant is known, the old pane's seam
+    /// pane is live and its bind sequence is known, the old pane's seam
     /// re-confirmations neither advance the owner (refused before and inside
     /// [`pane_row_owner::PaneRowOwners::advance`]) nor move the entry
     /// ([`MoveOutcome::NotLivePane`]), however many ticks run and in whatever
     /// order. Once the later pane closes and is swept, the old pane's next
     /// confirmation takes the id back — it is the only pane left running it.
-    /// With an unknown bind instant, the latest confirmation wins as before.
+    /// An unknown bind sequence never outranks a known one: an advance from a
+    /// pane whose sequence is unknown is refused while the id's entry has a
+    /// known one, and a pin with an unknown sequence never beats an entry.
+    /// Only between two unknown sequences does the latest confirmation win.
     ///
     /// Same lock rules as [`Self::deliver_owed_finish`].
     pub fn on_terminal_coord_bind(
@@ -533,7 +539,7 @@ impl AiCoordRegistrar {
             // confirmation for a pane that has since closed must not displace
             // the id's entry on the pane that runs it now.
             let row_facts = self.pane_row_facts(row);
-            let row_bound = row_facts.and_then(|f| f.bound_at_ms);
+            let row_seq = row_facts.and_then(|f| f.bind_seq);
             // The same pin rule `live_terminal_row` applies: a pin whose row
             // another id owns (the pinned pane `/clear`ed) is not a later pane
             // running this id.
@@ -545,12 +551,12 @@ impl AiCoordRegistrar {
                 .filter(|pin| *pin != row)
                 .filter(|pin| self.inner.pane_rows.admits(*pin, claude_session_id))
                 .and_then(|pin| self.pane_row_facts(pin))
-                .and_then(|f| f.bound_at_ms)
-                .is_some_and(|pin_bound| row_bound.is_some_and(|b| pin_bound > b));
+                .and_then(|f| f.bind_seq)
+                .is_some_and(|pin_seq| row_seq.is_some_and(|s| pin_seq > s));
             if row_facts.is_some() && !later_pin {
                 self.inner
                     .pane_rows
-                    .advance(row, claude_session_id, now, row_bound);
+                    .advance(row, claude_session_id, now, row_seq);
             }
         }
         match self.live_terminal_row(claude_session_id) {

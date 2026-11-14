@@ -805,6 +805,7 @@ mod tests {
                 crate::claude_session::pane_row_owner::PaneRowFacts {
                     tenant,
                     bound_at_ms: Some(1),
+                    bind_seq: Some(1),
                 },
             )
         });
