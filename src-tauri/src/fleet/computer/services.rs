@@ -48,6 +48,18 @@ pub(crate) const GUEST_COMPLETABLE_KINDS: &[&str] = &[KIND_GH_ACTIONS_RUNNER];
 pub(crate) const WATCHED_PATTERNS: &[&str] =
     &["actions.runner.*.service", "qontinui-runner*.service"];
 
+/// The `'static` kind constant for a kind name, or `None` for a name this
+/// build does not know. PURE.
+pub(crate) fn kind_named(name: &str) -> Option<&'static str> {
+    [
+        KIND_GH_ACTIONS_RUNNER,
+        KIND_QONTINUI_RUNNER,
+        KIND_OTHER_WATCHED,
+    ]
+    .into_iter()
+    .find(|k| *k == name)
+}
+
 /// Classify a unit name. `actions.runner.*` is a GitHub runner service on
 /// every platform (systemd unit or Windows service); `qontinui-runner*` is this
 /// product's own runner unit.
