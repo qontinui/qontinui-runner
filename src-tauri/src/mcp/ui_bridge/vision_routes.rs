@@ -3188,7 +3188,11 @@ impl RequestHints for AssertRequest {
              contrast_meets_wcag, image_palette_within, no_near_duplicate_images, \
              no_placeholder_images, image_focal_visible, transparent_image_legible, \
              salience_order, image_sharpness_at_least, image_blockiness_within, \
-             settled_within, state_entered_within, text_over_image_contrast."
+             image_loaded, image_resolution_sufficient, image_not_distorted, \
+             image_dims_reserved, lcp_image_prioritized, image_has_text_alternative, \
+             image_not_oversized, image_weight_within, offscreen_image_lazy, \
+             no_duplicate_images, settled_within, state_entered_within, \
+             text_over_image_contrast."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
              `ocr_blocks` (from /vision/extract), `target` (device/app id), \
@@ -3228,6 +3232,16 @@ impl RequestHints for AssertRequest {
                 "salience_order",
                 "image_sharpness_at_least",
                 "image_blockiness_within",
+                "image_loaded",
+                "image_resolution_sufficient",
+                "image_not_distorted",
+                "image_dims_reserved",
+                "lcp_image_prioritized",
+                "image_has_text_alternative",
+                "image_not_oversized",
+                "image_weight_within",
+                "offscreen_image_lazy",
+                "no_duplicate_images",
                 "settled_within",
                 "state_entered_within",
                 "text_over_image_contrast"
@@ -4041,6 +4055,16 @@ mod tests {
             A::SalienceOrder { .. } => "salience_order",
             A::ImageSharpnessAtLeast { .. } => "image_sharpness_at_least",
             A::ImageBlockinessWithin { .. } => "image_blockiness_within",
+            A::ImageLoaded { .. } => "image_loaded",
+            A::ImageResolutionSufficient { .. } => "image_resolution_sufficient",
+            A::ImageNotDistorted { .. } => "image_not_distorted",
+            A::ImageDimsReserved { .. } => "image_dims_reserved",
+            A::LcpImagePrioritized { .. } => "lcp_image_prioritized",
+            A::ImageHasTextAlternative { .. } => "image_has_text_alternative",
+            A::ImageNotOversized { .. } => "image_not_oversized",
+            A::ImageWeightWithin { .. } => "image_weight_within",
+            A::OffscreenImageLazy { .. } => "offscreen_image_lazy",
+            A::NoDuplicateImages { .. } => "no_duplicate_images",
             A::SettledWithin { .. } => "settled_within",
             A::StateEnteredWithin { .. } => "state_entered_within",
             A::TextOverImageContrast { .. } => "text_over_image_contrast",
@@ -4049,7 +4073,7 @@ mod tests {
 
     /// Every name [`assertion_wire_name`] returns, in its arm order. Keep the
     /// two together: an arm added there belongs here too.
-    const ASSERTION_WIRE_NAMES: [&str; 23] = [
+    const ASSERTION_WIRE_NAMES: [&str; 33] = [
         "no_overlap",
         "element_above",
         "contains_text",
@@ -4070,6 +4094,16 @@ mod tests {
         "salience_order",
         "image_sharpness_at_least",
         "image_blockiness_within",
+        "image_loaded",
+        "image_resolution_sufficient",
+        "image_not_distorted",
+        "image_dims_reserved",
+        "lcp_image_prioritized",
+        "image_has_text_alternative",
+        "image_not_oversized",
+        "image_weight_within",
+        "offscreen_image_lazy",
+        "no_duplicate_images",
         "settled_within",
         "state_entered_within",
         "text_over_image_contrast",
@@ -4103,6 +4137,16 @@ mod tests {
                 {"type":"salience_order","cta_id":"cta"},
                 {"type":"image_sharpness_at_least","element":"hero","min_sharpness":50.0},
                 {"type":"image_blockiness_within","element":"hero","max_blockiness":1.5},
+                {"type":"image_loaded"},
+                {"type":"image_resolution_sufficient","element":"hero","min_effective":1.0},
+                {"type":"image_not_distorted","max_aspect_delta":0.05},
+                {"type":"image_dims_reserved"},
+                {"type":"lcp_image_prioritized"},
+                {"type":"image_has_text_alternative"},
+                {"type":"image_not_oversized","max_effective":2.0},
+                {"type":"image_weight_within","max_bytes":512000},
+                {"type":"offscreen_image_lazy"},
+                {"type":"no_duplicate_images"},
                 {"type":"settled_within","ms":500},
                 {"type":"state_entered_within","state":"checkout","ms":500},
                 {"type":"text_over_image_contrast","min_ratio":4.5,"percentile":5.0}
@@ -4270,7 +4314,8 @@ mod tests {
     /// Adding `element_above` (U3) took the list from 11 to 12, and the L1
     /// image assertions (image plan Phase 15) from 12 to 20, the timeline
     /// assertions (plan 2026-09-20 Phase 4) to 22, and
-    /// `text_over_image_contrast` (image plan Phase 16) to 23; without a pin,
+    /// `text_over_image_contrast` (image plan Phase 16) to 23, and the L0 image
+    /// assertions (image plan Phase 8) to 33; without a pin,
     /// a variant added upstream stays undiscoverable while
     /// `evaluate_assertion` (which is variant-agnostic) handles it fine.
     ///
@@ -4287,7 +4332,7 @@ mod tests {
     /// the same list, so both are checked here.
     #[test]
     fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
-        const EXPECTED: [&str; 23] = [
+        const EXPECTED: [&str; 33] = [
             "no_overlap",
             "element_above",
             "contains_text",
@@ -4308,6 +4353,16 @@ mod tests {
             "salience_order",
             "image_sharpness_at_least",
             "image_blockiness_within",
+            "image_loaded",
+            "image_resolution_sufficient",
+            "image_not_distorted",
+            "image_dims_reserved",
+            "lcp_image_prioritized",
+            "image_has_text_alternative",
+            "image_not_oversized",
+            "image_weight_within",
+            "offscreen_image_lazy",
+            "no_duplicate_images",
             "settled_within",
             "state_entered_within",
             "text_over_image_contrast",
