@@ -10,12 +10,14 @@
 //!
 //! The subscription is the closed-set name `device_ci`
 //! (`qontinui_runner_lib::coord_ws::Subscription::DeviceCi`), which coord
-//! resolves server-side to the glob `events.ci.*.<device_id>` for the
-//! device_id of the credential presented at upgrade. That glob matches the
-//! whole CI channel family — `build_requested`, `build_cancelled` and
-//! `settings_requested` (`*` in Redis patterns crosses word boundaries but
-//! the trailing `.<device_id>` still anchors the device), so one
-//! subscription covers all three; exact-match routing in
+//! resolves server-side to two globs for the device_id of the credential
+//! presented at upgrade: `events.ci.*.<device_id>` and
+//! `events.ops.*.<device_id>` (coord `ws.rs`, `"device_ci"`). The first
+//! matches the whole CI channel family — `build_requested`,
+//! `build_cancelled` and `settings_requested`; the second carries the ops
+//! lane's `task_requested` ([`super::ops`]). `*` in Redis patterns crosses
+//! word boundaries but the trailing `.<device_id>` still anchors the device,
+//! so one subscription covers all four; exact-match routing in
 //! [`route_ci_channel`] decides what each frame is.
 //!
 //! # Why the socket is now held even when `ci_node` is DISABLED

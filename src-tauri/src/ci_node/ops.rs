@@ -15,14 +15,17 @@
 //!    CHECKOUT and looks the task id up AGAIN - an id absent from the allowlist
 //!    is refused here whatever coord said - and re-validates the arguments
 //!    against the task's schema,
-//! 4. runs the script the ALLOWLIST names (the payload's script path is only
+//! 4. claims the task by posting `running` - coord's ONE-TIME transition, so a
+//!    redelivery after a runner restart, or a task already cancelled or
+//!    finished, is refused there and the script is not run - and only then
+//! 5. runs the script the ALLOWLIST names (the payload's script path is only
 //!    cross-checked) in an `ops-<id>` child cgroup on Linux, under the task's
 //!    timeout, with arguments passed only as `OPS_ARG_*` environment variables
 //!    (never argv, never a shell), and
 //!    The runner never runs anything as root: a `needs_root` task still runs as
 //!    the runner's user and its script escalates itself through the documented
 //!    sudoers entry (`ops/README.md` in qontinui-claude-config).
-//! 5. posts the result to `POST /coord/ops/tasks/:id/result`.
+//! 6. posts the result to `POST /coord/ops/tasks/:id/result`.
 //!
 //! Non-Linux hosts, and Linux hosts with no writable delegated cgroup, are
 //! reported EXPLICITLY in the result log (`containment=...`) rather than
@@ -593,10 +596,69 @@ async fn run_script(
 // Result posting
 // ---------------------------------------------------------------------------
 
-async fn post_result(id: &str, state: &str, exit_code: Option<i32>, log: &str) {
+/// What became of one result POST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostOutcome {
+    /// Coord answered 2xx.
+    Accepted,
+    /// Coord answered a definitive refusal (this status) - retrying cannot help.
+    Refused(u16),
+    /// No answer, or only retryable ones, within the retry budget.
+    Undelivered,
+}
+
+/// PURE: may the script run, given what coord said to the `running` claim?
+///
+/// Coord's `running` transition is the task's ONE-TIME claim (`running` ->
+/// `running` is a 409, and so is any terminal row), so only an accepted claim
+/// licenses the run. A refusal means the row was already claimed (a
+/// redelivery after a runner restart, which the in-memory seen-set cannot
+/// catch), cancelled, finished, or is not ours. A 409 that is our OWN earlier
+/// claim (its answer lost) is already turned into `Accepted` by
+/// [`is_own_earlier_write`]. An undelivered claim means the run would be
+/// unaccounted for in the ledger, so it is not run; coord's sweep expires the
+/// row (if the claim did land unseen, after its running-stale bound).
+pub(crate) fn claim_licenses_run(claim: PostOutcome) -> Result<(), String> {
+    match claim {
+        PostOutcome::Accepted => Ok(()),
+        PostOutcome::Refused(status) => Err(format!(
+            "coord refused the running claim ({status}); the task is already claimed, cancelled, finished or not ours"
+        )),
+        PostOutcome::Undelivered => {
+            Err("coord never answered the running claim; not running unaccounted".to_string())
+        }
+    }
+}
+
+/// PURE: can a retryable status have been returned AFTER coord committed the
+/// write? Only a gateway status: a proxy answers 502/504 when it lost the
+/// backend's reply, which may follow the commit. 503 is excluded because coord's
+/// own handler sends it (`schema_migration_pending`) before any write, as it
+/// does every other status.
+pub(crate) fn status_may_follow_a_commit(status: u16) -> bool {
+    matches!(status, 502 | 504)
+}
+
+/// PURE: is a refusal really coord reporting OUR OWN earlier write?
+///
+/// When an earlier attempt may have landed with its answer lost, coord's 409
+/// `invalid_transition` carries the row's current `state`; if that is the state
+/// we were posting, the earlier attempt committed it. Without a possibly-landed
+/// earlier attempt a 409 is a genuine refusal - for `running`, a second claim
+/// (e.g. a redelivery after a runner restart) - and must stay one.
+pub(crate) fn is_own_earlier_write(
+    maybe_landed: bool,
+    status: u16,
+    row_state: Option<&str>,
+    posted_state: &str,
+) -> bool {
+    maybe_landed && status == 409 && row_state == Some(posted_state)
+}
+
+async fn post_result(id: &str, state: &str, exit_code: Option<i32>, log: &str) -> PostOutcome {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         warn!("ops: no coord base; result for {id} not posted");
-        return;
+        return PostOutcome::Undelivered;
     };
     let url = format!("{}/coord/ops/tasks/{id}/result", base.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -608,8 +670,12 @@ async fn post_result(id: &str, state: &str, exit_code: Option<i32>, log: &str) {
         .timeout(Duration::from_secs(15))
         .build()
     else {
-        return;
+        return PostOutcome::Undelivered;
     };
+    // Set once an attempt may have been COMMITTED by coord without its answer
+    // reaching us. Only a failure after the request left can be that; a status
+    // coord's own handler sends (401, 429, 500 ...) proves nothing was written.
+    let mut maybe_landed = false;
     for (attempt, wait) in [0u64, 2, 4, 8, 16].into_iter().enumerate() {
         if wait > 0 {
             tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -627,18 +693,37 @@ async fn post_result(id: &str, state: &str, exit_code: Option<i32>, log: &str) {
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => return,
+            Ok(r) if r.status().is_success() => return PostOutcome::Accepted,
             // Only a definitive refusal ends the loop: a 401 (device JWT expired
             // mid-task; the next attempt re-reads it), 408 and 429 are retried.
             Ok(r) if matches!(r.status().as_u16(), 400 | 403 | 404 | 409 | 422) => {
-                warn!("ops: result for {id} refused by coord: {}", r.status());
-                return;
+                let status = r.status().as_u16();
+                let row_state = r
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_owned));
+                if is_own_earlier_write(maybe_landed, status, row_state.as_deref(), state) {
+                    debug!("ops: result for {id} already {state} (an earlier attempt landed)");
+                    return PostOutcome::Accepted;
+                }
+                warn!("ops: result for {id} refused by coord: {status}");
+                return PostOutcome::Refused(status);
             }
-            Ok(r) => debug!("ops: result POST {} (attempt {attempt})", r.status()),
-            Err(e) => debug!("ops: result POST error {e} (attempt {attempt})"),
+            Ok(r) => {
+                maybe_landed |= status_may_follow_a_commit(r.status().as_u16());
+                debug!("ops: result POST {} (attempt {attempt})", r.status());
+            }
+            Err(e) => {
+                // A connect error never reached coord; anything later (a
+                // timeout or reset after the request was sent) may have.
+                maybe_landed |= !e.is_connect() && !e.is_builder();
+                debug!("ops: result POST error {e} (attempt {attempt})");
+            }
         }
     }
     warn!("ops: result for {id} not delivered after retries");
+    PostOutcome::Undelivered
 }
 
 // ---------------------------------------------------------------------------
@@ -696,8 +781,8 @@ pub(crate) fn handle_with(inner: serde_json::Value, enabled: bool) {
     );
     // Only a well-formed, in-time, first delivery is remembered; a garbage id
     // cannot evict a real entry. The set is in memory: a redelivery after a
-    // runner restart can re-run a task, which coord bounds by expires_at and by
-    // the ledger row's state (a terminal row refuses a second result).
+    // runner restart is not caught here; it is caught by coord refusing the
+    // second one-time `running` claim, which `execute` requires before running.
     if !matches!(decision, PreDecision::Ignore(_)) {
         mark_seen(&payload.ops_task_id);
     }
@@ -751,7 +836,12 @@ async fn execute(p: OpsTaskPayload) {
     }) {
         return fail(&id, "expired while queued behind another ops task".into()).await;
     }
-    post_result(&id, "running", None, "").await;
+    // Only coord's acceptance of the one-time claim licenses the run. Nothing is
+    // posted on a refusal: the row is not ours to move (or already terminal).
+    if let Err(why) = claim_licenses_run(post_result(&id, "running", None, "").await) {
+        warn!("ops: {id} not run: {why}");
+        return;
+    }
 
     let Ok(tmp) = tempfile::Builder::new().prefix("qontinui-ops-").tempdir() else {
         return fail(&id, "could not create a work directory".into()).await;
@@ -861,6 +951,53 @@ default = "install"
             script_sha: "a".repeat(40),
             args: BTreeMap::new(),
             expires_at: None,
+        }
+    }
+
+    #[test]
+    fn only_an_accepted_running_claim_licenses_the_run() {
+        assert!(claim_licenses_run(PostOutcome::Accepted).is_ok());
+        // 409: already claimed (a redelivery after a runner restart) or terminal.
+        assert!(claim_licenses_run(PostOutcome::Refused(409)).is_err());
+        // 403: not this device's task; 404: unknown row or coord's lane is off.
+        assert!(claim_licenses_run(PostOutcome::Refused(403)).is_err());
+        assert!(claim_licenses_run(PostOutcome::Refused(404)).is_err());
+        assert!(claim_licenses_run(PostOutcome::Undelivered).is_err());
+    }
+
+    #[test]
+    fn a_409_is_our_own_claim_only_after_a_possibly_landed_attempt() {
+        // Attempt 0 refused: a genuine second claim, whatever the row says.
+        assert!(!is_own_earlier_write(
+            false,
+            409,
+            Some("running"),
+            "running"
+        ));
+        // An earlier attempt's answer was lost and the row is now running: ours.
+        assert!(is_own_earlier_write(true, 409, Some("running"), "running"));
+        // ...but a row that moved elsewhere (cancelled/expired/terminal) is not.
+        assert!(!is_own_earlier_write(
+            true,
+            409,
+            Some("succeeded"),
+            "running"
+        ));
+        assert!(!is_own_earlier_write(true, 409, None, "running"));
+        assert!(!is_own_earlier_write(true, 403, Some("running"), "running"));
+        // The same holds for a terminal result whose first answer was lost.
+        assert!(is_own_earlier_write(true, 409, Some("failed"), "failed"));
+    }
+
+    #[test]
+    fn only_a_gateway_status_may_follow_a_commit() {
+        // A redelivery whose attempt 0 got one of these must NOT later read a
+        // 409 `running` (the pre-restart claim) as its own write.
+        for s in [400, 401, 403, 404, 408, 409, 429, 500, 503] {
+            assert!(!status_may_follow_a_commit(s), "{s}");
+        }
+        for s in [502, 504] {
+            assert!(status_may_follow_a_commit(s), "{s}");
         }
     }
 
