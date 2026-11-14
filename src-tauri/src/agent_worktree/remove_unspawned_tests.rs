@@ -163,6 +163,21 @@ async fn a_provisioned_tree_in_a_repo_that_does_not_ignore_claude_is_removed() {
     let id = agent();
     let tree = fx.allocate(&id, "canon");
     provision_scaffolding(&tree);
+    // The provisioners exclude exactly what they wrote via the repo's
+    // `info/exclude` (`crate::provision_exclude`), so `.claude/` would not read
+    // `??` here. Empty that file so the removal still faces untracked
+    // scaffolding — the shape a failed exclude write, an unanswered probe, or a
+    // runner build predating the exclude leaves behind.
+    let exclude = git(
+        &tree,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ],
+    );
+    std::fs::write(exclude.trim(), "").unwrap();
     let porcelain = git(&tree, &["status", "--porcelain"]);
     assert!(porcelain.contains("?? .claude/"), "{porcelain}");
     assert!(porcelain.contains("?? .mcp.json"), "{porcelain}");
