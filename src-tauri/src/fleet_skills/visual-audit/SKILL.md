@@ -1,6 +1,6 @@
 ---
 name: visual-audit
-description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the 20-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag, and eight L1 image assertions). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
+description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the 22-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, contrast_meets_wcag, eight L1 image assertions, and three timeline assertions: animation_settled, settled_within, state_entered_within). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
 user-invocable: true
 ---
 
@@ -12,7 +12,7 @@ that turn declarative visual questions into structured answers:
 | Endpoint | What it does |
 |---|---|
 | `POST /ui-bridge/vision/analyze` | Run one of the six analyzers (layout/typography/color/dynamic/elements/image). Returns `verdict` (READ THIS FIRST — see below), `analyzer` (echoed back), `findings: [{kind, severity, analyzer?, region?, detail, elements?, confidence}]`, `imageValues?` (the `image` analyzer's measurements — see below), and the provenance set: `coverage?`, `frame?`, `frameError?`, `evaluatedAt`, `snapshotAttribution`. |
-| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **Only the L1 image assertions read the frame** (see the DSL table) — every other assertion evaluates from the snapshot, and for those the captured frame is reported as provenance but consulted by no verdict. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed` and the same provenance set. |
+| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **Only the L1 image assertions read the frame** (see the DSL table), and the three timeline assertions read the interaction timeline named by `timelineRef` — every other assertion evaluates from the snapshot, and for those the captured frame is reported as provenance but consulted by no verdict. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed`, the same provenance set, and `timelineRef` (how the ref resolved) when one was sent. |
 | `POST /ui-bridge/vision/baseline` | Capture a baseline image + register the snapshot's element bboxes under `name`. |
 | `GET  /ui-bridge/vision/baselines` | List registered baselines. |
 
@@ -343,7 +343,9 @@ Each assertion is a tagged-JSON object:
 | `typography_consistent` | `{"type":"typography_consistent","elements":["h1","h2"],"dimensions":["font_family"]}` |
 | `no_layout_shift_since` | `{"type":"no_layout_shift_since","baseline":"v1.0-home","tolerance_px":2}` |
 | `no_clipping` | `{"type":"no_clipping","region":{"x":0,"y":0,"w":1280,"h":720}}` |
-| `animation_settled` | `{"type":"animation_settled","region":null,"settle_frames":3}` |
+| `animation_settled` | `{"type":"animation_settled","region":null}` — no CSS animation or transition was still running when the interaction's timeline ended. Reads the timeline (`timelineRef`), not frames. With `region` set, a still-running animation cannot be placed (the timeline names targets by fingerprint, not geometry), so that answers `unknown`; "nothing running anywhere" still passes. The retired `settle_frames` key is accepted and ignored. |
+| `settled_within` | `{"type":"settled_within","ms":500}` — the timeline's `summary.settleMs` is at most `ms`. A recording that covered `ms` and never settled fails; one that stopped short of `ms` without settling is `unknown`. `ms` is the caller's bound; there is no default. |
+| `state_entered_within` | `{"type":"state_entered_within","state":"saved-toast","ms":2000}` — the declared UI state became active within `ms` of the action, read from the timeline's `summary.expectedStates` (request it with `expectStates` + `withinMs` on the action's `/control/with-diff` call) or its `state-entered` events. A state already active throughout FAILS (the action did not enter it) when the recording covered `ms` and the reading is not degraded; otherwise `unknown`. |
 | `contrast_meets_wcag` | `{"type":"contrast_meets_wcag","element":"btn-save","level":"aa"}` |
 | `image_palette_within` | `{"type":"image_palette_within","element":"hero","palette":[{"r":20,"g":40,"b":90}],"max_delta_e":10,"min_coverage":0.6}` — at least `min_coverage` of the image's pixels lie within `max_delta_e` (CIEDE2000) of a palette colour. Reads the frame. |
 | `no_near_duplicate_images` | `{"type":"no_near_duplicate_images","max_hamming":6}` — no two images' pHashes within `max_hamming` bits. Reads the frame. |
@@ -353,6 +355,16 @@ Each assertion is a tagged-JSON object:
 | `salience_order` | `{"type":"salience_order","cta_id":"cta-signup"}` — the CTA is the most salient interactive or media element. Reads the frame. |
 | `image_sharpness_at_least` | `{"type":"image_sharpness_at_least","element":"hero","min_sharpness":50}` — variance of the Laplacian at the rendered scale. Reads the frame. |
 | `image_blockiness_within` | `{"type":"image_blockiness_within","element":"hero","max_blockiness":1.5}` — compression blockiness (~1.0 is clean). Reads the frame. |
+
+The three timeline assertions evaluate against the stored timeline of one journey
+edge observation, named by the request's top-level `timelineRef` (its id). The ref
+resolves only within the app the request is about — `target` when one is sent,
+else the runner's own app — so a ref from another app, an unknown id, an
+observation with no stored timeline, a withdrawn or unparseable one, or a ledger
+that cannot be read leaves all three `unknown` with the resolution's own code,
+never a pass. Without a `timelineRef` they are `unknown`.
+The response's `timelineRef` block (`id`, `appId`, `loaded`, `unknown`) says
+which of those happened.
 
 Every threshold on an image assertion is the CALLER's (a slot spec or the
 visual system); an omitted one answers `outcome: "unknown"`, never a pass.
