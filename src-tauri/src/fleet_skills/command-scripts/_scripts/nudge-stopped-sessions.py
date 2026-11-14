@@ -51,6 +51,7 @@ exit 0: its paused sessions read STOPPED, and /next-move would end the pause.
 """
 import argparse
 import datetime as dt
+import http.client
 import importlib.util
 import json
 import os
@@ -805,7 +806,12 @@ def nudge_one(tid, idle_min, cooldown_h, own, include_complete, use_coord=True, 
             else:
                 sanitized = value
     except urllib.error.HTTPError as e:
-        return False, False, f"submit-prompt answered {e.code}: {e.read()[:200]!r}"
+        try:  # a refused POST's body can be cut short: that must not end the pass
+            body_text = e.read()[:200]
+        except Exception:  # noqa: BLE001 - IncompleteRead, timeout, reset: the refusal itself is the fact
+            body_text = b""
+        # the literal prefix is SUBMIT_REFUSED: nudge_outcome classifies on it
+        return False, False, f"submit-prompt answered {e.code}: {body_text!r}"
     except Exception as e:  # the runner may have typed it anyway: the read-back decides
         reply = f"{type(e).__name__}: {e}"
     if sanitized:
@@ -1133,6 +1139,15 @@ def menu_limit_selftest():
         if (verdict, judged) != ("LIMITED", "LIMITED") or cfs.MENU_OPEN_LINE not in why:
             bad.append(f"an open menu, its transcript limit reset 25h ago, {name}: close reads {verdict} {why}, "
                        f"nudge reads {judged} {reasons}; want LIMITED naming the open menu, and kept LIMITED")
+    # The holds come before the open-menu answer: a finished or waiting_human row whose screen
+    # still ends on the menu is held, not left LIMITED for triage's limit step to type into.
+    menu_why = [cfs.MENU_OPEN_LINE, "the final reply carries no limit message"]
+    for name, facts in (("coord waiting_human", {"sessionStatus": "waiting_human"}),
+                        ("a finish the close screen honours", {"finished": True, "finishedAt": now - 30 * m})):
+        checks += 1
+        judged, reasons = judge("LIMITED", list(menu_why), facts, dict(tx, last_prompt=now - 26 * 60 * m), now, 24)
+        if judged != "HELD":
+            bad.append(f"{name} with the menu open: judge = {judged} {reasons}; want HELD, not LIMITED")
     # nudge_one's final look over an open menu that prompt_state reads as an empty prompt.
     checks += 1
     me = sys.modules[__name__]
@@ -1929,6 +1944,27 @@ def selftest():
                 got = (None, None, f"raised TypeError: {e}")
             if got[:2] != (False, False) or want_msg not in got[2] or seen != want_seen:
                 bad.append(f"nudge_one pre-send check (raw={raw!r}) = {got}, prompt_state saw {seen}")
+        # A refused POST whose body read is cut short (IncompleteRead) still reads as the runner's
+        # refusal: the pass completes, nudge_outcome says failed, and nothing escapes nudge_one.
+        class _Torn(urllib.error.HTTPError):
+            def read(self, *_a):
+                raise http.client.IncompleteRead(b"{")
+
+        def _refuse(*_a, **_k):
+            raise _Torn("http://127.0.0.1:9/x", 500, "boom", {}, None)
+        cfs.raw_tail = lambda tid: "screen"
+        cfs.prompt_state = lambda raw, *, cols: ("empty", "")
+        saved_urlopen = urllib.request.urlopen
+        urllib.request.urlopen = _refuse
+        try:
+            try:
+                got = nudge_one("t1", 15, 24, set(), False)
+            except Exception as e:  # noqa: BLE001
+                got = (None, None, f"raised {type(e).__name__}: {e}")
+        finally:
+            urllib.request.urlopen = saved_urlopen
+        if got[:2] != (False, False) or not got[2].startswith(SUBMIT_REFUSED) or nudge_outcome(*got) != "failed":
+            bad.append(f"nudge_one with a refused POST whose body read is cut short = {got}")
         # The /next-move branch: a futile nudge an hour ago is re-screened HELD and never sent.
         cfs.transcript_facts = lambda row: dict(fut, last_prompt=time.time() * 1000 - 3600000)
         got = nudge_one("t1", 15, 24, set(), False, use_coord=False, use_gh=False)
@@ -2032,7 +2068,7 @@ def main():
     try:
         res, warnings, ready_err = screen(a.idle_min, only, a.cooldown_hours, a.include_complete,
                                           not a.no_coord, not a.no_gh)
-    except cfs.READ_ERRORS as e:
+    except (*cfs.READ_ERRORS, http.client.HTTPException) as e:
         print(f"UNKNOWN: could not read the runner at {cfs.API}: {e}", file=sys.stderr)
         return 3
     prep, prep_text = cfs.prepare_status()
@@ -2063,7 +2099,7 @@ def main():
         try:
             ok, sent, msg = nudge_one(r["terminalId"], a.idle_min, a.cooldown_hours, own, a.include_complete,
                                       not a.no_coord, not a.no_gh)
-        except cfs.READ_ERRORS as e:
+        except (*cfs.READ_ERRORS, http.client.HTTPException) as e:
             ok, sent, msg = False, False, f"UNKNOWN before the send, not sent: {e}"
         sends += sent  # a SENT? row may have started a turn too, so it uses up the cap
         failed += not ok

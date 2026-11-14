@@ -37,6 +37,10 @@ just to get it out of the prepare's way. Marking it finished means the bulk
 and the prepare's verdict counts a finished row as done
 rather than waiting for it. Mark it finished only when its work really is
 done. The prepare's state is the `restart_prep` block of `/restart-readiness`.
+The prepare arrives only once qontinui-runner#2796 lands. As of 2026-11-13 that
+PR is open and no build from `main` serves that block, so a body with no
+`restart_prep` field means the prepare has not landed on this build. That is
+not a reading of any prepare's state.
 
 ---
 
