@@ -4441,6 +4441,25 @@ mod tests {
         assert!(!region.contains("r.deliver_owed_finish("), "{region}");
     }
 
+    /// Phase 2: main.rs wires the re-key seam's observer to
+    /// `note_pane_row`, and the live-pane-row lookup to the terminal manager
+    /// and the session registry (source scan, as above).
+    #[test]
+    fn the_rekey_observer_is_wired_to_the_registrar() {
+        let main = include_str!("../main.rs");
+        let (_, after) = main
+            .split_once("registry.attach_rekey_observer(")
+            .expect("main.rs attaches the re-key observer");
+        let region: String = after.chars().take(300).collect();
+        assert!(region.contains("r.note_pane_row(row, csid)"), "{region}");
+        let (_, after) = main
+            .split_once("ai_coord_registrar.attach_pane_row_tenant(")
+            .expect("main.rs attaches the pane-row lookup");
+        let region: String = after.chars().take(600).collect();
+        assert!(region.contains(".coord_row_bound_at(row)"), "{region}");
+        assert!(region.contains(".tenant_scope_of(row)"), "{region}");
+    }
+
     /// Taken from #2711 (vet D5): after the registrar follows a migrated pane
     /// to its new row, the OLD pane's exit close must not close the live row
     /// through the store's close observer. The migration marks the old
@@ -4501,6 +4520,252 @@ mod tests {
             rows_of_kind(&reg, SessionEventKind::Closed).is_empty(),
             "no coord Closed for either row of a live session"
         );
+    }
+
+    /// The registry + registrar wired as main.rs wires them: the seam's
+    /// observer calls `note_pane_row`, and the live-pane-row lookup answers
+    /// the rows in `live` with the registry's own tenant scope.
+    fn wire_seam(
+        registry: &Arc<crate::session::SessionRegistry>,
+        reg: &Arc<AiCoordRegistrar>,
+        live: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    ) {
+        let r = Arc::downgrade(reg);
+        registry.attach_rekey_observer(move |row, csid| {
+            if let Some(r) = r.upgrade() {
+                r.note_pane_row(row, csid);
+            }
+        });
+        let sreg = Arc::downgrade(registry);
+        reg.attach_pane_row_tenant(move |row| {
+            if !live.lock().unwrap().contains(&row) {
+                return None;
+            }
+            Some(PaneRowFacts {
+                tenant: crate::claude_session::pane_row_owner::tenant_from_scope(
+                    sreg.upgrade()?.tenant_scope_of(row),
+                ),
+                bound_at_ms: Some(1_000),
+            })
+        });
+    }
+
+    /// Plan Phase 2 "Done when" — the finding's reproduction. After a runner
+    /// restart, auto-bind adopted the PREVIOUS boot's row for X while the pane
+    /// hosting X runs on its own new row R. The re-key seam then confirms R
+    /// onto X; the session's finish must be queued to R, the pane row.
+    #[test]
+    fn a_pane_sessions_finish_after_a_restart_lands_on_the_pane_row() {
+        use crate::session::coord_identity::{confirm_for_terminal, RekeyOutcome, RekeySource};
+        let _amb = crate::test_env::isolated_ambient();
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let sdir = tempfile::tempdir().unwrap();
+        let (registry, _soutbox) = crate::session::coord_identity::tests::registry(sdir.path());
+        const PIN: &str = "90aea717-0000-4000-8000-000000000001";
+        const X: &str = "90aea717-0000-4000-8000-0000000000aa";
+        let pane_row = registry
+            .register_external_with_lineage(
+                crate::session::coord_identity::tests::intent(),
+                None,
+                Some(PIN.into()),
+            )
+            .unwrap();
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let live: Arc<Mutex<std::collections::HashSet<Uuid>>> = Default::default();
+        live.lock().unwrap().insert(pane_row);
+        wire_seam(&registry, &reg, live);
+
+        // Boot: auto-bind ran ahead of the pane's bind and adopted coord's
+        // pick — the previous boot's row, still active.
+        let previous_boot_row = Uuid::new_v4();
+        reg.bind_transcript_session(X, Some(previous_boot_row), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(reg.session_id_for(X), Some(previous_boot_row));
+
+        // The seam confirms the pane row onto X (provider registry).
+        assert_eq!(
+            confirm_for_terminal(
+                &registry,
+                "t1",
+                Some(pane_row),
+                X,
+                RekeySource::ProviderRegistry
+            ),
+            RekeyOutcome::Queued
+        );
+        assert_eq!(reg.session_id_for(X), Some(pane_row));
+
+        // The finish.
+        let (store, _sdir2) = attach_store(&reg);
+        {
+            let r = Arc::downgrade(&reg);
+            store.attach_finish_observer(move |rec| match r.upgrade() {
+                Some(r) => r.forward_finish_change(rec),
+                None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+            });
+        }
+        store.record_open(crate::session::session_lifecycle_store::test_open_record(X));
+        let out = store.set_finished(X, true, None).unwrap();
+        assert_eq!(
+            out.coord,
+            FinishSync::Queued {
+                coord_session_id: pane_row
+            },
+            "the finish names the pane row, not the previous boot's"
+        );
+        assert!(
+            reg.inner
+                .outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .all(|r| r.session_id != previous_boot_row),
+            "nothing is written to the previous boot's row after the move"
+        );
+    }
+
+    /// Phase 2: after adopting R′ for X, a seam confirm of the pane row R onto
+    /// X moves the entry — through `Queued` and through `AlreadyCurrent`, and
+    /// through `confirm_for_session` (the retry doors) as well as
+    /// `confirm_for_terminal` — so the finish and the heartbeat address R. An
+    /// ADOPTED R′ gets no `Closed`.
+    #[test]
+    fn a_seam_confirm_moves_an_adopted_entry_onto_the_pane_row() {
+        use crate::session::coord_identity::{
+            confirm_for_session, confirm_for_terminal, RekeyOutcome, RekeySource,
+        };
+        let _amb = crate::test_env::isolated_ambient();
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        const PIN: &str = "5ea70000-0000-4000-8000-000000000001";
+        const X: &str = "5ea70000-0000-4000-8000-0000000000aa";
+        const Y: &str = "5ea70000-0000-4000-8000-0000000000bb";
+        let sdir = tempfile::tempdir().unwrap();
+        let (registry, _o) = crate::session::coord_identity::tests::registry(sdir.path());
+        let intent = crate::session::coord_identity::tests::intent;
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let live: Arc<Mutex<std::collections::HashSet<Uuid>>> = Default::default();
+        wire_seam(&registry, &reg, live.clone());
+
+        // Queued, through the terminal door.
+        let r1 = registry
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        live.lock().unwrap().insert(r1);
+        let stale1 = Uuid::new_v4();
+        reg.bind_transcript_session(X, Some(stale1), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            confirm_for_terminal(&registry, "t1", Some(r1), X, RekeySource::ProviderRegistry),
+            RekeyOutcome::Queued
+        );
+        assert_eq!(reg.session_id_for(X), Some(r1));
+        assert_eq!(
+            reg.finish_session(X, Some(1)),
+            FinishSync::Queued {
+                coord_session_id: r1
+            }
+        );
+        reg.heartbeat_on_interaction(X);
+        assert!(rows_of_kind(&reg, SessionEventKind::Heartbeat)
+            .iter()
+            .all(|h| h.session_id == r1));
+
+        // AlreadyCurrent, through the session door: the record already
+        // carries Y when the registrar's stale entry appears.
+        let r2 = registry
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        assert_eq!(
+            confirm_for_session(&registry, r2, Y, RekeySource::ProviderRegistry),
+            RekeyOutcome::Queued,
+            "the observer fires, but R2 is no live pane yet: nothing moves"
+        );
+        live.lock().unwrap().insert(r2);
+        let stale2 = Uuid::new_v4();
+        reg.bind_transcript_session(Y, Some(stale2), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            confirm_for_session(&registry, r2, Y, RekeySource::ProviderRegistry),
+            RekeyOutcome::AlreadyCurrent
+        );
+        assert_eq!(reg.session_id_for(Y), Some(r2));
+        assert_eq!(
+            reg.finish_session(Y, Some(2)),
+            FinishSync::Queued {
+                coord_session_id: r2
+            }
+        );
+        assert!(
+            rows_of_kind(&reg, SessionEventKind::Closed).is_empty(),
+            "an adopted R′ gets no Closed"
+        );
+    }
+
+    /// Phase 2: the seam never moves a sniffed or pinned-plane entry, and
+    /// never binds an absent one.
+    #[test]
+    fn the_seam_moves_no_sniffed_or_pinned_entry_and_binds_nothing() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let (r1, r2, r3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for r in [r1, r2, r3] {
+            live.lock()
+                .unwrap()
+                .insert(r, NewSessionTenant::Undetermined);
+        }
+        let s = reg
+            .register_sniffed_session("sniffed-x", "typed resume", None)
+            .unwrap();
+        assert_eq!(reg.note_pane_row(r1, "sniffed-x"), MoveOutcome::NotEligible);
+        assert_eq!(reg.session_id_for("sniffed-x"), Some(s));
+
+        let p = reg
+            .register_session("pinned-task-run", "ai session", None)
+            .unwrap();
+        assert_eq!(
+            reg.note_pane_row(r2, "pinned-task-run"),
+            MoveOutcome::NotEligible
+        );
+        assert_eq!(reg.session_id_for("pinned-task-run"), Some(p));
+
+        assert_eq!(reg.note_pane_row(r3, "absent-x"), MoveOutcome::Unbound);
+        assert_eq!(reg.session_id_for("absent-x"), None);
+        assert!(rows_of_kind(&reg, SessionEventKind::Closed).is_empty());
+    }
+
+    /// Phase 2 (re-vet): an auto-bind-MINTED `reverse[X] = M` (coord did not
+    /// know X when auto-bind ran) is moved onto the pane row, and exactly one
+    /// `Closed` is queued for M, stamped with M's tenant; a second confirm
+    /// queues nothing more.
+    #[test]
+    fn the_seam_moves_a_minted_entry_and_closes_the_minted_row_once() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let r = Uuid::new_v4();
+        live.lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Stated(PANE_TENANT));
+        let x = "minted-by-autobind";
+        let m = reg
+            .bind_transcript_session(x, None, Some(OWNING_TENANT), ResumeParams::default())
+            .unwrap();
+
+        assert_eq!(reg.note_pane_row(r, x), MoveOutcome::Moved { from: m });
+        assert_eq!(reg.note_pane_row(r, x), MoveOutcome::Unchanged);
+        let closed = rows_of_kind(&reg, SessionEventKind::Closed);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0].session_id, m);
+        assert_eq!(closed[0].payload["tenant_id"], json!(OWNING_TENANT));
+        assert_eq!(reg.session_id_for(x), Some(r));
+        assert_eq!(reg.recorded_tenant(x), Some(PANE_TENANT));
     }
 
     #[test]
