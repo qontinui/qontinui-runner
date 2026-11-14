@@ -4405,11 +4405,28 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     ai_coord_registrar.attach_terminal_coord_lookup(move |csid| {
                         tm.upgrade()?.coord_session_id_for_pinned(csid)
                     });
+                    // Plan `2026-11-12-transcript-autobind-adopts-a-previous-
+                    // boot-row-that-a-live-pane-has-replaced`: a live pane's
+                    // own row (tenant per its SessionRegistry scope, bind
+                    // instant) for the live-pane adoption and the movers;
+                    // `on_terminal_coord_bind` moves the registrar's entry for
+                    // the pinned id onto a newly bound row BEFORE it delivers
+                    // owed marks.
+                    let tm = std::sync::Arc::downgrade(&term_for_session);
+                    let sreg = std::sync::Arc::downgrade(&registry);
+                    ai_coord_registrar.attach_pane_row_tenant(move |row| {
+                        let bound_at_ms = tm.upgrade()?.coord_row_bound_at(row)?;
+                        let scope = sreg.upgrade()?.tenant_scope_of(row);
+                        Some(claude_session::pane_row_owner::PaneRowFacts {
+                            tenant: claude_session::pane_row_owner::tenant_from_scope(scope),
+                            bound_at_ms: Some(bound_at_ms),
+                        })
+                    });
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     term_for_session.attach_coord_bind_observer(
                         move |pinned, terminal_id, coord_id| {
                             if let Some(r) = reg.upgrade() {
-                                r.deliver_owed_finish(pinned, terminal_id, coord_id);
+                                r.on_terminal_coord_bind(pinned, terminal_id, coord_id);
                             }
                         },
                     );

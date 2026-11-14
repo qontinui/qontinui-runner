@@ -74,6 +74,17 @@ use crate::session::local_store::OutboxWriter;
 use crate::session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
 use crate::session::SessionEventKind;
 
+use super::pane_row_owner::{BindDoor, PaneRowFacts, PaneRowOwners};
+
+/// The pane-row transfer (plan
+/// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+/// D4) — a child module so it reaches [`Inner`]'s private maps without
+/// widening them.
+mod pane_transfer;
+pub(crate) use pane_transfer::{
+    pane_row_moves_not_owner, registrar_terminal_row_disagreements, MoveOutcome, Mover,
+};
+
 /// Default-ON env gate for AI-session coord registration (P0.3). Any of
 /// `0` / `false` / `off` (case-insensitive) disables it; anything else
 /// (including unset) leaves it ON.
@@ -121,6 +132,16 @@ struct RegisterOverrides {
     decided_tenant: Option<NewSessionTenant>,
     /// Resume parameters stamped on a FRESH `Started` row.
     resume: ResumeParams,
+    /// The door this registration comes through. `None` derives it from the
+    /// plane: [`BindDoor::Pinned`] with a `task_run_id`, else
+    /// [`BindDoor::Sniffed`]. [`AiCoordRegistrar::bind_transcript_session`]
+    /// states [`BindDoor::Transcript`].
+    door: Option<BindDoor>,
+    /// The adopted row is a LIVE pane's own row that the key owns (plan D1):
+    /// any OTHER key on it is evicted in the R6 critical section instead of
+    /// refusing [`TranscriptBindRefusal::CoordSessionInUse`] — unless an
+    /// owner entry on the row names another id, which still refuses.
+    take_from_live_pane: bool,
 }
 
 /// The parameters a later `claude --resume` must be pinned to: which account's
@@ -270,6 +291,15 @@ struct Inner {
     /// constructible without one (tests, ephemeral registrars). Unattached →
     /// the arm misses.
     terminal_coord_lookup: OnceLock<TerminalCoordLookup>,
+    /// The pane-row owner map and each row's bind door (plan D1/D4); see
+    /// [`super::pane_row_owner`]. A leaf lock.
+    pane_rows: PaneRowOwners,
+    /// Answers a coord row's [`PaneRowFacts`] when some LIVE terminal holds it
+    /// (`None` otherwise): its tenant per plan D3 and its bind instant.
+    /// main.rs wires it to `TerminalManager` and
+    /// `SessionRegistry::tenant_scope_of`. Unattached → no row is a live
+    /// pane's, so no live-pane adoption, seam move or finish-time repair runs.
+    pane_row_tenant: OnceLock<PaneRowLookup>,
     /// Test-only observability for the Phase-1 handle hook: counts every
     /// DECISION to fire it ([`AiCoordRegistrar::spawn_handle_register`]),
     /// incremented BEFORE the attached-store gate — so unit tests (which
@@ -282,6 +312,9 @@ struct Inner {
 /// See [`Inner::terminal_coord_lookup`]. Argument: a harness id; answers the
 /// coord row of the live terminal PINNED to it.
 type TerminalCoordLookup = Box<dyn Fn(&str) -> Option<Uuid> + Send + Sync>;
+
+/// See [`Inner::pane_row_tenant`].
+type PaneRowLookup = Box<dyn Fn(Uuid) -> Option<PaneRowFacts> + Send + Sync>;
 
 /// How many predecessors [`resolve_adoption_chain`] follows before giving up —
 /// each hop is one `/clear` inside the same provider process.
@@ -351,6 +384,8 @@ impl AiCoordRegistrar {
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
+                pane_rows: PaneRowOwners::default(),
+                pane_row_tenant: OnceLock::new(),
                 #[cfg(test)]
                 handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -393,12 +428,34 @@ impl AiCoordRegistrar {
     /// `None` when neither arm knows the id. One LINK of
     /// [`Self::resolve_record`]'s adoption chain.
     fn resolve_coord_session_id(&self, claude_session_id: &str) -> Option<Uuid> {
-        self.session_id_for(claude_session_id).or_else(|| {
-            self.inner
-                .terminal_coord_lookup
-                .get()
-                .and_then(|lookup| lookup(claude_session_id))
-        })
+        self.session_id_for(claude_session_id)
+            .or_else(|| self.pinned_terminal_row(claude_session_id, &[claude_session_id]))
+    }
+
+    /// The terminal arm, owner-checked (plan D1, "One narrowing"): the row of
+    /// the live terminal PINNED to `pinned`, answered only while no owner entry
+    /// on that row names an id outside `chain` — the record's own id and the
+    /// predecessors walked so far. A pin whose row now runs another session
+    /// (the pin was evicted by a transfer) answers `None`, so its finish is
+    /// never queued to the row the pane now runs that session on; a `/clear`
+    /// successor that owns the row still resolves through its predecessor's
+    /// pin. Removes answers, never adds one. The ONE helper every terminal-arm
+    /// call site uses.
+    fn pinned_terminal_row(&self, pinned: &str, chain: &[&str]) -> Option<Uuid> {
+        let row = self
+            .inner
+            .terminal_coord_lookup
+            .get()
+            .and_then(|lookup| lookup(pinned))?;
+        self.row_admits_chain(row, chain).then_some(row)
+    }
+
+    /// Whether no owner entry on `row` names an id outside `chain`.
+    fn row_admits_chain(&self, row: Uuid, chain: &[&str]) -> bool {
+        match self.inner.pane_rows.owner_of(row) {
+            None => true,
+            Some(owner) => chain.iter().any(|id| id.trim() == owner),
+        }
     }
 
     /// Resolve the coord row a lifecycle record's finished marker addresses:
@@ -419,18 +476,21 @@ impl AiCoordRegistrar {
         bound: Option<(&str, Uuid)>,
     ) -> Option<Uuid> {
         let store = self.inner.lifecycle_store.get();
+        let mut walked: Vec<String> = Vec::new();
         resolve_adoption_chain(
             claude_session_id,
             adopted_from,
             |id| {
+                walked.push(id.to_string());
+                let chain: Vec<&str> = walked.iter().map(String::as_str).collect();
                 self.session_id_for(id)
-                    .or_else(|| bound.filter(|(pinned, _)| *pinned == id).map(|(_, c)| c))
                     .or_else(|| {
-                        self.inner
-                            .terminal_coord_lookup
-                            .get()
-                            .and_then(|lookup| lookup(id))
+                        bound
+                            .filter(|(pinned, _)| *pinned == id)
+                            .map(|(_, c)| c)
+                            .filter(|c| self.row_admits_chain(*c, &chain))
                     })
+                    .or_else(|| self.pinned_terminal_row(id, &chain))
             },
             |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
         )
@@ -452,6 +512,10 @@ impl AiCoordRegistrar {
         &self,
         rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
     ) -> FinishSync {
+        // The finish-time repair (plan D4): an auto-bind entry that disagrees
+        // with the session's live pane row is moved onto it first, so this
+        // write and every one after it address the pane row.
+        self.repair_onto_live_pane(&rec.claude_session_id);
         let resolved =
             self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None);
         match rec.finished_at {
@@ -696,6 +760,40 @@ impl AiCoordRegistrar {
                 tenant,
                 resume,
                 decided_tenant: None,
+                door: Some(BindDoor::Transcript),
+                take_from_live_pane: false,
+            },
+        )
+    }
+
+    /// [`Self::bind_transcript_session`] for a harness id a LIVE pane hosts
+    /// (plan D1): adopt the pane's own row `row`, stamped with that row's
+    /// tenant `tenant` (plan D3 — `Stated(t)` from the pane row's scope, else
+    /// `Undetermined`, never the machine default). Any OTHER key bound to
+    /// `row` (the pane's pin, adopted before the pane's process switched id)
+    /// is evicted in the same critical section — no `Closed` for anything —
+    /// unless an owner entry on `row` names another id, which refuses
+    /// [`TranscriptBindRefusal::CoordSessionInUse`]. An R6 hit returns the
+    /// existing id, as every registration does.
+    pub fn bind_transcript_session_on_live_pane(
+        &self,
+        claude_session_id: &str,
+        row: Uuid,
+        tenant: NewSessionTenant,
+        resume: ResumeParams,
+    ) -> Result<Uuid, TranscriptBindRefusal> {
+        self.register_inner(
+            claude_session_id,
+            None,
+            "Claude Code session (transcript bind)",
+            None,
+            RegisterOverrides {
+                adopt: Some(row),
+                tenant: None,
+                resume,
+                decided_tenant: Some(tenant),
+                door: Some(BindDoor::Transcript),
+                take_from_live_pane: true,
             },
         )
     }
@@ -733,6 +831,11 @@ impl AiCoordRegistrar {
             Some(decided) => decided.tenant(),
             None => overrides.tenant.or_else(|| (self.inner.tenant_resolver)()),
         };
+        let door = overrides.door.unwrap_or(if task_run_id.is_some() {
+            BindDoor::Pinned
+        } else {
+            BindDoor::Sniffed
+        });
 
         // R6 — check-AND-reserve atomically under ONE reverse-map lock
         // acquisition (review W1). `spawn_register_typed_resume` dispatches a
@@ -755,17 +858,31 @@ impl AiCoordRegistrar {
             };
             match rev.get(claude_session_id) {
                 Some(existing) => Some(*existing),
+                // A live-pane adoption (plan D1) of a row another id OWNS is
+                // refused: the owner entry is the pid-exact evidence of what
+                // the pane runs, re-validated here inside the section.
+                None if overrides.take_from_live_pane
+                    && !self.inner.pane_rows.admits(session_id, claude_session_id) =>
+                {
+                    return Err(TranscriptBindRefusal::CoordSessionInUse);
+                }
                 // Adoption of an id another key already holds: refused in the
                 // SAME critical section as the reservation, so two adopters
-                // cannot both win.
-                None if adopt_coord_session.is_some_and(|a| {
-                    rev.iter().any(|(k, v)| *v == a && k != claude_session_id)
-                }) =>
+                // cannot both win — except a live-pane adoption, which TAKES
+                // the row (plan D1/D4): the other keys are evicted here.
+                None if !overrides.take_from_live_pane
+                    && adopt_coord_session.is_some_and(|a| {
+                        rev.iter().any(|(k, v)| *v == a && k != claude_session_id)
+                    }) =>
                 {
                     return Err(TranscriptBindRefusal::CoordSessionInUse);
                 }
                 None => {
+                    if overrides.take_from_live_pane {
+                        self.evict_other_keys_on(&mut rev, session_id, claude_session_id);
+                    }
                     rev.insert(claude_session_id.to_string(), session_id);
+                    self.inner.pane_rows.set_door(session_id, door);
                     // Record the tenant in the SAME critical section: the id
                     // is resolvable through `session_id_for` from here on, so
                     // a concurrent heartbeat / progress / transcript row must
@@ -1217,8 +1334,9 @@ impl AiCoordRegistrar {
     }
 
     /// Drop `session_id`'s per-row state: its tenant decision (`tenants` /
-    /// `undecided`) and its adopted mark (`adopted`).
+    /// `undecided`), its adopted mark (`adopted`) and its bind door.
     fn evict_tenant(&self, session_id: Uuid) {
+        self.inner.pane_rows.forget_door(session_id);
         // Through a poisoned lock, as the insert side writes: a skipped
         // removal would leave a stale mark for a later row under this id.
         self.inner
@@ -1315,6 +1433,7 @@ impl AiCoordRegistrar {
         let store = self.inner.lifecycle_store.get();
         let pin = pin.map(str::trim).filter(|p| !p.is_empty());
         let mut pinned_link = false;
+        let mut walked: Vec<String> = Vec::new();
         let row = resolve_adoption_chain(
             claude_session_id.trim(),
             adopted_from,
@@ -1322,11 +1441,10 @@ impl AiCoordRegistrar {
                 if pin == Some(id.trim()) {
                     pinned_link = true;
                 }
+                walked.push(id.to_string());
+                let chain: Vec<&str> = walked.iter().map(String::as_str).collect();
                 self.recorded_row(id).or_else(|| {
-                    self.inner
-                        .terminal_coord_lookup
-                        .get()
-                        .and_then(|lookup| lookup(id))
+                    self.pinned_terminal_row(id, &chain)
                         .map(|coord_session_id| RecordedCoordRow {
                             coord_session_id,
                             origin: RecordedRowOrigin::TerminalPinned,
@@ -3157,7 +3275,7 @@ mod tests {
     fn attach_one_terminal(reg: &AiCoordRegistrar, pinned: &'static str, coord: Uuid) {
         reg.attach_terminal_coord_lookup(move |csid| {
             crate::terminal::manager::resolve_pinned_coord(
-                std::iter::once((pinned, Some(coord))),
+                std::iter::once((pinned, Some((coord, 1)))),
                 csid,
             )
         });
@@ -3543,6 +3661,683 @@ mod tests {
         assert!(
             !store.get(&x).unwrap().finish_synced,
             "X's mark stays owed, for X's own registration to re-offer"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-
+    // a-live-pane-has-replaced`: the pane-row owner, the live-pane adoption
+    // (D1), the tenant stamp (D3), the one transfer and its movers (D4) and
+    // the re-key seam (D2).
+    // ------------------------------------------------------------------
+
+    use crate::claude_session::pane_row_owner::PaneRowFacts;
+
+    const PANE_TENANT: Uuid = Uuid::from_u128(0x9a7e_0000_0000_4000_8000_0000_0000_000a);
+
+    /// The live pane rows the registrar's pane-row lookup answers (row →
+    /// tenant per D3), mutable by the test.
+    fn attach_live_rows(reg: &AiCoordRegistrar) -> Arc<Mutex<HashMap<Uuid, NewSessionTenant>>> {
+        let rows: Arc<Mutex<HashMap<Uuid, NewSessionTenant>>> = Default::default();
+        let r = rows.clone();
+        reg.attach_pane_row_tenant(move |row| {
+            r.lock().unwrap().get(&row).map(|t| PaneRowFacts {
+                tenant: *t,
+                bound_at_ms: Some(1_000),
+            })
+        });
+        rows
+    }
+
+    /// The terminal lookup exactly as main.rs wires it (the production
+    /// newest-bound rule), over mutable `(pinned, (row, bind seq))` panes.
+    type Panes = Arc<Mutex<Vec<(String, Option<(Uuid, u64)>)>>>;
+    fn attach_panes(reg: &AiCoordRegistrar) -> Panes {
+        let panes: Panes = Default::default();
+        let p = panes.clone();
+        reg.attach_terminal_coord_lookup(move |csid| {
+            let g = p.lock().unwrap();
+            crate::terminal::manager::resolve_pinned_coord(
+                g.iter().map(|(pin, b)| (pin.as_str(), *b)),
+                csid,
+            )
+        });
+        panes
+    }
+
+    fn rows_of_kind(reg: &AiCoordRegistrar, kind: SessionEventKind) -> Vec<OutboxRow> {
+        reg.inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == kind.as_str())
+            .collect()
+    }
+
+    type OutboxRow = crate::session::local_store::OutboxRecord;
+
+    /// D1 + D4: the pane pinned to P adopted its row R; the seam then saw the
+    /// pane's process run X (an in-pane `/resume X`). X's live-pane adoption
+    /// TAKES R — the pin is evicted, keeps no row, and closing it queues
+    /// nothing for R (X still runs there).
+    #[test]
+    fn a_live_pane_adoption_evicts_the_pin_the_seam_replaced() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (p, x) = ("pane-pin-p", "in-pane-resume-x");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        assert_eq!(
+            reg.bind_transcript_session(p, Some(r), None, ResumeParams::default()),
+            Ok(r)
+        );
+        assert_eq!(reg.live_terminal_row(p).map(|l| l.row), Some(r));
+
+        // The seam advances R's owner to X; X is unbound, so nothing moves.
+        assert_eq!(reg.note_pane_row(r, x), MoveOutcome::Unbound);
+        assert_eq!(reg.session_id_for(x), None, "the seam never binds");
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r));
+        assert_eq!(reg.live_terminal_row(p), None, "the pin lost its row");
+
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                x,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Ok(r)
+        );
+        assert_eq!(reg.session_id_for(x), Some(r));
+        assert_eq!(reg.session_id_for(p), None, "the pin was evicted");
+        assert_eq!(reg.task_run_id_for(&r), Some(x.to_string()));
+        assert_eq!(
+            reg.recorded_row(x).map(|r| r.origin),
+            Some(RecordedRowOrigin::Adopted)
+        );
+
+        reg.close_session(p);
+        assert!(
+            reg.inner.outbox.pending().unwrap().is_empty(),
+            "closing the evicted pin queues nothing for R"
+        );
+        assert_eq!(reg.session_id_for(x), Some(r));
+    }
+
+    /// The live-pane adoption of a row another id OWNS is refused — the owner
+    /// entry is re-validated inside the R6 section.
+    #[test]
+    fn a_live_pane_adoption_of_a_row_another_id_owns_is_refused() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        reg.note_pane_row(r, "owner-y");
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                "other-x",
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Err(TranscriptBindRefusal::CoordSessionInUse)
+        );
+        assert_eq!(reg.session_id_for("other-x"), None);
+    }
+
+    /// The typed-resume discriminator (M-a beside the owner rule): a typed
+    /// `claude --resume X` registers X's OWN sniffed row S first; the seam
+    /// later advances the pane's row R to X; an auto-bind attempt for X then
+    /// finds X bound. X stays on S — neither the seam nor the live-pane door
+    /// moves a sniffed entry.
+    #[test]
+    fn a_typed_resume_keeps_its_sniffed_row_after_the_seam_advances_the_pane_owner() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (p, x) = ("pane-pinned-p", "typed-resume-x");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+
+        let s = reg
+            .register_sniffed_session(x, "typed resume", None)
+            .expect("sniffed");
+        assert_ne!(s, r);
+        assert_eq!(reg.note_pane_row(r, x), MoveOutcome::NotEligible);
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                x,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Ok(s),
+            "an R6 hit: X is already bound, to its own row"
+        );
+        assert_eq!(reg.session_id_for(x), Some(s));
+        assert_eq!(
+            reg.finish_session(x, Some(3)),
+            FinishSync::Queued {
+                coord_session_id: s
+            }
+        );
+    }
+
+    /// D3: the adopted pane row carries the pane row's own tenant, on every
+    /// write; an unresolved scope sends no top-level `tenant_id`, records no
+    /// tenant, and is never filled with the machine default.
+    #[test]
+    fn a_live_pane_adoption_stamps_the_pane_rows_tenant() {
+        const MACHINE: Uuid = Uuid::from_u128(0x3ac4_0000_0000_4000_8000_0000_0000_0001);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(MACHINE));
+        let (stated, unresolved) = (Uuid::new_v4(), Uuid::new_v4());
+
+        reg.bind_transcript_session_on_live_pane(
+            "stated-x",
+            stated,
+            NewSessionTenant::Stated(PANE_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        reg.bind_transcript_session_on_live_pane(
+            "unresolved-x",
+            unresolved,
+            NewSessionTenant::Undetermined,
+            ResumeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(reg.recorded_tenant("stated-x"), Some(PANE_TENANT));
+        assert_eq!(reg.recorded_tenant("unresolved-x"), None);
+
+        reg.heartbeat_on_interaction("stated-x");
+        reg.heartbeat_on_interaction("unresolved-x");
+        let beats = rows_of_kind(&reg, SessionEventKind::Heartbeat);
+        assert_eq!(beats.len(), 2, "{beats:?}");
+        for b in &beats {
+            if b.session_id == stated {
+                assert_eq!(b.payload["tenant_id"], json!(PANE_TENANT));
+            } else {
+                assert_eq!(b.session_id, unresolved);
+                assert!(
+                    b.payload.get("tenant_id").is_none(),
+                    "an unresolved scope sends no tenant_id, never the machine's: {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Two live panes pinned to X during a migration overlap: the live-pane
+    /// adoption takes the NEWEST-bound pane's row, whatever order the
+    /// manager's map yields them in.
+    #[test]
+    fn a_live_pane_adoption_takes_the_newest_bound_of_two_pinned_panes() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        for newest_first in [false, true] {
+            let (reg, _dir) = registrar();
+            let x = "migrated-x";
+            let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+            let live = attach_live_rows(&reg);
+            live.lock()
+                .unwrap()
+                .insert(old, NewSessionTenant::Undetermined);
+            live.lock()
+                .unwrap()
+                .insert(new, NewSessionTenant::Stated(PANE_TENANT));
+            let panes = attach_panes(&reg);
+            let mut v = vec![
+                (x.to_string(), Some((old, 10))),
+                (x.to_string(), Some((new, 11))),
+            ];
+            if newest_first {
+                v.reverse();
+            }
+            *panes.lock().unwrap() = v;
+
+            let l = reg.live_terminal_row(x).expect("a live pane hosts X");
+            assert_eq!(l.row, new);
+            assert_eq!(l.tenant, NewSessionTenant::Stated(PANE_TENANT));
+            assert_eq!(
+                reg.bind_transcript_session_on_live_pane(
+                    x,
+                    l.row,
+                    l.tenant,
+                    ResumeParams::default()
+                ),
+                Ok(new)
+            );
+        }
+    }
+
+    /// Q3 Amendment 2: after the transfer evicts the pin P from R, a finish for
+    /// P is local-only — never queued to R, where X now runs.
+    #[test]
+    fn a_finish_for_an_evicted_pin_stays_local_only() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let (p, x) = ("evicted-pin-p", "running-x");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        open_on(&store, p, "term-pane", None);
+        reg.bind_transcript_session(p, Some(r), None, ResumeParams::default())
+            .unwrap();
+        reg.note_pane_row(r, x);
+        reg.bind_transcript_session_on_live_pane(
+            x,
+            r,
+            NewSessionTenant::Undetermined,
+            ResumeParams::default(),
+        )
+        .unwrap();
+
+        let _ = store.set_finished(p, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(p).unwrap()),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "the pin's terminal arm no longer answers the row X owns"
+        );
+        assert_eq!(
+            reg.finish_session(p, Some(1)),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
+        );
+        assert!(finished_rows(&reg).is_empty(), "nothing queued to R");
+    }
+
+    /// A `/clear` successor that the seam made the pane row's owner still
+    /// resolves through its predecessor's pin: the owner check admits an id
+    /// of the record's own chain.
+    #[test]
+    fn a_clear_successor_that_owns_the_pane_row_resolves_through_the_pin() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let (p, y) = ("pinned-before-clear", "cleared-into-y");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        open_on(&store, p, "term-pane", None);
+        open_on(&store, y, "term-pane", Some(p));
+        reg.note_pane_row(r, y);
+        let _ = store.set_finished(y, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(y).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+    }
+
+    /// The bind trigger does not move X onto a row whose owner entry names
+    /// another id: `NotOwner`, nothing evicted, counted.
+    #[test]
+    fn the_bind_trigger_does_not_move_onto_a_row_another_id_owns() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (x, y) = ("bound-x", "owner-y");
+        let (stale, r) = (Uuid::new_v4(), Uuid::new_v4());
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        reg.note_pane_row(r, y);
+        reg.bind_transcript_session_on_live_pane(
+            y,
+            r,
+            NewSessionTenant::Undetermined,
+            ResumeParams::default(),
+        )
+        .unwrap();
+
+        let before = pane_row_moves_not_owner();
+        assert_eq!(
+            reg.move_onto_pane_row(x, r, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::NotOwner
+        );
+        assert!(pane_row_moves_not_owner() > before, "counted");
+        reg.on_terminal_coord_bind(x, "term-x", r);
+        assert_eq!(reg.session_id_for(x), Some(stale), "nothing moved");
+        assert_eq!(reg.session_id_for(y), Some(r), "nothing evicted");
+        assert_eq!(reg.task_run_id_for(&r), Some(y.to_string()));
+    }
+
+    /// D4's finish-time repair: X adopted a stale row R′ while its pane is
+    /// bound to R, and no seam or bind trigger ran. The finish moves the entry
+    /// first, so it and the next heartbeat address R, and the repair is
+    /// counted.
+    #[test]
+    fn a_finish_repairs_a_stale_adoption_onto_the_live_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let x = "pane-hosted-x";
+        let (stale, r) = (Uuid::new_v4(), Uuid::new_v4());
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Stated(PANE_TENANT));
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((x.to_string(), Some((r, 1))));
+        open_on(&store, x, "term-pane", None);
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+
+        let before = registrar_terminal_row_disagreements();
+        let _ = store.set_finished(x, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(x).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+        assert!(registrar_terminal_row_disagreements() > before, "counted");
+        assert_eq!(reg.session_id_for(x), Some(r));
+        reg.heartbeat_on_interaction(x);
+        let beats = rows_of_kind(&reg, SessionEventKind::Heartbeat);
+        assert_eq!(beats.len(), 1);
+        assert_eq!(beats[0].session_id, r);
+        assert_eq!(beats[0].payload["tenant_id"], json!(PANE_TENANT));
+        assert!(
+            rows_of_kind(&reg, SessionEventKind::Closed).is_empty(),
+            "an ADOPTED stale row is left to coord's reaper"
+        );
+    }
+
+    /// The shape #2711's override asserted the other way: a SNIFFED X beside a
+    /// live pane pinned to X keeps its own row — the repair never moves a
+    /// sniffed entry.
+    #[test]
+    fn a_finish_does_not_move_a_sniffed_entry_beside_a_pinned_pane() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let x = "sniffed-x";
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((x.to_string(), Some((r, 1))));
+        open_on(&store, x, "term-pane", None);
+        let s = reg
+            .register_sniffed_session(x, "typed resume", None)
+            .unwrap();
+        let _ = store.set_finished(x, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(x).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: s
+            }
+        );
+        assert_eq!(reg.session_id_for(x), Some(s));
+    }
+
+    /// Taken from #2711 (`a_rebind_observer_moves_heartbeat_progress_and_tenant_to_the_new_row`),
+    /// tenant per D3: with NO terminal lookup attached, the coord-bind
+    /// observer alone moves every row-keyed write (heartbeat, progress,
+    /// finish, the inject resolver) onto the pane row, which reads ADOPTED and
+    /// carries the pane row's own tenant — and no `tenant_id` when the pane
+    /// row's scope is unresolved.
+    #[test]
+    fn a_terminal_bind_moves_every_row_keyed_write_onto_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let csid = "respawned-pane-session";
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        live.lock()
+            .unwrap()
+            .insert(new, NewSessionTenant::Stated(PANE_TENANT));
+        reg.bind_transcript_session(
+            csid,
+            Some(old),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+
+        reg.on_terminal_coord_bind(csid, "term-new", new);
+
+        assert_eq!(reg.session_id_for(csid), Some(new));
+        assert_eq!(reg.task_run_id_for(&new), Some(csid.to_string()));
+        assert_eq!(reg.task_run_id_for(&old), None);
+        assert_eq!(reg.recorded_tenant(csid), Some(PANE_TENANT));
+        assert_eq!(
+            reg.recorded_row(csid).map(|r| r.origin),
+            Some(RecordedRowOrigin::Adopted),
+            "the pane row was minted elsewhere, never reported as minted here"
+        );
+        reg.heartbeat_on_interaction(csid);
+        reg.progress_on_interaction(csid);
+        assert_eq!(
+            reg.finish_session(csid, Some(9)),
+            FinishSync::Queued {
+                coord_session_id: new
+            }
+        );
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 3, "{pending:?}");
+        for row in &pending {
+            assert_eq!(
+                row.session_id, new,
+                "{} row addressed the old row",
+                row.event_kind
+            );
+            assert_eq!(row.payload["id"], json!(new));
+            assert_eq!(
+                row.payload["tenant_id"],
+                json!(PANE_TENANT),
+                "{} row lost the pane row's tenant",
+                row.event_kind
+            );
+        }
+
+        // A pane row whose scope is unresolved: the writes carry no tenant.
+        let other = "respawned-unresolved";
+        let (old2, new2) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.bind_transcript_session(
+            other,
+            Some(old2),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        reg.on_terminal_coord_bind(other, "term-new2", new2);
+        assert_eq!(reg.session_id_for(other), Some(new2));
+        assert_eq!(reg.recorded_tenant(other), None);
+        reg.heartbeat_on_interaction(other);
+        let beat = rows_of_kind(&reg, SessionEventKind::Heartbeat)
+            .into_iter()
+            .find(|r| r.session_id == new2)
+            .expect("heartbeat to the pane row");
+        assert!(beat.payload.get("tenant_id").is_none(), "{beat:?}");
+    }
+
+    /// Taken from #2711: an old row this registrar MINTED has no other closer,
+    /// so the transfer closes it — stamped with ITS OWN tenant. A second bind
+    /// to the same row is a no-op and closes nothing more.
+    #[test]
+    fn a_rebind_closes_an_old_row_this_registrar_minted() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = "minted-then-respawned";
+        let minted = reg
+            .bind_transcript_session(csid, None, Some(OWNING_TENANT), ResumeParams::default())
+            .unwrap();
+        let new = Uuid::new_v4();
+        reg.on_terminal_coord_bind(csid, "term-new", new);
+        assert_eq!(
+            reg.move_onto_pane_row(csid, new, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::Unchanged
+        );
+        let closed = rows_of_kind(&reg, SessionEventKind::Closed);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0].session_id, minted);
+        assert_eq!(closed[0].payload["id"], json!(minted));
+        assert_eq!(closed[0].payload["tenant_id"], json!(OWNING_TENANT));
+        assert_eq!(reg.session_id_for(csid), Some(new));
+    }
+
+    /// Taken from #2711.
+    #[test]
+    fn rebind_to_the_same_row_is_a_no_op() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = "same-row-session";
+        let row = Uuid::new_v4();
+        assert_eq!(
+            reg.move_onto_pane_row(csid, row, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::Unbound,
+            "a first bind has nothing to move"
+        );
+        reg.on_terminal_coord_bind(csid, "term", row);
+        assert_eq!(reg.session_id_for(csid), None, "and binds nothing");
+
+        reg.bind_transcript_session(
+            csid,
+            Some(row),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.move_onto_pane_row(csid, row, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::Unchanged
+        );
+        reg.on_terminal_coord_bind(csid, "term", row);
+        assert_eq!(reg.session_id_for(csid), Some(row));
+        assert_eq!(reg.task_run_id_for(&row), Some(csid.to_string()));
+        assert_eq!(reg.recorded_tenant(csid), Some(OWNING_TENANT));
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+    }
+
+    /// Taken from #2711: main.rs's coord-bind observer calls
+    /// `on_terminal_coord_bind` (which moves the entry, then delivers owed
+    /// marks), not `deliver_owed_finish` alone. The closure is not reachable
+    /// from a unit test, so the wiring is pinned by source scan.
+    #[test]
+    fn the_coord_bind_observer_rebinds_the_registrar() {
+        let main = include_str!("../main.rs");
+        let (_, after) = main
+            .split_once("term_for_session.attach_coord_bind_observer(")
+            .expect("main.rs attaches the coord-bind observer");
+        let region: String = after.chars().take(400).collect();
+        assert!(
+            region.contains("r.on_terminal_coord_bind(pinned, terminal_id, coord_id)"),
+            "{region}"
+        );
+        assert!(!region.contains("r.deliver_owed_finish("), "{region}");
+    }
+
+    /// Taken from #2711 (vet D5): after the registrar follows a migrated pane
+    /// to its new row, the OLD pane's exit close must not close the live row
+    /// through the store's close observer. The migration marks the old
+    /// terminal superseded, so the store answers `TerminalSuperseded` and
+    /// fires nothing; a close racing ahead of the mark is a mis-bound
+    /// `NotFound`, which fires nothing either.
+    #[test]
+    fn closing_the_superseded_pane_after_a_rebind_leaves_the_live_row_open() {
+        use crate::session::session_lifecycle_store::{test_open_record, CloseOutcome};
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, _store_dir) = attach_store(&reg);
+        {
+            let reg = Arc::downgrade(&reg);
+            store.attach_close_observer(move |csid| {
+                if let Some(r) = reg.upgrade() {
+                    r.close_session(csid);
+                }
+            });
+        }
+        // Non-uuid: keeps the attached store's handle hook network-silent.
+        let csid = "migrated-pane-session";
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        let on = |terminal: &str| {
+            let mut rec = test_open_record(csid);
+            rec.terminal_id = terminal.to_string();
+            rec.origin =
+                Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string());
+            rec
+        };
+        store.record_open(on("term-old"));
+        reg.bind_transcript_session(csid, Some(old), None, ResumeParams::default())
+            .unwrap();
+
+        // The migration: the record re-keys onto the new pane, which is bound
+        // to its freshly minted row; then the old pane is marked and closed.
+        store.record_open(on("term-new"));
+        reg.on_terminal_coord_bind(csid, "term-new", new);
+        store.mark_terminal_superseded("term-old", "term-new");
+        assert!(matches!(
+            store.record_close_checked(csid, Some("term-old"), "pty-exit"),
+            CloseOutcome::TerminalSuperseded { .. }
+        ));
+        assert!(matches!(
+            store.record_close_checked(csid, Some("term-old"), "pty-exit"),
+            CloseOutcome::NotFound { .. }
+        ));
+
+        assert_eq!(
+            reg.session_id_for(csid),
+            Some(new),
+            "the live row stays bound"
+        );
+        assert_eq!(store.get(csid).unwrap().state, "open");
+        assert!(
+            rows_of_kind(&reg, SessionEventKind::Closed).is_empty(),
+            "no coord Closed for either row of a live session"
         );
     }
 
