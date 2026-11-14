@@ -92,6 +92,11 @@ pub(crate) enum CiChannel {
     /// The owner reconfigured this device's CI lane from qontinui-web —
     /// see [`super::settings_directive`].
     SettingsRequested,
+    /// A coord-dispatched ops task (plan
+    /// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`
+    /// Phase 4) - see [`super::ops`]. Honoured only when
+    /// `QONTINUI_OPS_TASKS_ENABLED` is on; otherwise the frame is dropped.
+    OpsTaskRequested,
 }
 
 /// Exact-match routing for an inbound frame's channel. `None` for anything
@@ -109,6 +114,8 @@ pub(crate) fn route_ci_channel(channel: &str, device_id: uuid::Uuid) -> Option<C
         Some(CiChannel::BuildCancelled)
     } else if channel == format!("events.ci.settings_requested.{device_id}") {
         Some(CiChannel::SettingsRequested)
+    } else if channel == format!("events.ops.task_requested.{device_id}") {
+        Some(CiChannel::OpsTaskRequested)
     } else {
         None
     }
@@ -193,6 +200,8 @@ async fn connect_and_pump_ci(
     let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "ci_node").await?;
     *connected_at = Some(std::time::Instant::now());
     info!("ci_node: WS connected for device_id={device_id}");
+    // systemd `READY=1` waits on this (plan 2026-10-19 Phase 2b).
+    crate::sd_notify::mark_ci_subscription_up();
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(CI_KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -244,6 +253,11 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
     let Some(kind) = route_ci_channel(channel, device_id) else {
         return Ok(());
     };
+    // Dark by default: an ops frame is dropped before it is even parsed.
+    if kind == CiChannel::OpsTaskRequested && !super::ops::enabled() {
+        debug!("ci_node: ops task frame dropped (QONTINUI_OPS_TASKS_ENABLED is off)");
+        return Ok(());
+    }
     let Some(inner) = parse_envelope_json(&value) else {
         warn!("ci_node: envelope on {channel} had no parseable payload/body");
         return Ok(());
@@ -257,6 +271,7 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
             Ok(cancel) => super::admission::cancel(&cancel.dispatch_id),
             Err(e) => warn!("ci_node: build_cancelled payload did not parse: {e}"),
         },
+        CiChannel::OpsTaskRequested => super::ops::handle(inner),
         CiChannel::SettingsRequested => {
             match serde_json::from_value::<super::settings_directive::CiSettingsDirective>(inner) {
                 Ok(directive) => super::settings_directive::apply(directive),
@@ -342,6 +357,15 @@ mod tests {
         assert_eq!(
             route_ci_channel(&format!("events.ci.settings_requested.{device}"), device),
             Some(CiChannel::SettingsRequested)
+        );
+        // Ops tasks route only on this device's exact channel.
+        assert_eq!(
+            route_ci_channel(&format!("events.ops.task_requested.{device}"), device),
+            Some(CiChannel::OpsTaskRequested)
+        );
+        assert_eq!(
+            route_ci_channel(&format!("events.ops.task_requested.{other}"), device),
+            None
         );
         // Another device's CI traffic: not ours.
         assert_eq!(

@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use super::interceptor::OutputInterceptor;
 use super::session::TerminalSession;
+use super::spawn_refusal::SpawnFailure;
 use super::types::{TerminalId, TerminalInfo};
 use crate::coord_drain_state::SpawnOrigin;
 
@@ -445,11 +446,13 @@ impl TerminalManager {
         trust: TrustArm,
         spawn_tenant: Option<uuid::Uuid>,
         origin: SpawnOrigin,
-    ) -> Result<TerminalInfo, String> {
+    ) -> Result<TerminalInfo, SpawnFailure> {
         let id = uuid::Uuid::new_v4().to_string();
         // Claimed until the session is inserted (the claim drops at return):
         // the boot sweep never probes or adopts this pane meanwhile.
-        let _building = self.claim_in_flight(&id)?;
+        let _building = self
+            .claim_in_flight(&id)
+            .map_err(SpawnFailure::before_child)?;
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
         let working_dir = working_dir
             .filter(|d| !d.is_empty())
@@ -492,7 +495,8 @@ impl TerminalManager {
                     &working_dir,
                     &trust,
                     TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
-                )?;
+                )
+                .map_err(SpawnFailure::before_child)?;
             }
             // Never silent: a skipped trust write on a backend spawn is an
             // interactive `claude` that will raise the trust dialog with nobody
@@ -562,10 +566,13 @@ impl TerminalManager {
         let info = session.info();
         let session = Arc::new(session);
 
+        // AFTER a successful spawn: the child is running, and a `LocalPty` has
+        // no kill on drop, so it can outlive this failure (plan
+        // `2026-11-08-…-leaves-the-tree-on-disk`, Why #5).
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
+            .map_err(|e| SpawnFailure::after_child(format!("Sessions lock poisoned: {}", e)))?;
         sessions.insert(id, session);
 
         // Notify frontend so externally-created terminals get a UI tab
