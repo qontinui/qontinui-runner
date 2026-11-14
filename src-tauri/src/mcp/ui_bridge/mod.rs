@@ -703,7 +703,13 @@ mod manifest_drift_tests {
         // routes — `add_dual!` registers both for the same handler. SDK
         // declares only the `/ai/` form, hence the runner's `/control/ai/`
         // siblings are intentionally runner-only.
-        [
+        //
+        // The `let` binding is load-bearing, not style: ui-bridge's
+        // `scripts/check-runner-contract.mjs` lifts this list out of the source
+        // by matching `let runner_only_baseline: … = [`, and refuses to compare
+        // at all (exit 2) when it cannot find it — which it could not while the
+        // array was this fn's bare tail expression.
+        let runner_only_baseline: HashSet<(&'static str, &'static str)> = [
             // Runner infrastructure
             ("GET", "/ui-bridge/_routes"),
             ("GET", "/ui-bridge/_help"),
@@ -915,7 +921,8 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/with-diff"),
         ]
         .into_iter()
-        .collect()
+        .collect();
+        runner_only_baseline
     }
 
     /// Phase 2a (plan 2026-05-03 ui-bridge-runner-wireup-discipline).
