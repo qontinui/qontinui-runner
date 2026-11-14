@@ -4,6 +4,14 @@
 //! `2026-11-13-spawn-refused-tree-followups`: a never-spawned tree's removal
 //! used the grace-preserving eviction, which kept a device key live for the
 //! grace window with no re-provision ever possible behind it.
+//!
+//! The device, ephemeral and agent tests lock in behaviour that already
+//! existed: the session-close release always revoked every LIVE binding for a
+//! workdir. Only the graced test here (and
+//! `agent_worktree::remove_unspawned`'s
+//! `a_removed_trees_proxy_nonces_are_revoked_with_no_grace`) fails on the old
+//! code — the first because graced keys were left to expire, the second
+//! because removal used the grace-preserving eviction.
 
 use super::*;
 

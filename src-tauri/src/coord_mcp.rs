@@ -9204,6 +9204,17 @@ pub(crate) fn register_device_proxy_nonce_for_test(workdir: &str) -> String {
     register_proxy_nonce(workdir, None, None)
 }
 
+/// Test-only: drop every trace of `nonce` from the process-global registry —
+/// live, graced and tombstoned — so a test outside this module leaves the
+/// shared maps as it found them.
+#[cfg(test)]
+pub(crate) fn forget_proxy_nonce_for_test(nonce: &str) {
+    let registry = NonceRegistry::global();
+    registry.test_live().remove(nonce);
+    registry.test_graced().remove(nonce);
+    registry.test_tombstones().remove(nonce);
+}
+
 /// The `cause` [`release_workdir_proxy_nonces`] records when the last open
 /// session for a workdir closes.
 pub(crate) const RELEASE_CAUSE_SESSION_CLOSE: &str =

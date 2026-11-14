@@ -913,4 +913,65 @@ async fn a_removed_trees_proxy_nonces_are_revoked_with_no_grace() {
         !crate::coord_mcp::proxy_nonce_is_valid(&superseded),
         "the removed tree's graced key is refused immediately"
     );
+    for n in [&live, &superseded] {
+        crate::coord_mcp::forget_proxy_nonce_for_test(n);
+    }
+}
+
+/// The scaffolding listing passes `--untracked-files=all` itself: under
+/// `status.showUntrackedFiles=no`, a scaffolding-only tree's untracked
+/// scaffolding must still be listed — and so deleted. Without the flag the
+/// listing reads empty and the scaffolding survives.
+#[test]
+fn the_scaffolding_listing_sees_scaffolding_hidden_by_show_untracked_no() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    git(
+        &fx.canonical,
+        &["config", "status.showUntrackedFiles", "no"],
+    );
+    provision_scaffolding(&tree);
+    assert_eq!(
+        git(&tree, &["status", "--porcelain"]),
+        "",
+        "fixture: plain porcelain is blind to the scaffolding"
+    );
+
+    let claude_files = |dir: &Path| -> usize {
+        fn count(dir: &Path) -> usize {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| {
+                            let p = e.path();
+                            if p.is_dir() {
+                                count(&p)
+                            } else {
+                                1
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        count(dir)
+    };
+    assert!(
+        claude_files(&tree.join(".claude")) > 0,
+        "fixture: provisioning wrote .claude files"
+    );
+
+    assert_eq!(delete_scaffolding(&tree), Ok(()));
+
+    // `--untracked-files=all` lists FILES, so each listed file is deleted and
+    // empty `.claude/` directories may remain for `git worktree remove`.
+    for entry in [".mcp.json", ".coord-mcp-status"] {
+        assert!(!tree.join(entry).exists(), "{entry} was listed and deleted");
+    }
+    assert_eq!(
+        claude_files(&tree.join(".claude")),
+        0,
+        "every .claude file was listed and deleted"
+    );
 }

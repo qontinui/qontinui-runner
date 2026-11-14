@@ -278,7 +278,7 @@ fn recheck_safety_with(
     ) {
         Ok((true, stdout, _)) if !stdout.trim().is_empty() => {
             return SafetyVerdict::Refuse(format!(
-                "{repo_path} is dirty (git status --porcelain non-empty) — refusing reset"
+                "{repo_path} is dirty (git status --porcelain --untracked-files=all non-empty) — refusing reset"
             ));
         }
         Ok((true, _, _)) => {} // clean — proceed to next check.
