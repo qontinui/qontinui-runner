@@ -77,4 +77,4 @@ jobs:
       - name: Run the command-table guards
         # conftest.py imports `models`, so pytest must run from python-bridge/.
         working-directory: python-bridge
-        run: python -m pytest tests/test_executor_command_table.py -q
+        run: python -m pytest tests/test_executor_command_table.py tests/test_single_xlib_owner.py -q
