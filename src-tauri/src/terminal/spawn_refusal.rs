@@ -927,7 +927,8 @@ mod tests {
     /// (whitespace-insensitive) — an arm's value or a block's tail — and is
     /// not itself an arm PATTERN (its closing paren followed by `=>`). A
     /// `Result::` type path in front (`Result::Err(`,
-    /// `std::result::Result::Err(`) is the same variant and is read through;
+    /// `std::result::Result::Err(`, `Result::<T, E>::Err(`) is the same
+    /// variant and is read through;
     /// any other prefix (`map_err(`, `io::Err(`, `MyResult::Err(`) ends in an
     /// identifier character or `:`, which is in no value position. An `Err(`
     /// whose `{` opens a closure body (`|e| { Err(e) }`) is the CLOSURE's
@@ -978,12 +979,13 @@ mod tests {
     }
 
     /// `before` (the text ahead of an `Err(`) with a trailing `Result::` type
-    /// path removed — `Result::`, `std::result::Result::`, any `a::b::Result::`
-    /// — so `Result::Err(` is judged as a bare `Err(`. Anything else, including
-    /// a type that merely ends in `Result` (`MyResult::`), is returned as is.
+    /// path removed — `Result::`, `std::result::Result::`, any `a::b::Result::`,
+    /// each with or without a turbofish (`Result::<T, E>::`) — so
+    /// `Result::Err(` is judged as a bare `Err(`. Anything else, including a
+    /// type that merely ends in `Result` (`MyResult::`), is returned as is.
     fn strip_result_path(before: &str) -> &str {
         let ident = |c: char| c.is_alphanumeric() || c == '_';
-        let Some(mut rest) = before.strip_suffix("Result::") else {
+        let Some(mut rest) = strip_turbofish(before).strip_suffix("Result::") else {
             return before;
         };
         if rest.ends_with(ident) {
@@ -993,6 +995,33 @@ mod tests {
             rest = r.trim_end_matches(ident);
         }
         rest
+    }
+
+    /// `before` with a trailing turbofish `::<…>::` cut back to its leading
+    /// `::` (`Result::<T, E>::` → `Result::`), matching the angle brackets so a
+    /// nested `Vec<u8>` argument is skipped whole. Returned as is when it does
+    /// not end in one.
+    fn strip_turbofish(before: &str) -> &str {
+        let Some(generic) = before.strip_suffix("::").filter(|g| g.ends_with('>')) else {
+            return before;
+        };
+        let mut depth = 0i32;
+        for (k, c) in generic.char_indices().rev() {
+            match c {
+                '>' => depth += 1,
+                '<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return match generic.get(..k) {
+                            Some(head) if head.ends_with("::") => head,
+                            _ => before,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        before
     }
 
     /// Does `before` — text ending in `{` — open a closure body, the `{`
@@ -1050,7 +1079,12 @@ mod tests {
     /// `efb77492`).
     #[test]
     fn a_result_path_err_tail_without_its_removal_is_reported() {
-        for tail in ["Result::Err(e)", "std::result::Result::Err(e)"] {
+        for tail in [
+            "Result::Err(e)",
+            "std::result::Result::Err(e)",
+            "Result::<(), String>::Err(e)",
+            "std::result::Result::<Vec<u8>, E>::Err(e)",
+        ] {
             let src = format!(
                 "fn door() {{\n    let ctx = acquire();\n    match spawn() {{\n        Ok(c) => \
                  {{\n            // door-scan: keep(spawned) running\n            return Ok(c);\n        \
@@ -1070,11 +1104,15 @@ mod tests {
         assert!(value_position_err("        io::Err(e)").is_none());
     }
 
-    /// A `door-scan:` marker line and an `Err(` line inside a multi-line
-    /// string literal (plain or raw) are string text: neither is a marker nor
-    /// an exit (follow-up edge `cc184737`).
+    /// A `door-scan:` marker line inside a multi-line string literal (plain or
+    /// raw) is string text, not a marker: it neither declares a keep for the
+    /// exit below it nor a no-exits for the door (follow-up edge `cc184737`).
+    /// The marker half is what pins the `starts_in_code` change — it was red
+    /// before it. The `Err(e)` line beside it is a control: the lexer already
+    /// dropped string contents, so that half passed before and after, and it
+    /// stays to keep a string-borne `Err(` from ever counting as an exit.
     #[test]
-    fn markers_and_errs_inside_a_multi_line_string_are_not_code() {
+    fn a_marker_inside_a_multi_line_string_is_not_a_marker() {
         for (open, close) in [("\"", "\""), ("r#\"", "\"#")] {
             let keep = format!(
                 "fn door() {{\n    let ctx = acquire();\n    let s = {open}\nErr(e)\n// door-scan: \
