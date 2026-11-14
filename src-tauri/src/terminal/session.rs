@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
 use tracing::{debug, info, warn};
 
+use super::child_path::{child_base_path, compose_child_path};
 use super::exit_notice::{ExitNoticeSink, TauriExitSink};
 use super::grid::{Grid, GridPerformer, GridSnapshot};
 use super::interceptor::OutputInterceptor;
@@ -1397,63 +1398,6 @@ fn consume_input_bytes(buf: &mut String, data: &[u8]) -> Vec<String> {
     completed
 }
 
-/// The PATH a PTY child gets: `runner_path` with every qontinui shim dir
-/// ([`is_qontinui_shim_dir`]) removed, then `own_dirs` prepended in order.
-///
-/// Two defects this closes (plan
-/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
-/// Phase 2):
-///
-/// 1. A runner started from inside another runner's session (a supervisor
-///    launched there, then a temp runner) INHERITS that session's
-///    `qontinui-identity-*` dir. Passed through, it reached every pane's PATH,
-///    where two identity shims could dispatch to each other for ever.
-/// 2. The install-intercept seam rebuilt the child PATH from the runner's own
-///    and discarded the identity seam's prepend. Both seams now build through
-///    here, the install seam passing `[identity_dir, install_dir]`.
-///
-/// An entry equal to one of `own_dirs` is dropped from the tail as well, since
-/// it is already at the head. Every other entry keeps its position and its
-/// spelling, empty entries included. The separator is the platform's.
-///
-/// [`is_qontinui_shim_dir`]: crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir
-pub(crate) fn compose_child_path(
-    runner_path: Option<&str>,
-    own_dirs: &[&std::path::Path],
-) -> String {
-    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
-
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
-    let own: Vec<String> = own_dirs
-        .iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
-    let own_trimmed: Vec<String> = own.iter().map(|d| trim(d)).collect();
-    let is_own = |entry: &str| {
-        let entry = trim(entry);
-        own_trimmed.iter().any(|o| {
-            if cfg!(windows) {
-                o.eq_ignore_ascii_case(&entry)
-            } else {
-                *o == entry
-            }
-        })
-    };
-    let mut parts: Vec<&str> = own.iter().map(String::as_str).collect();
-    if let Some(path) = runner_path.filter(|p| !p.is_empty()) {
-        for entry in path.split(sep) {
-            if !entry.is_empty()
-                && (is_own(entry) || is_qontinui_shim_dir(std::path::Path::new(entry)))
-            {
-                continue;
-            }
-            parts.push(entry);
-        }
-    }
-    parts.join(&sep.to_string())
-}
-
 /// What [`TerminalSession::apply_identity_seam`] settled for one PTY child.
 ///
 /// A named struct rather than a bare tuple: the second field is a THREE-state
@@ -1987,7 +1931,12 @@ impl TerminalSession {
         // PATH + set the loopback port/mode so an agent that types `npm install …`
         // is transparently declared/observed. Fail-open: any materialize failure
         // injects nothing.
-        Self::apply_install_intercept_env(&mut cmd, &id, seam.identity_dir.as_deref());
+        Self::apply_install_intercept_env(
+            &mut cmd,
+            &id,
+            seam.identity_dir.as_deref(),
+            &std::env::temp_dir(),
+        );
 
         // The LAST env mutations before the spawn — account pin, then the
         // credential scrub. Extracted so the ordering is unit-testable; see the
@@ -3213,8 +3162,10 @@ impl TerminalSession {
         cmd: &mut CommandBuilder,
         identity_dir: &std::path::Path,
     ) {
-        let current_path = std::env::var("PATH").ok();
-        let new_path = compose_child_path(current_path.as_deref(), &[identity_dir]);
+        // The base carries the user's toolchain dirs after the runner's own
+        // entries (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path).
+        let base = child_base_path();
+        let new_path = compose_child_path(base.as_deref(), &[identity_dir]);
         Self::set_child_path(cmd, &new_path);
         // The identity shim reads this to skip its own dir in the
         // real-tool scan (reusing the install shim's env contract).
@@ -3222,6 +3173,15 @@ impl TerminalSession {
             "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
             identity_dir.to_string_lossy().as_ref(),
         );
+    }
+
+    /// The identity seam's fail-open PATH: no own dir prepended, foreign shim
+    /// dirs still stripped, and the toolchain dirs [`child_base_path`] appends
+    /// still carried. A runner with no PATH at all leaves the child's untouched.
+    fn apply_fail_open_child_path(cmd: &mut CommandBuilder) {
+        if let Some(base) = child_base_path() {
+            Self::set_child_path(cmd, &compose_child_path(Some(&base), &[]));
+        }
     }
 
     /// Extract the explicit session id a built PTY child command's argv NAMES,
@@ -3385,33 +3345,37 @@ impl TerminalSession {
     /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`
     /// Phase 2 this seam re-read the runner's PATH and silently DROPPED the
     /// identity prepend whenever interception was on.
+    ///
+    /// `base_dir` is where the per-terminal shim dir is materialized (and stale
+    /// ones swept): production passes `std::env::temp_dir()`, a test its own
+    /// fixture dir so it never has to repoint the process's temp dir.
     fn apply_install_intercept_env(
         cmd: &mut CommandBuilder,
         terminal_id: &str,
         identity_dir: Option<&std::path::Path>,
+        base_dir: &std::path::Path,
     ) {
         use crate::install_effects_producer::intercept::shim_materializer;
 
         if !shim_materializer::intercept_enabled() {
             return; // ships dark — byte-identical child env
         }
-        let base_dir = std::env::temp_dir();
         let port = crate::install_effects_producer::intercept::bound_port();
         // The MODE the terminal gets is resolved from the runner's OWN env
         // (`QONTINUI_INSTALL_INTERCEPT_MODE`; default observe, `gate` enables
         // Phase-3 gating, anything else fails open to observe — plan §3 step 3).
         let mode = shim_materializer::resolve_mode();
-        let seam = match shim_materializer::materialize(&base_dir, terminal_id, port, mode) {
+        let seam = match shim_materializer::materialize(base_dir, terminal_id, port, mode) {
             Some(s) => s,
             None => return, // fail-open: couldn't write shims ⇒ inject nothing
         };
 
-        let current_path = std::env::var("PATH").ok();
+        let base = child_base_path();
         let own_dirs: Vec<&std::path::Path> = identity_dir
             .into_iter()
             .chain(std::iter::once(seam.shim_dir.as_path()))
             .collect();
-        let new_path = compose_child_path(current_path.as_deref(), &own_dirs);
+        let new_path = compose_child_path(base.as_deref(), &own_dirs);
         Self::set_child_path(cmd, &new_path);
         cmd.env(shim_materializer::PORT_ENV, seam.port.to_string());
         cmd.env(shim_materializer::MODE_ENV, &seam.mode);
@@ -3631,9 +3595,7 @@ impl TerminalSession {
                 // dir must not reach this child either (plan
                 // 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2).
                 // A runner with no PATH at all leaves the child's untouched.
-                if let Ok(current_path) = std::env::var("PATH") {
-                    Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
-                }
+                Self::apply_fail_open_child_path(cmd);
             }
         }
 
@@ -7328,6 +7290,10 @@ pub(crate) mod tests {
             format!("{}/", identity.display()), // our own, already inherited
             marked.to_string_lossy().into_owned(),
             p("usr-bin"),
+            // A toolchain dir `child_base_path` appended after the runner's own
+            // entries (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path):
+            // it must survive both seams and the fail-open composition, last.
+            p("toolchain-appended"),
         ]
         .join(sep);
 
@@ -7339,6 +7305,7 @@ pub(crate) mod tests {
             String::new(),
             p("node-bin"),
             p("usr-bin"),
+            p("toolchain-appended"),
         ]
         .join(sep);
         assert_eq!(got, want);
@@ -7346,6 +7313,7 @@ pub(crate) mod tests {
         // The identity seam alone, and a runner with no PATH at all.
         let only_identity = compose_child_path(Some(&runner_path), &[&identity]);
         assert!(only_identity.starts_with(&*identity.to_string_lossy()));
+        assert!(only_identity.ends_with(&p("toolchain-appended")));
         assert!(!only_identity.contains("qontinui-shim-xyz"));
         assert!(!only_identity.contains("qontinui-identity-abc"));
         assert_eq!(
@@ -7360,8 +7328,160 @@ pub(crate) mod tests {
         // No own dir (the identity seam failed open): the foreign dirs are
         // still stripped and nothing is prepended.
         let bare = compose_child_path(Some(&runner_path), &[]);
-        let want_bare = [p("cargo-bin"), String::new(), p("node-bin"), p("usr-bin")].join(sep);
+        let want_bare = [
+            p("cargo-bin"),
+            String::new(),
+            p("node-bin"),
+            p("usr-bin"),
+            p("toolchain-appended"),
+        ]
+        .join(sep);
         assert_eq!(bare, want_bare);
+    }
+
+    /// The child PATH a `CommandBuilder` carries, split on the platform's
+    /// separator.
+    fn child_path_entries(cmd: &CommandBuilder) -> Vec<String> {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        cmd.get_env(TerminalSession::PATH_ENV_KEY)
+            .map(|v| v.to_string_lossy().split(sep).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The fixture every toolchain-PATH test runs under: the env-isolation
+    /// guard, the login-shell read OFF, `CARGO_HOME` unset and `HOME` at the
+    /// fixture dir, whose `.cargo/bin` exists. Returns the fixture, the env
+    /// restore guard and that dir. The restore guard is declared after the
+    /// fixture so it drops first, while the env lock is still held.
+    fn toolchain_fixture(
+        extra_keys: &[&'static str],
+    ) -> (
+        crate::test_env::IsolatedAmbient,
+        crate::test_env::EnvVarRestore,
+        String,
+    ) {
+        let amb = crate::test_env::isolated_ambient();
+        let mut keys = vec!["CARGO_HOME", "QONTINUI_CHILD_PATH_SHELL_READ"];
+        keys.extend_from_slice(extra_keys);
+        let restore = crate::test_env::EnvVarRestore::capture(&keys);
+        std::env::set_var("QONTINUI_CHILD_PATH_SHELL_READ", "0");
+        std::env::remove_var("CARGO_HOME");
+        let cargo_bin = amb.dir().join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let cargo_bin = cargo_bin.to_string_lossy().into_owned();
+        (amb, restore, cargo_bin)
+    }
+
+    /// The Phase 1 arming test (plan
+    /// `2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path`): a hosted
+    /// child's PATH — direct-exec terminal pane and headless spawn alike —
+    /// carries `$HOME/.cargo/bin` after the runner's own entries. Enters ONLY
+    /// through the two production seams, so deleting the wiring at either one
+    /// reddens it.
+    #[test]
+    fn hosted_child_path_carries_the_user_toolchain_after_the_runner_entries() {
+        let (amb, _restore, cargo_bin) = toolchain_fixture(&[]);
+        let runner_path = std::env::var("PATH").expect("the test process has a PATH");
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        // The runner's own entries a child keeps (foreign shim dirs are
+        // stripped by design, and a test hosted by a runner inherits one).
+        let kept: Vec<String> = runner_path
+            .split(sep)
+            .filter(|e| {
+                e.is_empty()
+                    || !crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir(
+                        std::path::Path::new(e),
+                    )
+            })
+            .map(str::to_string)
+            .collect();
+
+        // PTY plane: the identity seam. Its dir stays first.
+        let identity = amb.dir().join("qontinui-identity-armtest");
+        let mut cmd = CommandBuilder::new("dummy");
+        TerminalSession::apply_identity_path_shim(&mut cmd, &identity);
+        let pty = child_path_entries(&cmd);
+        assert_eq!(
+            pty.first().map(String::as_str),
+            Some(&*identity.to_string_lossy())
+        );
+        assert_eq!(
+            &pty[1..pty.len() - 1],
+            kept.as_slice(),
+            "runner entries keep their order"
+        );
+        assert_eq!(
+            pty.last(),
+            Some(&cargo_bin),
+            "toolchain dir appended last: {pty:?}"
+        );
+
+        // Headless plane.
+        let mut headless = tokio::process::Command::new("dummy");
+        crate::agent_runtime::finalize_headless_child_env(
+            &mut headless,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
+        let path = headless
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+            .expect("the headless seam sets PATH");
+        let entries: Vec<String> = path.split(sep).map(str::to_string).collect();
+        assert_eq!(&entries[..entries.len() - 1], kept.as_slice());
+        assert_eq!(entries.last(), Some(&cargo_bin), "{entries:?}");
+    }
+
+    #[test]
+    fn install_intercept_seam_keeps_the_appended_toolchain_dirs() {
+        use crate::install_effects_producer::intercept::shim_materializer::ENABLE_FLAG;
+        let (amb, _restore, cargo_bin) = toolchain_fixture(&[ENABLE_FLAG]);
+        std::env::set_var(ENABLE_FLAG, "1");
+        // The shim materializer writes — and sweeps — in the fixture, never in
+        // the box's shared temp dir.
+        let shim_base = amb.dir().join("tmp");
+        std::fs::create_dir_all(&shim_base).unwrap();
+
+        let identity = amb.dir().join("qontinui-identity-armtest");
+        let mut cmd = CommandBuilder::new("dummy");
+        TerminalSession::apply_install_intercept_env(
+            &mut cmd,
+            "term-toolchain",
+            Some(&identity),
+            &shim_base,
+        );
+        let got = child_path_entries(&cmd);
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some(&*identity.to_string_lossy()),
+            "{got:?}"
+        );
+        assert!(
+            got.get(1)
+                .is_some_and(|d| d.contains("qontinui-shim-term-toolchain")),
+            "the install shim dir is second: {got:?}"
+        );
+        assert_eq!(got.last(), Some(&cargo_bin), "{got:?}");
+    }
+
+    #[test]
+    fn identity_fail_open_branch_keeps_the_appended_toolchain_dirs() {
+        let (_amb, _restore, cargo_bin) = toolchain_fixture(&[]);
+        let mut cmd = CommandBuilder::new("dummy");
+        TerminalSession::apply_fail_open_child_path(&mut cmd);
+        let got = child_path_entries(&cmd);
+        assert!(
+            !got.is_empty(),
+            "the fail-open branch still composes a PATH"
+        );
+        assert!(
+            !got.iter().any(|d| d.contains("qontinui-identity-armtest")),
+            "no own dir is prepended"
+        );
+        assert_eq!(got.last(), Some(&cargo_bin), "{got:?}");
     }
 
     #[test]

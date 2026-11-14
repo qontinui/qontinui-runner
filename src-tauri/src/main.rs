@@ -2016,6 +2016,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         warn!("plans dir migration failed (non-fatal): {}", e);
     }
 
+    // The login-shell PATH read every hosted-session child's base PATH folds
+    // in (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path).
+    // It runs on its own thread with a hard timeout, so neither this boot nor
+    // any spawn waits for it; until it answers children get the cargo-home
+    // fallback dirs.
+    terminal::child_path::start_login_shell_read();
+
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
     // Periodic HTTP POST `{device_id, hostname}` to coord's
