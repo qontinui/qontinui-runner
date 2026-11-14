@@ -4416,10 +4416,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let tm = std::sync::Arc::downgrade(&term_for_session);
                     let sreg = std::sync::Arc::downgrade(&registry);
                     ai_coord_registrar.attach_pane_row_tenant(move |row| {
-                        let bound_at_ms = tm.upgrade()?.coord_row_bound_at(row)?;
-                        let scope = sreg.upgrade()?.tenant_scope_of(row);
-                        Some(claude_session::pane_row_owner::PaneRowFacts {
-                            tenant: claude_session::pane_row_owner::tenant_from_scope(scope),
+                        use claude_session::pane_row_owner::{
+                            tenant_from_scope, PaneRowFacts, PaneRowLookup,
+                        };
+                        // An unreadable plane is Unknown, never "gone".
+                        let Some(binding) = tm.upgrade().and_then(|t| t.coord_row_bound_at(row))
+                        else {
+                            return PaneRowLookup::Unknown;
+                        };
+                        let Some(bound_at_ms) = binding else {
+                            return PaneRowLookup::Gone;
+                        };
+                        let Some(scope) = sreg.upgrade().map(|s| s.tenant_scope_of(row)) else {
+                            return PaneRowLookup::Unknown;
+                        };
+                        PaneRowLookup::Live(PaneRowFacts {
+                            tenant: tenant_from_scope(scope),
                             bound_at_ms: Some(bound_at_ms),
                         })
                     });
@@ -4432,9 +4444,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     );
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
-                    registry.attach_rekey_observer(move |row, csid| {
+                    registry.attach_rekey_observer(move |row, csid, source| {
                         if let Some(r) = reg.upgrade() {
-                            r.note_pane_row(row, csid);
+                            r.note_pane_row(row, csid, source);
                         }
                     });
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
