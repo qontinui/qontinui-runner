@@ -3,6 +3,7 @@ import { getGlobalSpecStore, SpecExecutor } from "@qontinui/ui-bridge";
 import type { SpecExecutionOptions } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { closestElementIds, getUIBridgeGlobal } from "./utils";
+import { buildElementDomTree, debugTreeLabel, type DomTreeNode } from "./elementDomTree";
 import { loadDiscoveredSpecs } from "../../lib/ui-bridge/use-discovered-specs";
 import { actionOutcome, actionOutcomeError, actionSucceeded } from "../sdk-ui-bridge/actionOutcome";
 import { describeThrown } from "@/lib/utils";
@@ -1214,7 +1215,7 @@ export function useDebugInspectEvents(
             return {
               id: el.id,
               type: el.type,
-              label: el.label,
+              label: debugTreeLabel(domEl, el.label),
               tagName: domEl instanceof HTMLElement ? domEl.tagName.toLowerCase() : "unknown",
               children: [], // Flat list of registered elements (no parent-child in bridge)
               depth,
@@ -1289,85 +1290,7 @@ export function useDebugInspectEvents(
             return true;
           }
 
-          const root = reg.element as Element;
-          const CLASS_MAX_LEN = 80;
-          const NODE_CAP = 200;
-
-          const camelToKebab = (s: string): string =>
-            s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
-
-          const serializeAttrs = (el: Element): Record<string, string> => {
-            const out: Record<string, string> = {};
-            for (const k of ["role", "title", "aria-label", "name", "type"]) {
-              const v = el.getAttribute(k);
-              if (v != null) out[k] = v;
-            }
-            const cls = el.getAttribute("class");
-            if (cls && cls.length > 0) {
-              out["class"] = cls.length > CLASS_MAX_LEN ? cls.slice(0, CLASS_MAX_LEN) + "…" : cls;
-            }
-            const dataset = (el as HTMLElement).dataset;
-            if (dataset) {
-              for (const k in dataset) {
-                const v = dataset[k];
-                if (typeof v === "string") out[`data-${camelToKebab(k)}`] = v;
-              }
-            }
-            return out;
-          };
-
-          interface DomTreeNode {
-            tagName: string;
-            attrs: Record<string, string>;
-            childCount: number;
-            children: DomTreeNode[];
-          }
-
-          let nodeCount = 0;
-          let truncated = false;
-          let actualDepth = 0;
-
-          // BFS so `truncated` reflects breadth-first cap rather than DFS skew.
-          const rootNode: DomTreeNode = {
-            tagName: root.tagName,
-            attrs: serializeAttrs(root),
-            childCount: root.children.length,
-            children: [],
-          };
-          nodeCount++;
-
-          // Each frame: (parentNode, parentEl, currentDepth — depth of parent's children)
-          const queue: Array<{ node: DomTreeNode; el: Element; depth: number }> = [
-            { node: rootNode, el: root, depth: 1 },
-          ];
-
-          while (queue.length > 0) {
-            const frame = queue.shift()!;
-            if (frame.depth > depthBudget) continue;
-            const childEls = Array.from(frame.el.children);
-            for (const childEl of childEls) {
-              if (nodeCount >= NODE_CAP) {
-                truncated = true;
-                break;
-              }
-              const childNode: DomTreeNode = {
-                tagName: childEl.tagName,
-                attrs: serializeAttrs(childEl),
-                childCount: childEl.children.length,
-                children: [],
-              };
-              nodeCount++;
-              frame.node.children.push(childNode);
-              if (frame.depth > actualDepth) actualDepth = frame.depth;
-              if (frame.depth + 1 <= depthBudget) {
-                queue.push({ node: childNode, el: childEl, depth: frame.depth + 1 });
-              }
-            }
-            if (truncated) break;
-          }
-
-          // If root had no children, depth is 0 (no descendants returned).
-          if (rootNode.children.length === 0) actualDepth = 0;
+          const walked = buildElementDomTree(reg.element as Element, depthBudget);
 
           const responseData: {
             elementId: string;
@@ -1376,10 +1299,10 @@ export function useDebugInspectEvents(
             truncated?: boolean;
           } = {
             elementId: treeElementId,
-            depth: actualDepth,
-            tree: rootNode,
+            depth: walked.depth,
+            tree: walked.tree,
           };
-          if (truncated) responseData.truncated = true;
+          if (walked.truncated) responseData.truncated = true;
 
           await sendResponse({
             requestId,
