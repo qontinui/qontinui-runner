@@ -532,6 +532,40 @@ mod tests {
         assert_eq!(split["withheld"], json!(["dispatch_started"]));
     }
 
+    /// `dispatches` brackets the whole read: its first count is taken before
+    /// the cgroups are listed and its second after their `memory.current` is
+    /// read, so a dispatch that began anywhere in between is seen. Fails when
+    /// the first count moves after the listing (the pane made by the first
+    /// call would be counted) or the second before the reads (the unit would
+    /// publish the reading the second call wrote).
+    #[test]
+    fn the_dispatch_counts_bracket_the_listing_and_the_reads() {
+        let m = sessions_machine();
+        let calls = std::cell::Cell::new(0_u32);
+        let split = m.measure_with(|| {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1 => m.cgroup(&holder("c"), Some(GIB / 8)),
+                2 => write(
+                    &m.root,
+                    &format!("{}/memory.current", unit()),
+                    &format!("{}\n", 9 * GIB),
+                ),
+                n => panic!("dispatches called {n} times"),
+            }
+            DispatchCounts::default()
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(split["pty_holder_scopes_seen"], json!(3), "{split:?}");
+        assert_eq!(split["pty_holder_scopes_measured"], json!(3), "{split:?}");
+        assert_eq!(split["runner_unit_bytes"], json!(2 * GIB), "{split:?}");
+        assert_eq!(
+            split["session_bytes"],
+            json!(2 * GIB + GIB / 2 + GIB / 4 + GIB / 8 + 6 * GIB),
+            "{split:?}"
+        );
+    }
+
     /// With `QONTINUI_CI_CGROUP_ROOT` naming a directory under a CI slice a
     /// counted dispatch still withholds the total: `ci_node` runs its own work
     /// for every dispatch in the runner's own cgroup, which is inside the unit.
