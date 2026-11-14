@@ -16,7 +16,17 @@
 //! For each transcript the watcher tails, identified by its file-named id
 //! (`<config>/projects/<cwd>/<id>.jsonl`):
 //!
-//! 1. ask coord which `coord.sessions` row answers for that harness id
+//! 0. when a LIVE pane hosts the id with a coord row of its own
+//!    ([`local_decision`] — the registrar's pane-row owner rule), adopt THAT
+//!    row without asking coord ([`Decision::AdoptLivePane`]). At boot coord
+//!    still names the previous boot's row for the id (it is still active, and
+//!    coord's uniqueness guard refuses the pane row's re-key while it is), so
+//!    its pick would send the session's finish, liveness and transcript to a
+//!    stale row. The local evidence is consulted again after coord answers,
+//!    in case the pane was bound during the round trip (plan
+//!    `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+//!    D1);
+//! 1. otherwise ask coord which `coord.sessions` row answers for that harness id
 //!    ([`crate::mcp::session_work_status::resolve_coord_row`] — the row
 //!    coord's pick order names, active first and then newest, since the id is
 //!    not unique);
@@ -53,6 +63,7 @@ use crate::mcp::session_work_status::RowResolution;
 use crate::session::session_transcript_tailer::{
     AutoBindKind, BindRefusal, BindRequest, SessionTranscriptTailer,
 };
+use crate::session::NewSessionTenant;
 
 /// Minimum spacing between two attempts for one session.
 pub const ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
@@ -98,6 +109,10 @@ pub fn identity_from_path(path: &Path) -> Option<TranscriptIdentity> {
 pub enum Decision {
     /// Bind to the row coord already has.
     Adopt(Uuid),
+    /// Bind to the row of the LIVE pane that hosts this session, without
+    /// asking coord, stamped with that row's tenant (plan D3) and taking the
+    /// row from the pane's pin.
+    AdoptLivePane { row: Uuid, tenant: NewSessionTenant },
     /// coord has no session for this id: register a fresh row owned by this
     /// tenant (already proven resolvable and consenting — see [`mint_gate`]).
     Mint(Uuid),
@@ -259,7 +274,7 @@ pub fn apply_decision(
     transcript_sync_permitted: bool,
 ) -> Option<AutoBindKind> {
     let adopt = match decision {
-        Decision::Adopt(id) => Some(*id),
+        Decision::Adopt(id) | Decision::AdoptLivePane { row: id, .. } => Some(*id),
         Decision::Mint(_) => None,
         Decision::Defer(why) => {
             debug!(
@@ -279,6 +294,15 @@ pub fn apply_decision(
             account_label: Some(identity.account_label.clone()),
             config_dir: Some(identity.config_dir.clone()),
         },
+        live_pane_tenant: match decision {
+            Decision::AdoptLivePane { tenant, .. } => Some(*tenant),
+            _ => None,
+        },
+    };
+    let adopted_kind = if matches!(decision, Decision::AdoptLivePane { .. }) {
+        AutoBindKind::AdoptedLivePane
+    } else {
+        AutoBindKind::Adopted
     };
     match tailer.bind_and_replay(
         &identity.claude_session_id,
@@ -292,11 +316,15 @@ pub fn apply_decision(
                 "transcript_autobind: bound {} to coord session {} ({}; replayed {} bytes)",
                 identity.claude_session_id,
                 o.coord_session_id,
-                if o.adopted { "adopted" } else { "minted" },
+                match (o.adopted, adopted_kind) {
+                    (true, AutoBindKind::AdoptedLivePane) => "adopted the live pane's row",
+                    (true, _) => "adopted",
+                    (false, _) => "minted",
+                },
                 o.replayed_bytes
             );
             Some(if o.adopted {
-                AutoBindKind::Adopted
+                adopted_kind
             } else {
                 AutoBindKind::Minted
             })
@@ -307,7 +335,7 @@ pub fn apply_decision(
                 identity.claude_session_id
             );
             Some(if adopt.is_some() {
-                AutoBindKind::Adopted
+                adopted_kind
             } else {
                 AutoBindKind::Minted
             })
@@ -387,9 +415,31 @@ pub fn spawn_ensure_bound(tailer: &Arc<SessionTranscriptTailer>, path: &Path) {
 /// a transcript into tenant B's row while B has sync off. PURE.
 fn bind_scope(decision: &Decision) -> crate::egress::SessionScope {
     match decision {
-        Decision::Mint(t) => crate::egress::SessionScope::Tenant(*t),
+        Decision::Mint(t)
+        | Decision::AdoptLivePane {
+            tenant: NewSessionTenant::Stated(t),
+            ..
+        } => crate::egress::SessionScope::Tenant(*t),
         _ => crate::egress::SessionScope::Unresolved,
     }
+}
+
+/// The runner's LOCAL evidence for an unbound transcript, consulted before
+/// coord is asked and again after it has answered: when a live pane hosts
+/// `claude_session_id` with a coord row of its own (the registrar's pane-row
+/// owner rule — an owner entry the re-key seam advanced, else the
+/// newest-bound pane pinned to the id), adopt that row. `None` defers to
+/// coord's pick.
+pub(crate) fn local_decision(
+    tailer: &SessionTranscriptTailer,
+    claude_session_id: &str,
+) -> Option<Decision> {
+    tailer
+        .live_pane_row(claude_session_id)
+        .map(|l| Decision::AdoptLivePane {
+            row: l.row,
+            tenant: l.tenant,
+        })
 }
 
 async fn bind_one(
@@ -397,18 +447,55 @@ async fn bind_one(
     identity: TranscriptIdentity,
     path: &Path,
 ) {
-    let resolution =
-        crate::mcp::session_work_status::resolve_coord_row(&identity.claude_session_id).await;
-    let decision = settle(tailer, &identity, &resolution).await;
+    bind_one_with(tailer, identity, path, |csid| async move {
+        crate::mcp::session_work_status::resolve_coord_row(&csid).await
+    })
+    .await;
+}
+
+/// [`bind_one`] with the coord resolver injected (`resolve_coord_row` is a
+/// free async function with no seam of its own). Local evidence first — a
+/// live pane's row is adopted without the round trip — then coord, then the
+/// local evidence AGAIN immediately before binding: at boot panes bind while
+/// the watcher starts tailing, and a pane bound during the round trip must
+/// not lose to coord's stale pick. Returns the decision applied.
+async fn bind_one_with<F, Fut>(
+    tailer: &Arc<SessionTranscriptTailer>,
+    identity: TranscriptIdentity,
+    path: &Path,
+    resolve: F,
+) -> Decision
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = RowResolution>,
+{
+    let decision = match local_decision(tailer, &identity.claude_session_id) {
+        Some(local) => local,
+        None => {
+            let resolution = resolve(identity.claude_session_id.clone()).await;
+            let settled = settle(tailer, &identity, &resolution).await;
+            match local_decision(tailer, &identity.claude_session_id) {
+                Some(local) => {
+                    info!(
+                        "transcript_autobind: {} — a live pane was bound while coord answered;                          adopting the pane's row instead of {:?}",
+                        identity.claude_session_id, settled
+                    );
+                    local
+                }
+                None => settled,
+            }
+        }
+    };
     let permitted = crate::egress::transcript_sync_gate_session(bind_scope(&decision)).is_open();
-    let (t, p) = (tailer.clone(), path.to_path_buf());
+    let (t, p, d) = (tailer.clone(), path.to_path_buf(), decision.clone());
     let joined = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-        apply_decision(&t, &identity, &p, &decision, permitted).inspect(|k| t.note_autobind(*k))
+        apply_decision(&t, &identity, &p, &d, permitted).inspect(|k| t.note_autobind(*k))
     })
     .await;
     if let Err(e) = joined {
         warn!("transcript_autobind: bind task failed to run: {e}");
     }
+    decision
 }
 
 #[cfg(test)]
@@ -701,6 +788,163 @@ mod tests {
         );
     }
 
+    /// Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D1: a live pane pinned to `CSID` bound to `row`, its scope `tenant`.
+    fn host_on_live_pane(
+        r: &AiCoordRegistrar,
+        row: Arc<Mutex<Option<Uuid>>>,
+        tenant: NewSessionTenant,
+    ) {
+        let pin = row.clone();
+        r.attach_terminal_coord_lookup(move |c| {
+            (c == CSID).then(|| *pin.lock().unwrap()).flatten()
+        });
+        r.attach_pane_row_tenant(move |q| {
+            (*row.lock().unwrap() == Some(q)).then_some(
+                crate::claude_session::pane_row_owner::PaneRowFacts {
+                    tenant,
+                    bound_at_ms: Some(1),
+                },
+            )
+        });
+    }
+
+    /// A resolver that counts its calls and answers `answer`, running
+    /// `during` while "in flight".
+    fn counting_resolver(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        answer: RowResolution,
+        during: impl FnOnce() + Send + 'static,
+    ) -> impl FnOnce(String) -> std::future::Ready<RowResolution> {
+        move |_csid| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            during();
+            std::future::ready(answer)
+        }
+    }
+
+    /// D1: a transcript whose id a live pane pins adopts that pane's own row,
+    /// stamped with the pane row's tenant — and coord is never asked.
+    #[tokio::test]
+    async fn a_live_panes_transcript_adopts_the_panes_row_without_asking_coord() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, r, outbox) = tailer(dir.path());
+        let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
+        let (pane_row, tenant) = (Uuid::new_v4(), Uuid::new_v4());
+        host_on_live_pane(
+            &r,
+            Arc::new(Mutex::new(Some(pane_row))),
+            NewSessionTenant::Stated(tenant),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stale = Uuid::new_v4();
+        let decision = bind_one_with(
+            &t,
+            id.clone(),
+            &path,
+            counting_resolver(calls.clone(), RowResolution::Existing(stale), || {}),
+        )
+        .await;
+        let expected = Decision::AdoptLivePane {
+            row: pane_row,
+            tenant: NewSessionTenant::Stated(tenant),
+        };
+        assert_eq!(decision, expected);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "coord was never asked"
+        );
+        assert_eq!(
+            bind_scope(&decision),
+            crate::egress::SessionScope::Tenant(tenant)
+        );
+
+        // The bind itself (bind_one_with's own apply is gated on this
+        // machine's consent, so apply again with the gate open; a bound key
+        // answers None).
+        let kind = apply_retrying(&t, &id, &path, &decision);
+        assert!(
+            matches!(kind, Some(AutoBindKind::AdoptedLivePane) | None),
+            "{kind:?}"
+        );
+        assert_eq!(r.session_id_for(CSID), Some(pane_row));
+        assert_eq!(r.recorded_tenant(CSID), Some(tenant));
+        assert!(
+            !outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .any(|row| row.session_id == stale),
+            "nothing addressed coord's stale pick"
+        );
+    }
+
+    /// Regression: a transcript no live pane hosts still asks coord, and
+    /// adopts coord's row as before.
+    #[tokio::test]
+    async fn a_transcript_no_pane_hosts_still_asks_coord() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, r, _outbox) = tailer(dir.path());
+        let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
+        host_on_live_pane(
+            &r,
+            Arc::new(Mutex::new(None)),
+            NewSessionTenant::Undetermined,
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let coords = Uuid::new_v4();
+        let decision = bind_one_with(
+            &t,
+            id,
+            &path,
+            counting_resolver(calls.clone(), RowResolution::Existing(coords), || {}),
+        )
+        .await;
+        assert_eq!(decision, Decision::Adopt(coords));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// D1's re-check: a pane bound WHILE coord's answer is in flight is
+    /// adopted instead of coord's (stale) pick.
+    #[tokio::test]
+    async fn a_pane_bound_while_coord_answers_is_adopted_instead_of_coords_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, r, _outbox) = tailer(dir.path());
+        let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
+        let bound: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+        host_on_live_pane(&r, bound.clone(), NewSessionTenant::Undetermined);
+        let pane_row = Uuid::new_v4();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decision = bind_one_with(
+            &t,
+            id,
+            &path,
+            counting_resolver(
+                calls.clone(),
+                RowResolution::Existing(Uuid::new_v4()),
+                move || *bound.lock().unwrap() = Some(pane_row),
+            ),
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            decision,
+            Decision::AdoptLivePane {
+                row: pane_row,
+                tenant: NewSessionTenant::Undetermined,
+            }
+        );
+        assert_eq!(
+            bind_scope(&decision),
+            crate::egress::SessionScope::Unresolved,
+            "an unresolved pane scope is judged under the strictest tenant"
+        );
+    }
+
     #[test]
     fn autobind_outcomes_reach_the_coverage_report() {
         let dir = tempfile::tempdir().unwrap();
@@ -709,10 +953,19 @@ mod tests {
         t.note_autobind(AutoBindKind::Minted);
         t.note_autobind(AutoBindKind::Minted);
         t.note_autobind(AutoBindKind::Deferred);
+        t.note_autobind(AutoBindKind::AdoptedLivePane);
         let c = t.coverage();
         assert_eq!(
-            (c.autobind_adopted, c.autobind_minted, c.autobind_deferred),
-            (1, 2, 1)
+            (
+                c.autobind_adopted,
+                c.autobind_minted,
+                c.autobind_deferred,
+                c.autobind_adopted_live_pane
+            ),
+            (1, 2, 1, 1),
+            "a live-pane adoption is counted apart from coord's pick"
         );
+        let served = serde_json::to_value(&c).unwrap();
+        assert_eq!(served["autobind_adopted_live_pane"], 1, "{served}");
     }
 }
