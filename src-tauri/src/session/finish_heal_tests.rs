@@ -207,7 +207,7 @@ impl HealPort for FakePort {
                 })
         })
     }
-    fn finish_queued(&self, _csid: &str, _finished_at: i64) -> Option<bool> {
+    fn finish_queued(&self, _csid: &str, _finished_at: i64, _row: Uuid) -> Option<bool> {
         // No outbox behind this port: nothing is ever still queued.
         Some(false)
     }

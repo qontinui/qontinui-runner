@@ -2928,11 +2928,16 @@ impl SessionLifecycleStore {
     /// (idempotent path-addressed PATCH).
     ///
     /// Each re-run while the mark stays unsynced appends one more `Finished`
-    /// row, including while an earlier one is still pending: the outbox has
-    /// no side-effect-free "is a row for this session pending" probe (its
-    /// `pending()` is the drain loop's cursor-bearing scan), so the count is
-    /// bounded by operator re-runs rather than deduplicated, and each row is
-    /// the same idempotent PATCH.
+    /// row, including while an earlier one is still pending: this door does
+    /// not deduplicate, so the count is bounded by operator re-runs, and each
+    /// row is the same idempotent PATCH. (A pending-row probe does exist —
+    /// `AiCoordRegistrar::finished_row_pending`, which the boot heal sweep
+    /// uses to skip a mark whose finish is still queued. It goes through the
+    /// outbox's `pending()` scan, which rebuilds the drain cursor's frontier
+    /// under the outbox write lock exactly as each drain tick does; this door
+    /// does not call it, since a duplicate here costs only one more
+    /// idempotent PATCH, and coord answering the earlier one unconfirmed is
+    /// precisely when a re-offer is wanted.)
     ///
     /// Calls are serialized end to end (`finish_forward`), so the retry's
     /// snapshot cannot be overtaken by a concurrent unmark: the order coord's
