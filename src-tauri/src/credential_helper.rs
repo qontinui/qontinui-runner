@@ -1230,6 +1230,10 @@ pub fn cleanup_credential_helper(session_id: &str) {
     }
 }
 
+/// How long the `Drop`-path cleanup waits for an in-flight install — the
+/// default of `IsolatedEditContext`'s per-context cleanup wait.
+pub(crate) const CLEANUP_INSTALL_WAIT: Duration = Duration::from_secs(30);
+
 /// [`cleanup_credential_helper`] on a detached thread — the form safe to call
 /// from a `Drop` impl.
 ///
@@ -1244,18 +1248,11 @@ pub fn cleanup_credential_helper(session_id: &str) {
 ///
 /// An install still in flight for `session_id` ([`track_install`]) is waited
 /// for first, ON THE SAME THREAD, by polling its completion
-/// ([`wait_for_installs`]): bounded by [`CLEANUP_INSTALL_WAIT`], then aborted
-/// (with a short grace for the abort to land), and the cleanup runs either
-/// way. The thread is unconditional, so a `Drop` during runtime shutdown
-/// cannot lose the cleanup the way a task spawned on that runtime could.
-pub fn spawn_cleanup_credential_helper(session_id: String) {
-    spawn_cleanup_credential_helper_within(session_id, CLEANUP_INSTALL_WAIT);
-}
-
-/// How long the `Drop`-path cleanup waits for an in-flight install.
-const CLEANUP_INSTALL_WAIT: Duration = Duration::from_secs(30);
-
-/// [`spawn_cleanup_credential_helper`] with the wait bound injected (tests).
+/// ([`wait_for_installs`]): bounded by `wait` (production passes
+/// [`CLEANUP_INSTALL_WAIT`]), then aborted (with a short grace for the abort to
+/// land), and the cleanup runs either way. The thread is unconditional, so a
+/// `Drop` during runtime shutdown cannot lose the cleanup the way a task
+/// spawned on that runtime could.
 pub(crate) fn spawn_cleanup_credential_helper_within(session_id: String, wait: Duration) {
     let pending = take_installs(&session_id);
     std::thread::spawn(move || {
@@ -1293,7 +1290,7 @@ fn wait_for_installs(pending: &[tokio::task::JoinHandle<()>], wait: Duration) ->
 }
 
 /// In-flight credential-helper installs, keyed by the agent id they install
-/// under — the same key [`spawn_cleanup_credential_helper`] tears down.
+/// under — the same key [`spawn_cleanup_credential_helper_within`] tears down.
 fn installs() -> &'static Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>> {
     static INSTALLS: OnceLock<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>> =
         OnceLock::new();
@@ -1301,7 +1298,7 @@ fn installs() -> &'static Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>
 }
 
 /// Record a detached install for `session_id`, so a later removal or cleanup
-/// can wait for it ([`settle_installs`], [`spawn_cleanup_credential_helper`]).
+/// can wait for it ([`settle_installs`], [`spawn_cleanup_credential_helper_within`]).
 /// Finished installs already recorded for the id are dropped on the way.
 pub(crate) fn track_install(session_id: &str, install: tokio::task::JoinHandle<()>) {
     let mut g = installs().lock().unwrap_or_else(|p| p.into_inner());
