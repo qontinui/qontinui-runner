@@ -2756,8 +2756,9 @@ async fn health(
         // Moves onto a pane row refused because another session owns it.
         "registrarPaneRowMovesNotOwner":
             crate::claude_session::coord_register::pane_row_moves_not_owner(),
-        // Live-pane adoptions deferred because only the pane's pin says it
-        // runs the session and another key holds the row.
+        // Distinct (row, session) pairs whose live-pane adoption was deferred
+        // because only the pane's pin says it runs the session and another key
+        // holds the row (each counted once, not per retry).
         "registrarPinSeedTakesDeferred":
             crate::claude_session::coord_register::pin_seed_takes_deferred(),
         // Browser-origin guard (plan 2026-09-17-runner-loopback-api-accepts-

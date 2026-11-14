@@ -893,16 +893,27 @@ impl AiCoordRegistrar {
                     if overrides.take_from_live_pane {
                         // Only the pin seed says the pane runs this key, and
                         // another key holds the row: deferred (auto-bind
-                        // retries). It can stay deferred until the seam names
-                        // the key, so it is counted and logged apart from the
-                        // generic deferral.
-                        pane_transfer::note_pin_seed_take_deferred();
-                        info!(
-                            "ai_coord_register: deferred: pin seed contested — {} holds coord \
-                             session {} only by its pane's pin, and another key is bound \
-                             there; not evicting it",
-                            claude_session_id, session_id
-                        );
+                        // retries). It stays deferred until a running-id seam
+                        // source names the key — for the pane's whole life if
+                        // the pane has no hook and no provider-registry row —
+                        // so each pair is counted once and logged apart from
+                        // the generic deferral.
+                        if pane_transfer::note_pin_seed_take_deferred(session_id, claude_session_id)
+                        {
+                            info!(
+                                "ai_coord_register: deferred: pin seed contested — {} holds \
+                                 coord session {} only by its pane's pin, and another key is \
+                                 bound there; not evicting it. It stays deferred until the \
+                                 provider registry or the SessionStart hook names {} on that \
+                                 row — for the pane's life if it has neither",
+                                claude_session_id, session_id, claude_session_id
+                            );
+                        } else {
+                            debug!(
+                                "ai_coord_register: deferred again: pin seed contested — {} on {}",
+                                claude_session_id, session_id
+                            );
+                        }
                     }
                     return Err(TranscriptBindRefusal::CoordSessionInUse);
                 }
@@ -4280,10 +4291,11 @@ mod tests {
         assert!(rows_of_kind(&reg, SessionEventKind::Closed).is_empty());
     }
 
-    /// Second review (A4): a refused pin-seed take is counted apart from the
-    /// generic deferral.
+    /// Second review (A4) / third review (A4): a refused pin-seed take is
+    /// counted apart from the generic deferral, once per `(row, session)`
+    /// pair however often auto-bind retries it.
     #[test]
-    fn a_contested_pin_seed_take_is_counted() {
+    fn a_contested_pin_seed_take_is_counted_once_per_pair() {
         let _env = env_lock();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
@@ -4291,16 +4303,95 @@ mod tests {
         reg.bind_transcript_session("holder-y", Some(r), None, ResumeParams::default())
             .unwrap();
         let before = pin_seed_takes_deferred();
-        assert_eq!(
-            reg.bind_transcript_session_on_live_pane(
-                "pin-p",
-                r,
-                NewSessionTenant::Undetermined,
-                ResumeParams::default()
-            ),
-            Err(TranscriptBindRefusal::CoordSessionInUse)
-        );
+        for _ in 0..3 {
+            assert_eq!(
+                reg.bind_transcript_session_on_live_pane(
+                    "pin-p",
+                    r,
+                    NewSessionTenant::Undetermined,
+                    ResumeParams::default()
+                ),
+                Err(TranscriptBindRefusal::CoordSessionInUse)
+            );
+        }
         assert!(pin_seed_takes_deferred() > before);
+        assert!(
+            !pane_transfer::note_pin_seed_take_deferred(r, "pin-p"),
+            "the pair was recorded once; retries add nothing"
+        );
+    }
+
+    /// Third review (A1): a retried running-id confirmation for a pane that
+    /// has since CLOSED must not displace the id's entry on the pane that runs
+    /// it now — here pane B, which reached X by an in-pane `/resume` (it is
+    /// not pinned to X).
+    #[test]
+    fn a_confirmation_for_a_closed_pane_never_displaces_the_live_panes_entry() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let x = "resumed-in-pane-b";
+        let (r_a, r_b) = (Uuid::new_v4(), Uuid::new_v4());
+        live.lock()
+            .unwrap()
+            .insert(r_b, NewSessionTenant::Undetermined);
+        reg.note_pane_row(r_b, x, RekeySource::ProviderRegistry);
+        assert_eq!(reg.inner.pane_rows.owner_of(r_b).as_deref(), Some(x));
+
+        // Pane A (closed: no live terminal holds R_A) has a deferred hook
+        // re-key for X that fires now.
+        assert_eq!(
+            reg.note_pane_row(r_a, x, RekeySource::Hook),
+            MoveOutcome::NotLivePane
+        );
+        assert_eq!(
+            reg.inner.pane_rows.owner_of(r_a),
+            None,
+            "never parked on R_A"
+        );
+        assert_eq!(reg.inner.pane_rows.owner_of(r_b).as_deref(), Some(x));
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r_b));
+    }
+
+    /// Third review (A2): pane B, pinned to X and bound later, `/clear`ed to Y
+    /// (R_B is Y's by an entry). The older pane A still runs X; B's pin must
+    /// not block A's advance, or X would be routable nowhere while B lives.
+    #[test]
+    fn a_later_pin_whose_row_another_id_owns_does_not_block_the_advance() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let rows: Arc<Mutex<HashMap<Uuid, i64>>> = Default::default();
+        {
+            let rows = rows.clone();
+            reg.attach_pane_row_tenant(move |row| {
+                rows.lock().unwrap().get(&row).map(|at| PaneRowFacts {
+                    tenant: NewSessionTenant::Undetermined,
+                    bound_at_ms: Some(*at),
+                })
+            });
+        }
+        let panes = attach_panes(&reg);
+        let (x, y) = ("still-running-in-a", "b-after-clear");
+        let (r_a, r_b) = (Uuid::new_v4(), Uuid::new_v4());
+        rows.lock().unwrap().insert(r_a, 100);
+        rows.lock().unwrap().insert(r_b, 200);
+        panes
+            .lock()
+            .unwrap()
+            .push(("pane-a-pin".to_string(), Some((r_a, 1))));
+        panes.lock().unwrap().push((x.to_string(), Some((r_b, 2))));
+        reg.note_pane_row(r_b, y, RekeySource::ProviderRegistry);
+        assert_eq!(reg.inner.pane_rows.owner_of(r_b).as_deref(), Some(y));
+
+        reg.note_pane_row(r_a, x, RekeySource::ProviderRegistry);
+        assert_eq!(
+            reg.inner.pane_rows.owner_of(r_a).as_deref(),
+            Some(x),
+            "B's pin does not outrank A: B runs Y now"
+        );
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r_a));
     }
 
     /// The bind trigger does not move X onto a row whose owner entry names
