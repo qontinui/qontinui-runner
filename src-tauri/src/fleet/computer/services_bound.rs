@@ -16,7 +16,10 @@
 //! true` reads "within the bound". Otherwise, younger than its
 //! `reemit_after_secs` reads "over" — that window is the re-emit period plus a
 //! margin ([`REEMIT_MARGIN_SECS`]) for a jittered tick and delivery back-off,
-//! so a standing condition never reads stale between re-emits. An older one,
+//! so a standing condition never reads stale between re-emits — the clock
+//! runs even while scans produce no service information, and such a re-emit
+//! says `scan_answered: false` with every kind held at its last vouched
+//! count. An older one,
 //! or none, reads "no longer over" only when coord served fewer events than
 //! its `EVENTS_LIMIT`; at the limit, or when the reporter stopped reporting,
 //! it is UNKNOWN.
@@ -189,16 +192,32 @@ impl OverBound {
         now: chrono::DateTime<chrono::Utc>,
     ) -> (OverBound, Vec<Action>) {
         let Some(scan) = scan else {
-            return (self.clone(), Vec::new());
+            // No service information: the state holds — but the re-emit
+            // clock still runs, so a long scan outage does not age the over
+            // event out. Every adopted kind is then HELD (nothing vouched for
+            // it this tick), reported with its last vouched count.
+            return match self {
+                OverBound::Over(prev)
+                    if (now - prev.emitted_at).num_seconds() >= REEMIT_EVERY_SECS =>
+                {
+                    let mut next = prev.clone();
+                    next.held = prev.kinds.clone();
+                    next.emitted_at = now;
+                    (OverBound::Over(next), vec![Action::Emit])
+                }
+                _ => (self.clone(), Vec::new()),
+            };
         };
         let OverBound::Over(prev) = self else {
             if scan.cut.is_empty() {
                 return (OverBound::Within, Vec::new());
             }
+            let mut last_counts = scan.counts.clone();
+            vouch_zero_for_empty_complete_kinds(&mut last_counts, &scan);
             let entered = Over {
                 kinds: scan.cut.clone(),
                 held: BTreeSet::new(),
-                last_counts: scan.counts.clone(),
+                last_counts,
                 emitted_at: now,
                 proposed: None,
             };
@@ -221,6 +240,7 @@ impl OverBound {
                 last_counts.insert(k, *n);
             }
         }
+        vouch_zero_for_empty_complete_kinds(&mut last_counts, &scan);
         let mut next = Over {
             kinds: prev.kinds.clone(),
             held,
@@ -252,19 +272,36 @@ impl OverBound {
     }
 }
 
+/// A kind the scan saw completely with no row at all is vouched for as zero,
+/// rather than leaving an older count standing. PURE.
+fn vouch_zero_for_empty_complete_kinds(
+    last_counts: &mut BTreeMap<&'static str, usize>,
+    scan: &Scan<'_>,
+) {
+    for k in scan.complete_kinds {
+        if !scan.counts.contains_key(k) {
+            last_counts.insert(k, 0);
+        }
+    }
+}
+
 /// The `telemetry_gap` saying this computer's service list is capped at
 /// coord's bound. `observed` is THIS scan's sendable count per kind, for the
 /// kinds it saw as they are; a HELD kind (over, but not seen completely by
 /// this scan) is left out of `observed` and listed in `held_kinds`, with its
-/// last count a scan could vouch for in `held_last_counts`. PURE.
+/// last count a scan could vouch for in `held_last_counts`. `scan_counts`
+/// is `None` when this tick's scan produced no service information
+/// (`scan_answered: false`): every kind is then held and `observed` is
+/// empty. PURE.
 pub(crate) fn over_bound_event(
     identity: &str,
-    scan_counts: &BTreeMap<&'static str, usize>,
+    scan_counts: Option<&BTreeMap<&'static str, usize>>,
     over: &Over,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ComputerEvent {
     let observed: BTreeMap<&'static str, usize> = scan_counts
-        .iter()
+        .into_iter()
+        .flatten()
         .filter(|(k, _)| !over.held.contains(*k))
         .map(|(k, n)| (*k, *n))
         .collect();
@@ -279,6 +316,7 @@ pub(crate) fn over_bound_event(
         serde_json::json!({
             "reason": OVER_BOUND_REASON,
             "cleared": false,
+            "scan_answered": scan_counts.is_some(),
             "bound": MAX_SERVICES_PER_COMPUTER,
             "observed": observed,
             "held_kinds": over.held,
@@ -290,7 +328,9 @@ pub(crate) fn over_bound_event(
 }
 
 /// The CLOSING `services_over_bound` event: the computer is back within the
-/// bound, so no kind is truncated any more. PURE.
+/// bound, so no kind is truncated any more. Same schema as the over event;
+/// `reemit_after_secs` is `null` because a cleared state promises no
+/// successor — it stays true until a later event says otherwise. PURE.
 pub(crate) fn cleared_event(
     identity: &str,
     scan_counts: &BTreeMap<&'static str, usize>,
@@ -302,11 +342,57 @@ pub(crate) fn cleared_event(
         serde_json::json!({
             "reason": OVER_BOUND_REASON,
             "cleared": true,
+            "scan_answered": true,
             "bound": MAX_SERVICES_PER_COMPUTER,
             "observed": scan_counts,
+            "held_kinds": [],
+            "held_last_counts": {},
             "truncated_kinds": [],
+            "reemit_after_secs": null,
         }),
     )
+}
+
+/// Rate limit on the over-bound WARN for one computer. A computer whose unit
+/// count drifts slowly across the bound (ephemeral runners registering near
+/// 256) can enter and leave every few ticks even with [`SETTLE_SCANS`]; each
+/// entry still queues its event, so coord's read surface stays truthful, but
+/// the WARN — a request for a human's attention — fires once per kind set per
+/// [`REEMIT_EVERY_SECS`], the cadence the event itself restates a standing
+/// condition at. A repeat inside the window is logged at debug, and so is
+/// the INFO that closes an entry whose WARN was suppressed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WarnLimit {
+    last: Option<(BTreeSet<&'static str>, chrono::DateTime<chrono::Utc>)>,
+    /// Whether the latest [`WarnLimit::admit`] was admitted.
+    entry_warned: bool,
+}
+
+impl WarnLimit {
+    /// `true` = WARN for `kinds` at `now` (and remember it). PURE.
+    pub(crate) fn admit(
+        &mut self,
+        kinds: &BTreeSet<&'static str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let due = match &self.last {
+            Some((last_kinds, at)) => {
+                last_kinds != kinds || (now - *at).num_seconds() >= REEMIT_EVERY_SECS
+            }
+            None => true,
+        };
+        if due {
+            self.last = Some((kinds.clone(), now));
+        }
+        self.entry_warned = due;
+        due
+    }
+
+    /// Whether the INFO closing the current entry is logged at info: only
+    /// when that entry's WARN was. PURE.
+    pub(crate) fn info_due(&self) -> bool {
+        self.entry_warned
+    }
 }
 
 fn gap_event(
@@ -572,7 +658,7 @@ mod tests {
         );
         let e = over_bound_event(
             "h",
-            &counts(&[(GH, 300)]),
+            Some(&counts(&[(GH, 300)])),
             over(&s),
             at("2026-11-14T00:00:00Z"),
         );
@@ -674,12 +760,13 @@ mod tests {
         assert_eq!(o.kinds, set(&[GH]));
         assert_eq!(o.held, set(&[GH]));
         assert_eq!(o.last_counts.get(GH), Some(&300));
-        let e = over_bound_event("h", &counts(&[(GH, 12), (QR, 200)]), o, t1);
+        let e = over_bound_event("h", Some(&counts(&[(GH, 12), (QR, 200)])), o, t1);
         assert_eq!(
             e.detail,
             serde_json::json!({
                 "reason": "services_over_bound",
                 "cleared": false,
+                "scan_answered": true,
                 "bound": 256,
                 "observed": {"qontinui_runner": 200},
                 "held_kinds": ["gh_actions_runner"],
@@ -772,7 +859,7 @@ mod tests {
     fn the_events_carry_the_bound_the_counts_and_the_truncated_kinds() {
         let now = at("2026-11-14T00:00:00Z");
         let (s, _) = step_with(&OverBound::Within, &[(GH, 300), (QR, 3)], ALL, now);
-        let e = over_bound_event("h", &counts(&[(GH, 300), (QR, 3)]), over(&s), now);
+        let e = over_bound_event("h", Some(&counts(&[(GH, 300), (QR, 3)])), over(&s), now);
         assert_eq!(e.kind, "telemetry_gap");
         assert_eq!(e.observed_at, "2026-11-14T00:00:00Z");
         assert_eq!(
@@ -780,6 +867,7 @@ mod tests {
             serde_json::json!({
                 "reason": "services_over_bound",
                 "cleared": false,
+                "scan_answered": true,
                 "bound": 256,
                 "observed": {"gh_actions_runner": 300, "qontinui_runner": 3},
                 "held_kinds": [],
@@ -800,10 +888,95 @@ mod tests {
             serde_json::json!({
                 "reason": "services_over_bound",
                 "cleared": true,
+                "scan_answered": true,
                 "bound": 256,
                 "observed": {"gh_actions_runner": 10},
+                "held_kinds": [],
+                "held_last_counts": {},
                 "truncated_kinds": [],
+                "reemit_after_secs": null,
             })
         );
+    }
+
+    /// Review round 4, A1: a slow drift across the bound (three scans over,
+    /// three under, again and again) emits its event on every entry, but
+    /// WARNs once per kind set per day.
+    #[test]
+    fn slow_oscillation_warns_once_per_day_and_still_emits_every_entry() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let mut s = OverBound::Within;
+        let mut limit = WarnLimit::default();
+        let (mut emits, mut warns, mut infos) = (0, 0, 0);
+        let mut cycle = |s: &mut OverBound, now: chrono::DateTime<chrono::Utc>| {
+            for c in [[(GH, 300)]; 3].into_iter().chain([[(GH, 10)]; 3]) {
+                let (next, actions) = step_with(s, &c, ALL, now);
+                for a in actions {
+                    match (a, &next) {
+                        (Action::Emit, _) => emits += 1,
+                        (Action::Warn, OverBound::Over(o)) if limit.admit(&o.kinds, now) => {
+                            warns += 1
+                        }
+                        (Action::Info, _) if limit.info_due() => infos += 1,
+                        _ => {}
+                    }
+                }
+                *s = next;
+            }
+        };
+        for i in 0..20 {
+            cycle(&mut s, t0 + chrono::Duration::seconds(i * 180));
+        }
+        assert_eq!(emits, 20, "every entry is on coord's read surface");
+        assert_eq!(warns, 1, "one WARN for the day");
+        assert_eq!(infos, 1, "and one INFO closing that entry");
+
+        // A day later the same kind set WARNs again.
+        let mut again = WarnLimit::default();
+        let kinds = set(&[GH]);
+        assert!(again.admit(&kinds, t0));
+        assert!(!again.admit(&kinds, at("2026-11-14T23:59:59Z")));
+        assert!(again.admit(&kinds, at("2026-11-15T00:00:00Z")));
+        // A different kind set is not limited by the first.
+        assert!(again.admit(&set(&[GH, QR]), at("2026-11-15T00:00:01Z")));
+    }
+
+    /// Review round 4, A2: a scan outage longer than the re-emit period still
+    /// re-emits, with every kind held at its last vouched count, so the
+    /// event never ages out while the computer may still be over.
+    #[test]
+    fn a_scan_outage_still_reemits_with_every_kind_held() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let (o, _) = step_with(&OverBound::Within, &[(GH, 300)], ALL, t0);
+        let (quiet, a) = o.step(None, at("2026-11-14T23:59:59Z"));
+        assert_eq!((&quiet, a), (&o, vec![]));
+        let day = at("2026-11-15T00:00:00Z");
+        let (s, a) = quiet.step(None, day);
+        assert_eq!(a, vec![Action::Emit]);
+        assert_eq!(over(&s).held, set(&[GH]));
+        assert_eq!(over(&s).emitted_at, day);
+        let e = over_bound_event("h", None, over(&s), day);
+        assert_eq!(e.detail["scan_answered"], false);
+        assert_eq!(e.detail["observed"], serde_json::json!({}));
+        assert_eq!(
+            e.detail["held_last_counts"],
+            serde_json::json!({"gh_actions_runner": 300})
+        );
+        assert_eq!(
+            e.detail["truncated_kinds"],
+            serde_json::json!(["gh_actions_runner"])
+        );
+    }
+
+    /// Review round 4, A3: a complete scan that sees a kind at zero rows
+    /// vouches for zero, rather than leaving the old count standing.
+    #[test]
+    fn a_complete_scan_with_no_rows_of_a_kind_vouches_for_zero() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let (two, _) = step_with(&OverBound::Within, &[(GH, 300), (QR, 300)], ALL, t0);
+        assert_eq!(over(&two).last_counts.get(QR), Some(&300));
+        let (s, _) = step_with(&two, &[(GH, 300)], ALL, t0);
+        assert_eq!(over(&s).last_counts.get(QR), Some(&0));
+        assert_eq!(over(&s).last_counts.get(GH), Some(&300));
     }
 }
