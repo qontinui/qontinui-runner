@@ -494,8 +494,13 @@ Exactly one of three shapes, chosen in this order:
    `parse_probe_blocks` reads — `claim`, `anchor`, `verified_at`,
    `verified_against` — plus, optionally, `addressed_by: <this-plan-stem>#<phase>`,
    the link the verification-failure detector joins on (that plan's Phase 6;
-   until coord's Phase 5 grammar lands the key is ignored, never refused, so a
-   block without it is still a valid claim). **The `text` fence is
+   coord parses the key, and a block without it is still a valid claim). A
+   `#<phase>` link reads landed only once a landed, non-document citation of the
+   plan attributes that phase (`phases: <n>`) or declares `delivers: complete`.
+   On a PR, that means its `Plan:` marker carries the scope. This applies to a
+   one-phase plan's `#1` too. Under a bare marker the link stays `unlanded`, and
+   the detector never fires on it. `/implement-plan` Step 4.5
+   (**DECLARE THE PHASES THIS PR DELIVERS**) has the grammar. **The `text` fence is
    display-only:** coord recognises a block only when its opening fence line is
    exactly ```` ```probe ```` (`PROBE_FENCE` in `prompt_document_claims.rs`), and
    the leading `probe` line inside the template stands in for that tag. When the

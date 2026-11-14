@@ -3085,10 +3085,10 @@ def blob_shas(paths):
     cannot answer. hash-object needs no repository, so the provisioned skill
     copy hashes as well as a checkout."""
     try:
-        p = subprocess.run(["git", "hash-object", "--", *paths], capture_output=True, text=True, timeout=30,
+        p = subprocess.run(["git", "hash-object", "--", *paths], capture_output=True, timeout=30,
                            env=nss.git_scope_env(), check=False)
-        shas = p.stdout.split() if p.returncode == 0 else []
-    except (OSError, subprocess.TimeoutExpired):
+        shas = p.stdout.decode("utf-8").split() if p.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         shas = []
     return dict(zip(paths, shas)) if len(shas) == len(paths) else {x: None for x in paths}
 
@@ -3644,7 +3644,7 @@ def ledger_selftest():
         # -B: the child imports this file as a module, which must not leave a __pycache__ in the skill tree.
         child = subprocess.Popen([sys.executable, "-B", "-c", LOCK_CHILD, os.path.abspath(__file__),
                                   lock_path(port, lock_dir)],
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8", errors="replace")
         try:
             first = child.stdout.readline().strip()
             if first != "held":
