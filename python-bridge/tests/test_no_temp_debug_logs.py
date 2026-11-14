@@ -61,10 +61,15 @@ as a deliberate test change:
 - ``tempfile.mkdtemp`` / ``mkstemp`` / ``NamedTemporaryFile`` / ``TemporaryFile``
   outputs. Deliberately not sources: the bridge uses ``mkdtemp`` legitimately
   (``executor_core.py`` ``self.temp_dir``, ``qontinui_executor.py`` ``run_dir``)
-  and ``NamedTemporaryFile`` for real temp files;
-- ``tempfile.TemporaryFile`` writes (no path to test);
+  and ``NamedTemporaryFile`` for real temp files. (``TemporaryFile`` has no path
+  at all, so its shape documents the limit rather than guarding a code path);
 - ``os.open`` (the low-level fd API) is not a sink;
-- ``shutil.copy`` / ``shutil.move`` into a temp or home dir are not sinks.
+- the ``shutil`` copy/move family (``copy``, ``copy2``, ``copyfile``,
+  ``copytree``, ``move``) into a temp or home dir is not a sink;
+- ``tarfile.TarFile(name, mode)`` and its ``TarFile.open`` / ``taropen``
+  constructors (only ``tarfile.open`` is a sink);
+- ``logging.config.dictConfig`` / ``fileConfig`` declaring a file handler by class
+  string with a ``filename`` value.
 
 Legitimate temp-dir writes are allow-listed by (file, function, arm, path
 expression), so a NEW write inside an allow-listed function is still flagged.
@@ -663,6 +668,20 @@ class C:
     ),
     "temporary_file_not_followed": (
         "import tempfile\nwith tempfile.TemporaryFile('w') as f:\n    f.write('x')\n",
+        [],
+    ),
+    "shutil_copyfile_not_followed": (
+        "import shutil, tempfile\nshutil.copyfile('a.log', tempfile.gettempdir() + '/a.log')\n",
+        [],
+    ),
+    "tarfile_class_not_followed": (
+        "import tarfile, tempfile\ntarfile.TarFile(tempfile.gettempdir() + '/a.tar', 'w')\n",
+        [],
+    ),
+    "dict_config_not_followed": (
+        "import logging.config, tempfile\n"
+        "logging.config.dictConfig({'handlers': {'f': {'class': 'logging.FileHandler',"
+        " 'filename': tempfile.gettempdir() + '/x'}}})\n",
         [],
     ),
     "shutil_move_not_followed": (
