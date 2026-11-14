@@ -234,6 +234,8 @@ mod prompt_snippets;
 mod prompts;
 /// The `qontinui-provenance:` frontmatter key both fleet provisioners stamp.
 mod provenance;
+/// Excludes the paths the fleet provisioners wrote from the checkout's `git status`.
+mod provision_exclude;
 /// The shared tracked-destination guard every fleet provisioner consults.
 mod provision_guard;
 mod rag;
