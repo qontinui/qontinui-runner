@@ -1241,8 +1241,133 @@ pub fn cleanup_credential_helper(session_id: &str) {
 /// hazard `IsolatedEditContext::drop` already guards its claim-release spawn
 /// against. A detached `std::thread` needs no runtime (unlike `tokio::spawn`,
 /// which itself panics outside one) and contains any panic to itself.
+///
+/// An install still in flight for `session_id` ([`track_install`]) is waited
+/// for first, ON THE SAME THREAD, by polling its completion
+/// ([`wait_for_installs`]): bounded by [`CLEANUP_INSTALL_WAIT`], then aborted
+/// (with a short grace for the abort to land), and the cleanup runs either
+/// way. The thread is unconditional, so a `Drop` during runtime shutdown
+/// cannot lose the cleanup the way a task spawned on that runtime could.
 pub fn spawn_cleanup_credential_helper(session_id: String) {
-    std::thread::spawn(move || cleanup_credential_helper(&session_id));
+    spawn_cleanup_credential_helper_within(session_id, CLEANUP_INSTALL_WAIT);
+}
+
+/// How long the `Drop`-path cleanup waits for an in-flight install.
+const CLEANUP_INSTALL_WAIT: Duration = Duration::from_secs(30);
+
+/// [`spawn_cleanup_credential_helper`] with the wait bound injected (tests).
+pub(crate) fn spawn_cleanup_credential_helper_within(session_id: String, wait: Duration) {
+    let pending = take_installs(&session_id);
+    std::thread::spawn(move || {
+        if !wait_for_installs(&pending, wait) {
+            warn!(
+                session_id = %session_id,
+                "credential_helper: an install was still running after {wait:?} and an abort; \
+                 cleaning up anyway"
+            );
+        }
+        cleanup_credential_helper(&session_id);
+    });
+}
+
+/// Block this (non-runtime) thread until every handle is finished, up to
+/// `wait`; then abort what is left and allow it `wait / 10` (at least 100 ms)
+/// to land. `true` when all finished.
+fn wait_for_installs(pending: &[tokio::task::JoinHandle<()>], wait: Duration) -> bool {
+    let poll = |until: std::time::Instant| loop {
+        if pending.iter().all(|h| h.is_finished()) {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if poll(std::time::Instant::now() + wait) {
+        return true;
+    }
+    for h in pending {
+        h.abort();
+    }
+    poll(std::time::Instant::now() + abort_grace(wait))
+}
+
+/// In-flight credential-helper installs, keyed by the agent id they install
+/// under — the same key [`spawn_cleanup_credential_helper`] tears down.
+fn installs() -> &'static Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>> {
+    static INSTALLS: OnceLock<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>> =
+        OnceLock::new();
+    INSTALLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a detached install for `session_id`, so a later removal or cleanup
+/// can wait for it ([`settle_installs`], [`spawn_cleanup_credential_helper`]).
+/// Finished installs already recorded for the id are dropped on the way.
+pub(crate) fn track_install(session_id: &str, install: tokio::task::JoinHandle<()>) {
+    let mut g = installs().lock().unwrap_or_else(|p| p.into_inner());
+    let list = g.entry(session_id.to_string()).or_default();
+    list.retain(|h| !h.is_finished());
+    list.push(install);
+}
+
+fn take_installs(session_id: &str) -> Vec<tokio::task::JoinHandle<()>> {
+    installs()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(session_id)
+        .unwrap_or_default()
+}
+
+/// Wait for every install still in flight for `session_id` under ONE shared
+/// deadline, `bound` from now, so an agent with several installs cannot stall
+/// a refusal report for `bound` per install. Called before an unspawned
+/// allocation's trees are removed, so the installs' writes land before (and
+/// their credentials are torn down after) the removal. Whatever is still
+/// running at the deadline is logged and aborted, and all of it shares one
+/// short grace for the aborts to land ([`abort_grace`]). `false` when an
+/// install is STILL running after that — the caller must then not judge the
+/// trees; that install is put back so the context's cleanup still waits for it.
+pub(crate) async fn settle_installs(session_id: &str, bound: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    let mut late = Vec::new();
+    for mut install in take_installs(session_id) {
+        if tokio::time::timeout_at(deadline, &mut install)
+            .await
+            .is_err()
+        {
+            late.push(install);
+        }
+    }
+    if late.is_empty() {
+        return true;
+    }
+    warn!(
+        session_id = %session_id,
+        "credential_helper: {} install(s) still running after {bound:?}; aborting",
+        late.len()
+    );
+    for install in &late {
+        install.abort();
+    }
+    let grace = tokio::time::Instant::now() + abort_grace(bound);
+    let mut settled = true;
+    for mut install in late {
+        if tokio::time::timeout_at(grace, &mut install).await.is_err() {
+            warn!(
+                session_id = %session_id,
+                "credential_helper: an aborted install has not stopped within the grace"
+            );
+            settled = false;
+            track_install(session_id, install);
+        }
+    }
+    settled
+}
+
+/// The one grace an abort gets to land: a tenth of the wait, at least 100 ms
+/// and at most 2 s.
+fn abort_grace(bound: Duration) -> Duration {
+    (bound / 10).clamp(Duration::from_millis(100), Duration::from_secs(2))
 }
 
 /// Delete stale credential config files (and orphaned `.tmp-*` siblings from
@@ -1365,6 +1490,85 @@ pub fn spawn_startup_sweep() {
 
 #[cfg(test)]
 mod tests {
+    /// Review A4: the `Drop`-path cleanup runs on its own thread AFTER an
+    /// install still in flight for the id. The install here writes the
+    /// session's config file 300 ms in; a cleanup that ran ahead of it would
+    /// leave that file behind for good.
+    #[tokio::test]
+    async fn the_drop_path_cleanup_waits_for_an_in_flight_install() {
+        let id = format!("drop-wait-{}", uuid::Uuid::new_v4());
+        let path = config_file_path(&id);
+        let written = path.clone();
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrote_flag = wrote.clone();
+        track_install(
+            &id,
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                std::fs::write(&written, "{}").unwrap();
+                wrote_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        spawn_cleanup_credential_helper_within(id.clone(), Duration::from_secs(10));
+        // Keep the runtime driving the install while the cleanup thread waits.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if wrote.load(std::sync::atomic::Ordering::SeqCst) && !path.exists() {
+                break;
+            }
+        }
+        // Past the install, give a cleanup that ran AHEAD of it the chance to
+        // be seen as one: the file it never deleted would still be there.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let left = path.exists();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            wrote.load(std::sync::atomic::Ordering::SeqCst),
+            "the install wrote its config file"
+        );
+        assert!(!left, "the cleanup ran after the install and removed it");
+    }
+
+    /// One deadline is shared by all of an agent's installs: three that never
+    /// finish on their own cost ONE bound plus one abort grace, not three.
+    #[tokio::test]
+    async fn settling_several_installs_shares_one_deadline() {
+        let id = format!("shared-deadline-{}", uuid::Uuid::new_v4());
+        for _ in 0..3 {
+            track_install(
+                &id,
+                tokio::spawn(tokio::time::sleep(Duration::from_secs(3600))),
+            );
+        }
+        let started = std::time::Instant::now();
+        assert!(settle_installs(&id, Duration::from_millis(300)).await);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(600),
+            "one shared 300 ms deadline (+ abort grace), not one per install: took {took:?}"
+        );
+    }
+
+    /// Review A4: an install that never finishes is aborted after the bound
+    /// and the cleanup still runs (it is never lost).
+    #[tokio::test]
+    async fn the_drop_path_cleanup_runs_even_when_an_install_never_finishes() {
+        let id = format!("drop-stuck-{}", uuid::Uuid::new_v4());
+        let path = config_file_path(&id);
+        std::fs::write(&path, "{}").unwrap();
+        let install = tokio::spawn(tokio::time::sleep(Duration::from_secs(3600)));
+        track_install(&id, install);
+        spawn_cleanup_credential_helper_within(id.clone(), Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let left = path.exists();
+        let _ = std::fs::remove_file(&path);
+        assert!(!left, "the cleanup ran despite the stuck install");
+    }
+
     use super::*;
 
     fn git_config_get(dir: &Path, key: &str) -> Option<String> {

@@ -59,6 +59,55 @@ pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
     Ok(tenant)
 }
 
+/// Settle `terminal_create`'s blocking spawn, handing an unspawned allocation
+/// to `remove` only where that is known to be safe.
+///
+/// - A **create error** is `TerminalManager::create`'s own typed `Err`: the
+///   allocation (if this call made one) is taken out of `isolated_ctx` and
+///   handed to `remove` with the failure, whose `child_started` decides
+///   whether its tree may be removed, as on every `acquire_for_terminal` door.
+///   Not every create error is pre-child: `create`'s "Sessions lock poisoned"
+///   comes AFTER a successful spawn (the child is running and a `LocalPty` has
+///   no kill on drop), so it is typed `child_started = true` and the tree is
+///   kept and only reported — the same as a reader/writer failure in
+///   `spawn_with_io`.
+/// - A **join error** is a panic inside `create`, which may come after
+///   `sessions.insert` — a live session may hold the tree — so it is logged,
+///   the context is left in place, and nothing is removed or reported (plan
+///   `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+///   Why #5).
+///
+/// `remove` is the seam the tests drive; the command passes
+/// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::remove_unspawned`].
+pub(crate) fn settle_terminal_spawn<T>(
+    joined: Result<Result<T, crate::terminal::spawn_refusal::SpawnFailure>, tokio::task::JoinError>,
+    isolated_ctx: &mut Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    remove: impl FnOnce(
+        crate::agent_worktree::isolated_edit::IsolatedEditContext,
+        &crate::terminal::spawn_refusal::SpawnFailure,
+    ),
+) -> Result<T, String> {
+    match joined {
+        Ok(Ok(info)) => Ok(info),
+        Ok(Err(e)) => {
+            if let Some(ctx) = isolated_ctx.take() {
+                remove(ctx, &e);
+            }
+            Err(e.message)
+        }
+        Err(join) => {
+            if let Some(ctx) = isolated_ctx.as_ref() {
+                warn!(
+                    "terminal_create: the spawn task failed ({join}) after allocation {}; a \
+                     session may already hold it, so it is not reported abandoned",
+                    ctx.agent_id
+                );
+            }
+            Err(format!("terminal spawn task failed: {join}"))
+        }
+    }
+}
+
 /// Create a new terminal session.
 ///
 /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
@@ -126,9 +175,10 @@ pub async fn terminal_create(
     // command gets there it has already run `acquire_for_terminal`, which under
     // `QONTINUI_AGENT_WORKTREE_MODE` does a `git worktree add`, takes a coord
     // claim, starts a heartbeat task and shells out to `git config`. A CRITICAL
-    // refusal would throw all of that away, and `IsolatedEditContext::Drop`
-    // releases the claim but does NOT remove the materialized worktree — so each
-    // refusal would leak a directory and the "Start anyway" retry would
+    // refusal would throw all of that away: `IsolatedEditContext::Drop` releases
+    // the claim, and `remove_unspawned` on the create-error arm below can take
+    // the fresh tree back off disk only after a `git worktree add` and a
+    // `git worktree remove` both ran — and the "Start anyway" retry would
     // materialize a second one. The most allocation-heavy step in the spawn must
     // not be the one that runs unguarded. Costs one `GlobalMemoryStatusEx` call;
     // returns the same typed refusal the seam would, so the frontend's dialog
@@ -209,15 +259,16 @@ pub async fn terminal_create(
         edit_siblings.as_deref().unwrap_or_default(),
     )
     .map_err(|refusal| refusal.to_string())?;
-    let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
-        effective_intent_repo.as_deref(),
-        title.as_deref().unwrap_or("Terminal edit session"),
-        working_dir,
-        None,
-        spawn_tenant_id,
-        &edit_siblings,
-    )
-    .await;
+    let (working_dir, mut isolated_ctx) =
+        crate::agent_worktree::isolated_edit::acquire_for_terminal(
+            effective_intent_repo.as_deref(),
+            title.as_deref().unwrap_or("Terminal edit session"),
+            working_dir,
+            None,
+            spawn_tenant_id,
+            &edit_siblings,
+        )
+        .await;
 
     let repo_detect_handle = app_handle.clone();
     let repo_detect_dir = working_dir.clone();
@@ -250,8 +301,9 @@ pub async fn terminal_create(
     // so a CRITICAL refusal has somewhere to go — the frontend re-invokes with
     // `resource_override: true` once they pick "Start anyway".
     let create_resource_override = resource_override.unwrap_or(false);
-    let info = spawn_blocking_tracked(move || {
+    let joined = spawn_blocking_tracked(move || {
         let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
+        // door-scan: spawn — the door's real spawn; the context is in hand until here.
         create_manager.create(
             create_title,
             create_working_dir,
@@ -270,8 +322,10 @@ pub async fn terminal_create(
             crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
         )
     })
-    .await
-    .map_err(|e| format!("terminal spawn task failed: {e}"))??;
+    .await;
+    let info = settle_terminal_spawn(joined, &mut isolated_ctx, |ctx, e| {
+        ctx.remove_unspawned("terminal_create command", e.child_started, &e.message)
+    })?;
 
     // Park the isolated edit context on the terminal session so its
     // heartbeat + claim live as long as the PTY. Cleared in `close()`.
@@ -2670,6 +2724,42 @@ fn warn_untracked_backend_spawn(
     );
 }
 
+/// A failed backend create ([`create_terminal_session_backend`]): the typed
+/// failure, plus the isolated edit context the caller handed in, returned
+/// UNPARKED — a failed create parks it on no session, and a caller that
+/// allocated it is the only party that knows whether the tree may be removed
+/// (`IsolatedEditContext::remove_unspawned_unreported`). A caller that passed
+/// `None`, or does not care, takes the message through `String::from`.
+pub(crate) struct BackendSpawnFailure {
+    pub(crate) failure: crate::terminal::spawn_refusal::SpawnFailure,
+    /// Boxed: the context is large and rides only the failure arm.
+    pub(crate) isolated_ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
+}
+
+impl std::fmt::Debug for BackendSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendSpawnFailure")
+            .field("failure", &self.failure)
+            .field(
+                "isolated_ctx",
+                &self.isolated_ctx.as_ref().map(|c| c.agent_id.as_str()),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BackendSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failure.message)
+    }
+}
+
+impl From<BackendSpawnFailure> for String {
+    fn from(failure: BackendSpawnFailure) -> Self {
+        failure.failure.message
+    }
+}
+
 /// Tracked variant of [`create_terminal_session_backend`] where the capture
 /// hint is NON-OPTIONAL — the compiler, not a log line, guarantees a backend
 /// spawn is durably recorded. All backend/headless callers (gate
@@ -2692,7 +2782,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     capture_hint: SessionCaptureHint,
     page_id: Option<String>,
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), BackendSpawnFailure> {
     create_terminal_session_backend(
         terminal_manager,
         session_registry,
@@ -2750,7 +2840,7 @@ pub(crate) fn create_terminal_session_backend(
     // while an account-migration respawn is the continuation of a session that
     // already existed a moment ago. See each call site.
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), BackendSpawnFailure> {
     warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` from
     // the pre-acquired context + the configured plan directories), derived
@@ -2842,7 +2932,22 @@ pub(crate) fn create_terminal_session_backend(
             .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| {
                 h.spawn_origin
             }),
-    )?;
+    );
+    // A failed create hands the caller's context BACK, unparked, with the typed
+    // failure: the gate continuation decides from `child_started` whether the
+    // fresh tree it allocated may be removed (plan
+    // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    // Phase 3). Dropping it here instead would release the claims and leave
+    // the tree on disk with nobody holding the fact that no child ran in it.
+    let info = match info {
+        Ok(info) => info,
+        Err(failure) => {
+            return Err(BackendSpawnFailure {
+                failure,
+                isolated_ctx: isolated_ctx.map(Box::new),
+            })
+        }
+    };
 
     // Spawn name: park it on the session (so `terminal_list` and a reconnecting
     // webview can read it), record the commit `Session-Name` trailer file for the
@@ -3491,6 +3596,92 @@ mod tests {
         assert_eq!(
             partial["unreadableRecords"],
             serde_json::json!(["/h/.claude/sessions/7.json (does not parse)"])
+        );
+    }
+
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phases 0 and 2, Why #5: a
+    /// create error hands the allocation to `remove` once, with the typed
+    /// `child_started`; a join error — a panic inside `create` that may come
+    /// after `sessions.insert` — hands over nothing and leaves the context in
+    /// place.
+    #[tokio::test]
+    async fn only_a_create_error_hands_the_allocation_to_remove_unspawned() {
+        use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+        use crate::terminal::spawn_refusal::SpawnFailure;
+        let id = "6f1c2a7e-0000-4000-8000-00000000c0de";
+        let new_ctx = || {
+            Some(IsolatedEditContext::for_test_with_agent_id(
+                id.to_string(),
+                Vec::new(),
+                Vec::new(),
+            ))
+        };
+        let handed = std::sync::Mutex::new(Vec::<(String, bool, String)>::new());
+        let remove = |ctx: IsolatedEditContext, e: &SpawnFailure| {
+            handed
+                .lock()
+                .unwrap()
+                .push((ctx.agent_id.clone(), e.child_started, e.message.clone()));
+        };
+
+        for failure in [
+            SpawnFailure::before_child("Failed to open PTY: out of ptys"),
+            SpawnFailure::after_child("Sessions lock poisoned: x"),
+        ] {
+            let mut ctx = new_ctx();
+            let created: Result<Result<(), SpawnFailure>, tokio::task::JoinError> =
+                Ok(Err(failure.clone()));
+            assert_eq!(
+                settle_terminal_spawn(created, &mut ctx, remove),
+                Err(failure.message.clone())
+            );
+            assert!(ctx.is_none(), "the context is handed over, not kept");
+        }
+        assert_eq!(
+            *handed.lock().unwrap(),
+            vec![
+                (
+                    id.to_string(),
+                    false,
+                    "Failed to open PTY: out of ptys".to_string()
+                ),
+                (
+                    id.to_string(),
+                    true,
+                    "Sessions lock poisoned: x".to_string()
+                ),
+            ],
+            "each create error hands the allocation over once, child_started typed"
+        );
+
+        let join = tokio::spawn(async { panic!("create panicked after insert") })
+            .await
+            .expect_err("a panicking task is a join error");
+        let mut ctx = new_ctx();
+        let settled = settle_terminal_spawn::<()>(Err(join), &mut ctx, remove);
+        assert!(
+            settled
+                .as_ref()
+                .is_err_and(|e| e.starts_with("terminal spawn task failed:")),
+            "{settled:?}"
+        );
+        assert!(ctx.is_some(), "a join error leaves the context in place");
+        assert_eq!(
+            handed.lock().unwrap().len(),
+            2,
+            "a join error hands over nothing"
+        );
+
+        let mut ctx = new_ctx();
+        assert_eq!(
+            settle_terminal_spawn::<u8>(Ok(Ok(7)), &mut ctx, remove),
+            Ok(7)
+        );
+        assert!(ctx.is_some());
+        assert_eq!(
+            handed.lock().unwrap().len(),
+            2,
+            "a spawned session hands over nothing"
         );
     }
 

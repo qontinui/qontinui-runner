@@ -2884,10 +2884,12 @@ pub(crate) fn admit_spawn(
 /// isolated git worktree first: under `QONTINUI_AGENT_WORKTREE_MODE`,
 /// `acquire_for_terminal` runs a `git worktree add`, takes a coord claim, starts
 /// a heartbeat task and shells out to `git config` for the credential helper. On
-/// a CRITICAL refusal all of that is thrown away, and `IsolatedEditContext::Drop`
-/// releases the claim but does NOT remove the materialized worktree — so every
-/// refusal leaks a directory, and the operator's "Start anyway" retry materializes
-/// a second one. Refusing before the acquisition costs one
+/// a CRITICAL refusal all of that is thrown away. `IsolatedEditContext::Drop`
+/// releases the claim but does not remove the materialized worktree; the door's
+/// `IsolatedEditContext::remove_unspawned` takes a pre-child refusal's fresh,
+/// empty tree back off disk, but only after a `git worktree add` and a removal
+/// both ran — and the operator's "Start anyway" retry materializes a second
+/// one. Refusing before the acquisition costs one
 /// `GlobalMemoryStatusEx` call plus — at most once per
 /// [`crate::health_monitor::THREAD_READING_TTL`], and in practice never here,
 /// because [`admit_spawn`] takes the same reading milliseconds later — one
@@ -3392,6 +3394,19 @@ where
         tracing::callsite::rebuild_interest_cache();
         f()
     })
+}
+
+/// Test-only: the exact refusal text [`precheck_spawn`] and [`admit_spawn`]
+/// return on a CRITICAL verdict, produced by the real [`evaluate`] →
+/// [`critical_refusal`] pair over the shipped defaults with no free commit at
+/// all. For the doors that type this refusal, so a reworded producer cannot
+/// drift away from their answer silently.
+#[cfg(test)]
+pub(crate) fn critical_refusal_fixture(what: &str) -> String {
+    match evaluate("host", Some(0), &SessionGuardSettings::default()) {
+        SpawnGate::Critical(observation) => critical_refusal(what, &observation),
+        other => panic!("zero free commit must be CRITICAL under the defaults, got {other:?}"),
+    }
 }
 
 /// Test-only: run `f` with a scoped `tracing` subscriber and return what it
