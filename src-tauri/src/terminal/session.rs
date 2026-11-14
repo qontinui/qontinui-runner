@@ -4732,12 +4732,24 @@ impl TerminalSession {
         slot.map(|id| (id, self.coord_bound_seq.load(Ordering::Relaxed)))
     }
 
-    /// When the current coord binding was made, in unix milliseconds (the
-    /// unit of a lifecycle record's `finished_at`), if one has been wired.
-    /// Read under the slot lock, like [`Self::coord_binding`].
-    pub fn coord_bound_at_ms(&self) -> Option<i64> {
+    /// The coord row and its bind instant (unix ms, the unit of a lifecycle
+    /// record's `finished_at`) in one read under the slot lock:
+    /// `Some(Some((row, at)))` when bound, `Some(None)` when not, and `None`
+    /// when the slot's lock is poisoned — UNKNOWN, never "not bound".
+    pub fn coord_row_with_bound_at(&self) -> Option<Option<(uuid::Uuid, i64)>> {
         let slot = self.coord_session_id.lock().ok()?;
-        slot.map(|_| self.coord_bound_at_ms.load(Ordering::Relaxed))
+        Some(slot.map(|id| (id, self.coord_bound_at_ms.load(Ordering::Relaxed))))
+    }
+
+    /// Test-only: poison this terminal's coord slot lock.
+    #[cfg(test)]
+    pub(crate) fn poison_coord_slot_for_test(&self) {
+        let slot = self.coord_session_id.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = slot.lock().unwrap();
+            panic!("poisoning the coord slot for a test");
+        })
+        .join();
     }
 
     /// This terminal's id (the [`super::manager::TerminalManager`] key, and

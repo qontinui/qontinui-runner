@@ -67,20 +67,35 @@ pub(crate) fn pane_row_moves_not_owner() -> u64 {
     PANE_ROW_MOVES_NOT_OWNER.load(Ordering::Relaxed)
 }
 
-/// How many live-pane adoptions were deferred because the row is held by
-/// another key and only the pane's PIN says the pane runs the adopter (no owner
-/// entry). Served on `/health` as `registrarPinSeedTakesDeferred`. Such a
-/// deferral can last until the seam names the adopter, which the generic
-/// `autobind_deferred` count cannot show apart.
-static PIN_SEED_TAKES_DEFERRED: AtomicU64 = AtomicU64::new(0);
+/// The DISTINCT `(row, session)` pairs whose live-pane adoption was ever
+/// deferred in this process because another key holds the row and only the
+/// pane's PIN says the pane runs the session (no owner entry). Each pair is
+/// counted once however often auto-bind retries it. Served on `/health` as
+/// `registrarPinSeedTakesDeferred`.
+///
+/// Such a deferral lasts until a running-id seam source (the provider
+/// registry, the SessionStart hook) names the session on the row. A pane with
+/// neither — no hook and no valid provider-registry row — never gets one, so
+/// its pair stays deferred for the pane's life: the accepted residual of only
+/// running-id sources advancing the owner (see `pane_row_owner`).
+static PIN_SEED_TAKES_DEFERRED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// See [`PIN_SEED_TAKES_DEFERRED`].
 pub(crate) fn pin_seed_takes_deferred() -> u64 {
-    PIN_SEED_TAKES_DEFERRED.load(Ordering::Relaxed)
+    PIN_SEED_TAKES_DEFERRED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len() as u64
 }
 
-pub(super) fn note_pin_seed_take_deferred() {
-    PIN_SEED_TAKES_DEFERRED.fetch_add(1, Ordering::Relaxed);
+/// Record a deferred pin-seed take; `true` the first time for the pair.
+pub(super) fn note_pin_seed_take_deferred(row: Uuid, claude_session_id: &str) -> bool {
+    PIN_SEED_TAKES_DEFERRED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((row, claude_session_id.trim().to_string()))
 }
 
 /// Which mover asked for a transfer — it decides which entry may move.
@@ -484,9 +499,10 @@ impl AiCoordRegistrar {
     ///    owner entries whose pane the terminal plane says is gone. Then, ONLY
     ///    for a source that reports the id the pane's process runs NOW
     ///    ([`RekeySource::observes_running_id`]: the provider registry, the
-    ///    SessionStart hook), advances `row`'s owner to the id — unless a live
-    ///    pane PINNED to the id was bound after `row`'s pane (that later pane
-    ///    keeps it). The argv rung and the pane-resume re-key name the PIN,
+    ///    SessionStart hook), advances `row`'s owner to the id — only while a
+    ///    live terminal holds `row`, and unless a live pane PINNED to the id
+    ///    (whose row no entry gives to another id) was bound after `row`'s
+    ///    pane (that later pane keeps it). The argv rung and the pane-resume re-key name the PIN,
     ///    which after a `/clear` is not what the pane runs; letting them
     ///    advance would make the pin an owner and let it evict the session
     ///    the pane actually runs.
@@ -513,17 +529,25 @@ impl AiCoordRegistrar {
             self.sweep_closed_pane_rows();
         }
         if source.observes_running_id() {
-            let row_bound = self.pane_row_facts(row).and_then(|f| f.bound_at_ms);
+            // Only a row a live terminal holds may become an owner: a retried
+            // confirmation for a pane that has since closed must not displace
+            // the id's entry on the pane that runs it now.
+            let row_facts = self.pane_row_facts(row);
+            let row_bound = row_facts.and_then(|f| f.bound_at_ms);
+            // The same pin rule `live_terminal_row` applies: a pin whose row
+            // another id owns (the pinned pane `/clear`ed) is not a later pane
+            // running this id.
             let later_pin = self
                 .inner
                 .terminal_coord_lookup
                 .get()
                 .and_then(|lookup| lookup(claude_session_id))
                 .filter(|pin| *pin != row)
+                .filter(|pin| self.inner.pane_rows.admits(*pin, claude_session_id))
                 .and_then(|pin| self.pane_row_facts(pin))
                 .and_then(|f| f.bound_at_ms)
                 .is_some_and(|pin_bound| row_bound.is_some_and(|b| pin_bound > b));
-            if !later_pin {
+            if row_facts.is_some() && !later_pin {
                 self.inner
                     .pane_rows
                     .advance(row, claude_session_id, now, row_bound);

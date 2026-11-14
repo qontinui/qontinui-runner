@@ -21,7 +21,18 @@
 //!   pane was spawned with says nothing about what it runs after `/clear` or an
 //!   in-pane `/resume`. An entry is forward-only: a coord decline never rolls
 //!   it back. Advancing a row to X drops every OTHER row's entry naming X, so
-//!   one id never has two explicit rows.
+//!   one id never has two explicit rows. Only a row a live terminal holds is
+//!   advanced.
+//!
+//!   **Accepted residual.** A pane with no SessionStart hook and no valid
+//!   provider-registry row never gets an entry, so a live-pane adoption that
+//!   finds another key on its row (the pin seed alone is contested) stays
+//!   deferred for the pane's whole life. That is chosen over the alternative:
+//!   letting the argv rung advance the owner would let a stale pin EVICT the
+//!   session the pane runs after `/clear`, and a wrong eviction is worse than
+//!   a deferral. The state is visible: each such `(row, session)` pair is
+//!   logged once at info ("deferred: pin seed contested") and counted on
+//!   `/health` as `registrarPinSeedTakesDeferred`.
 //! - **A pin seed** answers for a row with no entry: the row of the
 //!   newest-bound live pane PINNED to the id (the registrar's terminal lookup,
 //!   which takes the newest bind).
@@ -108,8 +119,10 @@ impl PaneRowLookup {
     }
 }
 
-/// A lookup that only knows live-or-not (tests, simple fakes): `None` reads
-/// as [`PaneRowLookup::Gone`].
+/// A test fake that only knows live-or-not: `None` reads as
+/// [`PaneRowLookup::Gone`]. Test-only, so no production lookup can turn "could
+/// not read" into "gone".
+#[cfg(test)]
 impl From<Option<PaneRowFacts>> for PaneRowLookup {
     fn from(f: Option<PaneRowFacts>) -> Self {
         f.map_or(PaneRowLookup::Gone, PaneRowLookup::Live)
@@ -180,8 +193,10 @@ impl PaneRowOwners {
     /// Make `harness_id` the owner of `row`, whose pane was bound at
     /// `pane_bound_at_ms`, forward-only. Drops every OTHER row's entry naming
     /// `harness_id` — unless that entry's pane was bound AFTER this row's,
-    /// in which case the advance is refused (the later-bound pane keeps the
-    /// id). A row already owned by the id keeps its original instant.
+    /// or this row's bind instant is unknown while that entry's is known, in
+    /// which case the advance is refused (the later-bound pane keeps the id;
+    /// an unknown instant never displaces a known one). A row already owned
+    /// by the id keeps its original instant.
     /// Returns whether the row's owner changed.
     pub(crate) fn advance(
         &self,
@@ -195,7 +210,8 @@ impl PaneRowOwners {
         if s.owners.iter().any(|(r, e)| {
             *r != row
                 && e.harness_id == harness_id
-                && bound_after(e.pane_bound_at_ms, pane_bound_at_ms)
+                && (bound_after(e.pane_bound_at_ms, pane_bound_at_ms)
+                    || (pane_bound_at_ms.is_none() && e.pane_bound_at_ms.is_some()))
         }) {
             return false;
         }
@@ -258,14 +274,23 @@ impl PaneRowOwners {
     /// unreadable terminal plane keeps every entry. Called with the lock
     /// RELEASED.
     pub(crate) fn sweep(&self, gone: impl Fn(Uuid) -> bool) {
-        let rows: Vec<Uuid> = self.lock().owners.keys().copied().collect();
-        let dead: Vec<Uuid> = rows.into_iter().filter(|r| gone(*r)).collect();
+        let judged: Vec<(Uuid, OwnerEntry)> = self
+            .lock()
+            .owners
+            .iter()
+            .map(|(r, e)| (*r, e.clone()))
+            .collect();
+        let dead: Vec<(Uuid, OwnerEntry)> = judged.into_iter().filter(|(r, _)| gone(*r)).collect();
         if dead.is_empty() {
             return;
         }
         let mut s = self.lock();
-        for r in dead {
-            s.owners.remove(&r);
+        for (r, judged_entry) in dead {
+            // Re-checked under the lock: an entry advanced while `gone` ran is
+            // not the one that was judged, and is kept.
+            if s.owners.get(&r) == Some(&judged_entry) {
+                s.owners.remove(&r);
+            }
         }
     }
 
@@ -493,8 +518,33 @@ mod tests {
         }
         assert_eq!(o.owner_of(new).as_deref(), Some(X));
         assert_eq!(o.owner_of(old), None);
-        // Unknown instants keep the latest-confirmation rule.
-        assert!(o.advance(old, X, 20, None));
+        // An unknown instant never displaces a known one...
+        assert!(!o.advance(old, X, 20, None));
+        assert_eq!(o.owner_of(new).as_deref(), Some(X));
+        // ...but between unknowns the latest confirmation still wins.
+        let (u1, u2) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(o.advance(u1, P, 1, None));
+        assert!(o.advance(u2, P, 2, None));
+        assert_eq!(o.owner_of(u1), None);
+    }
+
+    /// Review 3, A7: an entry re-advanced while the sweep's liveness check
+    /// ran is not the entry that was judged, so it is kept.
+    #[test]
+    fn a_sweep_keeps_an_entry_advanced_while_it_judged() {
+        let o = PaneRowOwners::default();
+        let r = Uuid::new_v4();
+        o.advance(r, X, 1, None);
+        o.sweep(|row| {
+            // The row is judged gone, but a new owner lands before removal.
+            o.advance(row, P, 2, None);
+            true
+        });
+        assert_eq!(
+            o.owner_of(r).as_deref(),
+            Some(P),
+            "the newer entry survives"
+        );
     }
 
     #[test]

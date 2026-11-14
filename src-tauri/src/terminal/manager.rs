@@ -372,19 +372,29 @@ impl TerminalManager {
 
     /// When the live terminal holding coord row `row` was bound to it (unix
     /// milliseconds): `Some(Some(at))`; `Some(None)` when no live terminal
-    /// holds the row; `None` when the terminal map could not be read (a
-    /// poisoned lock) — UNKNOWN, never "gone". The newest bind wins if
-    /// several hold the row. Read by the registrar's live-pane-row lookup
+    /// holds the row; `None` when the terminal map, or any terminal's coord
+    /// slot, could not be read (a poisoned lock) and no readable terminal
+    /// holds the row — UNKNOWN, never "gone". The newest bind wins if several
+    /// hold the row. Read by the registrar's live-pane-row lookup
     /// (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
     pub fn coord_row_bound_at(&self, row: uuid::Uuid) -> Option<Option<i64>> {
         let sessions = self.sessions.lock().ok()?;
-        Some(
-            sessions
-                .values()
-                .filter(|s| s.coord_session_id() == Some(row))
-                .filter_map(|s| s.coord_bound_at_ms())
-                .max(),
-        )
+        let mut unreadable = false;
+        let mut newest: Option<i64> = None;
+        for s in sessions.values() {
+            match s.coord_row_with_bound_at() {
+                None => unreadable = true,
+                Some(Some((r, at))) if r == row => {
+                    newest = Some(newest.map_or(at, |n| n.max(at)));
+                }
+                Some(_) => {}
+            }
+        }
+        match (newest, unreadable) {
+            (Some(at), _) => Some(Some(at)),
+            (None, true) => None,
+            (None, false) => Some(None),
+        }
     }
 
     /// Record the pane behind a remote tab (see `remote_panes`).
@@ -1552,6 +1562,34 @@ mod tests {
     /// Phase 1: two live panes pinned to one harness id (a respawn or
     /// migration whose old pane is still up) resolve to the row bound LAST,
     /// whatever order the manager's map yields them in.
+    /// Review 3, A5: a terminal whose coord slot lock is poisoned makes a row
+    /// no readable terminal holds UNKNOWN (`None`), never "gone", so the
+    /// registrar's sweep keeps its entry.
+    #[test]
+    fn a_poisoned_coord_slot_reads_as_unknown_not_gone() {
+        use std::sync::{Arc, Mutex};
+        let pane = || {
+            Arc::new(crate::terminal::session::tests::make_test_session(
+                Arc::new(Mutex::new(Vec::new())),
+            ))
+        };
+        let (a, b) = (pane(), pane());
+        let tm = TerminalManager::new();
+        tm.insert_for_test("term-a", a.clone());
+        tm.insert_for_test("term-b", b.clone());
+        let (row_a, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        tm.bind_coord_session(&a, row_a);
+        assert!(matches!(tm.coord_row_bound_at(row_a), Some(Some(_))));
+        assert_eq!(tm.coord_row_bound_at(other), Some(None), "read: gone");
+
+        b.poison_coord_slot_for_test();
+        assert_eq!(tm.coord_row_bound_at(other), None, "unreadable: unknown");
+        assert!(
+            matches!(tm.coord_row_bound_at(row_a), Some(Some(_))),
+            "a readable holder still answers live"
+        );
+    }
+
     #[test]
     fn two_panes_pinned_to_one_id_resolve_to_the_newest_bound() {
         use super::resolve_pinned_coord;
