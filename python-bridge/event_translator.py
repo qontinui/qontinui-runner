@@ -213,30 +213,6 @@ class EventTranslator:
         sys.stdout = self._real_stdout
 
         try:
-            # PROMINENT DEBUG LOGGING - Verify callback is being called
-            print(f"\n{'=' * 80}", file=sys.stderr, flush=True)
-            print(
-                "[EventTranslator] !!!!! MATCH_ATTEMPTED EVENT RECEIVED !!!!!",
-                file=sys.stderr,
-                flush=True,
-            )
-            print(f"{'=' * 80}\n", file=sys.stderr, flush=True)
-
-            # File-based debug logging (works even when stderr is disabled)
-            import os
-            import tempfile
-            from datetime import datetime
-
-            debug_log = os.path.join(tempfile.gettempdir(), "qontinui_event_emission.log")
-            try:
-                with open(debug_log, "a", encoding="utf-8") as f:
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    f.write(f"[{ts}] EventTranslator.on_match_attempted() CALLED\n")
-                    f.write(f"[{ts}]   event={event}\n")
-                    f.write(f"[{ts}]   event.data={event.data}\n")
-            except Exception:
-                pass
-
             # Extract event data
             data = event.data
 

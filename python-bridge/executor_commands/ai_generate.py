@@ -7,6 +7,7 @@ and still read executor state through ``self``. ``COMMANDS`` maps each command
 name to its handler method.
 """
 
+import logging
 from typing import Any, ClassVar
 
 from ._host import ExecutorHost
@@ -15,6 +16,8 @@ from ._shared import (
     AiShellCommandGeneratorService,
     AiTestGeneratorService,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AiGenerateCommands(ExecutorHost):
@@ -137,26 +140,10 @@ class AiGenerateCommands(ExecutorHost):
         Returns:
             Dict with success, command, description, and error fields.
         """
-        import datetime
-        import os
         import sys
 
-        # Debug log file. ~ expands from USERPROFILE on Windows and HOME
-        # elsewhere; the old literal fallback named one machine's Windows
-        # account, so on any other login this aimed at a profile that does not
-        # exist (and os.makedirs below would then create it).
-        debug_log = os.path.join(
-            os.path.expanduser("~"),
-            ".qontinui",
-            "ai-shell-debug.log",
-        )
-        os.makedirs(os.path.dirname(debug_log), exist_ok=True)
-
         def debug(msg):
-            ts = datetime.datetime.now().isoformat()
-            line = f"[{ts}] {msg}\n"
-            with open(debug_log, "a", encoding="utf-8") as f:
-                f.write(line)
+            logger.debug(msg)
             print(f"[DEBUG] {msg}", file=sys.stderr, flush=True)
 
         debug("=" * 60)
