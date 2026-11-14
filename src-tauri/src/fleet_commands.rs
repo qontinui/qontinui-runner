@@ -843,6 +843,120 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&exclude).unwrap(), first);
     }
 
+    /// A command excluded by one pass whose directory the repository then
+    /// starts versioning is HELD BACK (`RootVersioned`) by the next pass, and
+    /// that pass drops its stale exclude line — otherwise the line would hide a
+    /// file a person later creates at that path. A person's own line outside
+    /// the runner's marker block naming the same path is never touched.
+    #[test]
+    fn a_held_back_command_loses_its_exclude_line() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let registry = AgentCommandRegistry::new();
+        provision_fleet_commands_into(&commands_dir, &registry).expect("first pass");
+
+        let (vendored, _) = FLEET_COMMANDS[0];
+        let (held, _) = FLEET_COMMANDS[1];
+        let held_line = format!("/.claude/commands/{held}.md");
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        assert!(first.lines().any(|l| l == held_line), "{first}");
+        // A person's own line naming the same path, ABOVE the runner's block.
+        std::fs::write(&exclude, format!("# mine\n{held_line}\n{first}")).unwrap();
+
+        // The repository starts versioning the commands dir: it stages one
+        // builtin, and `held` is not on disk (upstream has not delivered it).
+        let git = |args: &[&str]| {
+            let ok = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["add", "-f", &format!(".claude/commands/{vendored}.md")]);
+        std::fs::remove_file(commands_dir.join(format!("{held}.md"))).unwrap();
+
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("second pass");
+        let held_skip = out
+            .skipped
+            .iter()
+            .find(|s| s.unit == format!("{held}.md"))
+            .expect("the absent builtin is held back");
+        assert_eq!(
+            held_skip.reason,
+            capability_manifest::SkipReason::RootVersioned
+        );
+
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let held_positions: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == held_line)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            held_positions,
+            vec![1],
+            "only the person's line survives: {text}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| *l == format!("/.claude/commands/{vendored}.md")),
+            "the now-tracked command's line is dropped too: {text}"
+        );
+        // Every command the second pass still wrote keeps its line, so the
+        // prune is not a wipe, and nothing but the staged builtin shows.
+        for (name, _) in &FLEET_COMMANDS[2..] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| *l == format!("/.claude/commands/{name}.md")),
+                "{name} keeps its line: {text}"
+            );
+        }
+        let porcelain = |dir: &std::path::Path| {
+            let o = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .output()
+                .expect("git status");
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(
+            porcelain(tmp.path()),
+            format!("A  .claude/commands/{vendored}.md\n"),
+            "only the staged builtin shows"
+        );
+        // Remove the person's line: a file they now create at the held path
+        // is visible to `git status`, because no runner line hides it.
+        std::fs::write(
+            &exclude,
+            text.replacen(&format!("# mine\n{held_line}\n"), "", 1),
+        )
+        .unwrap();
+        std::fs::write(commands_dir.join(format!("{held}.md")), b"mine\n").unwrap();
+        let o = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        let status = String::from_utf8(o.stdout).unwrap();
+        assert!(
+            status.contains(&format!("?? .claude/commands/{held}.md")),
+            "{status}"
+        );
+    }
+
     /// A destination that is TRACKED by the enclosing git repository must be
     /// left alone. `qontinui-claude-config` and `qontinui-dev-notes` both track
     /// exactly `.claude/commands/vet-plan.md` and `implement-plan.md`; spawning
