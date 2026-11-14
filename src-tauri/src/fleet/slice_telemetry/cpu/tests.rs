@@ -94,9 +94,20 @@ impl Machine {
         now: Instant,
         dispatches: impl Fn() -> DispatchCounts,
     ) -> (Snapshot, Option<CpuReport>) {
+        self.read_from(Some(&self.procfs), prev, now, dispatches)
+    }
+
+    /// A read with `procfs` as its `/proc` (`None`: no `/proc` at all).
+    fn read_from(
+        &self,
+        procfs: Option<&Path>,
+        prev: Option<&Snapshot>,
+        now: Instant,
+        dispatches: impl Fn() -> DispatchCounts,
+    ) -> (Snapshot, Option<CpuReport>) {
         measure(
             &self.root,
-            Some(&self.procfs),
+            procfs,
             self.ci_root.as_deref(),
             &self.memory_dirs(),
             dispatches,
@@ -122,14 +133,29 @@ impl Machine {
 
     /// Two reads 30 s apart, with `first` and then `second` written before each.
     fn two_reads(&self, first: &[(&str, u64)], second: &[(&str, u64)]) -> CpuReport {
+        self.two_reads_from(Some(&self.procfs), first, second)
+    }
+
+    /// As [`Machine::two_reads`], with `procfs` as each read's `/proc`.
+    fn two_reads_from(
+        &self,
+        procfs: Option<&Path>,
+        first: &[(&str, u64)],
+        second: &[(&str, u64)],
+    ) -> CpuReport {
         let t0 = Instant::now();
         self.usages(first);
-        let (s, r) = self.read(None, t0);
+        let (s, r) = self.read_from(procfs, None, t0, DispatchCounts::default);
         assert_eq!(r, None, "a first read has nothing to subtract");
         self.usages(second);
-        self.read(Some(&s), t0 + Duration::from_secs(30))
-            .1
-            .expect("a second read reports")
+        self.read_from(
+            procfs,
+            Some(&s),
+            t0 + Duration::from_secs(30),
+            DispatchCounts::default,
+        )
+        .1
+        .expect("a second read reports")
     }
 }
 
@@ -2725,32 +2751,7 @@ fn two_reads_without_procfs(m: &Machine) -> CpuReport {
             (a.as_str(), 10_000_000 * k),
         ]
     };
-    let (ci_root, t0) = (m.ci_root.as_deref(), Instant::now());
-    m.usages(&at(0));
-    let dirs = m.memory_dirs();
-    let (s, r) = measure(
-        &m.root,
-        None,
-        ci_root,
-        &dirs,
-        DispatchCounts::default,
-        None,
-        || t0,
-    );
-    assert_eq!(r, None, "a first read has nothing to subtract");
-    m.usages(&at(1));
-    let (dirs, later) = (m.memory_dirs(), t0 + Duration::from_secs(30));
-    measure(
-        &m.root,
-        None,
-        ci_root,
-        &dirs,
-        DispatchCounts::default,
-        Some(&s),
-        || later,
-    )
-    .1
-    .expect("a second read reports")
+    m.two_reads_from(None, &at(0), &at(1))
 }
 
 /// A read with no `/proc` finds no runner unit, holder scope or own cgroup:
