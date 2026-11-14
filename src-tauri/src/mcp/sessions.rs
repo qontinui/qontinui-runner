@@ -1495,7 +1495,9 @@ struct PolicyContextQuery {
 ///
 /// A coord failure does NOT produce an empty body — it produces an envelope
 /// carrying the fail-open notice, because a session that silently receives
-/// nothing is in exactly the pre-plan state the phase exists to end.
+/// nothing is in exactly the pre-plan state the phase exists to end. So does a
+/// session whose tenant cannot be resolved on a multi-bound device: it gets the
+/// notice, never the device default tenant's documents.
 async fn policy_context(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -1515,7 +1517,11 @@ async fn policy_context(
     // log's request URI. Parsed strictly; anything but a 64-hex SHA-256 is no
     // marker and gets the full render.
     let delivered_sha = crate::mcp::policy_context::delivered_sha_from_headers(&headers);
+    // `id` and `key` together name the session whose OWN tenant's policy is
+    // fetched — the terminal's coord-mcp nonce first, the registry second (plan
+    // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`).
     match crate::mcp::policy_context::policy_context(
+        &id,
         &key,
         q.source.as_deref(),
         attribution,

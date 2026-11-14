@@ -956,6 +956,13 @@ pub(crate) struct ResumeSpawn<'a> {
     /// Why this pane is being spawned — decides whether its tab is selected
     /// (`terminal-created` `surface`, [`crate::terminal::focus_coalescer`]).
     pub origin: crate::coord_drain_state::SpawnOrigin,
+    /// The tenant whose cached policy body the respawn's system-prompt file
+    /// composes: what [`crate::mcp::policy_tenant::new_session_policy_tenant`]
+    /// resolved for `working_dir`, awaited by the caller because this function
+    /// is synchronous (plan
+    /// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    /// Design §6). `None` composes no body — never the device default's.
+    pub policy_tenant: Option<uuid::Uuid>,
 }
 
 /// Spawn `claude --permission-mode bypassPermissions [--model m] --resume <sid>`
@@ -990,7 +997,8 @@ pub(crate) fn spawn_resumed_pane(
     // plus the `--settings <hook file>` pair below.
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
-    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(None);
+    let prompt_carrier =
+        crate::session::spawn_prompt::resolve_system_prompt_carrier(None, spec.policy_tenant);
     let command = resume_respawn_argv(
         // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
         // `claude_bin_path()` cannot be the PTY child's program on Windows.
@@ -1011,7 +1019,7 @@ pub(crate) fn spawn_resumed_pane(
         // Plus the policy body at spawn (plan
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
         // this respawn has no briefing, so it carries a BODY-ONLY composed
-        // file when the tenant's cache exists, and nothing otherwise.
+        // file when `spec.policy_tenant`'s cache exists, and nothing otherwise.
         resume_respawn_extra_required(
             crate::session::claude_hook::direct_spawn_settings_args(),
             prompt_carrier.as_ref(),
@@ -1181,11 +1189,30 @@ pub(crate) async fn migrate_session_off_runtime(
         },
         // The old pane's `claude`, identified BEFORE anything is closed: the
         // detached delta sync waits for exactly this process to leave the
-        // table. Taken here because the snapshot is async and
+        // table. And the tenant whose policy body the respawn composes (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Both taken here because they are async and
         // `migrate_session` is not.
-        || old_pane_claude(app, &record.terminal_id),
-        move |old_writer| {
-            migrate_session(&app_owned, &record_owned, &src, &dst, old_writer, origin)
+        || async {
+            tokio::join!(old_pane_claude(app, &record.terminal_id), async {
+                match record.working_dir.as_deref() {
+                    Some(wd) => {
+                        crate::mcp::policy_tenant::new_session_policy_tenant(Path::new(wd)).await
+                    }
+                    None => None,
+                }
+            })
+        },
+        move |(old_writer, policy_tenant)| {
+            migrate_session(
+                &app_owned,
+                &record_owned,
+                &src,
+                &dst,
+                old_writer,
+                policy_tenant,
+                origin,
+            )
         },
     )
     .await
@@ -1278,6 +1305,10 @@ fn migrate_session(
     src_config_dir: &str,
     dst_config_dir: &str,
     old_writer: Option<ProcIdentity>,
+    // The tenant whose cached policy body the respawn composes — resolved by
+    // the async caller ([`migrate_session_off_runtime`]); see
+    // [`ResumeSpawn::policy_tenant`].
+    policy_tenant: Option<uuid::Uuid>,
     // `OperatorTerminal` for the operator's click (its new tab is selected);
     // `Respawn` for the automatic usage-limit path, which is coalesced.
     origin: crate::coord_drain_state::SpawnOrigin,
@@ -1449,6 +1480,7 @@ fn migrate_session(
             resource_override: true,
             gate_identity: carried_gate_identity,
             origin,
+            policy_tenant,
         },
     );
     // GUARD: anchor-held window closes at the `restore_continuation_registration`

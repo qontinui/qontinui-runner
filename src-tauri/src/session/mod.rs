@@ -747,11 +747,28 @@ impl NewSessionTenant {
 pub(crate) async fn resolve_new_session_tenant_in(
     workdir: Option<&std::path::Path>,
 ) -> NewSessionTenant {
+    resolve_new_session_tenant_settled_in(workdir).await.0
+}
+
+/// [`resolve_new_session_tenant_in`], plus whether the repo answer SETTLED
+/// (`false` when the repo read was a transient unknown and the answer fell
+/// through to the machine rows; `true` with no `workdir`, where no repo read is
+/// made). A caller for whom a machine-row answer is not good enough on a
+/// multi-bound device — the spawn-time policy body, which must never brief a
+/// session under the default tenant's documents — reads the flag; recording
+/// callers keep the plain answer.
+pub(crate) async fn resolve_new_session_tenant_settled_in(
+    workdir: Option<&std::path::Path>,
+) -> (NewSessionTenant, bool) {
     let Some(workdir) = workdir else {
-        return NewSessionTenant::from_machine(resolve_new_session_tenant());
+        return (
+            NewSessionTenant::from_machine(resolve_new_session_tenant()),
+            true,
+        );
     };
     let repo = qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(workdir).await;
-    if repo.is_transient() {
+    let repo_settled = !repo.is_transient();
+    if !repo_settled {
         tracing::warn!(
             "new-session tenant: the repo in {} has not settled ({repo:?}); this session is \
              decided from the machine rows, as before the repo tier existed",
@@ -771,7 +788,7 @@ pub(crate) async fn resolve_new_session_tenant_in(
         (workdir, decision)
     })
     .await;
-    match decided {
+    let tenant = match decided {
         Ok((workdir, decision)) => new_session_tenant_from_decision(
             &workdir,
             decision,
@@ -786,7 +803,8 @@ pub(crate) async fn resolve_new_session_tenant_in(
             );
             NewSessionTenant::Undetermined
         }
-    }
+    };
+    (tenant, repo_settled)
 }
 
 /// The authority order for a NEW session, every input injected: a session
