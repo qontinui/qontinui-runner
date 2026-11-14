@@ -261,6 +261,75 @@ impl fmt::Display for FixEffectiveness {
     }
 }
 
+/// The exposure counts the fix evaluator (`evaluate_pending_fixes`) writes to
+/// `effectiveness_evidence` as JSON beside every verdict it writes. One struct
+/// is both the writer's shape and the readers' parse, so a reader cannot drift
+/// from the keys the evaluator writes.
+///
+/// `effectiveness_evidence` is also free text when a person sets a verdict by
+/// hand (`PUT /reflection-fixes/:id/effectiveness`), so a reader parses it with
+/// [`describe_effectiveness_evidence`], which falls back to the raw text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposureEvidence {
+    /// The verdict these counts decided ([`FixEffectiveness::as_str`]).
+    pub verdict: String,
+    /// The window the counts were taken over, in SQL terms.
+    pub window: String,
+    /// Completed runs of the fix's workflow after the fix was applied.
+    pub later_runs: i64,
+    /// Later runs a fix needs before it is judged at all.
+    pub min_later_runs: i64,
+    /// The fix names the finding it addressed.
+    pub source_finding: bool,
+    /// That finding carries a signature, so a recurrence is observable.
+    pub source_signature_known: bool,
+    /// Later runs whose findings carry the source signature again.
+    pub recurrences: i64,
+    /// The most later runs any one signature new since the fix appeared in.
+    pub new_signature_peak_runs: i64,
+    /// Later runs a new signature needs to count as a regression.
+    pub min_later_runs_for_regression: i64,
+}
+
+impl ExposureEvidence {
+    /// One sentence naming the counts the verdict rests on — the readable
+    /// form the reflection AI context and the UI show instead of the JSON.
+    pub fn summary(&self) -> String {
+        let runs = self.later_runs;
+        let observability = if !self.source_finding {
+            "the fix names no source finding, so a recurrence cannot be observed".to_string()
+        } else if !self.source_signature_known {
+            "its source finding carries no signature, so a recurrence cannot be observed"
+                .to_string()
+        } else {
+            format!(
+                "the source finding recurred in {} of them",
+                self.recurrences
+            )
+        };
+        format!(
+            "{} after {} later run{} (needs {}): {}; the most later runs any new signature appeared in was {} (regression at {})",
+            self.verdict,
+            runs,
+            if runs == 1 { "" } else { "s" },
+            self.min_later_runs,
+            observability,
+            self.new_signature_peak_runs,
+            self.min_later_runs_for_regression,
+        )
+    }
+}
+
+/// The readable form of a fix's `effectiveness_evidence`: the evaluator's
+/// [`ExposureEvidence`] as its [`ExposureEvidence::summary`], anything else
+/// (hand-set free text) unchanged.
+pub fn describe_effectiveness_evidence(raw: &str) -> String {
+    match serde_json::from_str::<ExposureEvidence>(raw) {
+        Ok(evidence) => evidence.summary(),
+        Err(_) => raw.to_string(),
+    }
+}
+
 /// Aggregated effectiveness report for a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectivenessReport {
@@ -321,4 +390,57 @@ pub struct UpdateEffectivenessInput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateFixStatusInput {
     pub status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence(source_finding: bool, signature: bool, later: i64, recur: i64) -> ExposureEvidence {
+        ExposureEvidence {
+            verdict: "ineffective".to_string(),
+            window: "task_runs.completed_at > reflection_fixes.applied_at".to_string(),
+            later_runs: later,
+            min_later_runs: 3,
+            source_finding,
+            source_signature_known: signature,
+            recurrences: recur,
+            new_signature_peak_runs: 1,
+            min_later_runs_for_regression: 2,
+        }
+    }
+
+    #[test]
+    fn evaluator_evidence_reads_as_the_counts_it_rests_on() {
+        let raw = serde_json::to_string(&evidence(true, true, 5, 2)).unwrap();
+        assert_eq!(
+            describe_effectiveness_evidence(&raw),
+            "ineffective after 5 later runs (needs 3): the source finding recurred in 2 of them; \
+             the most later runs any new signature appeared in was 1 (regression at 2)"
+        );
+    }
+
+    #[test]
+    fn an_unobservable_recurrence_says_why() {
+        assert!(evidence(false, false, 3, 0)
+            .summary()
+            .contains("names no source finding"));
+        assert!(evidence(true, false, 3, 0)
+            .summary()
+            .contains("carries no signature"));
+        assert!(evidence(true, true, 1, 0)
+            .summary()
+            .contains("after 1 later run "));
+    }
+
+    #[test]
+    fn hand_set_or_partial_evidence_is_shown_unchanged() {
+        for raw in [
+            "Issue recurred in run 42",
+            r#"{"verdict":"effective","later_runs":3}"#,
+            "",
+        ] {
+            assert_eq!(describe_effectiveness_evidence(raw), raw);
+        }
+    }
 }
