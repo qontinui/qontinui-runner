@@ -57,11 +57,12 @@ schemars = "1"
 jsonschema = { version = "0.45", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 thiserror = "2"
 anyhow = "1.0"
 async-trait = "0.1"
+agent-client-protocol = { version = "5", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "chrono"] }
 tracing-appender = "0.2"

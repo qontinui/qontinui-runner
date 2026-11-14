@@ -9,6 +9,9 @@
 // Allow many arguments: refactoring to structs is tracked separately
 #![allow(clippy::too_many_arguments)]
 
+// Plan `2026-11-13-acp-client-lane-for-acp-native-clis` Phase 1 — ACP client core
+// (headless lane for ACP-native CLIs). Phase 2 wires it into the continuation arm.
+mod acp_session;
 mod action_service;
 // Plan `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c — runner-side
 // enforcement of the coord agent registry at every spawn funnel site.
