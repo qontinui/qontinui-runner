@@ -672,13 +672,16 @@ impl QueueStamp {
     /// was last (re)started by coord's dispatch, which is as close to `now` as
     /// the runner can know.
     ///
-    /// `release_at` is built with `checked_add`: this runs inside
-    /// [`enqueue_locked`] under the `ci_state()` lock, and a panic there would
-    /// poison the mutex for every later caller until restart. Should the sum
-    /// ever be unrepresentable, the dispatch falls back to the unrenewed hold
-    /// — the deadline a dispatch from a coord with no ceiling gets.
+    /// Every deadline is built with `checked_add`: this runs inside
+    /// [`enqueue_locked`] under the `ci_state()` lock, and an `Instant`
+    /// overflow panic there would poison the mutex for every later caller
+    /// until restart. Should a sum ever be unrepresentable, `renew_by` falls
+    /// back to `now` (the dispatch is released on the next keeper tick, with a
+    /// reason, rather than held with no deadline) and `release_at` falls back
+    /// to `renew_by` — the deadline a dispatch from a coord with no ceiling
+    /// gets.
     fn fresh(payload: &CiDispatchPayload, now: Instant) -> Self {
-        let renew_by = now + UNRENEWED_HOLD;
+        let renew_by = now.checked_add(UNRENEWED_HOLD).unwrap_or(now);
         Self {
             queued_since: now,
             release_at: now
@@ -722,8 +725,10 @@ impl QueueStamp {
         wall_now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         let mut stamp = Self::fresh(payload, now);
+        // `checked_add` for the reason given on `fresh`: this runs under the
+        // `ci_state()` lock. An unrepresentable floor degrades to no floor.
         let floor = if payload.coord_accepts_queue_heartbeat() {
-            now + FIRST_RENEWAL_GRACE
+            now.checked_add(FIRST_RENEWAL_GRACE).unwrap_or(now)
         } else {
             now
         };
@@ -906,12 +911,22 @@ pub(crate) const UNRENEWED_HOLD: Duration = Duration::from_secs(10 * 60);
 /// authoritative bound and this only caps it ([`QueueStamp::on_arrival`]).
 /// (Independently, [`UNRENEWED_HOLD`] bounds the hold from the last renewal.)
 ///
-/// The goal is that queued work eventually BUILDS, not that its failure gets a
-/// better name. So a dispatch whose coord renews queued leases is held for the
-/// longest wait coord will honour: its advertised `queued_renewal_max_age_secs`
-/// less [`QUEUE_RELEASE_MARGIN`] — 25 minutes against coord's 30. That outlasts
-/// a build ahead of it running past one lease, which a one-lease release never
-/// could: such a dispatch would only have ended `cancelled` instead of `lost`.
+/// A dispatch whose coord renews queued leases is held for nearly the longest
+/// wait coord will honour: its advertised `queued_renewal_max_age_secs` less
+/// [`QUEUE_RELEASE_MARGIN`] — 25 minutes against coord's 30. That outlasts a
+/// build ahead of it running past one lease, which a one-lease release never
+/// could.
+///
+/// Why release [`QUEUE_RELEASE_MARGIN`] BEFORE the ceiling, while the lease is
+/// still live, rather than hold to the last second: at the ceiling coord
+/// refuses the renewal (409 `queued_renewal_refused`) and, one lease later,
+/// sweeps the row `lost`. A `cancelled` result posted after that is answered
+/// `409 dispatch_terminal` and its reason is discarded. The margin (delivery
+/// lag, one keeper tick, the release POST itself) makes sure the release — and
+/// with it `summary.reason` — lands in the ledger while coord still accepts it.
+/// The trade is deliberate: up to five minutes of possible queue time are
+/// given up so that every queued dispatch the runner cannot run ends with a
+/// named reason rather than a silent `lost`.
 ///
 /// A dispatch from a coord that advertises no queued phase gets no heartbeat,
 /// so its lease lapses one [`COORD_LEASE`] after creation whatever the runner
@@ -1197,7 +1212,16 @@ fn spawn_queue_keeper() {
 /// [`UNRENEWED_HOLD`] keeps inside coord's lease. `MissedTickBehavior::Delay`
 /// means a tick that somehow overran the interval is followed by the next one
 /// a full interval later rather than by a burst of catch-up ticks.
+///
+/// A [`KeeperArmGuard`] clears `keeper_armed` if the task ends any other way
+/// than through a tick that found the queue empty — a panic, or the task being
+/// dropped — so the next enqueue arms a fresh keeper instead of finding the
+/// flag stuck `true` with no keeper behind it.
 async fn run_queue_keeper<T: QueueTransport>(state: &Mutex<CiState>, transport: T) {
+    let mut arm = KeeperArmGuard {
+        state,
+        disarmed_by_tick: false,
+    };
     let mut ticks = tokio::time::interval_at(
         tokio::time::Instant::now() + QUEUE_HEARTBEAT_INTERVAL,
         QUEUE_HEARTBEAT_INTERVAL,
@@ -1206,8 +1230,45 @@ async fn run_queue_keeper<T: QueueTransport>(state: &Mutex<CiState>, transport: 
     loop {
         ticks.tick().await;
         if keeper_tick(state, &transport, Instant::now()).await {
+            arm.disarmed_by_tick = true;
             return;
         }
+    }
+}
+
+/// Clears `keeper_armed` when the keeper task exits for any reason other than
+/// a tick that found the queue empty.
+///
+/// That one exit is excluded on purpose: [`keeper_tick`] already disarmed
+/// under the same lock [`enqueue_locked`] arms under, and an enqueue that ran
+/// in between has since armed a NEW keeper. Clearing the flag again here would
+/// orphan that keeper's arm and let the following enqueue spawn a second
+/// keeper beside it. Every other exit — a panic in a tick, the task being
+/// dropped at shutdown — left the flag `true` with nothing renewing the queue,
+/// and without this guard no keeper would ever be spawned again.
+///
+/// A panic while the `ci_state()` lock was held poisons it; the guard takes
+/// the inner state anyway (`into_inner`), since clearing a bool cannot break
+/// any invariant the poisoning protects.
+struct KeeperArmGuard<'a> {
+    state: &'a Mutex<CiState>,
+    disarmed_by_tick: bool,
+}
+
+impl Drop for KeeperArmGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed_by_tick {
+            return;
+        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.keeper_armed = false;
+        warn!(
+            "ci_node: queue keeper exited abnormally with {} dispatch(es) queued;              disarmed so the next enqueue spawns a fresh keeper",
+            guard.queued.len()
+        );
     }
 }
 
@@ -1231,7 +1292,12 @@ fn mark_renewed(state: &Mutex<CiState>, dispatch_id: &str, at: Instant) {
         .iter_mut()
         .find(|q| q.payload.dispatch_id == dispatch_id)
     {
-        q.stamp.renew_by = q.stamp.renew_by.max(at + UNRENEWED_HOLD);
+        // `checked_add` under the lock (see `QueueStamp::fresh`): an
+        // unrepresentable sum records no renewal, so the dispatch keeps its
+        // existing deadline and is released by it — never a panic here.
+        if let Some(renewed) = at.checked_add(UNRENEWED_HOLD) {
+            q.stamp.renew_by = q.stamp.renew_by.max(renewed);
+        }
     }
 }
 
@@ -1852,6 +1918,70 @@ mod tests {
         std::sync::Arc::new(Mutex::new(s))
     }
 
+    /// REVIEW A2: a keeper task that panics (or is dropped) must not leave
+    /// `keeper_armed` stuck `true`, or no keeper is ever spawned again and the
+    /// queue is neither renewed nor released.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_keeper_clears_its_arm() {
+        struct Panics;
+        impl QueueTransport for Panics {
+            async fn heartbeat(
+                &self,
+                _coord_base: &str,
+                _dispatch_id: &str,
+            ) -> reporting::QueueHeartbeat {
+                panic!("heartbeat transport panicked (test)");
+            }
+            fn release(&self, _payload: &CiDispatchPayload, _reason: &str) {}
+        }
+        let now = Instant::now();
+        let mut payload = advertising(queued_payload("p"), 1800);
+        payload.coord_http_url = "http://127.0.0.1:9".to_string();
+        let state: &'static Mutex<CiState> = Box::leak(Box::new(Mutex::new(CiState::new())));
+        {
+            let mut s = state.lock().unwrap();
+            s.keeper_armed = true;
+            s.queued.push_back(queued_at(payload, now));
+        }
+        let joined = tokio::spawn(run_queue_keeper(state, Panics)).await;
+        assert!(
+            joined.as_ref().is_err_and(|e| e.is_panic()),
+            "the keeper task must have panicked: {joined:?}"
+        );
+        let s = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!s.keeper_armed, "a panicked keeper must clear keeper_armed");
+        assert_eq!(
+            s.queued.len(),
+            1,
+            "the queue itself is left for the next keeper"
+        );
+    }
+
+    /// The guard must NOT clear an arm on the normal empty-queue exit: by then
+    /// an enqueue may have armed a new keeper, and clearing would let a second
+    /// one spawn beside it.
+    #[tokio::test(start_paused = true)]
+    async fn a_keeper_exiting_on_an_empty_queue_leaves_a_newer_arm_alone() {
+        let state: &'static Mutex<CiState> = Box::leak(Box::new(Mutex::new(CiState::new())));
+        state.lock().unwrap().keeper_armed = true;
+        let fake = FakeTransport::new(reporting::QueueHeartbeat::Renewed);
+        let mut guard = KeeperArmGuard {
+            state,
+            disarmed_by_tick: false,
+        };
+        assert!(keeper_tick(state, &fake, Instant::now()).await);
+        guard.disarmed_by_tick = true;
+        // A new enqueue arms a fresh keeper before the old task finishes.
+        state.lock().unwrap().keeper_armed = true;
+        drop(guard);
+        assert!(
+            state.lock().unwrap().keeper_armed,
+            "the newer keeper's arm survives the old keeper's exit"
+        );
+    }
+
     #[tokio::test]
     async fn the_keeper_disarms_on_an_empty_queue_and_stays_armed_otherwise() {
         let now = Instant::now();
@@ -2167,7 +2297,7 @@ mod tests {
     /// started the lease, not to when the message arrived: a `build_requested`
     /// delivered 6 minutes late (9 minutes of lease left) is released 4 minutes
     /// after arrival, not 10 — while coord still holds it. Without the field
-    /// the anchor is arrival, as before.
+    /// the anchor is arrival.
     #[tokio::test]
     async fn a_late_delivered_dispatch_is_released_by_its_lease_deadline_not_its_arrival() {
         let arrived = Instant::now();
