@@ -1270,9 +1270,12 @@ async fn run_queue_keeper<T: QueueTransport>(
 /// deliberate: respawning from here would turn a keeper that panics
 /// deterministically into a panic respawn loop.
 ///
-/// A panic while the `ci_state()` lock was held poisons it; the guard takes
-/// the inner state anyway (`into_inner`), since clearing the arm cannot break
-/// any invariant the poisoning protects.
+/// A panic while the `ci_state()` lock was held poisons it. The guard still
+/// clears its arm through `into_inner` so its own drop cannot panic a second
+/// time; it does NOT restore service: every later `ci_state().lock().unwrap()`
+/// (admission, slot claim) panics on the poisoned lock too, so no later
+/// enqueue arms a keeper. The keeper's locked section is kept panic-free for
+/// that reason.
 struct KeeperArmGuard<'a> {
     state: &'a Mutex<CiState>,
     generation: u64,
@@ -2046,10 +2049,10 @@ mod tests {
                 panic_after,
                 rearmed: Mutex::new(None),
             };
-            let rearmed = std::sync::Arc::new(transport);
+            let transport = std::sync::Arc::new(transport);
             let joined = tokio::spawn({
-                let rearmed = rearmed.clone();
-                async move { run_queue_keeper(state, Shared(rearmed), TEST_GEN).await }
+                let transport = transport.clone();
+                async move { run_queue_keeper(state, Shared(transport), TEST_GEN).await }
             })
             .await;
             assert_eq!(
@@ -2057,7 +2060,7 @@ mod tests {
                 panic_after,
                 "panic_after={panic_after}: {joined:?}"
             );
-            let newer = rearmed
+            let newer = transport
                 .rearmed
                 .lock()
                 .unwrap()

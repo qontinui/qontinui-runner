@@ -154,8 +154,10 @@ impl CiDispatchPayload {
     /// creation as it always did.
     ///
     /// That is NOT "behaves as before" for such a dispatch: the admission queue
-    /// now RELEASES it as `cancelled`/`deferred_past_lease` at most
-    /// `admission::UNRENEWED_HOLD` (10 minutes) after arrival (earlier, as
+    /// now RELEASES it as `cancelled`/`deferred_past_lease`: it falls due at
+    /// most `admission::UNRENEWED_HOLD` (10 minutes) after arrival and is
+    /// released on the next keeper tick, up to one
+    /// `admission::QUEUE_HEARTBEAT_INTERVAL` later (earlier, as
     /// `queued_renewal_lapsed`, when the payload's `lease_expires_at` is
     /// sooner). Previously it was held, and could still build if a slot freed
     /// before coord swept it; now a dispatch still queued at that point is
