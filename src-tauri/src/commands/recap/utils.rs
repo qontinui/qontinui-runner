@@ -178,12 +178,8 @@ pub fn get_stage_display_name(stage: &str) -> String {
 
 /// Map recorded state names to UI stage names.
 ///
-/// Handles both:
-/// - the snake_case names of the deleted orchestrator `TaskState` (e.g.,
-///   "execution", "deterministic_verification"). Nothing ever recorded them:
-///   that state machine was never constructed outside its tests, so these
-///   arms are inert
-/// - Direct stage names from transitions (e.g., "setup", "verification", "agentic")
+/// Handles direct stage names from transitions (e.g., "setup", "verification",
+/// "agentic") and the plan executor's states.
 pub fn map_state_to_stage(state: &str) -> Option<&'static str> {
     match state {
         // Direct stage names (from stage transitions)
@@ -191,12 +187,6 @@ pub fn map_state_to_stage(state: &str) -> Option<&'static str> {
         "verification" => Some("verification"),
         "agentic" => Some("agentic"),
         "completion" => Some("completion"),
-        // The deleted orchestrator TaskState's names (never recorded; inert)
-        "planning" => Some("setup"),
-        "execution" => Some("agentic"),
-        "deterministic_verification" => Some("verification"),
-        "ai_verification" => Some("verification"),
-        "ai_summary" => Some("completion"),
         // Plan executor states
         "phase_running" | "phase_complete" => Some("agentic"),
         "sweep_running" | "sweep_complete" => Some("completion"),

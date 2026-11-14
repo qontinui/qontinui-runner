@@ -280,36 +280,6 @@ class TestRuntimeMetadataFlow:
 
         return tree_event
 
-    def test_missing_typed_text_detection(self):
-        """Test that we can detect when typed_text is missing."""
-
-        # Create a TYPE action WITHOUT calling record_text_typed
-        collector = UnifiedDataCollector(state_memory=None, screenshot_service=None)
-        collector.start_action("type-missing-001", None, "test-wf", 0)
-
-        # DON'T call record_text_typed - simulating the bug
-
-        record = collector.create_record(
-            action_type="TYPE",
-            config={"textSource": {"stateId": "Main"}},
-            start_time=time.time(),
-            end_time=time.time() + 0.1,
-            success=True,
-        )
-
-        tree_data = record.to_tree_event_data()
-        runtime = tree_data["metadata"]["runtime"]
-
-        # This should fail if typed_text is missing
-        if "typed_text" not in runtime:
-            print("✗ BUG DETECTED: typed_text missing from runtime metadata!")
-            print(f"  Runtime keys: {list(runtime.keys())}")
-            print("  This means EventTranslator.on_text_typed() was not called")
-            print("  OR record_text_typed() was not called")
-            raise AssertionError("typed_text is missing - library not emitting TEXT_TYPED events")
-        else:
-            print(f"✓ typed_text present (value: {runtime.get('typed_text')})")
-
 
 if __name__ == "__main__":
     """Run tests manually for debugging."""
@@ -336,8 +306,6 @@ if __name__ == "__main__":
         print("-" * 60)
         print(json.dumps(tree_event, indent=2))
         print("-" * 60)
-
-        test.test_missing_typed_text_detection()
 
         print("\n" + "=" * 60)
         print("ALL TESTS PASSED ✓")

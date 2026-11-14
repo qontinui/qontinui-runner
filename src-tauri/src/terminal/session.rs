@@ -24,6 +24,7 @@ use super::exit_notice::{ExitNoticeSink, TauriExitSink};
 use super::grid::{Grid, GridPerformer, GridSnapshot};
 use super::interceptor::OutputInterceptor;
 use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
+use super::spawn_refusal::SpawnFailure;
 use super::types::{TerminalId, TerminalInfo};
 use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
@@ -1698,7 +1699,13 @@ impl TerminalSession {
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, SpawnFailure> {
+        // Every failure is typed by whether the child process may already have
+        // started (`SpawnFailure::child_started`): a door may remove the
+        // worktree it allocated for this spawn only when none did. Everything
+        // up to and including the child spawn below is `before_child`; from
+        // `spawn_with_io` on it is `after_child`.
+        //
         // Spawn-time resource gate — BEFORE the PTY is opened, so a refusal
         // leaves no half-built session behind and nothing already running is
         // touched. Below the warn floor this emits a notice and returns
@@ -1709,7 +1716,8 @@ impl TerminalSession {
             "terminal session",
             resource_override,
             Some(&app_handle),
-        )?;
+        )
+        .map_err(SpawnFailure::before_child)?;
 
         // The pane's backend: in-process `LocalPty`, or — behind
         // `terminal.pty_holder`, default ON on Linux since Phase 5 — an out-of-process PTY holder
@@ -1730,7 +1738,7 @@ impl TerminalSession {
         );
         let opened = match backend {
             crate::terminal::daemon_pane_io::PaneBackend::LocalPty => {
-                Some(LocalPty::open(&id, cols, rows)?)
+                Some(LocalPty::open(&id, cols, rows).map_err(SpawnFailure::before_child)?)
             }
             crate::terminal::daemon_pane_io::PaneBackend::Holder => None,
         };
@@ -1859,7 +1867,8 @@ impl TerminalSession {
                 spawn_tenant,
                 served_probe,
             )
-        }?;
+        }
+        .map_err(SpawnFailure::before_child)?;
         let pinned_session_id = seam.pinned_session_id;
         let permission_request_hook = crate::session::claude_hook::permission_request_hook_for(
             Some(&spawn_argv),
@@ -1943,10 +1952,15 @@ impl TerminalSession {
         // above already ran the same scrub as the production env tail.
         let sealed = ScrubbedCommand::seal(cmd);
         let io: Arc<dyn PaneIo> = match opened {
-            Some(opened) => Arc::new(opened.spawn(sealed)?),
+            // A local spawn that fails started no child.
+            Some(opened) => Arc::new(opened.spawn(sealed).map_err(SpawnFailure::before_child)?),
+            // A holder failure has already been through the holder AND its
+            // in-process fallback; a holder process may have started before
+            // its attach was refused, so it is not proven child-free.
             None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
                 &id, sealed, cols, rows,
-            )?,
+            )
+            .map_err(SpawnFailure::after_child)?,
         };
 
         let session = Self::spawn_with_io(
@@ -1960,7 +1974,10 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
-        )?;
+        )
+        // The child is running from here on: a failure to wire its reader or
+        // writer leaves it to `abandon_pane`, which this caller cannot verify.
+        .map_err(SpawnFailure::after_child)?;
         // Only THIS path records it: an adopted holder pane or a remote mirror
         // is built by `spawn_with_io` alone and reads `absent` — and holds no
         // grant, so the pad never answers its prompts.

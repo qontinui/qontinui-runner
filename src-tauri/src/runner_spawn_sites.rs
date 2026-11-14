@@ -157,8 +157,14 @@ pub(crate) fn comment_mask(lines: &[&str]) -> Vec<bool> {
 }
 
 /// Line spans covered by a `#[cfg(test)] mod … { … }`.
+///
+/// The block ends at the first line that is a bare `}` at the `mod` line's own
+/// indentation (rustfmt's layout), NOT where a raw brace count returns to zero.
+/// A raw count also counts braces inside string and char literals — door-scan
+/// fixtures such as `"fn door() {\n"`, a `b'{'` match arm — so it closed
+/// `terminal/spawn_refusal.rs`'s test module hundreds of lines early and
+/// reported that module's fixtures as unlisted spawn sites.
 fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
-    let comments = comment_mask(lines);
     let mut spans = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if !line.trim_start().starts_with("#[cfg(test)]") {
@@ -169,20 +175,30 @@ fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
         else {
             continue;
         };
-        let mut depth = 0usize;
-        for (j, l) in lines.iter().enumerate().skip(open) {
-            if comments[j] {
-                continue;
-            }
-            depth += l.matches('{').count();
-            depth = depth.saturating_sub(l.matches('}').count());
-            if depth == 0 {
-                spans.push((open, j + 1));
-                break;
-            }
+        if code_part(lines[open]).ends_with('}') {
+            // `mod x { … }` on one line (a trailing `// …` allowed).
+            spans.push((open, open + 1));
+            continue;
+        }
+        let indent = lines[open].len() - lines[open].trim_start().len();
+        let prefix = lines[open].get(..indent).unwrap_or("");
+        // `}` at the mod's own indentation, a trailing `// …` allowed.
+        let closes = |l: &str| {
+            l.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('}') && code_part(rest) == "}")
+        };
+        if let Some(j) = (open + 1..lines.len()).find(|&j| closes(lines[j])) {
+            spans.push((open, j + 1));
         }
     }
     spans
+}
+
+/// `line` without a trailing `// …` comment or surrounding whitespace. Only used
+/// on a `mod` line or a candidate closing line, where `//` cannot sit in a
+/// literal that matters.
+fn code_part(line: &str) -> &str {
+    line.split_once("//").map_or(line, |(code, _)| code).trim()
 }
 
 fn fn_decl_re() -> Regex {
@@ -790,6 +806,31 @@ fn a_new_primitive_caller_and_a_helper_caller_are_found_but_test_modules_are_not
             ("new_door.rs".to_string(), "open_door".to_string()),
             ("new_door.rs".to_string(), "recipe".to_string()),
             ("new_door.rs".to_string(), "uses_recipe".to_string()),
+        ]
+    );
+}
+
+/// The test-module span ends at the `mod` line's own-indentation `}` — not
+/// where a raw brace count returns to zero, which braces inside string and
+/// char literals throw off (they closed `terminal/spawn_refusal.rs`'s test
+/// module early and reported its fixtures as unlisted spawn sites).
+#[test]
+fn a_test_module_span_ignores_braces_in_literals_and_ends_at_its_own_closer() {
+    let src = "#[cfg(test)]\nmod tests {\n    fn lex(b: u8) {\n        match b {\n            \
+               b'\x7b' => emit(b\"\x7b\"),\n            _ => {}\n        }\n        \
+               let _ = \"}\\n}\\n\";\n        tm.create(a);\n    }\n} // mod tests\n\
+               fn prod() {\n    tm.create(b);\n}\n\
+               #[cfg(test)]\nmod one_line { fn t() { tm.create(c); } } // one line\n\
+               fn prod2() {\n    tm.create(d);\n}\n";
+    let lines: Vec<&str> = src.lines().collect();
+    assert_eq!(test_spans(&lines), vec![(1, 11), (15, 16)]);
+    let sources = BTreeMap::from([("x.rs".to_string(), src.to_string())]);
+    let found: Vec<_> = scan_sites(&sources, &BTreeMap::new()).into_iter().collect();
+    assert_eq!(
+        found,
+        vec![
+            ("x.rs".to_string(), "prod".to_string()),
+            ("x.rs".to_string(), "prod2".to_string()),
         ]
     );
 }

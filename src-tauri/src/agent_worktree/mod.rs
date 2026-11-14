@@ -77,6 +77,7 @@ pub mod maintenance_executor;
 pub mod on_demand;
 pub mod orphan_target_reaper;
 pub mod reclaim;
+pub(crate) mod remove_unspawned;
 pub(crate) mod retire_abandoned;
 pub mod session_env;
 pub(crate) mod sibling_store;
@@ -2258,9 +2259,18 @@ async fn materialize_allocation(
     for w in &materialized {
         let sid = coord_resp.agent_id.clone();
         let wt_path = w.worktree_path.clone();
-        tokio::spawn(async move {
-            crate::credential_helper::setup_credential_helper_for_worktree(&wt_path, &sid).await;
+        // Tracked, not fire-and-forget: a removal or a context `Drop` for this
+        // agent waits for (or reaps) the install before tearing the
+        // credential down, so a fast refusal cannot clean up ahead of the
+        // install and leave its token file and refresh loop behind.
+        let install = tokio::spawn({
+            let sid = sid.clone();
+            async move {
+                crate::credential_helper::setup_credential_helper_for_worktree(&wt_path, &sid)
+                    .await;
+            }
         });
+        crate::credential_helper::track_install(&sid, install);
     }
 
     Ok(MaterializeOutcome::Worktrees(AllocateResult {

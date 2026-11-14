@@ -148,13 +148,28 @@ struct TerminalCreateArgs {
     edit_siblings: Vec<String>,
 }
 
+/// The `terminal_create` proxy's resource-guard precheck, run before the
+/// allocation: a CRITICAL refusal after it would leave the `git worktree add`
+/// on disk, one more tree per retry. Answered through the SAME
+/// [`TauriInvokeResponse::spawn_failed`] the failed-create arm uses, so one
+/// refusal has one answer whichever gate gave it
+/// ([`crate::resource_guard::precheck_spawn`]'s contract).
+fn spawn_precheck_or_invoke_error(
+    check: impl FnOnce() -> Result<(), String>,
+) -> Result<(), TauriInvokeResponse> {
+    check().map_err(TauriInvokeResponse::spawn_failed)
+}
+
 /// The `terminal_create` proxy's spawn-tenant admission: the shared
-/// [`crate::commands::terminal::admit_spawn_tenant`], answered as the invoke
-/// error a refused `terminal_create` command would return.
+/// [`crate::commands::terminal::admit_spawn_tenant`], answered through the
+/// same typed path the failed-create arm uses
+/// ([`TauriInvokeResponse::spawn_failed`]) — so a `terminal:tenant_<kind>:`
+/// refusal carries `TERMINAL_TENANT_<KIND>` and its status whichever gate gave
+/// it, the precheck here or the identity seam inside the spawn.
 fn spawn_tenant_or_invoke_error(
     raw: Option<&str>,
 ) -> Result<Option<uuid::Uuid>, TauriInvokeResponse> {
-    crate::commands::terminal::admit_spawn_tenant(raw).map_err(TauriInvokeResponse::err)
+    crate::commands::terminal::admit_spawn_tenant(raw).map_err(TauriInvokeResponse::spawn_failed)
 }
 
 impl TauriInvokeResponse {
@@ -174,6 +189,25 @@ impl TauriInvokeResponse {
             error: Some(msg.into()),
             code: None,
             status: None,
+        }
+    }
+    /// The answer to a refused spawn — the resource-guard precheck before the
+    /// allocation and a failed `tm.create` after it. A recognised refusal
+    /// family carries its `code` and typed status, by the rule `POST /terminals`
+    /// and the backend relay share
+    /// ([`crate::terminal::spawn_refusal::spawn_refusal_code`]); the text stays
+    /// verbatim, so a caller matching the `resource_guard:critical:` prefix is
+    /// unaffected. Anything unrecognised keeps the untyped 200 error.
+    fn spawn_failed(error: String) -> Self {
+        match crate::terminal::spawn_refusal::spawn_refusal_code(&error) {
+            Some((status, code)) => Self {
+                success: false,
+                data: None,
+                error: Some(error),
+                code: Some(code),
+                status: Some(status),
+            },
+            None => Self::err(error),
         }
     }
     /// A refused `editSiblings` input: a typed 400 `invalid_edit_sibling`,
@@ -334,6 +368,15 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     Err(refusal) => return TauriInvokeResponse::edit_sibling_refusal(refusal),
                 };
 
+            // The resource guard's CRITICAL verdict, judged before the
+            // allocation for the reason `POST /terminals` judges it there.
+            // `a.resource_override` is the caller's explicit "start it anyway".
+            if let Err(refusal) = spawn_precheck_or_invoke_error(|| {
+                crate::resource_guard::precheck_spawn("terminal session", a.resource_override)
+            }) {
+                return refusal;
+            }
+
             let (working_dir, isolated_ctx) =
                 crate::agent_worktree::isolated_edit::acquire_for_terminal(
                     effective_intent_repo.as_deref(),
@@ -356,6 +399,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 spawn_tenant_key.as_deref(),
             );
 
+            // door-scan: spawn — the door's real spawn; the context is in hand until here.
             match tm.create(
                 a.title,
                 working_dir,
@@ -390,7 +434,20 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     }
                     TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
                 }
-                Err(e) => TauriInvokeResponse::err(e),
+                Err(e) => {
+                    // The allocation (if this call made one) has its fresh tree
+                    // removed when no child started and it holds nothing, and is
+                    // reported spawn-failed, as on every `acquire_for_terminal`
+                    // door; the context's Drop then releases its claims.
+                    if let Some(ctx) = isolated_ctx {
+                        ctx.remove_unspawned(
+                            "tauri_proxy terminal_create",
+                            e.child_started,
+                            &e.message,
+                        );
+                    }
+                    TauriInvokeResponse::spawn_failed(e.message)
+                }
             }
         }
 
@@ -673,8 +730,17 @@ mod spawn_tenant_tests {
         let refusal =
             spawn_tenant_or_invoke_error(Some(&b.to_string())).expect_err("unpaired → refused");
         assert!(!refusal.success);
+        assert_eq!(refusal.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
+        assert_eq!(refusal.status, Some(StatusCode::BAD_REQUEST));
         let error = refusal.error.unwrap_or_default();
         assert!(error.starts_with("terminal:tenant_not_paired:"), "{error}");
+        // The same text through the failed-create arm gives the same answer.
+        let via_create = TauriInvokeResponse::spawn_failed(error.clone());
+        assert_eq!(
+            via_create.code.as_deref(),
+            Some("TERMINAL_TENANT_NOT_PAIRED")
+        );
+        assert_eq!(via_create.status, Some(StatusCode::BAD_REQUEST));
         assert_eq!(
             spawn_tenant_or_invoke_error(Some(&a.to_string())).ok(),
             Some(Some(a))
@@ -700,5 +766,60 @@ mod spawn_tenant_tests {
             .is_err(),
             "two spellings at once is a duplicate field, never a silent pick"
         );
+    }
+}
+
+#[cfg(test)]
+mod spawn_refusal_tests {
+    use super::*;
+    use crate::terminal::spawn_refusal::{refusal_family_fixtures, UNRECOGNISED_SPAWN_FAILURES};
+
+    fn answer(r: &TauriInvokeResponse) -> (StatusCode, Value) {
+        (
+            r.status.unwrap_or(StatusCode::OK),
+            serde_json::to_value(r).unwrap(),
+        )
+    }
+
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phase 0: one case per
+    /// refusal family, each text built by its real producer, answered with the
+    /// code and typed status `POST /terminals` gives it — and the text verbatim.
+    #[test]
+    fn a_refused_spawn_keeps_its_typed_answer_on_the_proxy() {
+        for (text, status, code) in refusal_family_fixtures() {
+            let (got, body) = answer(&TauriInvokeResponse::spawn_failed(text.clone()));
+            assert_eq!(got, status, "{text}");
+            assert_eq!(body["code"], code, "{text}");
+            assert_eq!(body["error"], text.as_str());
+            assert_eq!(body["success"], false);
+        }
+    }
+
+    /// The precheck's answer equals the failed-create arm's for the same text,
+    /// so a caller cannot tell which gate answered.
+    #[test]
+    fn the_proxy_precheck_answers_as_the_failed_create_arm_does() {
+        for (text, _, _) in refusal_family_fixtures() {
+            let t = text.clone();
+            let precheck = spawn_precheck_or_invoke_error(move || Err(t))
+                .expect_err("a refusal is an invoke error");
+            assert_eq!(
+                answer(&precheck),
+                answer(&TauriInvokeResponse::spawn_failed(text.clone())),
+                "{text}"
+            );
+        }
+        assert!(spawn_precheck_or_invoke_error(|| Ok(())).is_ok());
+    }
+
+    /// Anything unrecognised keeps today's untyped 200 invoke error.
+    #[test]
+    fn any_other_spawn_failure_stays_an_untyped_invoke_error() {
+        for text in UNRECOGNISED_SPAWN_FAILURES {
+            let (status, body) = answer(&TauriInvokeResponse::spawn_failed(text.to_string()));
+            assert_eq!(status, StatusCode::OK, "{text}");
+            assert!(body.get("code").is_none(), "{text}");
+            assert_eq!(body["error"], *text);
+        }
     }
 }
