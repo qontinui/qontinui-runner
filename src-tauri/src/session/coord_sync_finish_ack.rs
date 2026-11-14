@@ -75,10 +75,16 @@ pub(crate) const FINISHED_UNCONFIRMED_MAX_ATTEMPTS: u32 = 5;
 /// Ten minutes, because a dropped finish is re-offered by nothing automatic in
 /// this process, and the next runner start's heal sweep never re-offers a row
 /// reading `working` — so dropping early loses the finish for as long as the
-/// runner lives. Ten minutes outlasts a coord rolling deploy (the cause of the
-/// swallowed writes this module exists for was one coord build) and a burst of
-/// transient prepare failures, while costing at most ~15 PATCHes per finish on
-/// the one-minute backoff cap: cheap, and still bounded.
+/// runner lives. The ASSUMPTION (not measured) is that ten minutes outlasts a
+/// coord rolling deploy and a burst of transient prepare failures — the cause
+/// of the swallowed writes this module exists for was one coord build. The
+/// cost is about 16 PATCHes per finish (at 0, 1, 3, 7, 15 and 31 s on the
+/// doubling backoff, then one a minute at the cap until the floor is passed
+/// at ~603 s): cheap, and still bounded.
+///
+/// While the finish is held its session's chain is blocked, and this floor
+/// equals coord's Active→Stale threshold, so the drain gives such a session
+/// the same front keep-alive heartbeat a quarantined session gets.
 pub(crate) const FINISHED_UNCONFIRMED_MIN_AGE: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
 
