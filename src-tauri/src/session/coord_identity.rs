@@ -108,6 +108,19 @@ impl RekeySource {
         }
     }
 
+    /// Whether this source reports the id the pane's process runs NOW — the
+    /// provider's registry file for the pid, or its SessionStart hook — as
+    /// opposed to the id the pane was SPAWNED with (rung 2's argv, the R2
+    /// pane resume's pin), which a `/clear` or an in-pane `/resume` leaves
+    /// behind. Only these may advance the registrar's pane-row owner (plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
+    pub fn observes_running_id(self) -> bool {
+        match self {
+            RekeySource::Hook | RekeySource::ProviderRegistry => true,
+            RekeySource::Rung2 | RekeySource::R2Resume => false,
+        }
+    }
+
     /// Parse an outbox row's `rekey_source`. A row with NO label was queued by
     /// a build that predates this module, where the hook was the only writer —
     /// so an absent label is `Hook`. An unknown label is `None` (not counted).
@@ -721,7 +734,7 @@ fn confirm_inner(
             );
             // Outside every registry lock: `confirm_claude_code_session_id`
             // has returned and released its record-move guard.
-            registry.notify_rekey_confirmed(coord_session_id, claude_id);
+            registry.notify_rekey_confirmed(coord_session_id, claude_id, source);
             RekeyOutcome::Queued
         }
         Ok(false) => {
@@ -747,7 +760,7 @@ fn confirm_inner(
             // The steady-state answer once the record carries the id: a
             // repoint missed on the queuing tick (observer not attached yet at
             // boot, or a binding made after the queue) is caught here.
-            registry.notify_rekey_confirmed(coord_session_id, claude_id);
+            registry.notify_rekey_confirmed(coord_session_id, claude_id, source);
             RekeyOutcome::AlreadyCurrent
         }
         Err(SessionError::NotFound(_)) => {
@@ -1620,9 +1633,9 @@ pub(crate) mod tests {
         ));
         {
             let r = Arc::downgrade(&registrar);
-            reg.attach_rekey_observer(move |row, csid| {
+            reg.attach_rekey_observer(move |row, csid, source| {
                 if let Some(r) = r.upgrade() {
-                    r.note_pane_row(row, csid);
+                    r.note_pane_row(row, csid, source);
                 }
             });
             let sreg = Arc::downgrade(&reg);
@@ -1672,7 +1685,7 @@ pub(crate) mod tests {
         let seen: Arc<std::sync::Mutex<Vec<(Uuid, String)>>> = Default::default();
         {
             let seen = seen.clone();
-            reg.attach_rekey_observer(move |row, id| {
+            reg.attach_rekey_observer(move |row, id, _source| {
                 seen.lock().unwrap().push((row, id.to_string()));
             });
         }

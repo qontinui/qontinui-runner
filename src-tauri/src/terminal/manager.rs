@@ -371,16 +371,20 @@ impl TerminalManager {
     }
 
     /// When the live terminal holding coord row `row` was bound to it (unix
-    /// milliseconds); `None` when no live terminal holds the row. The newest
-    /// bind wins if several do. Read by the registrar's live-pane-row lookup
+    /// milliseconds): `Some(Some(at))`; `Some(None)` when no live terminal
+    /// holds the row; `None` when the terminal map could not be read (a
+    /// poisoned lock) — UNKNOWN, never "gone". The newest bind wins if
+    /// several hold the row. Read by the registrar's live-pane-row lookup
     /// (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
-    pub fn coord_row_bound_at(&self, row: uuid::Uuid) -> Option<i64> {
+    pub fn coord_row_bound_at(&self, row: uuid::Uuid) -> Option<Option<i64>> {
         let sessions = self.sessions.lock().ok()?;
-        sessions
-            .values()
-            .filter(|s| s.coord_session_id() == Some(row))
-            .filter_map(|s| s.coord_bound_at_ms())
-            .max()
+        Some(
+            sessions
+                .values()
+                .filter(|s| s.coord_session_id() == Some(row))
+                .filter_map(|s| s.coord_bound_at_ms())
+                .max(),
+        )
     }
 
     /// Record the pane behind a remote tab (see `remote_panes`).
