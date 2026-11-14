@@ -42,7 +42,10 @@ use super::helpers::{
     filter_element_fields, parse_eval_result, read_window_label, snapshot_signature,
 };
 use super::recovery_executor::attempt_recovery;
-use super::request::{ui_bridge_request_sync, ui_bridge_request_sync_in_window, wrap_ipc_result};
+use super::request::{
+    status_for_inner_failure, ui_bridge_request_sync, ui_bridge_request_sync_in_window,
+    wrap_ipc_result, wrap_ipc_result_keeping_failure_data,
+};
 use super::screenshots::capture_runner_window_base64;
 use super::types::{
     classify_transport_error, UIBridgeActionRequest, UIBridgeComponentActionRequest,
@@ -1003,9 +1006,53 @@ pub(crate) fn recovery_is_genuine(recovery: &super::recovery_executor::RecoveryO
 }
 
 /// Alias for the `execute_action` handler's own return type — the value that
-/// travels from `wrap_ipc_result` through the retry/recovery ladder.
-type ActionResult =
-    Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>;
+/// travels from [`wrap_element_action_ipc`] through the retry/recovery ladder.
+///
+/// Its error arm is `ApiResponse<serde_json::Value>`, not the flat
+/// `ApiResponse<()>` most handlers answer with, so a failure can carry the
+/// SDK's own payload as `data`.
+type ActionResult = Result<
+    Json<ApiResponse<serde_json::Value>>,
+    (StatusCode, Json<ApiResponse<serde_json::Value>>),
+>;
+
+/// The wrap every SDK `execute_action` reply on the element-action routes goes
+/// through: the element route's first dispatch, its stale-registry retry and
+/// its stable-ref retry, `type-into`'s mutation step, and the click of
+/// `click-by-text` / `click-by-selector`.
+///
+/// It keeps the failure payload ([`wrap_ipc_result_keeping_failure_data`]).
+/// An SDK `{success: false}` carries its whole diagnosis there:
+/// `failureDetails` (the canonical `errorCode`, the recovery suggestions and,
+/// once the SDK's occlusion gate ships, the covering element `occludedBy` /
+/// `occludedPct` of a refused click) and a failed `hoverClick`'s
+/// `forcedHover`. The flat [`wrap_ipc_result`]
+/// these routes used to call dropped all of it, so the caller got only the
+/// code the runner re-derives from the message. That code is unchanged: both
+/// wraps classify the same verdict, and only the `data` sibling differs.
+fn wrap_element_action_ipc(result: Result<serde_json::Value, String>) -> ActionResult {
+    wrap_ipc_result_keeping_failure_data(result)
+}
+
+/// Widen a flat `ApiResponse<()>` error (what [`parse_eval_result`] and
+/// [`wrap_ipc_result`] return) to the payload-carrying error a route answering
+/// in an [`ActionResult`] needs. Nothing is lost: a flat body has no `data`.
+fn widen_flat_error(
+    (status, Json(flat)): (StatusCode, Json<ApiResponse<()>>),
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    (
+        status,
+        Json(ApiResponse {
+            success: flat.success,
+            data: None,
+            error: flat.error,
+            error_detail: flat.error_detail,
+            hint: flat.hint,
+            code: flat.code,
+            suggestions: flat.suggestions,
+        }),
+    )
+}
 
 /// Re-code a POST-DISPATCH failure as `ACTION_FAILED`, preserving the
 /// handler's own error text verbatim and attaching the recovery audit trail.
@@ -1181,7 +1228,7 @@ pub async fn ui_bridge_execute_action_handler(
     Query(query): Query<ActionQueryParams>,
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
     // users-path-and-the-passage-of-time, D3): parse the body ONCE (the same
     // lossy fallback the dispatch applies) and read only the action NAME and
@@ -1242,7 +1289,7 @@ async fn execute_action_dispatch(
     Query(query): Query<ActionQueryParams>,
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     // Custom body extraction so JSON-parse errors come back with an actionable
     // hint instead of the raw serde_json message. We sidestep axum's
     // `Json<UIBridgeActionRequest>` extractor and parse the bytes ourselves
@@ -1347,7 +1394,7 @@ async fn execute_action_dispatch(
         if state.app_handle.get_webview_window(target).is_none() {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(api_error(format!(
+                Json(ApiResponse::error(format!(
                     "No runner window labeled '{target}'. Discover live windows via \
                      GET /ui-bridge/control/runner-windows."
                 ))),
@@ -1435,7 +1482,7 @@ async fn execute_action_dispatch(
                         let message = detail.message.clone();
                         return Err((
                             StatusCode::NOT_FOUND,
-                            Json(api_error_detailed(message, detail)),
+                            Json(ApiResponse::error_detailed(message, detail)),
                         ));
                     }
                 }
@@ -1501,7 +1548,7 @@ async fn execute_action_dispatch(
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, detail)),
+            Json(ApiResponse::error_detailed(msg, detail)),
         ));
     }
 
@@ -1744,7 +1791,7 @@ async fn execute_action_dispatch(
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, detail)),
+            Json(ApiResponse::error_detailed(msg, detail)),
         ));
     }
 
@@ -1790,10 +1837,9 @@ async fn execute_action_dispatch(
         );
         // Use a structured UiBridgeError so `error_detail.code` is
         // `ACTION_NOT_SUPPORTED` and `error_detail.context` carries the
-        // supported-action list. The Err arm here can't carry a free-form
-        // `data` payload (the handler's Err type is
-        // `Json<ApiResponse<()>>`); the structured detail is the canonical
-        // machine-readable surface in that envelope shape.
+        // supported-action list. Nothing was dispatched, so there is no SDK
+        // payload to carry as `data`: the structured detail is the canonical
+        // machine-readable surface of this pre-IPC body.
         //
         // No later stage re-emits this body. `as_action_failure` is what
         // shapes every post-dispatch failure, and it codes them
@@ -1813,13 +1859,14 @@ async fn execute_action_dispatch(
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, detail)),
+            Json(ApiResponse::error_detailed(msg, detail)),
         ));
     }
 
     // ── Execute the action ─────────────────────────────────────────────
-    let mut result =
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload.clone()).await);
+    let mut result = wrap_element_action_ipc(
+        ui_bridge_request_sync(&state, "execute_action", payload.clone()).await,
+    );
 
     // ── Issue 1: Stale registry retry ──────────────────────────────────
     // When React unmount/remount creates a new DOM node the old registry
@@ -1864,7 +1911,7 @@ async fn execute_action_dispatch(
 
             // Retry the original action once. Clone so `payload` stays
             // available for the Phase 5 RecoveryExecutor downstream.
-            let retry_result = wrap_ipc_result(
+            let retry_result = wrap_element_action_ipc(
                 ui_bridge_request_sync(&state, "execute_action", payload.clone()).await,
             );
 
@@ -1940,7 +1987,7 @@ async fn execute_action_dispatch(
                                     }),
                                     window_label,
                                 );
-                                let retry_result = wrap_ipc_result(
+                                let retry_result = wrap_element_action_ipc(
                                     ui_bridge_request_sync(&state, "execute_action", retry_payload)
                                         .await,
                                 );
@@ -1995,7 +2042,7 @@ async fn execute_action_dispatch(
     // "not found"), surface it as a distinct HTTP 404 with a structured
     // `error_detail.code == ElementNotFound` — the same envelope the
     // `get_element` DOM-tree / `assert` handlers already return for a typoed
-    // id. Without this, `wrap_ipc_result` routes the prose through
+    // id. Without this, `wrap_element_action_ipc` routes the prose through
     // `classify_transport_error`, which only maps the literal "No element
     // found" string and otherwise falls through to a generic
     // `INTERNAL_SERVER_ERROR` — making a missing-id miss indistinguishable
@@ -2003,8 +2050,10 @@ async fn execute_action_dispatch(
     //
     // This fires ONLY on a true, unrecoverable registry miss: an element
     // that exists but whose action fails carries a different error and
-    // keeps its existing `wrap_ipc_result` envelope untouched. We reuse the
-    // file's own canonical miss predicate (the exact substrings the
+    // keeps the envelope `wrap_element_action_ipc` built, the SDK's failure
+    // payload included. This 404 is the runner's own canonical body (`hint`
+    // forwarded), the one the other element routes answer a miss with. We
+    // reuse the file's own canonical miss predicate (the exact substrings the
     // stale-registry retry above keys on) so behavior stays consistent.
     {
         let is_registry_miss = |err: Option<&str>| -> bool {
@@ -2027,7 +2076,7 @@ async fn execute_action_dispatch(
                  stable-ref fallback; returning ELEMENT_NOT_FOUND",
                 id
             );
-            let mut body = api_error_detailed(
+            let mut body = ApiResponse::error_detailed(
                 format!("Element '{}' not found", id),
                 UiBridgeError::element_not_found(&id),
             );
@@ -2069,6 +2118,11 @@ async fn execute_action_dispatch(
                     .and_then(|d| d.get("code"))
                     .cloned(),
             })),
+            // `body.data` carries the SDK's `failureDetails` now (the route
+            // forwards it to the caller), but it is deliberately NOT fed in
+            // here: its `suggestedActions` would start the executor's
+            // automatic retries on every SDK failure of this arm, which no
+            // measurement covers yet.
             Err((_, body)) => Some(serde_json::json!({
                 "success": false,
                 "error": body.error,
@@ -3889,19 +3943,7 @@ fn apply_strict_timeout_reshape(
             }
             Ok(Json(resp))
         }
-        Err((status, Json(err))) => {
-            // Widen the error type from ApiResponse<()> -> ApiResponse<serde_json::Value>.
-            let widened = ApiResponse {
-                success: err.success,
-                data: None,
-                error: err.error,
-                error_detail: err.error_detail,
-                hint: err.hint,
-                code: err.code,
-                suggestions: err.suggestions,
-            };
-            Err((status, Json(widened)))
-        }
+        Err(flat) => Err(widen_flat_error(flat)),
     }
 }
 
@@ -4207,7 +4249,7 @@ pub async fn ui_bridge_find_by_text_handler(
 pub async fn ui_bridge_click_by_text_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_text");
     let result =
         ui_bridge_click_by_text_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
@@ -4218,10 +4260,15 @@ pub async fn ui_bridge_click_by_text_handler(
 /// Click an element by its visible text content.
 /// POST /ui-bridge/control/page/click-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true, "index": 0 }
-async fn ui_bridge_click_by_text_handler_dispatch(
+///
+/// Resolves the `index`-th visible match and clicks it through the SDK
+/// executor ([`click_resolved_element`]). It is also the runner's own answer
+/// for `POST /ui-bridge/sdk/page/click-by-text` when no SDK app is connected
+/// (`sdk_client.rs`).
+pub(crate) async fn ui_bridge_click_by_text_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let tag = body.get("tag").and_then(|v| v.as_str()).unwrap_or("*");
     let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -4230,57 +4277,24 @@ async fn ui_bridge_click_by_text_handler_dispatch(
     if text.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error("'text' field is required")),
+            Json(ApiResponse::error("'text' field is required")),
         ));
     }
 
     // Bust the vision cache: a click can change rendered pixels.
     crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let match_expr = if exact {
-        format!("el.textContent.trim() === '{}'", escaped_text)
-    } else {
-        format!(
-            "el.textContent.trim().toLowerCase().includes('{}')",
-            escaped_text.to_lowercase()
-        )
-    };
-
-    let js = format!(
-        r#"(() => {{
-            const matches = Array.from(document.querySelectorAll('{tag}'))
-                .filter(el => el.offsetParent !== null && {match_expr});
-            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No matching elements found' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
-            const el = matches[idx];
-            el.scrollIntoView({{ block: 'center' }});
-            el.click();
-            return JSON.stringify({{
-                clicked: true,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                index: idx,
-                totalMatches: matches.length
-            }});
-        }})()"#,
-        tag = tag,
-        match_expr = match_expr,
-        index = index
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
+    // Optional `windowLabel` scopes both steps to a pop-out window (Phase 4 of
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "click-by-text",
-            "click result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    click_resolved_element(
+        &state,
+        "click-by-text",
+        &click_by_text_find_expr(text, tag, exact),
+        index,
+        "No matching elements found",
+        read_window_label(&body),
+    )
+    .await
 }
 
 /// Journey ledger choke point (plan
@@ -4289,7 +4303,7 @@ async fn ui_bridge_click_by_text_handler_dispatch(
 pub async fn ui_bridge_click_by_selector_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_selector");
     let result =
         ui_bridge_click_by_selector_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
@@ -4300,58 +4314,143 @@ pub async fn ui_bridge_click_by_selector_handler(
 /// Click an element by CSS selector.
 /// POST /ui-bridge/control/page/click-by-selector
 /// Body: { "selector": "button[type='submit']", "index": 0 }
-async fn ui_bridge_click_by_selector_handler_dispatch(
+///
+/// Resolves the `index`-th visible match and clicks it through the SDK
+/// executor ([`click_resolved_element`]). It is also the runner's own answer
+/// for `POST /ui-bridge/sdk/page/click-by-selector` when no SDK app is
+/// connected (`sdk_client.rs`).
+pub(crate) async fn ui_bridge_click_by_selector_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("");
     let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
 
     if selector.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error("'selector' field is required")),
+            Json(ApiResponse::error("'selector' field is required")),
         ));
     }
 
     // Bust the vision cache: a click can change rendered pixels.
     crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
-    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    click_resolved_element(
+        &state,
+        "click-by-selector",
+        &click_by_selector_find_expr(selector),
+        index,
+        "No elements match selector",
+        read_window_label(&body),
+    )
+    .await
+}
 
-    let js = format!(
-        r#"(() => {{
-            const matches = Array.from(document.querySelectorAll('{selector}'))
-                .filter(el => el.offsetParent !== null);
-            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No elements match selector' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
-            const el = matches[idx];
-            el.scrollIntoView({{ block: 'center' }});
-            el.click();
-            return JSON.stringify({{
-                clicked: true,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                index: idx,
-                totalMatches: matches.length
-            }});
-        }})()"#,
-        selector = escaped_selector,
-        index = index
-    );
+/// The candidates `click-by-text` resolves among, in document order: the
+/// visible `tag` elements whose trimmed text equals `text` case-sensitively
+/// (`exact`), or else contains it case-insensitively.
+fn click_by_text_find_expr(text: &str, tag: &str, exact: bool) -> String {
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_tag = tag.replace('\\', "\\\\").replace('\'', "\\'");
+    let match_expr = if exact {
+        format!("el.textContent.trim() === '{escaped_text}'")
+    } else {
+        format!(
+            "el.textContent.trim().toLowerCase().includes('{}')",
+            escaped_text.to_lowercase()
+        )
+    };
+    format!(
+        "Array.from(document.querySelectorAll('{escaped_tag}'))\
+         .filter(el => el.offsetParent !== null && {match_expr})"
+    )
+}
 
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "click-by-selector",
-            "click result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+/// The candidates `click-by-selector` resolves among, in document order: the
+/// visible elements `selector` matches.
+fn click_by_selector_find_expr(selector: &str) -> String {
+    let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    format!(
+        "Array.from(document.querySelectorAll('{escaped}')).filter(el => el.offsetParent !== null)"
+    )
+}
+
+/// The action a click-by route asks the SDK executor for: the `click` the
+/// element route sends, so the executor's click gates apply exactly as they do
+/// there. In the pinned SDK (0.36.0) they refuse a disabled target (the
+/// `disabled` property, `aria-disabled`, `pointer-events: none`) and one that is
+/// not visible. They do not refuse a target another element covers: until the
+/// SDK's occlusion gate (its Phase 4) ships and the runner's pin moves (plan
+/// Phase 8), a covered click still answers `clicked: true`.
+fn click_action() -> serde_json::Value {
+    serde_json::json!({ "action": "click" })
+}
+
+/// The click-by routes' common tail, once a route has built the candidates it
+/// matches (`find_expr`): resolve and mark the `index`-th one, click the marked
+/// node through the SDK executor and release the marker ([`resolve_then_act`]),
+/// the same three steps `type-into` takes.
+///
+/// The routes used to click inside the evaluated script itself (`el.click()`),
+/// where no executor gate ever ran: a click on a disabled button answered
+/// `clicked: true`. A resolved miss is still the documented HTTP 200
+/// carrying `clicked: false` (CONTRACT.md, "Still open"). An SDK refusal (which
+/// clicks the SDK refuses is [`click_action`]'s to say) is a 4xx that keeps the
+/// SDK's `failureDetails` ([`click_by_response`]).
+async fn click_resolved_element(
+    state: &Arc<ApiState>,
+    route: &str,
+    find_expr: &str,
+    index: u64,
+    no_match: &str,
+    window_label: &str,
+) -> ActionResult {
+    match resolve_then_act(state, route, find_expr, index, click_action(), window_label).await? {
+        ResolvedAction::Miss(miss) => Ok(Json(ApiResponse::success(click_by_miss(
+            &miss, no_match, index,
+        )))),
+        ResolvedAction::Acted { target, reply } => click_by_response(route, &target, reply),
     }
+}
+
+/// The documented HTTP 200 answer to a resolved miss: `clicked: false`, with
+/// the route's own message, or the out-of-range index and the match count.
+fn click_by_miss(resolved: &serde_json::Value, no_match: &str, index: u64) -> serde_json::Value {
+    match resolved.get("matchCount").and_then(|v| v.as_u64()) {
+        Some(found) => serde_json::json!({
+            "clicked": false,
+            "error": format!("Index {index} out of range (found {found})"),
+        }),
+        None => serde_json::json!({ "clicked": false, "error": no_match }),
+    }
+}
+
+/// Turn the SDK's reply to a click-by route's click into the route's answer.
+///
+/// [`marked_action_outcome`] decides whether the executor clicked the node the
+/// route marked. An SDK refusal, a target that left the page between the steps
+/// and a click the SDK reached some other way are each a 4xx, and none says
+/// `clicked: true`. Only a click the executor performed on the marked node
+/// answers `clicked: true`, with what the resolution step found and the SDK's
+/// own `durationMs` and `consoleErrors`.
+fn click_by_response(
+    route: &str,
+    target: &MarkedTarget,
+    reply: Result<serde_json::Value, String>,
+) -> ActionResult {
+    let action_data = marked_action_outcome(route, "click", target, reply)?;
+    let resolved = &target.resolved;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "clicked": true,
+        "tag": resolved.get("tag"),
+        "text": resolved.get("text"),
+        "index": resolved.get("index"),
+        "totalMatches": resolved.get("totalMatches"),
+        "selector": resolved.get("path"),
+        "durationMs": action_data.get("durationMs"),
+        "consoleErrors": action_data.get("consoleErrors"),
+    }))))
 }
 
 /// Validate the `all` parameter of `read-value`.
@@ -4480,24 +4579,34 @@ pub async fn ui_bridge_read_value_handler(
     }
 }
 
-/// Build the element-RESOLUTION expression for `type-into`.
+/// Build the element-RESOLUTION expression of the two-step page routes
+/// (`type-into`, `click-by-text`, `click-by-selector`): this step finds the
+/// target, and the second hands it to the SDK executor through `execute_action`
+/// ([`resolve_then_act`]).
 ///
-/// The returned JS answers a JSON object and mutates nothing beyond scrolling
-/// the hit into view:
+/// The returned JS answers a JSON object. It changes the page in two ways only:
+/// it scrolls the hit into view, and it marks the hit with the one-shot
+/// [`TARGET_MARKER_ATTRIBUTE`] = `marker`.
 ///
-///   - hit  → `{found: true, path, tag, id, testId, index}`
-///   - miss → `{found: false, error, matchCount?}`
+///   - hit  → `{found: true, path, tag, id, testId, text, index, totalMatches}`
+///   - miss → `{found: false, error, matchCount?}` (nothing is marked)
 ///
-/// `path` is a selector that resolves to **exactly** this element (a unique
-/// `#id` where one exists, otherwise a full `:nth-of-type` path from `html`).
-/// That is what the SDK's `findElementByIdentifier` accepts in place of a
-/// registered element id, so it is how a raw `<input>` — which never appears in
-/// the UI Bridge element registry — becomes addressable by `execute_action`.
-/// A synthesized path is used even when the caller's own selector would do,
-/// because `findElementByIdentifier` tries `[data-testid=…]` and `#id` BEFORE
-/// `querySelector`, so a bare selector like `email` could silently address a
-/// different element than the one this step resolved.
-fn type_into_resolve_js(find_expr: &str, index: u64) -> String {
+/// The marker is what the second step addresses ([`target_selector`]), so the
+/// action reaches THIS node or none. The two steps are separate IPC round trips,
+/// and a selector re-resolved in the second one can match another node by then:
+/// content inserted above the target, or a virtualized list shifting its rows
+/// after the scroll. If the marked node is gone, the SDK answers element-not-found,
+/// which the route reports as a stale target ([`marked_action_outcome`]) rather
+/// than acting on whatever now sits at the old path. [`release_target_marker`]
+/// removes the marker after the second step.
+///
+/// `path` is what the routes REPORT as the target's selector: one that resolved
+/// to exactly this element at resolution time (a unique `#id` where one exists,
+/// otherwise a full `:nth-of-type` path from `html`). A selector, the marker's
+/// included, is what the SDK's `findElementByIdentifier` accepts in place of a
+/// registered element id, which is how a raw `<input>`, never in the UI Bridge
+/// element registry, becomes addressable by `execute_action`.
+fn element_path_resolve_js(find_expr: &str, index: u64, marker: &str) -> String {
     format!(
         r#"(() => {{
             const matches = Array.from({find_expr}).filter(el => el);
@@ -4533,6 +4642,7 @@ fn type_into_resolve_js(find_expr: &str, index: u64) -> String {
                 }}
                 path = ['html'].concat(parts).join(' > ');
             }}
+            el.setAttribute('{TARGET_MARKER_ATTRIBUTE}', '{marker}');
             el.scrollIntoView({{ block: 'center' }});
             return JSON.stringify({{
                 found: true,
@@ -4540,30 +4650,485 @@ fn type_into_resolve_js(find_expr: &str, index: u64) -> String {
                 tag: el.tagName,
                 id: el.id || null,
                 testId: el.getAttribute('data-testid'),
-                index: idx
+                text: (el.textContent || '').trim().slice(0, 100),
+                index: idx,
+                totalMatches: matches.length
             }});
         }})()"#
     )
 }
 
-/// Build the `execute_action` IPC payload that hands the value mutation to the
-/// SDK's `applyValueMutation` (native prototype setter chosen by element kind,
-/// `_valueTracker` reset, `input`, the direct `__reactProps$.onChange` call,
-/// then `change`).
+/// The attribute step 1 of the two-step page routes sets on the node it
+/// resolved, valued with a one-shot marker ([`new_target_marker`]), and that
+/// step 2 addresses ([`target_selector`]). The name is the runner's own; the
+/// SDK's attributes are `data-ui-bridge-*`.
+const TARGET_MARKER_ATTRIBUTE: &str = "data-qontinui-target";
+
+/// The `elementResolution.strategy` the SDK executor reports when its
+/// `findElementByIdentifier` produced the node it acted on. For a
+/// [`target_selector`] it is the only strategy that reaches the marked node.
+/// The executor tries its element registry before it and its CTR, discovery
+/// cache and page sentinels after it, and each of those is keyed by something
+/// other than the marker, so a node any of them produced is not one the marker
+/// bound.
+const MARKED_TARGET_STRATEGY: &str = "element-identifier";
+
+/// A fresh marker for one request: `t` and a v4 UUID's 32 hex digits.
+///
+/// Fresh per request, so no other request's marker, and no stale one a failed
+/// release left behind, addresses this request's node. Letter-led and
+/// alphanumeric, so [`target_selector`] needs no quotes. The SDK's
+/// `findElementByIdentifier` interpolates an identifier unescaped into
+/// `[data-testid="…"]` before it tries `querySelector`, so a `"` in it would
+/// throw there instead of resolving.
+fn new_target_marker() -> String {
+    format!("t{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The selector step 2 sends as `elementId`: the node carrying `marker`.
+///
+/// `findElementByIdentifier` tries the identifier as a `data-ui-bridge-test-id`,
+/// a `data-testid`, a `data-awas-element` and an `#id` before it runs it as a
+/// selector, and no page gives an element an attribute or id equal to this
+/// string, so the selector run is the lookup that answers.
+fn target_selector(marker: &str) -> String {
+    format!("[{TARGET_MARKER_ATTRIBUTE}={marker}]")
+}
+
+/// The JS that removes `marker` from every node carrying it, answering how many
+/// it released: `{released: n}`.
+fn release_target_marker_js(marker: &str) -> String {
+    let selector = target_selector(marker);
+    format!(
+        r#"(() => {{
+            const marked = document.querySelectorAll('{selector}');
+            marked.forEach(el => el.removeAttribute('{TARGET_MARKER_ATTRIBUTE}'));
+            return JSON.stringify({{ released: marked.length }});
+        }})()"#
+    )
+}
+
+/// Step 3 of a two-step page route: remove the marker step 1 set, so the page
+/// the caller observes next carries no trace of this request.
+///
+/// Best-effort. The route answers with the action's outcome, which a failed
+/// release does not change, and a marker left behind is inert: its value is
+/// this request's alone, so nothing addresses it again. A failure is logged.
+async fn release_target_marker(
+    state: &Arc<ApiState>,
+    route: &str,
+    marker: &str,
+    window_label: &str,
+) {
+    let release_js = release_target_marker_js(marker);
+    if let Err(e) = evaluate_js_expression_in_window(state, &release_js, window_label).await {
+        warn!("UI Bridge API: {route}: target marker {marker} was not released: {e}");
+    }
+}
+
+/// What step 1 of a two-step page route resolved and marked: its report
+/// (`path`, `tag`, `id`, `testId`, `text`, `index`, `totalMatches`; see
+/// [`element_path_resolve_js`]) and the marker it set on that node.
+struct MarkedTarget {
+    marker: String,
+    resolved: serde_json::Value,
+}
+
+impl MarkedTarget {
+    /// The selector the routes report for the target: the unique path step 1
+    /// computed. [`resolve_mark_and_act`] admits no hit without one.
+    fn reported_selector(&self) -> &str {
+        self.resolved
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    }
+
+    /// The target as a caller would recognise it, for messages: its tag, its
+    /// text when it has any, and the reported selector.
+    fn describe(&self) -> String {
+        let tag = self
+            .resolved
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("element");
+        let selector = self.reported_selector();
+        match self.resolved.get("text").and_then(|v| v.as_str()) {
+            Some(text) if !text.is_empty() => format!("{tag} {text:?} at {selector}"),
+            _ => format!("{tag} at {selector}"),
+        }
+    }
+
+    /// The target as a typed failure's `error_detail.context.resolved` names
+    /// it: what step 1 found, and the selector the route reports.
+    fn context_record(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tag": self.resolved.get("tag"),
+            "id": self.resolved.get("id"),
+            "testId": self.resolved.get("testId"),
+            "text": self.resolved.get("text"),
+            "selector": self.reported_selector(),
+        })
+    }
+}
+
+/// How the first two steps of a two-step page route ended.
+enum ResolvedAction {
+    /// Step 1 found no `index`-th match: `{found: false, error, matchCount?}`.
+    Miss(serde_json::Value),
+    /// Step 1 marked `target` and step 2 sent it the action. `reply` is the
+    /// SDK's answer, or the transport's failure.
+    Acted {
+        target: MarkedTarget,
+        reply: Result<serde_json::Value, String>,
+    },
+}
+
+/// The three steps of the two-step page routes (`type-into`, `click-by-text`,
+/// `click-by-selector`).
+///
+/// 1. Resolve the `index`-th candidate of `find_expr` and mark it
+///    ([`element_path_resolve_js`] with a [`new_target_marker`]).
+/// 2. Send `action` to the SDK executor, aimed at the marked node
+///    ([`marked_action_payload`]), so every executor gate applies.
+/// 3. Release the marker ([`release_target_marker`]) on every path the handler
+///    completes once step 1 was attempted: a hit, a miss, an evaluation that
+///    failed or answered something unparseable, and whatever step 2 answered.
+///    A miss marks nothing, but releasing after it costs one evaluation and
+///    spares every path an argument about how far the script got. A handler
+///    that does not complete (its future dropped when the client disconnects)
+///    releases nothing, and a resolution script the webview runs after the
+///    runner stopped waiting for it can set its marker after the release ran.
+///    Either leaves an inert marker behind ([`release_target_marker`]).
+async fn resolve_then_act(
+    state: &Arc<ApiState>,
+    route: &str,
+    find_expr: &str,
+    index: u64,
+    action: serde_json::Value,
+    window_label: &str,
+) -> Result<ResolvedAction, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+    let marker = new_target_marker();
+    let outcome = resolve_mark_and_act(
+        state,
+        route,
+        find_expr,
+        index,
+        action,
+        window_label,
+        &marker,
+    )
+    .await;
+    release_target_marker(state, route, &marker, window_label).await;
+    outcome
+}
+
+/// Steps 1 and 2 of [`resolve_then_act`], which owns `marker` and releases it.
+async fn resolve_mark_and_act(
+    state: &Arc<ApiState>,
+    route: &str,
+    find_expr: &str,
+    index: u64,
+    action: serde_json::Value,
+    window_label: &str,
+    marker: &str,
+) -> Result<ResolvedAction, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+    let resolve_js = element_path_resolve_js(find_expr, index, marker);
+    let raw = evaluate_js_expression_in_window(state, &resolve_js, window_label)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value>::error(e)),
+            )
+        })?;
+    // An unparseable eval result is the runner-side failure it is, never a
+    // result. `type-into` used to answer one with HTTP 200
+    // `{"typed": false, "error": "Parse error"}`, a success for a call that
+    // demonstrably never ran; `parse_eval_result` is the shared form of that
+    // rule.
+    let resolved =
+        parse_eval_result(route, "element-resolution result", &raw).map_err(widen_flat_error)?;
+    if resolved.get("found").and_then(|v| v.as_bool()) != Some(true) {
+        return Ok(ResolvedAction::Miss(resolved));
+    }
+    if resolved.get("path").and_then(|v| v.as_str()).is_none() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(format!(
+                "{route}: element resolution returned no addressable path"
+            ))),
+        ));
+    }
+    let target = MarkedTarget {
+        marker: marker.to_string(),
+        resolved,
+    };
+    let reply = ui_bridge_request_sync_in_window(
+        state,
+        "execute_action",
+        marked_action_payload(&target.marker, action),
+        window_label,
+    )
+    .await;
+    Ok(ResolvedAction::Acted { target, reply })
+}
+
+/// The `execute_action` IPC payload of step 2: `action` aimed at the node step 1
+/// marked. Its `elementId` is the marker's [`target_selector`], never the
+/// `path` step 1 reports, so the executor reaches that node or none.
 ///
 /// Field names match what `useControlEvents.ts::execute_action` destructures
 /// (`{ elementId, action }`), not the `{id, action, params}` spelling a couple
-/// of older Rust call sites still use. `clear` maps to the SDK's
-/// `clear-then-append` mode and its absence to `append`, which is exactly the
-/// `clear ? text : el.value + text` semantics this endpoint has always had.
-fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_json::Value {
+/// of older Rust call sites still use.
+fn marked_action_payload(marker: &str, action: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
-        "elementId": element_id,
-        "action": {
-            "action": "type",
-            "params": { "text": text, "clear": clear },
-        },
+        "elementId": target_selector(marker),
+        "action": action,
     })
+}
+
+/// Why [`marked_action_outcome`] answers `ELEMENT_STALE`.
+enum StaleTarget {
+    /// The SDK found no node carrying the marker: the target left the page
+    /// between the steps, and the SDK performed nothing.
+    Gone,
+    /// The SDK performed the action on a node it reached through this
+    /// strategy, not through the marker.
+    ReachedAnotherWay(String),
+}
+
+/// Step 2's verdict, shared by the two-step page routes: the SDK's reply to
+/// `action` (`click`, `type`) on the marked target, as the action data of an
+/// action performed on that node, or the route's typed 4xx.
+///
+/// - The reply goes through [`wrap_element_action_ipc`], so an SDK refusal is a
+///   4xx that keeps the SDK's `failureDetails` under `data`, coded the way the
+///   element route codes the same refusal ([`refused_action_failure`]).
+/// - The SDK names the target by the marker's selector, which denotes nothing
+///   once the marker is released. Every string of its reply names the target
+///   by the reported selector instead, as the route's own answer does.
+/// - An SDK element-not-found (or stale) answer for the marker means the marked
+///   node left the page between the steps. It is `ELEMENT_STALE`, with the
+///   resolved target in `error_detail.context`, not the SDK's "never registered
+///   or discovered", which is false of a node step 1 just found.
+/// - Defence in depth behind the binding, on a reply that performed the action.
+///   The SDK's success reply carries no tag, id or `data-testid` of the node it
+///   acted on (its `elementState` is a state record), so the identity it can
+///   report is how it found that node, `elementResolution.strategy`. Only
+///   [`MARKED_TARGET_STRATEGY`] reaches the marked node, so any other strategy
+///   is an action on a node step 1 did not mark. The route answers
+///   `ELEMENT_STALE` with `action_dispatched: true` rather than report the
+///   resolved node as acted on. A reply that names no strategy shows nothing
+///   either way and does not fire this refusal.
+fn marked_action_outcome(
+    route: &str,
+    action: &str,
+    target: &MarkedTarget,
+    reply: Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+    let marker_selector = target_selector(&target.marker);
+    let reported = target.reported_selector();
+    let reply = reply
+        .map(|data| rename_in_strings(data, &marker_selector, reported))
+        .map_err(|e| e.replace(&marker_selector, reported));
+    match wrap_element_action_ipc(reply) {
+        Err((status, Json(body))) => {
+            let sdk_code = body
+                .data
+                .as_ref()
+                .and_then(|data| data.pointer("/failureDetails/errorCode"))
+                .and_then(|v| v.as_str());
+            if matches!(sdk_code, Some("UB-ELEM-NOT-FOUND" | "UB-STALE-ELEMENT")) {
+                Err(stale_target_failure(
+                    route,
+                    action,
+                    target,
+                    StaleTarget::Gone,
+                    body.data,
+                ))
+            } else {
+                Err(refused_action_failure(route, action, target, status, body))
+            }
+        }
+        Ok(Json(performed)) => {
+            let data = performed.data.unwrap_or(serde_json::Value::Null);
+            let strategy = data
+                .pointer("/elementResolution/strategy")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            match strategy {
+                Some(strategy) if strategy != MARKED_TARGET_STRATEGY => Err(stale_target_failure(
+                    route,
+                    action,
+                    target,
+                    StaleTarget::ReachedAnotherWay(strategy),
+                    Some(data),
+                )),
+                _ => Ok(data),
+            }
+        }
+    }
+}
+
+/// An SDK refusal on a two-step page route, coded the way the element route
+/// codes the same refusal ([`as_action_failure`]).
+///
+/// The runner's message classifier (`classify_transport_error`) recognises none
+/// of the SDK's refusal prose (`UB-ELEM-DISABLED`'s "element is disabled …",
+/// `UB-ELEM-NOT-VISIBLE`'s, a `type` aimed at a non-input element), so the wrap
+/// codes such a refusal `INTERNAL_ERROR` at HTTP 400, a runner fault, which it is
+/// not. At HTTP 400 that code is re-coded `ACTION_FAILED`, with its `RESNAPSHOT`
+/// recovery; a code the classifier did derive is kept. `error_detail.context`
+/// gains the route, the requested action and the resolved target. The SDK's
+/// payload stays under `data`. Any other status (the webview never answered, or
+/// a dependency answered badly) is returned unchanged, as the element route
+/// leaves it.
+fn refused_action_failure(
+    route: &str,
+    action: &str,
+    target: &MarkedTarget,
+    status: StatusCode,
+    mut body: ApiResponse<serde_json::Value>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    if status == StatusCode::BAD_REQUEST {
+        if let Some(mut detail) = body.error_detail.take() {
+            if matches!(detail.code, super::types::UiBridgeErrorCode::InternalError) {
+                detail.code = super::types::UiBridgeErrorCode::ActionFailed;
+                detail.recovery = Some(super::types::recovery_hint_for(&detail.code));
+            }
+            let mut context = match detail.context.take() {
+                Some(serde_json::Value::Object(map)) => map,
+                _ => serde_json::Map::new(),
+            };
+            context
+                .entry("route")
+                .or_insert_with(|| serde_json::Value::String(route.to_string()));
+            context
+                .entry("requested_action")
+                .or_insert_with(|| serde_json::Value::String(action.to_string()));
+            context
+                .entry("resolved")
+                .or_insert_with(|| target.context_record());
+            detail.context = Some(serde_json::Value::Object(context));
+            body.error_detail = Some(detail);
+        }
+    }
+    (status, Json(body))
+}
+
+/// The typed 4xx of [`marked_action_outcome`]: `ELEMENT_STALE`, its message
+/// naming the resolved target, `error_detail.context` carrying it and whether
+/// the action was dispatched, and the SDK's reply as `data`.
+fn stale_target_failure(
+    route: &str,
+    action: &str,
+    target: &MarkedTarget,
+    why: StaleTarget,
+    data: Option<serde_json::Value>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let described = target.describe();
+    let (message, dispatched, strategy) = match why {
+        StaleTarget::Gone => (
+            format!(
+                "{route}: {described} left the page before the `{action}` reached it; \
+                 the SDK did not perform it"
+            ),
+            false,
+            None,
+        ),
+        StaleTarget::ReachedAnotherWay(strategy) => (
+            format!(
+                "{route}: the SDK performed the `{action}` on an element it reached through \
+                 its '{strategy}' lookup, not through {described}, the element this route \
+                 resolved; nothing shows the `{action}` landed on that element"
+            ),
+            true,
+            Some(strategy),
+        ),
+    };
+    let mut context = serde_json::json!({
+        "route": route,
+        "requested_action": action,
+        "action_dispatched": dispatched,
+        "resolved": target.context_record(),
+    });
+    if let Some(strategy) = strategy {
+        context["sdk_resolution_strategy"] = serde_json::Value::String(strategy);
+    }
+    let code = super::types::UiBridgeErrorCode::ElementStale;
+    let detail = UiBridgeError {
+        code,
+        message: message.clone(),
+        recovery: Some(super::types::recovery_hint_for(&code)),
+        context: Some(context),
+    };
+    let mut body = ApiResponse::<serde_json::Value>::error_detailed(message, detail);
+    body.data = data;
+    (status_for_inner_failure(&code), Json(body))
+}
+
+/// `value` with `from` replaced by `to` in every string it holds; object keys
+/// are left alone.
+fn rename_in_strings(value: serde_json::Value, from: &str, to: &str) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(s.replace(from, to)),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| rename_in_strings(item, from, to))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (key, rename_in_strings(item, from, to)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// The `type` action type-into asks the SDK executor for. It hands the value
+/// mutation to the SDK's `applyValueMutation` (native prototype setter chosen
+/// by element kind, `_valueTracker` reset, `input`, the direct
+/// `__reactProps$.onChange` call, then `change`).
+///
+/// `clear` maps to the SDK's `clear-then-append` mode and its absence to
+/// `append`, which is exactly the `clear ? text : el.value + text` semantics
+/// this endpoint has always had.
+fn type_into_action(text: &str, clear: bool) -> serde_json::Value {
+    serde_json::json!({
+        "action": "type",
+        "params": { "text": text, "clear": clear },
+    })
+}
+
+/// Turn the SDK's reply to type-into's `type` into the route's answer.
+///
+/// [`marked_action_outcome`] decides whether the executor typed into the node
+/// the route marked: an SDK refusal (a non-input element, say), a target that
+/// left the page between the steps and a `type` the SDK reached some other way
+/// are each a 4xx. The success payload is the SDK's declared `typeInto`
+/// contract (`{typed, element}`) plus `index`, `durationMs` and `consoleErrors`.
+fn type_into_response(
+    target: &MarkedTarget,
+    index: u64,
+    reply: Result<serde_json::Value, String>,
+) -> ActionResult {
+    let action_data = marked_action_outcome("type-into", "type", target, reply)?;
+    let resolved = &target.resolved;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "typed": true,
+        "index": index,
+        "element": {
+            "tag": resolved.get("tag"),
+            "id": resolved.get("id"),
+            "testId": resolved.get("testId"),
+            "selector": target.reported_selector(),
+        },
+        "durationMs": action_data.get("durationMs"),
+        "consoleErrors": action_data.get("consoleErrors"),
+    }))))
 }
 
 /// Journey ledger choke point (plan
@@ -4572,7 +5137,7 @@ fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_
 pub async fn ui_bridge_type_into_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let action = crate::journey::cursor::ActionSpec::untargeted_element("type_into");
     let result = ui_bridge_type_into_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
     crate::journey::capture::record_control_result(&state, &result, action);
@@ -4603,11 +5168,11 @@ pub async fn ui_bridge_type_into_handler(
 ///      deliberately in `performType`.
 ///
 /// So the mutation is gone and the endpoint is now two steps: resolve the
-/// selector/label/index to a uniquely-addressable path
-/// ([`type_into_resolve_js`]), then dispatch `execute_action` `type`
-/// ([`type_into_action_payload`]). All addressing modes survive — `index` and
-/// `label` are resolved here because `findElementByIdentifier` only ever
-/// returns the FIRST `querySelector` hit.
+/// selector/label/index and mark the node it names ([`element_path_resolve_js`]),
+/// then dispatch `execute_action` `type` ([`type_into_action`]) at the marked
+/// node, releasing the marker after ([`resolve_then_act`]). All addressing modes
+/// survive — `index` and `label` are resolved here because
+/// `findElementByIdentifier` only ever returns the FIRST `querySelector` hit.
 ///
 /// Response shape follows the SDK's declared `typeInto` contract
 /// (`{typed, element?}`) plus `index`. The old `valueLength` field is gone:
@@ -4617,7 +5182,7 @@ pub async fn ui_bridge_type_into_handler(
 async fn ui_bridge_type_into_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let selector = body.get("selector").and_then(|v| v.as_str());
     let label = body.get("label").and_then(|v| v.as_str());
     let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -4631,7 +5196,7 @@ async fn ui_bridge_type_into_handler_dispatch(
         Some(other) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
+                Json(ApiResponse::error(format!(
                     "'text' must be a string (the characters to type); got {other}"
                 ))),
             ));
@@ -4639,7 +5204,7 @@ async fn ui_bridge_type_into_handler_dispatch(
         None => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(
+                Json(ApiResponse::error(
                     "'text' field is required (the characters to type). To blank a \
                      field, send 'clear': true with 'text': \"\".",
                 )),
@@ -4663,72 +5228,32 @@ async fn ui_bridge_type_into_handler_dispatch(
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error("'selector' or 'label' field is required")),
+            Json(ApiResponse::error(
+                "'selector' or 'label' field is required",
+            )),
         ));
     };
 
-    // Optional `windowLabel` scopes BOTH steps to a pop-out window (Phase 4 of
+    // Optional `windowLabel` scopes every step to a pop-out window (Phase 4 of
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
     let window_label = read_window_label(&body);
 
-    // ── Step 1: resolve ──────────────────────────────────────────────────
-    let resolve_js = type_into_resolve_js(&find_expr, index);
-    let raw = evaluate_js_expression_in_window(&state, &resolve_js, window_label)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    // An unparseable eval result used to become
-    // `ApiResponse::success({"typed": false, "error": "Parse error"})` — an
-    // HTTP 200 for a call that demonstrably never ran. Report the runner-side
-    // failure it actually is. `parse_eval_result` is the shared form of that
-    // rule, so the four sibling routes that kept the laundering arm answer the
-    // same way.
-    let resolved = parse_eval_result("type-into", "element-resolution result", &raw)?;
-
-    if resolved.get("found").and_then(|v| v.as_bool()) != Some(true) {
-        let message = resolved
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("No elements found")
-            .to_string();
-        return Err((StatusCode::BAD_REQUEST, Json(api_error(message))));
+    // Resolve and mark the target, have the SDK type into the marked node,
+    // release the marker.
+    let action = type_into_action(&text, clear);
+    match resolve_then_act(&state, "type-into", &find_expr, index, action, window_label).await? {
+        // type-into alone answers a miss with HTTP 400 (CONTRACT.md, "Still
+        // open").
+        ResolvedAction::Miss(miss) => {
+            let message = miss
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("No elements found")
+                .to_string();
+            Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(message))))
+        }
+        ResolvedAction::Acted { target, reply } => type_into_response(&target, index, reply),
     }
-    let element_path = resolved
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(
-                    "type-into: element resolution returned no addressable path",
-                )),
-            )
-        })?;
-
-    // ── Step 2: mutate, via the SDK ──────────────────────────────────────
-    let action_result = ui_bridge_request_sync_in_window(
-        &state,
-        "execute_action",
-        type_into_action_payload(element_path, &text, clear),
-        window_label,
-    )
-    .await;
-    // `wrap_ipc_result` flattens the SDK's own refusals (non-input element,
-    // element vanished between the two steps) into an honest HTTP 400.
-    let Json(action) = wrap_ipc_result(action_result)?;
-    let action_data = action.data.unwrap_or(serde_json::Value::Null);
-
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "typed": true,
-        "index": index,
-        "element": {
-            "tag": resolved.get("tag"),
-            "id": resolved.get("id"),
-            "testId": resolved.get("testId"),
-            "selector": element_path,
-        },
-        "durationMs": action_data.get("durationMs"),
-        "consoleErrors": action_data.get("consoleErrors"),
-    }))))
 }
 
 // =========================================================================
@@ -5529,12 +6054,18 @@ mod wait_for_element_dual_emit_tests {
     }
 }
 
-/// `type-into` — the two pure builders behind the resolve-then-`execute_action`
-/// split, and the UTF-8 passthrough (Item C) that used to depend on a
-/// hand-written JS string literal.
+/// `type-into` — the pure parts behind its resolve, mark and `execute_action`
+/// steps (the builders, the one-shot target marker its click-by siblings share,
+/// the answer built from the SDK's reply), and the UTF-8 passthrough (Item C)
+/// that used to depend on a hand-written JS string literal.
 #[cfg(test)]
 mod type_into_tests {
-    use super::{type_into_action_payload, type_into_resolve_js};
+    use super::{
+        element_path_resolve_js, marked_action_payload, new_target_marker,
+        release_target_marker_js, target_selector, type_into_action, type_into_response, Json,
+        MarkedTarget,
+    };
+    use crate::mcp::ui_bridge::request::extract_response_data;
     use serde_json::json;
 
     // ── Item C: UTF-8 passthrough ───────────────────────────────────────
@@ -5547,7 +6078,7 @@ mod type_into_tests {
     /// The `text` a caller sent must arrive at the SDK unchanged — no lossy
     /// `?` substitution, no literal-termination failure.
     fn typed_text(text: &str) -> String {
-        let payload = type_into_action_payload("#email", text, false);
+        let payload = marked_action_payload("t0", type_into_action(text, false));
         payload["action"]["params"]["text"]
             .as_str()
             .expect("text must be a JSON string")
@@ -5559,7 +6090,7 @@ mod type_into_tests {
         let text = "\u{0442}\u{0435}\u{0441}\u{0442}";
         assert_eq!(typed_text(text), text);
         // Crucially: no '?' substitution anywhere in the serialized payload.
-        let wire = type_into_action_payload("#email", text, false).to_string();
+        let wire = marked_action_payload("t0", type_into_action(text, false)).to_string();
         assert!(!wire.contains('?'), "lossy downgrade in: {wire}");
     }
 
@@ -5589,12 +6120,13 @@ mod type_into_tests {
     fn action_payload_matches_the_execute_action_contract() {
         // `useControlEvents.ts` destructures `{ elementId, action }` — the
         // `{id, action, params}` spelling some older Rust call sites use
-        // reaches that handler as `elementId: undefined`.
-        let payload = type_into_action_payload("html > body > input", "hello", true);
+        // reaches that handler as `elementId: undefined`. The id is the
+        // marker's selector: the SDK types into the node step 1 marked.
+        let payload = marked_action_payload("t1", type_into_action("hello", true));
         assert_eq!(
             payload,
             json!({
-                "elementId": "html > body > input",
+                "elementId": "[data-qontinui-target=t1]",
                 "action": {
                     "action": "type",
                     "params": { "text": "hello", "clear": true },
@@ -5605,8 +6137,100 @@ mod type_into_tests {
 
     #[test]
     fn action_payload_defaults_to_append_when_not_clearing() {
-        let payload = type_into_action_payload("#note", "more", false);
-        assert_eq!(payload["action"]["params"]["clear"], json!(false));
+        assert_eq!(
+            type_into_action("more", false)["params"]["clear"],
+            json!(false)
+        );
+    }
+
+    // ── The one-shot target marker ──────────────────────────────────────
+
+    #[test]
+    fn resolve_js_marks_the_node_it_resolves_and_nothing_on_a_miss() {
+        let js = element_path_resolve_js("document.querySelectorAll('input')", 0, "tq1");
+        let mark = "el.setAttribute('data-qontinui-target', 'tq1');";
+        let at = js
+            .find(mark)
+            .unwrap_or_else(|| panic!("the hit must be marked with this request's marker: {js}"));
+        assert_eq!(js.matches(mark).count(), 1, "one node is marked: {js}");
+        // Both miss answers return before the mark, so a miss marks nothing.
+        for miss in ["'No elements found'", "'Index out of range'"] {
+            let returned = js.find(miss).expect("the miss arms survive");
+            assert!(returned < at, "{miss} must return before the mark: {js}");
+        }
+        // The mark lands on the chosen match.
+        assert!(js.find("const el = matches[idx];").unwrap() < at, "{js}");
+    }
+
+    #[test]
+    fn release_js_removes_the_marker_from_every_node_carrying_it() {
+        let js = release_target_marker_js("tq1");
+        assert!(
+            js.contains("document.querySelectorAll('[data-qontinui-target=tq1]')"),
+            "the release finds every node carrying this marker: {js}"
+        );
+        assert!(
+            js.contains("el.removeAttribute('data-qontinui-target')"),
+            "the release removes the marker attribute: {js}"
+        );
+        assert!(
+            !js.contains("setAttribute"),
+            "the release sets nothing: {js}"
+        );
+    }
+
+    /// `resolve_then_act` releases the marker on every path it completes: its
+    /// top-level statements are steps 1 and 2 with no `?` that could leave the
+    /// function before the release, then the release itself, unconditional, then
+    /// the outcome. Proved from source, as `click_by_fallbacks_click_through_the_sdk_executor`
+    /// proves its handlers' dispatch: the steps need a live webview.
+    #[test]
+    fn resolve_then_act_releases_the_marker_on_every_path_it_completes() {
+        let body = include_str!("elements.rs")
+            .split("\nasync fn resolve_then_act(")
+            .nth(1)
+            .expect("resolve_then_act is defined in elements.rs")
+            .split("\n}\n")
+            .next()
+            .unwrap_or_default()
+            .split_once(")> {\n")
+            .map(|(_signature, body)| body)
+            .expect("resolve_then_act's signature ends where it did");
+        let top_level: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.starts_with("     "))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            top_level,
+            [
+                "let marker = new_target_marker();",
+                "let outcome = resolve_mark_and_act(",
+                ")",
+                ".await;",
+                "release_target_marker(state, route, &marker, window_label).await;",
+                "outcome",
+            ],
+            "resolve_then_act must release unconditionally between steps 1-2 and the return"
+        );
+    }
+
+    #[test]
+    fn target_markers_are_fresh_unquoted_css_identifiers() {
+        let (a, b) = (new_target_marker(), new_target_marker());
+        assert_ne!(a, b, "each request gets its own marker");
+        for marker in [&a, &b] {
+            // A letter, then 32 hex digits: a valid unquoted attribute value,
+            // with nothing `findElementByIdentifier`'s quoted lookups choke on.
+            let digits = marker
+                .strip_prefix('t')
+                .unwrap_or_else(|| panic!("letter-led: {marker}"));
+            assert_eq!(digits.len(), 32, "{marker}");
+            assert!(digits.chars().all(|c| c.is_ascii_hexdigit()), "{marker}");
+            let selector = target_selector(marker);
+            assert_eq!(selector, format!("[data-qontinui-target={marker}]"));
+            assert!(!selector.contains(['"', '\'', '\\']), "{selector}");
+        }
     }
 
     // ── The resolution expression ───────────────────────────────────────
@@ -5616,7 +6240,7 @@ mod type_into_tests {
         // The whole point of the split: this step reads and scrolls, it does
         // not type. Any value assignment here would be the duplicate coming
         // back.
-        let js = type_into_resolve_js("document.querySelectorAll('input')", 0);
+        let js = element_path_resolve_js("document.querySelectorAll('input')", 0, "t0");
         assert!(
             !js.contains(".value ="),
             "resolution step must not assign a value: {js}"
@@ -5633,7 +6257,7 @@ mod type_into_tests {
 
     #[test]
     fn resolve_js_reports_a_miss_rather_than_a_typed_success() {
-        let js = type_into_resolve_js("document.querySelectorAll('input')", 3);
+        let js = element_path_resolve_js("document.querySelectorAll('input')", 3, "t0");
         assert!(js.contains("found: false"));
         assert!(js.contains("'No elements found'"));
         assert!(js.contains("'Index out of range'"));
@@ -5647,35 +6271,176 @@ mod type_into_tests {
 
     #[test]
     fn resolve_js_honours_the_requested_index_and_find_expression() {
-        let js = type_into_resolve_js("document.querySelectorAll('textarea')", 2);
+        let js = element_path_resolve_js("document.querySelectorAll('textarea')", 2, "t0");
         assert!(js.contains("document.querySelectorAll('textarea')"));
         assert!(js.contains("const idx = 2;"));
     }
 
     #[test]
     fn resolve_js_trips_no_page_evaluate_blocklist_pattern() {
-        // The expression runs through `page_evaluate`, which rejects a fixed
+        // The expressions run through `page_evaluate`, which rejects a fixed
         // pattern set (`utils.ts::PAGE_EVALUATE_STRUCTURAL_PATTERNS` /
         // `..._NETWORK_PATTERNS`). A resolution step that cannot be evaluated
-        // is a dead endpoint.
-        let js = type_into_resolve_js("document.querySelectorAll('input')", 0);
-        for banned in [
-            "import(",
-            "require(",
-            "__proto__",
-            "constructor[",
-            "eval(",
-            "new Function",
-            "document.cookie",
-            "window.open",
-            "crypto.subtle",
-            "fetch(",
-            "XMLHttpRequest",
-            "sendBeacon",
-            "WebSocket",
+        // is a dead endpoint, and a release that cannot be evaluated leaves its
+        // marker behind.
+        for js in [
+            element_path_resolve_js("document.querySelectorAll('input')", 0, "t0"),
+            release_target_marker_js("t0"),
         ] {
-            assert!(!js.contains(banned), "blocklisted `{banned}` in: {js}");
+            for banned in [
+                "import(",
+                "require(",
+                "__proto__",
+                "constructor[",
+                "eval(",
+                "new Function",
+                "document.cookie",
+                "window.open",
+                "crypto.subtle",
+                "fetch(",
+                "XMLHttpRequest",
+                "sendBeacon",
+                "WebSocket",
+            ] {
+                assert!(!js.contains(banned), "blocklisted `{banned}` in: {js}");
+            }
         }
+    }
+
+    // ── Step 2's verdict (`type_into_response`) ─────────────────────────
+
+    /// What step 1 answered and marked for the field these tests type into.
+    fn email_field() -> MarkedTarget {
+        MarkedTarget {
+            marker: "temail".to_string(),
+            resolved: json!({
+                "found": true, "path": "#email", "tag": "INPUT", "id": "email",
+                "testId": "email-input", "text": "", "index": 0, "totalMatches": 1,
+            }),
+        }
+    }
+
+    /// The SDK's answer to the `type` as `ui_bridge_request_sync` hands it to
+    /// the route: `extract_response_data` over `useControlEvents.ts`'s envelope.
+    fn sdk_reply(response: serde_json::Value) -> Result<serde_json::Value, String> {
+        let mut envelope = json!({
+            "requestId": "req-3",
+            "type": "execute_action",
+            "success": response["success"].clone(),
+            "timestamp": 1_762_473_600_001_u64,
+        });
+        if let Some(error) = response.get("error") {
+            envelope["error"] = error.clone();
+        }
+        envelope["data"] = response;
+        Ok(extract_response_data(&envelope))
+    }
+
+    fn typed_via(strategy: &str, class: &str, rank: u64) -> serde_json::Value {
+        json!({
+            "success": true,
+            "elementResolution": {
+                "strategy": strategy, "stabilityClass": class, "stabilityRank": rank,
+            },
+            "durationMs": 5,
+            "timestamp": 1,
+        })
+    }
+
+    #[test]
+    fn type_into_reports_the_type_the_sdk_performed_on_the_marked_node() {
+        let Json(resp) = type_into_response(
+            &email_field(),
+            0,
+            sdk_reply(typed_via("element-identifier", "strong", 4)),
+        )
+        .expect("a type performed on the marked node is a success");
+        assert_eq!(
+            resp.data,
+            Some(json!({
+                "typed": true,
+                "index": 0,
+                "element": {
+                    "tag": "INPUT", "id": "email", "testId": "email-input", "selector": "#email",
+                },
+                "durationMs": 5,
+                "consoleErrors": null,
+            }))
+        );
+    }
+
+    #[test]
+    fn type_into_refuses_a_type_the_sdk_reached_another_way() {
+        let (status, Json(body)) = type_into_response(
+            &email_field(),
+            0,
+            sdk_reply(typed_via("registry-id", "exact", 7)),
+        )
+        .expect_err("a type into a node the marker did not bind is no type into it");
+        assert!(status.is_client_error(), "got {status}");
+        let wire = serde_json::to_value(&body).unwrap();
+        assert!(!wire.to_string().contains("\"typed\":true"), "{wire}");
+        assert_eq!(
+            wire.pointer("/error_detail/code"),
+            Some(&json!("ELEMENT_STALE")),
+            "{wire}"
+        );
+        let context = &wire["error_detail"]["context"];
+        assert_eq!(context["route"], json!("type-into"), "{wire}");
+        assert_eq!(context["requested_action"], json!("type"), "{wire}");
+        assert_eq!(context["action_dispatched"], json!(true), "{wire}");
+        assert_eq!(
+            context["sdk_resolution_strategy"],
+            json!("registry-id"),
+            "{wire}"
+        );
+        assert_eq!(
+            context["resolved"]["testId"],
+            json!("email-input"),
+            "{wire}"
+        );
+    }
+
+    #[test]
+    fn type_into_reports_a_field_that_left_the_page_as_stale() {
+        let message = "Element not found: [data-qontinui-target=temail]. Element \
+                       '[data-qontinui-target=temail]' was never registered or discovered.";
+        let gone = json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-NOT-FOUND",
+                "message": message,
+                "elementId": "[data-qontinui-target=temail]",
+                "suggestedActions": [],
+                "retryRecommended": true,
+                "durationMs": 1,
+            },
+            "durationMs": 1,
+            "timestamp": 1,
+        });
+        let (status, Json(body)) = type_into_response(&email_field(), 0, sdk_reply(gone))
+            .expect_err("no field to type into is no type");
+        assert!(status.is_client_error(), "got {status}");
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire.pointer("/error_detail/code"),
+            Some(&json!("ELEMENT_STALE")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/error_detail/context/action_dispatched"),
+            Some(&json!(false)),
+            "{wire}"
+        );
+        assert!(
+            wire["error"]
+                .as_str()
+                .unwrap()
+                .contains("INPUT at #email left the page"),
+            "{wire}"
+        );
+        assert!(!wire.to_string().contains("data-qontinui-target"), "{wire}");
     }
 }
 
@@ -6835,7 +7600,7 @@ mod action_not_supported_tests {
     //! change in lockstep, which is exactly the regression guard we want.
     use super::{
         advertise_custom_actions_in_element_response, advertise_custom_actions_in_payload,
-        api_error_detailed, as_action_failure, classify_transport_error, extract_custom_actions,
+        as_action_failure, classify_transport_error, extract_custom_actions,
         extract_supported_actions, fold_custom_actions_into_element, is_action_advertised,
         recovery_is_genuine, ActionResult, Json, StatusCode, UiBridgeError,
     };
@@ -7392,7 +8157,10 @@ mod action_not_supported_tests {
                    exited with code 0. Restart the session before writing to it.";
         let failure: ActionResult = Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, classify_transport_error(msg))),
+            Json(ApiResponse::error_detailed(
+                msg,
+                classify_transport_error(msg),
+            )),
         ));
         let recovery = serde_json::to_value(RecoveryOutcome {
             recovered: false,
@@ -7445,7 +8213,10 @@ mod action_not_supported_tests {
         let msg = "No element found matching '#ghost'";
         let failure: ActionResult = Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, classify_transport_error(msg))),
+            Json(ApiResponse::error_detailed(
+                msg,
+                classify_transport_error(msg),
+            )),
         ));
         let (_, Json(body)) =
             as_action_failure(failure, "click", "ghost", serde_json::Value::Null).unwrap_err();
@@ -7479,7 +8250,7 @@ mod action_not_supported_tests {
             let msg = format!("{code}: the handler's own diagnosis, verbatim");
             let failure: ActionResult = Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error_detailed(
+                Json(ApiResponse::error_detailed(
                     msg.clone(),
                     classify_transport_error(&msg),
                 )),
@@ -7513,7 +8284,10 @@ mod action_not_supported_tests {
         let msg = "UI Bridge frontend did not become ready";
         let failure: ActionResult = Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error_detailed(msg, classify_transport_error(msg))),
+            Json(ApiResponse::error_detailed(
+                msg,
+                classify_transport_error(msg),
+            )),
         ));
         let (status, Json(body)) =
             as_action_failure(failure, "click", "btn-1", serde_json::Value::Null).unwrap_err();
@@ -7600,6 +8374,759 @@ mod action_not_supported_tests {
             ctx.get("requested_action").and_then(|v| v.as_str()),
             Some("scrollIntoView"),
             "contract: context.requested_action echoes the rejected action"
+        );
+    }
+}
+
+#[cfg(test)]
+mod element_action_failure_payload_tests {
+    //! Plan
+    //! `2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it`,
+    //! Phase 6: an SDK action failure on `POST /ui-bridge/control/element/:id/action`
+    //! answers 4xx with the SDK's own failure payload under `data`, and so does
+    //! `POST /ui-bridge/control/page/type-into`, whose mutation step dispatches
+    //! the same `execute_action` IPC.
+    //!
+    //! Both routes used to flatten that reply through `wrap_ipc_result`, which
+    //! drops it: `failureDetails` (the SDK's canonical `errorCode`, the recovery
+    //! suggestions and, once the SDK's occlusion gate ships, the element
+    //! covering a refused click) never reached the caller, and the only code
+    //! left was the one the runner re-derives from the message.
+    //!
+    //! The routes need an `ApiState` (a live Tauri `AppHandle`) that no unit
+    //! test can build, so these tests enter at the seam both routes send every
+    //! `execute_action` reply through, `wrap_element_action_ipc`, fed what
+    //! `ui_bridge_request_sync` hands the route (`extract_response_data` over
+    //! the frontend's envelope), and follow the failure the rest of the way
+    //! each route takes it.
+    use super::{
+        as_action_failure, type_into_response, widen_flat_error, wrap_element_action_ipc,
+        wrap_ipc_result, Json, MarkedTarget, StatusCode,
+    };
+    use crate::mcp::ui_bridge::request::extract_response_data;
+    use serde_json::json;
+
+    /// The envelope `useControlEvents.ts` (`case "execute_action"`) sends when
+    /// the SDK's `executeAction` answers `success: false`: the SDK's response
+    /// whole under `data`, its `error` mirrored onto the envelope.
+    fn ipc_envelope(response: serde_json::Value) -> serde_json::Value {
+        let error = response["error"].clone();
+        json!({
+            "requestId": "req-7",
+            "type": "execute_action",
+            "success": false,
+            "data": response,
+            "error": error,
+            "timestamp": 1_762_473_600_001_u64,
+        })
+    }
+
+    /// The response the SDK executor will give, once its occlusion gate
+    /// (ui-bridge Phase 4) ships, to a click it refuses because another element
+    /// covers every sampled point of the target
+    /// (`buildActionFailureDetails('UB-ELEM-BLOCKED', …)` with `occludedBy` and
+    /// `occludedPct`). The pinned 0.36.0 has no such gate and performs that
+    /// click; the wrap forwards whatever `failureDetails` the SDK sends, so this
+    /// is the payload it will carry once the gate ships. Shaped like the
+    /// executor's failure return and the SDK's
+    /// `ActionFailureDetails` (`core/types.ts`), with the catalog's recovery
+    /// template for the code (`diagnostics/codes.json`, its "Close the modal or
+    /// popup" entry without the `command` the plan's B-D10 drops).
+    fn blocked_click_response() -> serde_json::Value {
+        let message = "Element 'btn-save' is blocked: div#modal-overlay covers every sampled point";
+        json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-BLOCKED",
+                "message": message,
+                "elementId": "btn-save",
+                "suggestedActions": [
+                    {
+                        "suggestion": "Close the modal or popup",
+                        "confidence": 0.9, "retryable": true, "priority": 1,
+                    },
+                    {
+                        "suggestion": "Dismiss the overlay",
+                        "confidence": 0.8, "retryable": true, "priority": 2,
+                    },
+                    {
+                        "suggestion": "Wait for the blocking element to disappear",
+                        "confidence": 0.6, "retryable": true, "priority": 3,
+                    },
+                ],
+                "retryRecommended": true,
+                "occludedBy": "div#modal-overlay",
+                "occludedPct": 100,
+                "durationMs": 14,
+            },
+            "durationMs": 14,
+            "timestamp": 1_762_473_600_000_u64,
+        })
+    }
+
+    #[test]
+    fn element_action_failure_keeps_the_sdk_failure_details() {
+        let reply = || extract_response_data(&ipc_envelope(blocked_click_response()));
+        let recovery = json!({ "recovered": false, "via": "none", "commandChosen": null });
+
+        // The element route's path: the dispatch's wrap, then the
+        // post-recovery re-coder every unrecovered failure passes through.
+        let (status, Json(body)) = as_action_failure(
+            wrap_element_action_ipc(Ok(reply())),
+            "click",
+            "btn-save",
+            recovery.clone(),
+        )
+        .expect_err("an SDK failure stays a failure");
+        assert!(status.is_client_error(), "got {status}");
+        let wire = serde_json::to_value(&body).unwrap();
+
+        // The SDK's diagnosis reaches the caller under `data`.
+        assert_eq!(
+            wire.pointer("/data/failureDetails/errorCode"),
+            Some(&json!("UB-ELEM-BLOCKED")),
+            "the SDK's failureDetails must survive the route: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/occludedBy"),
+            Some(&json!("div#modal-overlay")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/occludedPct"),
+            Some(&json!(100)),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/suggestedActions/0/suggestion"),
+            Some(&json!("Close the modal or popup")),
+            "{wire}"
+        );
+        // The verdict fields stay siblings of `data`, never duplicated into it.
+        assert!(
+            wire["data"].get("success").is_none() && wire["data"].get("error").is_none(),
+            "{wire}"
+        );
+
+        // Everything else is what the flat wrap answered: the same status, the
+        // same message and the same `error_detail` (its code still classified
+        // from the message, its recovery audit trail still attached).
+        let (flat_status, Json(flat_body)) = as_action_failure(
+            wrap_ipc_result(Ok(reply())).map_err(widen_flat_error),
+            "click",
+            "btn-save",
+            recovery,
+        )
+        .expect_err("the flat wrap fails it too");
+        let flat = serde_json::to_value(&flat_body).unwrap();
+        assert_eq!(status, flat_status);
+        assert_eq!(wire["error"], flat["error"], "{wire}");
+        assert_eq!(wire["error_detail"], flat["error_detail"], "{wire}");
+        assert!(
+            flat.get("data").is_none(),
+            "the flat wrap drops the payload: {flat}"
+        );
+    }
+
+    /// `type-into`'s mutation step answers the seam's failure with no recovery
+    /// ladder after it (`type_into_response`). A `type` aimed at a non-input
+    /// element is the SDK's own refusal (`performType`'s
+    /// `ActionValidationError`, which the executor's generic catch arm reports
+    /// as `UB-ACTION-FAILED`).
+    #[test]
+    fn type_into_element_action_failure_keeps_the_sdk_failure_details() {
+        let target = MarkedTarget {
+            marker: "tedit".to_string(),
+            resolved: json!({
+                "found": true, "path": "div.editor", "tag": "DIV", "id": null,
+                "testId": null, "text": "", "index": 0, "totalMatches": 1,
+            }),
+        };
+        let message = "Type action requires an input or textarea element";
+        let response = json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ACTION-FAILED",
+                "message": message,
+                "elementId": "[data-qontinui-target=tedit]",
+                "suggestedActions": [
+                    {
+                        "suggestion": "Check if the element is interactable",
+                        "confidence": 0.7, "retryable": false, "priority": 1,
+                    },
+                    {
+                        "suggestion": "Wait and retry the action",
+                        "command": "wait 1 second then retry",
+                        "confidence": 0.6, "retryable": true, "priority": 2,
+                    },
+                ],
+                "retryRecommended": true,
+                "context": { "action": "type" },
+                "durationMs": 2,
+            },
+            "durationMs": 2,
+            "timestamp": 1_762_473_600_000_u64,
+        });
+        let (status, Json(body)) = type_into_response(
+            &target,
+            0,
+            Ok(extract_response_data(&ipc_envelope(response))),
+        )
+        .expect_err("a refused type stays a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire["error"], json!(message), "{wire}");
+        // An action failure, as the element route codes the same refusal, never
+        // the classifier's `INTERNAL_ERROR` fallthrough for prose it does not know.
+        assert_eq!(
+            wire.pointer("/error_detail/code"),
+            Some(&json!("ACTION_FAILED")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/error_detail/context/route"),
+            Some(&json!("type-into")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/errorCode"),
+            Some(&json!("UB-ACTION-FAILED")),
+            "the SDK's failureDetails must survive type-into: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/context/action"),
+            Some(&json!("type")),
+            "{wire}"
+        );
+        // Named by the selector the route reports, not the released marker.
+        assert_eq!(
+            wire.pointer("/data/failureDetails/elementId"),
+            Some(&json!("div.editor")),
+            "{wire}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod click_by_routes_tests {
+    //! `POST /ui-bridge/control/page/click-by-text` and `/click-by-selector`
+    //! click THROUGH THE SDK EXECUTOR (plan
+    //! `2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it`).
+    //! They used to click inside the evaluated script (`el.click()`), where no
+    //! executor gate ran, so a click on a disabled button answered
+    //! `clicked: true`: user evidence no user could produce. (A target another
+    //! element covers is refused only once the SDK's occlusion gate ships and
+    //! the runner's pin moves; `covered_refusal` is the answer it will give.)
+    //!
+    //! The click is aimed at the node the resolution step MARKED, not at a path
+    //! re-resolved in the click's own IPC round trip, and a reply showing the
+    //! SDK reached its target some other way is no `clicked: true` either.
+    //!
+    //! The routes need an `ApiState` (a live Tauri `AppHandle`) that no unit
+    //! test can build, so these tests pin the parts each route is made of: the
+    //! script it evaluates (it resolves and marks a target and never clicks),
+    //! the click it sends (aimed at the marker), and the answer it builds from
+    //! the SDK's reply to that click (`click_by_response`).
+    use super::{
+        click_action, click_by_miss, click_by_response, click_by_selector_find_expr,
+        click_by_text_find_expr, element_path_resolve_js, marked_action_payload, Json,
+        MarkedTarget, StatusCode,
+    };
+    use crate::mcp::ui_bridge::request::extract_response_data;
+    use serde_json::json;
+
+    /// The marker the resolution step set on the button these tests click.
+    const MARKER: &str = "tsave";
+    /// The selector the click was sent to, so the one the SDK names it by.
+    const MARKER_SELECTOR: &str = "[data-qontinui-target=tsave]";
+
+    /// What the resolution step answered and marked for that button.
+    fn save_button() -> MarkedTarget {
+        MarkedTarget {
+            marker: MARKER.to_string(),
+            resolved: json!({
+                "found": true,
+                "path": "#save",
+                "tag": "BUTTON",
+                "id": "save",
+                "testId": null,
+                "text": "Save",
+                "index": 0,
+                "totalMatches": 1,
+            }),
+        }
+    }
+
+    /// The envelope `useControlEvents.ts` (`case "execute_action"`) sends for
+    /// the SDK's answer to the click: the SDK's response whole under `data`.
+    fn ipc_envelope(response: serde_json::Value) -> serde_json::Value {
+        let mut envelope = json!({
+            "requestId": "req-9",
+            "type": "execute_action",
+            "success": response["success"].clone(),
+            "timestamp": 1_762_473_600_001_u64,
+        });
+        if let Some(error) = response.get("error") {
+            envelope["error"] = error.clone();
+        }
+        envelope["data"] = response;
+        envelope
+    }
+
+    /// The SDK's reply as the route receives it.
+    fn sdk_reply(response: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(extract_response_data(&ipc_envelope(response)))
+    }
+
+    /// The executor's click-gate refusal of a disabled button
+    /// (`ElementDisabledError`, reported as `UB-ELEM-DISABLED`).
+    fn disabled_refusal() -> serde_json::Value {
+        let message = "element is disabled (disabled attribute); click was not dispatched";
+        json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-DISABLED",
+                "message": message,
+                "elementId": MARKER_SELECTOR,
+                "suggestedActions": [
+                    {
+                        "suggestion": "Fill in required fields first",
+                        "confidence": 0.8, "retryable": false, "priority": 1,
+                    },
+                    {
+                        "suggestion": format!("Wait for '{MARKER_SELECTOR}' to become enabled"),
+                        "command": "wait for element to be enabled",
+                        "confidence": 0.6, "retryable": true, "priority": 3,
+                    },
+                ],
+                "retryRecommended": true,
+                "disabledReason": "native",
+                "context": { "ariaDisabled": false, "nativeDisabled": true, "pointerEvents": "auto" },
+                "durationMs": 3,
+            },
+            "durationMs": 3,
+            "timestamp": 1_762_473_600_000_u64,
+        })
+    }
+
+    /// The refusal the executor will give, once the SDK's occlusion gate
+    /// (ui-bridge Phase 4) ships and the runner's pin moves (plan Phase 8), of a
+    /// click on a button another element covers at every sampled point
+    /// (`UB-ELEM-BLOCKED`). The pinned 0.36.0 performs that click.
+    fn covered_refusal() -> serde_json::Value {
+        let message = format!(
+            "Element '{MARKER_SELECTOR}' is blocked: div#modal-overlay covers every sampled point"
+        );
+        json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-BLOCKED",
+                "message": message,
+                "elementId": MARKER_SELECTOR,
+                "suggestedActions": [
+                    {
+                        "suggestion": "Close the modal or popup",
+                        "confidence": 0.9, "retryable": true, "priority": 1,
+                    },
+                ],
+                "retryRecommended": true,
+                "occludedBy": "div#modal-overlay",
+                "occludedPct": 100,
+                "durationMs": 9,
+            },
+            "durationMs": 9,
+            "timestamp": 1_762_473_600_000_u64,
+        })
+    }
+
+    /// The executor's answer when no node carries the marker any more: the
+    /// button left the page between the resolution and the click.
+    fn marked_node_gone() -> serde_json::Value {
+        let message = format!(
+            "Element not found: {MARKER_SELECTOR}. Element '{MARKER_SELECTOR}' was never \
+             registered or discovered. Check the ID is correct, ensure the page containing it \
+             is mounted, or use find()/discover() to locate it first."
+        );
+        json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-NOT-FOUND",
+                "message": message,
+                "elementId": MARKER_SELECTOR,
+                "suggestedActions": [],
+                "retryRecommended": true,
+                "durationMs": 1,
+            },
+            "durationMs": 1,
+            "timestamp": 1_762_473_600_000_u64,
+        })
+    }
+
+    /// The executor's answer to a click it performed, resolved the way its
+    /// reply names (`elementResolution`, `core/resolution-score.ts`).
+    fn performed_via(strategy: &str, class: &str, rank: u64) -> serde_json::Value {
+        json!({
+            "success": true,
+            "elementState": { "visible": true, "enabled": true, "textContent": "Save" },
+            "elementResolution": {
+                "strategy": strategy, "stabilityClass": class, "stabilityRank": rank,
+            },
+            "durationMs": 7,
+            "timestamp": 1,
+        })
+    }
+
+    #[test]
+    fn click_by_route_answers_an_sdk_refusal_never_clicked_true() {
+        for (refusal, code) in [
+            (disabled_refusal(), "UB-ELEM-DISABLED"),
+            (covered_refusal(), "UB-ELEM-BLOCKED"),
+        ] {
+            let (status, Json(body)) =
+                click_by_response("click-by-text", &save_button(), sdk_reply(refusal))
+                    .expect_err("a click the SDK refused is a failure");
+            assert!(status.is_client_error(), "{code}: got {status}");
+            let wire = serde_json::to_value(&body).unwrap();
+            assert_eq!(
+                wire.pointer("/data/failureDetails/errorCode"),
+                Some(&json!(code)),
+                "the SDK's refusal must reach the caller: {wire}"
+            );
+            assert!(
+                !wire.to_string().contains("\"clicked\":true"),
+                "a refused click must never answer clicked: true: {wire}"
+            );
+            // The SDK named the button by the marker, which is gone once the
+            // route releases it; the caller reads the selector the route reports.
+            assert_eq!(
+                wire.pointer("/data/failureDetails/elementId"),
+                Some(&json!("#save")),
+                "{wire}"
+            );
+            assert!(
+                !wire.to_string().contains("data-qontinui-target"),
+                "no released marker may reach the caller: {wire}"
+            );
+        }
+        // A transport failure (the webview never answered) is no click either.
+        let (status, Json(body)) = click_by_response(
+            "click-by-text",
+            &save_button(),
+            Err("UI Bridge frontend did not become ready".to_string()),
+        )
+        .expect_err("no answer is no click");
+        assert!(status.is_server_error(), "got {status}");
+        assert!(!serde_json::to_value(&body)
+            .unwrap()
+            .to_string()
+            .contains("\"clicked\":true"));
+    }
+
+    /// An SDK refusal is an action failure, coded the way the element route
+    /// codes the same refusal (`as_action_failure`). The runner's message
+    /// classifier knows none of the SDK's refusal prose, so the wrap hands the
+    /// route `INTERNAL_ERROR`, a runner fault; the route answers
+    /// `ACTION_FAILED` with the `RESNAPSHOT` recovery, the resolved target in
+    /// `error_detail.context`, and the SDK's payload still under `data`.
+    #[test]
+    fn click_by_route_answers_an_sdk_refusal_as_action_failed() {
+        let (status, Json(body)) = click_by_response(
+            "click-by-selector",
+            &save_button(),
+            sdk_reply(disabled_refusal()),
+        )
+        .expect_err("a click the SDK refused is a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire.pointer("/error_detail/code"),
+            Some(&json!("ACTION_FAILED")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/error_detail/recovery"),
+            Some(&json!("RESNAPSHOT")),
+            "{wire}"
+        );
+        let context = &wire["error_detail"]["context"];
+        assert_eq!(context["route"], json!("click-by-selector"), "{wire}");
+        assert_eq!(context["requested_action"], json!("click"), "{wire}");
+        assert_eq!(context["resolved"]["selector"], json!("#save"), "{wire}");
+        assert_eq!(context["resolved"]["tag"], json!("BUTTON"), "{wire}");
+        assert!(
+            context.get("action_dispatched").is_none(),
+            "a refusal claims nothing about what reached the UI: {wire}"
+        );
+        // The SDK's own message and diagnosis are the caller's to read.
+        assert_eq!(
+            wire["error"],
+            json!("element is disabled (disabled attribute); click was not dispatched"),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/errorCode"),
+            Some(&json!("UB-ELEM-DISABLED")),
+            "{wire}"
+        );
+    }
+
+    #[test]
+    fn click_by_route_reports_the_click_the_sdk_performed() {
+        let expected = json!({
+            "clicked": true,
+            "tag": "BUTTON",
+            "text": "Save",
+            "index": 0,
+            "totalMatches": 1,
+            "selector": "#save",
+            "durationMs": 7,
+            "consoleErrors": null,
+        });
+        // Found through the marker, the one way the marked node is reached.
+        let Json(resp) = click_by_response(
+            "click-by-text",
+            &save_button(),
+            sdk_reply(performed_via("element-identifier", "strong", 4)),
+        )
+        .expect("a click the executor performed on the marked node is a success");
+        assert!(resp.success);
+        assert_eq!(resp.data, Some(expected.clone()));
+
+        // A reply that names no strategy shows nothing either way, so it does
+        // not fire the identity refusal.
+        let silent = json!({ "success": true, "durationMs": 7, "timestamp": 1 });
+        let Json(resp) = click_by_response("click-by-text", &save_button(), sdk_reply(silent))
+            .expect("an unreported resolution is not a mismatch");
+        assert_eq!(resp.data, Some(expected));
+    }
+
+    #[test]
+    fn click_by_route_refuses_a_click_the_sdk_reached_another_way() {
+        for (strategy, class, rank) in [
+            ("registry-id", "exact", 7),
+            ("discovery-cache", "moderate", 2),
+            ("semantic-path", "weak", 0),
+        ] {
+            let (status, Json(body)) = click_by_response(
+                "click-by-selector",
+                &save_button(),
+                sdk_reply(performed_via(strategy, class, rank)),
+            )
+            .expect_err("a click on a node the marker did not bind is no click on it");
+            assert!(status.is_client_error(), "{strategy}: got {status}");
+            let wire = serde_json::to_value(&body).unwrap();
+            assert!(
+                !wire.to_string().contains("\"clicked\":true"),
+                "{strategy}: never clicked: true: {wire}"
+            );
+            assert_eq!(
+                wire.pointer("/error_detail/code"),
+                Some(&json!("ELEMENT_STALE")),
+                "{wire}"
+            );
+            let context = &wire["error_detail"]["context"];
+            assert_eq!(context["action_dispatched"], json!(true), "{wire}");
+            assert_eq!(
+                context["sdk_resolution_strategy"],
+                json!(strategy),
+                "{wire}"
+            );
+            assert_eq!(context["resolved"]["selector"], json!("#save"), "{wire}");
+            assert_eq!(context["resolved"]["tag"], json!("BUTTON"), "{wire}");
+            let message = wire["error"].as_str().unwrap();
+            assert!(message.contains("BUTTON \"Save\" at #save"), "{message}");
+            assert!(message.contains(strategy), "{message}");
+            // The SDK's own reply rides along, for the caller to judge.
+            assert_eq!(
+                wire.pointer("/data/elementResolution/strategy"),
+                Some(&json!(strategy)),
+                "{wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_by_route_reports_a_target_that_left_the_page_as_stale() {
+        let (status, Json(body)) = click_by_response(
+            "click-by-text",
+            &save_button(),
+            sdk_reply(marked_node_gone()),
+        )
+        .expect_err("no node to click is no click");
+        assert!(status.is_client_error(), "got {status}");
+        let wire = serde_json::to_value(&body).unwrap();
+        assert!(!wire.to_string().contains("\"clicked\":true"), "{wire}");
+        assert_eq!(
+            wire.pointer("/error_detail/code"),
+            Some(&json!("ELEMENT_STALE")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/error_detail/context/action_dispatched"),
+            Some(&json!(false)),
+            "{wire}"
+        );
+        let message = wire["error"].as_str().unwrap();
+        assert!(
+            message.contains("BUTTON \"Save\" at #save left the page"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("never registered"),
+            "the SDK's guess is false of a node step 1 just found: {message}"
+        );
+        // The SDK's own diagnosis is kept, naming the reported selector.
+        assert_eq!(
+            wire.pointer("/data/failureDetails/errorCode"),
+            Some(&json!("UB-ELEM-NOT-FOUND")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/elementId"),
+            Some(&json!("#save")),
+            "{wire}"
+        );
+    }
+
+    #[test]
+    fn click_by_routes_evaluate_a_resolution_that_never_clicks() {
+        for js in [
+            element_path_resolve_js(&click_by_text_find_expr("Save", "button", true), 0, MARKER),
+            element_path_resolve_js(&click_by_text_find_expr("save", "*", false), 1, MARKER),
+            element_path_resolve_js(&click_by_selector_find_expr("button.primary"), 0, MARKER),
+        ] {
+            assert!(
+                !js.contains(".click("),
+                "the evaluated script must not click: {js}"
+            );
+            assert!(!js.contains("dispatchEvent"), "nor dispatch events: {js}");
+            assert!(!js.contains("clicked:"), "nor claim a click verdict: {js}");
+            assert!(
+                js.contains("el.offsetParent !== null"),
+                "the visible-match filter survives: {js}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_by_route_find_expressions_match_and_escape_as_before() {
+        let exact = click_by_text_find_expr("it's \\ here", "button", true);
+        assert!(
+            exact.contains("document.querySelectorAll('button')"),
+            "{exact}"
+        );
+        assert!(
+            exact.contains(r"el.textContent.trim() === 'it\'s \\ here'"),
+            "{exact}"
+        );
+        let loose = click_by_text_find_expr("Save Draft", "*", false);
+        assert!(
+            loose.contains("el.textContent.trim().toLowerCase().includes('save draft')"),
+            "{loose}"
+        );
+        let by_selector = click_by_selector_find_expr("a[title='x']");
+        assert!(
+            by_selector.contains(r"document.querySelectorAll('a[title=\'x\']')"),
+            "{by_selector}"
+        );
+    }
+
+    /// Hostile values for a caller value spliced into a quoted
+    /// `querySelectorAll('…')`. Each case is: the value; the splice that keeps
+    /// it one string; and the splice a broken escape produces, which closes the
+    /// string early.
+    ///
+    /// The escape has two halves, and each case pins one of them:
+    /// - A bare quote is kept inside by escaping the quote.
+    /// - A quote behind a backslash is kept inside by doubling the backslash.
+    ///   Escaping the quote alone turns `\'` into `\\'`, an escaped backslash
+    ///   followed by a quote that closes the string.
+    fn hostile_selector_cases() -> [(&'static str, &'static str, &'static str); 2] {
+        [
+            (
+                "*'),fetch('/x'),document.querySelectorAll('*",
+                r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')",
+                "'),fetch('",
+            ),
+            (
+                r"*\'),fetch('/x'),document.querySelectorAll('*",
+                r"querySelectorAll('*\\\'),fetch(\'/x\'),document.querySelectorAll(\'*')",
+                r"('*\\'),fetch(",
+            ),
+        ]
+    }
+
+    /// click-by-text splices the caller's `tag` into a quoted
+    /// `querySelectorAll('…')` of a script the runner builds and evaluates.
+    /// Spliced raw, a quote in it would close that string, and the rest would
+    /// run as the caller's own code without the guard `page/evaluate` applies
+    /// to caller scripts (coord finding f82377b2). The tag is escaped like the
+    /// text, so a hostile one stays inside its selector string. Both halves of
+    /// the escape are pinned (`hostile_selector_cases`).
+    #[test]
+    fn click_by_text_escapes_a_hostile_tag() {
+        for (hostile, escaped, early_close) in hostile_selector_cases() {
+            for exact in [true, false] {
+                let expr = click_by_text_find_expr("Save", hostile, exact);
+                assert!(
+                    expr.contains(escaped),
+                    "the tag must stay inside its selector string: {expr}"
+                );
+                assert!(
+                    !expr.contains(early_close),
+                    "no quote in the tag may close the selector string: {expr}"
+                );
+            }
+        }
+    }
+
+    /// click-by-selector splices the caller's `selector` into the same kind of
+    /// quoted `querySelectorAll('…')`, so a hostile one is held to both halves
+    /// of the escape the same way.
+    #[test]
+    fn click_by_selector_escapes_a_hostile_selector() {
+        for (hostile, escaped, early_close) in hostile_selector_cases() {
+            let expr = click_by_selector_find_expr(hostile);
+            assert!(
+                expr.contains(escaped),
+                "the selector must stay inside its string: {expr}"
+            );
+            assert!(
+                !expr.contains(early_close),
+                "no quote in the selector may close its string: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_by_route_clicks_the_marked_node_through_the_sdk_executor() {
+        let payload = marked_action_payload(MARKER, click_action());
+        assert_eq!(
+            payload,
+            json!({ "elementId": MARKER_SELECTOR, "action": { "action": "click" } })
+        );
+        // Never the path the route reports: re-resolved in the click's own
+        // round trip, it can match another node by then.
+        assert_ne!(payload["elementId"], save_button().resolved["path"]);
+    }
+
+    #[test]
+    fn click_by_route_keeps_the_documented_miss_shape() {
+        let none = json!({ "found": false, "error": "No elements found" });
+        assert_eq!(
+            click_by_miss(&none, "No matching elements found", 0),
+            json!({ "clicked": false, "error": "No matching elements found" })
+        );
+        let out_of_range =
+            json!({ "found": false, "error": "Index out of range", "matchCount": 2 });
+        assert_eq!(
+            click_by_miss(&out_of_range, "No elements match selector", 5),
+            json!({ "clicked": false, "error": "Index 5 out of range (found 2)" })
         );
     }
 }

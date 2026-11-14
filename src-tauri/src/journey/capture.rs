@@ -79,8 +79,9 @@ pub(crate) fn runner_instance() -> String {
 ///
 /// - `None` — the runner refused the request itself (a 4xx: malformed body,
 ///   unknown element, unknown action) — no UI action occurred, so no edge;
-/// - `Some(true)` — the action was attempted and failed (a 5xx, or a 200 whose
-///   envelope says `success: false`) — an `error` edge;
+/// - `Some(true)` — the action was attempted and failed (a 5xx, a 200 whose
+///   envelope says `success: false`, or a 4xx that reports its action
+///   performed, [`reports_action_dispatched`]) — an `error` edge;
 /// - `Some(false)` — the action succeeded.
 pub(crate) fn control_action_verdict<T: serde::Serialize, E: serde::Serialize>(
     result: &Result<
@@ -93,9 +94,28 @@ pub(crate) fn control_action_verdict<T: serde::Serialize, E: serde::Serialize>(
 ) -> Option<bool> {
     match result {
         Ok(body) => Some(!body.success),
-        Err((status, _)) if status.is_client_error() => None,
+        Err((status, axum::Json(body))) if status.is_client_error() => {
+            let context = body
+                .error_detail
+                .as_ref()
+                .and_then(|detail| detail.context.as_ref());
+            reports_action_dispatched(context).then_some(true)
+        }
         Err(_) => Some(true),
     }
+}
+
+/// Does a 4xx answer report its action performed on the UI after all? A route
+/// sets `error_detail.context.action_dispatched: true` on such a 4xx: the
+/// two-step page routes' `ELEMENT_STALE` when the SDK performed the action on a
+/// node other than the one the route resolved (`marked_action_outcome`). That
+/// answer is an attempted action that failed, not a request the runner refused
+/// before touching any UI, so it is an `error` edge like a 5xx.
+fn reports_action_dispatched(error_detail_context: Option<&serde_json::Value>) -> bool {
+    error_detail_context
+        .and_then(|context| context.get("action_dispatched"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 /// Record a CONTROL-surface action from its handler's result (M3). The
@@ -189,13 +209,17 @@ pub(crate) const RUNNER_REJECTION_ORIGIN: &str = "runner";
 
 /// Tag an IPC-fallback answer the runner produced with a 4xx as a runner
 /// rejection (`failure_origin: "runner"`), so [`sdk_refusal`] records nothing
-/// for it — exactly the control routes' 4xx rule. A 5xx (the action was
-/// attempted and failed) and any 2xx are returned unchanged.
+/// for it — exactly the control routes' 4xx rule, exception included: a 4xx
+/// that reports its action performed ([`reports_action_dispatched`]) is not
+/// tagged, so it is an `error` edge. A 5xx (the action was attempted and
+/// failed) and any 2xx are returned unchanged.
 pub(crate) fn tag_runner_rejection(
     mut response: serde_json::Value,
     status: axum::http::StatusCode,
 ) -> serde_json::Value {
-    if status.is_client_error() {
+    if status.is_client_error()
+        && !reports_action_dispatched(response.pointer("/error_detail/context"))
+    {
         if let Some(obj) = response.as_object_mut() {
             obj.insert(
                 "failure_origin".to_string(),
@@ -1300,6 +1324,55 @@ mod tests {
             "error_detail": {"code": "INVALID_REQUEST"}
         });
         assert!(sdk_action_target(None, None, true, &not_navigable).is_none());
+    }
+
+    /// A 4xx that reports its action performed
+    /// (`error_detail.context.action_dispatched: true`: the two-step page
+    /// routes' `ELEMENT_STALE` for an action the SDK performed on a node other
+    /// than the one the route resolved) is an attempted action that failed, an
+    /// `error` edge, on the control route and on its SDK twin's IPC fallback
+    /// alike. The same 4xx with `action_dispatched: false` (the target left the
+    /// page and nothing was performed) is still the runner's refusal.
+    #[test]
+    fn a_client_error_reporting_its_action_performed_is_an_error_edge() {
+        use crate::mcp::types::ApiResponse;
+        use crate::mcp::ui_bridge::{UiBridgeError, UiBridgeErrorCode};
+        use axum::http::StatusCode;
+        use axum::Json;
+        let stale = |dispatched: bool| {
+            ApiResponse::<serde_json::Value>::error_detailed(
+                "click-by-text: the SDK performed the `click` elsewhere",
+                UiBridgeError {
+                    code: UiBridgeErrorCode::ElementStale,
+                    message: "click-by-text: the SDK performed the `click` elsewhere".to_string(),
+                    recovery: None,
+                    context: Some(json!({
+                        "route": "click-by-text",
+                        "requested_action": "click",
+                        "action_dispatched": dispatched,
+                    })),
+                },
+            )
+        };
+        for (dispatched, verdict) in [(true, Some(true)), (false, None)] {
+            let control: Result<Json<ApiResponse<serde_json::Value>>, _> =
+                Err((StatusCode::BAD_REQUEST, Json(stale(dispatched))));
+            assert_eq!(
+                control_action_verdict(&control),
+                verdict,
+                "control route, action_dispatched: {dispatched}"
+            );
+            let fallback = tag_runner_rejection(
+                serde_json::to_value(stale(dispatched)).unwrap(),
+                StatusCode::BAD_REQUEST,
+            );
+            assert_eq!(sdk_refusal(&fallback), !dispatched, "{fallback}");
+            assert_eq!(
+                sdk_action_target(None, None, true, &fallback).is_some(),
+                dispatched,
+                "SDK twin's fallback, action_dispatched: {dispatched}: {fallback}"
+            );
+        }
     }
 
     #[test]
