@@ -926,6 +926,11 @@ pub(crate) struct ResumeSpawn<'a> {
     /// keeps the durable restore record consistent (the record stores the dir
     /// the session actually launched under).
     pub config_dir: &'a str,
+    /// How long [`spawn_resumed_pane`] may BLOCK waiting for a real `claude`
+    /// binary to reappear (npm auto-update reinstall window) before it falls
+    /// back to the bare name. Non-zero only for a caller on the blocking pool;
+    /// zero never sleeps.
+    pub claude_bin_wait: std::time::Duration,
     pub title: String,
     pub page_id: String,
     pub zone_index: i32,
@@ -994,7 +999,7 @@ pub(crate) fn spawn_resumed_pane(
     let command = resume_respawn_argv(
         // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
         // `claude_bin_path()` cannot be the PTY child's program on Windows.
-        &crate::agent_runtime::resolve_claude_bin(),
+        &crate::agent_runtime::resolve_claude_bin_waiting(spec.claude_bin_wait),
         spec.claude_session_id,
         model,
         &launch_cfg,
@@ -1424,6 +1429,8 @@ fn migrate_session(
                 &record.claude_session_id,
             ),
             config_dir: dst_config_dir,
+            // Runs on the blocking pool (`migrate_session_off_runtime`).
+            claude_bin_wait: crate::agent_runtime::CLAUDE_BIN_RESOLVE_WAIT,
             title: title.clone(),
             page_id: record.page_id.clone(),
             zone_index: record.zone_index,

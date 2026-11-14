@@ -678,6 +678,7 @@ async fn resume_one(
                     working_dir: &cand.working_dir,
                     model_transcript,
                     config_dir: &cand.config_dir,
+                    claude_bin_wait: std::time::Duration::ZERO,
                     title: cand.title.clone(),
                     page_id: cand.page_id.clone(),
                     zone_index: cand.zone_index,
