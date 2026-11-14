@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import servedActions from "@/lib/ui-bridge/servedActions.0.46.json";
 
-import { availableActionsFor } from "./ActionExecutorView";
+import { availableActionsFor, paramsFor, parseJsonParams, parseKeys } from "./ActionExecutorView";
 
 const ids = (element: Parameters<typeof availableActionsFor>[0]) =>
   availableActionsFor(element).map((a) => a.id);
@@ -31,7 +31,57 @@ describe("availableActionsFor", () => {
 
   it("offers only advertised verbs: a button gets no text or value verbs", () => {
     const offered = ids({ type: "button", actions: servedActions.autoRegisteredButton });
-    expect(offered).toEqual(["click", "doubleClick", "focus", "blur", "hover"]);
+    expect(offered).toEqual([
+      "click",
+      "doubleClick",
+      "focus",
+      "blur",
+      "hover",
+      "hoverClick",
+      "rightClick",
+      "middleClick",
+      "unhover",
+      "scrollIntoView",
+      "sendKeys",
+      "scroll",
+      "drag",
+    ]);
+  });
+
+  it("offers the advertised pointer verbs and sendKeys, sendKeys through the keys field", () => {
+    const offered = availableActionsFor({
+      type: "input",
+      actions: servedActions.autoRegisteredTextInput,
+    });
+    expect(offered.map((a) => a.id)).toEqual(
+      expect.arrayContaining([
+        "hoverClick",
+        "rightClick",
+        "middleClick",
+        "unhover",
+        "scrollIntoView",
+        "sendKeys",
+      ]),
+    );
+    const sendKeys = offered.find((a) => a.id === "sendKeys");
+    expect(sendKeys?.requiresParams).toBe(true);
+    expect(sendKeys?.paramType).toBe("keys");
+  });
+
+  it("never guesses the advertised-only verbs from the kind", () => {
+    for (const type of ["input", "textarea", "button", "checkbox", "select"]) {
+      const offered = ids({ type });
+      for (const id of [
+        "hoverClick",
+        "rightClick",
+        "middleClick",
+        "unhover",
+        "scrollIntoView",
+        "sendKeys",
+      ]) {
+        expect(offered).not.toContain(id);
+      }
+    }
   });
 
   it("offers each verb once when an element advertises both select and setValue", () => {
@@ -56,5 +106,70 @@ describe("availableActionsFor", () => {
     expect(ids({ type: "textarea" })).toEqual(expect.arrayContaining(["type", "setValue"]));
     expect(ids({ type: "button", actions: [] })).not.toContain("setValue");
     expect(ids({ type: "checkbox" })).toEqual(expect.arrayContaining(["check", "toggle"]));
+  });
+});
+
+describe("parseKeys", () => {
+  it("splits on any whitespace and drops empties", () => {
+    expect(parseKeys("  ctrl+a   Backspace\tEnter ")).toEqual(["ctrl+a", "Backspace", "Enter"]);
+    expect(parseKeys("   ")).toEqual([]);
+  });
+});
+
+describe("paramsFor", () => {
+  const fields = { text: "hello", value: "v1", keys: " ctrl+a  Enter " };
+
+  it("sends each param under the name the SDK reads", () => {
+    expect(paramsFor({ paramType: "text" }, fields)).toEqual({ text: "hello" });
+    expect(paramsFor({ paramType: "value" }, fields)).toEqual({ value: "v1" });
+    expect(paramsFor({ paramType: "keys" }, fields)).toEqual({ keys: ["ctrl+a", "Enter"] });
+  });
+
+  it("sends {} for a no-param action or an empty field", () => {
+    expect(paramsFor({}, fields)).toEqual({});
+    expect(paramsFor({ paramType: "keys" }, { ...fields, keys: "   " })).toEqual({});
+    expect(paramsFor({ paramType: "value" }, { ...fields, value: "" })).toEqual({});
+  });
+});
+
+describe("structured-param verbs (scroll, drag, autocomplete)", () => {
+  it("offers all three where advertised, through the JSON field", () => {
+    const offered = availableActionsFor({
+      type: "input",
+      actions: servedActions.autoRegisteredTextInput,
+    });
+    for (const id of ["scroll", "drag", "autocomplete"]) {
+      const action = offered.find((a) => a.id === id);
+      expect(action?.requiresParams).toBe(true);
+      expect(action?.paramType).toBe("json");
+    }
+  });
+
+  it("never guesses them from the kind", () => {
+    for (const type of ["input", "textarea", "button", "select"]) {
+      const offered = ids({ type });
+      for (const id of ["scroll", "drag", "autocomplete"]) expect(offered).not.toContain(id);
+    }
+  });
+
+  it("parseJsonParams accepts only a JSON object", () => {
+    expect(parseJsonParams('{"direction":"down","amount":300}')).toEqual({
+      direction: "down",
+      amount: 300,
+    });
+    for (const bad of ["", "   ", "{", "[1,2]", "null", "42", '"s"']) {
+      expect(parseJsonParams(bad)).toBeNull();
+    }
+  });
+
+  it("sends the JSON field's object verbatim, else {}", () => {
+    const base = { text: "", value: "", keys: "" };
+    expect(
+      paramsFor(
+        { paramType: "json" },
+        { ...base, json: '{"searchText":"ber","selectValue":"Berlin"}' },
+      ),
+    ).toEqual({ searchText: "ber", selectValue: "Berlin" });
+    expect(paramsFor({ paramType: "json" }, { ...base, json: "not json" })).toEqual({});
   });
 });
