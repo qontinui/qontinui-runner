@@ -13,7 +13,7 @@ Following the Single Responsibility Principle, this module:
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,9 @@ class ActionExecutionRecord:
         active_states_after: Set of active state names after action execution
 
     Outcome:
-        success: Whether the action completed successfully
+        success: Whether the action completed successfully. Meaningful only once
+            end_time is set; read ``status`` for the outcome of a record that may
+            still be running.
         error_message: Error message if action failed (None if successful)
         retry_count: Number of retry attempts made (0 if first attempt succeeded)
 
@@ -67,7 +69,14 @@ class ActionExecutionRecord:
     Metadata:
         metadata: Additional arbitrary data for extensibility
 
+    The record owns its top-level ``config`` and ``metadata`` dicts: construction
+    takes a shallow copy of each, so adding, removing or replacing a key in the
+    dict the caller passed cannot change a built record. Nested values remain
+    shared. ``frozen`` stops rebinding ``config`` and ``metadata``, not mutating
+    them through the record.
+
     Properties (Computed):
+        status: "running" while end_time is None, else "success" or "failed"
         duration_seconds: Duration in seconds (from duration_ms)
         state_changed: Whether active states changed during action
         states_activated: States that were activated during action
@@ -118,6 +127,32 @@ class ActionExecutionRecord:
 
     # Extensibility
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Take ownership of the caller's ``config`` and ``metadata`` dicts.
+
+        ``frozen=True`` stops reassignment, not mutation of a shared dict, so
+        both are copied (shallowly) at construction. ``object.__setattr__`` is
+        the documented way to set a field from inside a frozen dataclass.
+        """
+        object.__setattr__(self, "config", dict(self.config))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+    @property
+    def status(self) -> Literal["running", "success", "failed"]:
+        """Execution status of the action.
+
+        ``success`` defaults to True, so it says nothing about an action that
+        has not finished: an unfinished action must render as running, never as
+        succeeded.
+
+        Returns:
+            "running" while end_time is None, otherwise "success" or "failed"
+            according to ``success``
+        """
+        if self.end_time is None:
+            return "running"
+        return "success" if self.success else "failed"
 
     @property
     def duration_seconds(self) -> float | None:
@@ -175,7 +210,7 @@ class ActionExecutionRecord:
                 - parent_id: Parent action/workflow ID
                 - nesting_level: Depth in execution tree
                 - workflow_name: Name of containing workflow
-                - status: "success", "failed", or "running"
+                - status: "running" until end_time is set, then "success" or "failed"
                 - error: Error message (if failed)
                 - metadata: Combined metadata including runtime data
                 - state_context: State change information
@@ -190,7 +225,7 @@ class ActionExecutionRecord:
             "parent_id": self.parent_action_id,
             "nesting_level": self.nesting_level,
             "workflow_name": self.workflow_id,
-            "status": "success" if self.success else "failed" if self.end_time else "running",
+            "status": self.status,
             "error": self.error_message,
             "metadata": {
                 **self.metadata,

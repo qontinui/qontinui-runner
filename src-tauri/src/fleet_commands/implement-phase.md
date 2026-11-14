@@ -89,7 +89,10 @@ the row within an hour.
 
 Implement the described phase fully:
 - No stubs, no partial work, no TODOs
-- Use subagents for independent work
+- Use subagents for independent work. Each Agent call passes the `effort` its
+  work's profile names in `agent_playbook/spawn-effort-profiles` (served
+  policy `production-and-cost` `spawn-effort-profiles`; Coordinator mode below
+  spells the rule out)
 - Fix issues as you find them
 - **Pre-edit peer hotspot check (best-effort).** Before the first edit
   to any non-trivial file, query coord:
@@ -132,8 +135,34 @@ Implement the described phase fully:
 > **3. Post-edit verify (after the phase commit):** call verify with
 > `{repo, paths: <files actually touched>, head_sha: "<the new commit
 > sha>", tests_predicted: <the predict response's `detail.affected_tests`,
-> when present>}` — MCP `coord_edit_verify(<JSON>)` or HTTP `curl -fsS -X
-> POST "$COORD_HTTP_URL/coord/edits/verify" …`. Record the composed
+> when present>}` — MCP `coord_edit_verify(<JSON>)`, or the HTTP door,
+> which **requires a credential** once coord takes the tenant and machine
+> from the verified principal (plan
+> `2026-10-31-edit-verify-claim-overlap-reads-a-truncated-scan-as-no-overlap`
+> Phase 2; until that lands an anonymous POST still answers, but use the
+> credentialed form either way). Present a device JWT staged in a private
+> tempfile, never on argv:
+>
+> ```bash
+> JWT="${COORD_DEVICE_JWT:-}"
+> [ -n "$JWT" ] || JWT=$(cat "$HOME/.qontinui/coord-device-jwt" 2>/dev/null)
+> if [ -n "$JWT" ]; then
+>   ( HDR=$(mktemp); trap 'rm -f "$HDR"' EXIT
+>     printf 'Authorization: Bearer %s\n' "$JWT" > "$HDR"
+>     curl -fsS -X POST "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/edits/verify" \
+>       -H @"$HDR" -H 'Content-Type: application/json' -d '<same JSON>' )
+> else
+>   echo "edit-verify SKIPPED: no device credential"
+> fi
+> ```
+>
+> The file token lives about 4 h, so refresh it first with your deployment's
+> device-credential refresher where one exists. `$COORD_DEVICE_JWT` is read
+> first and the file is the fallback; nothing here checks either token's
+> expiry. A `401`/`403` (an expired token, or a credential coord does not
+> admit as a fleet principal, such as an `/agents/allocate` token) or no
+> credential at all means verify was **skipped**: say so in your Part 3 report,
+> never read it as a clean verify. The predict door stays anonymous. Record the composed
 > outcome (`composed_outcome` + the per-subspace summary) in your Part 3
 > report. A `Contradiction`/`Failure` composed outcome is a report **red
 > flag**, NOT an automatic revert.
@@ -144,6 +173,15 @@ If you would otherwise complain that the phase is too large to implement
 directly, **do not stop or hand back to the operator**. Pivot into coordinator
 mode and ship the phase by orchestrating subagents. The coordinator never
 writes feature code itself — its job is to spawn, review, decide, and unblock.
+
+**Every Agent this mode launches passes `effort`, follow-up agents and
+re-spawns included** (served policy `production-and-cost`
+`spawn-effort-profiles`). A chunk agent's deliverable is a change meant to merge, so pass the effort of the `implementation` profile in
+`agent_playbook/spawn-effort-profiles`. Read it with
+`/policy get agent_playbook spawn-effort-profiles`; never take the level
+from this file or from memory. If the playbook cannot be read, or the Agent tool has no `effort` parameter
+(it has none while `CLAUDE_CODE_EFFORT_LEVEL` is set), pass none and say so in
+the report. Never guess a level.
 
 **Responsibilities**
 
@@ -289,6 +327,7 @@ trigger is NOT a gate; skip those and just report the blocker.
   `unit_ready`/`unit_status` predicates carry this UUID, not the slug.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`, `pr_ci_green`,
+  `pr_ci_red`, `pr_conflicting`,
   `release_in_sync`, `branch_reapable`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
