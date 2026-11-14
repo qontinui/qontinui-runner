@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use qontinui_runner_lib::wedge_diagnostics::{spawn_blocking_tracked, tracked_blocking_by_thread};
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Default sample cadence in seconds.
 ///
@@ -2044,21 +2044,97 @@ pub(crate) async fn publish_once() {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            debug!(
-                "fleet::resource_sample: published {} lane(s)",
-                body.samples.len()
-            );
             // A 200 is not "stored": coord drops invalid items and unknown
             // fields INSIDE a 200 and says so only in the body.
-            if let Some(problems) = resp.text().await.ok().and_then(|t| sample_ack_problems(&t)) {
-                log_ack_problems(problems);
-            }
+            let text = resp.text().await.ok();
+            log_sample_ack(sample_ack(text.as_deref(), body.samples.len()));
         }
         Ok(resp) => {
             let status = resp.status();
-            warn_once(format!("POST {url} -> HTTP {status}"));
+            warn_once(
+                &http_failure_class(status.as_u16()),
+                format!("POST {url} -> HTTP {status}"),
+            );
         }
-        Err(e) => warn_once(format!("POST {url} failed: {e}")),
+        Err(e) => warn_once(
+            transport_failure_class(e.is_connect(), e.is_timeout()),
+            format!("POST {url} failed: {e}"),
+        ),
+    }
+}
+
+/// The one line logged for a 2xx body that is not coord's documented outcome.
+const ACK_UNKNOWN_LINE: &str =
+    "coord's 2xx body is not the documented outcome; whether the samples were stored is UNKNOWN";
+
+/// What a 2xx from `POST /coord/devices/{id}/resource-sample` established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SampleAck {
+    /// The documented outcome naming no loss: coord stored `persisted` of the
+    /// `sent` lanes.
+    Stored { persisted: u64, sent: usize },
+    /// The documented outcome naming what coord did NOT store.
+    Problems(Vec<String>),
+    /// The body could not be read, is not the documented outcome, or names no
+    /// `persisted` count: whether anything was stored is UNKNOWN — never read
+    /// as success.
+    Unknown,
+}
+
+/// Classify a 2xx body (`None` = it could not be read) for `sent` lanes. PURE.
+pub(crate) fn sample_ack(body: Option<&str>, sent: usize) -> SampleAck {
+    let Some(body) = body else {
+        return SampleAck::Unknown;
+    };
+    match sample_ack_problems(body) {
+        None => SampleAck::Unknown,
+        Some(problems) if !problems.is_empty() => SampleAck::Problems(problems),
+        Some(_) => serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("persisted")?.as_u64())
+            .map_or(SampleAck::Unknown, |persisted| SampleAck::Stored {
+                persisted,
+                sent,
+            }),
+    }
+}
+
+/// The line a [`SampleAck`] logs, or `None` for [`SampleAck::Problems`], whose
+/// lines are [`log_ack_problems`]'s. PURE.
+pub(crate) fn sample_ack_line(ack: &SampleAck) -> Option<String> {
+    match ack {
+        SampleAck::Stored { persisted, sent } => {
+            Some(format!("coord stored {persisted}/{sent} lane(s)"))
+        }
+        SampleAck::Problems(_) => None,
+        SampleAck::Unknown => Some(ACK_UNKNOWN_LINE.to_string()),
+    }
+}
+
+/// Log one 2xx outcome: a clean store at debug (and the recovery line when an
+/// earlier loss cleared), a loss through [`log_ack_problems`], and an UNKNOWN
+/// outcome at info ONCE per process.
+fn log_sample_ack(ack: SampleAck) {
+    let line = sample_ack_line(&ack);
+    match ack {
+        SampleAck::Stored { .. } => {
+            log_ack_problems(Vec::new());
+            if let Some(line) = line {
+                debug!("fleet::resource_sample: {line}");
+            }
+        }
+        SampleAck::Problems(problems) => log_ack_problems(problems),
+        SampleAck::Unknown => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if let Some(line) = line {
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    info!("fleet::resource_sample: {line}");
+                } else {
+                    debug!("fleet::resource_sample: {line}");
+                }
+            }
+        }
     }
 }
 
@@ -2188,15 +2264,47 @@ fn log_ack_problems(problems: Vec<String>) {
     *last = key;
 }
 
-/// Log a publish failure loudly the first few times, then quietly.
+/// WARNs each publish-failure class gets per process before it drops to debug.
+const WARNS_PER_FAILURE_CLASS: u32 = 3;
+
+/// The failure class of a non-2xx answer: `http:<status>`. PURE.
+pub(crate) fn http_failure_class(status: u16) -> String {
+    format!("http:{status}")
+}
+
+/// The failure class of a request that got no answer, from
+/// `reqwest::Error::is_connect` / `is_timeout`. PURE.
+pub(crate) fn transport_failure_class(is_connect: bool, is_timeout: bool) -> &'static str {
+    if is_connect {
+        "transport:connect"
+    } else if is_timeout {
+        "transport:timeout"
+    } else {
+        "transport:other"
+    }
+}
+
+/// Spend one WARN of `class`'s budget: `true` while it has one left. PURE.
+pub(crate) fn warn_budget_admits(budget: &mut BTreeMap<String, u32>, class: &str) -> bool {
+    let spent = budget.entry(class.to_string()).or_default();
+    *spent = spent.saturating_add(1);
+    *spent <= WARNS_PER_FAILURE_CLASS
+}
+
+/// Log a publish failure loudly the first few times PER CLASS, then quietly.
 ///
 /// A 30s sampler against a coord that is down for an hour would otherwise emit
 /// 120 identical WARNs and bury whatever the operator is actually reading. The
-/// first ones are the diagnosis; the rest are noise.
-fn warn_once(msg: String) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEEN: AtomicU32 = AtomicU32::new(0);
-    if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
+/// first ones are the diagnosis; the rest are noise. The budget is per failure
+/// class, so a NEW kind of failure (a 422 after three 503s, a refused connect
+/// after three 5xx) is WARNed rather than lost under the first kind's budget.
+fn warn_once(class: &str, msg: String) {
+    static BUDGET: std::sync::Mutex<BTreeMap<String, u32>> = std::sync::Mutex::new(BTreeMap::new());
+    let loud = BUDGET
+        .lock()
+        .map(|mut b| warn_budget_admits(&mut b, class))
+        .unwrap_or(true);
+    if loud {
         warn!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
     } else {
         debug!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
@@ -2206,6 +2314,87 @@ fn warn_once(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan `2026-11-13-computer-services-cap-and-sample-outcome` Phase 2: a
+    /// 2xx whose body is unreadable or undocumented reads UNKNOWN, never
+    /// "stored"; a clean body names how many lanes coord stored.
+    #[test]
+    fn an_unread_2xx_is_unknown_and_a_clean_one_names_what_was_stored() {
+        for unknown in [
+            None,
+            Some(""),
+            Some("not json"),
+            Some("{}"),
+            Some(r#"{"rejected":[]}"#),
+        ] {
+            let ack = sample_ack(unknown, 2);
+            assert_eq!(ack, SampleAck::Unknown, "{unknown:?}");
+            let line = sample_ack_line(&ack).unwrap();
+            assert_eq!(
+                line,
+                "coord's 2xx body is not the documented outcome; whether the samples were stored is UNKNOWN"
+            );
+            assert!(
+                !line.starts_with("coord stored"),
+                "no stored line for {unknown:?}"
+            );
+        }
+
+        let clean = r#"{"received":2,"accepted":2,"persisted":2,"rejected":[],"schema_pending":false,"computer_axes_stored":true,"unknown_fields":[]}"#;
+        let ack = sample_ack(Some(clean), 2);
+        assert_eq!(
+            ack,
+            SampleAck::Stored {
+                persisted: 2,
+                sent: 2
+            }
+        );
+        assert_eq!(
+            sample_ack_line(&ack).as_deref(),
+            Some("coord stored 2/2 lane(s)")
+        );
+
+        let lossy = r#"{"received":2,"accepted":2,"persisted":1}"#;
+        let ack = sample_ack(Some(lossy), 2);
+        assert!(
+            matches!(&ack, SampleAck::Problems(p) if p.len() == 1),
+            "{ack:?}"
+        );
+        assert_eq!(sample_ack_line(&ack), None);
+    }
+
+    /// Phase 2: each failure class has its own budget of three WARNs.
+    #[test]
+    fn a_new_failure_class_is_warned_after_three_of_another() {
+        let mut budget = BTreeMap::new();
+        for _ in 0..3 {
+            assert!(warn_budget_admits(&mut budget, &http_failure_class(503)));
+        }
+        assert!(
+            !warn_budget_admits(&mut budget, &http_failure_class(503)),
+            "a fourth 503 is quiet"
+        );
+        assert_eq!(http_failure_class(422), "http:422");
+        assert!(
+            warn_budget_admits(&mut budget, &http_failure_class(422)),
+            "a 422 after three 503s is WARNed"
+        );
+
+        let mut budget = BTreeMap::new();
+        for status in [500, 502, 503] {
+            for _ in 0..3 {
+                assert!(warn_budget_admits(&mut budget, &http_failure_class(status)));
+            }
+        }
+        let connect = transport_failure_class(true, false);
+        assert_eq!(connect, "transport:connect");
+        assert!(
+            warn_budget_admits(&mut budget, connect),
+            "a refused connect after the 5xx is WARNed"
+        );
+        assert_eq!(transport_failure_class(false, true), "transport:timeout");
+        assert_eq!(transport_failure_class(false, false), "transport:other");
+    }
 
     #[test]
     fn a_200_ack_names_what_coord_did_not_store() {
