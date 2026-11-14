@@ -94,7 +94,10 @@ mod tests {
             // exposure counts with try_get (plan
             // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
             // Phase 4).
-            baseline: 530,
+            // 530 -> 529: proposals.rs `query_eligible_pathnames` migrated to
+            // try_get when the scan was scoped to its app (plan
+            // 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran).
+            baseline: 529,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
