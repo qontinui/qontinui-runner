@@ -31,6 +31,8 @@ interface ApiResponse<T> {
 export interface TriggerToast {
   id: string;
   type: "success" | "error" | "info";
+  /** Stays until dismissed or cleared, rather than expiring. */
+  sticky?: boolean;
   message: string;
 }
 
@@ -86,6 +88,7 @@ export interface UseTriggersReturn {
   selectTrigger: (trigger: WorkflowTrigger | null) => void;
   refresh: () => Promise<void>;
   dismissToast: (id: string) => void;
+  clearSaveRefusals: () => void;
 }
 
 let toastCounter = 0;
@@ -100,14 +103,29 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
   const [toasts, setToasts] = useState<TriggerToast[]>([]);
   const [operationLoading, setOperationLoading] = useState<Record<string, boolean>>({});
 
-  const addToast = useCallback((type: TriggerToast["type"], message: string) => {
+  const addToast = useCallback((type: TriggerToast["type"], message: string, sticky = false) => {
     const id = `toast-${++toastCounter}`;
-    setToasts((prev) => [...prev, { id, type, message }]);
+    setToasts((prev) => [...prev, { id, type, message, sticky }]);
+    if (sticky) return;
     // Auto-dismiss after 4 seconds
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 4000);
   }, []);
+
+  // A refused save is the only place the server's reason is shown, and the author
+  // has to read it to correct the form, so it stays until the save succeeds or it
+  // is dismissed.
+  const clearSaveRefusals = useCallback(() => {
+    setToasts((prev) => prev.filter((t) => !t.sticky));
+  }, []);
+  const addSaveRefusalToast = useCallback(
+    (message: string) => {
+      clearSaveRefusals();
+      addToast("error", message, true);
+    },
+    [addToast, clearSaveRefusals],
+  );
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -141,14 +159,15 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
       });
       setOpLoading("create", false);
       if (data) {
+        clearSaveRefusals();
         addToast("success", `Trigger "${data.name}" created`);
         await loadTriggers();
       } else {
-        addToast("error", `Failed to create trigger: ${err}`);
+        addSaveRefusalToast(`Failed to create trigger: ${err}`);
       }
       return data;
     },
-    [loadTriggers, addToast, setOpLoading],
+    [loadTriggers, addToast, addSaveRefusalToast, clearSaveRefusals, setOpLoading],
   );
 
   const updateTrigger = useCallback(
@@ -160,24 +179,26 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
       });
       setOpLoading(`update-${id}`, false);
       if (data) {
+        clearSaveRefusals();
         addToast("success", `Trigger "${data.name}" updated`);
         await loadTriggers();
       } else {
-        addToast("error", `Failed to update trigger: ${err}`);
+        addSaveRefusalToast(`Failed to update trigger: ${err}`);
       }
       return data;
     },
-    [loadTriggers, addToast, setOpLoading],
+    [loadTriggers, addToast, addSaveRefusalToast, clearSaveRefusals, setOpLoading],
   );
 
   const deleteTrigger = useCallback(
     async (id: string): Promise<boolean> => {
       setOpLoading(`delete-${id}`, true);
-      const { data, error: err } = await apiRequest<unknown>(`/triggers/${id}`, {
+      const { error: err } = await apiRequest<unknown>(`/triggers/${id}`, {
         method: "DELETE",
       });
       setOpLoading(`delete-${id}`, false);
-      if (data !== null) {
+      // Success has `data: null` (`ApiResponse::success(())`), so only `err` can tell.
+      if (err === null) {
         addToast("success", "Trigger deleted");
         await loadTriggers();
         if (selectedTrigger?.id === id) {
@@ -195,12 +216,13 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
   const setEnabled = useCallback(
     async (id: string, enabled: boolean): Promise<boolean> => {
       setOpLoading(`toggle-${id}`, true);
-      const { data, error: err } = await apiRequest<unknown>(`/triggers/${id}/enabled`, {
+      const { error: err } = await apiRequest<unknown>(`/triggers/${id}/enabled`, {
         method: "PUT",
         body: JSON.stringify({ enabled }),
       });
       setOpLoading(`toggle-${id}`, false);
-      if (data !== null) {
+      // Success has `data: null` (`ApiResponse::success(())`), so only `err` can tell.
+      if (err === null) {
         addToast("info", `Trigger ${enabled ? "enabled" : "disabled"}`);
         await loadTriggers();
         return true;
@@ -333,5 +355,6 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
     selectTrigger,
     refresh,
     dismissToast,
+    clearSaveRefusals,
   };
 }
