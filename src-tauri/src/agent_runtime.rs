@@ -158,6 +158,18 @@ pub struct LaunchPayload {
     /// is indistinguishable from one honoured.
     #[serde(default)]
     pub account: Option<String>,
+    /// The headless harness coord asks for (plan
+    /// `2026-11-13-acp-client-lane-for-acp-native-clis` Phase 3): absent = the
+    /// `claude` CLI; `{"acp": "<id>"}` = that `acp_agents` entry. An id this
+    /// runner does not have is refused (`acp_agent_absent:<id>`), never run
+    /// under Claude.
+    #[serde(default)]
+    pub harness: Option<crate::acp_session::dispatch::HarnessSpec>,
+    /// Coord stamps `"headless"` beside a `harness`. Absent on older frames;
+    /// this path is headless either way, and an explicit `terminal` refuses an
+    /// ACP harness.
+    #[serde(default)]
+    pub presentation: Option<Presentation>,
 }
 
 impl LaunchPayload {
@@ -349,6 +361,34 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The headless harness this continuation must run under (plan
+    /// `2026-11-13-acp-client-lane-for-acp-native-clis` Phase 3). Coord sends
+    /// `{"acp": "<id>"}` beside `presentation: "headless"` and the
+    /// `acp:<id>` required capability; absent = the `claude` CLI. A value this
+    /// runner cannot read, or an id it does not have, is refused with a typed
+    /// `spawn_failed` — never a Claude spawn.
+    #[serde(default)]
+    pub harness: Option<crate::acp_session::dispatch::HarnessSpec>,
+}
+
+/// Which harness runs a HEADLESS continuation or coord agent launch (plan
+/// `2026-11-13-acp-client-lane-for-acp-native-clis` Phase 2). Chosen by
+/// [`crate::acp_session::dispatch::select_headless_harness`]; `ClaudeCli` is
+/// the default, so behaviour is unchanged unless a spawn asks for ACP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeadlessHarness {
+    ClaudeCli,
+    Acp(crate::acp_session::dispatch::AcpHarness),
+}
+
+impl HeadlessHarness {
+    /// The ACP harness, when this is one.
+    fn into_acp(self) -> Option<crate::acp_session::dispatch::AcpHarness> {
+        match self {
+            Self::ClaudeCli => None,
+            Self::Acp(harness) => Some(harness),
+        }
+    }
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -4911,7 +4951,7 @@ pub(crate) fn registered_continuation_gate(
 /// `work_completed` is always the bare marker (the fixed string is what lets
 /// coord's transition guard compare it exactly), while `work_abandoned` carries
 /// `": <first line, ≤200 chars>"` whenever a detail was sent.
-fn is_session_work_outcome(recorded: &str) -> bool {
+pub(crate) fn is_session_work_outcome(recorded: &str) -> bool {
     recorded == "work_completed" || marker_matches("work_abandoned", recorded)
 }
 
@@ -7335,6 +7375,36 @@ async fn run_gate_continuation_inner(
         }
     }
 
+    // Step 2b: the headless harness (plan
+    // `2026-11-13-acp-client-lane-for-acp-native-clis`). Chosen after the claim,
+    // so a refusal can be posted as this device's typed `spawn_failed`, and
+    // before the worktree acquire, so it costs nothing. No `harness` is the
+    // `claude` CLI, exactly as before.
+    let harness = match crate::acp_session::dispatch::select_headless_harness_here(
+        payload.harness.as_ref(),
+        payload.presentation,
+        None,
+    ) {
+        Ok(harness) => harness,
+        Err(refusal) => {
+            warn!(
+                "agent_runtime: gate-continuation harness refused: {refusal} (anchor_key={:?})",
+                payload.anchor_key
+            );
+            if let ConsumeTarget::Gate(gate_id, _) = consume_target {
+                post_spawn_outcome(
+                    gate_id,
+                    device_id,
+                    ContinuationOutcome::SpawnFailed,
+                    Some(refusal.to_string()),
+                    None,
+                )
+                .await;
+            }
+            return Err(anyhow::anyhow!(refusal));
+        }
+    };
+
     // Step 3: acquire a device-local worktree (+ claim heartbeat). The `ctx`
     // owns the claim heartbeat task. For the HEADLESS path it stays bound here
     // so its heartbeat runs for the whole subprocess and the claim releases on
@@ -7429,6 +7499,8 @@ async fn run_gate_continuation_inner(
     // STARTED and had already exited by its start verdict, whose exit path is
     // fired below only after `spawned` is posted.
     let mut exited_terminal: Option<String> = None;
+    // Set by the ACP arm, whose reporter posts `spawned` and the verdict itself.
+    let mut outcome_posted_by_harness = false;
     let result: anyhow::Result<Option<uuid::Uuid>> = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
@@ -7467,21 +7539,57 @@ async fn run_gate_continuation_inner(
                 &workdir,
                 no_worktree_cause.as_deref(),
             );
-            // Known lag, accepted: the headless fn returns only after the child
-            // EXITS, so on this presentation the `spawned` outcome — and the
-            // session id with it — reaches coord at exit rather than at spawn.
-            // Headless continuations are rare and the binding is still correct,
-            // just late; when `spawned` is posted is deliberately unchanged.
-            let res = run_continuation_headless(
-                agent_id,
-                &workdir,
-                &headless_prompt,
-                reservation,
-                pinned_session_id,
-            )
-            .await;
-            drop(ctx);
-            presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
+            match harness {
+                HeadlessHarness::ClaudeCli => {
+                    // Known lag, accepted: the headless fn returns only after the
+                    // child EXITS, so on this presentation the `spawned` outcome —
+                    // and the session id with it — reaches coord at exit rather
+                    // than at spawn. Headless continuations are rare and the
+                    // binding is still correct, just late; when `spawned` is
+                    // posted is deliberately unchanged.
+                    let res = run_continuation_headless(
+                        agent_id,
+                        &workdir,
+                        &headless_prompt,
+                        reservation,
+                        pinned_session_id,
+                    )
+                    .await;
+                    drop(ctx);
+                    presentation_bindable_session(
+                        PresentationResult::Headless(res),
+                        pinned_session_id,
+                    )
+                }
+                HeadlessHarness::Acp(acp) => {
+                    // Not in the P3 live registry, like the headless Claude child:
+                    // give the anchor back now.
+                    reservation.release();
+                    let gate = reportable_gate_id(&payload).map(|gate_id| {
+                        crate::acp_session::dispatch::GateIdentity { gate_id, device_id }
+                    });
+                    let reporter = AcpRunLifecycle {
+                        agent_id,
+                        gate,
+                        push_ref: None,
+                    };
+                    let res = crate::acp_session::dispatch::run_acp_continuation(
+                        &acp,
+                        &workdir,
+                        &headless_prompt,
+                        gate,
+                        acp_transcript_path(agent_id),
+                        &reporter,
+                    )
+                    .await;
+                    drop(ctx);
+                    // `Ok` = the session started and the reporter already posted
+                    // `spawned` and the verdict; Step 4 must not post over it. An
+                    // agent-minted ACP session id is not a Claude session to bind.
+                    outcome_posted_by_harness = res.is_ok();
+                    res.map(|_report| None).map_err(anyhow::Error::from)
+                }
+            }
         }
     };
 
@@ -7498,6 +7606,7 @@ async fn run_gate_continuation_inner(
 
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
+        ConsumeTarget::Gate(..) if outcome_posted_by_harness => {}
         ConsumeTarget::Gate(gate_id, _) => {
             let resolution = spawn_resolution_outcome(&result);
             post_spawn_outcome(
@@ -9517,6 +9626,121 @@ fn headless_continuation_bound_port(resolve: impl FnOnce() -> Option<u16>) -> Op
     port
 }
 
+/// Where an ACP run's JSONL transcript goes: beside the headless run's log.
+fn acp_transcript_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
+    agent_logs_root().map(|d| d.join(format!("{agent_id}.acp.jsonl")))
+}
+
+/// The runner's lifecycle posts for one ACP run (plan
+/// `2026-11-13-acp-client-lane-for-acp-native-clis`, Design decision 1): the
+/// agent lifecycle (`spawn-complete` / `spawn-failed`, as the headless Claude
+/// child reports) and, for a gate continuation, the `continuation-consumed`
+/// outcome. It posts `spawned` and `work_unreported` only — the work outcomes
+/// belong to the session.
+struct AcpRunLifecycle {
+    agent_id: uuid::Uuid,
+    gate: Option<crate::acp_session::dispatch::GateIdentity>,
+    push_ref: Option<String>,
+}
+
+/// What an outcome post says stands afterwards.
+fn acp_standing(
+    posted: ContinuationOutcome,
+    ack: OutcomeAck,
+) -> crate::acp_session::dispatch::Standing {
+    use crate::acp_session::dispatch::Standing;
+    match ack {
+        OutcomeAck::Recorded => Standing::Value(posted.wire().to_string()),
+        OutcomeAck::Superseded(standing) => Standing::Value(standing),
+        OutcomeAck::NoVerdict => Standing::Unknown,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::acp_session::dispatch::AcpRunReporter for AcpRunLifecycle {
+    fn gate_id(&self) -> Option<uuid::Uuid> {
+        self.gate.map(|g| g.gate_id)
+    }
+
+    async fn session_started(&self, agent: &str, agent_session_id: &str) {
+        info!(
+            "agent_runtime: agent_id={} acp:{agent} session {agent_session_id} started",
+            self.agent_id
+        );
+        let note = format!("acp:{agent}");
+        report_spawn_complete(self.agent_id, None, Some(&note), self.push_ref.as_deref()).await;
+        if let Some(gate) = self.gate {
+            // Posted here, at start, rather than at exit as the headless Claude
+            // arm does: the verdict below must follow it (coord takes
+            // `spawned → work_unreported`, never the reverse).
+            post_spawn_outcome(
+                gate.gate_id,
+                gate.device_id,
+                ContinuationOutcome::Spawned,
+                None,
+                None,
+            )
+            .await;
+        }
+    }
+
+    async fn read_standing(&self) -> crate::acp_session::dispatch::Standing {
+        let Some(gate) = self.gate else {
+            return crate::acp_session::dispatch::Standing::Unknown;
+        };
+        // coord serves no device-keyed gate read; this route's verify-by-read
+        // echo is the read. Re-posting `spawned` is idempotent while `spawned`
+        // stands and refused over a session's `work_*`, so it changes nothing
+        // and answers with what `continuation_consumed_outcome` holds.
+        let ack = post_continuation_outcome(
+            gate.gate_id,
+            gate.device_id,
+            ContinuationOutcome::Spawned,
+            None,
+            None,
+        )
+        .await;
+        acp_standing(ContinuationOutcome::Spawned, ack)
+    }
+
+    async fn post_work_unreported(&self, detail: &str) -> crate::acp_session::dispatch::Standing {
+        let Some(gate) = self.gate else {
+            return crate::acp_session::dispatch::Standing::Unknown;
+        };
+        let ack = post_continuation_outcome(
+            gate.gate_id,
+            gate.device_id,
+            ContinuationOutcome::WorkUnreported,
+            Some(detail.to_string()),
+            None,
+        )
+        .await;
+        info!(
+            "agent_runtime: acp continuation gate_id={} posted work_unreported ({detail}) —              ack {ack:?}",
+            gate.gate_id
+        );
+        acp_standing(ContinuationOutcome::WorkUnreported, ack)
+    }
+
+    async fn run_finished(&self, report: &crate::acp_session::dispatch::AcpRunReport) {
+        info!(
+            "agent_runtime: agent_id={} acp:{} run finished: verdict={:?} child={:?}",
+            self.agent_id, report.agent, report.verdict, report.child
+        );
+        if !report.clean() {
+            report_spawn_failed_in_phase(
+                self.agent_id,
+                &format!("acp_stop_reason={}", report.first_stop_reason()),
+                None,
+                0,
+                self.push_ref.as_deref(),
+                SpawnPhase::Exited,
+            )
+            .await;
+        }
+    }
+}
+
 /// Run a gate continuation as a headless `claude` child (the existing
 /// subprocess flow), posting `spawn-complete` on first successful spawn and
 /// `spawn-failed` on a non-zero / failed exit. Mirrors the agent-spawn path's
@@ -10178,11 +10402,39 @@ async fn run_agent_subprocess(
     // so read it once here and reuse for all of this spawn's reports.
     let primary_push_ref = payload.worktrees.first().and_then(|wt| wt.push_ref.clone());
 
+    // The headless harness (plan `2026-11-13-acp-client-lane-for-acp-native-clis`
+    // Phase 3), chosen before anything is minted or materialized so a refusal
+    // costs nothing. An ACP agent carries the account pin through its own env
+    // var, so the Claude roster below does not resolve it.
+    let harness = match crate::acp_session::dispatch::select_headless_harness_here(
+        payload.harness.as_ref(),
+        payload.presentation.unwrap_or(Presentation::Headless),
+        payload.account.as_deref(),
+    ) {
+        Ok(harness) => harness,
+        Err(refusal) => {
+            warn!("agent_runtime: agent_id={agent_id} NOT launched — harness refused: {refusal}");
+            report_spawn_failed(
+                agent_id,
+                &refusal.to_string(),
+                None,
+                0,
+                primary_push_ref.as_deref(),
+            )
+            .await;
+            return Err(anyhow::anyhow!(refusal));
+        }
+    };
+    let claude_account_pin = match harness {
+        HeadlessHarness::ClaudeCli => payload.account.as_deref(),
+        _ => None,
+    };
+
     // Step 0: resolve the optional per-spawn account pin — BEFORE materializing
     // anything, so an unusable pin costs no worktrees. An unresolvable pin is a
     // terminal spawn failure reported to coord, never a quiet demotion to
     // least-usage rotation (see `resolve_spawn_account_with`).
-    let pinned_account = match resolve_spawn_account(payload.account.as_deref()) {
+    let pinned_account = match resolve_spawn_account(claude_account_pin) {
         Ok(a) => a,
         Err(e) => {
             let reason = format!("{e:#}");
@@ -10425,6 +10677,10 @@ async fn run_agent_subprocess(
     // main checkout, here); otherwise the defs stay absent.
     crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
 
+    if let Some(acp) = harness.into_acp() {
+        return run_agent_launch_acp(&payload, &acp, &primary_wt, coord_mcp, stop).await;
+    }
+
     let log_path = agent_log_path(payload.agent_id);
 
     // Step 2: heartbeat task — runs for the agent's whole life.
@@ -10620,6 +10876,61 @@ async fn run_agent_subprocess(
     )
     .await;
     Ok(())
+}
+
+/// The ACP arm of a coord agent launch (plan
+/// `2026-11-13-acp-client-lane-for-acp-native-clis` Phase 3): one ACP run under
+/// the agent's heartbeat, stoppable by coord's stop request. There is no
+/// restart loop: an ACP agent ends a turn with a stop reason rather than
+/// crashing out, and a non-`end_turn` stop is reported as `spawn-failed`.
+async fn run_agent_launch_acp(
+    payload: &LaunchPayload,
+    acp: &crate::acp_session::dispatch::AcpHarness,
+    primary_wt: &str,
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    stop: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    let push_ref = payload.worktrees.first().and_then(|wt| wt.push_ref.clone());
+    let hb_payload = payload.clone();
+    let hb_task = tokio::spawn(async move { run_heartbeat_loop(hb_payload).await });
+    let reporter = AcpRunLifecycle {
+        agent_id: payload.agent_id,
+        gate: None,
+        push_ref: push_ref.clone(),
+    };
+    let result = crate::acp_session::dispatch::run_acp(
+        acp,
+        crate::acp_session::dispatch::AcpRunContext {
+            workdir: primary_wt,
+            prompt: &payload.initial_prompt,
+            gate: None,
+            coord_mcp,
+            transcript_path: acp_transcript_path(payload.agent_id),
+            cancel: Some(stop),
+        },
+        &reporter,
+    )
+    .await;
+    hb_task.abort();
+    match result {
+        Ok(_report) => Ok(()),
+        Err(e) => {
+            let reason = e.to_string();
+            warn!(
+                "agent_runtime: agent_id={} acp:{} did not start: {reason}",
+                payload.agent_id, acp.agent
+            );
+            report_spawn_failed(
+                payload.agent_id,
+                first_line(&reason).as_str(),
+                None,
+                0,
+                push_ref.as_deref(),
+            )
+            .await;
+            Err(e.into())
+        }
+    }
 }
 
 /// `git worktree add` each allocated worktree from the primary checkout
@@ -14389,6 +14700,8 @@ mod tests {
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
             account: None,
+            harness: None,
+            presentation: None,
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -17555,6 +17868,7 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            harness: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -21340,6 +21654,7 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                harness: None,
             }
         }
         let gate = uuid::Uuid::now_v7();

@@ -530,6 +530,38 @@ impl Default for PiCliSettings {
     }
 }
 
+/// One ACP-native agent CLI the runner can drive headlessly (plan
+/// `2026-11-13-acp-client-lane-for-acp-native-clis`), keyed in
+/// [`AiSettings::acp_agents`] by its agent id (`^[a-z0-9][a-z0-9._-]{0,63}$`).
+///
+/// An entry whose `program` resolves to an executable is advertised to coord
+/// as the host capability `acp:<id>`, and coord places a continuation carrying
+/// `harness: {"acp": "<id>"}` only on a device that advertises it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpAgentSettings {
+    /// The agent CLI: an absolute path, or a bare name looked up on the
+    /// runner's `PATH` (e.g. `gemini`, `opencode`, `codex-acp`).
+    pub program: String,
+    /// Arguments that put it in ACP mode (e.g. `["--experimental-acp"]`,
+    /// `["acp"]`).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The env var through which this agent selects its account / config
+    /// home (e.g. `CODEX_HOME`). A launch that pins an account sets it to the
+    /// pin; without it such a launch is refused rather than run unpinned.
+    #[serde(default)]
+    pub env_account_var: Option<String>,
+    /// Wall-clock bound on one prompt turn. An ACP agent does not exit at the
+    /// end of its work the way a headless `claude -p` does, so the runner
+    /// bounds the turn itself.
+    #[serde(default = "default_acp_agent_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_acp_agent_timeout() -> u64 {
+    6 * 3600
+}
+
 /// Settings for Gemini API (direct HTTP calls)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiApiSettings {
@@ -562,6 +594,11 @@ pub struct AiSettings {
     /// pi CLI settings (`@earendil-works/pi-coding-agent` agent CLI).
     #[serde(default)]
     pub pi_cli: PiCliSettings,
+    /// ACP-native agent CLIs the headless dispatch lane can run a continuation
+    /// under, keyed by agent id. Empty (the default) means none: an ACP
+    /// harness request is then refused, never run under Claude.
+    #[serde(default)]
+    pub acp_agents: std::collections::BTreeMap<String, AcpAgentSettings>,
     /// Local Ollama instance settings (Tier 0).
     #[serde(default)]
     pub ollama: OllamaSettings,
@@ -716,6 +753,7 @@ impl Default for AiSettings {
             gemini_cli: GeminiCliSettings::default(),
             gemini_api: GeminiApiSettings::default(),
             pi_cli: PiCliSettings::default(),
+            acp_agents: std::collections::BTreeMap::new(),
             ollama: OllamaSettings::default(),
             openai_compatible: OpenAiCompatibleSettings::default(),
             auto_refine_video_after_iterations: default_auto_refine_video_after_iterations(),

@@ -1776,6 +1776,14 @@ fn host_capabilities() -> Vec<String> {
         host_mem_total_bytes(),
     );
     caps.extend(imagegen_probe::capability_tokens());
+    // `acp:<id>` per configured ACP agent whose program resolves (plan
+    // `2026-11-13-acp-client-lane-for-acp-native-clis`, Design decision 3):
+    // coord places an ACP-harness continuation only on a device advertising it.
+    // Read per heartbeat, so a settings edit is advertised on the next beat.
+    caps.extend(crate::acp_session::dispatch::acp_capability_tokens(
+        &crate::settings::get_ai_settings().acp_agents,
+        crate::acp_session::dispatch::resolve_acp_program,
+    ));
     caps
 }
 

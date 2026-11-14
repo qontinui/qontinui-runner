@@ -2,10 +2,9 @@
 //! Codex via `codex-acp`, ...) headlessly through the Agent Client Protocol.
 //!
 //! Plan `2026-11-13-acp-client-lane-for-acp-native-clis`, Phase 1: the client
-//! core only. Nothing in the runner calls this module yet — Phase 2 wires it
-//! into the headless continuation arm (`HeadlessHarness::Acp` in
-//! `agent_runtime.rs`). The bin crate's root allows dead code crate-wide, so
-//! no module-level allow is needed meanwhile.
+//! core; Phases 2-3 wire it into the headless continuation arm and the coord
+//! agent launch through [`dispatch`] (the `HeadlessHarness` choice in
+//! `agent_runtime.rs`).
 //!
 //! - [`client`]: spawn the agent as our own child (credential scrub and git
 //!   posture identical to the headless Claude child), `initialize`,
@@ -14,8 +13,12 @@
 //!   not advertised).
 //! - [`map`]: `session/update` → transcript lines and usage events; stop
 //!   reasons.
+//! - [`dispatch`]: Phases 2-3 — the headless dispatch lane `agent_runtime.rs`
+//!   calls: harness selection from the `acp_agents` setting, skill inlining,
+//!   coord-mcp delivery, the continuation verdict, the run transcript.
 
 pub(crate) mod client;
+pub(crate) mod dispatch;
 pub(crate) mod map;
 
 pub(crate) use client::{

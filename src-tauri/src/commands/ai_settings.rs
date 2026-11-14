@@ -213,6 +213,8 @@ pub fn save_ai_settings(
             gemini_api: existing_settings.gemini_api,
             // Preserve existing pi CLI settings
             pi_cli: existing_settings.pi_cli,
+            // Preserve the ACP agents (no frontend surface edits them).
+            acp_agents: existing_settings.acp_agents,
             // Preserve existing Ollama / OpenAI-compatible settings (Tier 0 substrate)
             ollama: existing_settings.ollama,
             openai_compatible: existing_settings.openai_compatible,
@@ -323,6 +325,8 @@ pub fn save_gemini_settings(
             },
             // Preserve existing pi CLI / Ollama / OpenAI-compatible settings
             pi_cli: existing_settings.pi_cli,
+            // Preserve the ACP agents (no frontend surface edits them).
+            acp_agents: existing_settings.acp_agents,
             ollama: existing_settings.ollama,
             openai_compatible: existing_settings.openai_compatible,
             auto_refine_video_after_iterations: existing_settings
@@ -1039,6 +1043,8 @@ pub fn save_agentic_settings(
             gemini_cli: existing_settings.gemini_cli,
             gemini_api: existing_settings.gemini_api,
             pi_cli: existing_settings.pi_cli,
+            // Preserve the ACP agents (no frontend surface edits them).
+            acp_agents: existing_settings.acp_agents,
             ollama: existing_settings.ollama,
             openai_compatible: existing_settings.openai_compatible,
             auto_refine_video_after_iterations: existing_settings

@@ -155,8 +155,10 @@ pub const COORD_MCP_STDIO_SHIM_FILE: &str = "coord-mcp-shim.py";
 /// URL, no nonce, no door (plan Design decision 4).
 pub const COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG: &str = "--credential";
 
-/// The `mcpServers.coord-mcp` entry, whatever its transport.
-fn coord_mcp_entry(doc: &serde_json::Value) -> Option<&serde_json::Value> {
+/// The `mcpServers.coord-mcp` entry, whatever its transport. Public so the
+/// ACP lane (`acp_session::dispatch`) hands an agent the very entry the
+/// `.mcp.json` writer rendered.
+pub fn coord_mcp_entry(doc: &serde_json::Value) -> Option<&serde_json::Value> {
     doc.pointer("/mcpServers/coord-mcp")
 }
 
