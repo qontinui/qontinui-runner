@@ -833,9 +833,13 @@ struct CiState {
     /// otherwise a box that stays under the headroom threshold would accrue one
     /// sleeping task per redelivered dispatch.
     waker_armed: bool,
-    /// A [`spawn_queue_keeper`] task is in flight. At most one, and it disarms
-    /// itself (under this lock) the tick it finds the queue empty.
-    keeper_armed: bool,
+    /// The generation of the [`spawn_queue_keeper`] task in flight, if any. At
+    /// most one. Only the keeper holding THIS generation may clear it — the
+    /// tick it finds the queue empty, or its [`KeeperArmGuard`] on an abnormal
+    /// exit — so an old keeper can never disarm a newer one armed in between.
+    keeper_arm: Option<u64>,
+    /// The last generation [`enqueue_locked`] minted.
+    keeper_generation: u64,
 }
 
 impl CiState {
@@ -844,7 +848,8 @@ impl CiState {
             running: HashMap::new(),
             queued: VecDeque::new(),
             waker_armed: false,
-            keeper_armed: false,
+            keeper_arm: None,
+            keeper_generation: 0,
         }
     }
 }
@@ -1007,21 +1012,25 @@ fn take_expired(
 
 /// Push a deferred dispatch and arm the queue-keeper if none is running.
 /// `stamp` is `Some` for a RE-queue, which keeps both of its deadlines; `None`
-/// stamps it on arrival. Returns `(queue depth, keeper newly armed)`; the
-/// caller spawns the keeper OUTSIDE the lock.
+/// stamps it on arrival. Returns `(queue depth, newly minted keeper
+/// generation)`: `Some(gen)` when no keeper was armed, in which case the
+/// caller spawns one for `gen` OUTSIDE the lock.
 fn enqueue_locked(
     state: &mut CiState,
     payload: CiDispatchPayload,
     stamp: Option<QueueStamp>,
-) -> (usize, bool) {
+) -> (usize, Option<u64>) {
     let stamp = stamp
         .unwrap_or_else(|| QueueStamp::on_arrival(&payload, Instant::now(), chrono::Utc::now()));
     state.queued.push_back(QueuedDispatch { payload, stamp });
-    let arm = !state.keeper_armed;
-    if arm {
-        state.keeper_armed = true;
-    }
-    (state.queued.len(), arm)
+    let minted = if state.keeper_arm.is_none() {
+        state.keeper_generation = state.keeper_generation.wrapping_add(1);
+        state.keeper_arm = Some(state.keeper_generation);
+        state.keeper_arm
+    } else {
+        None
+    };
+    (state.queued.len(), minted)
 }
 
 /// What the queue-keeper does to coord. A trait so one keeper pass can be
@@ -1085,6 +1094,7 @@ async fn keeper_tick<T: QueueTransport>(
     state: &Mutex<CiState>,
     transport: &T,
     now: Instant,
+    generation: u64,
 ) -> bool {
     use futures::StreamExt as _;
     let (expired, renew, emptied) = {
@@ -1101,9 +1111,12 @@ async fn keeper_tick<T: QueueTransport>(
         let emptied = guard.queued.is_empty();
         if emptied {
             // Disarmed under the same lock a push arms under, so a dispatch
-            // queued after this point spawns a fresh keeper and this one exits
-            // after its final releases.
-            guard.keeper_armed = false;
+            // queued after this point spawns a fresh keeper (a NEW generation)
+            // and this one exits after its final releases. Only our own
+            // generation is cleared.
+            if guard.keeper_arm == Some(generation) {
+                guard.keeper_arm = None;
+            }
         }
         (expired, renew, emptied)
     };
@@ -1196,10 +1209,14 @@ async fn keeper_tick<T: QueueTransport>(
     emptied
 }
 
-/// The queue-keeper task: [`run_queue_keeper`] over the process state and the
-/// production transport.
-fn spawn_queue_keeper() {
-    tokio::spawn(run_queue_keeper(ci_state(), CoordQueueTransport));
+/// The queue-keeper task for arm `generation`: [`run_queue_keeper`] over the
+/// process state and the production transport.
+fn spawn_queue_keeper(generation: u64) {
+    tokio::spawn(run_queue_keeper(
+        ci_state(),
+        CoordQueueTransport,
+        generation,
+    ));
 }
 
 /// One [`keeper_tick`] every [`QUEUE_HEARTBEAT_INTERVAL`] until a tick finds the
@@ -1213,15 +1230,14 @@ fn spawn_queue_keeper() {
 /// means a tick that somehow overran the interval is followed by the next one
 /// a full interval later rather than by a burst of catch-up ticks.
 ///
-/// A [`KeeperArmGuard`] clears `keeper_armed` if the task ends any other way
-/// than through a tick that found the queue empty — a panic, or the task being
-/// dropped — so the next enqueue arms a fresh keeper instead of finding the
-/// flag stuck `true` with no keeper behind it.
-async fn run_queue_keeper<T: QueueTransport>(state: &Mutex<CiState>, transport: T) {
-    let mut arm = KeeperArmGuard {
-        state,
-        disarmed_by_tick: false,
-    };
+/// `generation` is the arm [`enqueue_locked`] minted for this keeper. A
+/// [`KeeperArmGuard`] clears it if the task ends abnormally (see there).
+async fn run_queue_keeper<T: QueueTransport>(
+    state: &Mutex<CiState>,
+    transport: T,
+    generation: u64,
+) {
+    let _arm = KeeperArmGuard { state, generation };
     let mut ticks = tokio::time::interval_at(
         tokio::time::Instant::now() + QUEUE_HEARTBEAT_INTERVAL,
         QUEUE_HEARTBEAT_INTERVAL,
@@ -1229,44 +1245,53 @@ async fn run_queue_keeper<T: QueueTransport>(state: &Mutex<CiState>, transport: 
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
-        if keeper_tick(state, &transport, Instant::now()).await {
-            arm.disarmed_by_tick = true;
+        if keeper_tick(state, &transport, Instant::now(), generation).await {
             return;
         }
     }
 }
 
-/// Clears `keeper_armed` when the keeper task exits for any reason other than
-/// a tick that found the queue empty.
+/// Clears this keeper's arm when its task exits, however it exits — a panic in
+/// a tick, the task being dropped at shutdown, or the normal empty-queue
+/// return. Without it, an abnormal exit would leave `keeper_arm` set with no
+/// keeper behind it, and no keeper would ever be spawned again.
 ///
-/// That one exit is excluded on purpose: [`keeper_tick`] already disarmed
-/// under the same lock [`enqueue_locked`] arms under, and an enqueue that ran
-/// in between has since armed a NEW keeper. Clearing the flag again here would
-/// orphan that keeper's arm and let the following enqueue spawn a second
-/// keeper beside it. Every other exit — a panic in a tick, the task being
-/// dropped at shutdown — left the flag `true` with nothing renewing the queue,
-/// and without this guard no keeper would ever be spawned again.
+/// It clears the arm only while it still holds THIS keeper's generation. By
+/// the time an old keeper exits, [`keeper_tick`] may already have disarmed it
+/// under the lock and an enqueue may have armed a NEWER generation — for
+/// example while the old keeper is still posting the releases that tick took.
+/// Clearing that newer arm would orphan it and let the next enqueue spawn a
+/// second keeper beside it; the generation check makes that impossible on
+/// every exit path, the normal one included (where the arm is usually already
+/// gone and this is a no-op).
+///
+/// After an ABNORMAL exit the queued dispatches are not served — neither
+/// renewed nor released — until the next enqueue arms a keeper. That is
+/// deliberate: respawning from here would turn a keeper that panics
+/// deterministically into a panic respawn loop.
 ///
 /// A panic while the `ci_state()` lock was held poisons it; the guard takes
-/// the inner state anyway (`into_inner`), since clearing a bool cannot break
+/// the inner state anyway (`into_inner`), since clearing the arm cannot break
 /// any invariant the poisoning protects.
 struct KeeperArmGuard<'a> {
     state: &'a Mutex<CiState>,
-    disarmed_by_tick: bool,
+    generation: u64,
 }
 
 impl Drop for KeeperArmGuard<'_> {
     fn drop(&mut self) {
-        if self.disarmed_by_tick {
-            return;
-        }
         let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.keeper_armed = false;
+        if guard.keeper_arm != Some(self.generation) {
+            return;
+        }
+        guard.keeper_arm = None;
         warn!(
-            "ci_node: queue keeper exited abnormally with {} dispatch(es) queued;              disarmed so the next enqueue spawns a fresh keeper",
+            "ci_node: queue keeper (generation {}) exited abnormally with {} dispatch(es) \
+             queued; disarmed so the next enqueue spawns a fresh keeper",
+            self.generation,
             guard.queued.len()
         );
     }
@@ -1423,8 +1448,8 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
             if needs_waker {
                 spawn_headroom_waker();
             }
-            if needs_keeper {
-                spawn_queue_keeper();
+            if let Some(generation) = needs_keeper {
+                spawn_queue_keeper(generation);
             }
         }
         Admission::Proceed => start_build(payload, settings, host, max_concurrent, stamp),
@@ -1571,8 +1596,8 @@ fn start_build(
             needs_keeper,
         } => {
             info!("ci_node: slot taken while gating — deferring dispatch {dispatch_id}");
-            if needs_keeper {
-                spawn_queue_keeper();
+            if let Some(generation) = needs_keeper {
+                spawn_queue_keeper(generation);
             }
             return;
         }
@@ -1605,7 +1630,8 @@ enum SlotClaim {
     /// the stamp it came in with.
     Requeued {
         dispatch_id: String,
-        needs_keeper: bool,
+        /// The keeper generation to spawn, when this requeue armed one.
+        needs_keeper: Option<u64>,
     },
 }
 
@@ -1911,16 +1937,29 @@ mod tests {
         }
     }
 
-    fn state_with(entries: Vec<QueuedDispatch>) -> std::sync::Arc<Mutex<CiState>> {
+    /// The keeper generation [`state_with`] arms, which the tests' keeper
+    /// ticks run as.
+    const TEST_GEN: u64 = 1;
+
+    fn armed_state(entries: Vec<QueuedDispatch>) -> CiState {
         let mut s = CiState::new();
-        s.keeper_armed = true;
+        s.keeper_generation = TEST_GEN;
+        s.keeper_arm = Some(TEST_GEN);
         s.queued.extend(entries);
-        std::sync::Arc::new(Mutex::new(s))
+        s
     }
 
-    /// REVIEW A2: a keeper task that panics (or is dropped) must not leave
-    /// `keeper_armed` stuck `true`, or no keeper is ever spawned again and the
-    /// queue is neither renewed nor released.
+    fn state_with(entries: Vec<QueuedDispatch>) -> std::sync::Arc<Mutex<CiState>> {
+        std::sync::Arc::new(Mutex::new(armed_state(entries)))
+    }
+
+    fn leaked_state(entries: Vec<QueuedDispatch>) -> &'static Mutex<CiState> {
+        Box::leak(Box::new(Mutex::new(armed_state(entries))))
+    }
+
+    /// REVIEW: a keeper task that panics (or is dropped) must not leave its
+    /// arm set, or no keeper is ever spawned again and the queue is neither
+    /// renewed nor released.
     #[tokio::test(start_paused = true)]
     async fn a_panicking_keeper_clears_its_arm() {
         struct Panics;
@@ -1934,16 +1973,10 @@ mod tests {
             }
             fn release(&self, _payload: &CiDispatchPayload, _reason: &str) {}
         }
-        let now = Instant::now();
         let mut payload = advertising(queued_payload("p"), 1800);
         payload.coord_http_url = "http://127.0.0.1:9".to_string();
-        let state: &'static Mutex<CiState> = Box::leak(Box::new(Mutex::new(CiState::new())));
-        {
-            let mut s = state.lock().unwrap();
-            s.keeper_armed = true;
-            s.queued.push_back(queued_at(payload, now));
-        }
-        let joined = tokio::spawn(run_queue_keeper(state, Panics)).await;
+        let state = leaked_state(vec![queued_at(payload, Instant::now())]);
+        let joined = tokio::spawn(run_queue_keeper(state, Panics, TEST_GEN)).await;
         assert!(
             joined.as_ref().is_err_and(|e| e.is_panic()),
             "the keeper task must have panicked: {joined:?}"
@@ -1951,7 +1984,7 @@ mod tests {
         let s = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(!s.keeper_armed, "a panicked keeper must clear keeper_armed");
+        assert_eq!(s.keeper_arm, None, "a panicked keeper must clear its arm");
         assert_eq!(
             s.queued.len(),
             1,
@@ -1959,27 +1992,87 @@ mod tests {
         );
     }
 
-    /// The guard must NOT clear an arm on the normal empty-queue exit: by then
-    /// an enqueue may have armed a new keeper, and clearing would let a second
-    /// one spawn beside it.
+    /// A transport whose `release()` is the window between [`keeper_tick`]
+    /// disarming (queue emptied) and the keeper task exiting: it re-queues a
+    /// dispatch through [`enqueue_locked`], which arms a NEWER generation —
+    /// exactly what a concurrent enqueue does — and then optionally panics.
+    struct ReArmsOnRelease {
+        state: &'static Mutex<CiState>,
+        panic_after: bool,
+        rearmed: Mutex<Option<u64>>,
+    }
+
+    impl QueueTransport for ReArmsOnRelease {
+        async fn heartbeat(&self, _base: &str, _id: &str) -> reporting::QueueHeartbeat {
+            reporting::QueueHeartbeat::Renewed
+        }
+        fn release(&self, _payload: &CiDispatchPayload, _reason: &str) {
+            let (_, minted) = {
+                let mut s = self.state.lock().unwrap();
+                enqueue_locked(&mut s, queued_payload("newer"), None)
+            };
+            *self.rearmed.lock().unwrap() = minted;
+            if self.panic_after {
+                panic!("release transport panicked after a re-arm (test)");
+            }
+        }
+    }
+
+    /// One already-expired, non-advertising dispatch: the first tick releases
+    /// it and empties the queue.
+    fn expired_entry() -> QueuedDispatch {
+        let now = Instant::now();
+        QueuedDispatch {
+            payload: queued_payload("old"),
+            stamp: QueueStamp {
+                queued_since: now,
+                release_at: now,
+                renew_by: now,
+            },
+        }
+    }
+
+    /// REVIEW: an old keeper must never clear a NEWER keeper's arm. Driven
+    /// end to end through `run_queue_keeper`: the release that empties the
+    /// queue re-arms a newer generation inside the window before the old task
+    /// exits. On the normal path and on a panic in that window, the newer arm
+    /// must survive — else the next enqueue spawns a second keeper beside it.
     #[tokio::test(start_paused = true)]
-    async fn a_keeper_exiting_on_an_empty_queue_leaves_a_newer_arm_alone() {
-        let state: &'static Mutex<CiState> = Box::leak(Box::new(Mutex::new(CiState::new())));
-        state.lock().unwrap().keeper_armed = true;
-        let fake = FakeTransport::new(reporting::QueueHeartbeat::Renewed);
-        let mut guard = KeeperArmGuard {
-            state,
-            disarmed_by_tick: false,
-        };
-        assert!(keeper_tick(state, &fake, Instant::now()).await);
-        guard.disarmed_by_tick = true;
-        // A new enqueue arms a fresh keeper before the old task finishes.
-        state.lock().unwrap().keeper_armed = true;
-        drop(guard);
-        assert!(
-            state.lock().unwrap().keeper_armed,
-            "the newer keeper's arm survives the old keeper's exit"
-        );
+    async fn an_old_keepers_exit_leaves_a_newer_generation_armed() {
+        for panic_after in [false, true] {
+            let state = leaked_state(vec![expired_entry()]);
+            let transport = ReArmsOnRelease {
+                state,
+                panic_after,
+                rearmed: Mutex::new(None),
+            };
+            let rearmed = std::sync::Arc::new(transport);
+            let joined = tokio::spawn({
+                let rearmed = rearmed.clone();
+                async move { run_queue_keeper(state, Shared(rearmed), TEST_GEN).await }
+            })
+            .await;
+            assert_eq!(
+                joined.is_err(),
+                panic_after,
+                "panic_after={panic_after}: {joined:?}"
+            );
+            let newer = rearmed
+                .rearmed
+                .lock()
+                .unwrap()
+                .expect("the release re-armed");
+            assert_ne!(newer, TEST_GEN, "the re-arm minted a new generation");
+            let s = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                s.keeper_arm,
+                Some(newer),
+                "panic_after={panic_after}: the newer keeper's arm survives the old keeper's exit"
+            );
+            assert_eq!(s.queued.len(), 1, "the re-queued dispatch waits for it");
+        }
     }
 
     #[tokio::test]
@@ -1988,17 +2081,18 @@ mod tests {
         let empty = state_with(Vec::new());
         let fake = FakeTransport::new(reporting::QueueHeartbeat::Renewed);
         assert!(
-            keeper_tick(&empty, &fake, now).await,
+            keeper_tick(&empty, &fake, now, TEST_GEN).await,
             "an empty queue ends the keeper"
         );
-        assert!(
-            !empty.lock().unwrap().keeper_armed,
+        assert_eq!(
+            empty.lock().unwrap().keeper_arm,
+            None,
             "and disarms it under the lock"
         );
 
         let busy = state_with(vec![queued_at(advertising(queued_payload("a"), 1800), now)]);
-        assert!(!keeper_tick(&busy, &fake, now).await);
-        assert!(busy.lock().unwrap().keeper_armed);
+        assert!(!keeper_tick(&busy, &fake, now, TEST_GEN).await);
+        assert_eq!(busy.lock().unwrap().keeper_arm, Some(TEST_GEN));
         assert_eq!(*fake.heartbeats.lock().unwrap(), ["a"]);
         assert!(fake.releases.lock().unwrap().is_empty());
         assert_eq!(
@@ -2014,7 +2108,7 @@ mod tests {
         // Still queued when coord refuses: released with the refusal reason.
         let state = state_with(vec![queued_at(advertising(queued_payload("a"), 1800), now)]);
         let fake = FakeTransport::new(reporting::QueueHeartbeat::Refused);
-        keeper_tick(&state, &fake, now).await;
+        keeper_tick(&state, &fake, now, TEST_GEN).await;
         assert_eq!(
             *fake.releases.lock().unwrap(),
             [("a".to_string(), QUEUED_RENEWAL_REFUSED_REASON.to_string())]
@@ -2026,7 +2120,7 @@ mod tests {
         let state = state_with(vec![queued_at(advertising(queued_payload("b"), 1800), now)]);
         let mut fake = FakeTransport::new(reporting::QueueHeartbeat::Refused);
         fake.admit_during_heartbeat = Some(state.clone());
-        keeper_tick(&state, &fake, now).await;
+        keeper_tick(&state, &fake, now, TEST_GEN).await;
         assert!(fake.releases.lock().unwrap().is_empty());
     }
 
@@ -2039,7 +2133,7 @@ mod tests {
             queued_at(queued_payload("legacy"), now),
         ]);
         let fake = FakeTransport::new(reporting::QueueHeartbeat::Terminal("lost".into()));
-        keeper_tick(&state, &fake, now).await;
+        keeper_tick(&state, &fake, now, TEST_GEN).await;
         assert!(
             fake.releases.lock().unwrap().is_empty(),
             "a settled row is not released"
@@ -2067,7 +2161,10 @@ mod tests {
             now - Duration::from_secs(16 * 60),
         )]);
         let fake = FakeTransport::new(reporting::QueueHeartbeat::Renewed);
-        assert!(keeper_tick(&state, &fake, now).await, "the queue emptied");
+        assert!(
+            keeper_tick(&state, &fake, now, TEST_GEN).await,
+            "the queue emptied"
+        );
         assert_eq!(
             *fake.releases.lock().unwrap(),
             [("stale".to_string(), DEFERRED_PAST_LEASE_REASON.to_string())]
@@ -2086,7 +2183,13 @@ mod tests {
     ) -> Option<(u64, String)> {
         for minute in 1..=minutes {
             *fake.reply.lock().unwrap() = reply_at(minute);
-            keeper_tick(state, fake, start + Duration::from_secs(minute * 60)).await;
+            keeper_tick(
+                state,
+                fake,
+                start + Duration::from_secs(minute * 60),
+                TEST_GEN,
+            )
+            .await;
             if let Some((_, reason)) = fake.releases.lock().unwrap().first() {
                 return Some((minute, reason.clone()));
             }
@@ -2176,7 +2279,7 @@ mod tests {
         let transport = Rendezvous(tokio::sync::Barrier::new(3), AtomicUsize::new(0));
         tokio::time::timeout(
             Duration::from_secs(10),
-            keeper_tick(&state, &transport, now),
+            keeper_tick(&state, &transport, now, TEST_GEN),
         )
         .await
         .expect("the tick finishes");
@@ -2214,7 +2317,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
             QUEUE_HEARTBEAT_BATCH_TIMEOUT * 2,
-            keeper_tick(&state, &HangsOn("hung"), now),
+            keeper_tick(&state, &HangsOn("hung"), now, TEST_GEN),
         )
         .await
         .expect("the tick ends at the batch bound, not never");
@@ -2272,7 +2375,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let ran = tokio::time::timeout(
             QUEUE_HEARTBEAT_INTERVAL * 3 + Duration::from_secs(30),
-            run_queue_keeper(&state, Shared(transport.clone())),
+            run_queue_keeper(&state, Shared(transport.clone()), TEST_GEN),
         )
         .await;
         assert!(ran.is_err(), "a non-empty queue keeps the keeper running");
@@ -2533,7 +2636,7 @@ mod tests {
         let mut state = CiState::new();
         let before = Instant::now();
         let (depth, armed) = enqueue_locked(&mut state, absurd, None);
-        assert_eq!((depth, armed), (1, true));
+        assert_eq!((depth, armed.is_some()), (1, true));
         let stamp = state.queued[0].stamp;
         assert!(stamp.release_at > stamp.queued_since);
         assert!(
@@ -2695,12 +2798,12 @@ mod tests {
             claim,
             SlotClaim::Requeued {
                 ref dispatch_id,
-                needs_keeper: true
+                needs_keeper: Some(_)
             } if dispatch_id == "late"
         ));
         let s = full.lock().unwrap();
         assert_eq!(s.queued[0].stamp, stamp);
-        assert!(s.keeper_armed);
+        assert!(s.keeper_arm.is_some());
         drop(s);
 
         let free = std::sync::Arc::new(Mutex::new(CiState::new()));
@@ -2746,10 +2849,10 @@ mod tests {
             renew_by: Instant::now() + Duration::from_secs(700),
         };
         let (depth, armed) = enqueue_locked(&mut state, queued_payload("a"), Some(first));
-        assert_eq!((depth, armed), (1, true));
+        assert_eq!((depth, armed.is_some()), (1, true));
         assert_eq!(state.queued[0].stamp, first);
         let (depth, armed) = enqueue_locked(&mut state, queued_payload("b"), None);
-        assert_eq!((depth, armed), (2, false), "one keeper, ever");
+        assert_eq!((depth, armed), (2, None), "one keeper, ever");
         let fresh = state.queued[1].stamp;
         assert!(
             fresh.queued_since < first.queued_since

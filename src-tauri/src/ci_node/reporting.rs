@@ -748,17 +748,25 @@ pub(crate) fn classify_queue_heartbeat(status: u16, body: &str) -> QueueHeartbea
 
 /// The one HTTP client every queue heartbeat shares (10 s request timeout).
 ///
-/// The keeper renews up to [`super::admission::QUEUE_HEARTBEAT_CONCURRENCY`]
-/// dispatches every minute for as long as anything is queued; a client per
-/// heartbeat would rebuild the TLS config and connection pool each time and
-/// never reuse a connection to coord. `None` if the build failed — a TLS
-/// backend that cannot initialise will not succeed on a retry either.
+/// The keeper renews EVERY queued dispatch whose coord advertised the queued
+/// phase on each tick (one tick per minute), with at most
+/// [`super::admission::QUEUE_HEARTBEAT_CONCURRENCY`] renewals in flight at
+/// once, for as long as anything is queued. A client per heartbeat would
+/// rebuild the TLS config and connection pool each time and never reuse a
+/// connection to coord. `None` if the build failed — a TLS backend that cannot
+/// initialise will not succeed on a retry either.
+///
+/// Idle pooled connections are dropped after 45 s, inside the keeper's 60 s
+/// period: a proxy or load balancer in front of coord may close an idle
+/// connection before then, and a heartbeat sent on such a half-closed socket
+/// fails and costs that dispatch a renewal.
 fn queue_heartbeat_client() -> Option<&'static reqwest::Client> {
     static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(45))
                 .build()
                 .ok()
         })
