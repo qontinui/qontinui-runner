@@ -1566,7 +1566,8 @@ pub fn worktree_is_dirty(path: &Path) -> DirtyProbe {
         return DirtyProbe::Unknown;
     };
     let mut child = match crate::process_helpers::no_window("git")
-        .args(["-C", path_str, "status", "--porcelain"])
+        .args(["-C", path_str])
+        .args(super::dirty::STATUS_PORCELAIN_ALL_UNTRACKED)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -4044,6 +4045,14 @@ mod tests {
         ] {
             assert!(plural.contains(needle), "missing {needle:?} in {plural:?}");
         }
+    }
+
+    /// Edge 9171555e: `status.showUntrackedFiles=no` must not blind the
+    /// reaper's dirty probe.
+    #[test]
+    fn the_production_dirty_probe_sees_an_untracked_file_hidden_by_show_untracked_no() {
+        let repo = super::super::dirty::repo_with_hidden_untracked_file();
+        assert_eq!(worktree_is_dirty(repo.path()), DirtyProbe::Dirty);
     }
 
     /// The PRODUCTION dirty probe fails closed to `Unknown`, never to `Clean`.
