@@ -8272,8 +8272,13 @@ async fn remove_unspawned_continuation(
     reason: &str,
 ) {
     if let Some(ctx) = ctx {
-        ctx.remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
+        #[cfg(test)]
+        let agent_id = ctx.agent_id.clone();
+        let _report = ctx
+            .remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
             .await;
+        #[cfg(test)]
+        headless_refusal_tests::record_continuation_removal(agent_id, _report);
     }
 }
 
@@ -22742,6 +22747,12 @@ mod gateway_spawn_refusal_tests {
         }
     }
 }
+
+/// Plan `2026-11-13-spawn-refused-tree-followups` Phase 2: the headless
+/// continuation's gateway refusal, driven end to end through the remover.
+#[cfg(test)]
+#[path = "agent_runtime/headless_refusal_tests.rs"]
+mod headless_refusal_tests;
 
 /// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
 /// Phase 3: what the gate-continuation and coord-launch doors hand the remover.
