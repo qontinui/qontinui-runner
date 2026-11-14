@@ -2600,6 +2600,9 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > it there, so the window is anchored to the moment of arming rather than to
 > evaluation. The split is deliberate — do not "fix" it back into a continuation
 > on `unit_ready`, and do not re-spell it `unit_status`.
+> Under `/vet-imp`, the chain releases the plan reserve once step 8 reads this
+> net's `gate_id` back (`/vet-imp` Step 3). `/vet-plan` itself never releases it,
+> because its own reserve reads `renewed`.
 >
 > *Why the two gates are separate.* One gate was answering two different
 > questions — *this plan is ready, dispatchable work* (a record, true the instant

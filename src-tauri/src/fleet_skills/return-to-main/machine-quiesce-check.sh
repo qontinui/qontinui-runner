@@ -768,12 +768,17 @@ def _git(repo_dir, *args, raw=False):
     env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
         p = subprocess.run(["git", "--no-optional-locks", "-C", repo_dir, "-c", "core.fsmonitor=false"] + list(args),
-                           capture_output=True, text=not raw, timeout=30, env=env)
+                           capture_output=True, timeout=30, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     if p.returncode != 0:
         return None
-    return p.stdout if raw else p.stdout.strip()
+    if raw:
+        return p.stdout
+    # Parsed (refs, paths): a strict decode. UnicodeDecodeError is NOT caught here; each
+    # caller's own arm reads it UNKNOWN: _primary_verdict's per-primary backstop names it
+    # on stderr, and repo_work() reports "unknown: ..." (work, the safe direction).
+    return p.stdout.decode("utf-8").strip()
 
 
 # One reflog line, matched over the WHOLE line and about as strict as git's own
@@ -1106,6 +1111,15 @@ def _names(repos, cap=6):
 
 
 def repo_work(for_class, repo_dir):
+    """(has_work, why) for one QUIET primary; see _repo_work. A git answer that is
+    not UTF-8 is that repo's UNKNOWN, reported as work like every other unread."""
+    try:
+        return _repo_work(for_class, repo_dir)
+    except UnicodeDecodeError as exc:
+        return True, "unknown: a git answer is not UTF-8 (%s at byte %d)" % (exc.reason, exc.start)
+
+
+def _repo_work(for_class, repo_dir):
     """Whether R has something the sweep would do under this task class, read
     cheaply from what is already on disk (NO fetch: origin/<default> as last
     fetched -- the sweep fetches before it acts). checkout-ff: on its default
