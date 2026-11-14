@@ -319,7 +319,7 @@ pub(crate) fn cap_report(mut computers: Vec<ComputerReport>) -> Vec<ComputerRepo
 }
 
 /// One computer's result in a 200 response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Outcome {
     /// coord did NOT store this computer's services or events.
     pub(crate) identity_conflict: bool,
@@ -328,6 +328,12 @@ pub(crate) struct Outcome {
     /// Timestamps coord clamped to its own now because they were ahead of
     /// its clock (contract amendment A3).
     pub(crate) timestamps_clamped: u64,
+    /// A `parent_identity_hash` was sent but coord holds no computer with it
+    /// in this tenant, so the parent link is UNKNOWN (left unset by coord).
+    pub(crate) parent_unresolved: bool,
+    /// Keys coord did not recognise and therefore did NOT store — a field this
+    /// runner sends that the answering coord does not carry (contract drift).
+    pub(crate) unknown_fields: Vec<String>,
 }
 
 /// The per-computer outcomes of a 200 response, or `None` when the body is
@@ -353,6 +359,19 @@ pub(crate) fn parse_outcomes(body: &str) -> Option<BTreeMap<String, Outcome>> {
                         .get("timestamps_clamped")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
+                    parent_unresolved: c
+                        .get("parent_unresolved")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    unknown_fields: c
+                        .get("unknown_fields")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|k| k.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 };
                 Some((id, o))
             })
@@ -490,6 +509,9 @@ pub(crate) fn quarantine(
 /// (`MAX_UNIT_LEN`).
 pub(crate) const MAX_TEXT_LEN: usize = 512;
 pub(crate) const MAX_UNIT_LEN: usize = 256;
+/// coord's `MAX_SERVICES_PER_COMPUTER`: an entry listing more services is
+/// refused, and the refusal costs the whole report.
+pub(crate) const MAX_SERVICES_PER_COMPUTER: usize = 256;
 
 fn too_long(v: &Option<String>) -> bool {
     v.as_ref().is_some_and(|s| s.chars().count() > MAX_TEXT_LEN)
@@ -499,9 +521,15 @@ fn too_long(v: &Option<String>) -> bool {
 /// value, never the whole report: a text field over [`MAX_TEXT_LEN`] chars is
 /// nulled (a truncated unit or runner name would be a wrong key, not a
 /// shorter one); a service whose unit name is over [`MAX_UNIT_LEN`] is
-/// dropped. Timestamps are NOT checked here: coord is the authority on "now"
-/// and clamps a future timestamp itself (contract amendment A3). PURE.
-pub(crate) fn presanitize(c: &mut ComputerReport) {
+/// dropped; and a list over [`MAX_SERVICES_PER_COMPUTER`] is cut to the bound
+/// from its LARGEST kind (the one that overflowed), and only the kinds that
+/// lost rows leave `services_complete_kinds` — a truncated kind claimed
+/// complete would make coord delete the stored rows it omits, while a kind
+/// sent whole keeps its deletions. The cut rows are absent from `last_sent`,
+/// so the next delta carries them. Returns how many services the cap deferred. Timestamps are NOT
+/// checked here: coord is the authority on "now" and clamps a future
+/// timestamp itself (contract amendment A3). PURE.
+pub(crate) fn presanitize(c: &mut ComputerReport) -> usize {
     for f in [
         &mut c.hostname,
         &mut c.os,
@@ -514,8 +542,31 @@ pub(crate) fn presanitize(c: &mut ComputerReport) {
             *f = None;
         }
     }
+    let mut over_cap = 0;
     if let Some(rows) = c.services.as_mut() {
         rows.retain(|r| r.unit.chars().count() <= MAX_UNIT_LEN);
+        if rows.len() > MAX_SERVICES_PER_COMPUTER {
+            over_cap = rows.len() - MAX_SERVICES_PER_COMPUTER;
+            let mut per_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
+            for r in rows.iter() {
+                *per_kind
+                    .entry(services::classify_unit(&r.unit))
+                    .or_default() += 1;
+            }
+            // Largest kind last (ties: the later name), so the cut lands on it.
+            let largest = per_kind
+                .iter()
+                .max_by_key(|(k, n)| (**n, **k))
+                .map(|(k, _)| *k);
+            rows.sort_by_key(|r| Some(services::classify_unit(&r.unit)) == largest);
+            let cut: std::collections::BTreeSet<&'static str> = rows[MAX_SERVICES_PER_COMPUTER..]
+                .iter()
+                .map(|r| services::classify_unit(&r.unit))
+                .collect();
+            rows.truncate(MAX_SERVICES_PER_COMPUTER);
+            c.services_complete_kinds
+                .retain(|k| !cut.contains(k.as_str()));
+        }
         for r in rows.iter_mut() {
             for f in [
                 &mut r.active_state,
@@ -532,6 +583,7 @@ pub(crate) fn presanitize(c: &mut ComputerReport) {
             }
         }
     }
+    over_cap
 }
 
 /// The fallback after a 422 that named no event: the same report with the
@@ -665,6 +717,12 @@ pub(crate) struct Reporter {
     /// Consecutive 5xx (other than 503), for exponential back-off.
     server_errors: u32,
     conflict_logged: bool,
+    /// Warned once that a guest's parent link did not resolve on coord.
+    parent_unresolved_logged: bool,
+    /// The last `unknown_fields` set logged — a CHANGED set is logged again.
+    last_unknown_fields: Vec<String>,
+    /// Warned once that the service list exceeded coord's per-computer bound.
+    services_cap_logged: bool,
     dedupe_logged: bool,
     failures_logged: u32,
     no_identity_logged: bool,
@@ -697,6 +755,9 @@ impl Reporter {
             strip_until: None,
             server_errors: 0,
             conflict_logged: false,
+            parent_unresolved_logged: false,
+            last_unknown_fields: Vec::new(),
+            services_cap_logged: false,
             dedupe_logged: false,
             failures_logged: 0,
             no_identity_logged: false,
@@ -740,7 +801,13 @@ impl Reporter {
     /// One tick. Best-effort end to end: every failure returns quietly.
     pub(crate) async fn tick(&mut self) {
         let now = chrono::Utc::now();
-        let axes = crate::fleet::host_axes::collect();
+        // procfs reads: off the async worker, like the sampler's own
+        // `collect_host_lane`. A panicked read is an all-UNKNOWN reading.
+        let axes = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+            crate::fleet::host_axes::collect,
+        )
+        .await
+        .unwrap_or_default();
         let Some(host_id) = identity::host_identity_hash() else {
             if !self.no_identity_logged {
                 self.no_identity_logged = true;
@@ -890,8 +957,14 @@ impl Reporter {
         if computers.is_empty() {
             return;
         }
-        for c in &mut computers {
-            presanitize(c);
+        let over_cap: usize = computers.iter_mut().map(presanitize).sum();
+        if over_cap > 0 && !self.services_cap_logged {
+            self.services_cap_logged = true;
+            warn!(
+                "fleet::computer: this computer watches more services than coord's bound of \
+                 {MAX_SERVICES_PER_COMPUTER}; {over_cap} are deferred to the next delta, and \
+                 removals of the overflowing kind are not applied while it stays over the bound"
+            );
         }
         let strip = self
             .strip_until
@@ -1054,13 +1127,19 @@ impl Reporter {
         let mut conflicted = 0;
         let mut expired_total = 0;
         let mut clamped_total = 0;
+        let mut parent_unresolved = 0;
+        let mut unknown_fields = std::collections::BTreeSet::new();
         let now = chrono::Utc::now();
         if let Some(state) = self.state.as_mut() {
             for c in &body.computers {
                 let outcome = outcomes
                     .and_then(|o| o.get(&c.identity_hash))
-                    .copied()
+                    .cloned()
                     .unwrap_or_default();
+                unknown_fields.extend(outcome.unknown_fields.iter().cloned());
+                if outcome.parent_unresolved {
+                    parent_unresolved += 1;
+                }
                 if outcome.identity_conflict {
                     conflicted += 1;
                     continue;
@@ -1114,6 +1193,24 @@ impl Reporter {
                 "fleet::computer: coord reported an identity_conflict for {conflicted} computer(s) \
                  (another live reporter shares the machine id); their events stay queued"
             );
+        }
+        if parent_unresolved > 0 && !self.parent_unresolved_logged {
+            self.parent_unresolved_logged = true;
+            info!(
+                "fleet::computer: coord could not resolve the parent of {parent_unresolved} \
+                 computer(s) (no computer with that identity in this tenant), so their parent \
+                 link is UNKNOWN until the host's own entry is stored"
+            );
+        }
+        let unknown_fields: Vec<String> = unknown_fields.into_iter().collect();
+        if unknown_fields != self.last_unknown_fields {
+            if !unknown_fields.is_empty() {
+                warn!(
+                    "fleet::computer: coord did not recognise and did NOT store field(s) \
+                     {unknown_fields:?} — this runner sends a field the answering coord does not carry"
+                );
+            }
+            self.last_unknown_fields = unknown_fields;
         }
         self.persist();
     }
@@ -1519,8 +1616,7 @@ mod tests {
             o.get(HOST_ID),
             Some(&Outcome {
                 identity_conflict: true,
-                events_expired: 0,
-                timestamps_clamped: 0,
+                ..Outcome::default()
             })
         );
         assert_eq!(parse_outcomes("not json"), None);
@@ -1528,9 +1624,95 @@ mod tests {
         let expired = format!(
             r#"{{"computers":[{{"identity_hash":"{HOST_ID}","identity_conflict":false,"events_expired":4,"timestamps_clamped":2}}]}}"#
         );
-        let o = parse_outcomes(&expired).unwrap()[HOST_ID];
+        let o = &parse_outcomes(&expired).unwrap()[HOST_ID];
         assert_eq!(o.events_expired, 4);
         assert_eq!(o.timestamps_clamped, 2);
+        assert!(!o.parent_unresolved);
+        assert!(o.unknown_fields.is_empty());
+
+        let drift = format!(
+            r#"{{"computers":[{{"identity_hash":"{HOST_ID}","parent_unresolved":true,"unknown_fields":["gpus_v2","x"]}}]}}"#
+        );
+        let o = &parse_outcomes(&drift).unwrap()[HOST_ID];
+        assert!(o.parent_unresolved);
+        assert_eq!(
+            o.unknown_fields,
+            vec!["gpus_v2".to_string(), "x".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_service_list_over_coords_bound_cuts_the_overflowing_kind_and_defers_it() {
+        let mut obs = observed(svc::INCIDENT_SHOW);
+        let template = obs.scan.units.as_ref().unwrap()[0].clone();
+        let unit = |name: String| {
+            let mut w = template.clone();
+            w.row.unit = name;
+            w.row.kind = services::classify_unit(&w.row.unit).to_string();
+            w
+        };
+        // More GitHub runners than coord allows, then two small-kind units
+        // LAST — so a plain truncate would cut them, and only the sort that
+        // moves the largest kind to the tail keeps them.
+        let mut units: Vec<WatchedUnit> = (0..MAX_SERVICES_PER_COMPUTER + 1)
+            .map(|i| unit(format!("actions.runner.r{i}.service")))
+            .collect();
+        units.push(unit("qontinui-runner.service".into()));
+        units.push(unit("qontinui-runner-b.service".into()));
+        obs.scan.units = Some(units);
+        obs.scan.complete_kinds = vec![
+            services::KIND_GH_ACTIONS_RUNNER,
+            services::KIND_QONTINUI_RUNNER,
+        ];
+
+        let mut c = plan_computer(&obs, true, None, &[]).unwrap();
+        assert_eq!(presanitize(&mut c), 3);
+        let rows = c.services.as_ref().unwrap();
+        assert_eq!(rows.len(), MAX_SERVICES_PER_COMPUTER);
+        assert!(
+            rows.iter().any(|r| r.unit == "qontinui-runner.service")
+                && rows.iter().any(|r| r.unit == "qontinui-runner-b.service"),
+            "the small kind survives whole"
+        );
+        assert_eq!(
+            c.services_complete_kinds,
+            vec![services::KIND_QONTINUI_RUNNER.to_string()],
+            "only the truncated kind loses completeness — coord would delete what it omits"
+        );
+
+        // Delivered: the deferred units are what the next delta carries.
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(ObserverState::default());
+        let body = ComputerReportReq {
+            device_id: "d".into(),
+            computers: vec![c],
+        };
+        r.on_delivered(&body, true, None);
+        let delta = plan_computer(&obs, false, r.last_sent.get(HOST_ID), &[]).unwrap();
+        let mut deferred: Vec<&str> = delta
+            .services
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.unit.as_str())
+            .collect();
+        deferred.sort_unstable();
+        assert_eq!(deferred.len(), 3, "{deferred:?}");
+        assert!(deferred.iter().all(|u| u.starts_with("actions.runner.")));
+
+        // Exactly at the bound: untouched, still complete.
+        let mut ok = plan_computer(&observed(svc::INCIDENT_SHOW), true, None, &[]).unwrap();
+        let kinds = ok.services_complete_kinds.clone();
+        ok.services = Some(
+            (0..MAX_SERVICES_PER_COMPUTER)
+                .map(|i| unit(format!("actions.runner.r{i}.service")).row)
+                .collect(),
+        );
+        assert_eq!(presanitize(&mut ok), 0);
+        assert_eq!(ok.services_complete_kinds, kinds);
     }
 
     #[test]

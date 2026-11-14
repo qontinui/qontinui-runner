@@ -335,7 +335,8 @@ in the current branch's history with `git merge-base --is-ancestor 879c36bb4 HEA
 >   `GET /coord/agent-work-units/<stem>/citations`, device or agent JWT). It is
 >   coord's own delivery reduction over the plan's PR citations: `shipped`,
 >   `evidence_complete`, `evidence_gaps`, `phases_declared_indices`,
->   `phases_delivered` and `phases_remaining`, with each citation's merged-state
+>   `phases_delivered`, `phases_attested`, `phase_attestations`,
+>   `phases_complete_scope` and `phases_remaining`, with each citation's merged-state
 >   observed against **origin**. Read it through `/vet-plan` §0.25's arm table,
 >   in that table's order (4, 3, 2, 1, 5, then 6). §5 "Settling case 1" below
 >   says which arm lets this skill write. When it reads arm 2 because
@@ -465,7 +466,22 @@ and the body. Before writing your stamp:
    above the first sub-H1 heading, and the difficulty rubric reads it only
    there — moving or deleting it silently reverts the plan to its computed
    rating.)
-1. Read the top of the plan. Identify EVERY top-of-file blockquote that
+1. Read the top of the plan **from `origin/main`, not from the local file**,
+   when the plan directory is inside a git repo:
+   `TOP="$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)"`, then
+   `git -C "$TOP" fetch -q origin +refs/heads/main:refs/remotes/origin/main`
+   (exit status read unpiped — a failed fetch is a STOP for this plan), then
+   record `BASED_ON=$(git -C "$TOP" rev-parse -q --verify
+   "origin/main:<repo-relative path>")` for this path and read the block from
+   `git -C "$TOP" cat-file -p "$BASED_ON"`. `$QONTINUI_PLANS_DIR` usually names
+   a shared checkout that can be thousands of commits behind, and a guard run
+   against its copy never sees a peer's newer `IN PROGRESS`. Make your edits on
+   a private scratch copy of that blob (`mktemp -d`), never over the shared
+   checkout's file, which may hold a peer's uncommitted edit [policy:
+   `git-operations` `shared-checkout-route-around`]; Step 6 publishes the
+   scratch copy with `--based-on "$BASED_ON"`. Record one line per plan —
+   `<repo-relative path> <BASED_ON> <scratch copy>` — in a private list file
+   (`new` in place of the blob for a path origin does not hold). Identify EVERY top-of-file blockquote that
    asserts a status, lifecycle state, or verification date — lines
    starting `> **Status:`, `> **Edit YYYY-MM-DD —`, or `> **Update:`
    all count. **Record verbatim any block reading `IN PROGRESS`** — its
@@ -484,6 +500,30 @@ and the body. Before writing your stamp:
    `NOT STARTED`), include that in **one trailing line inside your
    new block**, prefixed `History:` or `Previously:`. Never as a
    sibling blockquote.
+5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
+   declarations.** If any block you are replacing (item 2 deletes every
+   status-adjacent blockquote, not only the Status one) carries an
+   `Area:` declaration (`` > **Area:** `<area>` ``, or a line-leading plain
+   `Area:`), an `Initiative-Item:` line or a
+   `Depends-On:` declaration, carry each verbatim into your new block —
+   `Depends-On:` as the suffix of your new `> **Status:` line, with its stems
+   on the same physical line as the key (the scanner reads only the rest of
+   that line, so a re-wrap that pushes them onto the next `>` line drops
+   them), and `**Area:**` / `Initiative-Item:` each as a `>` line
+   (conventionally directly under the Status line). Each must sit on or
+   below the `> **Status:` line inside that same blockquote, with no blank
+   line or non-`>` line in between — a `>` line above the Status line is not
+   read — and never in a sibling blockquote. The runner's plan scanner reads
+   all three only from this status blockquote, into `metadata.area`,
+   `metadata.initiative_item` and `metadata.depends_on`, and its next push
+   writes what it parsed (every active-directory push is a `metadata` merge
+   patch in which an undeclared `area` or `initiative_item` is sent as
+   `null`, a delete, and an undeclared `depends_on` as `[]`), so a stamp
+   that drops any of them erases it from the work unit's `metadata` on the
+   next scan. For `Depends-On:` that is worse than a clean erase: the runner
+   skips the dependency-edge write for an empty set, so edge rows written
+   earlier survive and coord goes on enforcing a dependency the plan no
+   longer shows.
 
 When `/verify-plan-status` finds existing stamps that disagree with
 what you'd verify (e.g. a plan stamped `VETTED` whose acceptance
@@ -646,8 +686,18 @@ branches, not three**:
 **Name the arm in the `History:` line when you write `SHIPPED` over an
 `IN PROGRESS` stamp**, for example `case 1: list_citations arm 1, tenant <id>
 (shipped, evidence_complete, phases_remaining [] corroborated by non-empty
-phases_declared_indices ⊆ phases_delivered, no NO PHASE ATTRIBUTION gap)`.
-Then a later reader can check the verdict without re-deriving it.
+phases_declared_indices covered by phases_delivered, no NO PHASE ATTRIBUTION gap)`;
+when a declared phase was covered by a resolved attestation instead, name it:
+`… covered by phases_delivered [1] + phases_attested [0] (attestation phase 0 →
+<evidence_kind> <evidence_ref>, resolution resolved), …` — the fields a
+`phase_attestations` row carries; the delivery read serves no attestation id.
+When `phases_complete_scope` was the literal `true` instead, name the citation
+that carried it. The bool names no citation, so read it off the cited PRs (the
+citations list names them): the landed one whose body carries a
+`Plan: … delivers: complete` marker. If you cannot identify it, write the line
+without the parenthetical rather than guess: `… phases_remaining [] corroborated by phases_complete_scope
+true (landed complete-scoped citation <repo>#<n>), no NO PHASE ATTRIBUTION
+gap)`. Then a later reader can check the verdict without re-deriving it.
 
 **UNKNOWN lands on the unidentified default (do not overwrite), never on "not
 started"** — `verification-and-evidence` `unknown-must-not-render-as-a-default`.
@@ -726,13 +776,19 @@ have landed, where the stamp goes `DIRTY` and the first PR is left unobserved
 ```bash
 if git -C "$QONTINUI_PLANS_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   TOP="$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)"
-  for P in <stamped paths>; do          # absolute paths of the stamped .md files
-    bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
-      "$TOP" "${P#"$TOP"/}" "$P" \
-      "docs(plans): status-stamp $(basename "$P" .md) — verified against source <date>"
-  done
+  # One line per stamped plan, from sub-step 1: <repo-relative path> <blob it read> <scratch copy>
+  while read -r REL BASED_ON COPY; do
+    bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on "$BASED_ON" \
+      "$TOP" "$REL" "$COPY" \
+      "docs(plans): status-stamp $(basename "$REL" .md) — verified against source <date>"
+  done < "<the stamp list sub-step 1 wrote>"
 fi
 ```
+
+**Exit 7 (STALE BASE)** means origin no longer holds the blob sub-step 1 read:
+re-read that plan from origin, re-run the single-stamp invariant and the
+`IN PROGRESS` guard against it, then re-stamp with the new blob — or report it
+unstamped (`_status-writers.md` → "Publishing a stamp — the compare-and-swap").
 
 Each call prints exactly one verdict line — `LANDED <commit|unchanged> <blob>` or
 `PROPOSED <pr-url|branch> <branch>` — and that line is the evidence the stamp is
@@ -741,7 +797,8 @@ path rather than counting it in the final report's totals.
 
 If the check fails, the plan directory is a plain folder: the stamped files on disk
 are the record, there is nothing to commit or push, and you must not create a repo to
-hold them. (Closeout push authority covers docs/plans diffs wherever a repo exists.)
+hold them. That arm does not call `land-plan-stamp.sh` at all, so it has no
+`--based-on` and no compare: a plain folder has no origin to race. (Closeout push authority covers docs/plans diffs wherever a repo exists.)
 
 ### 7. Final report
 

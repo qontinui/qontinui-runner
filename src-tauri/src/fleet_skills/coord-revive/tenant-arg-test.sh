@@ -299,8 +299,9 @@ class H(BaseHTTPRequestHandler):
                 code, c = refusals[nm]
                 self._send(code, {"success": False, "code": c, "error": "stub refusal"})
                 return
-            # The runner field is `tenant` (ProvisionSessionBody); it has no
-            # `tenant_id` and ignores unknown fields.
+            # Models a runner predating qontinui-runner 6b2346280: the field is
+            # `tenant` (ProvisionSessionBody), with no `tenant_id` alias, and
+            # unknown fields are ignored rather than refused.
             tenant = req.get("tenant") if nm == "p2" else None
             nonce = "n-" + (tenant or mode("default_tenant"))
             url = "http://127.0.0.1:%d/coord-mcp" % port
