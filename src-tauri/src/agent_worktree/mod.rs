@@ -2985,13 +2985,14 @@ fn checkout_shared_branch(
         // A FAILED status command means we cannot prove the tree clean → unsafe
         // → bail. (Distinct from the reclaim-side `worktree_is_dirty`, which
         // fails OPEN because it's deciding whether to REMOVE, not to mutate.)
-        let porcelain = run_git_command(canonical, &["status", "--porcelain"]).map_err(|e| {
-            format!(
-                "refusing shared-branch switch to '{branch}' in {}: could not determine \
+        let porcelain =
+            run_git_command(canonical, dirty::STATUS_PORCELAIN_ALL_UNTRACKED).map_err(|e| {
+                format!(
+                    "refusing shared-branch switch to '{branch}' in {}: could not determine \
                  working-tree state ({e})",
-                canonical.display()
-            )
-        })?;
+                    canonical.display()
+                )
+            })?;
         if !porcelain.trim().is_empty() {
             return Err(format!(
                 "refusing shared-branch switch to '{branch}' in {}: working tree has \
@@ -4396,6 +4397,26 @@ mod tests {
         assert!(
             checkout_shared_branch(path, "agent/oncurrent", parent).is_ok(),
             "same-branch re-checkout must not bail on dirty"
+        );
+    }
+
+    /// Edge 9171555e: an untracked file hidden by `status.showUntrackedFiles=no`
+    /// must still stop a shared-branch switch of the canonical checkout.
+    #[test]
+    fn checkout_shared_branch_bails_on_an_untracked_file_hidden_by_show_untracked_no() {
+        let repo = dirty::repo_with_hidden_untracked_file();
+        let parent = run_git_command(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let err = checkout_shared_branch(repo.path(), "agent/hidden", parent.trim()).unwrap_err();
+        assert!(
+            err.contains("uncommitted changes"),
+            "expected dirty bail, got: {err}"
+        );
+        assert_eq!(
+            run_git_command(repo.path(), &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "main",
+            "the refused switch must leave the checkout where it was"
         );
     }
 

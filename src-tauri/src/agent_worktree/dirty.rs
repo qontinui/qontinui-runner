@@ -44,6 +44,51 @@
 /// exactly, or as a directory prefix (`.claude/` covers `.claude/agents/x`).
 pub(crate) const RUNNER_SCAFFOLDING: &[&str] = &[".claude", ".coord-mcp-status", ".mcp.json"];
 
+/// `git status` porcelain arguments for every dirty gate in this module tree:
+/// EVERY untracked file is listed, whatever the repo's
+/// `status.showUntrackedFiles` says. Under `no`, plain `status --porcelain`
+/// prints nothing for an untracked file, so an operator's untracked work reads
+/// as a clean tree and a gate that must refuse lets the action through.
+/// `all` lists individual files rather than collapsing a directory to `dir/`;
+/// [`is_scaffolding_path`] matches either spelling.
+pub(crate) const STATUS_PORCELAIN_ALL_UNTRACKED: &[&str] =
+    &["status", "--porcelain", "--untracked-files=all"];
+
+/// Test fixture shared by every dirty gate's `showUntrackedFiles=no` test: a
+/// committed repo on `main` with `status.showUntrackedFiles no` set and ONE
+/// untracked, non-scaffolding file (`operator-notes.txt`). Asserts that plain
+/// `git status --porcelain` really prints nothing for it, so a test built on
+/// this fixture is measuring the blinded case and not a tree any spelling sees.
+#[cfg(test)]
+pub(crate) fn repo_with_hidden_untracked_file() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path().to_str().expect("utf-8 tempdir").to_string();
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", &p])
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).expect("utf-8 git output")
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.path().join("a.txt"), b"x").expect("write a.txt");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "c1"]);
+    git(&["config", "status.showUntrackedFiles", "no"]);
+    std::fs::write(dir.path().join("operator-notes.txt"), b"wip").expect("write untracked");
+    assert_eq!(
+        git(&["status", "--porcelain"]),
+        "",
+        "fixture: plain porcelain must be blind to the untracked file"
+    );
+    dir
+}
+
 /// Strip git's quoting from a porcelain path. git quotes paths containing
 /// spaces or unusual bytes (`?? "a b.txt"`); ordinary paths are bare.
 pub(crate) fn unquote(path: &str) -> &str {
@@ -333,7 +378,8 @@ pub(crate) fn probe_reclaim_dirty(
         return DirtyVerdict::Unknown;
     };
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["-C", path_str, "status", "--porcelain"]);
+    cmd.args(["-C", path_str])
+        .args(STATUS_PORCELAIN_ALL_UNTRACKED);
     probe_reclaim_dirty_with(path, cmd, timeout, label)
 }
 
@@ -374,6 +420,21 @@ pub(crate) fn probe_reclaim_dirty_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Edge 9171555e: `status.showUntrackedFiles=no` must not blind the
+    /// reclaim probe — an untracked file is work a reclaim would delete.
+    #[test]
+    fn an_untracked_file_hidden_by_show_untracked_no_is_still_dirty() {
+        let repo = repo_with_hidden_untracked_file();
+        assert_eq!(
+            probe_reclaim_dirty(
+                repo.path(),
+                RECLAIM_DIRTY_PROBE_TIMEOUT,
+                "test: hidden untracked"
+            ),
+            DirtyVerdict::Dirty
+        );
+    }
 
     #[test]
     fn clean_tree_is_not_dirty() {

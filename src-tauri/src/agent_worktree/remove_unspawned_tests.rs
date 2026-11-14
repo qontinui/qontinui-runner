@@ -620,10 +620,11 @@ async fn a_refused_remove_after_scaffolding_cleanup_says_it_was_deleted() {
     );
 }
 
-/// Review fix 5: with `status.showUntrackedFiles=no` the dirty probe's plain
-/// porcelain hides an operator's untracked file; the removal's own listing
-/// passes `--untracked-files=all`, so the scaffolding guard sees and refuses it
-/// (before `git worktree remove` would be the only thing left to).
+/// Review fix 5, tightened by edge 9171555e: with `status.showUntrackedFiles=no`
+/// an operator's untracked file must still keep the tree. The dirty probe now
+/// passes `--untracked-files=all` itself, so it is the FIRST guard that refuses
+/// (it used to be blind here, leaving the scaffolding listing — which also
+/// passes the flag — as the only guard before `git worktree remove`).
 #[tokio::test]
 async fn an_untracked_file_hidden_by_show_untracked_no_still_keeps_the_tree() {
     let fx = Fixture::new();
@@ -638,12 +639,11 @@ async fn an_untracked_file_hidden_by_show_untracked_no_still_keeps_the_tree() {
 
     let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
 
-    match only_outcome(&report) {
-        TreeOutcome::Kept(KeepReason::Scaffolding(why)) => {
-            assert!(why.contains("notes.txt"), "{why}")
-        }
-        other => panic!("expected the scaffolding listing to refuse, got {other:?}"),
-    }
+    assert_eq!(
+        only_outcome(&report),
+        &TreeOutcome::Kept(KeepReason::Dirty(DirtyVerdict::Dirty)),
+        "the dirty probe itself must see the hidden untracked file"
+    );
     assert!(tree.join("notes.txt").exists());
 }
 
