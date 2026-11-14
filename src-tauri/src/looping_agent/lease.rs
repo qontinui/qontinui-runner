@@ -1534,7 +1534,8 @@ mod tests {
     }
 
     // A constant floor, so it is checked where constants are: a violation
-    // fails `cargo check` / `clippy` itself, not a test run.
+    // fails compilation of the test target (`cargo check --all-targets`,
+    // `clippy --all-targets`, `cargo test`), not a test run.
     const _: () = assert!(DISPLACED_MIN_HELD_TICKS >= 6);
 
     #[test]

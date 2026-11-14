@@ -63,12 +63,14 @@ pub const REFRESH_BEFORE_EXPIRY_SECS: i64 = 4 * 60 * 60 / 3;
 /// COGNITO_ACCESS_TOKEN_TTL_SECS`: a threshold at or above the token's own
 /// lifetime makes [`AuthManager::cognito_token_needs_refresh`] permanently
 /// true, which turns every `check_auth_status` into a synchronous network
-/// round-trip. `cognito_threshold_is_below_token_ttl` pins it.
+/// round-trip. A `const _` assertion in this file's test module pins it, so a
+/// violation fails compilation of the test target (`check --all-targets`,
+/// `cargo test`).
 pub const COGNITO_REFRESH_BEFORE_EXPIRY_SECS: i64 = 60 * 60 / 3;
 
 /// The `expires_in` Cognito returns on both the code-for-token exchange and
 /// the refresh grant. Declared here so the threshold above can be pinned
-/// against it by a test rather than by a comment.
+/// against it by a compile-time assertion rather than by a comment.
 pub const COGNITO_ACCESS_TOKEN_TTL_SECS: i64 = 3_600;
 
 /// Minimal projection of a device-JWT payload — only the `exp` claim is
