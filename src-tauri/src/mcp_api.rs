@@ -2745,6 +2745,23 @@ async fn health(
         // sessions close means coord is refusing the POSTs.
         "agent_log_emitter_agents":
             crate::claude_session::coord_register::agent_log_emitter_agents(),
+        // How many finishes found a harness id's registrar entry on a row
+        // other than its live pane's row and moved it there (plan
+        // 2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-
+        // live-pane-has-replaced, D4's finish-time repair). It should stay
+        // flat once a boot settles: a climb means the live-pane adoption, the
+        // bind trigger or the re-key seam missed an ordering.
+        "registrarTerminalRowDisagreements":
+            crate::claude_session::coord_register::registrar_terminal_row_disagreements(),
+        // Moves onto a pane row refused because another session owns it.
+        "registrarPaneRowMovesNotOwner":
+            crate::claude_session::coord_register::pane_row_moves_not_owner(),
+        // Distinct (row, session) pairs whose live-pane adoption was EVER
+        // deferred because only the pane's pin says it runs the session and
+        // another key holds the row (cumulative; once per pair, not per
+        // retry, and not decremented when resolved).
+        "registrarPinSeedTakesEverDeferred":
+            crate::claude_session::coord_register::pin_seed_takes_ever_deferred(),
         // Browser-origin guard (plan 2026-09-17-runner-loopback-api-accepts-
         // any-origin): kill-switch state, route-policy mode, per-class refusal
         // and shadow counts, and the last 20 non-admit tuples — withheld from a
@@ -21723,6 +21740,37 @@ mod coord_provision_session_gate_tests {
         assert_eq!(
             provenance["build"]["profile"],
             qontinui_runner_lib::build_provenance::build_profile_json()
+        );
+    }
+
+    /// Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// Phase 1 (taken from qontinui-runner#2711): `/health` serves the
+    /// finish-time repair count (same source-scan technique as the tests
+    /// around it).
+    #[test]
+    fn the_health_handler_emits_the_registrar_terminal_row_disagreements() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"registrarTerminalRowDisagreements\":"),
+            "{region}"
+        );
+        assert!(
+            region.contains(
+                "crate::claude_session::coord_register::registrar_terminal_row_disagreements()"
+            ),
+            "{region}"
+        );
+        assert!(
+            region.contains("\"registrarPaneRowMovesNotOwner\":"),
+            "{region}"
+        );
+        assert!(
+            region.contains("\"registrarPinSeedTakesEverDeferred\":"),
+            "{region}"
         );
     }
 
