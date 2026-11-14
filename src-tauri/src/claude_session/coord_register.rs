@@ -1694,7 +1694,12 @@ impl AiCoordRegistrar {
                          re-sending its finished mark to coord session {}",
                         r.claude_session_id, target
                     );
-                    self.enqueue_finished(&r.claude_session_id, target, r.finished_at)
+                    self.enqueue_finished(
+                        &r.claude_session_id,
+                        target,
+                        r.finished_at,
+                        r.finish_reason.as_deref(),
+                    )
                 })
         })
     }
