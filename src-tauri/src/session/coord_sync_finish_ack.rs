@@ -22,11 +22,25 @@
 //! ## What happens to an unconfirmed finish
 //!
 //! It is NOT dropped (that would lose the finish for good) and NOT retried
-//! forever (a coord that never moves the row would cost a hot loop per
-//! finished session). The drain keeps the row on the session's ordinary backoff
-//! and retries it up to [`FINISHED_UNCONFIRMED_MAX_ATTEMPTS`] times — below the
-//! serving-failure quarantine, so this bound always fires first — then
-//! ACK-drops it WITHOUT stamping and counts it in
+//! forever (a coord that never moves the row would cost a request a minute per
+//! finished session, for good). The drain keeps the row on the session's
+//! ordinary backoff (1 s doubling to one minute) and, only once it has had at
+//! least [`FINISHED_UNCONFIRMED_MAX_ATTEMPTS`] unconfirmed answers AND the
+//! first of them is at least [`FINISHED_UNCONFIRMED_MIN_AGE`] old, ACK-drops it
+//! WITHOUT stamping. The count alone would be spent in ~30 s, which a coord
+//! deploy or a transient swallow easily outlasts.
+//!
+//! The bound is NOT guaranteed to fire before the whole-session quarantine.
+//! An unconfirmed answer never adds to `serving_failures`, but the session can
+//! still be quarantined by its OTHER failures (an earlier row's serving
+//! failures carried in the same retry entry, or a 5xx on the finish itself
+//! while coord serves other rows). Entering quarantine drops the session's
+//! retry entry, which restarts the count and the age. A quarantined session's
+//! lifecycle rows — the finish among them — stay held and are retried once a
+//! minute, so an unconfirmed finish there still reaches this bound and is
+//! dropped the same way.
+//!
+//! A dropped finish is ACK-dropped WITHOUT stamping and counts it in
 //! [`FINISHED_UNCONFIRMED_DROPPED`] (`GET /health`
 //! `sessionOutbox.finishedUnconfirmed`). The mark stays unsynced, which is the
 //! honest state. Exactly three things re-offer it, none of them automatic
@@ -50,13 +64,27 @@ use super::tracking_health::SessionWorkStatus;
 /// with a row that says the write did not land.
 pub(crate) const FINISHED_UNCONFIRMED_KIND: &str = "finished_unconfirmed";
 
-/// Attempts after which an unconfirmed finish is ACK-dropped unstamped.
-/// Below `QUARANTINE_AFTER_SERVING_FAILURES` (8) by design, so the bound —
-/// not the whole-session quarantine — is what ends the retry.
+/// Unconfirmed answers an unconfirmed finish must have had before it may be
+/// ACK-dropped unstamped (together with [`FINISHED_UNCONFIRMED_MIN_AGE`]).
 pub(crate) const FINISHED_UNCONFIRMED_MAX_ATTEMPTS: u32 = 5;
 
+/// How long after its FIRST unconfirmed answer an unconfirmed finish is kept
+/// before it may be ACK-dropped unstamped (together with
+/// [`FINISHED_UNCONFIRMED_MAX_ATTEMPTS`]).
+///
+/// Ten minutes, because a dropped finish is re-offered by nothing automatic in
+/// this process, and the next runner start's heal sweep never re-offers a row
+/// reading `working` — so dropping early loses the finish for as long as the
+/// runner lives. Ten minutes outlasts a coord rolling deploy (the cause of the
+/// swallowed writes this module exists for was one coord build) and a burst of
+/// transient prepare failures, while costing at most ~15 PATCHes per finish on
+/// the one-minute backoff cap: cheap, and still bounded.
+pub(crate) const FINISHED_UNCONFIRMED_MIN_AGE: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
 /// Finished rows ACK-dropped unstamped after
-/// [`FINISHED_UNCONFIRMED_MAX_ATTEMPTS`] unconfirmed answers, since this
+/// [`FINISHED_UNCONFIRMED_MAX_ATTEMPTS`] unconfirmed answers spread over at
+/// least [`FINISHED_UNCONFIRMED_MIN_AGE`], since this
 /// process booted. Bumped only once the outbox ACK has landed.
 pub(crate) static FINISHED_UNCONFIRMED_DROPPED: AtomicU64 = AtomicU64::new(0);
 
