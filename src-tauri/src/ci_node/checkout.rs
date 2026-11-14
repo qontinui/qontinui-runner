@@ -929,7 +929,7 @@ mod tests {
 
     /// Synchronous git for fixtures; panics with git's output on failure.
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .current_dir(dir)
             .args(["-c", "user.name=ci", "-c", "user.email=ci@example.invalid"])
             .args(args)

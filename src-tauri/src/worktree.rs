@@ -15,7 +15,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tracing::{error, info, warn};
 
 use crate::str_utils::truncate_str;
@@ -1152,7 +1151,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     fn run(cwd: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .args(args)
             .current_dir(cwd)
             .output()

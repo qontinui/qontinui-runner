@@ -6170,6 +6170,7 @@ mod tests {",
 
         // Control: a raw, UNscrubbed git with `-C <target>` answers for the
         // inherited decoy, whose HEAD IS on its trunk.
+        // git-env-ok: this control must inherit the decoy GIT_DIR to prove the env is live in this child.
         let control = Command::new("git")
             .arg("-C")
             .arg(target)
@@ -6216,20 +6217,7 @@ mod tests {",
         // A real git repo but no `origin/main` ref → undeterminable → None.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
-        let run = |args: &[&str]| {
-            let ok = Command::new("git")
-                .args([&["-C", path.to_str().unwrap()], args].concat())
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            assert!(ok, "git {args:?} should succeed");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@example.com"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(path.join("a.txt"), b"x").unwrap();
-        run(&["add", "a.txt"]);
-        run(&["commit", "-q", "-m", "c1"]);
+        let _git = trunk_fixture(path);
         // No origin/main ref exists → compute returns None.
         assert!(compute_landed_in_main(path).is_none());
     }
@@ -6240,20 +6228,7 @@ mod tests {",
         // bare "remote", then verify HEAD-is-ancestor → Some(true).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
-        let wt = path.to_str().unwrap();
-        let git = |args: &[&str]| {
-            let out = Command::new("git")
-                .args([&["-C", wt], args].concat())
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?} failed");
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "t@example.com"]);
-        git(&["config", "user.name", "t"]);
-        std::fs::write(path.join("a.txt"), b"x").unwrap();
-        git(&["add", "a.txt"]);
-        git(&["commit", "-q", "-m", "c1"]);
+        let git = trunk_fixture(path);
         // Point a local origin/main remote-tracking ref straight at HEAD.
         let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
         git(&["update-ref", "refs/remotes/origin/main", &head]);
@@ -6281,7 +6256,7 @@ mod tests {",
     fn trunk_fixture(path: &Path) -> impl Fn(&[&str]) + '_ {
         let wt = path.to_str().unwrap();
         let git = move |args: &[&str]| {
-            let out = Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .args([&["-C", wt], args].concat())
                 .output()
                 .unwrap();
@@ -6485,7 +6460,7 @@ mod tests {",
         let path = dir.path();
         let wt = path.to_str().unwrap();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .args([&["-C", wt], args].concat())
                 .output()
                 .unwrap();
@@ -6533,20 +6508,7 @@ mod tests {",
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
-        let wt = path.to_str().unwrap();
-        let git = |args: &[&str]| {
-            let out = Command::new("git")
-                .args([&["-C", wt], args].concat())
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?} failed");
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "t@example.com"]);
-        git(&["config", "user.name", "t"]);
-        std::fs::write(path.join("a.txt"), b"x").unwrap();
-        git(&["add", "a.txt"]);
-        git(&["commit", "-q", "-m", "c1"]);
+        let _git = trunk_fixture(path);
         assert!(
             !capture_worktree("qontinui-runner", path).is_dirty,
             "a freshly committed tree is clean"
@@ -6578,7 +6540,7 @@ mod tests {",
         let path = dir.path();
         let wt = path.to_str().unwrap();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .args([&["-C", wt], args].concat())
                 .output()
                 .unwrap();

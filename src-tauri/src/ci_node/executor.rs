@@ -1195,11 +1195,9 @@ mod tests {
     #[tokio::test]
     async fn a_dispatch_provision_ignores_an_enclosing_repos_url_rewrite() {
         let git = |cwd: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .current_dir(cwd)
                 .args(args)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
                 .output()
                 .expect("git runs");
             assert!(out.status.success(), "git {args:?}: {out:?}");

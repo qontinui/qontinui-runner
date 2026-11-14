@@ -559,7 +559,6 @@ pub fn spawn_push_worktree_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::TempDir;
 
     // ---- pure helpers -----------------------------------------------------
@@ -676,7 +675,7 @@ mod tests {
     // ---- end-to-end diff over a real temp git repo ------------------------
 
     fn git(cwd: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .args(args)
             .current_dir(cwd)
             .output()

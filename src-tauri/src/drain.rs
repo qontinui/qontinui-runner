@@ -697,16 +697,20 @@ mod tests {
 
     use crate::test_env::env_lock;
 
+    /// A `git -C <dir>` command for these fixtures, built through the
+    /// chokepoint so an inherited `GIT_DIR` / `GIT_INDEX_FILE` (a git hook
+    /// running the suite) cannot aim it at the caller's repository.
+    fn git_in(dir: &std::path::Path) -> std::process::Command {
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.arg("-C").arg(dir);
+        cmd
+    }
+
     /// Initialize a throwaway git repo in `dir` with one committed file so
     /// `stash create` has a base commit to diff against.
     fn init_repo(dir: &std::path::Path) {
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .expect("git spawn");
+            let out = git_in(dir).args(args).output().expect("git spawn");
             assert!(
                 out.status.success(),
                 "git {:?} failed: {}",
@@ -739,9 +743,7 @@ mod tests {
     }
 
     fn ref_exists(dir: &std::path::Path, ref_name: &str) -> bool {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        git_in(dir)
             .args(["rev-parse", "--verify", "--quiet", ref_name])
             .output()
             .map(|o| o.status.success())
@@ -789,12 +791,7 @@ mod tests {
         std::fs::write(dir.join("seed.txt"), "seed\nlocal edit\n").unwrap();
         std::fs::write(dir.join("scratch.txt"), "uncommitted\n").unwrap();
         // Stage so `stash create` captures it (create stashes the index + tree).
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(["add", "-A"])
-            .output()
-            .unwrap();
+        git_in(&dir).args(["add", "-A"]).output().unwrap();
 
         let sid = stable_ai_session_id("task-dirty");
         let wrote = capture_wip_ref(
@@ -829,12 +826,7 @@ mod tests {
         // Dirty the tree: modify a tracked file + add an untracked file.
         std::fs::write(dir.join("seed.txt"), "seed\nWIP edit\n").unwrap();
         std::fs::write(dir.join("scratch.txt"), "uncommitted\n").unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(["add", "-A"])
-            .output()
-            .unwrap();
+        git_in(&dir).args(["add", "-A"]).output().unwrap();
 
         let sid = stable_ai_session_id("task-roundtrip");
         let ref_name = format!("refs/wip/{sid}");
@@ -852,9 +844,7 @@ mod tests {
 
         // Reset the working tree back to the committed state (simulating a
         // fresh worktree on resume before restore runs).
-        let reset = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
+        let reset = git_in(&dir)
             .args(["reset", "--hard", "-q"])
             .output()
             .unwrap();

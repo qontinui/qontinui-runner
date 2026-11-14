@@ -8001,7 +8001,7 @@ mod tests {",
     /// Run git in `dir`, asserting success. Identity pinned per-invocation so
     /// the temp repos commit without global config.
     fn tgit(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .args([
