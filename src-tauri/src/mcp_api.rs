@@ -2751,6 +2751,13 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // systemd `sd_notify` state (plan 2026-10-19-ci-nodes-run-the-tauri-
+        // runner-always-on-as-ci-node-role, Phase 2b): whether a `Type=notify`
+        // unit launched this runner, whether `READY=1` went out, the armed
+        // `WatchdogSec=`, the last keepalive decision and the readiness
+        // snapshot that gated it. `notifySocket: false` = inert (every
+        // desktop/dev runner); `lastDecision: null` = UNKNOWN, not healthy.
+        "sdNotify": crate::sd_notify::health_json(),
         // The six per-tenant egress switches (plan
         // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7): for
         // each flow, whether it may send right now, which rung decided it
