@@ -101,7 +101,6 @@ hidden_imports = [
     'pynput',
     'pynput.mouse',
     'pynput.keyboard',
-    'pyautogui',
     'easyocr',
     'structlog',
     'pydantic',
