@@ -52,8 +52,10 @@
 //!
 //! The boot sweep also takes in-window UNSYNCED marks — among them a finish
 //! the drain ACK-dropped after `FINISHED_UNCONFIRMED_MAX_ATTEMPTS` unconfirmed
-//! answers — and re-offers one through the same `redeliver_finish` door when
-//! its own row passes the same NULL rule. The read-back does not: its own
+//! answers spread over `FINISHED_UNCONFIRMED_MIN_AGE` — and re-offers one through the same `redeliver_finish` door when
+//! its own row passes the same NULL rule — unless the mark's own `Finished`
+//! row is still pending in the outbox (`finish_still_queued`; the drain still
+//! owes it, and a re-offer would only queue a duplicate). The read-back does not: its own
 //! retry door (`set_finished` on an unsynced mark) already re-offers it.
 //!
 //! ## What guards the runner's own revivals
@@ -135,6 +137,12 @@ pub enum HealSkip {
     RevivedAfterFinish,
     /// coord served a `since` the runner cannot parse — UNKNOWN.
     SinceUnreadable,
+    /// An UNSYNCED mark whose `Finished` row is still pending in the outbox:
+    /// the drain will deliver it, so a re-offer would only queue a duplicate.
+    FinishStillQueued,
+    /// Whether the mark's `Finished` row is still queued could not be read
+    /// (the outbox read failed) — UNKNOWN, so nothing is re-offered.
+    OutboxUnreadable,
 }
 
 impl HealSkip {
@@ -150,6 +158,8 @@ impl HealSkip {
             Self::StatusNotNull => "status_not_null",
             Self::RevivedAfterFinish => "revived_after_finish",
             Self::SinceUnreadable => "since_unreadable",
+            Self::FinishStillQueued => "finish_still_queued",
+            Self::OutboxUnreadable => "outbox_unreadable",
         }
     }
 }
@@ -226,6 +236,9 @@ pub trait HealPort: Send + Sync {
     /// Re-send the mark through the serialized late-delivery body; `None`
     /// when the mark is no longer finished-and-unsynced at `finished_at`.
     fn redeliver(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<FinishSync>;
+    /// Whether a `Finished` row for this mark (`csid` at `finished_at`) is
+    /// still pending in the outbox; `None` when the outbox cannot be read.
+    fn finish_queued(&self, csid: &str, finished_at: i64) -> Option<bool>;
 }
 
 impl HealPort for AiCoordRegistrar {
@@ -235,6 +248,9 @@ impl HealPort for AiCoordRegistrar {
     }
     fn redeliver(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<FinishSync> {
         self.redeliver_finish(csid, finished_at, row)
+    }
+    fn finish_queued(&self, csid: &str, finished_at: i64) -> Option<bool> {
+        self.finished_row_pending(csid, finished_at)
     }
 }
 
@@ -373,8 +389,15 @@ pub fn apply_heal_observed(
                     (false, _) => HealOutcome::MarkChanged,
                 }
             }
+            // An UNSYNCED mark whose own `Finished` row is still in the
+            // outbox is not lost — the drain still owes it — so the boot
+            // sweep does not queue a second one beside it (review A6).
             (HealDecision::Resend { row }, false) => match port {
-                Some(p) => redelivered(p, rec, at, row, true),
+                Some(p) => match p.finish_queued(&rec.claude_session_id, at) {
+                    Some(false) => redelivered(p, rec, at, row, true),
+                    Some(true) => HealOutcome::Left(HealSkip::FinishStillQueued),
+                    None => HealOutcome::Left(HealSkip::OutboxUnreadable),
+                },
                 None => HealOutcome::NotQueued {
                     row,
                     reason: "no_forwarder",
