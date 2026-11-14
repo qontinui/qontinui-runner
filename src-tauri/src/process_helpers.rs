@@ -3161,8 +3161,8 @@ mod source_scan {
     /// lexer. Ending early reads some test code as production: a column-0
     /// line inside a multi-line string literal ends a skip. That happens in
     /// many files today; a reviewer's port counted 21, among them
-    /// `fleet.rs`, `check_executor/analyzers/*`, `env_write_lock_guard.rs`
-    /// and `orchestrator/planning.rs`, and the rules above newly made it
+    /// `fleet.rs`, `check_executor/analyzers/*` and
+    /// `env_write_lock_guard.rs`, and the rules above newly made it
     /// happen in `pair.rs` and `playwright/executor.rs`. Nothing in those
     /// spans trips a guard. Two shapes still end LATE and hide the
     /// production item after the test item:
