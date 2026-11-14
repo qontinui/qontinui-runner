@@ -510,6 +510,10 @@ pub(crate) fn provision_fleet_skills_into(
         registry.override_count()
     ));
 
+    // What this pass actually wrote, relative to `skills_dir`, so exactly
+    // those skill directories (never a tracked path) are excluded from
+    // `git status` after the loop.
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
     for (skill, source) in resolved.iter().zip(&sources) {
         let files = source.files();
         // A whole-skill refusal is recorded as `<name>/*`, not as the bare
@@ -628,8 +632,13 @@ pub(crate) fn provision_fleet_skills_into(
                 continue;
             }
             out.record_written();
+            written.push(relative);
         }
     }
+
+    // Keep what this pass wrote out of the checkout's `git status` (see
+    // `crate::provision_exclude`). Best-effort: never fails the pass.
+    crate::provision_exclude::exclude_written_paths("fleet_skills", skills_dir, &written, &tracked);
 
     if out.written == 0 {
         // Nothing landed at all — a stated outcome, not a claim that the
@@ -1017,6 +1026,40 @@ mod tests {
             embedded.contents(),
             "an untracked destination is overwritten exactly as before"
         );
+    }
+
+    /// A fresh checkout used as a session cwd must not read dirty after a
+    /// provisioning pass: every skill directory written is excluded via the
+    /// repo's `info/exclude`, and a second pass adds no duplicate lines.
+    #[test]
+    fn provisioned_skills_do_not_dirty_the_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let registry = AgentSkillRegistry::new();
+
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
+        assert!(out.written > 0);
+        let status = |dir: &Path| {
+            let o = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .output()
+                .expect("git status");
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(
+            status(tmp.path()),
+            "",
+            "provisioned skills read as untracked"
+        );
+
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision again");
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), first);
+        assert!(first.lines().any(|l| l == "/.claude/skills/coord-revive/"));
     }
 
     #[test]

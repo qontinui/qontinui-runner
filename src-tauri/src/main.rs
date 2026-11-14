@@ -236,6 +236,8 @@ mod prompts;
 mod provenance;
 /// The shared tracked-destination guard every fleet provisioner consults.
 mod provision_guard;
+/// Excludes the paths the fleet provisioners wrote from the checkout's `git status`.
+mod provision_exclude;
 mod rag;
 mod recording;
 mod reflection;

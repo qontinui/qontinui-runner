@@ -600,6 +600,9 @@ pub(crate) fn provision_fleet_commands_into(
     )
     .with_destination(commands_dir.display().to_string());
     let mut edited = 0usize;
+    // What this pass actually wrote, relative to `commands_dir`, so exactly
+    // those paths (never a tracked one) are excluded from `git status` below.
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
@@ -656,7 +659,17 @@ pub(crate) fn provision_fleet_commands_into(
             ),
         )?;
         out.record_written();
+        written.push(std::path::PathBuf::from(&file_name));
     }
+    // Keep what this pass wrote out of the checkout's `git status`, so a
+    // session cwd that is a git checkout does not read dirty (see
+    // `crate::provision_exclude`). Best-effort: never fails the pass.
+    crate::provision_exclude::exclude_written_paths(
+        "fleet_commands",
+        commands_dir,
+        &written,
+        &tracked,
+    );
     // Built after the loop rather than at construction so it can carry the
     // read-back count; a pass that clobbered nobody's edits reads as before.
     let mut detail = format!(
@@ -787,6 +800,47 @@ mod tests {
         let (_, on_disk) = strip_provenance(&on_disk).expect("provenance line");
         assert_eq!(on_disk, "# my own procedure\n");
         assert_ne!(on_disk, default_body);
+    }
+
+    /// A fresh checkout used as a session cwd must not read dirty after a
+    /// provisioning pass: every command written gets its own anchored line in
+    /// the repo's `info/exclude` (never a blanket `.claude/commands/`), and a
+    /// second pass leaves that file byte-identical.
+    #[test]
+    fn provisioned_commands_do_not_dirty_the_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        assert_eq!(out.written, FLEET_COMMANDS.len());
+        let o = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        assert!(o.status.success());
+        assert_eq!(
+            String::from_utf8(o.stdout).unwrap(),
+            "",
+            "nothing reads untracked"
+        );
+
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        for (name, _) in FLEET_COMMANDS {
+            assert!(
+                first
+                    .lines()
+                    .any(|l| l == format!("/.claude/commands/{name}.md")),
+                "{name} has its own line"
+            );
+        }
+        assert!(!first.lines().any(|l| l.trim() == "/.claude/commands/"));
+        provision_fleet_commands_into(&commands_dir, &registry).expect("provision again");
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), first);
     }
 
     /// A destination that is TRACKED by the enclosing git repository must be
