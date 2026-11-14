@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 69 | 82 | 56 | 11 | 2 | 0 |
+| `repo_layout` | 70 | 83 | 56 | 12 | 2 | 0 |
 | `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -18,7 +18,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `os_bound_tooling` | 106 | 107 | 96 | 10 | 0 | 0 |
 
-## `repo_layout` (69 rows)
+## `repo_layout` (70 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
@@ -49,6 +49,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `qontinui-claude-config's hourly 'fleet-agents-parity' gate \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/ci_node/ops.rs` | `const DEFAULT_OPS_REPO` | `const DEFAULT_OPS_REPO: &str = "qontinui/qontinui-claude-config";` | 1 | fallback_correct — Default repo for the D4 ops-lane script allowlist; overridden by OPS_REPO_ENV, and the lane is dark unless coord enables it. | — (no CAPABILITY_SPECS row) |
 | `src/commands/config.rs` | `get_workspace_paths_impl` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/terminal_analysis.rs` | `get_latest_plan_content` | `let dev_notes = parent.join("qontinui-dev-notes");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/context/builtins.rs` | `get_builtin_contexts` | `"qontinui-mobile".to_string(),` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |

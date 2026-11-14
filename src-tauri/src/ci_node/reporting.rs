@@ -76,6 +76,14 @@ pub(crate) fn is_terminal_dispatch_state(state: &str) -> bool {
     matches!(state, "succeeded" | "failed" | "lost" | "cancelled")
 }
 
+/// Did a 2xx progress response renew the dispatch's lease? Only when its body
+/// parses to a NON-terminal state: a terminal one is coord's answer for a
+/// dispatch it already marked lost/cancelled (no lease touched), and an
+/// unparseable body proves nothing.
+pub(crate) fn progress_response_renews_lease(body: &str) -> bool {
+    parse_response_state(body).is_some_and(|s| !is_terminal_dispatch_state(&s))
+}
+
 /// Extract `{"state": ...}` from an ingest-route response body.
 fn parse_response_state(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
@@ -305,6 +313,11 @@ async fn post_batch(
     {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(text) = resp.text().await {
+                // Only a parsed NON-terminal state renewed this dispatch's
+                // lease; the systemd watchdog gate ages build guards by it.
+                if progress_response_renews_lease(&text) {
+                    crate::sd_notify::note_ci_lease_renewed();
+                }
                 if let Some(state) = parse_response_state(&text) {
                     if is_terminal_dispatch_state(&state) && !cancel.is_cancelled() {
                         warn!(
@@ -800,6 +813,23 @@ mod tests {
         for s in ["queued", "dispatched", "running", ""] {
             assert!(!is_terminal_dispatch_state(s), "{s} must be live");
         }
+    }
+
+    /// Plan 2026-10-19 Phase 2b: only a parsed non-terminal state is a lease
+    /// renewal. Named `sd_` so the watchdog-gate filter runs it.
+    #[test]
+    fn sd_progress_response_renews_lease_only_on_a_non_terminal_state() {
+        assert!(progress_response_renews_lease(r#"{"state":"running"}"#));
+        assert!(progress_response_renews_lease(r#"{"state":"leased"}"#));
+        for terminal in ["succeeded", "failed", "lost", "cancelled"] {
+            assert!(
+                !progress_response_renews_lease(&format!(r#"{{"state":"{terminal}"}}"#)),
+                "{terminal}"
+            );
+        }
+        assert!(!progress_response_renews_lease(r#"{"error":"x"}"#));
+        assert!(!progress_response_renews_lease("not json"));
+        assert!(!progress_response_renews_lease(""));
     }
 
     #[test]

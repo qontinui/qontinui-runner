@@ -211,12 +211,18 @@ class TestStoreDebugVisual:
             match_info={"found": True},
         )
 
-        # Special characters should be replaced with hyphens
-        assert "action-with-special-chars" in reference
-        assert "/" not in reference
-        assert ":" not in reference
-        assert "*" not in reference
-        assert "?" not in reference
+        # The reference is "debug_visuals/<filename>" by design; the action_id
+        # must reach the filename with its special characters replaced, so it
+        # cannot add a path separator (or another unsafe character) of its own.
+        prefix = "debug_visuals/"
+        assert reference.startswith(prefix)
+        filename = reference.removeprefix(prefix)
+        assert "action-with-special-chars" in filename
+        assert "/" not in filename
+        assert ":" not in filename
+        assert "*" not in filename
+        assert "?" not in filename
+        assert (temp_storage_dir / "debug_visuals" / filename).is_file()
 
     def test_store_debug_visual_sequential_numbering(self, temp_storage_dir, sample_png_bytes):
         """Test sequential numbering for debug visuals."""
