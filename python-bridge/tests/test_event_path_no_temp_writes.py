@@ -9,7 +9,8 @@ no try/except, so a read-only temp dir raised out of the event path.
 These tests run in the python-executor-command-table CI job, whose venv holds only
 pytest, numpy and Pillow, so they import nothing heavy:
 
-- ``event_manager`` is stdlib-only and is imported as is;
+- ``event_manager`` is stdlib-only and is loaded by path as is (no ``sys.path``
+  change);
 - ``event_translator`` is loaded under a private name with ``services`` and
   ``qontinui`` stubbed in ``sys.modules`` for the duration of the load only
   (``patch.dict`` restores the real table), and ``QONTINUI_AVAILABLE`` forced on;
@@ -21,7 +22,7 @@ pytest, numpy and Pillow, so they import nothing heavy:
 from __future__ import annotations
 
 import ast
-import datetime
+import datetime as dt
 import importlib.util
 import os
 import sys
@@ -34,9 +35,19 @@ from unittest.mock import Mock, patch
 import pytest
 
 BRIDGE = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BRIDGE))
 
-from event_manager import EventManager  # noqa: E402  (stdlib-only module)
+
+def _load_bridge_module(filename: str, alias: str) -> ModuleType:
+    """Load a bridge module by path under a private name, without touching sys.path."""
+    spec = importlib.util.spec_from_file_location(alias, BRIDGE / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# event_manager is stdlib-only, so it loads with no stubs.
+EventManager = _load_bridge_module("event_manager.py", "_event_manager_light").EventManager
 
 
 @pytest.fixture
@@ -68,12 +79,7 @@ def _load_event_translator() -> ModuleType:
         "qontinui.reporting": None,
     }
     with patch.dict(sys.modules, stubs):
-        spec = importlib.util.spec_from_file_location(
-            "_event_translator_light", BRIDGE / "event_translator.py"
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_bridge_module("event_translator.py", "_event_translator_light")
     module.QONTINUI_AVAILABLE = True  # type: ignore[attr-defined]
     return module
 
@@ -91,7 +97,7 @@ def _load_start_execution(extra_globals: dict) -> object:
         # pre-fix function fails on its assertion rather than on a NameError.
         "os": os,
         "tempfile": tempfile,
-        "datetime": datetime.datetime,
+        "datetime": dt.datetime,
         "time": time,
         **extra_globals,
     }
