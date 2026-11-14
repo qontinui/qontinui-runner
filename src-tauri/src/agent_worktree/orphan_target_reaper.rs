@@ -192,12 +192,45 @@
 //! | # | Root | Resolution | Behaviour |
 //! |---|---|---|---|
 //! | 1 | the workspace root | [`super::census::qontinui_root`] | **unchanged** |
-//! | 2 | the harness scratchpad tree | [`harness_scratchpad_root`] — `<tmp>/claude-<uid>`, both halves read at RUNTIME | new |
+//! | 2… | the harness scratchpad FAMILY | [`reap_roots_from`]: `<tmp>/claude-<uid>`, then every `<qontinui_dir>/scratch/<account>/claude-<uid>` and `…/<account>/<lineage>/claude-<uid>` ([`scratch_family_under`]) | one [`ReapRoot`] per tree |
 //!
-//! Root 2 is **discovered, never hardcoded**: `<tmp>` from the platform temp dir
-//! and `<uid>` from `geteuid(2)`. A literal `/tmp/claude-1000` would be correct
-//! on precisely one box and silently wrong everywhere else, which is the same
+//! The scratch roots are **discovered, never hardcoded**: `<tmp>` from the
+//! platform temp dir, `<uid>` from `geteuid(2)` and `<qontinui_dir>` from
+//! `ambient::qontinui_dir`. A literal `/tmp/claude-1000` would be correct on
+//! precisely one box and silently wrong everywhere else, which is the same
 //! defect class as a fabricated zero.
+//!
+//! ### Why the scratch root is a FAMILY — the tree it used to read was empty
+//!
+//! The account shortcuts launch sessions with `TMPDIR=<qontinui_dir>/scratch/
+//! <account>`, so their scratchpads are under
+//! `<qontinui_dir>/scratch/<account>/claude-<uid>/<project>/<session>/…`, not
+//! under `<tmp>`. On merytshost 2026-10-31 the reaper's one scratch root was
+//! `/tmp/claude-1000` and reported `scanned=0 census=complete` — a complete
+//! census of an empty directory, reading as coverage — while the on-disk
+//! family held hundreds of GB (417 GB when re-measured 2026-11-02). Each family member is now its own root with its own
+//! visit budget and its own line on the cycle (`path=` names it), a family that
+//! could not be established is a root of its own that says so, and every root
+//! also reports how many bytes its walk READ (`walked_gb=`, `dirs=`) beside
+//! `scanned`, so `scanned=0` over a populated tree no longer looks like
+//! `scanned=0` over an empty one.
+//!
+//! ### A scratch candidate takes two more gates than a workspace one
+//!
+//! A scratch root holds other sessions' live state, so a candidate there must
+//! (a) sit under `<project>/<session-uuid>/`, (b) belong to a session that is
+//! idle on EVERY account — the newest `<account>/projects/<project>/<uuid>.jsonl`
+//! across all of them, because a session can move accounts and leave a frozen
+//! copy behind — with no live process naming its uuid or holding its directory,
+//! and (c) not be held: no granted flock on its `.cargo-lock` files
+//! (`/proc/locks`, through the census's own parser) and no process whose cwd,
+//! open fd or `CARGO_TARGET_DIR` is in it. The reaper's own `.cargo-lock` probe
+//! is a write-open, which an `flock` does not block, so on Linux the old G-live
+//! was an mtime alone. Anything those reads could not establish — no account
+//! home, no transcript, an unlistable process table — refuses the candidate;
+//! a rule that needed a positive DEAD would never fire, and one that read an
+//! absence as DEAD would delete a live session's build. See
+//! [`classify_candidate`] and [`scratch_liveness_verdict`].
 //!
 //! **An absent root is ABSENT, not empty.** Every root carries a
 //! [`RootState`] into [`ReapSummary::roots`], and a root that is `Absent`,
@@ -318,11 +351,26 @@
 //! change on a platform this branch cannot compile-check. Reported as UNKNOWN
 //! with a reason; never as healthy.
 //!
-//! ## Arming (fail-safe)
+//! ## Arming — TWO populations, TWO switches
 //!
-//! DRY-RUN by default; armed only by `COORD_ORPHAN_TARGET_REAP_ENABLED` truthy —
-//! same posture as [`super::reclaim`]. While dark it merely LOGS what it would
-//! reap (+ bytes), so the operator reviews a shadow cycle before arming.
+//! **Workspace roots: DRY-RUN by default**; armed only by
+//! `COORD_ORPHAN_TARGET_REAP_ENABLED` truthy — same posture as
+//! [`super::reclaim`]. While dark it merely LOGS what it would reap (+ bytes),
+//! so the operator reviews a shadow cycle before arming.
+//!
+//! **Scratch roots: ARMED by default**, disabled by
+//! `COORD_ORPHAN_TARGET_SCRATCH_REAP_ENABLED` being exactly `0`
+//! ([`SCRATCH_REAP_ENABLED_ENV`]). The two are independent and each root carries
+//! its own ([`ReapRoot::armed`], rendered as `armed=` in the root's token): a
+//! reclaim nobody switched on is a reclaim the product does not have, and the
+//! workspace flag's named prerequisite — coord's retention pin is not honoured,
+//! so a pinned worktree's `target-<slug>` is reapable — is a property of
+//! WORKSPACE worktrees. A scratch target has no coord worktree row to pin. What
+//! guards the scratch arm instead is per candidate: the session and holder
+//! gates above, and a RE-READ of all of them immediately before each removal
+//! ([`reread_scratch_candidate`]) — a candidate list is a snapshot and never a
+//! delete list. A new default reaches a box only on that box's next runner
+//! start.
 //!
 //! ### Shadow-window prerequisites BEFORE that flag is ever flipped
 //!
@@ -379,11 +427,21 @@ pub const KEEP_ENV: &str = "COORD_ORPHAN_TARGET_KEEP";
 pub const KEEP_SENTINEL: &str = ".reap-keep";
 
 /// Env override pointing the harness-scratchpad enumeration root somewhere
-/// else. Unset — the normal case — the root is DISCOVERED from the platform
-/// temp dir and the invoking uid ([`harness_scratchpad_root`]), never
-/// hardcoded. This exists so the root is an injectable seam for tests and for
-/// an operator whose harness lays scratchpads out elsewhere.
+/// else. Unset — the normal case — the roots are DISCOVERED from the platform
+/// temp dir, the invoking uid and the on-disk scratch family
+/// ([`scratch_family_under`]), never hardcoded. This exists so the root is an
+/// injectable seam for tests and for an operator whose harness lays
+/// scratchpads out elsewhere. It overrides the WHOLE family outright: set, the
+/// one named directory is the only scratch root walked.
 pub const SCRATCH_ROOT_ENV: &str = "COORD_ORPHAN_TARGET_SCRATCH_ROOT";
+/// Env switch for the SCRATCH population's destructive arm — session scratch
+/// under the harness-scratchpad roots, which is a different population from the
+/// workspace's with a different safety argument (plan
+/// `2026-11-01-session-scratch-on-disk-has-no-reclaim-arm-so-the-largest-idle-bytes-hold-every-build-behind-the-reserve`,
+/// D6 and Phase 5). **Default ON; exactly `0` disables.** Any other value —
+/// unset, empty, `false`, `1` — leaves the scratch arm on. Independent of
+/// [`REAP_ENABLED_ENV`]: neither switch arms or disarms the other population.
+pub const SCRATCH_REAP_ENABLED_ENV: &str = "COORD_ORPHAN_TARGET_SCRATCH_REAP_ENABLED";
 /// Env override for the percentage-used at or above which a capacity axis is
 /// reported PRESSURED. Default 90 %. Applies to BOTH axes independently.
 pub const PRESSURE_PCT_ENV: &str = "COORD_ORPHAN_TARGET_PRESSURE_PCT";
@@ -540,12 +598,77 @@ const WORKTREE_RECLAIM_BASENAME: &str = "target";
 const BUILD_POOL_BASENAMES: &[&str] = &["target-agent", "target-arming"];
 const BUILD_POOL_COMPONENT: &str = "target-pool";
 
+/// Ceiling on the directory entries one family discovery pass reads
+/// ([`scratch_family_under`]). Discovery lists two levels of the scratch tree,
+/// and every account directory there holds thousands of loose files beside its
+/// `claude-<uid>` tree (measured on merytshost 2026-11-11: 3,601 entries in
+/// `scratch/` and 117,974 more across its children, 10,734 in the largest), so
+/// the ceiling is sized for that with room to grow — a first cut at 20,000 was
+/// hit on the first real read and reported the family incomplete. Reading a
+/// directory entry is a `readdir` record, not a stat, so a pass at this scale
+/// costs a fraction of a second. It is still a ceiling, and it says so when it
+/// bites ([`ScratchFamily::truncated`]) rather than returning a quiet prefix.
+const MAX_FAMILY_SCAN_ENTRIES: usize = 1_000_000;
+
 /// True iff `COORD_ORPHAN_TARGET_REAP_ENABLED` is truthy. Default OFF (dry-run).
+///
+/// Arms the WORKSPACE population only. The scratch population has its own
+/// switch ([`scratch_reap_armed`]); see [`root_armed`].
 pub fn reap_armed() -> bool {
-    matches!(
-        std::env::var(REAP_ENABLED_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
+    workspace_reap_armed_from(std::env::var(REAP_ENABLED_ENV).ok().as_deref())
+}
+
+/// [`reap_armed`] over an injected value: truthy is exactly `1`, `true` or
+/// `TRUE`. Anything else — unset included — is dry-run.
+fn workspace_reap_armed_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("true") | Some("TRUE"))
+}
+
+/// True unless `COORD_ORPHAN_TARGET_SCRATCH_REAP_ENABLED` is exactly `0`.
+/// Default ON — a reclaim nobody switched on is a reclaim the product does not
+/// have (served policy `engineering-priorities` `capability-ships-enabled`).
+///
+/// The workspace population stays default-OFF behind [`reap_armed`] because its
+/// arming prerequisite — coord's retention pin is not honoured here, so a
+/// pinned worktree's `target-<slug>` is reapable — is a property of WORKSPACE
+/// worktrees. A scratch target has no coord worktree row to pin, so the two
+/// populations do not share that gap, and the scratch arm is further guarded
+/// per candidate by the session-liveness and holder gates
+/// ([`classify_candidate`]).
+pub fn scratch_reap_armed() -> bool {
+    scratch_reap_armed_from(std::env::var(SCRATCH_REAP_ENABLED_ENV).ok().as_deref())
+}
+
+/// [`scratch_reap_armed`] over an injected value. Only the exact string `0`
+/// disables; a mistyped `false` or ` 0` does NOT silently disarm a default-on
+/// capability, which is the same strictness the switch's documentation states.
+fn scratch_reap_armed_from(raw: Option<&str>) -> bool {
+    raw != Some("0")
+}
+
+/// A warning for a [`SCRATCH_REAP_ENABLED_ENV`] value that reads like an attempt
+/// to switch the arm off but is not exactly `0`. The arm is default ON, so an
+/// operator who typed `false` or `off` to stop deletion would otherwise get
+/// deletion, silently.
+fn scratch_switch_warning(raw: Option<&str>) -> Option<String> {
+    match raw {
+        None | Some("0") | Some("1") => None,
+        Some(other) => Some(format!(
+            "{SCRATCH_REAP_ENABLED_ENV}={other:?} is not exactly `0`, so the scratch reclaim \
+             stays ON — only the exact value `0` disables it"
+        )),
+    }
+}
+
+/// Whether the destructive arm is open for a root of `kind`, from the two
+/// switches' raw values. **Each population reads only its own switch** — the
+/// workspace flag never arms scratch and the scratch flag never arms the
+/// workspace — and a test pins exactly that.
+fn root_armed(kind: ReapRootKind, workspace_raw: Option<&str>, scratch_raw: Option<&str>) -> bool {
+    match kind {
+        ReapRootKind::Workspace => workspace_reap_armed_from(workspace_raw),
+        ReapRootKind::HarnessScratchpad => scratch_reap_armed_from(scratch_raw),
+    }
 }
 
 /// The pressure threshold, in percent-used, from [`PRESSURE_PCT_ENV`].
@@ -707,6 +830,15 @@ pub struct Candidate {
     /// [`OwnerProbe::Invoking`] / [`OwnerProbe::NotApplicable`] loses the verb —
     /// see [`SkipReason::ForeignOwner`].
     pub owner: OwnerProbe,
+    /// The harness-scratchpad root this candidate was found under, or `None`
+    /// for a workspace candidate. `Some` is what puts a candidate through the
+    /// SCRATCH gates in [`classify_candidate`]: it must sit under a
+    /// `<project>/<session-uuid>/` directory ([`SkipReason::NotSessionScoped`]),
+    /// that session must be idle on every account's transcript
+    /// ([`SkipReason::SessionLive`] / [`SkipReason::SessionUnknown`]), and no
+    /// live process may hold the target ([`SkipReason::Building`] /
+    /// [`SkipReason::HeldByProcess`] / [`SkipReason::LockStateUnknown`]).
+    pub family_root: Option<PathBuf>,
 }
 
 /// Result of one enumeration pass. Carries the walk's own limits so an
@@ -759,6 +891,22 @@ pub struct Enumeration {
     /// one would double-count the tree behind it — so they are counted here
     /// rather than vanishing.
     pub reparse_dirs_skipped: usize,
+    /// Bytes of the regular files directly inside the directories this walk
+    /// READ — read from the directory record the walk already holds for every
+    /// entry, so counting them costs no syscall.
+    ///
+    /// **Not the size of the tree**, and rendered as such. A target root, a
+    /// [`NEVER_DESCEND`] directory, a link and anything past the depth bound
+    /// are pruned and contribute nothing, so this is a floor under what the
+    /// root holds. It exists so a root that scanned no target roots still
+    /// states what it DID read: `scanned=0` beside `walked_gb=60` is a tree
+    /// with no cargo targets in it, while `scanned=0` beside `walked_gb=0.00`
+    /// is an empty one, and the cycle line used to render both identically.
+    pub walked_bytes: u64,
+    /// Set by [`enumerate_family_within`]: stamped onto every candidate as
+    /// [`Candidate::family_root`] so the classifier can tell a scratch
+    /// candidate from a workspace one.
+    family_root: Option<PathBuf>,
 }
 
 impl Enumeration {
@@ -903,6 +1051,21 @@ pub fn enumerate_all_within(root: &Path, max_depth: u32) -> Enumeration {
     e
 }
 
+/// [`enumerate_all_within`] for a harness-scratchpad (family) root: every
+/// candidate it returns carries [`Candidate::family_root`], so the classifier
+/// applies the session-liveness and holder gates to it. The walk itself is the
+/// same one — it never follows a link and never descends into a target root —
+/// which is the property that keeps a symlink in a family root, pointing at a
+/// live checkout's build output, out of the candidate list.
+pub fn enumerate_family_within(root: &Path, max_depth: u32) -> Enumeration {
+    let mut e = Enumeration {
+        family_root: Some(root.to_path_buf()),
+        ..Enumeration::default()
+    };
+    walk(root, 0, max_depth, &WalkCtx::Loose, &mut e);
+    e
+}
+
 /// Back-compat facade: just the candidate list.
 pub fn enumerate_candidates(root: &Path) -> Vec<Candidate> {
     enumerate_all(root).candidates
@@ -969,6 +1132,11 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
             continue;
         }
         if !ft.is_dir() {
+            if ft.is_file() {
+                // The record is already in hand, so what the walk READ is free
+                // to count — see [`Enumeration::walked_bytes`].
+                e.walked_bytes = e.walked_bytes.saturating_add(meta.len());
+            }
             continue;
         }
         let name = match path.file_name().and_then(|n| n.to_str()) {
@@ -992,6 +1160,7 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
                 enclosing_git_unreadable: ctx.git_unreadable(),
                 // Free: `meta` is the directory record this loop already read.
                 owner: owner_of(&meta),
+                family_root: e.family_root.clone(),
             });
             continue;
         }
@@ -1288,6 +1457,28 @@ pub enum SkipReason {
     /// Operator-pinned via the `.reap-keep` sentinel or the `COORD_ORPHAN_TARGET_KEEP`
     /// allowlist — the ledger-less equivalent of a worktree retention pin.
     Kept,
+    /// **G-session-scope** (scratch roots only) — the target does not sit under
+    /// a `<project>/<session-uuid>/` directory of its scratch root, so no
+    /// session owns it and there is no liveness to read. An observation about
+    /// the path's shape, not a missing reading. Never a candidate, whatever its
+    /// size: the steward's census calls the same population `NON_SESSION`.
+    NotSessionScoped,
+    /// **G-session-live** (scratch roots only) — the owning session is not
+    /// idle: its newest transcript, across EVERY account, is younger than the
+    /// grace window, or a live process names its uuid or holds its directory.
+    SessionLive,
+    /// **G-session-live, failed closed** (scratch roots only) — the session's
+    /// liveness could not be READ: no account home resolved, or no account
+    /// holds a transcript for it, or one could not be stat'ed. Refused, because
+    /// a rule that needed a positive DEAD would never fire and a rule that
+    /// treated an absent reading as one would delete a live session's build.
+    SessionUnknown,
+    /// **G-holder** (scratch roots only) — a live process holds the target
+    /// itself: its cwd or an open file is under the target, or its
+    /// `CARGO_TARGET_DIR` names it. An OBSERVATION of a holder, kept apart from
+    /// [`Self::Building`] (a held `.cargo-lock`), because "a build is in flight
+    /// here" is a claim about cargo and this one is about any process.
+    HeldByProcess,
 }
 
 impl SkipReason {
@@ -1308,6 +1499,10 @@ impl SkipReason {
             SkipReason::ActivityUnknown => "activity-unknown",
             SkipReason::GracePending => "grace-pending",
             SkipReason::Kept => "kept",
+            SkipReason::NotSessionScoped => "non-session",
+            SkipReason::SessionLive => "session-live",
+            SkipReason::SessionUnknown => "session-unknown",
+            SkipReason::HeldByProcess => "held-by-process",
         }
     }
 
@@ -1322,6 +1517,7 @@ impl SkipReason {
                 | SkipReason::DirtyUnknown
                 | SkipReason::ActivityUnknown
                 | SkipReason::LockStateUnknown
+                | SkipReason::SessionUnknown
         )
     }
 
@@ -1422,6 +1618,28 @@ impl SkipReason {
                 "Operator-pinned — a `.reap-keep` sentinel at its top level, or its name in \
                  `COORD_ORPHAN_TARGET_KEEP`. A pin is honoured even when armed."
             }
+            SkipReason::NotSessionScoped => {
+                "Under a scratch root but not under a `<project>/<session-uuid>/` directory of \
+                 it, so no session owns this target and there is no liveness to read. Never a \
+                 candidate, whatever its size — an unattributable target is not this reaper's \
+                 to reason about."
+            }
+            SkipReason::SessionLive => {
+                "The owning session is not idle: its newest transcript on ANY account is \
+                 younger than the grace window, or a live process names its uuid or holds its \
+                 directory. A session can move accounts, so the newest transcript across every \
+                 account decides — never the one in the account whose tree this is."
+            }
+            SkipReason::SessionUnknown => {
+                "The owning session's liveness could NOT be read (no account home resolved, no \
+                 account holds a transcript for it, or one could not be stat'ed). Refused — a \
+                 refusal on a missing reading, NOT an observation that the session is live."
+            }
+            SkipReason::HeldByProcess => {
+                "A live process holds this target: its working directory or an open file is \
+                 under it, or its `CARGO_TARGET_DIR` names it. A dry-run list is a snapshot and \
+                 never a delete list, so a held target stays however idle its session looks."
+            }
         }
     }
 }
@@ -1452,6 +1670,12 @@ pub struct ClassifyOptions {
     /// alternative — re-probing mid-walk — would also make the snapshot
     /// internally inconsistent.
     dirty_memo: Arc<Mutex<HashMap<PathBuf, DirtyProbe>>>,
+    /// What the SCRATCH gates read: the process table, `/proc/locks`, and the
+    /// account homes whose transcripts say whether a session is idle. Only a
+    /// candidate carrying [`Candidate::family_root`] ever touches it, and its
+    /// reads are lazy and memoised per options value, so a cycle with no
+    /// scratch candidate past the cheap gates reads none of it.
+    scratch: ScratchEnv,
 }
 
 /// The three answers a dirtiness probe can give. A tri-state because the
@@ -1472,25 +1696,40 @@ impl ClassifyOptions {
         Self::new(grace())
     }
 
-    /// Explicit grace, env keep-list, real git probe.
+    /// Explicit grace, env keep-list, real git probe, the real process table.
     pub fn new(grace: Duration) -> Self {
         Self {
             grace,
             keep_names: keep_names_from_env(),
             worktree_is_dirty,
             dirty_memo: Arc::default(),
+            scratch: ScratchEnv::ambient(),
         }
     }
 
     /// Explicit grace and an injected dirty probe, with an empty keep-list — the
     /// seam the boundary-gate tests drive, so they never need a real git repo.
+    ///
+    /// The scratch environment is [`ScratchEnv::fail_closed`]: with no process
+    /// table and no account home, every scratch candidate is refused as
+    /// UNKNOWN. A test that wants a scratch candidate to clear the scratch gates
+    /// must say so with [`Self::with_scratch_env`], so the permissive reading is
+    /// always a deliberate one.
     pub fn with_probe(grace: Duration, worktree_is_dirty: fn(&Path) -> DirtyProbe) -> Self {
         Self {
             grace,
             keep_names: Vec::new(),
             worktree_is_dirty,
             dirty_memo: Arc::default(),
+            scratch: ScratchEnv::fail_closed(),
         }
+    }
+
+    /// Replace the scratch environment — the seam that points the scratch gates
+    /// at a fixture process table and fixture account homes.
+    pub fn with_scratch_env(mut self, scratch: ScratchEnv) -> Self {
+        self.scratch = scratch;
+        self
     }
 
     /// The memoised dirty probe. A poisoned lock degrades to an un-memoised
@@ -1751,9 +1990,63 @@ fn boundary_verdict(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipRea
 /// Gate order is the safety contract: boundary gates (cheapest, no disk probing
 /// beyond `git status`) first, then pin, then reparse, then the positive
 /// artifact check, then the live-build and grace probes.
+///
+/// ## A candidate under a scratch root takes two more gates
+///
+/// One carrying [`Candidate::family_root`] must also (1) sit under a
+/// `<project>/<session-uuid>/` directory of that root, checked right after the
+/// boundary gates because it is pure and decisive, and (2), once the disk gates
+/// below have cleared it, belong to a session that is idle on every account and
+/// whose target no live process holds ([`scratch_liveness_verdict`]). Both are
+/// refusals on the same footing as the rest: a missing reading refuses.
 pub fn classify_candidate(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipReason> {
     boundary_verdict(c, opts)?;
-    classify_path(&c.path, opts)
+    let session = match c.family_root.as_deref() {
+        Some(family) => {
+            Some(scratch_session_of(family, &c.path).ok_or(SkipReason::NotSessionScoped)?)
+        }
+        None => None,
+    };
+    classify_path(&c.path, opts)?;
+    match session {
+        Some(s) => scratch_liveness_verdict(&c.path, &s, opts),
+        None => Ok(()),
+    }
+}
+
+/// The checks that must hold AGAIN immediately before an armed scratch removal:
+/// the disk gates (pin, reparse, layout, held lock, idle age) and the scratch
+/// gates, over a process table and transcript read taken NOW rather than at
+/// classification time. Cheaper than [`classify_candidate`] on purpose — the
+/// boundary gates (ownership, `git status`) are properties of where the target
+/// sits, which a session resuming cannot change; what a resume changes is
+/// exactly what this re-reads.
+fn reread_scratch_candidate(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipReason> {
+    let Some(family) = c.family_root.as_deref() else {
+        return Ok(());
+    };
+    let session = scratch_session_of(family, &c.path).ok_or(SkipReason::NotSessionScoped)?;
+    // The shape and the transcript lookup above are LEXICAL, and the holder
+    // reads below are on resolved paths. If a component between the family root
+    // and the target has become a link since the walk, those two describe
+    // different directories, and the removal that follows would follow the
+    // link. The target must still resolve to exactly where the walk found it.
+    let unchanged = match (
+        std::fs::canonicalize(family),
+        std::fs::canonicalize(&c.path),
+    ) {
+        (Ok(canon_family), Ok(canon_target)) => c
+            .path
+            .strip_prefix(family)
+            .is_ok_and(|rel| canon_target == canon_family.join(rel)),
+        _ => false,
+    };
+    if !unchanged {
+        return Err(SkipReason::Reparse);
+    }
+    let fresh = opts.clone().with_scratch_env(opts.scratch.fresh());
+    classify_path(&c.path, &fresh)?;
+    scratch_liveness_verdict(&c.path, &session, &fresh)
 }
 
 /// The five original per-directory gates, for a path whose ownership boundary
@@ -1815,6 +2108,825 @@ fn classify(path: &Path, grace: Duration) -> Result<(), SkipReason> {
 fn looks_like_cargo_artifact(path: &Path) -> bool {
     let has_profile = path.join("debug").is_dir() || path.join("release").is_dir();
     has_cargo_marker(path) && has_profile
+}
+
+// ---------------------------------------------------------------------------
+// The on-disk scratch family and the gates a scratch candidate must clear.
+//
+// Plan `2026-11-01-session-scratch-on-disk-has-no-reclaim-arm-so-the-largest-
+// idle-bytes-hold-every-build-behind-the-reserve`, D1 / D3 / D4 and Phase 4.
+// ---------------------------------------------------------------------------
+
+/// Everything [`scratch_family_under`] found, and everything it could not.
+///
+/// A discovery that read nothing because a directory was unreadable must not
+/// render as one that read everything and found no member, so the problems are
+/// carried beside the members rather than dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScratchFamily {
+    /// Every `<scratch>/<account>/claude-<uid>` and
+    /// `<scratch>/<account>/<lineage>/claude-<uid>` that is a REAL directory,
+    /// sorted. Depth 2 is a family member too — the one-session-lifecycle plan
+    /// (Phase 126) puts `claude-<uid>` one level further down.
+    pub members: Vec<PathBuf>,
+    /// A symlink to a directory where a member, an account directory or a
+    /// lineage directory would be. Never a member and never descended into: a
+    /// link here is how a scratch tree comes to hold a live checkout, and a walk
+    /// that followed it would count one tree twice and delete a build dir it
+    /// does not own.
+    pub links_skipped: usize,
+    /// Directories that could not be listed or stat'ed. `> 0` ⇒ the member list
+    /// may be missing a tree.
+    pub unreadable: usize,
+    /// [`MAX_FAMILY_SCAN_ENTRIES`] was reached. The member list is a prefix.
+    pub truncated: bool,
+}
+
+impl ScratchFamily {
+    /// The member list may be missing a tree.
+    pub fn incomplete(&self) -> bool {
+        self.unreadable > 0 || self.truncated
+    }
+}
+
+/// The real (non-link) child directories of `dir`, sorted. Spends from
+/// `budget`, and records a missing read on `fam` — except a `dir` that does not
+/// exist, which is simply absent and has no children. A link to a directory is
+/// counted in [`ScratchFamily::links_skipped`] unless it is named `member_leaf`,
+/// which [`probe_family_member`] counts itself.
+fn real_child_dirs_budgeted(
+    dir: &Path,
+    member_leaf: &str,
+    budget: &mut usize,
+    fam: &mut ScratchFamily,
+) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => {
+            fam.unreadable += 1;
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        if *budget == 0 {
+            fam.truncated = true;
+            break;
+        }
+        *budget -= 1;
+        let Ok(entry) = entry else {
+            fam.unreadable += 1;
+            continue;
+        };
+        // `DirEntry::file_type` never follows a link, so a symlink to a
+        // directory is `is_symlink`, not `is_dir`.
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => out.push(entry.path()),
+            // A link to a directory where an account or lineage directory would
+            // be: never followed, but counted — a `scratch/<account>` that is a
+            // link onto a bigger disk would otherwise read as an empty family
+            // with nothing incomplete, the shape this discovery exists to end.
+            Ok(ft)
+                if ft.is_symlink() && entry.file_name() != member_leaf && entry.path().is_dir() =>
+            {
+                fam.links_skipped += 1
+            }
+            Ok(_) => {}
+            Err(_) => fam.unreadable += 1,
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Probe one candidate family member. A real directory joins the family, a
+/// link is counted and refused, a missing path is nothing, and any other
+/// failure is a missing reading.
+fn probe_family_member(path: PathBuf, fam: &mut ScratchFamily) {
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => fam.links_skipped += 1,
+        Ok(m) if m.is_dir() => fam.members.push(path),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => fam.unreadable += 1,
+    }
+}
+
+/// Every `claude-<uid>` tree under `<qontinui_dir>/scratch`, which is where the
+/// account shortcuts point `TMPDIR` — so where the harness's per-session
+/// scratchpads (`<project>/<session>/scratchpad/…`) actually go.
+///
+/// ## Why this exists
+///
+/// The reaper's scratch root used to be `<tmp>/claude-<uid>` alone. On a box
+/// whose sessions are launched with `TMPDIR=<qontinui_dir>/scratch/<account>`
+/// that tree is empty, and the cycle said so as
+/// `harness-scratchpad:present(scanned=0,candidates=0,census=complete)` — a
+/// complete census of the wrong directory, reading as coverage of the right
+/// one. On merytshost the right one held 417 GB.
+///
+/// ## Shape
+///
+/// `<scratch>/<account>/claude-<uid>` (depth 1) and
+/// `<scratch>/<account>/<lineage>/claude-<uid>` (depth 2). **Pure over its
+/// arguments** — no env, no ambient home — so a fixture `qontinui_dir` drives
+/// every arm. Reads at most [`MAX_FAMILY_SCAN_ENTRIES`] directory entries, and
+/// says when that bit; never follows a link.
+pub fn scratch_family_under(qontinui_dir: &Path, uid: u32) -> ScratchFamily {
+    scratch_family_with_budget(qontinui_dir, uid, MAX_FAMILY_SCAN_ENTRIES)
+}
+
+/// [`scratch_family_under`] with the entry ceiling named by the caller — the
+/// seam that lets a test hit the ceiling without creating twenty thousand
+/// directories.
+fn scratch_family_with_budget(qontinui_dir: &Path, uid: u32, budget: usize) -> ScratchFamily {
+    let mut fam = ScratchFamily::default();
+    let leaf = format!("claude-{uid}");
+    let mut budget = budget;
+    let accounts =
+        real_child_dirs_budgeted(&qontinui_dir.join("scratch"), &leaf, &mut budget, &mut fam);
+    for account in accounts {
+        probe_family_member(account.join(&leaf), &mut fam);
+        for lineage in real_child_dirs_budgeted(&account, &leaf, &mut budget, &mut fam) {
+            // `<account>/claude-<uid>` is the depth-1 member itself, never a
+            // lineage directory to look inside.
+            if lineage.file_name().is_some_and(|n| n == leaf.as_str()) {
+                continue;
+            }
+            probe_family_member(lineage.join(&leaf), &mut fam);
+        }
+    }
+    fam.members.sort();
+    fam
+}
+
+/// A scratch session directory is named by its uuid, and anything else under a
+/// project directory is not a session (the steward's `NON_SESSION`): 8-4-4-4-12
+/// hex, either case.
+fn is_session_uuid(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// Which session a scratch target belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScratchSession {
+    /// The encoded-cwd directory the session lives under — also the name of
+    /// the directory its transcript lives under in every account home.
+    project: String,
+    uuid: String,
+    /// `<family>/<project>/<uuid>`.
+    dir: PathBuf,
+}
+
+/// The session `target` belongs to, or `None` when it is not under a
+/// `<project>/<uuid>/…` directory of `family_root` with at least one more
+/// level — the target itself.
+///
+/// A target directly under the family root (`coord-target-<hash>`), directly
+/// under a project directory, or under a non-uuid directory has no owner whose
+/// liveness could be read, and so is never a candidate.
+fn scratch_session_of(family_root: &Path, target: &Path) -> Option<ScratchSession> {
+    use std::path::Component;
+    let rel = target.strip_prefix(family_root).ok()?;
+    let mut names: Vec<&str> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(n) => names.push(n.to_str()?),
+            _ => return None,
+        }
+    }
+    let [project, uuid, _, ..] = names.as_slice() else {
+        return None;
+    };
+    if !is_session_uuid(uuid) {
+        return None;
+    }
+    Some(ScratchSession {
+        project: (*project).to_string(),
+        uuid: (*uuid).to_string(),
+        dir: family_root.join(project).join(uuid),
+    })
+}
+
+/// The `projects/` subdirectory every account home keeps its transcripts under.
+const TRANSCRIPT_PROJECTS_DIR: &str = "projects";
+
+/// What the transcripts say about how long a session has been idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRead {
+    /// Time since the NEWEST copy of the session's transcript, across every
+    /// account home that holds one, was written.
+    Idle(Duration),
+    /// No account holds a copy, or one could not be read. Not an age.
+    Unknown,
+}
+
+/// The newest `<home>/projects/<project>/<uuid>.jsonl` across ALL `homes`.
+///
+/// **Across all of them, not the account whose scratch tree this is.** A
+/// session can move accounts: `session_carry::copy_transcript` leaves a FROZEN
+/// copy behind in the old one, so the old account's transcript reads idle for a
+/// session that is running right now under the new one. The measured idle
+/// population in the plan (66 of 68 GB on one account) was binned by exactly
+/// that single-account mtime.
+///
+/// A missing copy in one home is normal; a copy that could not be read is not —
+/// it could be the newer one — and a session with no copy anywhere is UNKNOWN,
+/// never old.
+fn newest_transcript_age(homes: &[PathBuf], project: &str, uuid: &str) -> TranscriptRead {
+    let file = format!("{uuid}.jsonl");
+    let mut newest: Option<std::time::SystemTime> = None;
+    for home in homes {
+        let path = home.join(TRANSCRIPT_PROJECTS_DIR).join(project).join(&file);
+        match std::fs::metadata(&path) {
+            Ok(meta) => match meta.modified() {
+                Ok(t) => newest = Some(newest.map_or(t, |cur| cur.max(t))),
+                Err(_) => return TranscriptRead::Unknown,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return TranscriptRead::Unknown,
+        }
+    }
+    match newest {
+        // An mtime in the future (`elapsed` errors) is the freshest possible
+        // reading, not a missing one.
+        Some(t) => TranscriptRead::Idle(t.elapsed().unwrap_or(Duration::ZERO)),
+        None => TranscriptRead::Unknown,
+    }
+}
+
+/// Where the account homes come from.
+#[derive(Clone)]
+enum HomesSource {
+    /// The runner's own discovery — `CLAUDE_CONFIG_DIR`, the settings roster,
+    /// then every `~/.claude-*`: the same rule the transcript readers use.
+    /// Resolved on first use, not at construction, so building a
+    /// [`ClassifyOptions`] reads no settings.
+    Ambient,
+    /// Injected. `None` is "the accounts root could not be resolved".
+    Fixed(Option<Vec<PathBuf>>),
+}
+
+#[derive(Default)]
+struct ScratchMemo {
+    homes: std::sync::OnceLock<Option<Vec<PathBuf>>>,
+    procs: Mutex<Option<Arc<ProcSnapshot>>>,
+}
+
+/// What the scratch gates read, behind seams.
+///
+/// Production reads `/proc` and the discovered account homes; a test hands it a
+/// fixture `/proc`-shaped directory and a fixture home, which is how every arm —
+/// a live session, a held target, an unreadable table — is driven without a
+/// process or a session to hold.
+#[derive(Clone)]
+pub struct ScratchEnv {
+    proc_root: PathBuf,
+    homes: HomesSource,
+    memo: Arc<ScratchMemo>,
+}
+
+impl ScratchEnv {
+    /// The real `/proc` and the discovered account homes.
+    pub fn ambient() -> Self {
+        Self {
+            proc_root: PathBuf::from("/proc"),
+            homes: HomesSource::Ambient,
+            memo: Arc::default(),
+        }
+    }
+
+    /// An injected process table and account homes. `homes: None` is an
+    /// unresolved accounts root.
+    pub fn fixed(proc_root: PathBuf, homes: Option<Vec<PathBuf>>) -> Self {
+        Self {
+            proc_root,
+            homes: HomesSource::Fixed(homes),
+            memo: Arc::default(),
+        }
+    }
+
+    /// No process table and no account home: every scratch candidate that
+    /// reaches the liveness gates is refused as UNKNOWN.
+    pub fn fail_closed() -> Self {
+        Self::fixed(PathBuf::new(), None)
+    }
+
+    /// The same inputs with EMPTY memos, so the next read goes to the machine.
+    fn fresh(&self) -> Self {
+        Self {
+            proc_root: self.proc_root.clone(),
+            homes: self.homes.clone(),
+            memo: Arc::default(),
+        }
+    }
+
+    /// The account homes, resolved once per options value. `None` ⇒ unresolved.
+    fn homes(&self) -> Option<&[PathBuf]> {
+        self.memo
+            .homes
+            .get_or_init(|| match &self.homes {
+                HomesSource::Fixed(h) => h.clone(),
+                HomesSource::Ambient => {
+                    let found =
+                        qontinui_runner_lib::session_archive::discovery::discover_account_homes_from_env(
+                            &crate::settings::get_claude_config_dirs(),
+                        );
+                    if found.is_empty() {
+                        None
+                    } else {
+                        Some(found.into_iter().map(|h| h.config_dir).collect())
+                    }
+                }
+            })
+            .as_deref()
+    }
+
+    /// The process table, read at most once per memo. A poisoned lock degrades
+    /// to an un-memoised read — never to an answer.
+    fn procs(&self) -> Arc<ProcSnapshot> {
+        let Ok(mut slot) = self.memo.procs.lock() else {
+            return Arc::new(ProcSnapshot::read(&self.proc_root));
+        };
+        slot.get_or_insert_with(|| Arc::new(ProcSnapshot::read(&self.proc_root)))
+            .clone()
+    }
+
+    /// Own-uid processes whose `/proc` entries were denied, in the table read so
+    /// far. 0 when none has been read.
+    pub fn opaque_procs_seen(&self) -> usize {
+        self.memo
+            .procs
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|p| p.opaque))
+            .unwrap_or(0)
+    }
+}
+
+/// One own-uid process, reduced to what the gates ask about it.
+#[derive(Debug, Default)]
+struct ProcEntry {
+    /// `/proc/<pid>/cmdline`, ASCII-lowercased, NULs kept: a uuid named
+    /// anywhere in argv is found by substring.
+    cmdline: Vec<u8>,
+    /// `CLAUDE_CODE_SESSION_ID` from its environment.
+    session_env: Option<String>,
+    /// `CARGO_TARGET_DIR` from its environment, made absolute against its cwd
+    /// and canonicalised where it exists.
+    cargo_target_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    /// The binary it is executing (`/proc/<pid>/exe`). A process running a
+    /// binary built into a target holds nothing else in it — no fd, no flock, a
+    /// cwd elsewhere, a relative argv[0] — and is the holder most likely to be
+    /// missed without this read.
+    exe: Option<PathBuf>,
+    /// Absolute link targets of its open fds. Pipes, sockets and anon inodes
+    /// are not paths and are not kept.
+    fds: Vec<PathBuf>,
+}
+
+/// One read of the process table, shared by every candidate of a cycle.
+#[derive(Debug, Default)]
+struct ProcSnapshot {
+    /// The table could be listed at all. `false` ⇒ every question about
+    /// holders and sessions is UNKNOWN.
+    listed: bool,
+    procs: Vec<ProcEntry>,
+    /// Own-uid pids this uid was denied — see
+    /// [`ReapSummary::scratch_opaque_procs`].
+    opaque: usize,
+    /// `/proc/locks`, parsed by the census's own parser. `None` ⇒ unreadable.
+    locks: Option<HashMap<super::cargo_locks::LockKey, super::cargo_locks::LockEntry>>,
+}
+
+/// What the process table says about a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// A held flock on one of the target's `.cargo-lock` files.
+    Locked,
+    /// A process's cwd, open fd or `CARGO_TARGET_DIR` is under (or names) it.
+    Held,
+    /// Nothing holds it.
+    Free,
+    /// A read the answer depends on failed.
+    Unknown,
+}
+
+/// Parse the two variables the gates need out of a `/proc/<pid>/environ` blob.
+fn read_environ(raw: &[u8], entry: &mut ProcEntry) {
+    for var in raw.split(|b| *b == 0) {
+        if let Some(v) = var.strip_prefix(b"CLAUDE_CODE_SESSION_ID=") {
+            entry.session_env = Some(String::from_utf8_lossy(v).to_ascii_lowercase());
+        } else if let Some(v) = var.strip_prefix(b"CARGO_TARGET_DIR=") {
+            let v = String::from_utf8_lossy(v);
+            if !v.is_empty() {
+                entry.cargo_target_dir = Some(PathBuf::from(v.into_owned()));
+            }
+        }
+    }
+}
+
+/// Ceiling on the open-fd links one process-table read follows. A table with
+/// more is UNKNOWN rather than a quiet prefix: the census's own open-file scan
+/// stops at 100,000 and reports a null owner, and a gate that guards a deletion
+/// must not read a truncated table as a complete one.
+const MAX_PROC_FDS: usize = 500_000;
+
+/// How a failed `/proc/<pid>/…` read is to be understood.
+enum ProcFailure {
+    /// The process exited between the listing and the read: it holds nothing.
+    Vanished,
+    /// The kernel refused this uid. See [`ProcSnapshot::read`].
+    Denied,
+    /// Anything else (`EMFILE`, `EIO`, `ENOMEM`, …). A reading that failed for a
+    /// reason nobody has accounted for is a missing reading, never an absence.
+    Other,
+}
+
+fn proc_failure(e: &std::io::Error) -> ProcFailure {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return ProcFailure::Denied;
+    }
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return ProcFailure::Vanished;
+    }
+    // `ESRCH` is what `/proc/<pid>/environ` answers for a process that is
+    // exiting, and `std` does not map it to `NotFound`.
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        return ProcFailure::Vanished;
+    }
+    ProcFailure::Other
+}
+
+/// What reading one process came to.
+enum ProcRead {
+    Entry {
+        entry: ProcEntry,
+        denied: bool,
+    },
+    /// It vanished mid-read.
+    Gone,
+    /// A read failed for a reason that is neither a vanished process nor a
+    /// refusal: the table as a whole can no longer be called read.
+    Unknown,
+}
+
+/// Read one `/proc/<pid>` directory. `exe` is the one field whose absence is
+/// not a vanished process (a zombie has none while `cwd` already says so).
+fn read_one_proc(dir: &Path, fd_budget: &mut usize) -> ProcRead {
+    let mut pe = ProcEntry::default();
+    let mut denied = false;
+    macro_rules! field {
+        ($read:expr, |$v:ident| $assign:expr) => {
+            match $read {
+                Ok($v) => $assign,
+                Err(e) => match proc_failure(&e) {
+                    ProcFailure::Denied => denied = true,
+                    ProcFailure::Vanished => return ProcRead::Gone,
+                    ProcFailure::Other => return ProcRead::Unknown,
+                },
+            }
+        };
+    }
+    field!(std::fs::read(dir.join("cmdline")), |b| pe.cmdline =
+        b.to_ascii_lowercase());
+    field!(std::fs::read(dir.join("environ")), |b| read_environ(
+        &b, &mut pe
+    ));
+    field!(std::fs::read_link(dir.join("cwd")), |p| pe.cwd = Some(p));
+    match std::fs::read_link(dir.join("exe")) {
+        Ok(p) => pe.exe = Some(p),
+        Err(e) => match proc_failure(&e) {
+            ProcFailure::Denied => denied = true,
+            ProcFailure::Vanished => {}
+            ProcFailure::Other => return ProcRead::Unknown,
+        },
+    }
+    match std::fs::read_dir(dir.join("fd")) {
+        Ok(fds) => {
+            for fd in fds {
+                let target = match fd {
+                    Ok(fd) => std::fs::read_link(fd.path()),
+                    Err(e) => Err(e),
+                };
+                match target {
+                    Ok(t) => {
+                        if *fd_budget == 0 {
+                            return ProcRead::Unknown;
+                        }
+                        *fd_budget -= 1;
+                        if t.is_absolute() {
+                            pe.fds.push(t);
+                        }
+                    }
+                    Err(e) => match proc_failure(&e) {
+                        ProcFailure::Denied => denied = true,
+                        // An fd closed between the listing and the link read.
+                        ProcFailure::Vanished => {}
+                        ProcFailure::Other => return ProcRead::Unknown,
+                    },
+                }
+            }
+        }
+        Err(e) => match proc_failure(&e) {
+            ProcFailure::Denied => denied = true,
+            ProcFailure::Vanished => return ProcRead::Gone,
+            ProcFailure::Other => return ProcRead::Unknown,
+        },
+    }
+    if let Some(raw) = pe.cargo_target_dir.take() {
+        // Relative to the holder's cwd as it is NOW, not as it was at exec: a
+        // process that has since changed directory can resolve elsewhere. The
+        // flock read backstops that, because cargo holds its lock either way.
+        let abs = if raw.is_absolute() {
+            Some(raw)
+        } else {
+            pe.cwd.as_ref().map(|cwd| cwd.join(raw))
+        };
+        pe.cargo_target_dir = abs.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    }
+    ProcRead::Entry { entry: pe, denied }
+}
+
+impl ProcSnapshot {
+    /// Read the own-uid process table under `proc_root`.
+    ///
+    /// **What counts as unreadable.** A table that cannot be LISTED is
+    /// [`ProcSnapshot::listed`]` == false` and answers UNKNOWN for everything,
+    /// and so is one in which any read failed for a reason other than the two
+    /// below, or whose open-fd links exceed [`MAX_PROC_FDS`]. Per process: one
+    /// that vanished mid-read held nothing, and is skipped. A permission
+    /// denial on an own-uid process is the kernel saying this uid may not
+    /// inspect it — `systemd --user`, `ssh-agent`, an `sshd-session` all answer
+    /// so on this box — and is TOLERATED but COUNTED. Refusing on any of them
+    /// would leave the gates inert on every box that runs a user manager; a
+    /// live cargo build is caught regardless of its `/proc` entry by the
+    /// `/proc/locks` read, which lists every process's flocks.
+    ///
+    /// The count is a LOWER BOUND: a process that is not dumpable has a
+    /// root-owned `/proc/<pid>` directory, so it is dropped by the own-uid
+    /// filter before any read is attempted and is not counted.
+    fn read(proc_root: &Path) -> Self {
+        let mut snap = ProcSnapshot::default();
+        let Ok(listing) = std::fs::read_dir(proc_root) else {
+            return snap;
+        };
+        snap.listed = true;
+        let mut fd_budget = MAX_PROC_FDS;
+        for entry in listing {
+            // A listing that errors mid-way could have dropped any pid.
+            let Ok(entry) = entry else {
+                return ProcSnapshot::default();
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            // Own-uid only: another account's processes are not this reaper's
+            // to reason about, and its `/proc/<pid>/fd` is unreadable anyway.
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) => match proc_failure(&e) {
+                    ProcFailure::Vanished => continue,
+                    _ => return ProcSnapshot::default(),
+                },
+            };
+            if matches!(owner_of(&meta), OwnerProbe::Foreign { .. }) {
+                continue;
+            }
+            match read_one_proc(&entry.path(), &mut fd_budget) {
+                ProcRead::Entry { entry, denied } => {
+                    if denied {
+                        snap.opaque += 1;
+                    }
+                    snap.procs.push(entry);
+                }
+                ProcRead::Gone => {}
+                ProcRead::Unknown => return ProcSnapshot::default(),
+            }
+        }
+        snap.locks = std::fs::read_to_string(proc_root.join("locks"))
+            .ok()
+            .map(|text| super::cargo_locks::parse_proc_locks(&text));
+        snap
+    }
+
+    /// Does a live process name this session — its uuid in argv or in
+    /// `CLAUDE_CODE_SESSION_ID`, or a cwd or open fd under its directory?
+    fn names_session(&self, session: &ScratchSession, canon_dir: &Path) -> bool {
+        let needle = session.uuid.to_ascii_lowercase();
+        self.procs.iter().any(|p| {
+            contains_bytes(&p.cmdline, needle.as_bytes())
+                || p.session_env.as_deref() == Some(needle.as_str())
+                || p.cwd.as_deref().is_some_and(|c| c.starts_with(canon_dir))
+                || p.exe.as_deref().is_some_and(|x| x.starts_with(canon_dir))
+                || p.fds.iter().any(|f| f.starts_with(canon_dir))
+        })
+    }
+
+    /// Does anything hold `canon_target`?
+    ///
+    /// Two independent reads, because each is blind where the other is not. A
+    /// held flock on any of the target's `.cargo-lock` files is the proper
+    /// G-live read on Linux — the reaper's own `cargo_lock_held` is a
+    /// write-open, which an `flock` does not block — and `/proc/locks` lists
+    /// every process's, readable or not. A process whose cwd, executable,
+    /// open fd or `CARGO_TARGET_DIR` is under the target covers what holds the
+    /// directory without holding a lock: a shell parked in it, an editor, a
+    /// binary built into it and still running, a `cargo` that has not taken its
+    /// lock yet.
+    fn holds_target(&self, canon_target: &Path) -> Holder {
+        use super::cargo_locks::lookup_lock;
+        // The flock read can fail in three places — `/proc/locks`, listing the
+        // target for its lock files, statting one. A failure is remembered
+        // rather than returned at once, because what a process is OBSERVED to
+        // hold below outranks a reading that could not be made.
+        let mut unknown = false;
+        match (&self.locks, cargo_lock_files(canon_target)) {
+            (Some(locks), Some(lock_files)) => {
+                for file in lock_files {
+                    match lock_key_of_path(&file) {
+                        // An inode-only match (an anonymous device) is a
+                        // candidate, not a proof — and refusing on a candidate
+                        // is the safe direction here, unlike a report that must
+                        // not name a false owner.
+                        Ok(Some(key))
+                            if lookup_lock(locks, key)
+                                .is_some_and(|(_, e, _)| !e.holders.is_empty()) =>
+                        {
+                            return Holder::Locked;
+                        }
+                        // A lock that is free, or not there at all.
+                        Ok(_) => {}
+                        Err(()) => unknown = true,
+                    }
+                }
+            }
+            _ => unknown = true,
+        }
+        let held = self.procs.iter().any(|p| {
+            p.cwd
+                .as_deref()
+                .is_some_and(|c| c.starts_with(canon_target))
+                || p.exe
+                    .as_deref()
+                    .is_some_and(|x| x.starts_with(canon_target))
+                || p.fds.iter().any(|f| f.starts_with(canon_target))
+                || p.cargo_target_dir
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with(canon_target) || canon_target.starts_with(d))
+        });
+        if held {
+            Holder::Held
+        } else if unknown {
+            Holder::Unknown
+        } else {
+            Holder::Free
+        }
+    }
+}
+
+/// Substring search over bytes. An empty needle matches nothing.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The real (non-link) child directories of `dir`, or `None` when the listing
+/// itself failed for a reason other than the directory not existing.
+fn real_child_dirs(dir: &Path) -> Option<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.ok()?;
+        if entry.file_type().ok()?.is_dir() {
+            out.push(entry.path());
+        }
+    }
+    Some(out)
+}
+
+/// Every place cargo can keep a `.cargo-lock` under a target root: the root,
+/// `<root>/<profile>/` and `<root>/<triple>/<profile>/`. The same two levels
+/// the census's own enumeration reads, and no deeper. Existence is not
+/// required — the caller stats each — so a profile with no lock costs one
+/// failed stat. `None` when a listing failed.
+fn cargo_lock_files(target: &Path) -> Option<Vec<PathBuf>> {
+    let mut out = vec![target.join(".cargo-lock")];
+    for l1 in real_child_dirs(target)? {
+        out.push(l1.join(".cargo-lock"));
+        for l2 in real_child_dirs(&l1)? {
+            out.push(l2.join(".cargo-lock"));
+        }
+    }
+    Some(out)
+}
+
+/// `/proc/locks`' key for a file's inode, from its stat.
+#[cfg(unix)]
+fn lock_key_of(meta: &std::fs::Metadata) -> Option<super::cargo_locks::LockKey> {
+    use std::os::unix::fs::MetadataExt;
+    let (major, minor) = super::cargo_locks::dev_major_minor(meta.dev());
+    Some(super::cargo_locks::LockKey {
+        major,
+        minor,
+        ino: meta.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn lock_key_of(_meta: &std::fs::Metadata) -> Option<super::cargo_locks::LockKey> {
+    None
+}
+
+/// `Ok(Some(key))` for a lock file that exists, `Ok(None)` for one that does
+/// not, `Err(())` when the stat failed or this platform has no inode key.
+fn lock_key_of_path(path: &Path) -> Result<Option<super::cargo_locks::LockKey>, ()> {
+    match std::fs::metadata(path) {
+        Ok(meta) => lock_key_of(&meta).map(Some).ok_or(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// The SCRATCH gates for a candidate that has already cleared the boundary and
+/// disk gates: is its session idle, and does anything hold it?
+///
+/// Read at classify time, in this order, cheapest first:
+///
+///  1. **Transcript.** The newest `<home>/projects/<project>/<uuid>.jsonl`
+///     across ALL account homes must be older than the grace window
+///     ([`SkipReason::SessionLive`]); no copy anywhere, or no resolved account
+///     home, is [`SkipReason::SessionUnknown`].
+///  2. **Holder.** An unlistable process table is
+///     [`SkipReason::LockStateUnknown`] — the plan's name for a holder read
+///     that could not be made. A held `.cargo-lock` is
+///     [`SkipReason::Building`]; a process in, or aimed at, the target is
+///     [`SkipReason::HeldByProcess`].
+///  3. **Session.** A live process naming the session's uuid or holding its
+///     directory is [`SkipReason::SessionLive`]. Only then is a holder read
+///     that could not be completed reported, as `LockStateUnknown`: what was
+///     observed outranks what could not be read.
+///
+/// The verdict is the SNAPSHOT's, and a snapshot is never a delete list: the
+/// armed removal path re-reads all of it immediately before each removal
+/// ([`reread_scratch_candidate`]).
+fn scratch_liveness_verdict(
+    target: &Path,
+    session: &ScratchSession,
+    opts: &ClassifyOptions,
+) -> Result<(), SkipReason> {
+    let env = &opts.scratch;
+    let Some(homes) = env.homes() else {
+        return Err(SkipReason::SessionUnknown);
+    };
+    match newest_transcript_age(homes, &session.project, &session.uuid) {
+        TranscriptRead::Unknown => return Err(SkipReason::SessionUnknown),
+        TranscriptRead::Idle(age) if age < opts.grace => return Err(SkipReason::SessionLive),
+        TranscriptRead::Idle(_) => {}
+    }
+    let procs = env.procs();
+    if !procs.listed {
+        return Err(SkipReason::LockStateUnknown);
+    }
+    // `/proc` reports resolved paths, so compare against resolved paths. A path
+    // that cannot be resolved cannot be compared, which is a missing reading.
+    let (Ok(canon_target), Ok(canon_dir)) = (
+        std::fs::canonicalize(target),
+        std::fs::canonicalize(&session.dir),
+    ) else {
+        return Err(SkipReason::LockStateUnknown);
+    };
+    // What a process is OBSERVED to hold outranks a reading that could not be
+    // made, and the specific observation outranks the general one: a build's
+    // open fds are under the session directory too, so asking "does a process
+    // name this session" first would report every held target as a live
+    // session and bury the held lock that is the better evidence.
+    let holder = procs.holds_target(&canon_target);
+    match holder {
+        Holder::Locked => return Err(SkipReason::Building),
+        Holder::Held => return Err(SkipReason::HeldByProcess),
+        Holder::Free | Holder::Unknown => {}
+    }
+    if procs.names_session(session, &canon_dir) {
+        return Err(SkipReason::SessionLive);
+    }
+    match holder {
+        Holder::Unknown => Err(SkipReason::LockStateUnknown),
+        _ => Ok(()),
+    }
 }
 
 /// Junction-safe recursive removal. Removes any link — `dir` itself or a
@@ -1926,9 +3038,20 @@ pub const STATVFS_FAILED: &str = "statvfs_call_failed";
 /// The two axes are independent all the way through: one being unmeasurable
 /// never nulls the other, because throwing away a reading that WAS taken is as
 /// dishonest as fabricating one that was not.
+///
+/// **`bytes_free` is `f_bavail`, not `f_bfree`.** `f_bfree` counts the blocks the
+/// filesystem reserves for root as free; `f_bavail` is what an unprivileged
+/// process can actually allocate, and it is the reading coord's allocation
+/// budget uses (`free_bytes` against `reserve_bytes`). The pressure axis used to
+/// read `f_bfree`, so on merytshost (101.96e9 root-reserved bytes) it showed
+/// 86.3 % used while `df` showed 92 to 93 % — two readers of one disk
+/// disagreeing across the 90 % line. Percent used is therefore
+/// `(total - avail) / total`: it crosses 90 % exactly where `avail` drops to 10 %
+/// of the disk, which is where coord's reserve starts.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FsCapacity {
     pub bytes_total: u64,
+    /// Bytes available to an unprivileged process (`f_bavail`).
     pub bytes_free: u64,
     /// `None` ⇒ UNKNOWN, with [`Self::bytes_unknown_reason`] saying why.
     pub bytes_pct_used: Option<f64>,
@@ -1977,16 +3100,20 @@ fn pct_used(total: u64, free: u64) -> Option<f64> {
 /// fields. Split out from [`fs_capacity`] so the percentages and — the part
 /// that matters — the UNKNOWN arm are unit-testable on every platform, with no
 /// mount and no privileges.
+///
+/// The byte axis takes **`f_bavail`** — see [`FsCapacity`] for why it is not
+/// `f_bfree`. The inode axis keeps `f_ffree`: a filesystem has no
+/// root-reserved inode count to disagree about.
 pub fn capacity_from_statvfs(
     block_size: u64,
     f_blocks: u64,
-    f_bfree: u64,
+    f_bavail: u64,
     f_files: u64,
     f_ffree: u64,
 ) -> FsCapacity {
     // The percentages are computed on the COUNTS, not on the byte products, so
     // a large filesystem cannot overflow its way to a wrong ratio.
-    let (bytes_pct_used, bytes_unknown_reason) = match pct_used(f_blocks, f_bfree) {
+    let (bytes_pct_used, bytes_unknown_reason) = match pct_used(f_blocks, f_bavail) {
         Some(p) => (Some(p), None),
         None => (None, Some(BLOCK_COUNT_NOT_REPORTED)),
     };
@@ -1996,7 +3123,7 @@ pub fn capacity_from_statvfs(
     };
     FsCapacity {
         bytes_total: f_blocks.saturating_mul(block_size),
-        bytes_free: f_bfree.saturating_mul(block_size),
+        bytes_free: f_bavail.saturating_mul(block_size),
         bytes_pct_used,
         bytes_unknown_reason,
         inodes_total: f_files,
@@ -2040,6 +3167,15 @@ pub fn fs_capacity(path: &Path) -> FsCapacity {
     }
     // SAFETY: `statvfs` returned 0, so `buf` is initialised.
     let s = unsafe { buf.assume_init() };
+    capacity_from_statvfs_struct(&s)
+}
+
+/// The raw `statvfs(3)` struct to a [`FsCapacity`], split out of
+/// [`fs_capacity`] so the one line that chooses WHICH free-block field feeds the
+/// byte axis is testable on a hand-built struct, on a filesystem that reserves
+/// nothing for root.
+#[cfg(unix)]
+fn capacity_from_statvfs_struct(s: &libc::statvfs) -> FsCapacity {
     // `f_frsize` is the fragment size the block counts are denominated in;
     // `f_bsize` is the preferred I/O size and only a fallback for the
     // filesystems that leave `f_frsize` zero.
@@ -2051,7 +3187,9 @@ pub fn fs_capacity(path: &Path) -> FsCapacity {
     capacity_from_statvfs(
         block_size,
         s.f_blocks as u64,
-        s.f_bfree as u64,
+        // `f_bavail`, not `f_bfree`: what an unprivileged process can allocate,
+        // which is the reading coord's budget uses.
+        s.f_bavail as u64,
         s.f_files as u64,
         s.f_ffree as u64,
     )
@@ -2379,12 +3517,20 @@ pub struct ReapRoot {
     /// tree shape, from [`ReapRootKind::max_walk_depth`], because one global
     /// constant is necessarily wrong for one of the two trees.
     pub max_walk_depth: u32,
+    /// Whether the destructive arm is open for THIS root. Arming is a property
+    /// of the root's population, not of the cycle: the workspace root is armed
+    /// by [`REAP_ENABLED_ENV`] and the scratch roots by
+    /// [`SCRATCH_REAP_ENABLED_ENV`], independently ([`root_armed`]). A root
+    /// built by [`ReapRoot::at`] is DRY-RUN until [`Self::with_armed`] says
+    /// otherwise — the fail-safe default.
+    pub armed: bool,
 }
 
 impl ReapRoot {
     /// Probe a resolved path. `Present` only for a real directory; a missing
     /// path is `Absent`, and a stat that failed for any other reason is
-    /// `Unreadable` — the three are never collapsed.
+    /// `Unreadable` — the three are never collapsed. DRY-RUN until
+    /// [`Self::with_armed`].
     pub fn at(kind: ReapRootKind, path: &Path) -> Self {
         let state = match std::fs::symlink_metadata(path) {
             Ok(m) if m.is_dir() => RootState::Present,
@@ -2400,6 +3546,7 @@ impl ReapRoot {
             path: Some(path.to_path_buf()),
             state,
             max_walk_depth: kind.max_walk_depth(),
+            armed: false,
         }
     }
 
@@ -2409,67 +3556,172 @@ impl ReapRoot {
             path: None,
             state: RootState::Unresolved(why),
             max_walk_depth: kind.max_walk_depth(),
+            armed: false,
+        }
+    }
+
+    /// An UNRESOLVED root that still knows which path it could not resolve — a
+    /// family discovery that failed names the directory it was reading, so the
+    /// cycle line does not have to guess.
+    fn unresolved_at(kind: ReapRootKind, path: &Path, why: &'static str) -> Self {
+        Self {
+            path: Some(path.to_path_buf()),
+            ..Self::unresolved(kind, why)
+        }
+    }
+
+    /// Open or close the destructive arm for this root.
+    pub fn with_armed(mut self, armed: bool) -> Self {
+        self.armed = armed;
+        self
+    }
+}
+
+/// Every input [`reap_roots_from`] resolves the enumeration roots from, as
+/// values: no env read, no ambient home. Production fills it from the process
+/// ([`reap_roots`]); a test fills it from a fixture, which is how the family
+/// and the two arming switches are driven without touching either.
+#[derive(Debug, Clone, Default)]
+pub struct ReapRootInputs {
+    /// The workspace root, or `None` when it did not resolve.
+    pub workspace_root: Option<PathBuf>,
+    /// [`SCRATCH_ROOT_ENV`], when set. Non-blank, it replaces the whole family.
+    pub scratch_root_override: Option<String>,
+    /// The platform temp dir.
+    pub tmp: PathBuf,
+    /// The `~/.qontinui` directory the on-disk scratch family hangs under.
+    pub qontinui_dir: Option<PathBuf>,
+    /// The invoking uid, or `None` on a platform with no POSIX uid.
+    pub uid: Option<u32>,
+    /// Raw [`REAP_ENABLED_ENV`].
+    pub workspace_reap_env: Option<String>,
+    /// Raw [`SCRATCH_REAP_ENABLED_ENV`].
+    pub scratch_reap_env: Option<String>,
+}
+
+impl ReapRootInputs {
+    /// Read every input from the running process.
+    pub fn ambient() -> Self {
+        Self {
+            workspace_root: qontinui_root(),
+            scratch_root_override: std::env::var(SCRATCH_ROOT_ENV).ok(),
+            tmp: std::env::temp_dir(),
+            qontinui_dir: qontinui_runner_lib::ambient::qontinui_dir(),
+            #[cfg(unix)]
+            uid: Some(invoking_uid()),
+            #[cfg(not(unix))]
+            uid: None,
+            workspace_reap_env: std::env::var(REAP_ENABLED_ENV).ok(),
+            scratch_reap_env: std::env::var(SCRATCH_REAP_ENABLED_ENV).ok(),
         }
     }
 }
 
-/// The harness scratchpad tree's root, **discovered** rather than hardcoded.
+/// The scratch roots for `inputs`: `<tmp>/claude-<uid>` first, then every
+/// member of the on-disk family ([`scratch_family_under`]), each its own
+/// [`ReapRoot`] with its own visit budget and its own state on the cycle line.
 ///
-/// The harness lays sessions out as
-/// `<tmp>/claude-<uid>/<project>/<session>/scratchpad/…`, so the family root is
-/// `<tmp>/claude-<uid>`: `<tmp>` from the platform temp dir, `<uid>` from
-/// [`invoking_uid`]. Both halves are read at RUNTIME — a literal
-/// `/tmp/claude-1000` would be correct on exactly one box.
-///
-/// [`SCRATCH_ROOT_ENV`] overrides it outright, which is the seam the tests
-/// drive and the escape hatch for a harness laid out differently.
-///
-/// `None` on a platform with no POSIX uid: the layout is a POSIX one, and
-/// inventing a Windows analogue would be a fabricated root — worse than a
-/// stated gap, which is what the caller turns it into
-/// ([`RootState::Unresolved`]).
-pub fn harness_scratchpad_root() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var(SCRATCH_ROOT_ENV) {
-        let explicit = explicit.trim();
+/// **A family that could not be established says so as a root of its own.** An
+/// unresolved `~/.qontinui`, an unreadable or truncated discovery, and a scratch
+/// tree that holds no `claude-<uid>` at all each become a non-walkable root
+/// naming the directory, so a cycle can never read as having covered a family
+/// it did not find — the failure this resolution exists to close.
+fn scratch_roots_from(inputs: &ReapRootInputs) -> Vec<ReapRoot> {
+    const KIND: ReapRootKind = ReapRootKind::HarnessScratchpad;
+    if let Some(explicit) = inputs.scratch_root_override.as_deref().map(str::trim) {
         if !explicit.is_empty() {
-            return Some(PathBuf::from(explicit));
+            return vec![ReapRoot::at(KIND, Path::new(explicit))];
         }
     }
-    scratchpad_root_from_platform()
+    let Some(uid) = inputs.uid else {
+        return vec![ReapRoot::unresolved(
+            KIND,
+            "this platform has no POSIX uid, so the `claude-<uid>` harness scratchpad layout \
+             does not exist here — a named gap, never an empty tree",
+        )];
+    };
+    let mut roots = vec![ReapRoot::at(
+        KIND,
+        &inputs.tmp.join(format!("claude-{uid}")),
+    )];
+    let Some(qdir) = inputs.qontinui_dir.as_deref() else {
+        roots.push(ReapRoot::unresolved(
+            KIND,
+            "no `~/.qontinui` directory resolved, so the on-disk scratch family under it is \
+             unknown — a named gap, never an empty tree",
+        ));
+        return roots;
+    };
+    let scratch = qdir.join("scratch");
+    let family = scratch_family_under(qdir, uid);
+    if family.incomplete() {
+        warn!(
+            "orphan_target_reaper: scratch family discovery under {} was INCOMPLETE \
+             (unreadable={}, truncated={}) — the members below may be missing a tree",
+            scratch.display(),
+            family.unreadable,
+            family.truncated,
+        );
+        roots.push(ReapRoot::unresolved_at(
+            KIND,
+            &scratch,
+            "scratch family discovery was incomplete (an unreadable directory or the entry \
+             ceiling) — the family roots listed may be missing a tree",
+        ));
+    }
+    if family.links_skipped > 0 {
+        warn!(
+            "orphan_target_reaper: {} symlink(s) to directories under {} were refused as family \
+             roots or account directories — a link is never followed",
+            family.links_skipped,
+            scratch.display(),
+        );
+    }
+    if family.members.is_empty() && !family.incomplete() {
+        roots.push(match std::fs::symlink_metadata(&scratch) {
+            Ok(_) => ReapRoot::unresolved_at(
+                KIND,
+                &scratch,
+                "the scratch directory exists but holds no `claude-<uid>` tree under any \
+                 account — no on-disk scratch family to walk",
+            ),
+            // Absent, not empty: nothing lives under a directory that is not there.
+            Err(_) => ReapRoot::at(KIND, &scratch),
+        });
+    }
+    roots.extend(family.members.iter().map(|m| ReapRoot::at(KIND, m)));
+    roots
 }
 
-#[cfg(unix)]
-fn scratchpad_root_from_platform() -> Option<PathBuf> {
-    Some(std::env::temp_dir().join(format!("claude-{}", invoking_uid())))
+/// Resolve every enumeration root from `inputs`, in order: the workspace root
+/// (unchanged), then the scratch family ([`scratch_roots_from`]). Every root is
+/// returned WITH its state and its arming, so a caller can never silently lose
+/// one and a population can never inherit another's switch ([`root_armed`]).
+pub fn reap_roots_from(inputs: &ReapRootInputs) -> Vec<ReapRoot> {
+    let arm = |root: ReapRoot| {
+        let armed = root_armed(
+            root.kind,
+            inputs.workspace_reap_env.as_deref(),
+            inputs.scratch_reap_env.as_deref(),
+        );
+        root.with_armed(armed)
+    };
+    let mut roots = vec![arm(match inputs.workspace_root.as_deref() {
+        Some(r) => ReapRoot::at(ReapRootKind::Workspace, r),
+        None => ReapRoot::unresolved(
+            ReapRootKind::Workspace,
+            "`workspace_paths::workspace_root()` returned None, so the workspace root is \
+             unknown on this machine",
+        ),
+    })];
+    roots.extend(scratch_roots_from(inputs).into_iter().map(arm));
+    roots
 }
 
-#[cfg(not(unix))]
-fn scratchpad_root_from_platform() -> Option<PathBuf> {
-    None
-}
-
-/// The ambient enumeration roots, in order: the workspace root (unchanged),
-/// then the harness scratchpad tree. Every root is returned WITH its state, so
-/// a caller can never silently lose one.
+/// The ambient enumeration roots ([`reap_roots_from`] over the running
+/// process). Every root is returned WITH its state and its arming.
 pub fn reap_roots() -> Vec<ReapRoot> {
-    vec![
-        match qontinui_root() {
-            Some(r) => ReapRoot::at(ReapRootKind::Workspace, &r),
-            None => ReapRoot::unresolved(
-                ReapRootKind::Workspace,
-                "`workspace_paths::workspace_root()` returned None, so the workspace root is \
-                 unknown on this machine",
-            ),
-        },
-        match harness_scratchpad_root() {
-            Some(r) => ReapRoot::at(ReapRootKind::HarnessScratchpad, &r),
-            None => ReapRoot::unresolved(
-                ReapRootKind::HarnessScratchpad,
-                "this platform has no POSIX uid, so the `<tmp>/claude-<uid>` harness scratchpad \
-                 layout does not exist here — a named gap, never an empty tree",
-            ),
-        },
-    ]
+    reap_roots_from(&ReapRootInputs::ambient())
 }
 
 /// One reaper cycle against the ambient config ([`reap_roots`] + env arming +
@@ -2481,7 +3733,7 @@ pub fn reap_roots() -> Vec<ReapRoot> {
 /// is indistinguishable from a cycle that looked and found nothing. The
 /// unresolved root is reported as such in [`ReapSummary::roots`] instead.
 pub fn tick_once() -> ReapSummary {
-    run_cycle_over_roots(&reap_roots(), reap_armed(), grace())
+    run_cycle_over_roots(&reap_roots(), grace())
 }
 
 /// Render a [`measure_dir_size`] result for the operator-facing cycle log.
@@ -2522,26 +3774,45 @@ fn count_skip(summary: &mut ReapSummary, reason: SkipReason) {
             summary.skipped_other_owner += 1
         }
         SkipReason::WorktreeDirty => summary.skipped_worktree_dirty += 1,
+        SkipReason::NotSessionScoped => summary.skipped_non_session += 1,
+        SkipReason::SessionLive => summary.skipped_session_live += 1,
+        SkipReason::HeldByProcess => summary.skipped_held += 1,
         // Counted above; listed only for exhaustiveness, so a NEW reason cannot
         // be added without deciding which bucket it belongs in.
         SkipReason::OwnershipUnknown
         | SkipReason::DirtyUnknown
         | SkipReason::ActivityUnknown
-        | SkipReason::LockStateUnknown => {}
+        | SkipReason::LockStateUnknown
+        | SkipReason::SessionUnknown => {}
     }
+}
+
+/// ` session=<uuid>` for a scratch candidate, empty for a workspace one — so
+/// the would-reap and reaped lines name the session a reviewer must check the
+/// liveness reads against.
+fn session_tag(c: &Candidate) -> String {
+    c.family_root
+        .as_deref()
+        .and_then(|family| scratch_session_of(family, &c.path))
+        .map(|s| format!(" session={}", s.uuid))
+        .unwrap_or_default()
 }
 
 /// One reaper cycle over a SINGLE root with explicit `armed`/`grace` — the
 /// original testable seam, kept verbatim in behaviour. Delegates to
 /// [`run_cycle_over_roots`] so there is exactly one cycle implementation.
 pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
-    run_cycle_over_roots(&[ReapRoot::at(ReapRootKind::Workspace, root)], armed, grace)
+    run_cycle_over_roots(
+        &[ReapRoot::at(ReapRootKind::Workspace, root).with_armed(armed)],
+        grace,
+    )
 }
 
-/// One reaper cycle over a LIST of roots with explicit `armed`/`grace`.
+/// One reaper cycle over a LIST of roots with an explicit `grace`. Arming is
+/// each root's own ([`ReapRoot::armed`]), not the cycle's.
 /// Enumerates target roots under each walkable root, classifies each, and —
-/// only when `armed` — removes the reapable ones junction-safely. When `!armed`
-/// it merely logs "would reap" and removes NOTHING.
+/// only when THAT root is armed — removes the reapable ones junction-safely.
+/// A root that is not armed merely logs "would reap" and removes NOTHING.
 ///
 /// Every root is accounted for in [`ReapSummary::roots`] whether or not it was
 /// walked, because "the tree is not there" and "the tree is there and holds
@@ -2550,8 +3821,14 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
 /// The per-root capacity read ([`fs_capacity`]) happens here rather than inside
 /// the walk: it is a superblock read, so it is O(1) and cannot be confused with
 /// the enumeration's cost.
-pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) -> ReapSummary {
-    let opts = ClassifyOptions::new(grace);
+pub fn run_cycle_over_roots(roots: &[ReapRoot], grace: Duration) -> ReapSummary {
+    run_cycle_over_roots_with(roots, &ClassifyOptions::new(grace))
+}
+
+/// [`run_cycle_over_roots`] with the classifier's options injected — the seam
+/// that points the scratch gates at a fixture process table and fixture
+/// account homes, and the dirty probe at a fixture.
+pub fn run_cycle_over_roots_with(roots: &[ReapRoot], opts: &ClassifyOptions) -> ReapSummary {
     let threshold = pressure_pct();
     let mut summary = ReapSummary::default();
     // Canonical paths already walked this cycle, so two roots resolving to the
@@ -2569,7 +3846,13 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
             capacity: None,
             max_walk_depth: r.max_walk_depth,
             completeness: None,
+            walked_bytes: 0,
+            dirs_visited: 0,
+            armed: r.armed,
         };
+        // This root's switch, not the cycle's: the workspace and the scratch
+        // populations are armed independently ([`root_armed`]).
+        let armed = r.armed;
         let rendered_path = r
             .path
             .as_ref()
@@ -2606,7 +3889,7 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         // exhaustion was invisible to a byte-only reading.
         let capacity = fs_capacity(path);
         info!(
-            "orphan_target_reaper: root[{}] {rendered_path} state={} | {}",
+            "orphan_target_reaper: root[{}] {rendered_path} state={} armed={armed} | {}",
             r.kind.as_str(),
             report.state.token(),
             capacity.render(threshold),
@@ -2614,9 +3897,16 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         report.capacity = Some(capacity);
 
         // THIS root's depth bound, not a module-wide one — the workspace tree is
-        // flat and the scratchpad tree is not.
-        let enumeration = enumerate_all_within(path, r.max_walk_depth);
+        // flat and the scratchpad tree is not. A scratch root is walked as a
+        // FAMILY root, so every candidate carries the root it came from and
+        // goes through the session-liveness and holder gates.
+        let enumeration = match r.kind {
+            ReapRootKind::Workspace => enumerate_all_within(path, r.max_walk_depth),
+            ReapRootKind::HarnessScratchpad => enumerate_family_within(path, r.max_walk_depth),
+        };
         report.scanned = enumeration.candidates.len();
+        report.walked_bytes = enumeration.walked_bytes;
+        report.dirs_visited = enumeration.dirs_visited;
         // Recorded per root, BEFORE the candidate loop, so a truncated walk
         // cannot reach a consumer as a bare count. `scanned`/`candidates` on
         // this report are a floor whenever this is `Truncated`.
@@ -2634,7 +3924,7 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         summary.reparse_dirs_skipped += enumeration.reparse_dirs_skipped;
 
         for c in enumeration.candidates {
-            match classify_candidate(&c, &opts) {
+            match classify_candidate(&c, opts) {
                 Err(reason) => count_skip(&mut summary, reason),
                 Ok(()) => {
                     // `measure_dir_size(..).unwrap_or(0)` used to render an
@@ -2655,13 +3945,32 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
                         Some(_) => {}
                     }
                     let size = render_size(measured);
+                    let session = session_tag(&c);
                     if !armed {
                         info!(
-                            "orphan_target_reaper: [dry-run] would reap {} [root={} class={}] \
+                            "orphan_target_reaper: [dry-run] would reap {} [root={} class={}{session}] \
                              ({size})",
                             c.path.display(),
                             r.kind.as_str(),
                             c.class.as_str(),
+                        );
+                        continue;
+                    }
+                    // A candidate list is a snapshot and never a delete list: a
+                    // session can resume, and a build can start, between the
+                    // classification above and this removal (and sizing a large
+                    // target takes real time). A scratch candidate is therefore
+                    // RE-READ — disk gates, transcripts, process table, locks —
+                    // immediately before it is removed, and a disagreement
+                    // between the two reads removes nothing.
+                    if let Err(reason) = reread_scratch_candidate(&c, opts) {
+                        summary.reread_refused += 1;
+                        warn!(
+                            "orphan_target_reaper: re-read refused {} [root={}{session}]: {} — \
+                             cleared at classification, NOT removed",
+                            c.path.display(),
+                            r.kind.as_str(),
+                            reason.token(),
                         );
                         continue;
                     }
@@ -2670,7 +3979,7 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
                             summary.reaped += 1;
                             summary.reaped_bytes = summary.reaped_bytes.saturating_add(bytes);
                             info!(
-                                "orphan_target_reaper: reaped {} [root={} class={}] ({size})",
+                                "orphan_target_reaper: reaped {} [root={} class={}{session}] ({size})",
                                 c.path.display(),
                                 r.kind.as_str(),
                                 c.class.as_str(),
@@ -2689,8 +3998,9 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         }
         summary.roots.push(report);
     }
+    summary.scratch_opaque_procs = opts.scratch.opaque_procs_seen();
 
-    info!("{}", render_cycle_line(&summary, armed));
+    info!("{}", render_cycle_line(&summary));
     if summary.population_unknown() {
         warn!(
             "orphan_target_reaper: cycle enumerated NO target roots under any configured \
@@ -2724,8 +4034,13 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
 /// testable as a STRING rather than only as struct fields: what has to hold is
 /// that a reader of this line cannot mistake a truncated walk for a census, and
 /// that is a property of the rendered text.
-fn render_cycle_line(summary: &ReapSummary, armed: bool) -> String {
+fn render_cycle_line(summary: &ReapSummary) -> String {
     let completeness = summary.completeness();
+    // The cycle-level `armed=` is true iff ANY walked root is armed. Arming is a
+    // property of each root's population ([`root_armed`]), so the per-root token
+    // inside `roots=[…]` is the answer to "was THIS root armed"; this one only
+    // says whether the cycle could have removed anything at all.
+    let armed = summary.any_root_armed();
     // The cycle line is the surface a shadow-window review reads, and an
     // enumeration that saw NOTHING renders on it bit-for-bit like a clean
     // machine: `scanned=0 candidates=0 candidate_gb=0.00 reaped=0`. Its one
@@ -2759,7 +4074,8 @@ fn render_cycle_line(summary: &ReapSummary, armed: bool) -> String {
         "orphan_target_reaper: cycle armed={armed} population={population} roots=[{}] scanned={} truncated={} \
          candidates={}{} candidate_gb={:.2}{} reaped={} reaped_gb={:.2} \
          skipped(live={},unrecognized={},grace={},reparse={},kept={},report_only={},\
-         other_owner={},foreign_owner={},wt_dirty={},unknown={}) \
+         other_owner={},foreign_owner={},wt_dirty={},non_session={},session_live={},held={},\
+         unknown={}) reread_refused={} scratch_opaque_procs={} \
          walk(read_errors={},entry_errors={},depth_limited={},reparse_skipped={}) errors={}",
         // Every configured root, WITH its state — so a cycle that walked one of
         // two roots can never read as a cycle that walked the machine.
@@ -2799,7 +4115,12 @@ fn render_cycle_line(summary: &ReapSummary, armed: bool) -> String {
         summary.skipped_other_owner,
         summary.skipped_foreign_owner,
         summary.skipped_worktree_dirty,
+        summary.skipped_non_session,
+        summary.skipped_session_live,
+        summary.skipped_held,
         summary.skipped_unknown,
+        summary.reread_refused,
+        summary.scratch_opaque_procs,
         summary.read_errors,
         summary.entry_errors,
         summary.depth_limited_dirs,
@@ -2834,14 +4155,36 @@ pub struct RootReport {
     /// `capacity`, and NOT [`Completeness::Complete`], which would claim a
     /// coverage nobody measured. For an unwalked root the answer is `state`.
     pub completeness: Option<Completeness>,
+    /// Bytes of the regular files directly inside the directories this walk
+    /// read ([`Enumeration::walked_bytes`]) — a FLOOR under what the root
+    /// holds, printed beside `scanned` so a root that found no target roots
+    /// states how much it read instead of looking empty. 0 for a root that was
+    /// not walked.
+    pub walked_bytes: u64,
+    /// Directories the walk visited. With `walked_bytes`, what separates "a
+    /// tree with no cargo target in it" from "an empty tree".
+    pub dirs_visited: usize,
+    /// Whether the destructive arm was open for this root this cycle.
+    pub armed: bool,
 }
 
 impl RootReport {
     /// Compact per-root token for the cycle summary line.
+    ///
+    /// A harness-scratchpad root also names its PATH, last inside the
+    /// parentheses: the family has one root per account tree, so a token that
+    /// did not say which tree it read would be a census of nothing in
+    /// particular. The existing fields keep their order and spelling and the
+    /// new ones follow them.
     fn render(&self) -> String {
+        let path = match (self.kind, &self.path) {
+            (ReapRootKind::HarnessScratchpad, Some(p)) => Some(p.display().to_string()),
+            _ => None,
+        };
         match &self.state {
             st if st.is_walkable() => format!(
-                "{}:{}(scanned={},candidates={},depth<={},census={})",
+                "{}:{}(scanned={},candidates={},depth<={},census={},walked_gb={:.2},dirs={},\
+                 armed={}{})",
                 self.kind.as_str(),
                 st.token(),
                 self.scanned,
@@ -2852,10 +4195,19 @@ impl RootReport {
                     // A walkable root that reached the walk always has one; the
                     // fallback names the gap rather than inventing "complete".
                     .map_or_else(|| "UNKNOWN".to_string(), Completeness::token),
+                self.walked_bytes as f64 / 1_073_741_824.0,
+                self.dirs_visited,
+                self.armed,
+                path.map_or_else(String::new, |p| format!(",path={p}")),
             ),
             // NOT `scanned=0`: an unwalked root reports its state alone, so a
             // reader cannot mistake "not there" for "there and empty".
-            st => format!("{}:{}", self.kind.as_str(), st.token()),
+            st => format!(
+                "{}:{}{}",
+                self.kind.as_str(),
+                st.token(),
+                path.map_or_else(String::new, |p| format!("(path={p})")),
+            ),
         }
     }
 }
@@ -2899,6 +4251,25 @@ pub struct ReapSummary {
     pub skipped_foreign_owner: usize,
     /// Inside a worktree with uncommitted work (G-dirty).
     pub skipped_worktree_dirty: usize,
+    /// Scratch-root targets with no `<project>/<session-uuid>/` owner
+    /// ([`SkipReason::NotSessionScoped`]).
+    pub skipped_non_session: usize,
+    /// Scratch-root targets whose session is not idle ([`SkipReason::SessionLive`]).
+    pub skipped_session_live: usize,
+    /// Scratch-root targets a live process holds ([`SkipReason::HeldByProcess`]).
+    pub skipped_held: usize,
+    /// Armed scratch candidates the classifier cleared that the re-read taken
+    /// immediately before removal then REFUSED. The candidate list is a
+    /// snapshot, and a session may resume between the snapshot and the delete;
+    /// each of these is a removal that did not happen because the second read
+    /// disagreed with the first.
+    pub reread_refused: usize,
+    /// Own-uid processes whose `/proc` entries this uid was denied (the kernel
+    /// has declared them un-inspectable by us — `systemd --user`, `ssh-agent`).
+    /// They are tolerated, because refusing on any of them would leave the
+    /// scratch gates inert on every systemd box, but they are COUNTED here so
+    /// the tolerance is visible on the line a shadow window is read from.
+    pub scratch_opaque_procs: usize,
     /// Refused because a READING was missing (ownership, dirtiness, or idle
     /// age), not because anything was observed.
     pub skipped_unknown: usize,
@@ -2967,6 +4338,15 @@ impl ReapSummary {
     /// state enum that could drift from it.
     pub fn no_root_walked(&self) -> bool {
         !self.roots.iter().any(|r| r.completeness.is_some())
+    }
+
+    /// Whether any root that was actually WALKED had its destructive arm open.
+    /// A root that was not walked removed nothing whatever its switch said, so
+    /// it does not make the cycle armed.
+    pub fn any_root_armed(&self) -> bool {
+        self.roots
+            .iter()
+            .any(|r| r.armed && r.completeness.is_some())
     }
 
     /// The walk did not reach everything, whatever it found on the way.
@@ -3125,10 +4505,17 @@ pub fn spawn_orphan_reaper() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_INTERVAL_SECS)
         .max(60);
+    if let Some(warning) =
+        scratch_switch_warning(std::env::var(SCRATCH_REAP_ENABLED_ENV).ok().as_deref())
+    {
+        warn!("orphan_target_reaper: {warning}");
+    }
     info!(
-        "orphan_target_reaper: starting periodic reaper, interval={}s, armed={}",
+        "orphan_target_reaper: starting periodic reaper, interval={}s, armed(workspace)={}, \
+         armed(scratch)={} — the two populations are armed independently",
         secs,
-        reap_armed()
+        reap_armed(),
+        scratch_reap_armed()
     );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
@@ -3197,13 +4584,77 @@ mod tests {
         OwnerProbe::NotApplicable
     }
 
-    /// A harness-shaped scratchpad tree: `<root>/claude-4242/<project>/<session>/scratchpad`.
+    /// The session every scratch fixture lives under: scratch directories are
+    /// named by their session's uuid, and a target under anything else is not a
+    /// candidate ([`SkipReason::NotSessionScoped`]).
+    const SESS: &str = "0a1b2c3d-1111-4222-8333-444455556666";
+    /// The encoded-cwd directory the fixture session lives under, here and in
+    /// the fixture account home's `projects/`.
+    const PROJ: &str = "-home-x-Projects-proj";
+
+    /// A harness-shaped scratchpad tree: `<root>/claude-4242/<project>/<SESS>/scratchpad`.
     /// Returns `(family_root, scratchpad)`.
     fn mk_scratchpad_tree(base: &Path) -> (PathBuf, PathBuf) {
         let family = base.join("claude-4242");
-        let scratch = family.join("-home-x-Projects-proj/sess-abc/scratchpad");
+        let scratch = family.join(format!("{PROJ}/{SESS}/scratchpad"));
         fs::create_dir_all(&scratch).unwrap();
         (family, scratch)
+    }
+
+    /// Set `path`'s mtime `secs` seconds into the past.
+    fn age_path(path: &Path, secs: u64) {
+        let t = std::time::SystemTime::now() - Duration::from_secs(secs);
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(t)).unwrap();
+    }
+
+    /// Age every artifact the idle probe reads, so a [`mk_target_root`] target
+    /// has been idle for `secs`.
+    fn age_target(root: &Path, secs: u64) {
+        for rel in [
+            "CACHEDIR.TAG",
+            ".rustc_info.json",
+            "debug/.cargo-lock",
+            "debug",
+            "debug/deps",
+        ] {
+            let p = root.join(rel);
+            if p.exists() {
+                age_path(&p, secs);
+            }
+        }
+    }
+
+    /// A fixture account home holding a transcript for `session` last written
+    /// `secs` ago, under [`PROJ`].
+    fn mk_account_home(base: &Path, name: &str, session: &str, secs: u64) -> PathBuf {
+        let home = base.join(name);
+        let dir = home.join(format!("projects/{PROJ}"));
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("{session}.jsonl"));
+        fs::write(&transcript, b"{}").unwrap();
+        age_path(&transcript, secs);
+        home
+    }
+
+    /// A listable, EMPTY fixture process table named `name` under `base`: no
+    /// processes, no locks.
+    fn mk_proc_root(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(name);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("locks"), b"").unwrap();
+        root
+    }
+
+    /// The scratch environment in which [`SESS`] is IDLE: one account home whose
+    /// transcript is three days old, and an empty process table.
+    fn idle_env(base: &Path) -> ScratchEnv {
+        let home = mk_account_home(base, "acct-a", SESS, 3 * 86_400);
+        ScratchEnv::fixed(mk_proc_root(base, "proc"), Some(vec![home]))
+    }
+
+    /// Classifier options over [`idle_env`], the dirty probe stubbed clean.
+    fn idle_opts(base: &Path, grace: Duration) -> ClassifyOptions {
+        ClassifyOptions::with_probe(grace, |_| DirtyProbe::Clean).with_scratch_env(idle_env(base))
     }
 
     /// A cargo target root that has NO `CACHEDIR.TAG` — only a
@@ -3397,6 +4848,7 @@ mod tests {
             repo_root: None,
             enclosing_git_unreadable: false,
             owner: OwnerProbe::Invoking,
+            family_root: None,
         };
         let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
         assert_eq!(
@@ -3497,6 +4949,7 @@ mod tests {
             repo_root: Some(PathBuf::from("/ws/repo-wt-x")),
             enclosing_git_unreadable: true,
             owner: OwnerProbe::Invoking,
+            family_root: None,
         };
         assert_eq!(
             classify_candidate(&opaque, &opts),
@@ -3665,6 +5118,10 @@ mod tests {
             SkipReason::ActivityUnknown,
             SkipReason::GracePending,
             SkipReason::Kept,
+            SkipReason::NotSessionScoped,
+            SkipReason::SessionLive,
+            SkipReason::SessionUnknown,
+            SkipReason::HeldByProcess,
         ];
         let tokens: std::collections::BTreeSet<&str> = all.iter().map(|r| r.token()).collect();
         assert_eq!(tokens.len(), all.len(), "every reason needs its own token");
@@ -3693,7 +5150,8 @@ mod tests {
                 "ownership-unknown",
                 "worktree-dirty-unknown",
                 "lock-state-unknown",
-                "activity-unknown"
+                "activity-unknown",
+                "session-unknown"
             ]
         );
     }
@@ -3947,7 +5405,7 @@ mod tests {
         // right is not the property that matters; the rendered token is, and it
         // had no coverage at all until this assertion — which is precisely how a
         // rebase disarmed the field while every test stayed green.
-        let line = render_cycle_line(&s, /* armed */ false);
+        let line = render_cycle_line(&s);
         assert!(
             line.contains("population=UNKNOWN"),
             "a cycle that walked nothing must not publish an affirmative token: {line}"
@@ -4679,6 +6137,7 @@ mod tests {",
                 repo_root: None,
                 enclosing_git_unreadable: false,
                 owner: OwnerProbe::Invoking,
+                family_root: None,
             };
             assert_eq!(
                 classify_candidate(&c, &opts),
@@ -4703,6 +6162,7 @@ mod tests {",
             repo_root: None,
             enclosing_git_unreadable: false,
             owner: OwnerProbe::Foreign { uid: 999 },
+            family_root: None,
         };
         assert_eq!(
             classify_candidate(&foreign("/tmp/claude-999/s/scratchpad/cargo-target"), &opts),
@@ -4750,20 +6210,32 @@ mod tests {",
         assert_eq!(owner_of(&meta), OwnerProbe::Invoking);
     }
 
-    /// The second root is DISCOVERED — platform temp dir plus the effective uid,
+    /// The tmp root is DISCOVERED — platform temp dir plus the effective uid,
     /// both read at runtime. A hardcoded `/tmp/claude-1000` is right on exactly
     /// one box.
     #[cfg(unix)]
     #[test]
     fn the_scratchpad_root_is_discovered_from_the_platform_never_hardcoded() {
-        let derived = scratchpad_root_from_platform().expect("unix always resolves a root");
+        let inputs = ReapRootInputs {
+            // The override replaces the whole family; this test is about the
+            // DISCOVERED root, whatever the environment it runs in sets.
+            scratch_root_override: None,
+            ..ReapRootInputs::ambient()
+        };
+        assert_eq!(inputs.tmp, std::env::temp_dir());
+        assert_eq!(inputs.uid, Some(invoking_uid()));
+        let first = reap_roots_from(&inputs)
+            .into_iter()
+            .find(|r| r.kind == ReapRootKind::HarnessScratchpad)
+            .and_then(|r| r.path)
+            .expect("unix always resolves a scratch root");
         assert!(
-            derived.starts_with(std::env::temp_dir()),
+            first.starts_with(std::env::temp_dir()),
             "{}",
-            derived.display()
+            first.display()
         );
         assert_eq!(
-            derived.file_name().unwrap().to_string_lossy(),
+            first.file_name().unwrap().to_string_lossy(),
             format!("claude-{}", invoking_uid())
         );
     }
@@ -4777,7 +6249,6 @@ mod tests {",
         let missing = tmp.path().join("claude-4242"); // deliberately never created
         let s = run_cycle_over_roots(
             &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &missing)],
-            /* armed */ false,
             Duration::ZERO,
         );
         assert_eq!(s.roots.len(), 1, "a root is never silently dropped");
@@ -4792,7 +6263,11 @@ mod tests {",
             "nothing was stat'd, so no capacity is claimed"
         );
         let rendered = s.roots[0].render();
-        assert_eq!(rendered, "harness-scratchpad:absent");
+        assert_eq!(
+            rendered,
+            format!("harness-scratchpad:absent(path={})", missing.display()),
+            "a scratch root names the tree it could not find"
+        );
         assert!(
             !rendered.contains("scanned"),
             "an unwalked root must not carry a scanned=0 that reads as 'walked, found nothing': \
@@ -4816,13 +6291,12 @@ mod tests {",
         assert_eq!(one.roots.len(), 1);
         assert_eq!(one.roots[0].kind, ReapRootKind::Workspace);
 
-        let both = run_cycle_over_roots(
+        let both = run_cycle_over_roots_with(
             &[
                 ReapRoot::at(ReapRootKind::Workspace, &ws),
                 ReapRoot::at(ReapRootKind::HarnessScratchpad, &family),
             ],
-            /* armed */ false,
-            Duration::ZERO,
+            &idle_opts(tmp.path(), Duration::ZERO),
         );
         assert_eq!(both.roots.len(), 2);
         assert_eq!(both.roots[0].scanned, 1, "root 1 unchanged");
@@ -4842,12 +6316,17 @@ mod tests {",
                 ReapRoot::at(ReapRootKind::Workspace, tmp.path()),
                 ReapRoot::at(ReapRootKind::HarnessScratchpad, tmp.path()),
             ],
-            false,
             Duration::ZERO,
         );
         assert_eq!(s.scanned, 1, "the shared tree is walked exactly once");
         assert_eq!(s.roots[1].state, RootState::AlreadyWalked);
-        assert_eq!(s.roots[1].render(), "harness-scratchpad:already-walked");
+        assert_eq!(
+            s.roots[1].render(),
+            format!(
+                "harness-scratchpad:already-walked(path={})",
+                tmp.path().display()
+            )
+        );
     }
 
     /// Every pre-existing gate still applies on the new root: a pin is honoured,
@@ -4862,10 +6341,9 @@ mod tests {",
         let free = scratch.join("free-target");
         mk_target_root(&free);
 
-        let s = run_cycle_over_roots(
+        let s = run_cycle_over_roots_with(
             &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family)],
-            /* armed */ false,
-            Duration::ZERO,
+            &idle_opts(tmp.path(), Duration::ZERO),
         );
         assert_eq!(s.scanned, 2);
         assert_eq!(s.skipped_kept, 1, "the pin is honoured on the new root too");
@@ -4948,16 +6426,24 @@ mod tests {",
             6,
             "an unresolved root still knows the bound it WOULD have used"
         );
+        let inputs = ReapRootInputs {
+            workspace_root: Some(tmp.path().to_path_buf()),
+            tmp: tmp.path().to_path_buf(),
+            uid: Some(4242),
+            ..ReapRootInputs::default()
+        };
+        let resolved = reap_roots_from(&inputs);
         assert_eq!(
-            reap_roots()
-                .iter()
-                .map(|r| (r.kind, r.max_walk_depth))
-                .collect::<Vec<_>>(),
-            vec![
-                (ReapRootKind::Workspace, 4),
-                (ReapRootKind::HarnessScratchpad, 6)
-            ],
-            "the ambient roots carry the per-root bounds, not a shared constant"
+            resolved.first().map(|r| (r.kind, r.max_walk_depth)),
+            Some((ReapRootKind::Workspace, 4))
+        );
+        assert!(
+            resolved.len() >= 2
+                && resolved[1..]
+                    .iter()
+                    .all(|r| (r.kind, r.max_walk_depth) == (ReapRootKind::HarnessScratchpad, 6)),
+            "every resolved scratch root carries the scratch bound, not a shared constant: \
+             {resolved:?}"
         );
     }
 
@@ -5014,7 +6500,6 @@ mod tests {",
 
         let shallow = run_cycle_over_roots(
             &[ReapRoot::at(ReapRootKind::Workspace, &family)],
-            /* armed */ false,
             Duration::ZERO,
         );
         assert_eq!(
@@ -5027,10 +6512,9 @@ mod tests {",
             shallow.completeness()
         );
 
-        let deep_enough = run_cycle_over_roots(
+        let deep_enough = run_cycle_over_roots_with(
             &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family)],
-            /* armed */ false,
-            Duration::ZERO,
+            &idle_opts(tmp.path(), Duration::ZERO),
         );
         assert_eq!(
             (deep_enough.scanned, deep_enough.candidates),
@@ -5061,7 +6545,6 @@ mod tests {",
 
         let s = run_cycle_over_roots(
             &[ReapRoot::at(ReapRootKind::Workspace, &root)],
-            /* armed */ false,
             Duration::ZERO,
         );
         assert_eq!(s.scanned, 1, "the deep root really is hidden");
@@ -5100,7 +6583,7 @@ mod tests {",
 
         // 4. In the operator-facing cycle line — beside `candidates=`, which is
         //    the number a consumer actually reads.
-        let line = render_cycle_line(&s, /* armed */ false);
+        let line = render_cycle_line(&s);
         assert!(line.contains("INCOMPLETE CENSUS"), "{line}");
         // The cycle-level verdict beside the per-root census marker: this walk
         // DID find roots, so it is `partial` — never the affirmative `measured`,
@@ -5125,11 +6608,10 @@ mod tests {",
         mk_target_root(&shallow_only.path().join("target-wt-a"));
         let clean = run_cycle_over_roots(
             &[ReapRoot::at(ReapRootKind::Workspace, shallow_only.path())],
-            false,
             Duration::ZERO,
         );
         assert_eq!(clean.completeness(), Completeness::Complete);
-        let clean_line = render_cycle_line(&clean, false);
+        let clean_line = render_cycle_line(&clean);
         assert!(!clean_line.contains("INCOMPLETE"), "{clean_line}");
         assert!(clean_line.contains("census=complete"), "{clean_line}");
         assert!(
@@ -5497,5 +6979,1409 @@ mod tests {",
         }
         assert_eq!(seen.get("jn"), Some(&true));
         assert_eq!(seen.get("target-dir"), Some(&false));
+    }
+
+    // =====================================================================
+    // Plan `2026-11-01-session-scratch-on-disk-has-no-reclaim-arm-…`,
+    // Phases 4 and 5 — the on-disk scratch family, its gates, its arming.
+    // =====================================================================
+
+    /// `canonicalize`, for planting paths a `/proc` fixture reports: the kernel
+    /// reports RESOLVED paths, and so does the gate it is compared against.
+    fn canon(p: &Path) -> PathBuf {
+        fs::canonicalize(p).unwrap()
+    }
+
+    /// `(tmp, family, target)`: `claude-4242/<PROJ>/<SESS>/scratchpad/tgt`, a
+    /// cargo target idle for three days.
+    fn idle_scratch_target() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        let target = scratch.join("tgt");
+        mk_target_root(&target);
+        fs::write(target.join("debug/.cargo-lock"), b"").unwrap();
+        age_target(&target, 3 * 86_400);
+        (tmp, family, target)
+    }
+
+    /// The one candidate a family walk finds under `family`.
+    fn only_candidate(family: &Path) -> Candidate {
+        let mut found = enumerate_family_within(family, SCRATCHPAD_MAX_WALK_DEPTH).candidates;
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one target root expected: {found:?}"
+        );
+        found.remove(0)
+    }
+
+    /// One day: long enough that a three-day-old target and transcript clear
+    /// it, and that a minute-old transcript does not.
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    fn scratch_opts(env: ScratchEnv) -> ClassifyOptions {
+        ClassifyOptions::with_probe(DAY, |_| DirtyProbe::Clean).with_scratch_env(env)
+    }
+
+    /// Plant one own-uid process in a fixture `/proc`: argv, environment, cwd
+    /// and the paths it holds open.
+    #[cfg(unix)]
+    fn plant_proc(
+        proc_root: &Path,
+        pid: u32,
+        argv: &[&str],
+        env: &[(&str, &str)],
+        cwd: &Path,
+        fds: &[&Path],
+    ) -> PathBuf {
+        let dir = proc_root.join(pid.to_string());
+        fs::create_dir_all(dir.join("fd")).unwrap();
+        fs::write(dir.join("cmdline"), argv.join("\0")).unwrap();
+        let environ: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        fs::write(dir.join("environ"), environ.join("\0")).unwrap();
+        std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/fixture-exe", dir.join("exe")).unwrap();
+        for (i, f) in fds.iter().enumerate() {
+            std::os::unix::fs::symlink(f, dir.join("fd").join(i.to_string())).unwrap();
+        }
+        dir
+    }
+
+    /// D1 — the family is every `claude-<uid>` tree under the on-disk scratch
+    /// dir, at depth 1 AND depth 2, and a link is never a member.
+    #[cfg(unix)]
+    #[test]
+    fn the_family_is_every_account_tree_at_depth_one_and_two_and_never_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("scratch");
+        let mk = |rel: &str| fs::create_dir_all(scratch.join(rel)).unwrap();
+        mk(".claude-a/claude-4242");
+        mk(".claude-b/claude-4242");
+        mk(".claude-c/lineage-1/claude-4242");
+        mk(".claude-e/not-a-family-member");
+        mk(".claude-f/claude-9999"); // another uid's tree is not ours
+        fs::write(scratch.join("loose-file.txt"), b"x").unwrap();
+        // A link named like a member: how a scratch tree comes to hold a live
+        // checkout. Refused, and counted.
+        let elsewhere = tmp.path().join("a-live-checkout");
+        fs::create_dir_all(&elsewhere).unwrap();
+        mk(".claude-d");
+        std::os::unix::fs::symlink(&elsewhere, scratch.join(".claude-d/claude-4242")).unwrap();
+
+        let fam = scratch_family_under(tmp.path(), 4242);
+        assert_eq!(
+            fam.members,
+            vec![
+                scratch.join(".claude-a/claude-4242"),
+                scratch.join(".claude-b/claude-4242"),
+                scratch.join(".claude-c/lineage-1/claude-4242"),
+            ],
+            "depth 1 and depth 2 are both members; a link, another uid and a bare account are not"
+        );
+        assert_eq!(fam.links_skipped, 1);
+        assert!(!fam.incomplete(), "{fam:?}");
+
+        // A missing scratch dir is an empty family, not a failed read.
+        let none = scratch_family_under(&tmp.path().join("no-such-dir"), 4242);
+        assert!(none.members.is_empty() && !none.incomplete(), "{none:?}");
+    }
+
+    /// The discovery pass is bounded and SAYS so: a prefix of the family is not
+    /// the family.
+    #[cfg(unix)]
+    #[test]
+    fn family_discovery_is_bounded_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            fs::create_dir_all(tmp.path().join(format!("scratch/.claude-{i}/claude-4242")))
+                .unwrap();
+        }
+        let cut = scratch_family_with_budget(tmp.path(), 4242, 3);
+        assert!(cut.truncated && cut.incomplete(), "{cut:?}");
+        let whole = scratch_family_with_budget(tmp.path(), 4242, 1_000);
+        assert!(!whole.truncated, "{whole:?}");
+        assert_eq!(whole.members.len(), 5);
+    }
+
+    /// Phase 4, test 1 — a fixture `qontinui_dir` with two account trees and an
+    /// EMPTY tmp root produces candidates from both trees. Today's code walks
+    /// `<tmp>/claude-<uid>` alone, so it finds neither: the cycle read
+    /// `scanned=0 census=complete` over the wrong directory while the right one
+    /// held 417 GB.
+    #[cfg(unix)]
+    #[test]
+    fn a_qontinui_dir_with_two_account_trees_and_an_empty_tmp_yields_candidates_from_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uid = invoking_uid();
+        let qdir = tmp.path().join("qdir");
+        let sess_b = "9f8e7d6c-1111-4222-8333-444455556666";
+        for (account, sess) in [(".claude-a", SESS), (".claude-b", sess_b)] {
+            let tgt = qdir.join(format!(
+                "scratch/{account}/claude-{uid}/{PROJ}/{sess}/scratchpad/tgt"
+            ));
+            mk_target_root(&tgt);
+            age_target(&tgt, 3 * 86_400);
+        }
+        // The tmp root exists and holds nothing — the shape of the incident.
+        fs::create_dir_all(tmp.path().join(format!("empty-tmp/claude-{uid}"))).unwrap();
+        let inputs = ReapRootInputs {
+            tmp: tmp.path().join("empty-tmp"),
+            qontinui_dir: Some(qdir.clone()),
+            uid: Some(uid),
+            // Dry-run: this test counts candidates, it does not reap them.
+            scratch_reap_env: Some("0".to_string()),
+            ..ReapRootInputs::default()
+        };
+        let roots = reap_roots_from(&inputs);
+        let scratch_roots: Vec<_> = roots
+            .iter()
+            .filter(|r| r.kind == ReapRootKind::HarnessScratchpad)
+            .collect();
+        assert_eq!(
+            scratch_roots.len(),
+            3,
+            "the tmp root and one root PER account tree: {scratch_roots:?}"
+        );
+
+        let home_a = mk_account_home(tmp.path(), "home-a", SESS, 3 * 86_400);
+        let home_b = mk_account_home(tmp.path(), "home-b", sess_b, 3 * 86_400);
+        let env = ScratchEnv::fixed(mk_proc_root(tmp.path(), "proc"), Some(vec![home_a, home_b]));
+        let s = run_cycle_over_roots_with(&roots, &scratch_opts(env));
+        assert_eq!(
+            s.candidates,
+            2,
+            "a candidate from EACH account tree: {}",
+            render_cycle_line(&s)
+        );
+        let line = render_cycle_line(&s);
+        for account in [".claude-a", ".claude-b"] {
+            let named = format!("scratch/{account}/claude-{uid}");
+            assert!(
+                line.contains(&named),
+                "the line names every tree it read ({named}): {line}"
+            );
+        }
+        // Per root, not just in total: each account tree scanned its own target.
+        let per_root: Vec<usize> = s
+            .roots
+            .iter()
+            .filter(|r| r.path.as_deref().is_some_and(|p| p.starts_with(&qdir)))
+            .map(|r| r.scanned)
+            .collect();
+        assert_eq!(per_root, vec![1, 1], "{line}");
+    }
+
+    /// A family that could not be established is a root of its own that says so
+    /// — never a cycle that reads as having covered a family it did not find.
+    #[cfg(unix)]
+    #[test]
+    fn a_family_that_could_not_be_established_says_so_as_a_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = ReapRootInputs {
+            tmp: tmp.path().join("t"),
+            uid: Some(invoking_uid()),
+            ..ReapRootInputs::default()
+        };
+        let scratch_states = |inputs: &ReapRootInputs| -> Vec<(&'static str, bool)> {
+            reap_roots_from(inputs)
+                .into_iter()
+                .filter(|r| r.kind == ReapRootKind::HarnessScratchpad)
+                .skip(1) // the tmp root, always first
+                .map(|r| (r.state.token(), r.path.is_some()))
+                .collect()
+        };
+        // No `~/.qontinui` at all.
+        assert_eq!(scratch_states(&base), vec![("unresolved", false)]);
+        // A scratch dir that is not there: ABSENT, naming the path.
+        let absent = ReapRootInputs {
+            qontinui_dir: Some(tmp.path().join("q1")),
+            ..base.clone()
+        };
+        assert_eq!(scratch_states(&absent), vec![("absent", true)]);
+        // A scratch dir that exists and holds no `claude-<uid>` anywhere.
+        fs::create_dir_all(tmp.path().join("q2/scratch/.claude-a")).unwrap();
+        let empty = ReapRootInputs {
+            qontinui_dir: Some(tmp.path().join("q2")),
+            ..base.clone()
+        };
+        assert_eq!(scratch_states(&empty), vec![("unresolved", true)]);
+        // And none of them lets the cycle claim a measured population.
+        let s = run_cycle_over_roots(&reap_roots_from(&empty), Duration::ZERO);
+        assert!(
+            !render_cycle_line(&s).contains("population=measured"),
+            "{}",
+            render_cycle_line(&s)
+        );
+        // The override still replaces the whole family outright.
+        let overridden = ReapRootInputs {
+            scratch_root_override: Some(format!("{}", tmp.path().join("elsewhere").display())),
+            qontinui_dir: Some(tmp.path().join("q2")),
+            ..base
+        };
+        assert_eq!(
+            reap_roots_from(&overridden)
+                .iter()
+                .filter(|r| r.kind == ReapRootKind::HarnessScratchpad)
+                .count(),
+            1
+        );
+    }
+
+    /// D2 — a root that scanned nothing says how much it READ, so `scanned=0`
+    /// over a populated tree is distinguishable from `scanned=0` over an empty
+    /// one. The cycle line rendered both identically.
+    #[test]
+    fn a_root_that_scanned_nothing_states_how_much_it_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let populated = tmp.path().join("populated");
+        fs::create_dir_all(populated.join("sub")).unwrap();
+        fs::write(populated.join("sub/big.bin"), vec![0u8; 8 << 20]).unwrap();
+        let s = run_cycle_over_roots(
+            &[
+                ReapRoot::at(ReapRootKind::HarnessScratchpad, &empty),
+                ReapRoot::at(ReapRootKind::HarnessScratchpad, &populated),
+            ],
+            Duration::ZERO,
+        );
+        let [e, p] = [s.roots[0].render(), s.roots[1].render()];
+        assert!(
+            e.contains("scanned=0") && e.contains("walked_gb=0.00") && e.contains("dirs=0"),
+            "{e}"
+        );
+        assert!(
+            p.contains("scanned=0") && p.contains("walked_gb=0.01") && p.contains("dirs=1"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn a_scratch_session_is_project_uuid_and_a_level_below() {
+        let fam = Path::new("/f/claude-1");
+        let s = scratch_session_of(fam, &fam.join(format!("{PROJ}/{SESS}/scratchpad/tgt")))
+            .expect("project/uuid/…/target is a session target");
+        assert_eq!((s.project.as_str(), s.uuid.as_str()), (PROJ, SESS));
+        assert_eq!(s.dir, fam.join(PROJ).join(SESS));
+        // The shapes that are NOT: directly under the family root, directly under
+        // a project, under a non-uuid directory, and the session dir itself.
+        for rel in [
+            "coord-target-abc".to_string(),
+            format!("{PROJ}/tgt"),
+            format!("{PROJ}/sess-abc/scratchpad/tgt"),
+            format!("{PROJ}/{SESS}"),
+        ] {
+            assert_eq!(scratch_session_of(fam, &fam.join(&rel)), None, "{rel}");
+        }
+        assert_eq!(
+            scratch_session_of(fam, Path::new("/elsewhere/p/u/x")),
+            None,
+            "a path outside the family root belongs to no session of it"
+        );
+        assert!(is_session_uuid("0A1B2C3D-1111-4222-8333-444455556666"));
+        assert!(!is_session_uuid("0a1b2c3d-1111-4222-8333-44445555666")); // 35
+        assert!(!is_session_uuid("0a1b2c3d_1111_4222_8333_444455556666"));
+        assert!(!is_session_uuid("0a1b2c3d-1111-4222-8333-44445555666g"));
+    }
+
+    /// G-session-scope — a target with no `<project>/<uuid>/` owner is never a
+    /// candidate on a family root, whatever its size or age (the steward's
+    /// `NON_SESSION`). Unix-only: its control target carries a `.cargo-lock`,
+    /// whose inode key exists only where there is an inode to read.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_with_no_session_directory_is_never_a_candidate_on_a_family_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let family = tmp.path().join("claude-4242");
+        for rel in [
+            "coord-target-abc",               // directly under the family root
+            &format!("{PROJ}/shared-target"), // directly under a project dir
+            &format!("{PROJ}/not-a-uuid/scratchpad/tgt"),
+        ] {
+            mk_target_root(&family.join(rel));
+            age_target(&family.join(rel), 3 * 86_400);
+        }
+        let opts = idle_opts(tmp.path(), DAY);
+        let found = enumerate_family_within(&family, SCRATCHPAD_MAX_WALK_DEPTH).candidates;
+        assert_eq!(found.len(), 3);
+        for c in &found {
+            assert_eq!(
+                classify_candidate(c, &opts),
+                Err(SkipReason::NotSessionScoped),
+                "{}",
+                c.path.display()
+            );
+        }
+        // …and it is counted as what it is, not as an unknown reading.
+        assert!(!SkipReason::NotSessionScoped.is_unknown());
+        let s = run_cycle_over_roots_with(
+            &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family).with_armed(true)],
+            &opts,
+        );
+        assert_eq!((s.scanned, s.candidates, s.reaped), (3, 0, 0));
+        assert_eq!(s.skipped_non_session, 3);
+        assert_eq!(s.skipped_unknown, 0);
+        // Control: the same target under a uuid session IS reapable.
+        let (tmp2, family2, _t) = idle_scratch_target();
+        assert_eq!(
+            classify_candidate(&only_candidate(&family2), &idle_opts(tmp2.path(), DAY)),
+            Ok(())
+        );
+    }
+
+    /// Phase 4, test 2a — a target whose session reads LIVE stays out: a fresh
+    /// transcript, a process naming the uuid in argv or in its environment, or a
+    /// cwd or open fd under the session's directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_whose_session_reads_live_stays_out() {
+        let (tmp, family, _target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let sess_dir = canon(&family.join(PROJ).join(SESS));
+        let upper = SESS.to_ascii_uppercase();
+        let home_old = mk_account_home(tmp.path(), "home-old", SESS, 3 * 86_400);
+        let verdict = |proc_name: &str, homes: Vec<PathBuf>, plant: &dyn Fn(&Path)| {
+            let proc_root = mk_proc_root(tmp.path(), proc_name);
+            plant(&proc_root);
+            classify_candidate(&c, &scratch_opts(ScratchEnv::fixed(proc_root, Some(homes))))
+        };
+        let nothing: &dyn Fn(&Path) = &|_| {};
+
+        // Control: idle transcript, empty process table — the target IS reapable,
+        // so every refusal below is attributable to the one thing it changes.
+        assert_eq!(verdict("p0", vec![home_old.clone()], nothing), Ok(()));
+
+        let fresh = mk_account_home(tmp.path(), "home-fresh", SESS, 60);
+        assert_eq!(
+            verdict("p1", vec![fresh], nothing),
+            Err(SkipReason::SessionLive),
+            "a transcript written a minute ago"
+        );
+        assert_eq!(
+            verdict("p2", vec![home_old.clone()], &|root| {
+                plant_proc(
+                    root,
+                    101,
+                    &["claude", "--resume", upper.as_str()],
+                    &[],
+                    Path::new("/"),
+                    &[],
+                );
+            }),
+            Err(SkipReason::SessionLive),
+            "the uuid in argv, in either case"
+        );
+        assert_eq!(
+            verdict("p3", vec![home_old.clone()], &|root| {
+                plant_proc(
+                    root,
+                    102,
+                    &["bash"],
+                    &[("CLAUDE_CODE_SESSION_ID", SESS)],
+                    Path::new("/"),
+                    &[],
+                );
+            }),
+            Err(SkipReason::SessionLive),
+            "the uuid in CLAUDE_CODE_SESSION_ID"
+        );
+        let in_session = sess_dir.join("scratchpad");
+        assert_eq!(
+            verdict("p4", vec![home_old.clone()], &|root| {
+                plant_proc(root, 103, &["vim"], &[], &in_session, &[]);
+            }),
+            Err(SkipReason::SessionLive),
+            "a cwd under the session directory"
+        );
+        assert_eq!(
+            verdict("p5", vec![home_old.clone()], &|root| {
+                plant_proc(
+                    root,
+                    104,
+                    &["tail"],
+                    &[],
+                    Path::new("/"),
+                    &[&in_session.join("notes.log")],
+                );
+            }),
+            Err(SkipReason::SessionLive),
+            "an open fd under the session directory"
+        );
+        // A process that names ANOTHER session is nothing to do with this one.
+        assert_eq!(
+            verdict("p6", vec![home_old], &|root| {
+                plant_proc(
+                    root,
+                    105,
+                    &["claude", "--resume", "ffffffff-1111-4222-8333-444455556666"],
+                    &[],
+                    Path::new("/"),
+                    &[],
+                );
+            }),
+            Ok(())
+        );
+    }
+
+    /// Phase 4, test 2b — a target whose liveness CANNOT BE READ stays out, and
+    /// each way of not reading it refuses under a reason that says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_whose_liveness_cannot_be_read_stays_out() {
+        let (tmp, family, _target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let proc_root = mk_proc_root(tmp.path(), "proc");
+        let home = mk_account_home(tmp.path(), "home", SESS, 3 * 86_400);
+        let v = |env: ScratchEnv| classify_candidate(&c, &scratch_opts(env));
+        assert_eq!(
+            v(ScratchEnv::fixed(
+                proc_root.clone(),
+                Some(vec![home.clone()])
+            )),
+            Ok(()),
+            "control"
+        );
+        // The accounts root did not resolve.
+        assert_eq!(
+            v(ScratchEnv::fixed(proc_root.clone(), None)),
+            Err(SkipReason::SessionUnknown)
+        );
+        // Resolved, but no account holds a transcript for the session: a session
+        // with no copy anywhere is UNKNOWN, never old.
+        let empty_home = tmp.path().join("empty-home");
+        fs::create_dir_all(empty_home.join("projects")).unwrap();
+        assert_eq!(
+            v(ScratchEnv::fixed(proc_root.clone(), Some(vec![empty_home]))),
+            Err(SkipReason::SessionUnknown)
+        );
+        // The process table cannot be listed. Two independent layers refuse this —
+        // the snapshot is not `listed`, and with no table there is no `locks` read
+        // either — so the first is also asserted on its own, or removing it would
+        // leave the verdict unchanged and the test green.
+        assert!(!ProcSnapshot::read(&tmp.path().join("no-such-proc")).listed);
+        assert!(ProcSnapshot::read(&proc_root).listed);
+        assert_eq!(
+            v(ScratchEnv::fixed(
+                tmp.path().join("no-such-proc"),
+                Some(vec![home.clone()])
+            )),
+            Err(SkipReason::LockStateUnknown)
+        );
+        // Listable, but `/proc/locks` is not there: the holder read cannot be made.
+        let no_locks = mk_proc_root(tmp.path(), "no-locks");
+        fs::remove_file(no_locks.join("locks")).unwrap();
+        assert_eq!(
+            v(ScratchEnv::fixed(no_locks, Some(vec![home]))),
+            Err(SkipReason::LockStateUnknown)
+        );
+        // The same three, as the buckets the shadow window reads.
+        assert!(SkipReason::SessionUnknown.is_unknown());
+        assert!(SkipReason::LockStateUnknown.is_unknown());
+        assert!(!SkipReason::SessionLive.is_unknown());
+    }
+
+    /// Phase 4, test 3 — a session idle under THIS account's transcript but
+    /// fresh under another account's stays out: sessions move accounts and leave
+    /// a frozen copy behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_idle_here_but_fresh_under_another_account_stays_out() {
+        let (tmp, family, _target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let proc_root = mk_proc_root(tmp.path(), "proc");
+        let frozen = mk_account_home(tmp.path(), "home-old-account", SESS, 5 * 86_400);
+        let live = mk_account_home(tmp.path(), "home-new-account", SESS, 30);
+        let verdict = |homes: Vec<PathBuf>| {
+            classify_candidate(
+                &c,
+                &scratch_opts(ScratchEnv::fixed(proc_root.clone(), Some(homes))),
+            )
+        };
+        assert_eq!(
+            verdict(vec![frozen.clone()]),
+            Ok(()),
+            "control: the frozen copy alone reads idle — which is the trap"
+        );
+        for order in [
+            vec![frozen.clone(), live.clone()],
+            vec![live.clone(), frozen.clone()],
+        ] {
+            assert_eq!(
+                verdict(order),
+                Err(SkipReason::SessionLive),
+                "the NEWEST copy across every account decides, in either order"
+            );
+        }
+    }
+
+    /// Phase 4, test 4 — a target with a live holder stays out: a process whose
+    /// `CARGO_TARGET_DIR` names it (absolute or relative to its cwd), whose cwd
+    /// or open fd is inside it, or a held flock on its `.cargo-lock`.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_with_a_live_holder_stays_out() {
+        let (tmp, family, target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let home = mk_account_home(tmp.path(), "home", SESS, 3 * 86_400);
+        let canon_target = canon(&target);
+        let scratchpad = canon_target.parent().unwrap().to_path_buf();
+        let verdict = |name: &str, plant: &dyn Fn(&Path)| {
+            let root = mk_proc_root(tmp.path(), name);
+            plant(&root);
+            classify_candidate(
+                &c,
+                &scratch_opts(ScratchEnv::fixed(root, Some(vec![home.clone()]))),
+            )
+        };
+        let tgt = canon_target.to_str().unwrap().to_string();
+
+        assert_eq!(verdict("h0", &|_| {}), Ok(()), "control");
+        assert_eq!(
+            verdict("h1", &|r| {
+                plant_proc(
+                    r,
+                    201,
+                    &["cargo", "build"],
+                    &[("CARGO_TARGET_DIR", tgt.as_str())],
+                    Path::new("/"),
+                    &[],
+                );
+            }),
+            Err(SkipReason::HeldByProcess),
+            "a live CARGO_TARGET_DIR holder"
+        );
+        assert_eq!(
+            verdict("h2", &|r| {
+                plant_proc(
+                    r,
+                    202,
+                    &["cargo"],
+                    &[("CARGO_TARGET_DIR", "tgt")],
+                    &scratchpad,
+                    &[],
+                );
+            }),
+            Err(SkipReason::HeldByProcess),
+            "a RELATIVE CARGO_TARGET_DIR resolves against the holder's cwd"
+        );
+        assert_eq!(
+            verdict("h3", &|r| {
+                plant_proc(
+                    r,
+                    203,
+                    &["bash"],
+                    &[],
+                    &canon_target.join("debug/deps"),
+                    &[],
+                );
+            }),
+            Err(SkipReason::HeldByProcess),
+            "a shell parked inside it"
+        );
+        assert_eq!(
+            verdict("h4", &|r| {
+                plant_proc(
+                    r,
+                    204,
+                    &["rustc"],
+                    &[],
+                    Path::new("/"),
+                    &[&canon_target.join("debug/deps/x.rlib")],
+                );
+            }),
+            Err(SkipReason::HeldByProcess),
+            "an open file inside it"
+        );
+        assert_eq!(
+            verdict("h5", &|r| {
+                plant_proc(
+                    r,
+                    205,
+                    &["cargo"],
+                    &[("CARGO_TARGET_DIR", "/somewhere/else")],
+                    Path::new("/"),
+                    &[],
+                );
+            }),
+            Ok(()),
+            "a CARGO_TARGET_DIR that names some OTHER directory holds nothing here"
+        );
+        // A granted flock row on the target's `.cargo-lock`, keyed by the file's
+        // real device and inode.
+        let lock = target.join("debug/.cargo-lock");
+        let meta = fs::metadata(&lock).unwrap();
+        let (major, minor) = {
+            use std::os::unix::fs::MetadataExt;
+            super::super::cargo_locks::dev_major_minor(meta.dev())
+        };
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino()
+        };
+        assert_eq!(
+            verdict("h6", &|r| {
+                fs::write(
+                    r.join("locks"),
+                    format!("1: FLOCK  ADVISORY  WRITE 4242 {major:02x}:{minor:02x}:{ino} 0 EOF\n"),
+                )
+                .unwrap();
+            }),
+            Err(SkipReason::Building),
+            "a held flock reads as a build in flight even when no process entry names the target"
+        );
+        // …and a row on SOME OTHER inode does not.
+        assert_eq!(
+            verdict("h7", &|r| {
+                fs::write(
+                    r.join("locks"),
+                    format!(
+                        "1: FLOCK  ADVISORY  WRITE 4242 {major:02x}:{minor:02x}:{} 0 EOF\n",
+                        ino + 1
+                    ),
+                )
+                .unwrap();
+            }),
+            Ok(())
+        );
+    }
+
+    /// Against the REAL `/proc`: a flock this process holds on the target's
+    /// `.cargo-lock` keeps it, and releasing it frees it. The fixture tests above
+    /// drive the parser and the key match; this one drives the kernel.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_flock_held_on_the_real_proc_keeps_the_target() {
+        use std::os::unix::io::AsRawFd;
+        let (tmp, family, target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let home = mk_account_home(tmp.path(), "home", SESS, 3 * 86_400);
+        let opts = scratch_opts(ScratchEnv::fixed(PathBuf::from("/proc"), Some(vec![home])));
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target.join("debug/.cargo-lock"))
+            .unwrap();
+        // SAFETY: a valid fd owned by `lock` for the duration of the call.
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "taking the flock failed");
+        assert_eq!(
+            classify_candidate(&c, &opts),
+            Err(SkipReason::Building),
+            "a flock held on the real kernel table keeps the target"
+        );
+        drop(lock);
+        // A fresh options value: the process table is memoised per value.
+        let after = scratch_opts(ScratchEnv::fixed(
+            PathBuf::from("/proc"),
+            Some(vec![tmp.path().join("home")]),
+        ));
+        assert_eq!(
+            classify_candidate(&c, &after),
+            Ok(()),
+            "released, nothing holds it — so the refusal above was the flock"
+        );
+    }
+
+    /// A denial on an own-uid process entry is TOLERATED but COUNTED. Refusing on
+    /// every one would leave the gates inert on any box with a user manager
+    /// (`systemd --user` denies its cwd to its own uid), and a live build is
+    /// caught by `/proc/locks` regardless of its entry.
+    #[cfg(unix)]
+    #[test]
+    fn an_own_uid_process_the_kernel_denies_us_is_counted_not_a_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, family, _target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let home = mk_account_home(tmp.path(), "home", SESS, 3 * 86_400);
+        let proc_root = mk_proc_root(tmp.path(), "proc");
+        let dir = plant_proc(
+            &proc_root,
+            301,
+            &["systemd", "--user"],
+            &[],
+            Path::new("/"),
+            &[],
+        );
+        fs::set_permissions(dir.join("environ"), fs::Permissions::from_mode(0o000)).unwrap();
+        // Skip on the CONDITION, not on uid 0: root and `CAP_DAC_OVERRIDE` both
+        // read a mode-000 file, and then no denial can be planted at all.
+        if fs::read(dir.join("environ")).is_ok() {
+            eprintln!(
+                "SKIPPED (LOUDLY): this uid reads a mode-000 file, so no denial can be planted"
+            );
+            return;
+        }
+        let env = ScratchEnv::fixed(proc_root, Some(vec![home]));
+        let opts = scratch_opts(env);
+        assert_eq!(
+            classify_candidate(&c, &opts),
+            Ok(()),
+            "a process this uid may not inspect does not refuse the target"
+        );
+        assert_eq!(opts.scratch.opaque_procs_seen(), 1, "…but it is counted");
+        let s = run_cycle_over_roots_with(
+            &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family)],
+            &opts,
+        );
+        assert_eq!(s.scratch_opaque_procs, 1);
+        assert!(
+            render_cycle_line(&s).contains("scratch_opaque_procs=1"),
+            "{}",
+            render_cycle_line(&s)
+        );
+        // A process that VANISHED mid-read (no cwd) held nothing, and is skipped
+        // without being counted as a denial.
+        let gone = mk_proc_root(tmp.path(), "gone");
+        let d = plant_proc(&gone, 302, &["x"], &[], Path::new("/"), &[]);
+        fs::remove_file(d.join("cwd")).unwrap();
+        let snap = ProcSnapshot::read(&gone);
+        assert!(
+            snap.listed && snap.procs.is_empty() && snap.opaque == 0,
+            "{snap:?}"
+        );
+    }
+
+    /// Phase 4, test 5 — a non-cargo directory in scratch is never a candidate,
+    /// at the enumerator AND at the classifier, on a family root.
+    #[test]
+    fn a_non_cargo_directory_in_scratch_is_never_a_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        let wt = scratch.join("feat-unpushed");
+        fs::create_dir_all(wt.join("src")).unwrap();
+        fs::write(wt.join(".git"), b"gitdir: /repo/.git/worktrees/feat\n").unwrap();
+        let notes = scratch.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let lookalike = scratch.join("target-lookalike");
+        fs::create_dir_all(lookalike.join("debug")).unwrap();
+        mk_target_root(&scratch.join("cargo-target"));
+
+        let found = enumerate_family_within(&family, SCRATCHPAD_MAX_WALK_DEPTH).candidates;
+        let names: Vec<String> = found
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["cargo-target".to_string()], "{names:?}");
+        assert_eq!(found[0].family_root.as_deref(), Some(family.as_path()));
+
+        let opts = idle_opts(tmp.path(), Duration::ZERO);
+        for p in [&wt, &notes, &lookalike] {
+            let c = Candidate {
+                path: p.clone(),
+                class: TargetClass::SiblingNonGit,
+                repo_root: None,
+                enclosing_git_unreadable: false,
+                owner: expected_local_owner(),
+                family_root: Some(family.clone()),
+            };
+            assert_eq!(
+                classify_candidate(&c, &opts),
+                Err(SkipReason::UnrecognizedLayout),
+                "{}",
+                p.display()
+            );
+        }
+        assert!(wt.exists() && notes.exists() && lookalike.exists());
+    }
+
+    /// Phase 4, test 6 — a symlink in a family root pointing at a checkout's
+    /// target is never a candidate, and that target SURVIVES an armed reap. The
+    /// reaper's walk already refuses links; this pins it for the new roots, whose
+    /// trees are known to hold such links (`scratch/fbsroot/qontinui-runner` is
+    /// one into the primary checkout, 89.6 GB).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_a_family_root_to_a_checkouts_target_is_never_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        // A live checkout, elsewhere, with a real cargo target of its own.
+        let checkout = tmp.path().join("live-checkout");
+        let live_target = checkout.join("src-tauri/target-live");
+        mk_target_root(&live_target);
+        fs::write(
+            live_target.join("debug/deps/precious.rlib"),
+            b"build output",
+        )
+        .unwrap();
+        age_target(&live_target, 3 * 86_400);
+        // Links to it from inside the session scratch: to the checkout, and
+        // directly to the target.
+        std::os::unix::fs::symlink(&checkout, scratch.join("checkout-link")).unwrap();
+        std::os::unix::fs::symlink(&live_target, scratch.join("target-link")).unwrap();
+        // A genuine target beside them, so the armed run below is not vacuous.
+        let mine = scratch.join("tgt");
+        mk_target_root(&mine);
+        age_target(&mine, 3 * 86_400);
+
+        let found = enumerate_family_within(&family, SCRATCHPAD_MAX_WALK_DEPTH);
+        assert_eq!(
+            found.candidates.len(),
+            1,
+            "only the real target: {:?}",
+            found.candidates
+        );
+        assert!(
+            found.reparse_dirs_skipped >= 2,
+            "the links were counted, not followed"
+        );
+
+        let s = run_cycle_over_roots_with(
+            &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family).with_armed(true)],
+            &idle_opts(tmp.path(), DAY),
+        );
+        assert_eq!(
+            (s.candidates, s.reaped),
+            (1, 1),
+            "{}",
+            render_cycle_line(&s)
+        );
+        assert!(!mine.exists(), "the genuine target was reaped");
+        assert!(
+            live_target.join("debug/deps/precious.rlib").exists(),
+            "the live checkout's build output is untouched"
+        );
+        assert!(
+            fs::symlink_metadata(scratch.join("target-link")).is_ok()
+                && fs::symlink_metadata(scratch.join("checkout-link")).is_ok(),
+            "the links themselves were not removed either"
+        );
+    }
+
+    /// A candidate list is a snapshot and never a delete list: the armed path
+    /// RE-READS before removing, so a session that resumed after the
+    /// classification keeps its target.
+    #[cfg(unix)]
+    #[test]
+    fn the_reread_before_removal_refuses_what_changed_since_classification() {
+        let (tmp, family, target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let home = mk_account_home(tmp.path(), "home", SESS, 3 * 86_400);
+        let proc_root = mk_proc_root(tmp.path(), "proc");
+        let opts = scratch_opts(ScratchEnv::fixed(proc_root.clone(), Some(vec![home])));
+
+        // Classified while idle: the process table is read once and memoised.
+        assert_eq!(classify_candidate(&c, &opts), Ok(()));
+        // The session RESUMES: a process now names it.
+        let resumed = plant_proc(
+            &proc_root,
+            777,
+            &["claude", "--resume", SESS],
+            &[],
+            Path::new("/"),
+            &[],
+        );
+        assert_eq!(
+            classify_candidate(&c, &opts),
+            Ok(()),
+            "the memo still holds the PAST — which is exactly why a removal may not trust it"
+        );
+        assert_eq!(
+            reread_scratch_candidate(&c, &opts),
+            Err(SkipReason::SessionLive),
+            "the re-read goes to the machine, not to the memo"
+        );
+
+        // An armed cycle over the stale memo removes nothing and says why.
+        let roots = [ReapRoot::at(ReapRootKind::HarnessScratchpad, &family).with_armed(true)];
+        let s = run_cycle_over_roots_with(&roots, &opts);
+        assert_eq!((s.candidates, s.reaped, s.reread_refused), (1, 0, 1));
+        assert!(target.exists(), "the resumed session's target survived");
+        assert!(
+            render_cycle_line(&s).contains("reread_refused=1"),
+            "{}",
+            render_cycle_line(&s)
+        );
+
+        // Control: the session ends, and the same armed cycle reaps — so the
+        // refusal above was the re-read and nothing else.
+        fs::remove_dir_all(resumed).unwrap();
+        let s = run_cycle_over_roots_with(&roots, &opts);
+        assert_eq!((s.candidates, s.reaped, s.reread_refused), (1, 1, 0));
+        assert!(!target.exists());
+    }
+
+    /// Phase 4, test 7 — the pressure read agrees with `f_bavail`, which is what
+    /// coord's budget uses. With root-reserved blocks, the old `f_bfree` reading
+    /// sits UNDER the 90 % line while the disk is already over it.
+    #[test]
+    fn the_pressure_read_over_root_reserved_blocks_agrees_with_f_bavail() {
+        // 1000 blocks of 4 KiB; 150 free by `f_bfree`, of which 100 are reserved
+        // for root, so only 50 are available to a process like this one.
+        let (blocks, bfree, bavail) = (1_000u64, 150u64, 50u64);
+        let c = capacity_from_statvfs(4096, blocks, bavail, 400, 100);
+        assert_eq!(c.bytes_free, bavail * 4096, "free is what can be allocated");
+        assert!((c.bytes_pct_used.unwrap() - 95.0).abs() < 1e-9);
+        assert_eq!(c.bytes_axis(90.0), PressureAxis::Pressured);
+        assert!(c.pressured(90.0));
+        // Non-vacuous: the SAME disk read by `f_bfree` is the divergence this
+        // fixes — 85 % used, under the line, "healthy".
+        assert_eq!(
+            capacity_from_statvfs(4096, blocks, bfree, 400, 100).bytes_axis(90.0),
+            PressureAxis::Ok
+        );
+        // The line is coord's reserve: pressure begins where `avail` falls to 10 %.
+        assert_eq!(
+            capacity_from_statvfs(4096, 1_000, 100, 400, 100).bytes_axis(90.0),
+            PressureAxis::Pressured
+        );
+        assert_eq!(
+            capacity_from_statvfs(4096, 1_000, 101, 400, 100).bytes_axis(90.0),
+            PressureAxis::Ok
+        );
+    }
+
+    /// The wiring, not just the arithmetic: `fs_capacity` hands `capacity_from_statvfs`
+    /// the real `f_bavail`. Effective wherever the filesystem reserves blocks for
+    /// root (merytshost: ~100 GB); on one that reserves none `f_bfree` and
+    /// `f_bavail` coincide and this asserts only what is true of both.
+    #[cfg(unix)]
+    #[test]
+    fn the_live_capacity_read_takes_f_bavail_not_f_bfree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let path = std::ffi::CString::new(dir.path().to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path and a correctly-sized out-buffer; the
+        // result is read only after the call reports success.
+        let rc = unsafe { libc::statvfs(path.as_ptr(), raw.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        // SAFETY: `statvfs` returned 0, so the buffer is initialised.
+        let raw = unsafe { raw.assume_init() };
+        let frsize = if raw.f_frsize != 0 {
+            raw.f_frsize as u64
+        } else {
+            raw.f_bsize as u64
+        };
+        let avail = raw.f_bavail as u64 * frsize;
+        let bfree = raw.f_bfree as u64 * frsize;
+        let got = fs_capacity(dir.path()).bytes_free;
+        // Free space moves while a test runs (concurrent builds), so compare with
+        // slack — a hundred times smaller than the root-reserve it must tell apart.
+        let slack = 256 << 20;
+        assert!(
+            got.abs_diff(avail) < slack,
+            "bytes_free {got} must be f_bavail {avail}, not f_bfree {bfree}"
+        );
+        if bfree.saturating_sub(avail) > 4 * slack {
+            assert!(
+                got.abs_diff(bfree) > slack,
+                "bytes_free {got} agrees with f_bfree {bfree} across {} reserved bytes",
+                bfree - avail
+            );
+        }
+    }
+
+    /// One workspace target and one scratch target, both idle, both reapable.
+    /// Returns `(tmp, inputs, workspace_target, scratch_target)`.
+    #[cfg(unix)]
+    fn two_population_fixture() -> (tempfile::TempDir, ReapRootInputs, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let uid = invoking_uid();
+        let ws = tmp.path().join("workspace");
+        let ws_target = ws.join("target-wt-a");
+        mk_target_root(&ws_target);
+        age_target(&ws_target, 3 * 86_400);
+        let qdir = tmp.path().join("qdir");
+        let scratch_target = qdir.join(format!(
+            "scratch/.claude-a/claude-{uid}/{PROJ}/{SESS}/scratchpad/tgt"
+        ));
+        mk_target_root(&scratch_target);
+        age_target(&scratch_target, 3 * 86_400);
+        let inputs = ReapRootInputs {
+            workspace_root: Some(ws),
+            tmp: tmp.path().join("empty-tmp"),
+            qontinui_dir: Some(qdir),
+            uid: Some(uid),
+            ..ReapRootInputs::default()
+        };
+        (tmp, inputs, ws_target, scratch_target)
+    }
+
+    /// Phase 5 gate — the two switches are PINNED APART: a scratch candidate
+    /// reaps with the workspace flag unset, and a workspace candidate does not.
+    #[cfg(unix)]
+    #[test]
+    fn the_two_arming_switches_are_pinned_apart() {
+        // Both switches unset: scratch ships ON, the workspace ships DARK.
+        let (tmp, inputs, ws_target, scratch_target) = two_population_fixture();
+        assert_eq!(inputs.workspace_reap_env, None);
+        assert_eq!(inputs.scratch_reap_env, None);
+        let roots = reap_roots_from(&inputs);
+        let armed: Vec<(ReapRootKind, bool)> = roots.iter().map(|r| (r.kind, r.armed)).collect();
+        assert_eq!(armed.first(), Some(&(ReapRootKind::Workspace, false)));
+        assert!(
+            armed[1..]
+                .iter()
+                .all(|(k, a)| *k == ReapRootKind::HarnessScratchpad && *a),
+            "every scratch root is armed by default: {armed:?}"
+        );
+        let s = run_cycle_over_roots_with(&roots, &idle_opts_zero(tmp.path()));
+        assert_eq!(s.reaped, 1, "{}", render_cycle_line(&s));
+        assert!(!scratch_target.exists(), "the scratch candidate reaped");
+        assert!(ws_target.exists(), "the workspace candidate did NOT");
+        assert_eq!(s.candidates, 2, "both were candidates; only one was armed");
+
+        // The reverse: workspace flag set, scratch switch `0`.
+        let (tmp, mut inputs, ws_target, scratch_target) = two_population_fixture();
+        inputs.workspace_reap_env = Some("1".to_string());
+        inputs.scratch_reap_env = Some("0".to_string());
+        let s = run_cycle_over_roots_with(&reap_roots_from(&inputs), &idle_opts_zero(tmp.path()));
+        assert_eq!(s.reaped, 1);
+        assert!(
+            !ws_target.exists(),
+            "the workspace flag armed the workspace"
+        );
+        assert!(
+            scratch_target.exists(),
+            "exactly `0` disarmed the scratch arm"
+        );
+
+        // Neither flag arms the other's population, and both together arm both.
+        let (tmp, mut inputs, ws_target, scratch_target) = two_population_fixture();
+        inputs.workspace_reap_env = Some("true".to_string());
+        let s = run_cycle_over_roots_with(&reap_roots_from(&inputs), &idle_opts_zero(tmp.path()));
+        assert_eq!(s.reaped, 2);
+        assert!(!ws_target.exists() && !scratch_target.exists());
+    }
+
+    /// Phase 5 — exactly `0` disables the scratch arm, and nothing else does.
+    /// A mistyped switch must not silently disarm a default-on capability.
+    #[test]
+    fn exactly_zero_disables_the_scratch_arm_and_nothing_else_does() {
+        assert!(!scratch_reap_armed_from(Some("0")));
+        for raw in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("false"),
+            Some("off"),
+            Some(" 0"),
+            Some("00"),
+        ] {
+            assert!(
+                scratch_reap_armed_from(raw),
+                "{raw:?} must leave the scratch arm ON"
+            );
+        }
+        // The workspace switch is unchanged: dark unless truthy.
+        for raw in [None, Some(""), Some("0"), Some("yes"), Some("True")] {
+            assert!(!workspace_reap_armed_from(raw), "{raw:?}");
+        }
+        for raw in [Some("1"), Some("true"), Some("TRUE")] {
+            assert!(workspace_reap_armed_from(raw), "{raw:?}");
+        }
+        // Each kind reads only its own.
+        assert!(root_armed(ReapRootKind::HarnessScratchpad, Some("1"), None));
+        assert!(!root_armed(
+            ReapRootKind::HarnessScratchpad,
+            Some("1"),
+            Some("0")
+        ));
+        assert!(!root_armed(ReapRootKind::Workspace, None, None));
+        assert!(!root_armed(ReapRootKind::Workspace, None, Some("1")));
+        assert_eq!(
+            SCRATCH_REAP_ENABLED_ENV,
+            "COORD_ORPHAN_TARGET_SCRATCH_REAP_ENABLED"
+        );
+    }
+
+    /// Each root's token carries ITS arming, and the cycle-level `armed=` is the
+    /// OR over walked roots — so the line a shadow window is read from says which
+    /// population could have removed anything.
+    #[cfg(unix)]
+    #[test]
+    fn each_roots_state_token_carries_its_arming() {
+        let (tmp, inputs, _ws, _scratch) = two_population_fixture();
+        let s = run_cycle_over_roots_with(&reap_roots_from(&inputs), &idle_opts_zero(tmp.path()));
+        let line = render_cycle_line(&s);
+        let ws = s
+            .roots
+            .iter()
+            .find(|r| r.kind == ReapRootKind::Workspace)
+            .unwrap();
+        assert!(ws.render().contains("armed=false"), "{}", ws.render());
+        let armed_scratch: Vec<String> = s
+            .roots
+            .iter()
+            .filter(|r| r.kind == ReapRootKind::HarnessScratchpad && r.completeness.is_some())
+            .map(RootReport::render)
+            .collect();
+        assert!(!armed_scratch.is_empty());
+        assert!(
+            armed_scratch.iter().all(|t| t.contains("armed=true")),
+            "{armed_scratch:?}"
+        );
+        assert!(line.contains(" armed=true "), "cycle-level OR: {line}");
+        // A cycle over only the dark workspace root is not armed.
+        let dark = run_cycle_over_roots(
+            &[ReapRoot::at(
+                ReapRootKind::Workspace,
+                inputs.workspace_root.as_deref().unwrap(),
+            )],
+            Duration::ZERO,
+        );
+        assert!(render_cycle_line(&dark).contains(" armed=false "));
+    }
+
+    /// Zero-grace idle options over [`idle_env`], for the cycle tests whose
+    /// workspace candidate is brand new.
+    #[cfg(unix)]
+    fn idle_opts_zero(base: &Path) -> ClassifyOptions {
+        idle_opts(base, Duration::ZERO)
+    }
+
+    /// OPERATOR PROBE — `#[ignore]`d, and **DRY-RUN BY CONSTRUCTION**: it reads
+    /// this machine's real scratch family and prints what a cycle WOULD reap,
+    /// beside the transcript, process and lock reads that cleared each target. It
+    /// forces every root unarmed and never calls a removal, whatever the
+    /// environment says.
+    ///
+    /// It exists because the periodic reaper is gated to the shared-root-owning
+    /// instance, so a supervisor temp runner never runs a cycle and cannot
+    /// produce the shadow-window evidence plan Phase 5 asks for. Run it with
+    /// `cargo-guard.sh test -- --ignored --nocapture real_scratch_family_dry_run_probe`;
+    /// `QONTINUI_REAPER_PROBE_CYCLES` sets the cycle count (default 3).
+    #[test]
+    #[ignore = "reads this machine's real scratch family; run on purpose, dry-run only"]
+    fn real_scratch_family_dry_run_probe() {
+        let cycles: usize = std::env::var("QONTINUI_REAPER_PROBE_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        // `ambient::qontinui_dir()` deflects to an empty directory inside a test
+        // binary (the ambient canary), which would make this probe a census of
+        // nothing — so resolve the real `~/.qontinui` by the pure rule it wraps.
+        let inputs = ReapRootInputs {
+            qontinui_dir: qontinui_runner_lib::ambient::qontinui_dir_from(
+                std::env::var_os(qontinui_runner_lib::ambient::QONTINUI_HOME_ENV),
+                dirs::home_dir(),
+            ),
+            ..ReapRootInputs::ambient()
+        };
+        let roots: Vec<ReapRoot> = reap_roots_from(&inputs)
+            .into_iter()
+            .filter(|r| r.kind == ReapRootKind::HarnessScratchpad)
+            .map(|r| r.with_armed(false)) // the one line that makes this a probe
+            .collect();
+        assert!(roots.iter().all(|r| !r.armed));
+        eprintln!("PROBE roots: {}", roots.len());
+        for cycle in 1..=cycles {
+            let opts = ClassifyOptions::from_env();
+            let started = std::time::Instant::now();
+            let summary = run_cycle_over_roots_with(&roots, &opts);
+            eprintln!(
+                "PROBE cycle {cycle}/{cycles} ({:?}): {}",
+                started.elapsed(),
+                render_cycle_line(&summary)
+            );
+            let mut would_reap: Vec<(PathBuf, String)> = Vec::new();
+            let mut by_reason: std::collections::BTreeMap<&'static str, usize> = Default::default();
+            for r in roots.iter().filter(|r| r.state.is_walkable()) {
+                let Some(path) = r.path.as_deref() else {
+                    continue;
+                };
+                for c in enumerate_family_within(path, r.max_walk_depth).candidates {
+                    match classify_candidate(&c, &opts) {
+                        Ok(()) => {
+                            let s = scratch_session_of(path, &c.path)
+                                .expect("a cleared scratch candidate has a session");
+                            let homes = opts.scratch.homes().unwrap_or(&[]);
+                            let age = match newest_transcript_age(homes, &s.project, &s.uuid) {
+                                TranscriptRead::Idle(a) => format!("{}h", a.as_secs() / 3600),
+                                TranscriptRead::Unknown => "UNKNOWN".to_string(),
+                            };
+                            let procs = opts.scratch.procs();
+                            let holder = std::fs::canonicalize(&c.path)
+                                .map(|t| format!("{:?}", procs.holds_target(&t)))
+                                .unwrap_or_else(|e| format!("canonicalize failed: {e}"));
+                            let named = std::fs::canonicalize(&s.dir)
+                                .map(|d| procs.names_session(&s, &d))
+                                .unwrap_or(true);
+                            would_reap.push((
+                                c.path.clone(),
+                                format!("session={} transcript_idle={age} holder={holder} session_named_by_a_process={named}", s.uuid),
+                            ));
+                        }
+                        Err(reason) => *by_reason.entry(reason.token()).or_default() += 1,
+                    }
+                }
+            }
+            eprintln!("PROBE cycle {cycle} refusals by reason: {by_reason:?}");
+            eprintln!("PROBE cycle {cycle} would-reap set: {}", would_reap.len());
+            for (p, why) in &would_reap {
+                eprintln!("PROBE   would-reap {} [{why}]", p.display());
+            }
+            if cycle < cycles {
+                std::thread::sleep(Duration::from_secs(
+                    std::env::var("QONTINUI_REAPER_PROBE_GAP_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1),
+                ));
+            }
+        }
+    }
+
+    // ---- Review follow-ups: the process-table read, the re-read, the struct reader.
+
+    /// The wiring, on a hand-built struct, so it is checked on a filesystem that
+    /// reserves nothing for root too: the byte axis is `f_bavail`.
+    #[cfg(unix)]
+    #[test]
+    fn the_statvfs_struct_reader_feeds_the_byte_axis_f_bavail() {
+        // SAFETY: `libc::statvfs` is plain old data; all-zero is a valid value.
+        let mut raw: libc::statvfs = unsafe { std::mem::zeroed() };
+        raw.f_frsize = 4096;
+        raw.f_bsize = 512;
+        raw.f_blocks = 1000;
+        raw.f_bfree = 150; // includes 100 reserved for root
+        raw.f_bavail = 50;
+        raw.f_files = 400;
+        raw.f_ffree = 100;
+        let c = capacity_from_statvfs_struct(&raw);
+        assert_eq!(c.bytes_total, 1000 * 4096);
+        assert_eq!(c.bytes_free, 50 * 4096, "available, not merely free");
+        assert!((c.bytes_pct_used.unwrap() - 95.0).abs() < 1e-9);
+        assert_eq!(c.bytes_axis(90.0), PressureAxis::Pressured);
+        // `f_frsize` of zero falls back to `f_bsize`.
+        raw.f_frsize = 0;
+        assert_eq!(capacity_from_statvfs_struct(&raw).bytes_free, 50 * 512);
+    }
+
+    #[test]
+    fn a_scratch_switch_that_reads_like_an_off_but_is_not_zero_is_warned_about() {
+        assert_eq!(scratch_switch_warning(None), None);
+        assert_eq!(scratch_switch_warning(Some("0")), None);
+        assert_eq!(scratch_switch_warning(Some("1")), None);
+        for raw in ["false", "off", "no", "0 ", ""] {
+            let w = scratch_switch_warning(Some(raw)).expect(raw);
+            assert!(
+                w.contains(SCRATCH_REAP_ENABLED_ENV) && w.contains("stays ON"),
+                "{w}"
+            );
+        }
+    }
+
+    /// A link to a directory where an account directory should be is counted,
+    /// not skipped silently: a `scratch/<account>` that is a link onto a bigger
+    /// disk must not read as an empty family with nothing incomplete.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_account_directory_is_counted_not_silently_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("bigger-disk/.claude-x");
+        fs::create_dir_all(elsewhere.join("claude-4242")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tmp.path().join("scratch/.claude-x")).unwrap();
+        let fam = scratch_family_under(tmp.path(), 4242);
+        assert!(
+            fam.members.is_empty(),
+            "a link is never descended into: {fam:?}"
+        );
+        assert_eq!(fam.links_skipped, 1, "…but it is counted: {fam:?}");
+    }
+
+    /// A process running a binary built into the target holds nothing else in
+    /// it, and one running a binary from the session's scratch is the session.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_running_a_binary_from_the_target_or_the_session_stays_out() {
+        let (tmp, family, target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let home = mk_account_home(tmp.path(), "home", SESS, 3 * 86_400);
+        let sess_dir = canon(&family.join(PROJ).join(SESS));
+        let verdict = |name: &str, exe: Option<&Path>| {
+            let root = mk_proc_root(tmp.path(), name);
+            let dir = plant_proc(&root, 401, &["./app"], &[], Path::new("/"), &[]);
+            if let Some(exe) = exe {
+                fs::remove_file(dir.join("exe")).unwrap();
+                std::os::unix::fs::symlink(exe, dir.join("exe")).unwrap();
+            }
+            classify_candidate(
+                &c,
+                &scratch_opts(ScratchEnv::fixed(root, Some(vec![home.clone()]))),
+            )
+        };
+        assert_eq!(
+            verdict("e0", None),
+            Ok(()),
+            "control: a binary from elsewhere"
+        );
+        assert_eq!(
+            verdict("e1", Some(&canon(&target).join("debug/app"))),
+            Err(SkipReason::HeldByProcess),
+            "a test binary or dev server built into the target"
+        );
+        assert_eq!(
+            verdict("e2", Some(&sess_dir.join("scratchpad/lane3/bin/d-run"))),
+            Err(SkipReason::SessionLive),
+            "a binary running out of the session's own scratch"
+        );
+    }
+
+    /// A read that failed for an UNEXPECTED reason is a missing reading, not a
+    /// process that held nothing — and a process that vanished is still skipped.
+    #[cfg(unix)]
+    #[test]
+    fn an_unexpected_read_error_makes_the_table_unknown_and_a_vanished_process_does_not() {
+        let (tmp, family, _target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let home = mk_account_home(tmp.path(), "home", SESS, 3 * 86_400);
+        let root = mk_proc_root(tmp.path(), "proc");
+        let dir = plant_proc(&root, 501, &["x"], &[], Path::new("/"), &[]);
+        let opts = |env: ScratchEnv| scratch_opts(env);
+        assert_eq!(
+            classify_candidate(
+                &c,
+                &opts(ScratchEnv::fixed(root.clone(), Some(vec![home.clone()])))
+            ),
+            Ok(()),
+            "control"
+        );
+        // `cwd` that is a regular file makes `readlink` fail with EINVAL: not a
+        // vanished process and not a refusal.
+        fs::remove_file(dir.join("cwd")).unwrap();
+        fs::write(dir.join("cwd"), b"not a link").unwrap();
+        assert!(!ProcSnapshot::read(&root).listed);
+        assert_eq!(
+            classify_candidate(&c, &opts(ScratchEnv::fixed(root, Some(vec![home])))),
+            Err(SkipReason::LockStateUnknown)
+        );
+        // The open-fd ceiling is a ceiling on the READ, not a quiet prefix.
+        let fdroot = mk_proc_root(tmp.path(), "fds");
+        let fdproc = plant_proc(
+            &fdroot,
+            502,
+            &["x"],
+            &[],
+            Path::new("/"),
+            &[Path::new("/a"), Path::new("/b")],
+        );
+        assert!(matches!(read_one_proc(&fdproc, &mut 1), ProcRead::Unknown));
+        assert!(matches!(
+            read_one_proc(&fdproc, &mut 2),
+            ProcRead::Entry { .. }
+        ));
+    }
+
+    /// The re-read checks that the target still resolves to where the walk found
+    /// it: a component swapped for a link since then would make the removal
+    /// follow the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_swapped_into_the_path_after_the_walk_refuses_the_removal() {
+        let (tmp, family, _target) = idle_scratch_target();
+        let c = only_candidate(&family);
+        let opts = idle_opts(tmp.path(), DAY);
+        assert_eq!(reread_scratch_candidate(&c, &opts), Ok(()), "control");
+        let scratchpad = family.join(PROJ).join(SESS).join("scratchpad");
+        let moved = scratchpad.with_file_name("scratchpad-real");
+        fs::rename(&scratchpad, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &scratchpad).unwrap();
+        assert_eq!(
+            reread_scratch_candidate(&c, &opts),
+            Err(SkipReason::Reparse),
+            "the same lexical path now resolves somewhere else"
+        );
     }
 }
