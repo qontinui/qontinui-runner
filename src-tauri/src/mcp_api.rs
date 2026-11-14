@@ -6275,6 +6275,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_session_worktrees",
     "coord_sessions_unfinished",
     "coord_set_gate_audience",
+    // Plan 2026-10-04-coord-pr-hold-without-github-drafts D4: placing a hold
+    // only TIGHTENS (it can stop a merge, never cause one), so any principal
+    // that may open a PR may hold one. Forwarded for PLACING ONLY:
+    // `coord_mcp_request_gate_one` refuses `held != true`, because through
+    // this proxy every session shares the device JWT and a release can cause
+    // a merge (COORD_MCP_PR_HOLD_RELEASE_REFUSAL names the release doors).
+    "coord_set_pr_hold",
     "coord_signature",
     "coord_slo_metrics",
     "coord_snooze_gate",
@@ -7234,6 +7241,11 @@ struct CoordMcpBodyRejection {
     /// `Some` only when a `tools/call` named a tool this door does not
     /// forward; `None` for a refused METHOD or an unparseable body.
     tool: Option<String>,
+    /// `true` when the method AND the tool are forwarded but the call's
+    /// ARGUMENTS are refused (today only a `coord_set_pr_hold` release), so
+    /// `error.data.cause` reads `argument_refused` rather than
+    /// `method_not_allowed` and names the tool.
+    argument_refused: bool,
 }
 
 // ===========================================================================
@@ -7417,6 +7429,17 @@ fn coord_mcp_refusal_data_with(
     const CODE: &str = "COORD_MCP_PROXY_METHOD_NOT_ALLOWED";
     const NEXT_DOOR: &str = "GET /coord-mcp/tool-policy";
     let probed_at = chrono::Utc::now().to_rfc3339();
+    if rejection.argument_refused {
+        // The tool IS forwarded; only these arguments are not. No drift
+        // diagnosis applies — a newer build would refuse them too.
+        return serde_json::json!({
+            "code": CODE,
+            "cause": "argument_refused",
+            "tool": rejection.tool,
+            "next_door": NEXT_DOOR,
+            "probed_at": probed_at,
+        });
+    }
     let Some(tool) = rejection.tool.as_deref() else {
         return serde_json::json!({
             "code": CODE,
@@ -7653,6 +7676,7 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
                 id: serde_json::Value::Null,
                 message: format!("request body is not valid JSON-RPC: {e}"),
                 tool: None,
+                argument_refused: false,
             });
         }
     };
@@ -7663,6 +7687,7 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
                     id: serde_json::Value::Null,
                     message: "empty JSON-RPC batch".to_string(),
                     tool: None,
+                    argument_refused: false,
                 });
             }
             for elem in elems {
@@ -7686,6 +7711,7 @@ fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBod
             id: id.clone(),
             message,
             tool,
+            argument_refused: false,
         })
     };
     let method = match req.get("method").and_then(|m| m.as_str()) {
@@ -7712,9 +7738,34 @@ fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBod
                 Some(tool.to_string()),
             );
         }
+        if tool == COORD_SET_PR_HOLD_TOOL
+            && req.pointer("/params/arguments/held") != Some(&serde_json::Value::Bool(true))
+        {
+            return Err(CoordMcpBodyRejection {
+                id,
+                message: COORD_MCP_PR_HOLD_RELEASE_REFUSAL.to_string(),
+                tool: Some(tool.to_string()),
+                argument_refused: true,
+            });
+        }
     }
     Ok(())
 }
+
+/// The coord hold tool (plan `2026-10-04-coord-pr-hold-without-github-drafts`).
+const COORD_SET_PR_HOLD_TOOL: &str = "coord_set_pr_hold";
+
+/// Why this proxy forwards only PLACING a hold. A device-principal call through
+/// `/coord-mcp` carries this box's paired-DEVICE JWT, so every session on the
+/// box (and a leaked session nonce) presents the same principal: a device-held
+/// hold placed by one session could be RELEASED by any other — and a release
+/// can cause a merge, which is the reasoning that withholds
+/// `coord_request_expedited_land`. An agent principal forwards its own JWT and
+/// coord would scope its release to its own holds, but the gate runs before the
+/// principal is resolved, so agent sessions are refused too (one rule; they
+/// release through the HTTP door). Placing only tightens, so it is forwarded;
+/// anything but `held: true` is refused here.
+const COORD_MCP_PR_HOLD_RELEASE_REFUSAL: &str = "coord_set_pr_hold is forwarded by the      /coord-mcp proxy only to PLACE a hold (`held: true`). A release (`held: false`, or      no `held`) is refused here: this door is reachable with a session nonce, and a      release can cause a merge, so it stays off the nonce-bearing path (agent      sessions included, for one rule). Release a hold from the operator console      (/admin/coord/prs), or through coord's HTTP door      POST /coord/repos/:owner/:repo/pull-requests/:number/hold with the holder's own      credential.";
 
 // ---------------------------------------------------------------------------
 // Semantic recall: fill in `coord_memory_search`'s query vector
@@ -19111,6 +19162,95 @@ mod coord_mcp_body_gate_tests {
         }
     }
 
+    /// Plan `2026-10-04-coord-pr-hold-without-github-drafts` D4: the hold tool
+    /// that replaces GitHub drafts is FORWARDED for placing only (holding only
+    /// tightens), while the draft toggle it retires stays a deliberate
+    /// withholding. Moving either name between the lists reds this test.
+    #[test]
+    fn pr_hold_is_forwarded_and_the_draft_toggle_stays_withheld() {
+        assert!(
+            coord_mcp_tool_is_allowed("coord_set_pr_hold"),
+            "coord_set_pr_hold must be callable through the proxy (plan D4)"
+        );
+        assert!(
+            !coord_mcp_withholding_is_deliberate("coord_set_pr_hold"),
+            "coord_set_pr_hold must not also read as a deliberate withholding"
+        );
+        // A release (or a call with no `held`) is refused at this door: the
+        // device JWT is shared by every session on the box.
+        for args in [
+            serde_json::json!({"repo":"o/r","pr_number":1,"held":false}),
+            serde_json::json!({"repo":"o/r","pr_number":1}),
+            serde_json::json!({"repo":"o/r","pr_number":1,"held":"true"}),
+            serde_json::json!({"repo":"o/r","pr_number":1,"held":null}),
+            serde_json::json!({"repo":"o/r","pr_number":1,"held":1}),
+            serde_json::json!("{\"held\":true}"),
+        ] {
+            let err = gate(serde_json::json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{"name":"coord_set_pr_hold","arguments":args}
+            }))
+            .expect_err("a non-placing coord_set_pr_hold must be refused");
+            assert_eq!(err.0, serde_json::json!(7));
+            assert!(err.1.contains("only to PLACE a hold"), "{}", err.1);
+            assert!(
+                err.1.contains("/admin/coord/prs"),
+                "names a release door: {}",
+                err.1
+            );
+        }
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"coord_set_pr_hold",
+                          "arguments":{"repo":"o/r","pr_number":1,"held":true,"reason":"r"}}
+            }))
+            .is_ok(),
+            "placing a hold (held:true) must forward"
+        );
+        // No `arguments` at all fails closed too.
+        assert!(gate(serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"coord_set_pr_hold"}
+        }))
+        .is_err());
+        // A batch is gated per element: one release refuses the whole batch,
+        // and the refusal says ARGUMENTS were refused, naming the tool.
+        let place = serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"coord_set_pr_hold",
+                      "arguments":{"repo":"o/r","pr_number":1,"held":true,"reason":"r"}}
+        });
+        let release = serde_json::json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"coord_set_pr_hold",
+                      "arguments":{"repo":"o/r","pr_number":1,"held":false}}
+        });
+        let rej = coord_mcp_body_gate(
+            serde_json::json!([place.clone(), release]).to_string().as_bytes(),
+        )
+        .expect_err("a batch carrying a release must be refused");
+        assert!(rej.argument_refused);
+        let data = super::coord_mcp_refusal_data_with(&rej, None);
+        assert_eq!(data["cause"], "argument_refused");
+        assert_eq!(data["tool"], "coord_set_pr_hold");
+        assert!(
+            coord_mcp_body_gate(serde_json::json!([place.clone(), place]).to_string().as_bytes())
+                .is_ok(),
+            "a batch of placements must forward"
+        );
+        for withheld in ["coord_set_pr_draft", "coord_create_pr"] {
+            assert!(
+                !coord_mcp_tool_is_allowed(withheld),
+                "{withheld} must stay withheld"
+            );
+            assert!(
+                coord_mcp_withholding_is_deliberate(withheld),
+                "{withheld} must stay a recorded deliberate exclusion"
+            );
+        }
+    }
+
     fn tools_list_answer(names: &[&str], next_cursor: Option<&str>) -> Vec<u8> {
         let tools: Vec<serde_json::Value> = names
             .iter()
@@ -19682,6 +19822,7 @@ mod coord_mcp_body_gate_tests {
             id: serde_json::json!(1),
             message: "m".to_string(),
             tool: Some("coord_create_pr".to_string()),
+            argument_refused: false,
         };
         let d = super::coord_mcp_refusal_data_with(&rej, None);
         assert_eq!(d["code"], "COORD_MCP_PROXY_METHOD_NOT_ALLOWED");
@@ -19730,6 +19871,7 @@ mod coord_mcp_body_gate_tests {
             id: serde_json::json!(1),
             message: "m".to_string(),
             tool: Some("coord_definitely_not_a_tool".to_string()),
+            argument_refused: false,
         };
         let d = super::coord_mcp_refusal_data_with(&rej, None);
         assert_eq!(d["cause"], "unknown");
@@ -19753,6 +19895,7 @@ mod coord_mcp_body_gate_tests {
             id: serde_json::json!(1),
             message: "m".to_string(),
             tool: None,
+            argument_refused: false,
         };
         let d = super::coord_mcp_refusal_data_with(&rej, None);
         assert_eq!(d["cause"], "method_not_allowed");
@@ -19825,6 +19968,7 @@ mod coord_mcp_body_gate_tests {
             id: serde_json::json!(1),
             message: "m".to_string(),
             tool: Some(tool.to_string()),
+            argument_refused: false,
         };
         let stale = trunk_with(&["coord_not_here"], &[]);
         let drift = trunk_with(&[], &[]);
