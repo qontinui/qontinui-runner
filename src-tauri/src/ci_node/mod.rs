@@ -127,7 +127,7 @@ pub(crate) struct CiDispatchPayload {
     /// rather than counted from the moment the message ARRIVED, so a late or
     /// redelivered `build_requested` is released before coord's sweeper
     /// instead of after it. Absent on a payload from a coord that does not
-    /// send it; the deadline is then counted from arrival, as before.
+    /// send it; the deadline is then counted from arrival.
     #[serde(default)]
     pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The instant from which coord REFUSES a queued renewal
@@ -138,7 +138,7 @@ pub(crate) struct CiDispatchPayload {
     /// whichever is sooner), so the ceiling needs no runner-side constant and
     /// a late delivery is released while coord still accepts the reason.
     /// Absent on a payload from a coord that does not send it; the release
-    /// deadline is then counted from arrival, as before.
+    /// deadline is then counted from arrival.
     #[serde(default)]
     pub queued_renewal_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -150,8 +150,15 @@ impl CiDispatchPayload {
     /// coord ignores an unknown `phase` field and reads a queue heartbeat as a
     /// BUILD heartbeat, promoting the row to `running` and stamping
     /// `started_at` for a build that never began. So an unadvertised coord gets
-    /// no queue heartbeat at all, which is exactly its behaviour before this
-    /// existed: the lease lapses as it always did.
+    /// no queue heartbeat at all, and its lease lapses one lease after
+    /// creation as it always did.
+    ///
+    /// That is NOT "behaves as before" for such a dispatch: the admission queue
+    /// now RELEASES it as `cancelled`/`deferred_past_lease` at
+    /// `admission::UNRENEWED_HOLD` (10 minutes) after arrival. Previously it was
+    /// held, and could still build if a slot freed between minutes 10 and 15;
+    /// now a dispatch still queued at minute 10 is handed back with a reason in
+    /// the ledger instead of ending as a reason-free `lost` at minute 15.
     pub(crate) fn coord_accepts_queue_heartbeat(&self) -> bool {
         self.progress_phases
             .iter()
