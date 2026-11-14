@@ -710,6 +710,8 @@ pub(crate) struct Reporter {
     /// Per identity hash: whether its observed service scan is over coord's
     /// per-computer bound, and when that was last put on coord's read surface.
     over_bound: BTreeMap<String, services_bound::OverBound>,
+    /// Per identity hash: the rate limit on its over-bound WARN.
+    over_bound_warns: BTreeMap<String, services_bound::WarnLimit>,
     dedupe_logged: bool,
     failures_logged: u32,
     no_identity_logged: bool,
@@ -745,6 +747,7 @@ impl Reporter {
             parent_unresolved_logged: false,
             last_unknown_fields: Vec::new(),
             over_bound: BTreeMap::new(),
+            over_bound_warns: BTreeMap::new(),
             dedupe_logged: false,
             failures_logged: 0,
             no_identity_logged: false,
@@ -760,6 +763,15 @@ impl Reporter {
     /// `fleet-heartbeat` thread's single async worker, which also carries the
     /// coord liveness heartbeat. Awaited, so a caller's ordering (persist
     /// before the POST) holds.
+    ///
+    /// A cancelled tick (a supervised run torn down mid-save) leaves its
+    /// blocking write to finish, and that write can land AFTER a rebuilt
+    /// reporter's newer save, leaving the older snapshot on disk. The impact
+    /// is bounded: each write is whole (its own temp file, fsync, rename), so
+    /// the file is one snapshot or the other, never torn; event ids are
+    /// content-derived, so an event re-queued from the older snapshot is a
+    /// duplicate coord drops, not a second event; and the next tick persists
+    /// the live state over it.
     async fn persist(&self) {
         let (Some(path), Some(state)) = (self.state_path.clone(), self.state.clone()) else {
             return;
@@ -1040,10 +1052,22 @@ impl Reporter {
             let previous = self.over_bound.get(id).cloned().unwrap_or_default();
             let (next_bound, actions) = previous.step(scan, now);
             let total: usize = counts.values().sum();
+            let scan_counts = observed_rows.is_some().then_some(&counts);
+            let limit = self.over_bound_warns.entry(id.clone()).or_default();
             for action in actions {
                 match (action, &next_bound) {
                     (services_bound::Action::Emit, services_bound::OverBound::Over(over)) => {
-                        evs.push(services_bound::over_bound_event(id, &counts, over, now));
+                        evs.push(services_bound::over_bound_event(id, scan_counts, over, now));
+                    }
+                    (services_bound::Action::Warn, services_bound::OverBound::Over(over))
+                        if !limit.admit(&over.kinds, now) =>
+                    {
+                        debug!(
+                            "fleet::computer: computer {} is over coord's bound again with kind(s) \
+                             {:?} (warned within the last day; the event records it)",
+                            short_id(id),
+                            over.kinds,
+                        )
                     }
                     (services_bound::Action::Warn, services_bound::OverBound::Over(over)) => {
                         warn!(
@@ -1062,9 +1086,13 @@ impl Reporter {
                     (services_bound::Action::Clear, _) => {
                         evs.push(services_bound::cleared_event(id, &counts, now));
                     }
-                    (services_bound::Action::Info, _) => info!(
+                    (services_bound::Action::Info, _) if limit.info_due() => info!(
                         "fleet::computer: computer {} watches {total} services, back within \
                          coord's bound of {MAX_SERVICES_PER_COMPUTER}",
+                        short_id(id),
+                    ),
+                    (services_bound::Action::Info, _) => debug!(
+                        "fleet::computer: computer {} is back within coord's bound again",
                         short_id(id),
                     ),
                     // Emit and Warn come only with an Over state.
@@ -1083,6 +1111,8 @@ impl Reporter {
         }
         // A forgotten computer's over-bound state goes with it.
         self.over_bound
+            .retain(|id, _| state.computers.contains_key(id));
+        self.over_bound_warns
             .retain(|id, _| state.computers.contains_key(id));
     }
 

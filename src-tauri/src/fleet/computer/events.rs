@@ -562,8 +562,10 @@ pub(crate) fn push_pending(state: &mut ObserverState, identity: &str, new: Vec<C
 ///
 /// A file that exists but does not parse is NOT silently replaced: it is
 /// copied aside to `*.json.corrupt` (the queued events in it are evidence)
-/// and logged, and the reporter starts fresh.
+/// and logged, and the reporter starts fresh. Temp files earlier saves left
+/// behind are swept first ([`sweep_orphan_temps`]).
 pub(crate) fn load(path: &Path) -> ObserverState {
+    sweep_orphan_temps(path);
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ObserverState::default(),
@@ -636,13 +638,95 @@ fn write_synced_then_rename(tmp: &Path, path: &Path, state: &ObserverState) -> s
         f.write_all(&serde_json::to_vec(state)?)?;
         f.sync_all()?;
     }
-    std::fs::rename(tmp, path)
+    std::fs::rename(tmp, path)?;
+    // The rename is durable only once the directory entry is: best-effort.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::debug!(
+                "fleet::computer: could not fsync {} after the state rename: {e}",
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Remove the temp files earlier saves left behind beside `path` — another
+/// process's (a previous runner's, killed mid-save), the pre-unique
+/// `<file>.tmp` name, or this process's own older than an hour. A temp file
+/// of this process younger than that may belong to a save still in flight,
+/// so it is left alone. Best-effort: nothing here can fail a load.
+fn sweep_orphan_temps(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    let own_pid = std::process::id();
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        // `<file>.<pid>.<n>.tmp`, or the pre-unique `<file>.tmp` (no pid).
+        let Some(middle) = file
+            .to_str()
+            .and_then(|f| f.strip_prefix(&prefix))
+            .and_then(|f| f.strip_suffix(".tmp").or((f == "tmp").then_some("")))
+        else {
+            continue;
+        };
+        let ours = middle.split('.').next().and_then(|p| p.parse::<u32>().ok()) == Some(own_pid);
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= std::time::Duration::from_secs(3_600));
+        if !ours || old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::services::{parse_systemctl_show, row_from_props, tests as svc};
     use super::*;
+
+    /// Review round 4, A5: the first load sweeps temp files earlier saves
+    /// left behind — another process's and the pre-unique name — but keeps
+    /// this process's fresh one (a save may still be in flight) and every
+    /// unrelated file.
+    #[test]
+    fn load_sweeps_orphaned_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("computer-observer.json");
+        save(&path, &ObserverState::default()).unwrap();
+        let plant = |name: &str| {
+            std::fs::write(dir.path().join(name), b"{half").unwrap();
+        };
+        let foreign = "computer-observer.json.4294967295.7.tmp";
+        let legacy = "computer-observer.json.tmp";
+        let own = format!("computer-observer.json.{}.999.tmp", std::process::id());
+        let unrelated = "computer-observer.json.corrupt";
+        for name in [foreign, legacy, own.as_str(), unrelated] {
+            plant(name);
+        }
+        assert_eq!(load(&path), ObserverState::default());
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            ["computer-observer.json", unrelated, own.as_str()]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
 
     /// Review round 3, A6: every save writes a temp file of its own.
     #[test]
