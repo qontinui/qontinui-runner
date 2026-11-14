@@ -4,7 +4,7 @@ This directory contains comprehensive unit tests for the unified data architectu
 
 ## Test Coverage
 
-The test suite includes **157 tests** across these 4 main test modules (the whole suite collects more):
+The test suite includes **111 tests** across these 3 main test modules (the whole suite collects more):
 
 ### 1. test_action_execution_record.py (36 tests)
 
@@ -133,67 +133,6 @@ Tests for the `ScreenshotService`:
   - All methods return None or 0
   - No filesystem operations
 
-### 4. test_tree_view_layer.py (46 tests)
-
-Tests for the `TreeViewLayer` service:
-
-- **TreeNode Serialization** (3 tests)
-  - Basic to_dict()
-  - With children
-  - Deep nesting
-
-- **Execution Tree View** (5 tests)
-  - Empty list handling
-  - Single action
-  - Parent-child relationships
-  - Multiple workflows
-  - Metadata inclusion
-
-- **Action-Only Tree View** (4 tests)
-  - Flattening hierarchy
-  - Chronological ordering
-  - Parent ID metadata
-
-- **State Transition Tree View** (5 tests)
-  - Entered states grouping
-  - Exited states grouping
-  - No change grouping
-  - Multiple actions per state
-
-- **Timeline Tree View** (4 tests)
-  - Relative timestamps
-  - Timestamp formatting in labels
-  - Hierarchy maintenance
-
-- **State Grouped Tree View** (5 tests)
-  - Grouping by active state sets
-  - Empty state sets
-  - Time-based sorting
-  - State change data
-
-- **Label Formatting** (6 tests)
-  - Success/failed/running indicators
-  - State change indicators
-  - Duration display
-  - No duration/no state change
-
-- **Running Action Status** (5 tests)
-  - Every view reports an action with no end_time as running, never succeeded
-
-- **Timeline Label Formatting** (3 tests)
-  - Zero time
-  - Non-zero time
-  - Full action label inclusion
-
-- **State Change Formatting** (4 tests)
-  - With changes
-  - No changes
-  - Only entered/exited
-
-- **Complex Scenarios** (2 tests)
-  - Complex workflow hierarchy
-  - Multiple view transformations
-
 ## Test Infrastructure
 
 ### conftest.py
@@ -294,7 +233,6 @@ Target coverage: **95%+** for all modules:
 - `models/action_execution_record.py`
 - `services/unified_data_collector.py`
 - `services/screenshot_service.py`
-- `services/tree_view_layer.py`
 
 ## Adding New Tests
 
