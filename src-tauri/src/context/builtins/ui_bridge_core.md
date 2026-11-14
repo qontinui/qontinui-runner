@@ -27,8 +27,10 @@ client = UIBridgeClient(
 # - A phone's LAN IP (http://<device-ip>:8087): from @qontinui/ui-bridge-native
 #   0.11.0, an unsigned off-device caller reaches only GET /ui-bridge/health
 #   (and POST /ui-bridge/pair with an armed code); control routes answer
-#   401 PAIRING_REQUIRED or PAIRING_UNCONFIGURED. Nothing here signs yet, and
-#   the runner's /ui-bridge/devices LAN transport is refused the same way.
+#   401 PAIRING_REQUIRED or PAIRING_UNCONFIGURED. This client does not sign.
+#   Go through the runner instead: POST /ui-bridge/devices/{id}/pair (over a
+#   USB cable with {}, on Wi-Fi with {"code": "<6 digits from the app>"}), then
+#   POST /ui-bridge/devices/{id}/connect; the runner signs every request.
 # - Web app (dev):       http://localhost:3001 (check app's configured port)
 ```
 

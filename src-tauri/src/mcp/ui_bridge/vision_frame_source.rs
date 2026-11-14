@@ -76,6 +76,10 @@ impl FrameProvider for RunnerWindowSource {
 pub struct DeviceScreenshotSource {
     /// Base url, e.g. `http://127.0.0.1:8087`. Trailing slash tolerated.
     pub base_url: String,
+    /// The target is a registered phone: its health is probed first, and the
+    /// request is signed when the phone requires pairing
+    /// ([`crate::mcp::sdk_http::probe_device_client`]).
+    pub phone: bool,
 }
 
 #[async_trait]
@@ -92,6 +96,13 @@ impl FrameProvider for DeviceScreenshotSource {
             .connect_timeout(Duration::from_secs(3))
             .build()
             .map_err(|e| format!("build screenshot client: {e}"))?;
+        let client = if self.phone {
+            crate::mcp::sdk_http::probe_device_client(base, client)
+                .await
+                .map_err(|e| format!("device screenshot at {url}: {e}"))?
+        } else {
+            crate::mcp::sdk_http::SdkHttpClient::unsigned(client)
+        };
 
         let resp = client.get(&url).send().await.map_err(|e| {
             if e.is_timeout() {
@@ -104,10 +115,17 @@ impl FrameProvider for DeviceScreenshotSource {
             }
         })?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "device screenshot {url} returned HTTP {}",
-                resp.status()
-            ));
+            let status = resp.status();
+            // A pairing refusal's `error` says what to do; keep it.
+            let reason = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| body.get("error")?.as_str().map(str::to_string));
+            return Err(match reason {
+                Some(reason) => format!("device screenshot {url} returned HTTP {status}: {reason}"),
+                None => format!("device screenshot {url} returned HTTP {status}"),
+            });
         }
         let body: serde_json::Value = resp
             .json()
@@ -230,13 +248,17 @@ pub async fn resolve_frame_provider(
         .get_active_proxy_url(id)
         .await
     {
-        return Ok(Box::new(DeviceScreenshotSource { base_url }));
+        return Ok(Box::new(DeviceScreenshotSource {
+            base_url,
+            phone: true,
+        }));
     }
 
     // 2. Registered app → its base url.
     if let Some(entry) = state.app_registry.get_live(id).await {
         return Ok(Box::new(DeviceScreenshotSource {
             base_url: entry.app.url.clone(),
+            phone: false,
         }));
     }
 
