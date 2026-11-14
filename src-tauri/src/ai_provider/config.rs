@@ -297,6 +297,67 @@ pub fn get_effective_config_dir_with_override(
     }
 }
 
+/// The refusal a Claude spawn seam raises when it would otherwise start a
+/// `claude` that dies with `401 ... Please run /login`, or `None` when the spawn
+/// may proceed. `selected_config_dir` is the seam's own resolved dir: a `None`
+/// there leaves `CLAUDE_CONFIG_DIR` unset, which is only safe when the ambient
+/// default holds a live login.
+///
+/// ONE definition, because this predicate has two kinds of reader that must not
+/// drift: the four seams that refuse through it (`agent_runtime`'s terminal,
+/// condition-check and headless paths, `looping_agent_supervisor`'s spawn) and
+/// [`spawn_account_ready`], which asks the same question before a gate
+/// continuation is claimed.
+///
+/// The detail is a WIRE value, not a log line: a gate continuation's caller posts
+/// it as `spawn_failed: <detail>`, and coord's re-drive classifier reads that. It
+/// stays byte-identical.
+pub fn spawn_account_refusal(selected_config_dir: Option<&str>) -> Option<String> {
+    if selected_config_dir.is_some()
+        || super::oauth_refresh::default_location_has_valid_credentials()
+    {
+        return None;
+    }
+    let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
+    Some(format!(
+        "no authenticated Claude account on this runner — run /login (instance={instance})"
+    ))
+}
+
+/// One reading of the spawn's predicate, with no pick.
+fn spawn_account_resolves() -> bool {
+    let ai = settings::get_ai_settings();
+    let (selected_config_dir, _source) = get_effective_config_dir(&ai.claude_cli);
+    spawn_account_refusal(selected_config_dir.as_deref()).is_none()
+}
+
+/// Would a session spawned on this runner right now land on a credential-valid
+/// account? `false` is exactly the case [`spawn_account_refusal`] would refuse.
+///
+/// The spawn seams read the resolver AFTER a `pick_best_account`, and an auto
+/// mode's resolver reads only what the last pick published
+/// ([`get_resolved_config_dir`]). A pick runs per unit of AI work, never on a
+/// timer, and `/login` lands in a roster dir rather than `~/.claude`, so on a box
+/// doing no work a resolver-only read would never see the first login. Hence two
+/// steps:
+///
+/// 1. Read with no pick, and answer `true` from that, so a healthy pin never
+///    rotates just because someone asked whether it is healthy. A later pick can
+///    only publish a credential-valid dir, so this `true` still holds for the
+///    spawn that follows.
+/// 2. Otherwise pick once, as the spawn would, and read again. The answer then
+///    matches the spawn's own order of pick-then-read.
+///
+/// A file read at the very least, and on macOS a Keychain subprocess: call it on
+/// the blocking pool, never on an async worker.
+pub fn spawn_account_ready() -> bool {
+    if spawn_account_resolves() {
+        return true;
+    }
+    super::account_usage::pick_best_account();
+    spawn_account_resolves()
+}
+
 /// Mark an account as rate-limited with the default cooldown duration.
 ///
 /// Used by paths that don't have access to a precise `Retry-After` value
