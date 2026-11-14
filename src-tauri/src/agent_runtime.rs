@@ -1034,7 +1034,7 @@ fn spawn_outcome_enrichment_enabled() -> bool {
     std::env::var("QONTINUI_SPAWN_OUTCOME_ENABLED").as_deref() != Ok("0")
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct LogLine {
     /// `stdout` or `stderr`.
     stream: String,
@@ -11945,6 +11945,9 @@ async fn pump_subprocess(
     let _ = out_task.await;
     let _ = err_task.await;
     flush_task.abort();
+    // Wait for the abort to land: a periodic drain still mid-POST would
+    // otherwise race the final drain below and send the head line twice.
+    let _ = flush_task.await;
     // The watch is a timer, not a supervisor: once the child is gone there is
     // nothing left to be stalled about, whether or not the window had expired.
     if let Some(t) = stall_task {
@@ -11963,6 +11966,46 @@ async fn forward_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     log_file: Option<Arc<Mutex<std::fs::File>>>,
     saw_output: Arc<AtomicBool>,
 ) {
+    forward_stream_with(
+        stream_name,
+        reader,
+        queue,
+        log_file,
+        saw_output,
+        |log| async move { post_log_line(agent_id, &log).await },
+    )
+    .await;
+}
+
+/// The pipe-reading loop, generic over the per-line POST so it is testable
+/// without a network.
+///
+/// A line is POSTed inline only while the retry queue is EMPTY. Once a POST
+/// has failed, the queue holds a backlog, and every later line is appended
+/// to it without a POST until the periodic flusher ([`flush_log_queue`])
+/// drains it. Without that rule each line paid its own failed POST (up to the
+/// 3 s timeout in [`post_log_line`]) before the next line was read, so a
+/// chatty child against an unreachable coord filled its pipe and blocked on
+/// write; and on recovery a fresh line overtook the queued ones. Same defect
+/// class as the ci_node progress flusher's per-line retry (#2805).
+///
+/// Trade-off, deliberate: the child is never throttled by coord any more. A
+/// child that outpaces coord after a failure fills the queue to
+/// [`LOG_FLUSH_QUEUE_CAP`] and its OLDEST lines are dropped from the coord
+/// stream. The per-agent log file still records every line, and a stalled
+/// agent is worse than a thinned remote log.
+async fn forward_stream_with<R, P, F>(
+    stream_name: &'static str,
+    reader: R,
+    queue: Arc<Mutex<VecDeque<LogLine>>>,
+    log_file: Option<Arc<Mutex<std::fs::File>>>,
+    saw_output: Arc<AtomicBool>,
+    post: P,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    P: Fn(LogLine) -> F,
+    F: std::future::Future<Output = bool>,
+{
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         // The stall watch's ONLY input. Set before anything that can fail or
@@ -11980,24 +12023,54 @@ async fn forward_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             let mut guard = f.lock().await;
             let _ = writeln!(&mut *guard, "[{stream_name}] {line}");
         }
-        // Try-immediate POST to coord; on failure, enqueue.
-        if !post_log_line(agent_id, &log).await {
-            let mut q = queue.lock().await;
-            if q.len() >= LOG_FLUSH_QUEUE_CAP {
-                q.pop_front();
-            }
-            q.push_back(log);
+        // A backlog means coord was failing (or the flusher has not caught up):
+        // queue behind it, in order, without a POST.
+        let backlog = !queue.lock().await.is_empty();
+        if backlog || !post(log.clone()).await {
+            enqueue_log_line(&queue, log).await;
         }
     }
 }
 
-async fn flush_log_queue(agent_id: uuid::Uuid, queue: &Arc<Mutex<VecDeque<LogLine>>>) {
+/// Append to the retry queue, dropping the oldest line past the cap.
+async fn enqueue_log_line(queue: &Arc<Mutex<VecDeque<LogLine>>>, log: LogLine) {
     let mut q = queue.lock().await;
-    while let Some(log) = q.pop_front() {
-        if !post_log_line(agent_id, &log).await {
-            // Put it back at the head and stop trying for this flush.
-            q.push_front(log);
+    if q.len() >= LOG_FLUSH_QUEUE_CAP {
+        q.pop_front();
+    }
+    q.push_back(log);
+}
+
+async fn flush_log_queue(agent_id: uuid::Uuid, queue: &Arc<Mutex<VecDeque<LogLine>>>) {
+    flush_log_queue_with(
+        queue,
+        |log| async move { post_log_line(agent_id, &log).await },
+    )
+    .await;
+}
+
+/// Drain the retry queue in order, stopping at the first failed POST.
+///
+/// The head line stays IN the queue while it is POSTed, and the lock is NOT
+/// held across the POST: the pipe readers keep appending (and, seeing a
+/// non-empty queue, keep queueing rather than overtaking the backlog). On
+/// success the head is popped only if it is still the line that was sent —
+/// a reader at the cap may have dropped it meanwhile.
+async fn flush_log_queue_with<P, F>(queue: &Arc<Mutex<VecDeque<LogLine>>>, post: P)
+where
+    P: Fn(LogLine) -> F,
+    F: std::future::Future<Output = bool>,
+{
+    loop {
+        let Some(head) = queue.lock().await.front().cloned() else {
             return;
+        };
+        if !post(head.clone()).await {
+            return;
+        }
+        let mut q = queue.lock().await;
+        if q.front() == Some(&head) {
+            q.pop_front();
         }
     }
 }
@@ -12624,6 +12697,130 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::{flush_log_queue_with, forward_stream_with, LogLine, LOG_FLUSH_QUEUE_CAP};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn numbered_lines(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    /// Against a coord that refuses every POST, only the FIRST line pays a
+    /// POST; the rest queue behind it. The old reader POSTed every line.
+    #[tokio::test]
+    async fn a_failing_coord_costs_one_post_not_one_per_line() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let p = posts.clone();
+        forward_stream_with(
+            "stdout",
+            std::io::Cursor::new(numbered_lines(500)),
+            queue.clone(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            move |_log| {
+                p.fetch_add(1, Ordering::SeqCst);
+                async { false }
+            },
+        )
+        .await;
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "one failed POST, then queue"
+        );
+        let q = queue.lock().await;
+        assert_eq!(q.len(), 500);
+        assert_eq!(q.front().map(|l| l.line.as_str()), Some("line 0"));
+        assert_eq!(q.back().map(|l| l.line.as_str()), Some("line 499"));
+    }
+
+    /// While a backlog exists a new line queues behind it rather than being
+    /// POSTed ahead of it, even when coord would accept it.
+    #[tokio::test]
+    async fn a_new_line_never_overtakes_the_backlog() {
+        let backlog = LogLine {
+            stream: "stdout".into(),
+            line: "older".into(),
+            at: chrono::Utc::now(),
+        };
+        let queue = Arc::new(Mutex::new(VecDeque::from([backlog])));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let p = posts.clone();
+        forward_stream_with(
+            "stdout",
+            std::io::Cursor::new(b"newer\n".to_vec()),
+            queue.clone(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            move |_log| {
+                p.fetch_add(1, Ordering::SeqCst);
+                async { true }
+            },
+        )
+        .await;
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        let lines: Vec<String> = queue.lock().await.iter().map(|l| l.line.clone()).collect();
+        assert_eq!(lines, vec!["older".to_string(), "newer".to_string()]);
+    }
+
+    /// The flusher delivers in order, stops at the first failure keeping the
+    /// failed line at the head, and never holds the queue lock across a POST
+    /// (a pipe reader must be able to append meanwhile).
+    #[tokio::test]
+    async fn the_flusher_drains_in_order_without_holding_the_lock() {
+        let queue: Arc<Mutex<VecDeque<LogLine>>> = Arc::new(Mutex::new(
+            (0..5)
+                .map(|i| LogLine {
+                    stream: "stdout".into(),
+                    line: format!("line {i}"),
+                    at: chrono::Utc::now(),
+                })
+                .collect(),
+        ));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (q, s) = (queue.clone(), sent.clone());
+        flush_log_queue_with(&queue, move |log| {
+            let (q, s) = (q.clone(), s.clone());
+            async move {
+                assert!(q.try_lock().is_ok(), "queue lock held across a POST");
+                let mut s = s.lock().unwrap();
+                s.push(log.line.clone());
+                s.len() <= 3 // the 4th POST fails
+            }
+        })
+        .await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec!["line 0", "line 1", "line 2", "line 3"]
+        );
+        let left: Vec<String> = queue.lock().await.iter().map(|l| l.line.clone()).collect();
+        assert_eq!(left, vec!["line 3".to_string(), "line 4".to_string()]);
+    }
+
+    /// The queue stays bounded during an outage (drop-oldest).
+    #[tokio::test]
+    async fn the_retry_queue_is_bounded() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        forward_stream_with(
+            "stderr",
+            std::io::Cursor::new(numbered_lines(LOG_FLUSH_QUEUE_CAP + 10)),
+            queue.clone(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            |_log| async { false },
+        )
+        .await;
+        let q = queue.lock().await;
+        assert_eq!(q.len(), LOG_FLUSH_QUEUE_CAP);
+        assert_eq!(q.front().map(|l| l.line.as_str()), Some("line 10"));
+    }
+
     /// Serve one HTTP response, `head` then `tail` after `gap`, on an ephemeral
     /// port, and return its URL.
     async fn serve_in_two_parts(
