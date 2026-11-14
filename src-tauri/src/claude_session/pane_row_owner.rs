@@ -97,8 +97,9 @@ pub(crate) struct PaneRowFacts {
     /// `Undetermined` — never the machine default.
     pub tenant: NewSessionTenant,
     /// When the terminal was bound to the row, unix milliseconds (the unit of
-    /// a lifecycle record's `finished_at`). `None` when not known. Read only
-    /// for the finish re-offer's revival guard — NEVER to rank panes: a wall
+    /// a lifecycle record's `finished_at`). `None` when not known. Kept for the finish
+    /// re-offer's revival guard (plan D5, Phase 3 — not yet built; nothing reads
+    /// it today) — NEVER to rank panes: a wall
     /// clock can step backwards, and two binds can share a millisecond.
     pub bound_at_ms: Option<i64>,
     /// The terminal's process-wide monotonic bind sequence
@@ -156,8 +157,9 @@ pub(crate) struct LivePaneRow {
     /// The row's tenant per D3 (see [`PaneRowFacts::tenant`]).
     pub tenant: NewSessionTenant,
     /// When the id's ownership of the row began: the advance instant for an
-    /// entry, the terminal's bind instant for a pin seed. Read by the finish
-    /// re-offer's revival guard.
+    /// entry, the terminal's bind instant for a pin seed. Kept for the finish
+    /// re-offer's revival guard (plan D5, Phase 3 — not yet built; nothing
+    /// reads it today).
     pub owned_since_ms: Option<i64>,
     /// The row's pane's monotonic bind sequence — what two panes are ranked
     /// by ([`PaneRowFacts::bind_seq`]).
@@ -205,8 +207,8 @@ impl PaneRowOwners {
     /// `harness_id` — unless that entry's pane was bound AFTER this row's,
     /// or this row's bind sequence is unknown while that entry's is known, in
     /// which case the advance is refused (the later-bound pane keeps the id;
-    /// an unknown instant never displaces a known one). A row already owned
-    /// by the id keeps its original instant.
+    /// an unknown sequence never displaces a known one). A row already owned
+    /// by the id keeps its original entry (its `since_ms` and stored sequence).
     /// Returns whether the row's owner changed.
     pub(crate) fn advance(
         &self,
