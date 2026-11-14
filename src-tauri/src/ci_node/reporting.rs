@@ -757,9 +757,11 @@ pub(crate) fn classify_queue_heartbeat(status: u16, body: &str) -> QueueHeartbea
 /// initialise will not succeed on a retry either.
 ///
 /// Idle pooled connections are dropped after 45 s, inside the keeper's 60 s
-/// period: a proxy or load balancer in front of coord may close an idle
-/// connection before then, and a heartbeat sent on such a half-closed socket
-/// fails and costs that dispatch a renewal.
+/// period, so the client does not keep relying on a connection that a proxy
+/// or load balancer in front of coord with an idle timeout longer than 45 s
+/// may have closed. That is a narrowing, not a guarantee: a proxy that closes
+/// sooner can still hand back a stale connection, and such a heartbeat may
+/// then fail and be retried on the next tick.
 fn queue_heartbeat_client() -> Option<&'static reqwest::Client> {
     static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
     CLIENT
