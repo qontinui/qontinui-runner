@@ -14,10 +14,6 @@ import {
   Bot,
   CheckCircle,
   AlertTriangle,
-  Lightbulb,
-  CheckSquare,
-  BookOpen,
-  Cog,
   Activity,
   Terminal,
   FileCode,
@@ -82,10 +78,6 @@ const orchestratorAgentIcons: Record<
   NonNullable<OrchestratorAgent>,
   React.ComponentType<{ className?: string }>
 > = {
-  planning: Lightbulb,
-  verification: CheckSquare,
-  knowledge: BookOpen,
-  orchestrator: Cog,
   worker: Bot,
 };
 

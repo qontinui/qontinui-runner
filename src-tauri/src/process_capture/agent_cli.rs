@@ -19,6 +19,15 @@
 //!
 //! A runtime-hosted match needs the package path, not a bare word: `node
 //! server.js --pi` is a dev server, not an agent.
+//!
+//! Two Linux shapes the Windows ones do not cover, both measured:
+//! - Node ≥ 24 renames its main thread, so `/proc/<pid>/comm` — the image name
+//!   the `/proc` walk records — reads `MainThread`, not `node`. A runtime is
+//!   therefore also recognised by its `/proc/<pid>/exe` basename.
+//! - An npm CLI started by its bin name (`pi`, `gemini`) runs through its
+//!   `#!/usr/bin/env node` shebang, so the argv is `node <prefix>/bin/pi`: the
+//!   bin link, not the package path. A runtime argument that is a `bin/` (or
+//!   `.bin/`) entry named exactly like an agent therefore names that agent.
 
 use std::collections::HashMap;
 
@@ -42,8 +51,10 @@ const AGENT_IMAGES: &[(&str, &str)] = &[
     ("amp", "amp"),
 ];
 
-/// Script runtimes that host an npm/pip-installed agent CLI.
-const RUNTIME_IMAGES: &[&str] = &["node", "bun", "deno", "python", "python3", "pythonw"];
+/// Script runtimes that host an npm-installed agent CLI. Python runtimes are
+/// matched by shape instead ([`is_runtime_stem`]): `python3.12` is as common
+/// as `python3`.
+const RUNTIME_IMAGES: &[&str] = &["node", "nodejs", "bun", "deno"];
 
 /// `(package path fragment, agent kind)` matched against a runtime's command
 /// line, with `\` normalised to `/` and lowercased. Fragments name the
@@ -57,14 +68,20 @@ const AGENT_PACKAGES: &[(&str, &str)] = &[
     ("@qwen-code/qwen-code/", "qwen"),
     ("@charmland/crush/", "crush"),
     ("@sourcegraph/amp/", "amp"),
+    // The launcher script execs a bundled `…/cursor-agent/versions/<v>/node
+    // …/index.js`: neither the image nor a bin entry names it.
+    ("/cursor-agent/versions/", "cursor-agent"),
     ("/aider/__main__", "aider"),
     ("/bin/aider", "aider"),
     ("/scripts/aider", "aider"),
 ];
 
 /// An image name as the checks compare it: last path component, lowercased,
-/// `.exe` stripped.
+/// `.exe` stripped — and the ` (deleted)` the kernel appends to a
+/// `/proc/<pid>/exe` target whose binary was replaced on disk (a package
+/// upgrade under a running agent).
 fn image_stem(name: &str) -> String {
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
     let base = name
         .rsplit(['/', '\\'])
         .next()
@@ -88,23 +105,73 @@ fn agent_by_image(pid: u32, snapshot: &ProcessSnapshot) -> Option<&'static str> 
         .map(|(_, kind)| *kind)
 }
 
-/// True iff `pid`'s image is a script runtime whose argv must be read.
-fn is_runtime(pid: u32, snapshot: &ProcessSnapshot) -> bool {
-    snapshot
-        .names
-        .get(&pid)
-        .map(|n| image_stem(n))
-        .is_some_and(|stem| RUNTIME_IMAGES.contains(&stem.as_str()))
+/// True iff `stem` names a script runtime: one of [`RUNTIME_IMAGES`];
+/// `python` / `pypy` followed only by a version and build letters (`python3`,
+/// `python3.12`, `python3.13t`, `pythonw`, `pypy3`); or `mainthread`, the
+/// `comm` Node ≥ 24 gives itself on Linux. That last one is a thread name, not
+/// an image — it only buys an argv read, so when the exe link is unreadable
+/// too (another user's process) the pane reads UNKNOWN rather than absent.
+fn is_runtime_stem(stem: &str) -> bool {
+    RUNTIME_IMAGES.contains(&stem)
+        || stem == "mainthread"
+        || ["python", "pypy"].iter().any(|p| {
+            stem.strip_prefix(p).is_some_and(|v| {
+                v.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'w' | 't'))
+            })
+        })
 }
 
-/// The agent kind a runtime's command line names, if any.
+/// True iff `pid` is a script runtime whose argv must be read — by its image
+/// name or by its executable path (whose stem is the real one where the name
+/// is a renamed thread).
+fn is_runtime(pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    [snapshot.names.get(&pid), snapshot.exe_paths.get(&pid)]
+        .into_iter()
+        .flatten()
+        .any(|n| is_runtime_stem(&image_stem(n)))
+}
+
+/// The agent kind a bare `bin/` entry names: `<anything>/bin/<stem>` or
+/// `<anything>/.bin/<stem>` whose stem is exactly an agent's (`claude`
+/// included), so `/usr/bin/pip` is not `pi` and `./pi.js` is no bin entry.
+fn agent_by_bin_entry(token: &str) -> Option<&'static str> {
+    let path = token.trim_matches(['"', '\'']);
+    let (dir, base) = path.rsplit_once('/')?;
+    let parent = dir.rsplit('/').next().unwrap_or(dir);
+    if parent != "bin" && parent != ".bin" {
+        return None;
+    }
+    if base == "claude" {
+        return Some("claude");
+    }
+    AGENT_IMAGES
+        .iter()
+        .find(|(image, _)| *image == base)
+        .map(|(_, kind)| *kind)
+}
+
+/// The agent kind a runtime's command line names, if any: an installed
+/// package path ([`AGENT_PACKAGES`]), a `bin/` entry named like an agent
+/// ([`agent_by_bin_entry`] — the shebang launch), or `python -m aider`.
 pub(crate) fn agent_by_cmdline(cmdline: &str) -> Option<&'static str> {
     let lower = cmdline.to_ascii_lowercase();
     let slashed = lower.replace('\\', "/");
-    AGENT_PACKAGES
+    if let Some(kind) = AGENT_PACKAGES
         .iter()
         .find(|(frag, _)| slashed.contains(frag))
         .map(|(_, kind)| *kind)
+    {
+        return Some(kind);
+    }
+    let tokens: Vec<&str> = slashed.split_whitespace().collect();
+    if let Some(kind) = tokens.iter().find_map(|t| agent_by_bin_entry(t)) {
+        return Some(kind);
+    }
+    tokens
+        .windows(2)
+        .any(|w| w[0] == "-m" && (w[1] == "aider" || w[1].starts_with("aider.")))
+        .then_some("aider")
 }
 
 /// One pane's reading.
@@ -290,6 +357,113 @@ mod tests {
     fn unknown_snapshot_is_unknown_for_every_pane() {
         let out = run(&[("a", 1)], &ProcessSnapshot::default(), Some(&[]));
         assert_eq!(out["a"], PaneAgent::Unknown);
+    }
+
+    /// Measured on Linux with Node 24: `comm` is `MainThread`, the exe is
+    /// node, and a CLI started by its bin name has argv `node <prefix>/bin/pi`.
+    #[test]
+    fn linux_node_shebang_launch_is_an_agent() {
+        let mut s = snap(&[(1, None, "bash"), (2, Some(1), "MainThread")]);
+        s.exe_paths.insert(
+            2,
+            "/home/u/.nvm/versions/node/v24.19.0/bin/node".to_string(),
+        );
+        let out = run(
+            &[("pane", 1)],
+            &s,
+            Some(&[(2, "node /home/u/.nvm/versions/node/v24.19.0/bin/pi")]),
+        );
+        assert_eq!(out["pane"], PaneAgent::Present("pi"));
+    }
+
+    /// A renamed-thread runtime whose argv cannot be read is UNKNOWN, not
+    /// absent — the exe path is what makes it a runtime at all.
+    #[test]
+    fn renamed_node_thread_with_unreadable_argv_is_unknown() {
+        // A thread name that proves nothing by itself: only the exe path can
+        // make this a runtime, so the test pins the exe arm of `is_runtime`.
+        let mut s = snap(&[(1, None, "bash"), (2, Some(1), "libuv-worker")]);
+        s.exe_paths.insert(2, "/usr/bin/node".to_string());
+        let out = run(&[("pane", 1)], &s, Some(&[]));
+        assert_eq!(out["pane"], PaneAgent::Unknown);
+    }
+
+    /// A Node binary replaced on disk under a running agent: the exe link
+    /// reads `… (deleted)`, which must still be node.
+    #[test]
+    fn replaced_node_binary_is_still_a_runtime() {
+        assert_eq!(image_stem("/usr/bin/node (deleted)"), "node");
+        // Not `MainThread`, which is a runtime on its own: the exe path must
+        // be what decides here.
+        let mut s = snap(&[(1, None, "bash"), (2, Some(1), "libuv-worker")]);
+        s.exe_paths.insert(2, "/usr/bin/node (deleted)".to_string());
+        let out = run(
+            &[("pane", 1)],
+            &s,
+            Some(&[(2, "node /usr/local/bin/gemini")]),
+        );
+        assert_eq!(out["pane"], PaneAgent::Present("gemini"));
+    }
+
+    /// `sudo pi`: the exe link is unreadable (another user's process) and the
+    /// name is Node's renamed thread. Still a runtime, so the argv is read.
+    #[test]
+    fn renamed_thread_with_unreadable_exe_is_still_read() {
+        let s = snap(&[(1, None, "bash"), (2, Some(1), "MainThread")]);
+        let found = run(&[("pane", 1)], &s, Some(&[(2, "node /usr/local/bin/pi")]));
+        assert_eq!(found["pane"], PaneAgent::Present("pi"));
+        let unreadable = run(&[("pane", 1)], &s, Some(&[]));
+        assert_eq!(unreadable["pane"], PaneAgent::Unknown);
+    }
+
+    #[test]
+    fn cursor_agent_bundled_node_is_an_agent() {
+        assert_eq!(
+            agent_by_cmdline("/home/u/.local/share/cursor-agent/versions/2025.11.1/node --use-system-ca /home/u/.local/share/cursor-agent/versions/2025.11.1/index.js"),
+            Some("cursor-agent")
+        );
+    }
+
+    #[test]
+    fn python_versions_are_runtimes() {
+        for stem in [
+            "python",
+            "python3",
+            "python3.12",
+            "python3.13t",
+            "pythonw",
+            "pypy3",
+        ] {
+            assert!(is_runtime_stem(stem), "{stem}");
+        }
+        for stem in ["pythonista", "pi", "nodemon", "pypyx"] {
+            assert!(!is_runtime_stem(stem), "{stem}");
+        }
+    }
+
+    #[test]
+    fn bin_entries_and_module_runs_name_agents() {
+        assert_eq!(
+            agent_by_cmdline("node /usr/local/bin/gemini"),
+            Some("gemini")
+        );
+        assert_eq!(
+            agent_by_cmdline("node /home/u/.npm-global/bin/claude --resume"),
+            Some("claude")
+        );
+        assert_eq!(
+            agent_by_cmdline("node ./node_modules/.bin/codex"),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_by_cmdline("python3.12 -m aider --model x"),
+            Some("aider")
+        );
+        // Exact stems only: `pip` is not `pi`, and a file named like an agent
+        // outside a bin dir is a script, not the CLI.
+        assert_eq!(agent_by_cmdline("python3 /usr/bin/pip install x"), None);
+        assert_eq!(agent_by_cmdline("node ./scripts/pi"), None);
+        assert_eq!(agent_by_cmdline("node /srv/bin/pi.js"), None);
     }
 
     #[test]
