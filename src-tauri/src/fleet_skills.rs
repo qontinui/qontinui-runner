@@ -216,9 +216,42 @@ fn collect_text_files(
 /// [`provision_fleet_skills_into`] and [`crate::provision_guard`]). **A tracked file outranks a served override**:
 /// the account layer decides what this binary would write, not whether it may
 /// replace a repository's committed content.
+///
+/// **And before any of that, the pass may STAND DOWN**
+/// ([`crate::provision_guard::stand_down`]): when `<workdir>/.claude/skills` is
+/// reached through a symlink, or the workdir's `.claude` resolves into the
+/// canonical `qontinui-claude-config` checkout, nothing is fetched, probed or
+/// written, and every bundled file is recorded as skipped (`symlinked` /
+/// `canonical_source`). That decision is the FIRST statement here, so every
+/// caller inherits it.
 pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
+    provision_fleet_skills_for_session_with_root(
+        workdir,
+        crate::workspace_paths::workspace_root_readonly().as_deref(),
+    );
+}
+
+/// [`provision_fleet_skills_for_session`] with the workspace root injected —
+/// the test seam. `workspace_root_readonly()` rather than `require_workspace_root()`:
+/// the stand-down only compares paths and writes nothing, and a `None` root
+/// fails open to the symlink arm alone.
+fn provision_fleet_skills_for_session_with_root(workdir: &str, root: Option<&Path>) {
+    let claude_dir = Path::new(workdir).join(".claude");
+    if let Some(reason) = crate::provision_guard::stand_down(&claude_dir, "skills", root) {
+        let line = format!(
+            "fleet_skills: standing down for {workdir} — {}",
+            reason.describe()
+        );
+        if matches!(reason, capability_manifest::SkipReason::Unexaminable(_)) {
+            warn!("{line}");
+        } else {
+            info!("{line}");
+        }
+        record_whole_pass_skip(workdir, &reason);
+        return;
+    }
     let registry = crate::agent_skills::resolve_registry();
-    let skills_dir = Path::new(workdir).join(".claude").join("skills");
+    let skills_dir = claude_dir.join("skills");
 
     // The registry's own row: WHICH of `resolve_registry`'s three arms answered.
     // Recorded before the write, because it is a fact about resolution rather
@@ -263,6 +296,38 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
             crate::capability_manifest::record_provision(workdir, report);
         }
     }
+}
+
+/// Record that the skills pass wrote NOTHING for `workdir`, for one reason that
+/// covers the whole destination: one skip per bundled FILE (`<skill>/<rel>`,
+/// the unit every other skills skip uses), so the token reads
+/// `written=0/N skipped-<reason>=N`.
+///
+/// The roster is the EMBEDDED bundle, not the account-resolved registry:
+/// resolving that would fetch overrides for a pass that writes nothing. Shared
+/// by the stand-down above and the session-level skips in
+/// `agent_worktree::isolated_edit`.
+pub(crate) fn record_whole_pass_skip(workdir: &str, reason: &capability_manifest::SkipReason) {
+    let skills_dir = Path::new(workdir).join(".claude").join("skills");
+    let embedded = embedded_skills();
+    let units = embedded
+        .iter()
+        .flat_map(|skill| {
+            skill
+                .files
+                .keys()
+                .map(|rel| format!("{}/{rel}", skill.name))
+        })
+        .collect::<Vec<_>>();
+    capability_manifest::record_provision(
+        workdir,
+        ProvisionReport::whole_pass_skip(
+            "fleet_skills",
+            skills_dir.display().to_string(),
+            units,
+            reason,
+        ),
+    );
 }
 
 /// Whether the skill `name` is in the fleet corpus this runner SERVES into
@@ -500,6 +565,7 @@ pub(crate) fn provision_fleet_skills_into(
         sources.iter().map(|s| s.files().len()).sum(),
         capability_manifest::Rung::Embedded,
     )
+    .with_probe(tracked.probe_state())
     .with_destination(skills_dir.display().to_string())
     .with_detail(format!(
         "{} skill(s) resolved — {} embedded default(s), {} served from the canonical \
@@ -591,6 +657,25 @@ pub(crate) fn provision_fleet_skills_into(
             // the skills dir — which is exactly what `TrackedPaths` reports.
             let relative = Path::new(skill.dir_name()).join(rel_path);
             let dst = skills_dir.join(&relative);
+            // Never write THROUGH a symlink, whatever the probe says: a file
+            // (or a whole skill directory) that is a link into a canonical
+            // checkout is invisible to `TrackedPaths`, and `std::fs::write`
+            // onto it truncates its target. Before `create_dir_all`, which
+            // would build inside the link's target.
+            if let Some(reason) = crate::provision_guard::symlink_below(skills_dir, &dst) {
+                let line = format!(
+                    "fleet_skills: skipping {} — {}",
+                    dst.display(),
+                    reason.describe()
+                );
+                if matches!(reason, capability_manifest::SkipReason::Unexaminable(_)) {
+                    warn!("{line}");
+                } else {
+                    info!("{line}");
+                }
+                out.skip(relative.display().to_string(), reason);
+                continue;
+            }
             // Before `create_dir_all`: a skill whose every file is tracked must
             // not leave a new empty directory in the repository's working tree.
             // A per-file ProbeUnknownInRepo keep is dropped HERE: the whole-skill
@@ -2155,5 +2240,205 @@ mod tests {
                 "{rel} came from the account layer and must not be executable (mode {mode:o})"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3 of `2026-11-09-the-runner-provisioner-wrote-the-served-claude-config-
+    // through-the-workspace-root-symlink`: the stand-down and never writing
+    // through a symlink, for skills. Fixtures that cannot be built FAIL.
+    // ------------------------------------------------------------------
+
+    use crate::provision_guard::test_support::{git_add, link_file, linked_workspace, snapshot};
+
+    /// Write every file of the FIRST bundled skill into `<claude>/skills` (what a
+    /// repo tracking the bundle holds); the second bundled skill is left absent,
+    /// the path upstream "added". Returns `(tracked skill, absent skill)`.
+    fn seed_repo_skills(claude: &Path) -> (String, String) {
+        let embedded = embedded_skills();
+        assert!(
+            embedded.len() >= 2,
+            "the bundle carries at least two skills"
+        );
+        let dir = claude.join("skills");
+        for rel in embedded[0].files.keys() {
+            let dst = dir.join(&embedded[0].name).join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::write(&dst, format!("the repo's own copy of {rel}")).unwrap();
+        }
+        (embedded[0].name.clone(), embedded[1].name.clone())
+    }
+
+    fn skills_report(workdir: &str) -> ProvisionReport {
+        crate::capability_manifest::session_provision_ledger(workdir)
+            .expect("the pass is recorded against this workdir")
+            .reports
+            .into_iter()
+            .rev()
+            .find(|r| r.capability == "fleet_skills")
+            .expect("a fleet_skills report")
+    }
+
+    fn embedded_file_total() -> usize {
+        embedded_skills().iter().map(|s| s.files.len()).sum()
+    }
+
+    /// T1 / T2 for skills: nothing is written through a linked `.claude`, and
+    /// the upstream-added skill stays absent, probe answered or not.
+    fn assert_linked_workspace_skills_are_not_written(probe_answers: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, repo) = linked_workspace(tmp.path(), probe_answers);
+        let (_tracked, absent) = seed_repo_skills(&repo.join(".claude"));
+        if probe_answers {
+            git_add(&repo, Path::new(".claude"));
+        }
+        let before = snapshot(&repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        provision_fleet_skills_for_session_with_root(wd, Some(&tmp.path().join("root")));
+
+        assert_eq!(
+            snapshot(&repo.join(".claude")),
+            before,
+            "a stand-down changes no byte, no mtime and creates no path"
+        );
+        assert!(
+            !repo.join(".claude/skills").join(&absent).exists(),
+            "the upstream-added skill stays absent"
+        );
+        let report = skills_report(wd);
+        let n = embedded_file_total();
+        assert_eq!(
+            (report.written, report.expected, report.skipped.len()),
+            (0, n, n)
+        );
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "symlinked"));
+        assert!(report.is_stood_down() && !report.warns());
+        let line = crate::served_corpus::probe(&ws).render_line();
+        assert!(
+            line.contains(&format!(
+                "skills written=0/{n} skipped-symlinked={n} as-of="
+            )),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_workspace_claude_gets_no_skill_when_the_probe_cannot_answer() {
+        assert_linked_workspace_skills_are_not_written(false);
+    }
+
+    #[test]
+    fn a_symlinked_workspace_claude_gets_no_skill_when_the_probe_answers() {
+        assert_linked_workspace_skills_are_not_written(true);
+    }
+
+    /// The same through the REAL entry point (`provision_fleet_skills_for_session`,
+    /// ambient workspace root); the symlink arm needs no root.
+    #[test]
+    fn a_symlinked_workspace_claude_gets_no_skill_through_the_real_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, repo) = linked_workspace(tmp.path(), false);
+        let (_tracked, absent) = seed_repo_skills(&repo.join(".claude"));
+        let before = snapshot(&repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        provision_fleet_skills_for_session(wd);
+
+        assert_eq!(snapshot(&repo.join(".claude")), before);
+        assert!(!repo.join(".claude/skills").join(&absent).exists());
+        let report = skills_report(wd);
+        let n = embedded_file_total();
+        assert_eq!(
+            (report.written, report.expected, report.skipped.len()),
+            (0, n, n)
+        );
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "symlinked"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_workspace_claude_gets_no_skill() {
+        use crate::provision_guard::test_support::link_junction;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(
+            repo.join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-skills-junction\n",
+        )
+        .unwrap();
+        let (_tracked, absent) = seed_repo_skills(&repo.join(".claude"));
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        link_junction(&ws.join(".claude"), &repo.join(".claude"));
+        let before = snapshot(&repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        provision_fleet_skills_for_session_with_root(wd, None);
+
+        assert_eq!(snapshot(&repo.join(".claude")), before);
+        assert!(!repo.join(".claude/skills").join(&absent).exists());
+        assert!(skills_report(wd)
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "symlinked"));
+    }
+
+    /// T4 for skills: the canonical checkout itself.
+    #[test]
+    fn the_canonical_source_checkout_gets_no_skill() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        let ccfg = root.join("qontinui-claude-config");
+        let (_tracked, absent) = seed_repo_skills(&ccfg.join(".claude"));
+        let before = snapshot(&ccfg.join(".claude"));
+        let wd = ccfg.to_str().unwrap();
+
+        provision_fleet_skills_for_session_with_root(wd, Some(&root));
+
+        assert_eq!(snapshot(&ccfg.join(".claude")), before);
+        assert!(!ccfg.join(".claude/skills").join(&absent).exists());
+        let report = skills_report(wd);
+        assert_eq!(report.written, 0);
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "canonical_source"));
+        assert!(report.is_stood_down() && !report.warns());
+    }
+
+    /// T6 for skills: one skill file is a symlink to a file elsewhere. It is
+    /// skipped `symlinked`, its target is left alone, every other file lands.
+    #[test]
+    fn a_per_file_symlink_in_a_skill_is_never_written_through() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let embedded = embedded_skills();
+        let first = &embedded[0].name;
+        std::fs::create_dir_all(skills_dir.join(first)).unwrap();
+        let external = tmp.path().join("external.md");
+        std::fs::write(&external, b"not ours").unwrap();
+        link_file(&skills_dir.join(first).join(SKILL_MANIFEST), &external);
+
+        let report = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
+            .expect("provision");
+
+        assert_eq!(std::fs::read(&external).unwrap(), b"not ours");
+        let n = embedded_file_total();
+        assert_eq!(report.written, n - 1);
+        let links: Vec<_> = report
+            .skipped
+            .iter()
+            .filter(|u| u.reason.wire() == "symlinked")
+            .collect();
+        assert_eq!(links.len(), 1, "{:?}", report.skipped);
+        assert!(links[0].unit.starts_with(first.as_str()));
     }
 }

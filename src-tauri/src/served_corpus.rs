@@ -393,6 +393,9 @@ pub(crate) struct PassSummary {
     expected: usize,
     /// Skipped-unit counts by `SkipReason::wire()`, zero counts omitted.
     skipped: std::collections::BTreeMap<&'static str, usize>,
+    /// What the tracked-file probe did. Rendered only when it was asked and did
+    /// not answer ([`crate::capability_manifest::TrackedProbeState::is_unanswered`]).
+    probe: crate::capability_manifest::TrackedProbeState,
     /// When the pass ran, RFC 3339 UTC.
     at: String,
 }
@@ -406,13 +409,22 @@ pub(crate) struct Provisioned {
 }
 
 impl Provisioned {
-    /// `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills …`.
+    /// `commands written=<w>/<e> skipped-<reason>=<n>… [probe=<state>] as-of=<ts>;
+    /// skills …`. `probe=` appears only for `unanswered_in_repo` and
+    /// `unanswered_outside_repo`: a pass that wrote only absent paths after a
+    /// probe that could not answer would otherwise read exactly like a healthy
+    /// fresh provision. It is never rendered for `not_run`, which every
+    /// stand-down and whole-pass skip carries, so a deliberate stand-down does
+    /// not read like a fault.
     fn render(&self) -> String {
         let one = |label: &str, p: &Probe<PassSummary>| match p {
             Probe::Measured(s) => {
                 let mut out = format!("{label} written={}/{}", s.written, s.expected);
                 for (reason, n) in &s.skipped {
                     out.push_str(&format!(" skipped-{}={n}", reason.replace('_', "-")));
+                }
+                if s.probe.is_unanswered() {
+                    out.push_str(&format!(" probe={}", s.probe.wire()));
                 }
                 out.push_str(&format!(" as-of={}", s.at));
                 out
@@ -460,6 +472,7 @@ fn provisioned_for(workdir: &Path) -> Probe<Provisioned> {
                     written: r.written,
                     expected: r.expected,
                     skipped,
+                    probe: r.probe,
                     at: r.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 })
             }
@@ -1707,6 +1720,38 @@ mod tests {
     use crate::agent_skills::AgentSkillRegistry;
     use crate::provision_guard::test_support::assert_not_in_any_repo;
     use std::process::{Command, Stdio};
+
+    /// Reviewer note A3, decided as intended: a routine pass outside any repo
+    /// (git always fails there) records `unanswered_outside_repo`, and the line
+    /// RENDERS `probe=unanswered_outside_repo` for it. That is deliberate, so a
+    /// pass that wrote only absent paths never reads like a healthy provision.
+    /// `not_run` and `answered` render no `probe=` field.
+    #[test]
+    fn the_outside_repo_probe_state_renders_as_intended() {
+        use crate::capability_manifest::TrackedProbeState as P;
+        let pass = |probe| {
+            Probe::Measured(PassSummary {
+                written: 3,
+                expected: 3,
+                skipped: std::collections::BTreeMap::new(),
+                probe,
+                at: "T".to_string(),
+            })
+        };
+        let line = |probe| {
+            Provisioned {
+                commands: pass(probe),
+                skills: pass(P::NotRun),
+            }
+            .render()
+        };
+        assert_eq!(
+            line(P::UnansweredOutsideRepo),
+            "commands written=3/3 probe=unanswered_outside_repo as-of=T; skills written=3/3 as-of=T"
+        );
+        assert!(!line(P::NotRun).contains("probe="));
+        assert!(!line(P::Answered).contains("probe="));
+    }
 
     /// Run git in `dir` with no dependence on the user's global hooks or
     /// signing config.

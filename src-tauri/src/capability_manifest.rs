@@ -1028,15 +1028,39 @@ pub enum SkipReason {
     Rejected(String),
     /// The session's WHOLE `.claude/` tree is authored by the enclosing
     /// repository (it tracks paths under `.claude/`), so the provisioner did
-    /// not run at all for this workdir.
+    /// not run at all for this workdir. ONE fact: the repository tracks
+    /// `.claude/`.
     ///
     /// Distinct from [`SkipReason::GitTracked`] on purpose: that one says
     /// "this destination FILE is tracked", this one says "the whole tree is the
-    /// repo's own" — different facts with different remedies. It is also the
-    /// answer when the tracked-tree probe did not answer inside its budget, or
-    /// git could not be started for want of a machine resource, and the skip
-    /// was taken to avoid clobbering files it could not see.
+    /// repo's own" — different facts with different remedies. The case where
+    /// the tracked-tree probe could not answer is a different fact again and
+    /// has its own label, [`SkipReason::TreeProbeUnanswered`].
     RepoAuthored,
+    /// The session-level `.claude` tracked-tree probe did NOT answer (it timed
+    /// out, its output was truncated, or git could not be started for want of
+    /// a machine resource), so the whole pass was skipped this spawn to avoid
+    /// clobbering files it could not see. Evidence of nothing, not evidence
+    /// that the repository authors `.claude/` ([`SkipReason::RepoAuthored`]),
+    /// and not [`SkipReason::ProbeUnknownInRepo`], which keeps an EXISTING
+    /// destination while still writing absent ones.
+    TreeProbeUnanswered,
+    /// The provisioner STOOD DOWN for the whole kind: the destination resolves
+    /// into the canonical source checkout the bundle is copied from
+    /// (`<workspace root>/qontinui-claude-config/.claude`), so a write would
+    /// overwrite the source. Decided from filesystem metadata alone, never
+    /// from a git probe — see [`crate::provision_guard::stand_down`]. The
+    /// detail says where the destination resolves.
+    CanonicalSource(String),
+    /// The provisioner STOOD DOWN for the whole kind, or skipped one file: the
+    /// destination is reached through a symlink (or a junction), so a write
+    /// would land somewhere other than its lexical path. A provisioner never
+    /// writes through a symlink. The detail names the link.
+    Symlinked(String),
+    /// A destination component could not be examined (a metadata error other
+    /// than "absent"), so the unit was skipped rather than written blind. NOT a
+    /// stand-down: a fault, so it warns and reaches the device-level reading.
+    Unexaminable(String),
 }
 
 impl SkipReason {
@@ -1051,6 +1075,10 @@ impl SkipReason {
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
             SkipReason::RepoAuthored => "repo_authored",
+            SkipReason::TreeProbeUnanswered => "tree_probe_unanswered",
+            SkipReason::CanonicalSource(_) => "canonical_source",
+            SkipReason::Symlinked(_) => "symlinked",
+            SkipReason::Unexaminable(_) => "unexaminable",
         }
     }
 
@@ -1075,7 +1103,66 @@ impl SkipReason {
                  for the whole tree"
                     .to_string()
             }
+            SkipReason::TreeProbeUnanswered => "the session-level `.claude` tracked-tree probe \
+                 did not answer (timeout, truncated output, or a resource-exhausted spawn), so \
+                 the whole pass was skipped this spawn"
+                .to_string(),
+            SkipReason::CanonicalSource(why) => {
+                format!("not written: the destination is the canonical source checkout — {why}")
+            }
+            SkipReason::Symlinked(why) => {
+                format!("not written: the destination is reached through a symlink — {why}")
+            }
+            SkipReason::Unexaminable(why) => format!(
+                "not written: the destination could not be examined, so the unit was skipped — {why}"
+            ),
         }
+    }
+}
+
+/// What the tracked-file probe ([`crate::provision_guard::TrackedPaths::probe`])
+/// did for one pass. Four values, because "it answered", "it could not answer
+/// inside a repository" and "it could not answer outside one" have three
+/// different consequences, and a pass that never probed (a stand-down, a
+/// whole-pass skip) is a fourth fact that must not read like a fault.
+///
+/// Not `process_helpers::ProbeOutcome`, a different type for a different probe
+/// (the session-level `git ls-files -- .claude`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedProbeState {
+    /// The probe ran and git answered.
+    Answered,
+    /// The probe did not answer and the root sits inside a repository, so
+    /// existing destinations were kept while absent ones were still written.
+    UnansweredInRepo,
+    /// The probe did not answer outside any repository (git always fails
+    /// there); destinations were written as before.
+    UnansweredOutsideRepo,
+    /// No probe ran for this pass.
+    #[default]
+    NotRun,
+}
+
+impl TrackedProbeState {
+    /// Stable snake_case wire string, matching the `serde` rename.
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            TrackedProbeState::Answered => "answered",
+            TrackedProbeState::UnansweredInRepo => "unanswered_in_repo",
+            TrackedProbeState::UnansweredOutsideRepo => "unanswered_outside_repo",
+            TrackedProbeState::NotRun => "not_run",
+        }
+    }
+
+    /// True for the two states in which the probe was asked and did not answer.
+    #[must_use]
+    pub fn is_unanswered(self) -> bool {
+        matches!(
+            self,
+            TrackedProbeState::UnansweredInRepo | TrackedProbeState::UnansweredOutsideRepo
+        )
     }
 }
 
@@ -1236,6 +1323,10 @@ pub struct ProvisionReport {
     pub destination: Option<String>,
     /// Provisioner-specific extra, in its own vocabulary.
     pub detail: Option<String>,
+    /// What the tracked-file probe did for this pass.
+    /// [`TrackedProbeState::NotRun`] for a pass that never probed (a stand-down
+    /// or a whole-pass skip).
+    pub probe: TrackedProbeState,
     /// When the pass ran (the report is built as the pass begins, and a pass
     /// lasts milliseconds). Load-bearing for a reader of the ledger that may
     /// be looking at a PREVIOUS spawn's report for the same workdir — the
@@ -1257,8 +1348,65 @@ impl ProvisionReport {
             rung,
             destination: None,
             detail: None,
+            probe: TrackedProbeState::NotRun,
             at: chrono::Utc::now(),
         }
+    }
+
+    /// A pass that wrote NOTHING for a reason that covers the whole destination
+    /// ([`SkipReason::Symlinked`], [`SkipReason::CanonicalSource`],
+    /// [`SkipReason::RepoAuthored`], [`SkipReason::TreeProbeUnanswered`]): one
+    /// skip per `units` entry, each with `reason`, rung [`Rung::Unresolved`],
+    /// no probe run. The token a reader sees is `written=0/N skipped-<reason>=N`,
+    /// the unit being the bundled file, as for any other pass.
+    #[must_use]
+    pub fn whole_pass_skip(
+        capability: &'static str,
+        destination: impl Into<String>,
+        units: impl IntoIterator<Item = String>,
+        reason: &SkipReason,
+    ) -> Self {
+        let units: Vec<String> = units.into_iter().collect();
+        let mut report = ProvisionReport::new(capability, units.len(), Rung::Unresolved)
+            .with_destination(destination);
+        for unit in units {
+            report.skip(unit, reason.clone());
+        }
+        report
+    }
+
+    /// Record what the tracked-file probe did.
+    #[must_use]
+    pub fn with_probe(mut self, probe: TrackedProbeState) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    /// True when this pass wrote nothing because it STOOD DOWN: every skip is
+    /// [`SkipReason::CanonicalSource`] or [`SkipReason::Symlinked`], a fact about
+    /// the session's cwd, not about what the device can deliver. Such a pass is
+    /// logged at `info!` and never becomes the capability's device-level
+    /// reading ([`record_provision`]).
+    #[must_use]
+    pub fn is_stood_down(&self) -> bool {
+        self.written == 0
+            && !self.skipped.is_empty()
+            && self.skipped.iter().all(|u| {
+                matches!(
+                    u.reason,
+                    SkipReason::CanonicalSource(_) | SkipReason::Symlinked(_)
+                )
+            })
+    }
+
+    /// True when [`record_provision`] logs this pass at `warn!`: it degraded and
+    /// did not merely stand down, or its probe could not answer inside a
+    /// repository (a pass that wrote only absent paths then reads
+    /// `is_complete`, and must not look healthy).
+    #[must_use]
+    pub fn warns(&self) -> bool {
+        (self.is_degraded() && !self.is_stood_down())
+            || self.probe == TrackedProbeState::UnansweredInRepo
     }
 
     /// A report for a pass that could not run at all: nothing written, one
@@ -1366,6 +1514,9 @@ impl ProvisionReport {
         if let Some(detail) = &self.detail {
             out.push_str(&format!(" ({detail})"));
         }
+        if self.probe.is_unanswered() {
+            out.push_str(&format!("; tracked-file probe {}", self.probe.wire()));
+        }
         if !self.removed.is_empty() {
             out.push_str(&format!("; {} removed:", self.removed.len()));
             for removed in &self.removed {
@@ -1430,6 +1581,12 @@ impl ProvisionReport {
             obs = obs.with_resolved_path(dest.clone());
         }
         let mut notes = Vec::new();
+        if self.probe.is_unanswered() {
+            notes.push(format!(
+                "the tracked-file probe did not answer ({})",
+                self.probe.wire()
+            ));
+        }
         if !self.skipped.is_empty() {
             let reasons = self
                 .skipped
@@ -1544,28 +1701,49 @@ fn with_store<T>(f: impl FnOnce(&mut ProvisionStore) -> T) -> T {
 /// contract is that provisioning cannot abort a launch. It logs the report at
 /// `info!` when the pass was complete and at `warn!` when it degraded — the same
 /// two levels the provisioners used before, now carrying counts and reasons
-/// instead of a bare sentence.
+/// instead of a bare sentence. Two exceptions, both [`ProvisionReport::warns`]:
+/// a pass that only STOOD DOWN ([`ProvisionReport::is_stood_down`]) is a
+/// deliberate outcome at that cwd and logs at `info!`; a pass whose tracked-file
+/// probe did not answer inside a repository logs at `warn!` even when it wrote
+/// everything, because "complete" there means only that every path was absent.
 pub fn record_provision(workdir: &str, report: ProvisionReport) {
-    if report.is_degraded() {
+    if report.warns() && report.is_degraded() {
         tracing::warn!("provisioning degraded — {}", report.summary());
+    } else if report.warns() {
+        tracing::warn!(
+            "provisioned on an unanswered tracked-file probe — {}",
+            report.summary()
+        );
     } else {
         tracing::info!("provisioned — {}", report.summary());
     }
-    with_store(|s| {
-        s.latest.insert(report.capability, report.observation());
-        match s.sessions.iter_mut().find(|l| l.workdir == workdir) {
+    with_store(|s| s.record(workdir, report));
+}
+
+impl ProvisionStore {
+    /// File one pass under `workdir`, and make it the capability's latest
+    /// device-level reading UNLESS it stood down: a pass that wrote nothing
+    /// because its destination is the canonical source or sits behind a symlink
+    /// is a fact about this SESSION's cwd, not about what the device delivers,
+    /// and `latest_observation("fleet_commands"|"fleet_skills")` feeds the
+    /// device manifest (see [`ManifestInputs::observed`]).
+    fn record(&mut self, workdir: &str, report: ProvisionReport) {
+        if !report.is_stood_down() {
+            self.latest.insert(report.capability, report.observation());
+        }
+        match self.sessions.iter_mut().find(|l| l.workdir == workdir) {
             Some(ledger) => ledger.reports.push(report),
             None => {
-                if s.sessions.len() >= LEDGER_CAPACITY {
-                    s.sessions.pop_front();
+                if self.sessions.len() >= LEDGER_CAPACITY {
+                    self.sessions.pop_front();
                 }
-                s.sessions.push_back(SessionProvisionLedger {
+                self.sessions.push_back(SessionProvisionLedger {
                     workdir: workdir.to_string(),
                     reports: vec![report],
                 });
             }
         }
-    });
+    }
 }
 
 /// The ledger for `workdir`, or `None` when this process has provisioned no such
@@ -3542,5 +3720,139 @@ mod tests {
             .find(|r| r["id"] == "fleet_skills")
             .expect("fleet_skills row");
         assert_eq!(skills["rung"], "embedded");
+    }
+
+    // ------------------------------------------------------------------
+    // The stand-down and the loud ledger (plan
+    // `2026-11-09-the-runner-provisioner-wrote-the-served-claude-config-through-
+    // the-workspace-root-symlink`, Phase 3).
+    // ------------------------------------------------------------------
+
+    fn stood_down_report() -> ProvisionReport {
+        ProvisionReport::whole_pass_skip(
+            "fleet_commands",
+            "ws/.claude/commands",
+            (0..3).map(|i| format!("unit-{i}.md")),
+            &SkipReason::Symlinked("ws/.claude -> repo/.claude is a symlink".to_string()),
+        )
+    }
+
+    /// T10 — a stand-down is a fact about the SESSION's cwd, not about what the
+    /// device delivers: it is filed in the session's ledger but never becomes
+    /// the capability's latest (device-level) observation, and it does not log
+    /// as a degraded pass. Run against a LOCAL store so no parallel test's
+    /// writes to the process-wide one can interfere.
+    #[test]
+    fn a_stood_down_pass_stays_out_of_the_device_reading() {
+        let mut store = ProvisionStore {
+            sessions: std::collections::VecDeque::new(),
+            latest: std::collections::HashMap::new(),
+        };
+        let mut healthy =
+            ProvisionReport::new("fleet_commands", 3, Rung::Embedded).with_detail("T10 baseline");
+        for _ in 0..3 {
+            healthy.record_written();
+        }
+        store.record("agent-worktree", healthy);
+        let baseline = store
+            .latest
+            .get("fleet_commands")
+            .cloned()
+            .expect("a reading");
+
+        let stood = stood_down_report();
+        assert!(stood.is_stood_down());
+        assert!(
+            !stood.warns(),
+            "a stand-down logs at info, not `provisioning degraded`"
+        );
+        assert!(
+            stood.is_degraded(),
+            "the manifest-level shortfall is unchanged"
+        );
+        store.record("workspace-root", stood);
+
+        assert_eq!(
+            store.latest.get("fleet_commands"),
+            Some(&baseline),
+            "the stand-down must not replace the device-level reading"
+        );
+        let filed = store
+            .sessions
+            .iter()
+            .find(|l| l.workdir == "workspace-root")
+            .expect("the stand-down is still filed against its session");
+        assert_eq!(filed.reports.len(), 1);
+    }
+
+    /// The other whole-pass skips and a partly-skipped pass are NOT stand-downs:
+    /// they degrade, they warn, and they stay the latest reading.
+    #[test]
+    fn only_a_whole_pass_of_stand_down_skips_stands_down() {
+        let repo_authored = ProvisionReport::whole_pass_skip(
+            "fleet_commands",
+            "d",
+            ["a.md".to_string()],
+            &SkipReason::RepoAuthored,
+        );
+        assert!(!repo_authored.is_stood_down());
+        assert!(repo_authored.warns());
+
+        let mut partial = ProvisionReport::new("fleet_commands", 2, Rung::Embedded);
+        partial.record_written();
+        partial.skip("b.md", SkipReason::Symlinked("b is a symlink".to_string()));
+        assert!(
+            !partial.is_stood_down(),
+            "a pass that wrote something is not a stand-down"
+        );
+        assert!(partial.warns());
+
+        let mut mixed = ProvisionReport::new("fleet_commands", 2, Rung::Unresolved);
+        mixed.skip("a.md", SkipReason::Symlinked("x".to_string()));
+        mixed.skip("b.md", SkipReason::GitTracked);
+        assert!(!mixed.is_stood_down());
+    }
+
+    /// The new reasons keep their wire spellings, and a report carrying an
+    /// unanswered probe says so in its summary and its manifest note.
+    #[test]
+    fn the_new_reasons_and_the_probe_state_have_stable_wire_spellings() {
+        assert_eq!(
+            SkipReason::TreeProbeUnanswered.wire(),
+            "tree_probe_unanswered"
+        );
+        assert_eq!(
+            SkipReason::CanonicalSource(String::new()).wire(),
+            "canonical_source"
+        );
+        assert_eq!(SkipReason::Symlinked(String::new()).wire(), "symlinked");
+        assert_eq!(
+            SkipReason::Unexaminable(String::new()).wire(),
+            "unexaminable"
+        );
+        assert_eq!(
+            TrackedProbeState::UnansweredInRepo.wire(),
+            "unanswered_in_repo"
+        );
+        assert_eq!(
+            serde_json::to_value(TrackedProbeState::UnansweredOutsideRepo).unwrap(),
+            "unanswered_outside_repo"
+        );
+        assert_eq!(TrackedProbeState::default(), TrackedProbeState::NotRun);
+
+        let mut report = ProvisionReport::new("fleet_skills", 1, Rung::Embedded)
+            .with_probe(TrackedProbeState::UnansweredInRepo);
+        report.record_written();
+        assert!(report.is_complete() && report.warns());
+        assert!(report
+            .summary()
+            .contains("tracked-file probe unanswered_in_repo"));
+        let note = report.observation().note.unwrap_or_default();
+        assert!(note.contains("probe did not answer"), "{note}");
+
+        let healthy = ProvisionReport::new("fleet_skills", 0, Rung::Embedded)
+            .with_probe(TrackedProbeState::Answered);
+        assert!(!healthy.warns());
+        assert!(!healthy.summary().contains("probe"));
     }
 }
