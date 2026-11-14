@@ -269,8 +269,8 @@ async fn analyze_handler(
     // Discover qontinui-root (parent of src-tauri)
     let root = find_qontinui_root().map_err(|e| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Cannot find qontinui-root: {}", e))),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::workspace_root_unresolved(&e)),
         )
     })?;
 
@@ -426,9 +426,9 @@ fn compute_start_time(
 /// - the walk was capped at 10 ancestors for no stated reason.
 ///
 /// Fails closed, because the recap's error is surfaced straight to the caller as
-/// a 500 and a fabricated root would silently produce an empty recap that reads
-/// like "nothing changed".
-fn find_qontinui_root() -> Result<PathBuf, String> {
+/// a typed 422 (`workspace_root_unresolved`) and a fabricated root would
+/// silently produce an empty recap that reads like "nothing changed".
+fn find_qontinui_root() -> Result<PathBuf, qontinui_types::paths::WorkspaceRootUnresolved> {
     crate::workspace_paths::require_workspace_root()
 }
 

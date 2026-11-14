@@ -816,7 +816,7 @@ fn start_build(
     let root = match crate::workspace_paths::require_workspace_root() {
         Ok(root) => root,
         Err(reason) => {
-            reject(&payload, reason);
+            reject(&payload, reason.to_string());
             return;
         }
     };

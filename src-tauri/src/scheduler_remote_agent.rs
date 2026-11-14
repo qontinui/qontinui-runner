@@ -305,13 +305,20 @@ pub(crate) async fn launch(
     crate::resource_guard::precheck_spawn("scheduled remote agent", false)?;
 
     // Provision what a session on a runner-only device has no other source
-    // for: the coord-mcp door, the bundled fleet commands and the bundled
-    // fleet skills (`/return-to-main` among them). Every one of these skips a
-    // destination the enclosing repo tracks, so a workspace root whose
-    // `.claude/` is a checkout is left alone.
+    // for: the coord-mcp door, the bundled fleet commands, the bundled fleet
+    // skills (`/return-to-main` among them) and the bundled subagent
+    // definitions.
+    //
+    // The working directory is the OPERATOR's choice, so the fleet trees go
+    // through the same gate the terminal chokepoint uses
+    // (`isolated_edit::provision_fleet_for_cwd`): where the cwd's `.claude/` is
+    // tracked by its repository, commands and skills are skipped whole-tree,
+    // and agent definitions are written only into an allocated agent worktree
+    // — an operator's checkout gets no untracked agent files. Elsewhere all
+    // three are provisioned as before, each skipping a destination the
+    // enclosing repo tracks.
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir_s, bound_port, None);
-    crate::fleet_commands::provision_fleet_commands_for_session(&workdir_s);
-    crate::fleet_skills::provision_fleet_skills_for_session(&workdir_s);
+    crate::agent_worktree::isolated_edit::provision_fleet_for_cwd(&workdir_s);
 
     // Most-available account, so the child does not spawn under a
     // quota-exhausted default and die on its first request.
@@ -497,6 +504,93 @@ pub(crate) async fn pump_to_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A3: the launch provisions the fleet trees through the operator-cwd gate,
+    /// never through the ungated per-provisioner calls. Pinned on the source,
+    /// because `launch` spawns a real `claude`.
+    #[test]
+    fn scheduler_launch_provisions_through_the_operator_cwd_gate() {
+        let src = include_str!("scheduler_remote_agent.rs");
+        let launch = &src[src.find("pub(crate) async fn launch(").expect("launch")..];
+        let launch = &launch[..launch.find("\n}\n").expect("end of launch")];
+        assert!(launch.contains("isolated_edit::provision_fleet_for_cwd(&workdir_s)"));
+        for ungated in [
+            "provision_agent_definitions_recorded(",
+            "provision_fleet_commands_for_session(",
+            "provision_fleet_skills_for_session(",
+        ] {
+            assert!(!launch.contains(ungated), "launch calls {ungated} ungated");
+        }
+    }
+
+    /// A3: through that gate, an operator's checkout whose `.claude/` the
+    /// repository tracks (not an allocated worktree) receives no agent files.
+    #[test]
+    fn scheduler_gate_writes_no_agent_files_into_a_tracked_operator_checkout() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        crate::provision_guard::test_support::git_init(root);
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        std::fs::write(root.join(".claude/commands/own.md"), b"own").unwrap();
+        crate::provision_guard::test_support::git_add(
+            root,
+            std::path::Path::new(".claude/commands/own.md"),
+        );
+
+        crate::agent_worktree::isolated_edit::provision_fleet_for_cwd(root.to_str().unwrap());
+
+        let agents = root.join(".claude/agents");
+        let written = std::fs::read_dir(&agents).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(
+            written, 0,
+            "no agent file lands in an operator's tracked checkout"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".claude/commands/own.md")).unwrap(),
+            b"own",
+            "the checkout's own tracked command is byte-unchanged"
+        );
+        let commands = std::fs::read_dir(root.join(".claude/commands"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec!["own.md".to_string()], "no command was added");
+
+        // The skip is RECORDED, not silent: the ledger holds the operator-checkout
+        // agent row, and the commands pass as repo-authored.
+        let ledger = crate::capability_manifest::session_provision_ledger(root.to_str().unwrap())
+            .expect("the gate records its skips against this workdir");
+        let agent_rows: Vec<_> = ledger
+            .reports
+            .iter()
+            .filter(|r| r.capability == "agent_definitions")
+            .collect();
+        assert_eq!(agent_rows.len(), 1, "{agent_rows:?}");
+        assert_eq!(agent_rows[0].written, 0);
+        assert!(
+            agent_rows[0].skipped.iter().any(|u| matches!(
+                &u.reason,
+                crate::capability_manifest::SkipReason::Unresolved(why)
+                    if why.contains("not an allocated agent worktree")
+            )),
+            "{:?}",
+            agent_rows[0].skipped
+        );
+        assert!(
+            ledger
+                .reports
+                .iter()
+                .any(|r| r.capability == "fleet_commands"
+                    && r.written == 0
+                    && !r.skipped.is_empty()
+                    && r.skipped
+                        .iter()
+                        .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored)),
+            "the commands pass is recorded as repo-authored: {:?}",
+            ledger.reports
+        );
+    }
 
     #[tokio::test]
     async fn read_lossy_lines_survives_non_utf8_and_keeps_draining() {

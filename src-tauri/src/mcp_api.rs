@@ -1642,7 +1642,21 @@ struct ProvisionProbeBody {
     /// Both shapes now land on the same 400 as an empty string.
     #[serde(default)]
     workdir: Option<String>,
+    /// Optional absolute path to an EXISTING git checkout's top level — the
+    /// repository a real session would have been opened on. Used ONLY to
+    /// resolve the workspace root the way a session scoped to that repository
+    /// does ([`crate::workspace_paths::session_workspace_root`], whose
+    /// `session_repo_parent` rung it reaches). Nothing is written into it:
+    /// every write still lands in the probe's own directory under `workdir`.
+    /// Given but not a checkout's top level → a typed 400
+    /// (`code: session_repo_not_a_checkout`). Absent, blank or `null` → the
+    /// probe resolves against its own (never-a-checkout) directory, as before.
+    #[serde(default)]
+    session_repo: Option<String>,
 }
+
+/// The `code` of the 400 a `session_repo` that is not a checkout gets.
+const SESSION_REPO_NOT_A_CHECKOUT: &str = "session_repo_not_a_checkout";
 
 /// What `POST /capability-manifest/provision-probe` answers with.
 #[derive(Debug, serde::Serialize)]
@@ -1658,11 +1672,21 @@ struct ProvisionProbeResponse {
     provisioned_into: String,
     /// The `agent_definitions` report this pass recorded — ONE entry, not both
     /// rows. The embedded `fleet_agents` floor is recorded by the same call from
-    /// inside `provision_agent_definitions_from_root`, which does not hand it
+    /// inside the provisioning pass, which does not hand it
     /// back, so it is visible on the next manifest read rather than here. A
     /// caller that needs both reads the manifest, which is what the parity
     /// harness does anyway.
     recorded: Vec<crate::capability_manifest::ProvisionReport>,
+    /// The `session_repo` the root was resolved for, as given; `null` when the
+    /// caller supplied none.
+    session_repo: Option<String>,
+    /// Which rung resolved the workspace root for THIS pass
+    /// (`WorkspaceRootKind::wire`: `declared`, `discovered`,
+    /// `session_repo_parent`, `home_default`, `unresolved`). Also carried in the
+    /// recorded `agent_definitions` report's detail. Per-pass, so it can differ
+    /// from the runner-wide `workspace_root` row of `GET /capability-manifest`,
+    /// which resolves with no session repository by design.
+    workspace_root_kind: &'static str,
 }
 
 /// `POST /capability-manifest/provision-probe` — fill the two
@@ -1703,15 +1727,17 @@ struct ProvisionProbeResponse {
 ///   own function, but the root that function resolves depends on the
 ///   destination: `session_workspace_root` adds the folder holding the session's
 ///   checkout as a rung, ahead of the home default. The probe's directory is
-///   never a checkout (it refuses one, above), so the probe never reads that
-///   rung. Where a declared root or the runner's own checkout answers, the probe
-///   and a spawn resolve the same root and only the destination differs.
-///   Elsewhere they can disagree. With no other rung, the probe records
-///   `agent_definitions` unresolved and no `fleet_agents` row, while a spawn into
-///   a checkout writes the embedded floor. On a box answered only by
-///   `<home>/qontinui-root`, the probe reads that root while a spawn into a
-///   checkout reads the checkout's parent, so the two rows can name different
-///   rungs.
+///   never a checkout (it refuses one, above), so with no `session_repo` the
+///   probe never reads that rung; a caller that wants it — the parity harness,
+///   which `git init`s a throwaway foreign repository per leg — passes that
+///   checkout as `session_repo`, and the root is then resolved for it exactly as
+///   a spawn opened on it resolves it (writes still land in the probe's own
+///   directory). Where a declared root or the runner's own checkout answers,
+///   every rung below is moot and only the destination differs. With no rung at
+///   all, the probe records `agent_definitions` unresolved but STILL writes and
+///   records the embedded `fleet_agents` floor — only the qontinui-claude-config
+///   overlay needs a root. The response's `workspace_root_kind` names the rung
+///   that answered for this pass.
 /// * the per-session ledger index — each call adds one ledger keyed by its own
 ///   fresh `probe-<uuid>` directory, and that index is capped at
 ///   `LEDGER_CAPACITY` (64), oldest dropped first. So N calls can push the N
@@ -1734,7 +1760,14 @@ async fn capability_manifest_provision_probe(
             .into_response()
     };
 
-    let requested = body.workdir.unwrap_or_default().trim().to_string();
+    let ProvisionProbeBody {
+        workdir: requested,
+        session_repo,
+    } = body;
+    let session_repo = session_repo
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let requested = requested.unwrap_or_default().trim().to_string();
     if requested.is_empty() {
         return refuse("workdir is required and must be an absolute path".to_string());
     }
@@ -1847,6 +1880,55 @@ async fn capability_manifest_provision_probe(
     // directory away after the re-resolution and swap in a link, which would be
     // a real, if narrow, capability. The probe narrows that window; it does not
     // close it, and must not be described as if it did.
+    // `session_repo` is READ, never written: it only answers which workspace root
+    // a session opened on it resolves. It is vetted before the probe creates
+    // anything, and passed to the resolver as the caller spelled it (the
+    // resolver folds lexically and refuses `.`/`..` itself, and this vetting
+    // refuses them too so the typed 400 names them; canonicalizing here would
+    // hand it a Windows `\\?\` path no other rung produces).
+    if let Some(repo) = &session_repo {
+        let repo_path = std::path::Path::new(repo);
+        let refusal = if !repo_path.is_absolute() {
+            Some(format!(
+                "session_repo must be an absolute path to a git checkout's top level; got {repo:?}."
+            ))
+        } else if repo_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }) || repo
+            // `Path::components` normalizes an interior `.` away (`/a/./b`
+            // yields no `CurDir`), so the raw segments are checked as well.
+            .split(['/', '\\'])
+            .any(|seg| seg == "." || seg == "..")
+        {
+            Some(format!(
+                "session_repo must not contain `.` or `..` components; got {repo:?}. Spell \
+                 the checkout's top level directly."
+            ))
+        } else if !repo_path.is_dir() {
+            Some(format!(
+                "session_repo {repo:?} is not an existing directory. Point it at the top level \
+                 of an existing git checkout (the folder holding its .git)."
+            ))
+        } else if !repo_path.join(".git").exists() {
+            Some(format!(
+                "session_repo {repo:?} is not a git checkout's top level: it holds no .git. \
+                 Point it at the folder holding the checkout's .git, or omit session_repo."
+            ))
+        } else {
+            None
+        };
+        if let Some(msg) = refusal {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg, "code": SESSION_REPO_NOT_A_CHECKOUT })),
+            )
+                .into_response();
+        }
+    }
+
     let target = path.join(format!("probe-{}", uuid::Uuid::new_v4()));
     if let Err(e) = std::fs::create_dir(&target) {
         return refuse(format!(
@@ -1879,12 +1961,30 @@ async fn capability_manifest_provision_probe(
     let provisioned_into = target.display().to_string();
 
     let workdir_for_task = provisioned_into.clone();
-    let recorded = match spawn_blocking_tracked(move || {
-        crate::agent_runtime::provision_agent_definitions_recorded(&workdir_for_task)
+    let session_repo_for_task = session_repo.clone();
+    let (recorded, workspace_root_kind) = match spawn_blocking_tracked(move || {
+        // The spawn path's own function, with its root resolver injected only
+        // to (a) aim it at `session_repo` when one was given and (b) read back
+        // which rung answered.
+        let mut kind = qontinui_types::paths::WorkspaceRootKind::Unresolved;
+        let reports = crate::agent_runtime::provision_agent_definitions_recorded_with(
+            &workdir_for_task,
+            |own_workdir| {
+                let resolved = match &session_repo_for_task {
+                    Some(repo) => {
+                        crate::workspace_paths::session_workspace_root(std::path::Path::new(repo))
+                    }
+                    None => crate::workspace_paths::session_workspace_root(own_workdir),
+                };
+                kind = resolved.kind;
+                resolved
+            },
+        );
+        (reports, kind.wire())
     })
     .await
     {
-        Ok(reports) => reports,
+        Ok(answer) => answer,
         Err(e) => {
             // A panicked pass answering 200 with `recorded: []` would read to the
             // harness exactly like a pass that recorded nothing, and its caller
@@ -1906,6 +2006,8 @@ async fn capability_manifest_provision_probe(
         workdir,
         provisioned_into,
         recorded,
+        session_repo,
+        workspace_root_kind,
     })
     .into_response()
 }
@@ -13319,14 +13421,14 @@ pub fn create_router(
             // arms are UNKNOWN; they are not the SAME unknown, and only one of
             // them is a bug worth chasing.
             let census_line = match census_task.await {
-                Ok(Some(c)) => format!(
+                Ok(Ok(c)) => format!(
                     "{} total = {} open-record-backed / {} dead-record-backed / {} orphaned",
                     c.total, c.open_backed, c.dead_backed, c.orphaned
                 ),
                 // No workspace root resolved: UNKNOWN, not an empty disk. Saying
                 // "0 total" here would be the same class of lie the corrected
                 // `restored` number above exists to stop telling.
-                Ok(None) => "UNAVAILABLE (no workspace root resolved)".to_string(),
+                Ok(Err(unresolved)) => format!("UNAVAILABLE ({unresolved})"),
                 Err(e) => format!("UNAVAILABLE (the census task itself failed: {e})"),
             };
             info!(
@@ -24494,10 +24596,51 @@ mod provision_probe_tests {
     use super::{capability_manifest_provision_probe, enclosing_git_work_tree, ProvisionProbeBody};
     use axum::response::Json;
 
+    /// A temporary directory guaranteed to sit outside every git work tree, as
+    /// the handler judges one ([`enclosing_git_work_tree`] on the canonical
+    /// path). `TMPDIR` comes first; when it lies inside a checkout (a runner
+    /// session's scratch dir can), the next candidate that does not is used, so
+    /// a test that needs a scratch cwd outside any repository always runs its
+    /// assertions instead of skipping them.
+    fn tempdir_outside_any_work_tree() -> tempfile::TempDir {
+        let mut candidates = vec![std::env::temp_dir()];
+        #[cfg(unix)]
+        candidates.extend(["/tmp", "/var/tmp", "/dev/shm"].map(std::path::PathBuf::from));
+        #[cfg(windows)]
+        candidates.extend(
+            ["SystemRoot", "SystemDrive"]
+                .iter()
+                .filter_map(|v| std::env::var_os(v))
+                .map(|v| std::path::PathBuf::from(v).join("Temp")),
+        );
+        for base in &candidates {
+            let Ok(dir) = tempfile::tempdir_in(base) else {
+                continue;
+            };
+            let canonical = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().into());
+            if enclosing_git_work_tree(&canonical).is_none() {
+                return dir;
+            }
+        }
+        panic!(
+            "no writable temporary directory outside a git work tree among {candidates:?}; \
+             this test needs one to reach the refusal arms it covers"
+        );
+    }
+
     /// Drive the handler and return `(status, body)`.
     async fn probe(workdir: &str) -> (axum::http::StatusCode, String) {
+        probe_with(workdir, None).await
+    }
+
+    /// [`probe`] with an optional `session_repo`.
+    async fn probe_with(
+        workdir: &str,
+        session_repo: Option<&str>,
+    ) -> (axum::http::StatusCode, String) {
         let resp = capability_manifest_provision_probe(Json(ProvisionProbeBody {
             workdir: Some(workdir.to_string()),
+            session_repo: session_repo.map(str::to_string),
         }))
         .await;
         let status = resp.status();
@@ -24505,6 +24648,86 @@ mod provision_probe_tests {
             .await
             .expect("read body");
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// B3 vet 2026-11-13 item 1: a `session_repo` that is not a checkout's top
+    /// level is a typed 400 and nothing is created; a real checkout is accepted,
+    /// read but never written, and the rung that answered is echoed both in the
+    /// response and in the recorded `agent_definitions` detail. (Which rung
+    /// answers depends on the box's declarations and this binary's ancestry;
+    /// `agent_runtime`'s `a_session_repo_checkout_yields_session_repo_parent_*`
+    /// pins the `session_repo_parent` arm through the same injected door.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_repo_is_vetted_read_only_and_its_rung_is_echoed() {
+        let root = tempdir_outside_any_work_tree();
+        let scratch = root.path().join("scratch");
+        let repo = root.path().join("foreign-repo");
+        let not_a_checkout = root.path().join("plain-folder");
+        for d in [&scratch, &repo, &not_a_checkout] {
+            std::fs::create_dir_all(d).expect("create");
+        }
+        std::fs::create_dir_all(repo.join(".git")).expect("create .git");
+
+        // `.`/`..` components are refused even when the path they spell would
+        // resolve to the real checkout.
+        let with_parent = root
+            .path()
+            .join("plain-folder")
+            .join("..")
+            .join("foreign-repo");
+        let with_cur_dir = format!("{}/./", repo.display());
+        let with_interior_cur_dir = root
+            .path()
+            .join(".")
+            .join("foreign-repo")
+            .display()
+            .to_string();
+        for bad in [
+            not_a_checkout.display().to_string(),
+            "relative/repo".to_string(),
+            with_parent.display().to_string(),
+            with_cur_dir,
+            with_interior_cur_dir,
+        ] {
+            let (status, body) = probe_with(&scratch.display().to_string(), Some(&bad)).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(parsed["code"], super::SESSION_REPO_NOT_A_CHECKOUT, "{body}");
+        }
+        assert_eq!(
+            std::fs::read_dir(&scratch).expect("scratch").count(),
+            0,
+            "a refused session_repo creates nothing"
+        );
+
+        let repo_s = repo.display().to_string();
+        let (status, body) = probe_with(&scratch.display().to_string(), Some(&repo_s)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(parsed["session_repo"], repo_s.as_str());
+        let kind = parsed["workspace_root_kind"]
+            .as_str()
+            .expect("workspace_root_kind");
+        assert!(
+            [
+                "declared",
+                "discovered",
+                "session_repo_parent",
+                "home_default",
+                "unresolved"
+            ]
+            .contains(&kind),
+            "{kind}"
+        );
+        let detail = parsed["recorded"][0]["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(&format!("workspace_root_kind: {kind}")),
+            "the row carries the same rung as the response: {detail}"
+        );
+        assert!(
+            !repo.join(".claude").exists(),
+            "the session repository is never written"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -24707,16 +24930,15 @@ mod provision_probe_tests {
     /// row the ledger recorded — the property the parity harness reads.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scratch_dir_is_probed_and_the_recorded_row_comes_back() {
-        let dir = std::env::temp_dir().join(format!("parity-probe-ok-{}", std::process::id()));
+        // Outside every work tree, checked on the CANONICAL path the handler
+        // checks (on macOS /var resolves to /private/var), so the assertions
+        // below always run rather than skipping on a TMPDIR inside a repo.
+        let root = tempdir_outside_any_work_tree();
+        let dir = root
+            .path()
+            .join(format!("parity-probe-ok-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch");
-        // Guard the guard: a temp dir that happens to sit inside a repo would
-        // make this test assert the wrong arm. Check the CANONICAL path, which
-        // is what the handler checks — on macOS /var resolves to /private/var.
         let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        if enclosing_git_work_tree(&canonical).is_some() {
-            std::fs::remove_dir_all(&dir).ok();
-            return;
-        }
 
         let (status, body) = probe(&dir.display().to_string()).await;
         assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");

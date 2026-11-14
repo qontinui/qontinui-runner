@@ -1987,7 +1987,7 @@ fn dev_logs_dir_in(root: &std::path::Path) -> std::path::PathBuf {
 pub async fn migrate_task_run_logs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
     use tracing::info;
 
     info!("Migrating JSONL logs for task run: {}", id);
@@ -1998,14 +1998,25 @@ pub async fn migrate_task_run_logs(
         .pg_db
         .get_task_run(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e)),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error(format!("Task run not found: {}", id))),
+            )
+        })?;
 
-    // Get the dev-logs directory path
+    // Get the dev-logs directory path. An unresolved root is the shared typed
+    // refusal (code `workspace_root_unresolved`), not a re-worded 500.
     let workspace_root = crate::workspace_paths::require_workspace_root().map_err(|why| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to resolve .dev-logs path: {why}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::workspace_root_unresolved(&why)),
         )
     })?;
     let dev_logs_dir = dev_logs_dir_in(&workspace_root);
@@ -2015,7 +2026,9 @@ pub async fn migrate_task_run_logs(
     let _dev_logs_dir = dev_logs_dir;
     Err((
         StatusCode::INTERNAL_SERVER_ERROR,
-        "Log migration to PostgreSQL is not yet implemented".to_string(),
+        Json(ApiResponse::error(
+            "Log migration to PostgreSQL is not yet implemented",
+        )),
     ))
 }
 

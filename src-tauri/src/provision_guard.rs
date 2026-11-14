@@ -419,6 +419,13 @@ impl KeepDecisions {
         Self { reasons }
     }
 
+    /// Keep `name` for `reason` too, unless it is already kept (the first
+    /// reason decided wins). For a rule beyond the tracked-file probe, such as
+    /// the agent provisioner's "not a copy this runner shipped".
+    pub(crate) fn keep_also(&mut self, name: &str, reason: SkipReason) {
+        self.reasons.entry(name.to_string()).or_insert(reason);
+    }
+
     /// Why `name` is kept, or `None` when this pass may write it.
     pub(crate) fn reason(&self, name: &str) -> Option<&SkipReason> {
         self.reasons.get(name)
@@ -602,6 +609,28 @@ pub(crate) mod test_support {
             .expect("run git add")
             .success();
         assert!(ok, "git add should succeed");
+    }
+
+    /// Commit what `dir`'s index holds, with the same scrubbed environment as
+    /// [`git_init`] (and signing off, so no global config can stall it).
+    pub(crate) fn git_commit(dir: &Path, message: &str) {
+        let ok = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run git commit")
+            .success();
+        assert!(ok, "git commit should succeed");
     }
 
     /// Assert `dir` is not inside ANY git repository.

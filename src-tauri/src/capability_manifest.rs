@@ -758,9 +758,9 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       qontinui-claude-config's hourly `fleet-agents-parity` gate \
                       (`agent-bundle-parity.sh`) checks that the two repositories' \
                       default branches agree, not this disk against this binary. When \
-                      the root does not resolve the \
-                      copy is a no-op that logs \"no qontinui-root resolved; skipping \
-                      .claude/agents\" and continues.",
+                      the root does not resolve, the checkout copy is skipped while the \
+                      embedded floor is still written, and this row is `unresolved` with \
+                      the workspace-root-unresolved refusal as its reason.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },
@@ -1037,6 +1037,27 @@ pub enum SkipReason {
     /// git could not be started for want of a machine resource, and the skip
     /// was taken to avoid clobbering files it could not see.
     RepoAuthored,
+    /// An EXISTING destination was kept because nothing shows this runner
+    /// wrote it: an operator-authored file whose bytes are no copy this runner
+    /// ships or shipped, a symbolic link (never written through), a destination
+    /// that is not a regular file or could not be inspected or read, or one
+    /// whose ownership probe did not answer (UNKNOWN, kept on the safe side).
+    /// The detail says which.
+    ///
+    /// Distinct from [`SkipReason::Rejected`] on purpose: that one says the
+    /// provisioner's validation REFUSED the content it was handed, while this
+    /// one says the content was fine and the file already on disk is not this
+    /// runner's to replace. A deliberate keep, like [`SkipReason::GitTracked`].
+    OperatorAuthored(String),
+    /// The destination IS the overlay source file (a hard link to it, or the
+    /// same file through another path), so the checkout's own copy is what the
+    /// session reads, served in place, and there was nothing to copy.
+    ///
+    /// Distinct from [`SkipReason::OperatorAuthored`] on purpose: nothing here
+    /// is an operator's file kept against this runner; the unit is the
+    /// checkout's own definition and the session has it. The pass still
+    /// records it, so a reader can see the unit was not freshly written.
+    ServedInPlace,
 }
 
 impl SkipReason {
@@ -1051,6 +1072,8 @@ impl SkipReason {
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
             SkipReason::RepoAuthored => "repo_authored",
+            SkipReason::OperatorAuthored(_) => "operator_authored",
+            SkipReason::ServedInPlace => "served_in_place",
         }
     }
 
@@ -1075,6 +1098,10 @@ impl SkipReason {
                  for the whole tree"
                     .to_string()
             }
+            SkipReason::OperatorAuthored(why) => format!("kept: {why}"),
+            SkipReason::ServedInPlace => "served in place: the destination is the checkout's \
+                 own source file, so there was nothing to copy"
+                .to_string(),
         }
     }
 }
@@ -2209,6 +2236,17 @@ mod tests {
             .contains("authored by its repository"));
         let json = serde_json::to_value(SkipReason::RepoAuthored).unwrap();
         assert_eq!(json["reason"], "repo_authored");
+    }
+
+    #[test]
+    fn operator_authored_is_its_own_skip_reason() {
+        let reason = SkipReason::OperatorAuthored("a symbolic link".to_string());
+        assert_eq!(reason.wire(), "operator_authored");
+        assert_ne!(reason, SkipReason::Rejected("a symbolic link".to_string()));
+        assert_eq!(reason.describe(), "kept: a symbolic link");
+        let json = serde_json::to_value(&reason).unwrap();
+        assert_eq!(json["reason"], "operator_authored");
+        assert_eq!(json["detail"], "a symbolic link");
     }
 
     #[test]

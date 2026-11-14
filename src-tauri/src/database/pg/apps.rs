@@ -561,8 +561,8 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
         Ok(root) => root,
         Err(why) => {
             info!(
-                "bootstrap: QONTINUI_DEV_BOOTSTRAP=1 but no workspace root resolved, so \
-                 no dev apps were registered. {why} Dev apps are registered at boot, \
+                "bootstrap: QONTINUI_DEV_BOOTSTRAP=1, but no dev apps were registered: \
+                 {why} Dev apps are registered at boot, \
                  so a change takes effect at the next runner start."
             );
             return Ok(());

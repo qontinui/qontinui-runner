@@ -6520,13 +6520,12 @@ pub async fn publish_tree_state() -> Result<(), String> {
         }
     };
 
-    let root = match qontinui_root() {
-        Some(p) => p,
-        None => {
+    let root = match crate::workspace_paths::runner_workspace_root().require() {
+        Ok(p) => p,
+        Err(unresolved) => {
             info!(
-                "fleet::tree_publisher: no workspace root resolved, so there are no repos \
-                 to publish (set the \"{}\" setting to point at them). Skipping.",
-                qontinui_types::paths::WORKSPACE_ROOT_SETTING
+                "fleet::tree_publisher: {unresolved} With no workspace root there are no \
+                 repos to publish. Skipping."
             );
             return Ok(());
         }

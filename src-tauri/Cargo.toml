@@ -250,6 +250,7 @@ proc-macro2 = { version = "1.0", features = ["span-locations"] }
 # misplaced under [target.'cfg(windows)'.dependencies], which broke
 # Linux + macOS builds.
 walkdir = "2.5"
+same-file = "1.0"
 glob-match = "0.2"
 jsonpath-rust = "1"
 
