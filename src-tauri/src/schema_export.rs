@@ -614,9 +614,6 @@ pub fn export_all_schemas() -> Value {
     add!("LLMCostSummary", qe::LLMCostSummary);
     add!("CostTrendDataPoint", qe::CostTrendDataPoint);
     add!("CostTrendResponse", qe::CostTrendResponse);
-    add!("HistoricalActionQuery", qe::HistoricalActionQuery);
-    add!("HistoricalActionResult", qe::HistoricalActionResult);
-    add!("PlaybackFrameRequest", qe::PlaybackFrameRequest);
 
     // ── qontinui-types: state_machine (Session 4d) ──
     add!("StandardActionType", qsm::StandardActionType);
@@ -1107,8 +1104,13 @@ mod tests {
         // verifier that alone filled them, plan
         // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
         // Phase 6) = 620.
-        // The codegen's "Processing N top-level types" line should read 620 here.
-        assert_eq!(obj.len(), 620, "Expected 620 schema entries");
+        // - the 3 Historical Playback execution types (HistoricalActionQuery,
+        // HistoricalActionResult, PlaybackFrameRequest — no reader or writer
+        // anywhere, plan
+        // 2026-11-08-the-historical-playback-execution-schemas-have-no-consumer-and-are-deleted
+        // Phase 1) = 617.
+        // The codegen's "Processing N top-level types" line should read 617 here.
+        assert_eq!(obj.len(), 617, "Expected 617 schema entries");
         // Nothing in the product fills those four any more, so registering
         // one again would export a verdict DTO that has no producer.
         for removed in [
