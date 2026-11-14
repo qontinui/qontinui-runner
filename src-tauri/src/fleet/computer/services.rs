@@ -440,6 +440,7 @@ pub(crate) mod linux {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::time::Duration;
 
+    use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
     use tracing::debug;
     use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -546,10 +547,20 @@ pub(crate) mod linux {
             if !any_answered {
                 return ServiceScan::default();
             }
-            let units = by_unit
-                .values()
-                .map(|p| super::watched_from_props(p, true))
-                .collect();
+            // Up to two file reads per unit (`.runner`, cgroup
+            // `memory.events`): one tracked blocking body, off the async
+            // worker. A panicked body is no service information this tick.
+            let props: Vec<UnitProps> = by_unit.into_values().collect();
+            let Ok(units) = spawn_blocking_tracked(move || {
+                props
+                    .iter()
+                    .map(|p| super::watched_from_props(p, true))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            else {
+                return ServiceScan::default();
+            };
             ServiceScan {
                 units: Some(units),
                 complete_kinds: linux_complete_kinds(system_ok, session),
@@ -910,6 +921,8 @@ pub(crate) fn props_from_sc(s: &ScService) -> UnitProps {
 pub(crate) mod windows {
     use std::time::Duration;
 
+    use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
     use super::{
         parse_sc_qc_binary_path, parse_sc_query, props_from_sc, read_runner_file, row_from_props,
         sc_listing_complete, windows_runner_dir, ServiceScan, WatchedUnit, KIND_GH_ACTIONS_RUNNER,
@@ -960,23 +973,37 @@ pub(crate) mod windows {
                 );
             }
         }
-        let mut units = Vec::new();
+        let mut found = Vec::new();
         for s in parse_sc_query(&listing)
             .into_iter()
             .filter(|s| s.name.starts_with("actions.runner."))
         {
-            let props = props_from_sc(&s);
-            let runner = match sc(&["qc", s.name.as_str()]).await {
-                Some((Some(0), qc)) => parse_sc_qc_binary_path(&qc)
-                    .and_then(|p| windows_runner_dir(&p))
-                    .and_then(|d| read_runner_file(std::path::Path::new(&d))),
+            let runner_dir = match sc(&["qc", s.name.as_str()]).await {
+                Some((Some(0), qc)) => {
+                    parse_sc_qc_binary_path(&qc).and_then(|p| windows_runner_dir(&p))
+                }
                 _ => None,
             };
-            units.push(WatchedUnit {
-                row: row_from_props(&props, runner),
-                cgroup_oom_kill: None,
-            });
+            found.push((props_from_sc(&s), runner_dir));
         }
+        // Every `.runner` read in one tracked blocking body, off the async
+        // worker. A panicked body is no service information this tick.
+        let Ok(units) = spawn_blocking_tracked(move || {
+            found
+                .into_iter()
+                .map(|(props, runner_dir)| WatchedUnit {
+                    row: row_from_props(
+                        &props,
+                        runner_dir.and_then(|d| read_runner_file(std::path::Path::new(&d))),
+                    ),
+                    cgroup_oom_kill: None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        else {
+            return ServiceScan::default();
+        };
         ServiceScan {
             units: Some(units),
             complete_kinds: if complete {
