@@ -359,10 +359,9 @@ async fn a_session_held_on_an_unconfirmed_finish_keeps_its_heartbeat_flowing() {
     let mut state = DrainState::default();
     drain_tick(&coord.inner, &mut state).await;
     assert!(state.retry[&s].unconfirmed_finish.is_some());
-    assert!(
-        state.retry[&s].next_attempt_at > Instant::now(),
-        "the finish is inside its backoff"
-    );
+    // Pin the finish deep inside its backoff, so the next tick cannot race
+    // the 1 s retry and the only thing that may go out is the keep-alive.
+    state.retry.get_mut(&s).unwrap().next_attempt_at = Instant::now() + Duration::from_secs(3600);
 
     let machine = Uuid::from_u128(0xeb2155ed_4152_4a91_be82_5d4346f717fc);
     for _ in 0..2 {
@@ -394,6 +393,83 @@ async fn a_session_held_on_an_unconfirmed_finish_keeps_its_heartbeat_flowing() {
         state.retry[&s].unconfirmed_finish.is_some(),
         "the keep-alive leaves the finish's retry state alone"
     );
+}
+
+/// Final review 1: a held session's OWN keep-alive heartbeat is never "coord
+/// took another row" evidence. Its finish is first answered unconfirmed (so
+/// the keep-alive is on), then coord 5xx's it tick after tick while the
+/// keep-alive heartbeat is accepted every tick: the 5xx are not serving
+/// failures, so the session is never quarantined on its own heartbeats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_sessions_own_keepalive_is_not_serving_evidence() {
+    let (_d, outbox, coord, rec, _acks) =
+        finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-self-evidence", 42);
+    let mut state = DrainState::default();
+    drain_tick(&coord.inner, &mut state).await;
+    assert!(state.retry[&s].unconfirmed_finish.is_some(), "keep-alive is on");
+
+    rec.lock().await.finished_answer = Some((503, r#"{"error":"unavailable"}"#.to_string()));
+    let machine = Uuid::from_u128(0xeb2155ed_4152_4a91_be82_5d4346f717fc);
+    for round in 0..12 {
+        outbox
+            .record(machine, s, SessionEventKind::Heartbeat, json!({ "id": s }))
+            .unwrap();
+        retry_now(&mut state, s);
+        drain_tick(&coord.inner, &mut state).await;
+        let r = &state.retry[&s];
+        assert_eq!(
+            r.serving_failures, 0,
+            "round {round}: the session's own keep-alive made a 5xx count as serving"
+        );
+        assert!(
+            r.unconfirmed_finish.is_some(),
+            "round {round}: the same finish row still blocks, so its record is kept"
+        );
+    }
+    assert!(
+        !state.quarantined.contains(&s),
+        "never quarantined on its own heartbeats"
+    );
+    assert_eq!(state.ack_ticks, 0, "keep-alives are not serving evidence");
+    assert_eq!(kinds(&pending_of(&outbox, s)), vec!["finished"]);
+}
+
+/// Final review 3: once the recorded unconfirmed finish is no longer the row
+/// blocking the session, its record is cleared — so the keep-alive turns off
+/// and no stale count or age carries over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_unconfirmed_record_clears_when_another_row_blocks() {
+    let (_d, outbox, coord, rec, _acks) =
+        finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-cleared", 42);
+    let mut state = DrainState::default();
+    drain_tick(&coord.inner, &mut state).await;
+    let first = state.retry[&s].unconfirmed_finish.expect("recorded");
+
+    // The recorded finish leaves the queue (as a drop would), and a
+    // NON-finish row now blocks the session on a 5xx.
+    outbox.ack(&[first.row]).unwrap();
+    let machine = Uuid::from_u128(0xeb2155ed_4152_4a91_be82_5d4346f717fc);
+    outbox
+        .record(
+            machine,
+            s,
+            SessionEventKind::Progress,
+            json!({ "id": s, "session_status": "working" }),
+        )
+        .unwrap();
+    rec.lock().await.next_patch_5xx = 1;
+    retry_now(&mut state, s);
+    drain_tick(&coord.inner, &mut state).await;
+    let r = state.retry.get(&s).expect("blocked on the progress row");
+    assert_eq!(
+        r.unconfirmed_finish, None,
+        "the old finish's record was cleared"
+    );
+    assert_eq!(kinds(&pending_of(&outbox, s)), vec!["progress"]);
 }
 
 /// Phase 3's coord answer to a swallowed progress write is an ordinary

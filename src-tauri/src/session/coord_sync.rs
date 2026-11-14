@@ -2095,12 +2095,26 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .await;
 
     let mut had_transport_error = false;
+    // `delivered`: coord took a row of some session's BACKLOG — the serving
+    // evidence (`last_ack`, `ack_ticks`). `took_any` also counts keep-alive
+    // heartbeats, for `/health` `lastAckAt` only.
     let mut delivered = false;
+    let mut took_any = false;
     let mut answered = false;
     let mut blocked: Vec<(Uuid, String, Option<OutboxRecord>)> = Vec::new();
     let mut heartbeat_failure_drops: Vec<&'static str> = Vec::new();
     for outcome in outcomes {
-        delivered |= outcome.acked_by_coord;
+        // A keep-alive heartbeat is never serving evidence. `ack_ticks` is ONE
+        // counter across sessions, so a held session's own keep-alive would
+        // otherwise read as "coord took another row" at its next failure (on
+        // this tick or any later one) and walk a run of 5xx on its own head
+        // row into quarantine. Excluding keep-alives for everyone is the
+        // conservative choice: they are held sessions' out-of-order probes,
+        // and any healthy session's ordinary rows still count.
+        if !outcome.keepalive {
+            delivered |= outcome.acked_by_coord;
+        }
+        took_any |= outcome.acked_by_coord;
         answered |= outcome.acked_by_coord || outcome.answered_by_coord;
         heartbeat_failure_drops.extend(outcome.heartbeat_failure_drops);
         succeeded.extend(outcome.succeeded);
@@ -2153,6 +2167,17 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         });
         entry.failures += 1;
         entry.failed_at_ack_tick = ack_ticks_at_start;
+        // The recorded unconfirmed finish is no longer what blocks this
+        // session (it left the queue, or an earlier row now fails first):
+        // forget it, so it neither keeps the keep-alive on nor carries a
+        // stale count/age into a later finish.
+        let blocked_key = blocked_row.as_ref().map(|r| (r.session_id, r.seq));
+        if entry
+            .unconfirmed_finish
+            .is_some_and(|u| Some(u.row) != blocked_key)
+        {
+            entry.unconfirmed_finish = None;
+        }
         // A 429 on a kind that retries it (`output_chunk`, and the lifecycle
         // kinds of `is_lifecycle_kind`: `started` / `state_change` / `closed`
         // / `finished`) is coord pacing this runner, not
@@ -2276,7 +2301,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     if answered {
         inner.has_been_online.store(true, Ordering::Relaxed);
     }
-    if delivered {
+    if took_any {
         // `lastAckAt` is "a row coord accepted", never a bare answer.
         note_outbox_ack();
     }
