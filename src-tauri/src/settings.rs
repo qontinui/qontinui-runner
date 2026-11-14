@@ -2606,9 +2606,14 @@ mod ci_node_tests {
             cpus: 48,
         };
         let mut ci = CiNodeSettings::default();
-        assert_eq!(ci.configured_or_suggested_builds(big), 12);
-        assert_eq!(ci.effective_max_concurrent_builds_for(big), 12);
+        // Unset: the suggestion it is handed (pure — no process-global read).
+        let suggested = crate::ci_node::host_sizing::suggested_concurrent_builds(big);
+        assert_eq!(suggested, 12);
+        assert_eq!(ci.configured_or(suggested), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_with(suggested), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_with(0), 1);
         ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.configured_or(suggested), 3);
         assert_eq!(ci.configured_or_suggested_builds(big), 3);
         assert_eq!(ci.effective_max_concurrent_builds_for(big), 3);
         assert_eq!(ci.effective_max_concurrent_builds(), 3);
@@ -2618,6 +2623,27 @@ mod ci_node_tests {
         assert_eq!(ci.effective_max_concurrent_builds(), 1);
         ci.max_concurrent_builds = None;
         assert!(ci.effective_max_concurrent_builds() >= 1);
+    }
+
+    /// Plan 2026-11-05 Phase 7: the model's admitted total falls below the
+    /// static suggestion on a busy box and never rises above it, so one
+    /// dispatch's host share stays a static slot's — and an explicit value is
+    /// still the operator's lever for fewer, fatter builds.
+    #[test]
+    fn a_dispatch_share_is_the_static_partition_unless_the_operator_says_so() {
+        use crate::ci_node::host_sizing::HostCapacity;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let big = HostCapacity {
+            mem_bytes: Some(368 * GIB),
+            cpus: 48,
+        };
+        let mut ci = CiNodeSettings::default();
+        // Static suggestion 12: every unset dispatch is sized as a 1/12 share.
+        assert_eq!(ci.dispatch_share_for(big), 12);
+        ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.dispatch_share_for(big), 3);
+        ci.max_concurrent_builds = Some(0);
+        assert_eq!(ci.dispatch_share_for(big), 1);
     }
 }
 
@@ -3057,12 +3083,14 @@ pub struct CiNodeSettings {
     /// advertised via the device budget POST when enabled.
     ///
     /// `None` (the default, and what a missing key loads as) means "never
-    /// configured — use the host's suggestion"
-    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds`]).
+    /// configured — use the host's suggestion": the capacity model's answer
+    /// for this device when it answers, else the static formula
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`]).
     /// `Some(n)` is an explicit operator value and always wins; an existing
-    /// settings.json carrying a number stays explicit. Read it through
-    /// [`CiNodeSettings::effective_max_concurrent_builds`], never directly, so
-    /// the advertised and admitted numbers cannot diverge.
+    /// settings.json carrying a number stays explicit. Read it through the
+    /// accessors on [`CiNodeSettings`], never directly: the number the budget
+    /// publish advertises and the number admission admits both resolve through
+    /// [`CiNodeSettings::configured_or`].
     ///
     /// `None` is OMITTED on disk rather than written as `null`: an older runner
     /// build reading this file (a rollback) treats a missing key as its own
@@ -3102,24 +3130,55 @@ fn default_ci_node_min_free_disk_gb() -> u64 {
 }
 
 impl CiNodeSettings {
-    /// The CI slot count this node ADVERTISES for `host`: the explicit value
-    /// verbatim (including a deliberate `0`, an opinion the budget publish must
-    /// carry), else the host suggestion. Pure — `fleet::build_budget_request`
-    /// reads this.
+    /// The explicit value verbatim (including a deliberate `0`, an opinion the
+    /// budget publish must carry), else `suggested`. PURE.
+    pub(crate) fn configured_or(&self, suggested: u32) -> u32 {
+        self.max_concurrent_builds.unwrap_or(suggested)
+    }
+
+    /// The CI slot count this node ADVERTISES and admits for `host` now: the
+    /// explicit value, else the suggestion — the capacity model's Lane B total
+    /// when it answers, else the static host formula
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`], plan
+    /// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+    /// Phase 7). NOT pure: an unset value reads the cached capacity row and
+    /// dial and the CI node's running set (`ci_state`'s lock, so never call it
+    /// holding that lock); an explicit one reads nothing.
     pub(crate) fn configured_or_suggested_builds(
         &self,
         host: crate::ci_node::host_sizing::HostCapacity,
     ) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n,
-            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host),
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds_now(host).0,
         }
     }
 
-    /// The concurrency the executor ADMITS against for `host` — the same
-    /// number as [`Self::configured_or_suggested_builds`], floored at 1 exactly
-    /// as admission always has been (and as coord's `ci_dispatch` floors it).
-    /// Pure.
+    /// The N of equal host shares the executor sizes ONE dispatch's cargo jobs
+    /// and test threads from (`host_sizing::share`): the explicit value, the
+    /// operator's lever for fewer, fatter builds, else the static host
+    /// suggestion — the partition the capacity model's admitted total never
+    /// exceeds, so N shares never oversubscribe the host. PURE.
+    pub(crate) fn dispatch_share_for(
+        &self,
+        host: crate::ci_node::host_sizing::HostCapacity,
+    ) -> u32 {
+        match self.max_concurrent_builds {
+            Some(n) => n.max(1),
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host).max(1),
+        }
+    }
+
+    /// The concurrency the executor ADMITS against, given the resolved
+    /// `suggested` count: [`Self::configured_or`] floored at 1 exactly as
+    /// admission always has been (and as coord's `ci_dispatch` floors it). PURE.
+    pub(crate) fn effective_max_concurrent_builds_with(&self, suggested: u32) -> u32 {
+        self.configured_or(suggested).max(1)
+    }
+
+    /// [`Self::effective_max_concurrent_builds_with`] the suggestion for `host`
+    /// now ([`Self::configured_or_suggested_builds`]) — NOT pure, the same
+    /// reads.
     pub(crate) fn effective_max_concurrent_builds_for(
         &self,
         host: crate::ci_node::host_sizing::HostCapacity,
@@ -3128,7 +3187,9 @@ impl CiNodeSettings {
     }
 
     /// [`Self::effective_max_concurrent_builds_for`] against the live host.
-    /// An explicit value never touches the host; only `None` probes it.
+    /// An explicit value never touches the host; only `None` probes it — and
+    /// then also reads the cached capacity model and takes the CI node's
+    /// `ci_state` lock (NOT pure; never call it holding that lock).
     pub fn effective_max_concurrent_builds(&self) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n.max(1),

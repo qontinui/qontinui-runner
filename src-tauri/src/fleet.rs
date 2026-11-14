@@ -249,7 +249,11 @@ fn probe_ci_reservation() -> CiReservation {
 /// The `ci_reserved_gib` this runner publishes: the cgroup bound on Linux,
 /// the CI job slots × [`CI_JOB_MEM_GIB`] where no cgroup can be read, and
 /// `None` (omitted, so coord keeps its last stored agent count) when a CI
-/// slice is unbounded.
+/// slice is unbounded. The slots are the node's configured or STATIC
+/// partition, never the capacity model's current answer: the plan makes the
+/// reservation one of the model's inputs (Phase 5), and feeding the model's
+/// output back into it would move the reservation, and the agent cap derived
+/// from it, inversely to load.
 fn published_ci_reserved_gib(reservation: CiReservation, ci_jobs: u32) -> Option<u32> {
     match reservation {
         CiReservation::Bounded(gib) => Some(gib),
@@ -834,9 +838,20 @@ struct DeviceBudgetRequest {
 /// three copies of it was two too many.
 use crate::util::error_chain::error_chain;
 
-/// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).
-/// Returns Ok on first success; returns Err with the last error if every
-/// attempt fails. The caller decides whether to surface or swallow.
+/// How a budget publish is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetDelivery {
+    /// The boot publish and the periodic re-assert: retried with backoff.
+    Retry,
+    /// A change-triggered publish on the sample loop: one attempt, so a
+    /// failing budget route can never hold that loop for minutes.
+    Once,
+}
+
+/// POST the budget payload — under [`BudgetDelivery::Retry`] with exponential
+/// backoff (2s, 4s, 8s, 16s, 32s, 60s), under [`BudgetDelivery::Once`] one
+/// attempt. Returns Ok on first success; returns Err with the last error if
+/// every attempt fails. The caller decides whether to surface or swallow.
 ///
 /// Per the runner-bootable-when-coord-down property, this is the ONLY
 /// place we busy-wait on coord HTTP; the caller wraps this in
@@ -845,6 +860,7 @@ async fn post_budget_with_retry(
     coord_base: &str,
     device_id: &str,
     body: &DeviceBudgetRequest,
+    delivery: BudgetDelivery,
 ) -> Result<(), String> {
     let url = format!("{}/coord/devices/{}/budget", coord_base, device_id);
     let client = reqwest::Client::builder()
@@ -852,7 +868,10 @@ async fn post_budget_with_retry(
         .build()
         .map_err(|e| format!("reqwest client build: {e}"))?;
     let mut last_err = String::new();
-    let backoff_ms: [u64; 6] = [2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
+    let backoff_ms: &[u64] = match delivery {
+        BudgetDelivery::Retry => &[2_000, 4_000, 8_000, 16_000, 32_000, 60_000],
+        BudgetDelivery::Once => &[0],
+    };
     for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
         // coord-tenant-scope(device): device_id (:481) is the only identity in scope; the budget row is device-keyed and coord's handler reads no tenant at all.
         match crate::auth::attach_device_auth(client.post(&url).json(body))
@@ -1035,6 +1054,13 @@ pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> boo
 /// `role` is consumed here (it decides the agent cap) but deliberately never
 /// reaches the payload — see [`DeviceBudgetRequest`] for why the supervisor
 /// owns that column.
+///
+/// `suggested` is the CI node's suggestion for an unset capacity, resolved by
+/// the caller ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`]:
+/// the capacity model's Lane B total when it answers, else the static formula)
+/// so this function stays pure; `host` gives the static partition the
+/// reservation is sized from.
+#[allow(clippy::too_many_arguments)]
 fn build_budget_request(
     hostname: &str,
     role: MachineRole,
@@ -1042,14 +1068,20 @@ fn build_budget_request(
     disk_reserved_gb: u64,
     ci: &crate::settings::CiNodeSettings,
     host: crate::ci_node::host_sizing::HostCapacity,
+    suggested: u32,
     ci_reservation: CiReservation,
 ) -> DeviceBudgetRequest {
-    let ci_jobs = if ci.enabled {
-        ci.configured_or_suggested_builds(host)
+    let (ci_jobs, reserved_jobs) = if ci.enabled {
+        (
+            ci.configured_or(suggested),
+            ci.configured_or(crate::ci_node::host_sizing::suggested_concurrent_builds(
+                host,
+            )),
+        )
     } else {
-        0
+        (0, 0)
     };
-    let ci_reserved_gib = published_ci_reserved_gib(ci_reservation, ci_jobs);
+    let ci_reserved_gib = published_ci_reserved_gib(ci_reservation, reserved_jobs);
     DeviceBudgetRequest {
         hostname: hostname.to_string(),
         cpu_cores: resources.cpu_cores.min(i32::MAX as u32) as i32,
@@ -1068,13 +1100,16 @@ fn build_budget_request(
         },
         ci_reserved_gib,
         // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
-        // (`ci_node.max_concurrent_builds`; unset ⇒ the host suggestion for
-        // `host`) — resolved through the same accessor `ci_node/admission.rs`
-        // admits against, so the advertised and admitted numbers cannot
-        // diverge. It is deliberately not renamed. It is operator-visible, and
-        // the split is about which coord COLUMN carries the number, not about
-        // what the node calls its own capacity. `host` is passed in rather than
-        // probed here so this function stays pure over its arguments.
+        // (`ci_node.max_concurrent_builds`; unset ⇒ `suggested`) — resolved
+        // through the same accessor `ci_node/admission.rs` admits against
+        // (`CiNodeSettings::configured_or`). The capacity model's answer moves
+        // between budget periods, so the republisher re-publishes whenever this
+        // number changes (`spawn_budget_republisher`): the advertised number
+        // trails the admitted one by at most one sample interval. It is
+        // deliberately not renamed. It is operator-visible, and the split is
+        // about which coord COLUMN carries the number, not about what the node
+        // calls its own capacity. `host` and `suggested` are passed in rather
+        // than probed here so this function stays pure over its arguments.
         max_concurrent_ci_jobs: ci_jobs.min(i32::MAX as u32) as i32,
     }
 }
@@ -1109,6 +1144,16 @@ pub async fn publish_budget(
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
+    publish_budget_with(role, resources, disk_reserved_gb, BudgetDelivery::Retry).await
+}
+
+/// [`publish_budget`] with its delivery chosen ([`BudgetDelivery`]).
+async fn publish_budget_with(
+    role: MachineRole,
+    resources: Resources,
+    disk_reserved_gb: u64,
+    delivery: BudgetDelivery,
+) -> Result<(), String> {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
             instance = ?crate::instance::instance_name(),
@@ -1141,13 +1186,25 @@ pub async fn publish_budget(
     let device_id_str = device_id_uuid.to_string();
 
     let ci = crate::settings::get_ci_node_settings();
+    let host = crate::ci_node::host_sizing::probe();
+    // The capacity model is read only when its answer is used: a CI node
+    // with no explicit capacity (`configured_or_suggested_builds` reads
+    // nothing for an explicit one). A disabled node publishes 0 CI jobs and
+    // `build_budget_request` ignores `suggested`, so it reads no model and logs
+    // no D9 records for a consumer that is off on this box.
+    let suggested = if ci.enabled {
+        ci.configured_or_suggested_builds(host)
+    } else {
+        0
+    };
     let body = build_budget_request(
         &device.hostname,
         role,
         resources,
         disk_reserved_gb,
         &ci,
-        crate::ci_node::host_sizing::probe(),
+        host,
+        suggested,
         probe_ci_reservation(),
     );
 
@@ -1165,8 +1222,12 @@ pub async fn publish_budget(
         }
     };
 
-    match post_budget_with_retry(&coord_base, &device_id_str, &body).await {
+    match post_budget_with_retry(&coord_base, &device_id_str, &body, delivery).await {
         Ok(()) => {
+            // Recorded only once coord took it: a failed publish leaves the
+            // old value, so `advertised_ci_jobs_changed` retries on the next
+            // sample tick with one attempt (`BudgetDelivery::Once`).
+            record_advertised_ci_jobs(body.max_concurrent_ci_jobs);
             // Columns this runner does NOT own are named as `not published`,
             // so the ownership split is visible in the log rather than
             // inferable only from the wire. Silence about which fields were
@@ -1218,6 +1279,32 @@ fn budget_republish_secs() -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(BUDGET_REPUBLISH_DEFAULT_SECS)
         .max(60)
+}
+
+/// The `max_concurrent_ci_jobs` the last SUCCESSFUL budget publish carried;
+/// `-1` = none yet in this process.
+static ADVERTISED_CI_JOBS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+fn record_advertised_ci_jobs(jobs: i32) {
+    ADVERTISED_CI_JOBS.store(i64::from(jobs), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Has the CI node's capacity moved off what the last successful budget
+/// publish advertised? With the capacity model (plan
+/// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci` Phase 7)
+/// an unset capacity changes with the box's load, and coord's `ci_dispatch`
+/// places against the advertised column, so a change is re-published on the
+/// next sample tick rather than at the next budget period. Takes `ci_state`'s
+/// lock through the model's read; the republisher holds no lock.
+fn advertised_ci_jobs_changed() -> bool {
+    let ci = crate::settings::get_ci_node_settings();
+    let now = if ci.enabled {
+        ci.configured_or_suggested_builds(crate::ci_node::host_sizing::probe())
+    } else {
+        0
+    };
+    let advertised = ADVERTISED_CI_JOBS.load(std::sync::atomic::Ordering::Relaxed);
+    advertised >= 0 && advertised != i64::from(now.min(i32::MAX as u32))
 }
 
 /// Periodically re-assert this device's budget, so a clobbered or stale
@@ -1276,6 +1363,14 @@ fn budget_republish_secs() -> u64 {
 /// therefore has up to one sample interval of granularity error (600s becomes
 /// 600–630s), which is immaterial for a self-heal loop and is the price of not
 /// running two timers.
+///
+/// One exception, and it is a CHANGE, not a re-assert: when the CI node's
+/// capacity moves off what the last successful publish advertised (the
+/// capacity model's answer follows the box's load —
+/// [`advertised_ci_jobs_changed`]), the budget is published on that tick with
+/// ONE attempt ([`BudgetDelivery::Once`]), so a failing budget route costs a
+/// tick at most one request timeout and never the retry ladder; a failure
+/// leaves the advertised value unrecorded, so the next tick tries again.
 pub fn spawn_budget_republisher(role: MachineRole) {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
@@ -1318,19 +1413,47 @@ pub fn spawn_budget_republisher(role: MachineRole) {
                 resource_sample::publish_once().await;
                 reporter.tick().await;
 
-                if tokio::time::Instant::now() < next_budget {
-                    continue;
+                // The CI node sizes its concurrency from coord's capacity
+                // model (plan 2026-11-05-one-free-resource-model-places-
+                // sessions-builds-and-ci Phase 7) and reads the cached row
+                // synchronously; this keeps it warm on the one periodic
+                // publisher rather than a timer of its own (coord is asked
+                // only when the kept read is stale — `fleet_capacity`).
+                if crate::settings::get_ci_node_settings().enabled {
+                    crate::ci_node::host_sizing::refresh_model().await;
+                    // A cap the model raised re-admits what it deferred.
+                    crate::ci_node::admission::drain_deferred_on_cap_rise();
                 }
+
+                let due = tokio::time::Instant::now() >= next_budget;
+                let delivery = if due {
+                    BudgetDelivery::Retry
+                } else if advertised_ci_jobs_changed() {
+                    BudgetDelivery::Once
+                } else {
+                    continue;
+                };
                 // Authoritative lane. Resources are re-detected each time: disk
                 // fills, and the ci_node settings this derives
                 // `max_concurrent_builds` from can change while the runner is up
                 // (the setting is designed to need no restart —
                 // `ci_node/subscription.rs` re-reads it every loop).
                 let resources = detect_resources();
-                if let Err(e) = publish_budget(role, resources, 0).await {
-                    warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
+                match publish_budget_with(role, resources, 0, delivery).await {
+                    Err(e) if due => {
+                        warn!("fleet::budget_republisher: re-publish failed (will retry): {e}")
+                    }
+                    // A change publish that failed is retried on the next
+                    // tick (its value stays unrecorded), so it logs quietly.
+                    Err(e) => tracing::debug!(
+                        "fleet::budget_republisher: CI capacity change publish failed \
+                         (next tick retries): {e}"
+                    ),
+                    Ok(()) => {}
                 }
-                next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+                if due {
+                    next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+                }
             }
         },
     );
@@ -7774,6 +7897,7 @@ mod tests {",
             0,
             ci,
             test_host(),
+            crate::ci_node::host_sizing::suggested_concurrent_builds(test_host()),
             CiReservation::Bounded(0),
         ))
         .expect("budget payload must serialize")
@@ -7851,6 +7975,7 @@ mod tests {",
                     0,
                     &ci_settings(enabled, 2),
                     test_host(),
+                    12,
                     CiReservation::Bounded(0),
                 ))
                 .expect("budget payload must serialize");
@@ -8423,11 +8548,51 @@ mod tests {",
             0,
             &ci,
             test_host(),
+            12,
             CiReservation::NoCgroup,
         ))
         .unwrap();
         let jobs = json["max_concurrent_ci_jobs"].as_i64().expect("ci jobs");
         assert_eq!(json["ci_reserved_gib"].as_i64(), Some(jobs * 16));
+    }
+
+    /// Plan 2026-11-05 Phase 7: an unset capacity ADVERTISES the suggestion it
+    /// is handed (the capacity model's answer), but the reservation published
+    /// for a host with no cgroup — which the plan makes a model input — is sized from
+    /// the static partition, so a loaded box's falling model total cannot
+    /// shrink its reservation and raise its agent cap.
+    #[test]
+    fn the_reservation_is_the_static_partition_not_the_models_answer() {
+        let mut ci = ci_settings(true, 0);
+        ci.max_concurrent_builds = None;
+        let mk = |suggested| {
+            serde_json::to_value(build_budget_request(
+                "test-host",
+                MachineRole::Agent,
+                Resources {
+                    cpu_cores: 16,
+                    memory_gb: 64,
+                    disk_total_gb: 1000,
+                },
+                0,
+                &ci,
+                test_host(),
+                suggested,
+                CiReservation::NoCgroup,
+            ))
+            .unwrap()
+        };
+        let busy = mk(1);
+        let idle = mk(12);
+        assert_eq!(busy["max_concurrent_ci_jobs"].as_i64(), Some(1));
+        assert_eq!(idle["max_concurrent_ci_jobs"].as_i64(), Some(12));
+        // 48c/368 GiB's static partition is 12 slots: 12 × 16 GiB either way.
+        assert_eq!(busy["ci_reserved_gib"].as_i64(), Some(192));
+        assert_eq!(busy["ci_reserved_gib"], idle["ci_reserved_gib"]);
+        assert_eq!(
+            busy["max_concurrent_agents"], idle["max_concurrent_agents"],
+            "the agent cap must not move with the model's answer"
+        );
     }
 
     /// nawa's tree as read 2026-11-04: `ci-runners.slice` high 230.4 GiB,
@@ -8493,6 +8658,7 @@ mod tests {",
                 0,
                 &ci,
                 test_host(),
+                12,
                 r,
             ))
             .unwrap()
