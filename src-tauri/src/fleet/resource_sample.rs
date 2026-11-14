@@ -338,17 +338,16 @@ pub(crate) struct ResourceSample {
     /// box is this gap, not a regression; `/health` `threadCeilings` names the
     /// enforced pair and where each number came from.
     ///
-    /// Publishing the effective ceilings beside the reading is the fix, and it
-    /// is deliberately NOT done here yet, because it would be inert and noisy:
-    /// `coord.device_resource_samples` has no ceiling columns (alembic in
-    /// qontinui-web is the sole author of `coord.*` schema, and no such
-    /// revision exists), so coord's ingest would route both keys into
-    /// `ResourceSampleItem::unknown_fields` — which it DROPS after emitting a
-    /// `tracing::warn!` naming them, on the log surface reserved for publisher
-    /// typos. At a 30 s tick that is ~2,880 warn lines per runner per day
-    /// buying a consumer nothing. The migration lands first; the publisher
-    /// follows it. Until then, grade this number knowing you may be grading it
-    /// against a ceiling the runner does not use.
+    /// The fix is published beside this field: the host lane carries
+    /// [`Self::launch_headroom`], [`Self::launch_verdict`], the GRADED reading
+    /// and the enforced warn / critical ceilings, so coord admits against the
+    /// device's own answer (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2). That plan orders the rollout: coord's ingest of those keys
+    /// (and qontinui-web's columns) deploys BEFORE a runner publishing them
+    /// merges, because a key coord does not know lands in
+    /// `ResourceSampleItem::unknown_fields` with a `tracing::warn!` — ~2,880
+    /// lines per runner per day at a 30 s tick.
     ///
     /// This doc used to say coord "grades this warn at 256 / critical at 400,
     /// the same two numbers as this runner's shipped
@@ -389,6 +388,40 @@ pub(crate) struct ResourceSample {
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) active_terminal_sessions: Option<i32>,
+    /// Further unattended launches this runner's own admission would take
+    /// right now before refusing one (`0` = the next launch is refused) —
+    /// [`crate::launch_capacity::launch_headroom`], the same projection
+    /// `admit_launch` decides on, capped at
+    /// [`crate::launch_capacity::LAUNCH_HEADROOM_CAP`]. coord admits a spawn on
+    /// this device only against it (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`).
+    ///
+    /// **Host lane only**, for [`Self::thread_count`]'s placement reason: it is
+    /// the runner PROCESS's admission. `None` when the session guard is
+    /// disabled (`launch_verdict = guard_disabled`) — UNKNOWN, never `0`, which
+    /// would read as "full". `i32` for the `INTEGER` counter-group reason
+    /// [`Self::thread_count`] gives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_headroom: Option<i32>,
+    /// `proceed` / `warn` / `critical` / `guard_disabled` / `unreadable` —
+    /// [`crate::launch_capacity::LaunchVerdict::as_str`], the vocabulary coord's
+    /// CHECK constraint carries. Host lane only; always `Some` there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_verdict: Option<String>,
+    /// The GRADED thread reading (raw minus the idle blocking pool) the
+    /// thread lane judges — the number the two ceilings below apply to, NOT
+    /// [`Self::thread_count`]. `None` when the guard is disabled or the thread
+    /// table was unreadable. Host lane only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_graded: Option<i32>,
+    /// The per-machine thread ceilings the runner ENFORCES
+    /// ([`crate::resource_guard::merge_thread_ceilings`]). A launch is refused
+    /// above the warn one. `None` only when the guard is disabled. Host lane
+    /// only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_warn_ceiling: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_critical_ceiling: Option<i32>,
     /// Per-lane breakdown of THIS runner process's in-flight tracked blocking
     /// bodies — [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_by_thread`],
     /// keyed by the thread that spawned each body. Bounded to
@@ -652,6 +685,18 @@ impl Saturation {
 }
 
 impl ResourceSample {
+    /// Write the launch capacity onto this sample — the only way its five
+    /// fields are set. Counts saturate into `i32` (a pathological count must
+    /// not wrap to a negative, which reads as room against every line).
+    fn set_launch_capacity(&mut self, capacity: &crate::launch_capacity::LaunchCapacity) {
+        let narrow = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+        self.launch_headroom = capacity.headroom.map(narrow);
+        self.launch_verdict = Some(capacity.verdict.as_str().to_string());
+        self.thread_graded = capacity.graded.map(narrow);
+        self.thread_warn_ceiling = capacity.warn.map(narrow);
+        self.thread_critical_ceiling = capacity.critical.map(narrow);
+    }
+
     fn empty(lane: Lane, lane_instance: Option<String>) -> Self {
         Self {
             lane: lane.as_str().to_string(),
@@ -692,6 +737,11 @@ impl ResourceSample {
             ci_jobs_running: None,
             thread_count: None,
             active_terminal_sessions: None,
+            launch_headroom: None,
+            launch_verdict: None,
+            thread_graded: None,
+            thread_warn_ceiling: None,
+            thread_critical_ceiling: None,
             blocking_lanes: None,
             threads_max: None,
             threads_used: None,
@@ -1300,6 +1350,15 @@ fn collect_host_lane() -> ResourceSample {
         s.active_terminal_sessions
             .and_then(|n| usize::try_from(n).ok()),
     );
+
+    // The launch capacity coord admits against (plan
+    // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    // Phase 2): ONE admission reading, taken here — this function already runs
+    // inside `spawn_blocking_tracked`, so the synchronous thread-table and
+    // commit reads never land on an async worker. Host lane only, for the
+    // spawn-pressure pair's placement reason: it is this runner PROCESS's
+    // admission, which no other lane owns.
+    s.set_launch_capacity(&crate::launch_capacity::live());
 
     s.blocking_lanes = Some(
         tracked_blocking_by_thread()
@@ -3378,6 +3437,90 @@ MemAvailable:   15335424 kB
             None,
             "no Tauri runtime is UNKNOWN, not zero sessions"
         );
+    }
+
+    /// The launch capacity coord admits against is the runner PROCESS's own
+    /// admission, so only the host lane carries it, and it carries it on every
+    /// tick (plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2 step 4).
+    ///
+    /// Mutation: drop the `set_launch_capacity` call from `collect_host_lane`
+    /// (the host asserts fail), or call it from `parse_meminfo` (the WSL ones do).
+    #[test]
+    fn the_host_lane_publishes_the_launch_fields_and_wsl_does_not() {
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.lane, "wsl");
+        assert_eq!(wsl.launch_headroom, None);
+        assert_eq!(wsl.launch_verdict, None);
+        assert_eq!(wsl.thread_graded, None);
+        assert_eq!(wsl.thread_warn_ceiling, None);
+        assert_eq!(wsl.thread_critical_ceiling, None);
+        let wsl_json = serde_json::to_value(&wsl).expect("serializes");
+        for key in [
+            "launch_headroom",
+            "launch_verdict",
+            "thread_graded",
+            "thread_warn_ceiling",
+            "thread_critical_ceiling",
+        ] {
+            assert!(wsl_json.get(key).is_none(), "the wsl lane must not carry {key}");
+        }
+
+        let host = collect_host_lane();
+        let verdict = host
+            .launch_verdict
+            .clone()
+            .expect("the host lane must publish a launch verdict on every tick");
+        assert!(
+            ["proceed", "warn", "critical", "guard_disabled", "unreadable"]
+                .contains(&verdict.as_str()),
+            "{verdict}"
+        );
+        if verdict == "guard_disabled" {
+            // A disabled guard enforces nothing: no number, never a 0.
+            assert_eq!(host.launch_headroom, None);
+            assert_eq!(host.thread_warn_ceiling, None);
+        } else {
+            let headroom = host
+                .launch_headroom
+                .expect("an enabled guard publishes headroom");
+            let cap = i32::try_from(crate::launch_capacity::LAUNCH_HEADROOM_CAP).expect("small");
+            assert!((0..=cap).contains(&headroom), "{headroom}");
+            let (warn, critical) = (
+                host.thread_warn_ceiling.expect("warn ceiling"),
+                host.thread_critical_ceiling.expect("critical ceiling"),
+            );
+            assert!(warn > 0 && critical >= warn, "{warn} / {critical}");
+        }
+        // The wire names coord's ingest DTO keys on.
+        let host_json = serde_json::to_value(&host).expect("serializes");
+        assert_eq!(host_json["launch_verdict"], verdict.as_str());
+
+        // The setter maps every field, and a disabled guard serializes no number.
+        let mut probe = ResourceSample::empty(Lane::Host, None);
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::Warn,
+            headroom: Some(0),
+            graded: Some(380),
+            warn: Some(376),
+            critical: Some(usize::MAX),
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert_eq!(v["launch_headroom"], 0);
+        assert_eq!(v["launch_verdict"], "warn");
+        assert_eq!(v["thread_graded"], 380);
+        assert_eq!(v["thread_warn_ceiling"], 376);
+        assert_eq!(v["thread_critical_ceiling"], i32::MAX, "saturates, never wraps");
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::GuardDisabled,
+            headroom: None,
+            graded: None,
+            warn: None,
+            critical: None,
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert!(v.get("launch_headroom").is_none());
+        assert_eq!(v["launch_verdict"], "guard_disabled");
     }
 
     /// The host lane's `blocking_lanes` breakdown must actually reflect

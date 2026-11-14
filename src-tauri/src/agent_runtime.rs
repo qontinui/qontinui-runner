@@ -4124,12 +4124,35 @@ fn admit_launch(
     // RUNNING session twice (once in the readings, once here). Residual,
     // stated: a burst of LAUNCHES alone is bounded only by the readings.
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
-    let (projected, shadowed) = reading.projected(pending);
+    let (decision, shadowed) = launch_admission(&reading, pending);
     crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
-    match launch_deferral_reason(&projected) {
+    decision
+}
+
+/// PURE: [`admit_launch`]'s decision over one reading and its pending charge,
+/// with the shadowed lane beside it (logged by the caller, outside any lock).
+///
+/// The decision is [`crate::resource_guard::AdmissionReading::projected`] at
+/// `pending`, which is EXACTLY the projection
+/// [`crate::launch_capacity::launch_headroom`] counts from — so the headroom
+/// this device publishes is `0` precisely when this refuses (pinned by
+/// `launch_capacity`'s `launch_headroom_is_zero_exactly_when_admit_launch_refuses`,
+/// plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 2 step 2). Split out so that test can drive the real decision without
+/// the process-global continuation registry.
+pub(crate) fn launch_admission(
+    reading: &crate::resource_guard::AdmissionReading,
+    pending: usize,
+) -> (
+    Result<(), String>,
+    Option<crate::resource_guard::SpawnGate>,
+) {
+    let (projected, shadowed) = reading.projected(pending);
+    let decision = match launch_deferral_reason(&projected) {
         Some(reason) => Err(reason),
         None => Ok(()),
-    }
+    };
+    (decision, shadowed)
 }
 
 /// [`evaluate_continuation_guard`] with the load reading taken LIVE through
@@ -4186,6 +4209,13 @@ pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
     )
 }
 
+/// Admitted, not-yet-running continuations — the pending charge
+/// [`admit_launch`] applies — for the launch capacity the host-lane sample
+/// publishes ([`crate::launch_capacity::live`]).
+pub(crate) fn reserved_spawns_now() -> usize {
+    lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns
+}
+
 /// The severity word of a lane verdict, `"proceed"` when nothing tripped.
 fn verdict_word(gate: &crate::resource_guard::SpawnGate) -> &'static str {
     gate.tripped()
@@ -4212,6 +4242,16 @@ fn spawn_admission_json(
     reserved_spawns: usize,
     cost: crate::resource_guard::ProjectedSpawnCost,
 ) -> serde_json::Value {
+    // The launch capacity this device publishes on its host-lane sample — the
+    // same function, so `/health` and coord read one number (plan
+    // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    // Phase 2 step 3).
+    let launch = crate::launch_capacity::launch_headroom(
+        lanes,
+        reserved_spawns,
+        cost,
+        crate::launch_capacity::LAUNCH_HEADROOM_CAP,
+    );
     let Some(lanes) = lanes else {
         return serde_json::json!({
             "enabled": false,
@@ -4222,6 +4262,8 @@ fn spawn_admission_json(
             "liveContinuations": live_continuations,
             "reservedSpawns": reserved_spawns,
             "countCap": "retired",
+            "launchHeadroom": launch.headroom,
+            "launchVerdict": launch.verdict.as_str(),
         });
     };
     let composed = crate::resource_guard::projected_verdict(Some(lanes), reserved_spawns, cost);
@@ -4260,6 +4302,11 @@ fn spawn_admission_json(
         // readings as projected cost (`verdict` above already includes them).
         "reservedSpawns": reserved_spawns,
         "countCap": "retired",
+        // Further projected launches admitted before one is refused (`0` =
+        // the next launch is refused), and the verdict behind it — what the
+        // host-lane sample publishes to coord.
+        "launchHeadroom": launch.headroom,
+        "launchVerdict": launch.verdict.as_str(),
     })
 }
 
@@ -22213,6 +22260,9 @@ mod tests {
         assert_eq!(v["threads"]["gradedThreads"], 200);
         assert_eq!(v["threads"]["warnCeiling"], 256);
         assert_eq!(v["threads"]["criticalCeiling"], 400);
+        // The memory lane already warns, so the next launch is refused.
+        assert_eq!(v["launchHeadroom"], 0);
+        assert_eq!(v["launchVerdict"], "warn");
         assert_eq!(v["liveContinuations"], 7);
         assert_eq!(v["countCap"], "retired");
 
@@ -22259,6 +22309,9 @@ mod tests {
         assert_eq!(v["enabled"], false);
         assert_eq!(v["memory"], serde_json::Value::Null);
         assert_eq!(v["threads"], serde_json::Value::Null);
+        // No reading, no number: the headroom is UNKNOWN, never 0.
+        assert_eq!(v["launchHeadroom"], serde_json::Value::Null);
+        assert_eq!(v["launchVerdict"], "guard_disabled");
         assert_eq!(v["liveContinuations"], 3);
         assert_eq!(v["reservedSpawns"], 2);
     }
