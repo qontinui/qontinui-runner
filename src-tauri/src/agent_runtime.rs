@@ -1252,6 +1252,53 @@ pub(crate) fn resolve_claude_bin() -> String {
     bare
 }
 
+/// How long a migration respawn waits for a real `claude` to reappear on PATH
+/// before it settles for the bare-name fallback. Longer than the identity
+/// shim's own 10 s wait: the shim only covers the window once the PTY child is
+/// already running, and a reinstall window that outlives it kills the pane
+/// with exit 127 (finding 00525a01, 2026-11-14 21:27).
+pub(crate) const CLAUDE_BIN_RESOLVE_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// [`resolve_claude_bin`], re-tried for up to `wait` while it can only answer
+/// with the bare-name fallback. A bare name is what an npm auto-update
+/// reinstall leaves behind for a moment (the real binary is renamed aside), and
+/// it resolves in the PTY child to the identity shim, whose bounded wait can
+/// run out. BLOCKS (thread sleep) for up to `wait`: only pass a non-zero `wait`
+/// from the blocking pool; a zero `wait` never sleeps.
+pub(crate) fn resolve_claude_bin_waiting(wait: std::time::Duration) -> String {
+    resolve_waiting_with(
+        resolve_claude_bin,
+        &claude_bin_path(),
+        wait,
+        std::time::Duration::from_millis(500),
+    )
+}
+
+/// The retry loop of [`resolve_claude_bin_waiting`], with the resolver injected
+/// so the waiting is testable. Returns the first answer that is not `bare`, or
+/// the last answer once `wait` has elapsed.
+fn resolve_waiting_with(
+    mut resolve: impl FnMut() -> String,
+    bare: &str,
+    wait: std::time::Duration,
+    step: std::time::Duration,
+) -> String {
+    // An absolute `bare` (a `QONTINUI_CLAUDE_BIN` override) is launchable
+    // as-is and `resolve` answers it at once; it equals `bare` by design, so
+    // retrying would only stall.
+    if std::path::Path::new(bare).is_absolute() {
+        return resolve();
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let found = resolve();
+        if found != bare || start.elapsed() >= wait {
+            return found;
+        }
+        std::thread::sleep(step);
+    }
+}
+
 // =============================================================================
 // Public entrypoint
 // =============================================================================
@@ -16944,6 +16991,47 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
+    }
+
+    #[test]
+    fn resolve_waiting_returns_real_binary_that_appears_mid_wait() {
+        let mut calls = 0;
+        let got = resolve_waiting_with(
+            || {
+                calls += 1;
+                if calls < 3 { "claude".to_string() } else { "/real/claude".to_string() }
+            },
+            "claude",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(got, "/real/claude");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn resolve_waiting_does_not_stall_on_an_absolute_override() {
+        let abs = if cfg!(windows) { r"C:\x\claude.exe" } else { "/x/claude" };
+        let start = std::time::Instant::now();
+        let got = resolve_waiting_with(
+            || abs.to_string(),
+            abs,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(5),
+        );
+        assert_eq!(got, abs);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resolve_waiting_gives_up_with_bare_name_after_the_wait() {
+        let got = resolve_waiting_with(
+            || "claude".to_string(),
+            "claude",
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(5),
+        );
+        assert_eq!(got, "claude");
     }
 
     /// The spawn seam resolves `claude` to the absolute file a PATH walk finds

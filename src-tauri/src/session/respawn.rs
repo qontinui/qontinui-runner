@@ -786,6 +786,7 @@ async fn materialize(
             working_dir: &working_dir,
             model_transcript,
             config_dir: &config_dir,
+            claude_bin_wait: std::time::Duration::ZERO,
             title,
             // Land back on the tile the session used to occupy when this box
             // still remembers it; otherwise the default page, zone 0 (a wrong
