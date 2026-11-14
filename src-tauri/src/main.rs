@@ -195,6 +195,9 @@ mod iteration_bundle;
 mod journey;
 mod knowledge_acquisition;
 mod known_issues;
+// The launch capacity this device publishes to coord (plan
+// 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 2).
+mod launch_capacity;
 mod launch_env;
 mod log_consolidation;
 mod logging;
