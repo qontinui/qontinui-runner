@@ -7,7 +7,7 @@
 use super::*;
 use crate::session::coord_sync_finish_ack::{
     unconfirmed_message, FINISHED_UNCONFIRMED_DROPPED, FINISHED_UNCONFIRMED_KIND,
-    FINISHED_UNCONFIRMED_MAX_ATTEMPTS,
+    FINISHED_UNCONFIRMED_MAX_ATTEMPTS, FINISHED_UNCONFIRMED_MIN_AGE,
 };
 
 type Acks = Arc<std::sync::Mutex<Vec<(String, Option<i64>)>>>;
@@ -63,6 +63,19 @@ fn retry_now(state: &mut DrainState, session: Uuid) {
     }
 }
 
+/// Backdate `session`'s first unconfirmed answer past the age floor, as if
+/// it had been retried for [`FINISHED_UNCONFIRMED_MIN_AGE`].
+fn age_unconfirmed(state: &mut DrainState, session: Uuid) {
+    let u = state
+        .retry
+        .get_mut(&session)
+        .and_then(|r| r.unconfirmed_finish.as_mut())
+        .expect("an unconfirmed finish is being counted");
+    u.first_at = Instant::now()
+        .checked_sub(FINISHED_UNCONFIRMED_MIN_AGE + Duration::from_secs(1))
+        .expect("the monotonic clock is older than the age floor");
+}
+
 fn kinds(rows: &[(i64, String)]) -> Vec<&str> {
     rows.iter().map(|(_, k)| k.as_str()).collect()
 }
@@ -115,7 +128,8 @@ async fn a_2xx_whose_row_reads_working_is_not_stamped_and_the_row_is_kept() {
         .expect("the session is on its own backoff");
     assert_eq!(retry.failures, 1);
     assert_eq!(retry.serving_failures, 0, "never charged to the quarantine");
-    assert_eq!(retry.unconfirmed_finish, Some(((s, kept[0].0), 1)));
+    let u = retry.unconfirmed_finish.expect("counted against the bound");
+    assert_eq!((u.row, u.attempts), ((s, kept[0].0), 1));
     assert!(!tick.outage, "coord answered: not an outage");
     assert_eq!(finished_patches(&*rec.lock().await, s), 1);
 }
@@ -201,6 +215,8 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
         );
         retry_now(&mut state, s);
     }
+    // Both bounds: the age floor has passed too.
+    age_unconfirmed(&mut state, s);
     drain_tick(&coord.inner, &mut state).await;
     assert_eq!(FINISHED_UNCONFIRMED_MAX_ATTEMPTS, 5);
     assert!(
@@ -230,6 +246,102 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
         ..Default::default()
     });
     assert_eq!(health["finishedUnconfirmed"], 1);
+}
+
+/// Review A1: the attempt count alone never drops a finish. Five (and more)
+/// unconfirmed answers inside the age floor — about thirty seconds on the
+/// session backoff — keep the row; it goes only once the first answer is
+/// [`FINISHED_UNCONFIRMED_MIN_AGE`] old.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unconfirmed_answers_inside_the_age_floor_never_drop_the_finish() {
+    let (_d, outbox, coord, rec, acks) =
+        finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-floor", 42);
+    let mut state = DrainState::default();
+    let answers = FINISHED_UNCONFIRMED_MAX_ATTEMPTS + 3;
+    for attempt in 1..=answers {
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            kinds(&pending_of(&outbox, s)),
+            vec!["finished"],
+            "still queued after unconfirmed answer {attempt}, inside the age floor"
+        );
+        retry_now(&mut state, s);
+    }
+    let u = state.retry[&s].unconfirmed_finish.expect("still counted");
+    assert_eq!(u.attempts, answers, "the count kept climbing");
+    assert_eq!(finished_patches(&*rec.lock().await, s), answers as usize);
+
+    age_unconfirmed(&mut state, s);
+    drain_tick(&coord.inner, &mut state).await;
+    assert!(
+        pending_of(&outbox, s).is_empty(),
+        "dropped once both bounds hold"
+    );
+    assert!(acks.lock().unwrap().is_empty(), "dropped UNSTAMPED");
+}
+
+/// Review A2: an already-quarantined session's finished row is a held
+/// lifecycle row; when coord keeps answering it unconfirmed it still reaches
+/// the bound and is dropped unstamped — never retried forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quarantined_sessions_unconfirmed_finish_still_reaches_the_bound() {
+    let (_d, outbox, coord, _rec, acks) =
+        finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-quarantined", 42);
+    let mut state = DrainState::default();
+    state.quarantined.insert(s);
+    for attempt in 1..FINISHED_UNCONFIRMED_MAX_ATTEMPTS {
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            kinds(&pending_of(&outbox, s)),
+            vec!["finished"],
+            "held after unconfirmed answer {attempt}"
+        );
+        let r = &state.retry[&s];
+        assert_eq!(
+            r.unconfirmed_finish.map(|u| u.attempts),
+            Some(attempt),
+            "a quarantined session's unconfirmed answers are counted"
+        );
+        assert!(
+            r.next_attempt_at > Instant::now() + MAX_BACKOFF - Duration::from_secs(5),
+            "still retried once a minute while quarantined"
+        );
+        retry_now(&mut state, s);
+    }
+    age_unconfirmed(&mut state, s);
+    drain_tick(&coord.inner, &mut state).await;
+    assert!(
+        pending_of(&outbox, s).is_empty(),
+        "the bound dropped the quarantined session's finish"
+    );
+    assert!(acks.lock().unwrap().is_empty(), "dropped UNSTAMPED");
+    assert!(
+        state.quarantined.contains(&s),
+        "the drop does not lift the quarantine"
+    );
+}
+
+/// Review A3: an unconfirmed 2xx is still coord ANSWERING — it moves the
+/// coord-is-serving signals, without stamping or dequeuing the finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconfirmed_answer_counts_as_coord_serving() {
+    let (_d, outbox, coord, _rec, acks) =
+        finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-serving", 42);
+    let mut state = DrainState::default();
+    assert!(!coord.inner.has_been_online.load(Ordering::Relaxed));
+    let tick = drain_tick(&coord.inner, &mut state).await;
+    assert!(state.last_ack.is_some(), "coord answered: last_ack moved");
+    assert_eq!(state.ack_ticks, 1);
+    assert!(coord.inner.has_been_online.load(Ordering::Relaxed));
+    assert!(!tick.outage);
+    assert!(acks.lock().unwrap().is_empty(), "never stamped");
+    assert_eq!(kinds(&pending_of(&outbox, s)), vec!["finished"]);
 }
 
 /// Phase 3's coord answer to a swallowed progress write is an ordinary
