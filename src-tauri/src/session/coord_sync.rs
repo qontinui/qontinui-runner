@@ -1143,8 +1143,18 @@ struct SessionRetry {
     /// it without its row reading `finished`, and how many such answers that
     /// row has had. Per ROW, so an earlier row's failures can never spend a
     /// finish's budget; bounded by
-    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS`].
-    unconfirmed_finish: Option<((Uuid, i64), u32)>,
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS`]
+    /// AND [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MIN_AGE`].
+    unconfirmed_finish: Option<UnconfirmedFinish>,
+}
+
+/// One `finished` row coord keeps answering without its row reading
+/// `finished`: which row, how many such answers, and when the first came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnconfirmedFinish {
+    row: (Uuid, i64),
+    attempts: u32,
+    first_at: Instant,
 }
 
 impl SessionRetry {
@@ -1669,6 +1679,12 @@ async fn push_chain(
                     // trips the abort that would stall every other session.
                     // The row stays queued and blocks THIS session's chain
                     // (seq order); `drain_tick` bounds its retries.
+                    //
+                    // It IS a coord answer, so it moves the coord-is-serving
+                    // signals (`last_ack`, `ack_ticks`, `has_been_online`, and
+                    // no outage verdict for this tick) exactly as an ACK would
+                    // — without stamping the finish or leaving the queue.
+                    out.acked_by_coord = true;
                     tracing::warn!(
                         session = %rec.session_id,
                         seq = rec.seq,
@@ -2112,8 +2128,8 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // refusing the row — it never counts toward quarantine.
         let fail_kind = classify_push_failure(&err, false).0;
         let rate_limited = fail_kind == "rate_limited";
-        // An unconfirmed finish has its own, lower bound (below): it never
-        // counts toward the whole-session quarantine either.
+        // An unconfirmed finish has its own bound (below): it never counts
+        // toward the whole-session quarantine either.
         let unconfirmed = fail_kind == super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND;
         if serving && !rate_limited && !unconfirmed {
             entry.serving_failures += 1;
@@ -2121,16 +2137,26 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
         if let (true, Some(blocked_rec)) = (unconfirmed, blocked_row) {
             let row = (blocked_rec.session_id, blocked_rec.seq);
-            let attempts = match entry.unconfirmed_finish {
-                Some((k, n)) if k == row => n + 1,
-                _ => 1,
+            let (attempts, first_at) = match entry.unconfirmed_finish {
+                Some(u) if u.row == row => (u.attempts + 1, u.first_at),
+                _ => (1, now),
             };
-            entry.unconfirmed_finish = Some((row, attempts));
-            if attempts >= super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS {
+            entry.unconfirmed_finish = Some(UnconfirmedFinish {
+                row,
+                attempts,
+                first_at,
+            });
+            // BOTH bounds: a count alone is spent in ~30 s on the 1-2-4-8-16 s
+            // backoff, which a coord deploy or a transient swallow outlasts.
+            let unconfirmed_for = now.saturating_duration_since(first_at);
+            if attempts >= super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS
+                && unconfirmed_for >= super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MIN_AGE
+            {
                 tracing::warn!(
                     session = %sid,
                     seq = row.1,
                     attempts,
+                    unconfirmed_secs = unconfirmed_for.as_secs(),
                     last_error = %snippet(&err),
                     "coord_sync: coord answered this finished row {attempts} time(s) without \
                      its row reading finished — ACK-dropping it UNSTAMPED (finish_synced stays \
@@ -2924,9 +2950,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     use super::coord_sync_finish_ack::{
                         finished_ack_verdict, unconfirmed_message, FinishedAck,
                     };
+                    // coord ANSWERED (409); a body that cannot be read did
+                    // not show the row finished, so it takes the same bounded
+                    // unconfirmed arm — never a network-class transport fault.
                     let body = match resp.text().await {
                         Ok(body) => body,
-                        Err(e) => return PushOutcome::Transport(transport_error(&e)),
+                        Err(e) => {
+                            return PushOutcome::Transport(unconfirmed_message(
+                                status.as_u16(),
+                                &format!(
+                                    "a 409 answer whose body could not be read: {}",
+                                    transport_error(&e)
+                                ),
+                            ))
+                        }
                     };
                     // Judge the BODY as a row: the status is already known.
                     return match finished_ack_verdict(200, &body) {
