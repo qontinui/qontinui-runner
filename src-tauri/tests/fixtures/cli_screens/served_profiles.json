@@ -115,7 +115,8 @@
       "reached your fable limit",
       "hit your limit",
       "limit reached",
-      "out of usage"
+      "out of usage",
+      "stop and wait for limit to reset"
     ],
     "verifiedVersion": "2.1.285"
   },
