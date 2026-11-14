@@ -137,10 +137,12 @@ struct RegisterOverrides {
     /// [`BindDoor::Sniffed`]. [`AiCoordRegistrar::bind_transcript_session`]
     /// states [`BindDoor::Transcript`].
     door: Option<BindDoor>,
-    /// The adopted row is a LIVE pane's own row that the key owns (plan D1):
-    /// any OTHER key on it is evicted in the R6 critical section instead of
-    /// refusing [`TranscriptBindRefusal::CoordSessionInUse`] — unless an
-    /// owner entry on the row names another id, which still refuses.
+    /// The adopted row is a LIVE pane's own row that the key owns (plan D1).
+    /// When an owner ENTRY on the row names the key, any OTHER key on it is
+    /// evicted in the R6 critical section instead of refusing
+    /// [`TranscriptBindRefusal::CoordSessionInUse`]. An entry naming another
+    /// id refuses; so does a contested row the key holds by the pin seed
+    /// alone (the pin is not evidence of what the pane runs after `/clear`).
     take_from_live_pane: bool,
 }
 
@@ -772,8 +774,10 @@ impl AiCoordRegistrar {
     /// `Undetermined`, never the machine default). Any OTHER key bound to
     /// `row` (the pane's pin, adopted before the pane's process switched id)
     /// is evicted in the same critical section — no `Closed` for anything —
-    /// unless an owner entry on `row` names another id, which refuses
-    /// [`TranscriptBindRefusal::CoordSessionInUse`]. An R6 hit returns the
+    /// but ONLY when an owner entry on `row` names this key. An entry naming
+    /// another id, or other keys on a row this key holds by the pin seed
+    /// alone, refuses [`TranscriptBindRefusal::CoordSessionInUse`] (auto-bind
+    /// defers and retries). An R6 hit returns the
     /// existing id, as every registration does.
     pub fn bind_transcript_session_on_live_pane(
         &self,
@@ -868,12 +872,20 @@ impl AiCoordRegistrar {
                 }
                 // Adoption of an id another key already holds: refused in the
                 // SAME critical section as the reservation, so two adopters
-                // cannot both win — except a live-pane adoption, which TAKES
-                // the row (plan D1/D4): the other keys are evicted here.
-                None if !overrides.take_from_live_pane
-                    && adopt_coord_session.is_some_and(|a| {
-                        rev.iter().any(|(k, v)| *v == a && k != claude_session_id)
-                    }) =>
+                // cannot both win — except a live-pane adoption whose
+                // authority is an OWNER ENTRY naming this key (the seam's
+                // pid-exact evidence), which TAKES the row (plan D1/D4): the
+                // other keys are evicted below. A take whose only authority
+                // is the PIN SEED never evicts: after a `/clear` the pane's
+                // pin P no longer names what the pane runs, and P's older
+                // transcript must not take the row from the successor that
+                // bound it — so it defers like any other contested adoption.
+                None if adopt_coord_session.is_some_and(|a| {
+                    rev.iter().any(|(k, v)| *v == a && k != claude_session_id)
+                        && !(overrides.take_from_live_pane
+                            && self.inner.pane_rows.owner_of(a).as_deref()
+                                == Some(claude_session_id.trim()))
+                }) =>
                 {
                     return Err(TranscriptBindRefusal::CoordSessionInUse);
                 }
@@ -4003,6 +4015,146 @@ mod tests {
                 coord_session_id: r
             }
         );
+    }
+
+    /// Review fix #1: a `/clear` in the pane pinned to P makes it run Y, and
+    /// Y's transcript binds to the pane row R through coord's pick before the
+    /// seam ticks. P's OLDER transcript is then tailed: the owner rule still
+    /// answers R for P by the pin seed alone — which is not evidence of what
+    /// the pane runs — so neither P's live-pane adoption nor a finish-time
+    /// repair for P may take R from Y. Once the seam names Y, P is refused for
+    /// the owner reason.
+    #[test]
+    fn a_pin_seed_alone_never_takes_the_row_from_a_clear_successor() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let (p, y) = ("pinned-before-clear-p", "cleared-into-y");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        reg.bind_transcript_session(y, Some(r), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.live_terminal_row(p).map(|l| l.row),
+            Some(r),
+            "precondition: the pin seed answers R for P"
+        );
+
+        // P's older transcript: the live-pane adoption is refused (auto-bind
+        // defers), and Y keeps R.
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                p,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Err(TranscriptBindRefusal::CoordSessionInUse)
+        );
+        assert_eq!(reg.session_id_for(p), None);
+        assert_eq!(reg.session_id_for(y), Some(r));
+        assert_eq!(reg.task_run_id_for(&r), Some(y.to_string()));
+
+        // P bound elsewhere (coord's pick) and finished: the repair does not
+        // take R either.
+        let stale = Uuid::new_v4();
+        reg.bind_transcript_session(p, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.move_onto_pane_row(p, r, Mover::Repair, NewSessionTenant::Undetermined),
+            MoveOutcome::Contested
+        );
+        open_on(&store, p, "term-pane", None);
+        let _ = store.set_finished(p, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(p).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: stale
+            }
+        );
+        assert_eq!(reg.session_id_for(y), Some(r), "Y still holds R");
+        reg.heartbeat_on_interaction(y);
+        assert!(rows_of_kind(&reg, SessionEventKind::Heartbeat)
+            .iter()
+            .any(|h| h.session_id == r));
+
+        // The seam names Y: R is Y's by an entry now, and P is refused on it.
+        assert_eq!(reg.note_pane_row(r, y), MoveOutcome::Unchanged);
+        assert_eq!(
+            reg.move_onto_pane_row(p, r, Mover::Repair, NewSessionTenant::Undetermined),
+            MoveOutcome::NotOwner
+        );
+        assert_eq!(reg.session_id_for(y), Some(r));
+    }
+
+    /// Review fix #2: the bind trigger mints no owner entry; the migration
+    /// overlap is covered by the owner rule instead. The old pane's row R_old
+    /// carries a seam entry for X; a NEW pane pinned to X is bound to R_new
+    /// later. The bind moves X onto R_new, and the old pane's seam
+    /// re-confirmation cannot pull it back.
+    #[test]
+    fn a_newer_pane_for_the_id_outranks_the_old_panes_seam_entry() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let rows: Arc<Mutex<HashMap<Uuid, i64>>> = Default::default();
+        {
+            let rows = rows.clone();
+            reg.attach_pane_row_tenant(move |row| {
+                rows.lock().unwrap().get(&row).map(|at| PaneRowFacts {
+                    tenant: NewSessionTenant::Undetermined,
+                    bound_at_ms: Some(*at),
+                })
+            });
+        }
+        let panes = attach_panes(&reg);
+        let x = "migrated-session-x";
+        let (stale, r_old, r_new) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        rows.lock().unwrap().insert(r_old, 1);
+        panes
+            .lock()
+            .unwrap()
+            .push(("old-pane-pin".to_string(), Some((r_old, 1))));
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.note_pane_row(r_old, x),
+            MoveOutcome::Moved { from: stale }
+        );
+
+        // The migration's new pane, pinned to X, bound after the entry began.
+        let later = chrono::Utc::now().timestamp_millis() + 60_000;
+        rows.lock().unwrap().insert(r_new, later);
+        panes
+            .lock()
+            .unwrap()
+            .push((x.to_string(), Some((r_new, 2))));
+        reg.on_terminal_coord_bind(x, "term-new", r_new);
+        assert_eq!(reg.session_id_for(x), Some(r_new));
+        assert_eq!(
+            reg.inner.pane_rows.owner_of(r_new),
+            None,
+            "the bind mints no owner entry"
+        );
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r_new));
+
+        // The old pane's process still confirms X on R_old: nothing moves back.
+        assert_eq!(reg.note_pane_row(r_old, x), MoveOutcome::NotLivePane);
+        assert_eq!(reg.session_id_for(x), Some(r_new));
+
+        // The old pane closes: its entry is swept on the next seam advance.
+        rows.lock().unwrap().remove(&r_old);
+        reg.note_pane_row(r_new, x);
+        assert_eq!(reg.inner.pane_rows.owner_of(r_old), None);
+        assert_eq!(reg.session_id_for(x), Some(r_new));
     }
 
     /// The bind trigger does not move X onto a row whose owner entry names
