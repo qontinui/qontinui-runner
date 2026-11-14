@@ -41,9 +41,10 @@
 # Only the two closeout kinds, and only rows with no `acked_at`:
 #
 #   gate_registration -> POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate
-#       Body rebuilt exactly as the runner's `coord_sync.rs`
-#       `gate_registration_body` builds it: `predicate` and `phase_name`
-#       forwarded when present; `continuation_spawn`, `clearance_audience` and
+#       Body rebuilt as the runner's `coord_sync.rs` `gate_registration_body`
+#       builds it -- one hand-kept mirror of coord's `UnitGateRequest`, so keep
+#       the two lists in step: `predicate` and `phase_name` forwarded when
+#       present; `continuation_spawn`, `clearance_audience`, `expires_at` and
 #       `gate_class` forwarded only when present AND non-null (a literal null is
 #       a deserialize error on coord's non-Option `clearance_audience`).
 #       `work_unit_slug` is a PATH segment and `work_unit_upsert` is the lazy
@@ -70,7 +71,8 @@
 #                   both already stage one. (Named, not numbered: rung numbers
 #                   move whenever a rung is inserted and this file is never in
 #                   that commit's diff -- check #37's whole subject.)
-#   --dry-run       Print the table and send nothing.
+#   --dry-run       Print the table, with each register-gate or finding body it
+#                   would send, and send nothing.
 #   --outbox        Drain only this file. Default: the primary's path plus every
 #                   `instance-*/` sibling.
 #
@@ -280,7 +282,7 @@ else:
     for k in ("predicate", "phase_name"):
         if k in p:
             body[k] = p[k]
-    for k in ("continuation_spawn", "clearance_audience", "gate_class"):
+    for k in ("continuation_spawn", "clearance_audience", "expires_at", "gate_class"):
         if k in p and p[k] is not None:
             body[k] = p[k]
     open(bodyf, "w", encoding="utf-8").write(json.dumps(body))
@@ -304,6 +306,10 @@ PYEOF
 
   if [ "$DRY" = "1" ]; then
     printf '%-18s %-38s %6s  %-6s %s\n' "$KIND" "$SESS" "$SEQ" "dry" "would POST $URL"
+    # The register-gate or finding body it would send, so a dry run (and the
+    # self-test) can see the body allowlist, not only the URL. The 404
+    # work-unit bootstrap body is not printed.
+    printf '%-18s %s\n' "" "body: $(cat "$BODYF")"
     rm -f "$BODYF" "$UPSERTF" "$ROWF"; continue
   fi
 

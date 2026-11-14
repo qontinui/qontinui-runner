@@ -28,10 +28,11 @@ page list for the runner on --port is UNKNOWN (exit 3). With --only as well, a t
   limit   for each LIMITED session (stopped by an account usage limit): type
           /next-move. It reaches the exhausted account, Claude prints its limit
           message, and the runner resumes the session in a new pane under
-          another account and closes this one (HANDED). A session parked on
-          Claude's open usage-limit menu with no limit message in its
-          transcript (a background subagent's limit, for one) gets Esc first,
-          which can let Claude print that message. When the runner then moves
+          another account and closes this one (HANDED). Every session parked on
+          Claude's open usage-limit menu gets Esc first, whether or not its
+          transcript carries a limit message (a background subagent's limit
+          carries none; a row whose reset passed carries one), which can let
+          Claude print that message. When the runner then moves
           it, the row reads HANDED; when its pane closes with the session
           nowhere, GONE; nothing is typed either way (hand_off_limited).
   name    for each STOPPED session with no /rename title: type /name, which
@@ -109,6 +110,7 @@ so for a moment they can name the previous holder), so nothing was triaged.
 import argparse
 import base64
 import datetime as dt
+import http.client
 import importlib.util
 import json
 import os
@@ -138,6 +140,10 @@ NAME_MAX = 80
 
 
 # ---------------------------------------------------------------- typing
+RESCREEN_NOW_SAYS = "re-screen now says "
+RESCREEN_STOPPED = RESCREEN_NOW_SAYS + "STOPPED"
+
+
 def ready_to_type(tid, idle_min, cooldown_h, own, want="STOPPED"):
     """Re-screen one row just before typing into it: nudge_one's pre-send
     checks in nudge-stopped-sessions.py, for a prompt other than /next-move.
@@ -158,7 +164,7 @@ def ready_to_type(tid, idle_min, cooldown_h, own, want="STOPPED"):
     verdict, why = nss.judge(verdict, why, nss.row_facts(row, ready), tx, time.time() * 1000, cooldown_h,
                              False, ext)
     if verdict != want:
-        return False, f"re-screen now says {verdict}: {'; '.join(why)}", tx
+        return False, f"{RESCREEN_NOW_SAYS}{verdict}: {'; '.join(why)}", tx
     moving = cfs.output_moving(tid)
     if moving is not False:
         return False, "terminal output still moving" if moving else "terminal output could not be sampled", tx
@@ -200,7 +206,11 @@ def submit(tid, message):
         body = json.loads(urllib.request.urlopen(req, timeout=60).read() or b"{}")
     except urllib.error.HTTPError as e:
         SUBMITTED[tid] = "refused"
-        return False, f"submit-prompt answered {e.code}: {e.read()[:200]!r}"
+        try:  # a refused POST's body can be cut short: that must not end the pass
+            body_text = e.read()[:200]
+        except Exception:  # noqa: BLE001 - IncompleteRead, timeout, reset: the refusal itself is the fact
+            body_text = b""
+        return False, f"submit-prompt answered {e.code}: {body_text!r}"
     except Exception:  # the runner may have typed it anyway: the read-back decides
         SUBMITTED[tid] = "sent"
         return True, ""
@@ -284,29 +294,41 @@ def successor(sid, gone, wait_s=30):
     return ""
 
 
-def await_handoff(tid, sid, wait_s=30, where=None):
-    """Wait for the runner to move a session that hit a usage limit. Returns
-    (state, message). "handed": another pane holds the same Claude session.
-    "gone": the pane closed and no other pane holds its session, or its session
-    id is unknown, so none could be looked for. "listed": the pane is still
-    listed after the wait; if its limit menu is still open, the menu is
-    dismissed with Esc, and nothing on it is chosen. A pane that closes near the
-    end of the wait also waits on successor's own read, so the whole wait can
-    reach about twice `wait_s`. `where`, when given, is a dict whose "step" is
-    set to name the second Esc just before it is sent, so a caller that catches
-    a raise names the call that raised."""
+def wait_for_handoffs(panes, wait_s=30, found=None):
+    """Wait, against ONE deadline, for the runner to move the sessions of every
+    pane in `panes` ({terminal id: Claude session id or None}). Fills and returns
+    `found`, {terminal id: (state, message)} for each pane that closed: "handed"
+    (another pane holds the same Claude session) or "gone" (no other pane does, or
+    the session id is unknown, so none could be looked for). A pane absent from it
+    is still listed after the wait. `found` is passed in so a raise partway (the
+    /terminals read, successor's own read) leaves the panes already settled."""
+    found = {} if found is None else found
+    left = dict(panes)
     deadline = time.time() + wait_s
-    while time.time() < deadline:
+    while left and time.time() < deadline:
         time.sleep(2)
-        if not any(t["id"] == tid for t in cfs.terminals()):
+        listed = {t["id"] for t in cfs.terminals()}
+        for tid, sid in list(left.items()):
+            if tid in listed:
+                continue
+            del left[tid]
             new = successor(sid, tid)
             if new:
-                return "handed", f"the runner resumed the session in pane {new[:8]} under another account"
-            return "gone", ("the pane closed, but no other pane holds its session" if sid else
-                            "the pane closed; its session id is unknown, so no other pane could be checked for it")
-    # The same rule as hand_off_limited and ready_to_type: the prepare read comes
-    # first, so the menu look is the last read before the Esc, and under a
-    # prepare the pane is left alone.
+                found[tid] = "handed", f"the runner resumed the session in pane {new[:8]} under another account"
+            else:
+                found[tid] = "gone", ("the pane closed, but no other pane holds its session" if sid else
+                                      "the pane closed; its session id is unknown, so no other pane could be checked for it")
+    return found
+
+
+def dismiss_open_menu(tid, where=None):
+    """The step after a wait the runner did not answer: if the pane's usage-limit
+    menu is still open, dismiss it with Esc (nothing on it is chosen). Returns
+    ("listed", message). The same rule as hand_off_limited and ready_to_type: the
+    prepare read comes first, so the menu look is the last read before the Esc,
+    and under a prepare the pane is left alone. `where`, when given, is a dict
+    whose "step" is set to name the Esc just before it is sent, so a caller that
+    catches a raise names the call that raised."""
     prep = cfs.prepare_status()[0]
     if limit_menu_open(screen_text(tid, chars=None) or ""):
         if prep != "clear":
@@ -318,44 +340,106 @@ def await_handoff(tid, sid, wait_s=30, where=None):
     return "listed", "the runner did not move the session"
 
 
+def await_handoff(tid, sid, wait_s=30, where=None):
+    """Wait for the runner to move a session that hit a usage limit. Returns
+    (state, message). "handed": another pane holds the same Claude session.
+    "gone": the pane closed and no other pane holds its session, or its session
+    id is unknown, so none could be looked for. "listed": the pane is still
+    listed after the wait; if its limit menu is still open, the menu is
+    dismissed with Esc, and nothing on it is chosen (dismiss_open_menu). A pane
+    that closes near the end of the wait also waits on successor's own read, so
+    the whole wait can reach about twice `wait_s`. `where`: see
+    dismiss_open_menu. The wait is wait_for_handoffs's, which hand_off_limited
+    runs once for every pane it sent an Esc to."""
+    got = wait_for_handoffs({tid: sid}, wait_s)
+    return got[tid] if tid in got else dismiss_open_menu(tid, where)
+
+
 def hand_off_limited(targets, a, own, outcomes=None):
     """Type /next-move into each LIMITED session. The prompt reaches the
     exhausted account, Claude prints its limit message, and the runner moves
     the session to another account; aftercare reads that back, and redirects a
     session with no /next-move, whose redirect is then the prompt that reaches
     the account. A pane whose usage-limit menu is open gets Esc first, which
-    can deliver the limit by itself: await_handoff waits for the runner's move.
-    A moved pane reads HANDED, and one that closed with its session nowhere
-    reads GONE, both with nothing typed. A runner call that raises, from the
-    look for the menu to the /next-move POST, ends that row and the step goes
-    on to the next: FAILED once anything went out to the pane (naming the call
-    that raised), else SKIPPED. Returns the count that did not complete.
-    `outcomes`, when given, receives each row's pass-ledger outcome by terminal
-    id. After an Esc a row is never skipped (a row never typed into): one that
-    ends in this step is done when HANDED, unknown when GONE with no session
-    id, and failed otherwise; one sent /next-move is settled by aftercare."""
+    can deliver the limit by itself. Every such Esc is sent before any wait, and
+    the runner's move is then waited for on all of those panes against one
+    shared deadline (wait_for_handoffs). A moved pane reads HANDED, and one that
+    closed with its session nowhere reads GONE, both with nothing typed. A
+    pane the runner did not move gets the second Esc if its menu is still open
+    (dismiss_open_menu), then the re-screen: when that reads the row STOPPED
+    after the Esc (its reset passed and the Esc unstuck it), the row is skipped,
+    not failed, and nothing is typed (the nudge step works from the pre-act
+    screen, where it read LIMITED, so a later pass picks it up); any
+    other re-screen refusal after an Esc is a failure. A runner call that
+    raises, from the look for the menu to the /next-move POST, ends that row
+    and the step goes on to the next: FAILED once anything went out to the pane
+    (naming the call that raised), else SKIPPED. Returns the count that did not
+    complete. `outcomes`, when given, receives each row's pass-ledger outcome
+    by terminal id. After an Esc a row is never skipped (a row never typed
+    into): one that ends in this step is done when HANDED, skipped when unstuck, unknown
+    when GONE with no session id, and failed otherwise; one sent /next-move is
+    settled by aftercare."""
     failures, sent = 0, []
     outcomes = {} if outcomes is None else outcomes
+    state_of = {}  # terminal id -> (touched, where): what went out to the pane, and the call in flight
+    esc_sent = {}  # terminal id -> session id, for each pane an Esc went out to
+
+    def raised(r, touched, where, e):
+        """http.client's too: nothing more is typed, and the step goes on. An Esc or a
+        POST can reach the pane even when its reply is torn, so a pane anything went out
+        to is FAILED and never looked at or typed into again (as aftercare does); one
+        nothing went out to is SKIPPED, as the name step's re-screen reads a raise."""
+        nonlocal failures
+        tid = r["terminalId"]
+        failures += 1
+        outcomes[tid] = "failed" if touched else "skipped"
+        print(f"  {'FAILED ' if touched else 'SKIPPED'} {tid[:8]}  {r['name'][:50]} - {where['step']} raised "
+              f"({type(e).__name__}: {str(e)[:80]}); not typed into{' again' if touched else ''}: read the pane "
+              "with --report")
+    # Pass 1: every Esc goes out before any wait. A menu left open holds the prompt. The
+    # prepare read comes first, so the menu look is the last read before the Esc
+    # (ready_to_type's rule); under a prepare the pane is left alone, and ready_to_type
+    # refuses the row in pass 3. When a background subagent hit the limit, the menu is all
+    # the pane shows, and this Esc alone can let the main session print the limit message
+    # the runner moves the session on (plan
+    # 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated).
+    skipped = set()  # rows pass 1 already ended (a raise)
     for r in targets:
         tid, sid = r["terminalId"], r.get("claudeSessionId")
-        # touched: an Esc or the /next-move POST went out to the pane.
-        touched, reached, where = False, False, {"step": "the look for an open usage-limit menu"}
+        touched, where = False, {"step": "the look for an open usage-limit menu"}
+        state_of[tid] = [touched, where]
         try:
-            # A menu left open holds the prompt. The prepare read comes first, so
-            # the menu look is the last read before the Esc (ready_to_type's
-            # rule); under a prepare the pane is left alone, and ready_to_type
-            # refuses the row just below.
             if cfs.prepare_status()[0] == "clear" and limit_menu_open(screen_text(tid, chars=None) or ""):
-                # When a background subagent hit the limit, the menu is all the pane
-                # shows, and this Esc alone can let the main session print the limit
-                # message the runner moves the session on (plan
-                # 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated).
-                # So wait for that move: a moved pane is typed nothing, and only one
-                # the runner did not move goes on to the re-screen and /next-move.
-                touched, where["step"] = True, "the Esc on its usage-limit menu"
+                state_of[tid][0], where["step"] = True, "the Esc on its usage-limit menu"
+                esc_sent[tid] = sid
                 write_keys(tid, b"\x1b")
+        except Exception as e:
+            raised(r, state_of[tid][0], where, e)
+            skipped.add(tid)
+    # Pass 2: one wait for the runner's move, for every pane an Esc went out to.
+    found, wait_err = {}, None
+    live = {t: sid for t, sid in esc_sent.items() if t not in skipped}
+    if live:
+        try:
+            wait_for_handoffs(live, found=found)
+        except Exception as e:  # the panes it settled before the raise keep their answer
+            wait_err = e
+    # Pass 3: each row in its own order.
+    for r in targets:
+        tid, sid = r["terminalId"], r.get("claudeSessionId")
+        if tid in skipped:
+            continue
+        touched, where = state_of[tid]
+        reached = False
+        try:
+            if tid in esc_sent:
                 where["step"] = "the hand-off read after its Esc"
-                state, why = await_handoff(tid, sid, where=where)
+                if tid not in found and wait_err is not None:
+                    raise wait_err
+                if tid in found:
+                    state, why = found[tid]
+                else:
+                    state, why = dismiss_open_menu(tid, where)
                 if state == "handed":
                     outcomes[tid] = "done"
                     print(f"  HANDED  {tid[:8]}  {r['name'][:50]} - {why}")
@@ -373,18 +457,20 @@ def hand_off_limited(targets, a, own, outcomes=None):
                 # refused POST's reply included) ends the row FAILED as well.
                 touched, where["step"] = True, "the /next-move POST"
                 ok, msg = submit(tid, "/next-move")
-        except Exception as e:  # http.client's too: nothing more is typed, and the step goes on
-            # An Esc or a POST can reach the pane even when its reply is torn, so a
-            # pane anything went out to is FAILED and never looked at or typed into
-            # again (as aftercare does); one nothing went out to is SKIPPED, as the
-            # name step's re-screen reads a raise.
-            failures += 1
-            outcomes[tid] = "failed" if touched else "skipped"
-            print(f"  {'FAILED ' if touched else 'SKIPPED'} {tid[:8]}  {r['name'][:50]} - {where['step']} raised "
-                  f"({type(e).__name__}: {str(e)[:80]}); not typed into{' again' if touched else ''}: read the pane "
-                  "with --report")
+        except Exception as e:
+            raised(r, touched, where, e)
             continue
         if not ok:
+            # The Esc unstuck the row: its reset passed, so the re-screen reads STOPPED
+            # now, where it read LIMITED at screen time. Nothing is wrong and nothing is
+            # typed; the nudge step owns a STOPPED row.
+            # Nothing nudges it this pass (the nudge step works from the pre-act screen,
+            # where it read LIMITED), so it is skipped, not done: a later pass picks it up.
+            if tid in esc_sent and not reached and msg.startswith(RESCREEN_STOPPED):
+                outcomes[tid] = "skipped"
+                print(f"  SKIPPED {tid[:8]}  {r['name'][:50]} - the Esc on its menu let it resume (unstuck); not typed "
+                      f"this pass, a later pass picks it up: {msg}")
+                continue
             failures += 1
             # reached: the runner refused the POST; touched: an Esc went in before it
             outcomes[tid] = "failed" if reached or touched else "skipped"
@@ -604,6 +690,11 @@ def ready_for_redirect(tid, term):
     if prep != "clear":
         return False, prep_text
     raw = cfs.raw_tail(tid)
+    # The same final look ready_to_type refuses on: an open usage-limit menu takes the
+    # redirect's Enter as a choice, and prompt_state does not count a dim option label,
+    # so a dim-labelled menu would read as an empty prompt just below.
+    if raw is not None and limit_menu_open(cfs.ANSI_RE.sub("", raw)):
+        return False, "Claude's usage-limit menu is open just before the send, so nothing is typed into it"
     state, typed = (cfs.prompt_state(raw, cols=cfs.wrap_cols(term)) if raw is not None
                     else ("unknown", "screen unreadable"))
     if state != "empty":
@@ -1225,6 +1316,79 @@ def selftest_prepare_hold():
     return failures
 
 
+def selftest_name_outcomes():
+    """main() --act with only the name step doing work: the outcomes name_sessions
+    settles itself reach PASS.named, which prefers them to its own reading of what
+    submit() recorded (a row it settled "failed" would otherwise read as done or
+    sent_unconfirmed). Every door is stubbed and nothing can type. Returns failures."""
+    import contextlib
+    import io
+    g = globals()
+    stopped = {"terminalId": "n1", "verdict": "STOPPED", "screen": "ACTIVE", "tab": "x", "name": "n", "reasons": []}
+    got = []
+
+    class Recorder:
+        def named(self, targets, named, typed, outcomes=None):
+            got.append((list(targets), dict(outcomes) if outcomes is not None else None))
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: []
+    keys_g = ("PASS", "run_helper", "name_sessions", "custom_title")
+    saved_g = {k: g[k] for k in keys_g}
+    saved_cfs = {k: getattr(cfs, k) for k in ("prepare_status", "terminals", "open_rows", "transcript_facts")}
+    saved_screen, saved_argv = nss.screen, sys.argv
+
+    def fake_name_sessions(targets, a, own, outcomes=None):
+        outcomes["n1"] = "failed"
+        return [], 1
+    try:
+        g["PASS"], g["run_helper"] = Recorder(), lambda script, args: (0, "")
+        g["name_sessions"], g["custom_title"] = fake_name_sessions, lambda path: None
+        cfs.prepare_status, cfs.terminals = lambda: ("clear", ""), lambda: []
+        cfs.open_rows, cfs.transcript_facts = lambda: {"n1": {}}, lambda row: {"path": "p"}
+        nss.screen = lambda *a, **k: ([dict(stopped)], [], None)
+        sys.argv = ["triage-sessions.py", "--act", "--skip", "close,limit,layout"]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            main()
+    finally:
+        sys.argv = saved_argv
+        nss.screen = saved_screen
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+    if not got or got[0][1] != {"n1": "failed"}:
+        print(f"FAIL the name step's settled outcomes did not reach PASS.named: {got}")
+        return 1
+    return 0
+
+
+def selftest_redirect_menu():
+    """ready_for_redirect's final look refuses an open usage-limit menu whose option
+    label is dim (prompt_state reads that screen as an empty prompt), as ready_to_type
+    does, and still passes a plain idle prompt. Every runner read is stubbed. Returns failures."""
+    g = globals()
+    failures = 0
+    saved_g = {k: g[k] for k in ("screen_text", "write_keys")}
+    saved_cfs = {k: getattr(cfs, k) for k in ("prepare_status", "output_moving", "raw_tail", "wrap_cols")}
+    try:
+        g["screen_text"], g["write_keys"] = lambda tid, chars=3000: UNKNOWN_NEXT_MOVE, lambda tid, data: None
+        cfs.prepare_status, cfs.output_moving = lambda: ("clear", ""), lambda tid: False
+        cfs.wrap_cols = lambda term: None
+        idle = "\x1b[10;1H\u276f \x1b[10;3H\x1b[?25h"
+        for case, raw, want_ok in (("a dim-labelled menu", cfs.LIMIT_MENU_RAW_DIM, False), ("the plain menu", cfs.LIMIT_MENU_RAW, False),
+                                   ("an idle prompt", idle, True)):
+            cfs.raw_tail = lambda tid, raw=raw: raw
+            ok, msg = ready_for_redirect("t1", {"id": "t1"})
+            if ok != want_ok or (not ok and "usage-limit menu is open" not in msg):
+                print(f"FAIL ready_for_redirect on {case}: {ok} {msg!r}, want ok={want_ok}")
+                failures += 1
+    finally:
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+    return failures
+
+
 def typing_steps_held(prep, skip):
     """The steps a restart prepare holds, in run order. Pure. These three type
     into a pane: /next-move would end a paused session's pause, and on a LIMITED
@@ -1361,6 +1525,8 @@ def selftest():
         print(f"FAIL auto_accept_dial read {sorted(set(paths))}, want only /health")
         failures += 1
     failures += selftest_prepare_hold()
+    failures += selftest_name_outcomes()
+    failures += selftest_redirect_menu()
     step_failures, steps = selftest_name_sessions()
     failures += step_failures
     close_failures, close_rows, close_argvs, listings = selftest_close_step()
@@ -2080,6 +2246,7 @@ def watch_selftest():
         # each Esc follows the menu look directly: the prepare read comes before the look, never between the
         # look and the key. The real write_keys counts each write; only its POST is stubbed.
         open_cases = ("stays open", "second Esc raises", "held at the second look", "stays open, 1000 columns")
+        saved_judge = nss.judge
 
         def menu_cell(case, parked, heir):
             """One hand_off_limited run over `parked`. Returns (not completed, output lines, keys posted,
@@ -2131,10 +2298,13 @@ def watch_selftest():
             # The re-screen's verdict for a pane whose menu stays open, so its final look is reached.
             cfs.proc_table = lambda: {}
             cfs.classify = lambda *_a, **_k: ("LIMITED", ["an open usage-limit menu ends the screen"])
+            if case == "the Esc unstuck it":  # its reset passed while the menu was up: the re-screen reads STOPPED
+                cfs.classify = lambda *_a, **_k: ("STOPPED", [])
+                nss.judge = lambda *_a, **_k: ("STOPPED", ["its usage limit reset"])
             g["write_keys"], g["post_keys"] = saved_g["write_keys"], post
             g["ready_to_type"] = saved_g["ready_to_type"] if case in (
                 "moved", "gone", "gone, no session id", "stays open", "re-screen raises", "a draft at the prompt",
-                "held at the second look", "stays open, 1000 columns") else (
+                "held at the second look", "stays open, 1000 columns", "the Esc unstuck it") else (
                 lambda tid, *_a, **_k: rescreened.append(tid) or (True, "", None))
             cfs.prompt_state = (saved_cfs["prompt_state"] if case in ("stays open", "a draft at the prompt",
                                                                       "stays open, 1000 columns") else stub_prompt)
@@ -2148,13 +2318,14 @@ def watch_selftest():
                 except Exception as e:  # a raise out of the step is this cell's failure, not the selftest's end
                     left = f"hand_off_limited raised {type(e).__name__}: {e}"
             cfs.prompt_state = stub_prompt
+            nss.judge = saved_judge
             return left, out.getvalue().splitlines(), posted, prompts, rescreened, outcomes, events
         heir, ready_stub, stub_prompt, esc = "h0000001-menu", g["ready_to_type"], cfs.prompt_state, b"\x1b"
         refused_open = "Claude's usage-limit menu is open just before the send"
         for i, case in enumerate(("moved", "gone", "gone, no session id", "not moved", "stays open", "read raises",
                                   "Esc raises", "second Esc raises", "re-screen raises", "the menu look raises",
                                   "a draft at the prompt", "held at the second look", "stays open, 1000 columns",
-                                  "the /next-move POST raises"), 1):
+                                  "the /next-move POST raises", "the Esc unstuck it"), 1):
             cells += 1
             parked = f"p{i:07d}-menu"
             left, lines, posted, prompts, rescreened, outcomes, events = menu_cell(case, parked, heir)
@@ -2186,7 +2357,11 @@ def watch_selftest():
                 "stays open, 1000 columns": (1, "failed", [], [], [esc, esc], [f"  SKIPPED {p}  parked - "
                                                                                 f"{refused_open}"]),
                 "the /next-move POST raises": (1, "failed", [(parked, "/next-move")], [parked], [esc],
-                                               [f"  FAILED  {p}  parked - the /next-move POST raised (IncompleteRead"])
+                                               [f"  FAILED  {p}  parked - the /next-move POST raised (IncompleteRead"]),
+                # the Esc unstuck it (the re-screen reads STOPPED): not a failure, nothing typed
+                "the Esc unstuck it": (0, "skipped", [], [], [esc],
+                                       [f"  SKIPPED {p}  parked - the Esc on its menu let it resume (unstuck); not "
+                                        "typed this pass"])
             }[case]
             if (left, outcomes.get(parked), prompts, rescreened) != want[:4] \
                     or posted != [(parked, k) for k in want[4]] \
@@ -2195,6 +2370,26 @@ def watch_selftest():
                 bad.append(f"a pane parked on the limit menu, {case}: {left} not completed, outcomes {outcomes}, "
                            f"keys posted {posted}, prompts {prompts}, re-screened {rescreened}, events {events}; "
                            f"want {want}: {lines}")
+        # Every Esc goes out before any wait, and one shared deadline covers the wait: two panes
+        # whose menus stay open and which the runner never moves cost one 30 s wait between them,
+        # not one each, and both Escs are sent before the first /terminals read.
+        cells += 1
+        pair = ["c0000001-menu", "c0000002-menu"]
+        order, started = [], clock.now
+        cfs.terminals = lambda: order.append("read") or [{"id": t} for t in pair]
+        cfs.prepare_status = lambda: ("clear", "")
+        cfs.raw_tail = lambda tid, chars=30000: cfs.LIMIT_MENU_SCREEN
+        g["post_keys"] = lambda tid, keys: order.append(("esc", tid))
+        g["write_keys"] = saved_g["write_keys"]
+        g["ready_to_type"] = lambda *_a, **_k: (False, "held", None)
+        pair_out = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            hand_off_limited([{"terminalId": t, "name": "pair", "claudeSessionId": f"s-{t}"} for t in pair],
+                             argparse.Namespace(idle_min=15, cooldown_hours=None), "", pair_out)
+        first_read = order.index("read") if "read" in order else len(order)
+        if order[:2] != [("esc", pair[0]), ("esc", pair[1])] or first_read < 2 or clock.now - started > 45:
+            bad.append(f"two panes parked on the limit menu: order {order[:6]}, {clock.now - started:.0f}s elapsed; "
+                       "want both Escs before the first /terminals read and one shared 30s wait")
         g["post_keys"], g["ready_to_type"] = saved_g["post_keys"], ready_stub
         cfs.classify, cfs.proc_table = saved_cfs["classify"], saved_cfs["proc_table"]
         # await_handoff's state as its other two readers take it, read as hand_off_limited reads it, over the
@@ -2562,7 +2757,7 @@ def main():
             # The runner UI shows a terminal with no pageId on the "default" page.
             ids = [t["id"] for t in cfs.terminals() if (t.get("pageId") or "default") in hit
                    and (not a.only or any(t["id"].startswith(o) for o in a.only.split(",") if o))]
-        except cfs.READ_ERRORS as e:
+        except (*cfs.READ_ERRORS, http.client.HTTPException) as e:
             print(f"UNKNOWN: could not read the runner at {cfs.API}: {e}", file=sys.stderr)
             return 3
         print(f"tab {', '.join(repr(n) for n in tabs)}: {len(hit)} tab(s), {len(ids)} terminal(s)")
@@ -2577,7 +2772,7 @@ def main():
         res, warnings, ready_err = nss.screen(a.idle_min, [o for o in a.only.split(",") if o], a.cooldown_hours,
                                               False)
         rows = cfs.open_rows()
-    except cfs.READ_ERRORS as e:
+    except (*cfs.READ_ERRORS, http.client.HTTPException) as e:
         print(f"UNKNOWN: could not read the runner at {cfs.API}: {e}", file=sys.stderr)
         return 3
     PASS.screened(res)
@@ -3639,6 +3834,26 @@ def outcome_selftest():
     for ok, sent, msg, want in nudge_cases:
         if nss.nudge_outcome(ok, sent, msg) != want:
             bad.append(f"nudge_outcome({ok}, {sent}, {msg[:30]!r}) = {nss.nudge_outcome(ok, sent, msg)!r}")
+    # A refused POST whose body read is cut short (IncompleteRead) is still the runner's refusal: submit()
+    # returns it, so name_sessions, the aftercare redirect and the hand-off step finish the pass.
+    class _TornBody(urllib.error.HTTPError):
+        def read(self, *_a):
+            raise http.client.IncompleteRead(b"{")
+
+    def _refused(*_a, **_k):
+        raise _TornBody("http://127.0.0.1:9/x", 500, "boom", {}, None)
+    saved_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = _refused
+    try:
+        try:
+            got = submit("t-torn", "/name")
+        except Exception as e:  # noqa: BLE001
+            got = (None, f"raised {type(e).__name__}: {e}")
+    finally:
+        urllib.request.urlopen = saved_urlopen
+        SUBMITTED.pop("t-torn", None)
+    if got[0] is not False or not got[1].startswith(nss.SUBMIT_REFUSED):
+        bad.append(f"submit() with a refused POST whose body read is cut short = {got}")
     # The prefixes the mappings key on are the ones the act functions return.
     close_src, nudge_src = inspect.getsource(cfs.close_one), inspect.getsource(nss.nudge_one)
     for src, needle in ((close_src, 'return False, f"' + cfs.DELETE_SENT + 'answered '),
