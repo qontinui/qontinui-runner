@@ -53,6 +53,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -758,11 +759,19 @@ impl Reporter {
         }
     }
 
-    fn persist(&self) {
-        if let (Some(path), Some(state)) = (self.state_path.as_ref(), self.state.as_ref()) {
-            if let Err(e) = events::save(path, state) {
-                debug!("fleet::computer: could not persist observer state: {e}");
-            }
+    /// Write the observer state. `events::save` fsyncs, so it runs as a
+    /// tracked blocking body on a snapshot of the state — never on the
+    /// `fleet-heartbeat` thread's single async worker, which also carries the
+    /// coord liveness heartbeat. Awaited, so a caller's ordering (persist
+    /// before the POST) holds.
+    async fn persist(&self) {
+        let (Some(path), Some(state)) = (self.state_path.clone(), self.state.clone()) else {
+            return;
+        };
+        match spawn_blocking_tracked(move || events::save(&path, &state)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("fleet::computer: could not persist observer state: {e}"),
+            Err(e) => debug!("fleet::computer: the observer-state write did not finish: {e}"),
         }
     }
 
@@ -793,11 +802,9 @@ impl Reporter {
         let now = chrono::Utc::now();
         // procfs reads: off the async worker, like the sampler's own
         // `collect_host_lane`. A panicked read is an all-UNKNOWN reading.
-        let axes = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
-            crate::fleet::host_axes::collect,
-        )
-        .await
-        .unwrap_or_default();
+        let axes = spawn_blocking_tracked(crate::fleet::host_axes::collect)
+            .await
+            .unwrap_or_default();
         let Some(host_id) = identity::host_identity_hash() else {
             if !self.no_identity_logged {
                 self.no_identity_logged = true;
@@ -806,12 +813,14 @@ impl Reporter {
             return;
         };
         if self.state.is_none() {
-            self.state = Some(
-                self.state_path
-                    .as_deref()
-                    .map(events::load)
+            // A panicked load is a fresh state, as `events::load`'s own
+            // fallback for an unreadable file.
+            self.state = Some(match self.state_path.clone() {
+                Some(path) => spawn_blocking_tracked(move || events::load(&path))
+                    .await
                     .unwrap_or_default(),
-            );
+                None => ObserverState::default(),
+            });
         }
 
         // Loop starvation is a fact about THIS loop, independent of coord, so
@@ -833,15 +842,15 @@ impl Reporter {
         }
 
         let Some(device) = crate::fleet::load_device_file() else {
-            self.persist();
+            self.persist().await;
             return;
         };
         let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
-            self.persist();
+            self.persist().await;
             return;
         };
         let Some(bearer) = crate::coord_mcp::read_usable_device_jwt().await else {
-            self.persist();
+            self.persist().await;
             return;
         };
 
@@ -852,9 +861,7 @@ impl Reporter {
             .last_facts_at
             .is_none_or(|t| t.elapsed() >= Duration::from_secs(REPORT_FULL_SECS));
         if facts_due || self.facts.is_none() {
-            self.facts = tokio::task::spawn_blocking(identity::collect_static)
-                .await
-                .ok();
+            self.facts = spawn_blocking_tracked(identity::collect_static).await.ok();
             self.access = access::collect().await;
             self.last_facts_at = Some(tokio::time::Instant::now());
         }
@@ -900,7 +907,7 @@ impl Reporter {
 
         self.derive_events(&observed, &host_id, now);
         // Persist BEFORE the POST: a crash mid-send must not lose events.
-        self.persist();
+        self.persist().await;
 
         if let Some(until) = self.route_absent_until {
             if tokio::time::Instant::now() < until {
@@ -956,7 +963,7 @@ impl Reporter {
                 self.route_absent_until = None;
                 self.server_errors = 0;
                 let outcomes = parse_outcomes(&text);
-                self.on_delivered(&body, full, outcomes.as_ref());
+                self.on_delivered(&body, full, outcomes.as_ref()).await;
             }
             404 | 405 | 503 => {
                 if !self.route_absent_logged {
@@ -969,7 +976,7 @@ impl Reporter {
                 }
                 self.back_off();
             }
-            422 => self.on_rejected(&body, &text, now, strip),
+            422 => self.on_rejected(&body, &text, now, strip).await,
             401 | 403 => {
                 self.log_failure(format!("POST {url} -> HTTP {status} (credential refused)"));
                 self.back_off();
@@ -1098,7 +1105,7 @@ impl Reporter {
     ///    the next reports are sent [`stripped`] for one full cadence.
     /// 4. If a stripped report is ALSO refused, every queue in it is
     ///    quarantined and the reporter backs off — nothing can wedge it.
-    fn on_rejected(
+    async fn on_rejected(
         &mut self,
         body: &ComputerReportReq,
         text: &str,
@@ -1131,11 +1138,11 @@ impl Reporter {
             }
         }
         if q.events > 0 {
-            self.persist();
+            self.persist().await;
             return;
         }
         if q.markers > 0 {
-            self.persist();
+            self.persist().await;
             self.back_off();
             return;
         }
@@ -1150,7 +1157,7 @@ impl Reporter {
             }
         }
         self.strip_until = None;
-        self.persist();
+        self.persist().await;
         self.back_off();
     }
 
@@ -1158,7 +1165,7 @@ impl Reporter {
     /// now holds — except for a computer coord reported as an
     /// `identity_conflict`, whose services and events it did NOT store; those
     /// stay queued.
-    fn on_delivered(
+    async fn on_delivered(
         &mut self,
         body: &ComputerReportReq,
         full: bool,
@@ -1255,7 +1262,7 @@ impl Reporter {
             }
             self.last_unknown_fields = unknown_fields;
         }
-        self.persist();
+        self.persist().await;
     }
 
     fn log_failure(&mut self, msg: String) {
@@ -1684,8 +1691,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_service_list_over_coords_bound_cuts_the_overflowing_kind_and_defers_it() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_service_list_over_coords_bound_cuts_the_overflowing_kind_and_defers_it() {
         let mut obs = observed(svc::INCIDENT_SHOW);
         let template = obs.scan.units.as_ref().unwrap()[0].clone();
         let unit = |name: String| {
@@ -1733,7 +1740,7 @@ mod tests {
             device_id: "d".into(),
             computers: vec![c],
         };
-        r.on_delivered(&body, true, None);
+        r.on_delivered(&body, true, None).await;
         let delta = plan_computer(&obs, false, r.last_sent.get(HOST_ID), &[]).unwrap();
         let mut deferred: Vec<&str> = delta
             .services
@@ -1762,8 +1769,8 @@ mod tests {
     /// scan over coord's bound queues ONE `services_over_bound` event, and it
     /// rides the same report as the first truncated list. A later delta —
     /// which lists only the deferred rows — does not read as "back within".
-    #[test]
-    fn a_scan_over_the_bound_queues_one_event_on_the_first_truncated_report() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_scan_over_the_bound_queues_one_event_on_the_first_truncated_report() {
         let mut obs = observed(svc::HEALTHY_SHOW);
         let template = obs.scan.units.as_ref().unwrap()[0].clone();
         obs.scan.units = Some(
@@ -1815,7 +1822,7 @@ mod tests {
             device_id: "d".into(),
             computers: report,
         };
-        r.on_delivered(&body, true, None);
+        r.on_delivered(&body, true, None).await;
         r.derive_events(observed, HOST_ID, at("2026-11-14T00:01:00Z"));
         let delta = r.plan_report(observed, false, false);
         assert_eq!(delta[0].services.as_ref().map(Vec::len), Some(44));
@@ -2107,6 +2114,153 @@ mod tests {
         src.split_once("\n#[cfg(test)]")
             .map(|(a, _)| a)
             .unwrap_or(src)
+    }
+
+    /// Plan `2026-11-13-computer-services-cap-and-sample-outcome` Phase 3: the
+    /// async `persist` writes a state the next reporter's load reads back
+    /// equal — on a current-thread runtime, the flavour the `fleet-heartbeat`
+    /// thread runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn persist_writes_a_state_that_load_reads_back_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("computer-observer.json");
+        let mut state = ObserverState {
+            last_tick_at: Some("2026-11-14T00:00:00Z".into()),
+            ..ObserverState::default()
+        };
+        events::push_pending(&mut state, HOST_ID, vec![ev("persisted-1")]);
+        let r = Reporter {
+            state: Some(state.clone()),
+            state_path: Some(path.clone()),
+            ..Reporter::new()
+        };
+        r.persist().await;
+        assert_eq!(events::load(&path), state);
+    }
+
+    /// The byte index just past the delimiter closing the one at `open`
+    /// (`open_ch` … `close_ch`, nesting counted), or `None` when unbalanced.
+    fn closing(src: &str, open: usize, open_ch: char, close_ch: char) -> Option<usize> {
+        let mut depth = 0i32;
+        for (i, ch) in src.get(open..)?.char_indices() {
+            if ch == open_ch {
+                depth += 1;
+            } else if ch == close_ch {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i + ch.len_utf8());
+                }
+            }
+        }
+        None
+    }
+
+    /// The byte spans of every `spawn_blocking_tracked(…)` call in `src`,
+    /// found by paren matching from the call's opening paren.
+    fn tracked_spans(src: &str) -> Vec<std::ops::Range<usize>> {
+        const CALL: &str = "spawn_blocking_tracked(";
+        src.match_indices(CALL)
+            .filter_map(|(start, _)| {
+                closing(src, start + CALL.len() - 1, '(', ')').map(|end| start..end)
+            })
+            .collect()
+    }
+
+    /// `needle` occurs in `body`, and only inside tracked blocking bodies.
+    fn assert_only_tracked(name: &str, body: &str, needle: &str) {
+        let spans = tracked_spans(body);
+        let hits: Vec<usize> = body.match_indices(needle).map(|(i, _)| i).collect();
+        assert!(!hits.is_empty(), "{name}: `{needle}` not found");
+        for h in hits {
+            assert!(
+                spans.iter().any(|s| s.contains(&h)),
+                "{name}: `{needle}` at byte {h} runs inline, outside spawn_blocking_tracked"
+            );
+        }
+    }
+
+    /// The text of the function whose signature `sig` first follows `after`.
+    fn fn_text<'a>(src: &'a str, after: &str, sig: &str) -> &'a str {
+        let from = src
+            .find(after)
+            .unwrap_or_else(|| panic!("{after} not found"));
+        let start = src
+            .get(from..)
+            .and_then(|s| s.find(sig))
+            .map(|i| from + i)
+            .unwrap_or_else(|| panic!("{sig} not found"));
+        src.get(start..)
+            .and_then(|s| s.find('{'))
+            .and_then(|i| closing(src, start + i, '{', '}'))
+            .and_then(|end| src.get(start..end))
+            .unwrap_or_else(|| panic!("{sig} has no closing brace"))
+    }
+
+    fn reporter_prod(name: &str) -> &'static str {
+        REPORTER_SOURCES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, src)| prod_part(src))
+            .unwrap_or_else(|| panic!("{name} is not a reporter source"))
+    }
+
+    /// Phase 3: the fsync'd state write and the state load run as tracked
+    /// blocking bodies, and `persist` is the only writer.
+    #[test]
+    fn observer_state_io_runs_in_tracked_blocking_bodies() {
+        let prod = reporter_prod("mod.rs");
+        assert!(prod.contains("spawn_blocking_tracked(move || events::save"));
+        assert_only_tracked("mod.rs", prod, "events::save(");
+        assert_only_tracked("mod.rs", prod, "events::load(");
+        assert_eq!(prod.matches("events::save(").count(), 1);
+        assert_only_tracked(
+            "persist",
+            fn_text(prod, "impl Reporter", "async fn persist("),
+            "events::save(",
+        );
+    }
+
+    /// Phase 3: no blocking body escapes the house wrapper's lane accounting.
+    #[test]
+    fn the_reporter_never_spawns_an_untracked_blocking_body() {
+        for (name, src) in REPORTER_SOURCES {
+            assert!(
+                !prod_part(src).contains("tokio::task::spawn_blocking("),
+                "{name} spawns an untracked blocking body"
+            );
+        }
+        assert_only_tracked(
+            "mod.rs",
+            reporter_prod("mod.rs"),
+            "identity::collect_static",
+        );
+    }
+
+    /// Phase 3: the procfs host axes are never read on the async worker.
+    #[test]
+    fn host_axes_are_never_collected_inline() {
+        let prod = reporter_prod("mod.rs");
+        assert!(!prod.contains("host_axes::collect()"));
+        assert_only_tracked("mod.rs", prod, "host_axes::collect");
+    }
+
+    /// Phase 3: each service scan's per-unit `.runner` / cgroup reads run in
+    /// a tracked blocking body.
+    #[test]
+    fn the_service_scans_read_unit_files_in_tracked_bodies() {
+        let services = reporter_prod("services.rs");
+        let linux = fn_text(
+            services,
+            "pub(crate) mod linux",
+            "pub(crate) async fn scan(",
+        );
+        assert_only_tracked("linux scan", linux, "watched_from_props(");
+        let windows = fn_text(
+            services,
+            "pub(crate) mod windows",
+            "pub(crate) async fn scan(",
+        );
+        assert_only_tracked("windows scan", windows, "read_runner_file(");
     }
 
     /// No timer, task or thread of its own — a task would escape the gate.
