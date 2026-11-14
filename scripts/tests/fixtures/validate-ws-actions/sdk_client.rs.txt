@@ -1,0 +1,78 @@
+// Fixture for scripts/__tests__/validate-ws-actions.test.mjs — one handler per
+// call shape the extractor must recognise. Not compiled; only its text matters.
+
+/// GET /ui-bridge/sdk/plain — Baseline: private fn, single doc line
+async fn handle_plain(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    dispatch_app_request(&state, "plainAction", json!({}), Method::GET, "/plain", None).await
+}
+
+/// POST /ui-bridge/sdk/typed — (a) the _typed entry point
+async fn handle_typed(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    let result = match dispatch_app_request_typed(
+        &state,
+        "typedAction",
+        json!({}),
+        Method::POST,
+        "/typed",
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    result
+}
+
+/// GET /ui-bridge/sdk/by-id/:app_id — (a) the _by_id entry point, app id before the action
+async fn handle_by_id(State(state): State<Arc<ApiState>>, Path(app_id): Path<String>) -> impl IntoResponse {
+    match dispatch_app_request_by_id(
+        &state,
+        app_id,
+        "byIdAction",
+        json!({}),
+        Method::GET,
+        "/by-id",
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => e,
+    }
+}
+
+/// DELETE /ui-bridge/sdk/crate-visible — (b) pub(crate) handler
+pub(crate) async fn handle_crate_visible(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    dispatch_app_request(&state, "crateVisibleAction", json!({}), Method::DELETE, "/cv", None).await
+}
+
+/// PUT /ui-bridge/sdk/public — (b) pub handler
+pub async fn handle_public(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    dispatch_app_request(&state, "publicAction", json!({}), Method::PUT, "/public", None).await
+}
+
+/// PATCH /ui-bridge/sdk/long-doc — (c) route line followed by more doc lines
+///
+/// The handler's explanation continues here, and on this line too.
+async fn handle_long_doc(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    dispatch_app_request(&state, "longDocAction", json!({}), Method::PATCH, "/long-doc", None).await
+}
+
+/// POST /ui-bridge/sdk/legacy — Legacy try_ws_dispatch shape
+async fn handle_legacy(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    try_ws_dispatch(&state, "legacyAction", json!({})).await
+}
+
+/// GET /ui-bridge/sdk/ipc-only — IPC-only handler, no dispatch site: must be skipped
+pub(crate) async fn handle_ipc_only(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    // A longer identifier ending in the entry point's name is not a dispatch site.
+    my_dispatch_app_request(&state, "notAnAction").await;
+    state.ipc.call("ipc_only").await
+}
+
+// The handler above must not borrow this one's dispatch site: the body scan
+// stops at the next `pub(crate) async fn` / `pub async fn` / `async fn`.
+pub(crate) async fn handle_undocumented(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    dispatch_app_request(&state, "undocumentedAction", json!({}), Method::GET, "/u", None).await
+}
