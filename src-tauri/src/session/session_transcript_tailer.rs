@@ -259,6 +259,12 @@ pub struct BindRequest {
     /// Account / config dir stamped on a FRESHLY minted coord row (an adopted
     /// row already exists, so nothing is written for it).
     pub resume: ResumeParams,
+    /// `adopt` is a LIVE pane's own row that this session owns (transcript
+    /// auto-bind's live-pane adoption): bind through
+    /// [`AiCoordRegistrar::bind_transcript_session_on_live_pane`], stamping
+    /// the row with this tenant decision (plan D3) and taking the row from the
+    /// pane's pin. Ignored without `adopt`.
+    pub live_pane_tenant: Option<crate::session::NewSessionTenant>,
 }
 
 /// What a successful [`SessionTranscriptTailer::bind_and_replay`] did.
@@ -599,6 +605,9 @@ struct Coverage {
     autobind_adopted: u64,
     autobind_minted: u64,
     autobind_deferred: u64,
+    /// Sessions bound by adopting the LIVE pane's own row, without asking
+    /// coord (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced` D1).
+    autobind_adopted_live_pane: u64,
     /// Transcript sync's gate (the user's toggle AND the tenant's
     /// `egress_transcript_sync`) as observed at the last append. `None` until
     /// an append is seen —
@@ -610,7 +619,7 @@ struct Coverage {
     /// idle fleet without losing the ability to say "still nothing bound".
     /// Compared field by field, not as a sum: a held batch moves one count
     /// from `appends_emitted` to `held_batches`, which a sum cannot see.
-    last_reported: [u64; 8],
+    last_reported: [u64; 9],
 }
 
 /// Point-in-time coverage snapshot. `Serialize` so a health/diagnostic surface
@@ -646,12 +655,19 @@ pub struct CoverageReport {
     /// Auto-bind attempts that did not bind (coord unreadable / unresolved,
     /// Gate 1 off, registrar refusal). Retried on the next throttle window.
     pub autobind_deferred: u64,
+    /// Transcripts the watcher bound by adopting the row of the LIVE pane
+    /// that hosts the session, without asking coord. Counted apart from
+    /// `autobind_adopted` (coord's pick), so the two adoption sources stay
+    /// measurable.
+    pub autobind_adopted_live_pane: u64,
 }
 
 /// How an auto-bind attempt ended, for the coverage counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoBindKind {
     Adopted,
+    /// Adopted the live pane's own row (no coord round trip).
+    AdoptedLivePane,
     Minted,
     Deferred,
 }
@@ -666,6 +682,15 @@ impl SessionTranscriptTailer {
     /// (see [`AiCoordRegistrar::pending_started_session_for`]). Blocking.
     pub fn pending_started_row(&self, session_key: &str) -> Option<Uuid> {
         self.registrar.pending_started_session_for(session_key)
+    }
+
+    /// The live pane row that hosts `session_key`, by the registrar's
+    /// pane-row owner rule ([`AiCoordRegistrar::live_terminal_row`]).
+    pub(crate) fn live_pane_row(
+        &self,
+        session_key: &str,
+    ) -> Option<crate::claude_session::pane_row_owner::LivePaneRow> {
+        self.registrar.live_terminal_row(session_key)
     }
 
     /// Record that the watcher SAW `session_key` and it has no binding, so the
@@ -684,6 +709,7 @@ impl SessionTranscriptTailer {
         let mut cov = self.lock_coverage();
         match kind {
             AutoBindKind::Adopted => cov.autobind_adopted += 1,
+            AutoBindKind::AdoptedLivePane => cov.autobind_adopted_live_pane += 1,
             AutoBindKind::Minted => cov.autobind_minted += 1,
             AutoBindKind::Deferred => cov.autobind_deferred += 1,
         }
@@ -1344,15 +1370,28 @@ impl SessionTranscriptTailer {
                 requested => (id, requested == Some(id)),
             },
             None => {
-                let id = self
-                    .registrar
-                    .bind_transcript_session(session_key, req.adopt, req.tenant, req.resume.clone())
-                    .map_err(|e| match e {
-                        TranscriptBindRefusal::RegistrationDisabled => {
-                            BindRefusal::RegistrationDisabled
-                        }
-                        TranscriptBindRefusal::CoordSessionInUse => BindRefusal::CoordSessionInUse,
-                    })?;
+                let bound = match (req.adopt, req.live_pane_tenant) {
+                    (Some(row), Some(tenant)) => {
+                        self.registrar.bind_transcript_session_on_live_pane(
+                            session_key,
+                            row,
+                            tenant,
+                            req.resume.clone(),
+                        )
+                    }
+                    _ => self.registrar.bind_transcript_session(
+                        session_key,
+                        req.adopt,
+                        req.tenant,
+                        req.resume.clone(),
+                    ),
+                };
+                let id = bound.map_err(|e| match e {
+                    TranscriptBindRefusal::RegistrationDisabled => {
+                        BindRefusal::RegistrationDisabled
+                    }
+                    TranscriptBindRefusal::CoordSessionInUse => BindRefusal::CoordSessionInUse,
+                })?;
                 (id, req.adopt == Some(id))
             }
         };
@@ -1576,6 +1615,7 @@ impl SessionTranscriptTailer {
             autobind_adopted: cov.autobind_adopted,
             autobind_minted: cov.autobind_minted,
             autobind_deferred: cov.autobind_deferred,
+            autobind_adopted_live_pane: cov.autobind_adopted_live_pane,
         }
     }
 
@@ -1614,6 +1654,7 @@ impl SessionTranscriptTailer {
             report.autobind_adopted,
             report.autobind_minted,
             report.autobind_deferred,
+            report.autobind_adopted_live_pane,
         ];
 
         let mut cov = self.lock_coverage();
@@ -1655,6 +1696,7 @@ impl SessionTranscriptTailer {
                 transcript_holes = report.transcript_holes,
                 held_batches = report.held_batches,
                 autobind_adopted = report.autobind_adopted,
+                autobind_adopted_live_pane = report.autobind_adopted_live_pane,
                 autobind_minted = report.autobind_minted,
                 autobind_deferred = report.autobind_deferred,
                 "session_transcript_tailer: coverage"
