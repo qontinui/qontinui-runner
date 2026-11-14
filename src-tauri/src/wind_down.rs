@@ -405,7 +405,15 @@ pub enum MemberState {
     PrimaryCheckout,
     /// A linked worktree whose probes all answered.
     Probed {
-        /// `git status --porcelain` printed anything, untracked files included.
+        /// `git status --porcelain` printed something that is the session's
+        /// own: any entry, untracked files included, EXCEPT untracked files
+        /// under `.claude/{commands,skills,agents}` that the served-corpus
+        /// residue rule proves are the runner's own provisioned bytes (the
+        /// bin crate's `session::served_residue`; plan
+        /// `2026-11-03-the-runners-served-claude-corpus-makes-every-no-op-closeout-not-closeable`).
+        /// A tree whose listing could not be fully judged is never `Probed`
+        /// clean: it is a [`MemberState::ProbeFailed`] unless something
+        /// definite (an edit, an unpushed commit) already makes it dirty.
         dirty: bool,
         /// Commits reachable from `HEAD` that are not pushed. With an upstream:
         /// `rev-list --count @{upstream}..HEAD`. With none (including a

@@ -173,7 +173,7 @@ const PROBE_STDERR_MAX_CHARS: usize = 200;
 /// Carried only as far as the log line: the keep decision is the same for all
 /// three, and the provisioning report records the keep rather than its cause.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ProbeFailure {
+pub(crate) enum ProbeFailure {
     /// git could not be started (no `git` on `PATH`), could not be polled, or its
     /// stdout could not be stored or read back. `stage` names which.
     Io { stage: &'static str, error: String },
@@ -466,6 +466,15 @@ fn has_git_ancestor(root: &Path) -> bool {
 /// - `--literal-pathspecs` disables pathspec magic and globbing, so no path this
 ///   module is ever handed can be reinterpreted as a pattern.
 fn run_bounded_git_ls_files(root: &Path) -> Result<Vec<u8>, ProbeFailure> {
+    run_bounded_git(root, &["--literal-pathspecs", "ls-files", "-z", "--", "."])
+}
+
+/// Run `git -C <root> <args>` under [`PROBE_TIMEOUT`], returning its stdout on
+/// a zero exit. The one bounded git runner of the provisioning path: the
+/// tracked-file probe above and the served-corpus exclude writer
+/// ([`crate::fleet::exclude_served_files`]) both go through it, so a hung git
+/// costs a provisioning pass at most this bound and never a spawn.
+pub(crate) fn run_bounded_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, ProbeFailure> {
     let io = |stage: &'static str| {
         move |e: std::io::Error| ProbeFailure::Io {
             stage,
@@ -490,11 +499,7 @@ fn run_bounded_git_ls_files(root: &Path) -> Result<Vec<u8>, ProbeFailure> {
     let mut child = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(root)
-        .arg("--literal-pathspecs")
-        .arg("ls-files")
-        .arg("-z")
-        .arg("--")
-        .arg(".")
+        .args(args)
         .stdin(Stdio::null())
         // Tracing would put its own lines ahead of git's error, and
         // `first_stderr_line` would report those instead of the cause. Best

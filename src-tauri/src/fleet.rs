@@ -4021,43 +4021,204 @@ fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     if !repo_path.join(".git").is_dir() {
         return;
     }
-    let info_dir = repo_path.join(".git").join("info");
-    let exclude_path = info_dir.join("exclude");
-    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let exclude_path = repo_path.join(".git").join("info").join("exclude");
+    if let Err(e) = append_managed_exclude_lines(&exclude_path, MANAGED_REPO_EXCLUDES) {
+        debug!("fleet::ensure_repo_info_exclude: {exclude_path:?}: {e}");
+    }
+}
 
-    // Match on whole (trimmed) lines so a substring like `.mcp.json.bak` never
-    // counts as already-covered.
-    let present: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
-    let missing: Vec<&str> = MANAGED_REPO_EXCLUDES
+/// Append each of `lines` that `exclude_path` does not already hold, as a WHOLE
+/// line, under [`MANAGED_EXCLUDE_MARKER`] (written once, the first time this
+/// writer adds anything). Returns how many lines were added.
+///
+/// The ONE writer of the runner's lines in an exclude file — the publish
+/// cycle's primary-checkout roster ([`ensure_repo_info_exclude`]) and the
+/// per-file served-corpus lines ([`exclude_served_files`]) both go through it.
+/// Append-only and whole-line, because the file has other writers (the
+/// operator, and Claude Code itself appends `**/.claude/...` lines): nothing
+/// here rewrites or reorders a line it did not write, and a match is on the
+/// whole trimmed line, so a substring like `.mcp.json.bak` never counts as
+/// already covered.
+pub(crate) fn append_managed_exclude_lines<S: AsRef<str>>(
+    exclude_path: &std::path::Path,
+    lines: &[S],
+) -> std::io::Result<usize> {
+    let existing = match std::fs::read_to_string(exclude_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // An exclude file that exists and cannot be read is left alone: writing
+        // our lines over it would destroy the lines we could not see.
+        Err(e) => return Err(e),
+    };
+    let present: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
+    let mut seen = std::collections::HashSet::new();
+    let missing: Vec<&str> = lines
         .iter()
-        .copied()
-        .filter(|pat| !present.contains(*pat))
+        .map(AsRef::as_ref)
+        .filter(|line| !present.contains(line) && seen.insert(*line))
         .collect();
     if missing.is_empty() {
-        return;
+        return Ok(0);
     }
-    // Capture marker presence before `existing` is moved into `out` below;
-    // `missing` holds 'static patterns so it doesn't borrow `existing`.
-    let marker_present = present.contains(MANAGED_EXCLUDE_MARKER);
-
-    if let Err(e) = std::fs::create_dir_all(&info_dir) {
-        debug!("fleet::ensure_repo_info_exclude: create_dir_all {info_dir:?} failed: {e}");
-        return;
-    }
-    let mut out = existing;
-    if !out.is_empty() && !out.ends_with('\n') {
+    let mut out = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
         out.push('\n');
     }
-    if !marker_present {
+    if !present.contains(MANAGED_EXCLUDE_MARKER) {
         out.push_str(MANAGED_EXCLUDE_MARKER);
         out.push('\n');
     }
-    for pat in missing {
-        out.push_str(pat);
+    for line in &missing {
+        out.push_str(line);
         out.push('\n');
     }
-    if let Err(e) = std::fs::write(&exclude_path, out) {
-        debug!("fleet::ensure_repo_info_exclude: write {exclude_path:?} failed: {e}");
+    if let Some(dir) = exclude_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Append rather than rewrite: a concurrent writer's line added between our
+    // read and this write survives (at worst one of ours is duplicated, which
+    // the whole-line match then treats as present).
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(exclude_path)?;
+    file.write_all(out.as_bytes())?;
+    Ok(missing.len())
+}
+
+/// Escape one path for a gitignore-syntax line so it matches only itself:
+/// `\`, `*`, `?` and `[` are taken literally. `None` for a path no exclude
+/// line can name: one holding a newline or a carriage return, or one ending in
+/// a space (git strips an unescaped trailing space, and an escaped one would
+/// defeat the writer's whole-line, trimmed "already present" match).
+fn gitignore_literal(path: &str) -> Option<String> {
+    if path.contains('\n') || path.contains('\r') || path.ends_with(' ') {
+        return None;
+    }
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// The three served folders, as `git rev-parse --show-prefix` names them when
+/// the provisioned dir sits at a work-tree root — the only place
+/// [`exclude_served_files`] writes for.
+const SERVED_EXCLUDE_PREFIXES: [&str; 3] =
+    [".claude/commands/", ".claude/skills/", ".claude/agents/"];
+
+/// Exclude exactly the served-corpus files one provisioner pass wrote into
+/// `dir` (plan `2026-11-03-the-runners-served-claude-corpus-makes-every-no-op-closeout-not-closeable`
+/// Phase 1).
+///
+/// `written` are the files the pass wrote, relative to `dir`, that its own
+/// [`crate::provision_guard::TrackedPaths`] reported UNTRACKED (the caller
+/// filters; a tracked path never gets a line, and an exclude could not affect
+/// one anyway). Each becomes one ANCHORED, literal line —
+/// `/.claude/commands/<name>.md`, `/.claude/skills/<name>/<rel>`,
+/// `/.claude/agents/<name>.md` — so a NEW file a session writes under the same
+/// folder stays visible to `git status` and `git add -A`. `dir_patterns` are
+/// extra gitignore patterns relative to `dir`, taken as written (the skills
+/// pass sends `**/__pycache__/`, the bytecode a bundled Python helper leaves).
+///
+/// The lines go into the file `git rev-parse --git-path info/exclude` names
+/// from `dir`: the COMMON dir's exclude for a linked worktree, so one spawn
+/// covers every worktree of the repo and the primary — which is why the lines
+/// are per file and never per folder. Outside a repository, or when git does
+/// not answer within the provisioning probe's bound, nothing is written.
+/// Fail-soft throughout: a missed line leaves a tree reading dirty, never a
+/// failed spawn.
+pub(crate) fn exclude_served_files(
+    dir: &std::path::Path,
+    written: &[std::path::PathBuf],
+    dir_patterns: &[&str],
+) {
+    if written.is_empty() && dir_patterns.is_empty() {
+        return;
+    }
+    let out = match crate::provision_guard::run_bounded_git(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+            "--show-prefix",
+        ],
+    ) {
+        Ok(out) => out,
+        Err(cause) => {
+            debug!(
+                "fleet::exclude_served_files: {} is not answered as a git work tree ({cause}); \
+                 no exclude lines written",
+                dir.display()
+            );
+            return;
+        }
+    };
+    // A lossy decode would build a garbled path for `create_dir_all`.
+    let Ok(text) = std::str::from_utf8(&out) else {
+        debug!("fleet::exclude_served_files: git rev-parse printed non-UTF-8; no exclude lines written");
+        return;
+    };
+    let mut answer = text.split('\n');
+    let (Some(exclude), Some(prefix)) = (answer.next(), answer.next()) else {
+        debug!(
+            "fleet::exclude_served_files: git rev-parse printed {text:?}; no exclude lines written"
+        );
+        return;
+    };
+    let exclude = exclude.trim_end_matches('\r');
+    let prefix = prefix.trim_end_matches('\r');
+    // The exclude path must be absolute: git before 2.31 does not know
+    // `--path-format` and echoes it back as its first line, which would put a
+    // junk file in the runner's own working directory.
+    if !std::path::Path::new(exclude).is_absolute() {
+        debug!(
+            "fleet::exclude_served_files: git rev-parse named no absolute exclude path \
+             ({exclude:?}); no exclude lines written"
+        );
+        return;
+    }
+    // Only a served folder AT A WORK-TREE ROOT is excluded. The residue rule
+    // (`session::served_residue`, and session-closeable.sh) judges
+    // `.claude/{commands,skills,agents}` at the root only, so a line for
+    // `<sub>/.claude/...` would hide an edited copy that no closeability check
+    // then reads — a false clean.
+    if !SERVED_EXCLUDE_PREFIXES.contains(&prefix) {
+        debug!(
+            "fleet::exclude_served_files: {} is not a served folder at a work-tree root \
+             (prefix {prefix:?}); no exclude lines written",
+            dir.display()
+        );
+        return;
+    }
+    let prefix_literal = prefix;
+    let mut lines: Vec<String> = Vec::with_capacity(written.len() + dir_patterns.len());
+    for rel in written {
+        let Some(rel) = rel.to_str() else { continue };
+        // Exclude lines use `/`; only Windows spells a separator any other way.
+        let rel: std::borrow::Cow<'_, str> = if cfg!(windows) {
+            rel.replace('\\', "/").into()
+        } else {
+            rel.into()
+        };
+        if let Some(literal) = gitignore_literal(&rel) {
+            lines.push(format!("/{prefix_literal}{literal}"));
+        }
+    }
+    for pattern in dir_patterns {
+        lines.push(format!("/{prefix_literal}{pattern}"));
+    }
+    match append_managed_exclude_lines(std::path::Path::new(exclude), &lines) {
+        Ok(0) => {}
+        Ok(n) => debug!("fleet::exclude_served_files: added {n} line(s) to {exclude}"),
+        Err(e) => warn!("fleet::exclude_served_files: could not write {exclude}: {e}"),
     }
 }
 

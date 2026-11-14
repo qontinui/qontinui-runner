@@ -600,6 +600,9 @@ pub(crate) fn provision_fleet_commands_into(
     )
     .with_destination(commands_dir.display().to_string());
     let mut edited = 0usize;
+    // Files this pass wrote that the repo does not track: each gets its own
+    // anchored exclude line once the loop is done (`fleet::exclude_served_files`).
+    let mut untracked_written: Vec<std::path::PathBuf> = Vec::new();
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
@@ -656,6 +659,14 @@ pub(crate) fn provision_fleet_commands_into(
             ),
         )?;
         out.record_written();
+        if !tracked.contains(Path::new(&file_name)) {
+            untracked_written.push(std::path::PathBuf::from(&file_name));
+        }
+    }
+    // An UNKNOWN probe inside a repository cannot say which paths are tracked,
+    // so it writes no exclude line at all rather than guess.
+    if !tracked.is_unknown_in_repo() {
+        crate::fleet::exclude_served_files(commands_dir, &untracked_written, &[]);
     }
     // Built after the loop rather than at construction so it can carry the
     // read-back count; a pass that clobbered nobody's edits reads as before.
