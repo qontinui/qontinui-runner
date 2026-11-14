@@ -46,9 +46,10 @@ site reached ``open()`` through a variable such as ``debug_log_path``.
 (b) an assignment whose value contains a source and a ``.log`` string literal
 (a log path parked in a variable or constant).
 
-**Known limits** (not followed, so not caught). Each has a ``*_not_followed`` shape
-below expecting no (or only the stated) offenders, so widening the scanner shows up
-as a deliberate test change:
+**Known limits** (not followed, so not caught). Each BULLET has at least one
+``*_not_followed`` shape below expecting no (or only the stated) offenders, so
+widening the scanner for that shape shows up as a deliberate test change; a bullet
+that names several calls pins one representative, not each call:
 
 - a path stored on an attribute (``self.log_path = ...`` then
   ``open(self.log_path, "a")``); arm (b) still flags the assignment when it builds
@@ -63,13 +64,15 @@ as a deliberate test change:
   (``executor_core.py`` ``self.temp_dir``, ``qontinui_executor.py`` ``run_dir``)
   and ``NamedTemporaryFile`` for real temp files. (``TemporaryFile`` has no path
   at all, so its shape documents the limit rather than guarding a code path);
-- ``os.open`` (the low-level fd API) is not a sink;
+- the low-level and raw write APIs (``os.open`` / ``os.fdopen``, ``io.FileIO``)
+  are not sinks;
 - the ``shutil`` copy/move family (``copy``, ``copy2``, ``copyfile``,
   ``copytree``, ``move``) into a temp or home dir is not a sink;
 - ``tarfile.TarFile(name, mode)`` and its ``TarFile.open`` / ``taropen``
   constructors (only ``tarfile.open`` is a sink);
-- ``logging.config.dictConfig`` / ``fileConfig`` declaring a file handler by class
-  string with a ``filename`` value.
+- ``logging.config.dictConfig`` declaring a file handler by class string with a
+  ``filename`` value, and ``logging.config.fileConfig`` (its INI file is not Python
+  source and is never scanned).
 
 Legitimate temp-dir writes are allow-listed by (file, function, arm, path
 expression), so a NEW write inside an allow-listed function is still flagged.
