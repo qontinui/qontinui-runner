@@ -1,7 +1,7 @@
 /**
  * Types for State Explorer
  *
- * These types correspond to the Rust types in src-tauri/src/verification_agent/types.rs
+ * These types correspond to the Rust types in src-tauri/src/state_explorer/ (types.rs, exploration.rs)
  */
 
 /**

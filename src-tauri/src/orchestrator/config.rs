@@ -293,12 +293,6 @@ pub struct BaseConfig {
     pub max_iterations: u32,
     /// Working directory for commands
     pub working_directory: String,
-    /// Enable planning phase
-    pub enable_planning: bool,
-    /// Enable AI verification
-    pub enable_ai_verification: bool,
-    /// Run verification before first iteration
-    pub run_initial_verification: bool,
 }
 
 impl Default for BaseConfig {
@@ -306,9 +300,6 @@ impl Default for BaseConfig {
         Self {
             max_iterations: 10,
             working_directory: ".".to_string(),
-            enable_planning: true,
-            enable_ai_verification: true,
-            run_initial_verification: false,
         }
     }
 }
@@ -706,18 +697,6 @@ impl EnhancedOrchestratorConfigBuilder {
     /// Set working directory.
     pub fn working_directory(mut self, dir: impl Into<String>) -> Self {
         self.config.base.working_directory = dir.into();
-        self
-    }
-
-    /// Enable or disable planning.
-    pub fn enable_planning(mut self, enable: bool) -> Self {
-        self.config.base.enable_planning = enable;
-        self
-    }
-
-    /// Enable or disable AI verification.
-    pub fn enable_ai_verification(mut self, enable: bool) -> Self {
-        self.config.base.enable_ai_verification = enable;
         self
     }
 
