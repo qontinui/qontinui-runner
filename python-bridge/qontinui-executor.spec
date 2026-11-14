@@ -54,7 +54,6 @@ hidden_imports = [
     'services',
     'services.unified_data_collector',
     'services.screenshot_service',
-    'services.tree_view_layer',
     'services.capture_tool_service',
     'services.training_export_service',
     'services.state_detection_service',
