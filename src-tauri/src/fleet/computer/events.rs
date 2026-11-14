@@ -28,6 +28,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::services::WatchedUnit;
+use super::services_bound::OverBound;
 
 /// Upper bound on unsent events per computer. Beyond it the OLDEST are
 /// dropped and a `telemetry_gap` marker says how many — a silent drop would
@@ -117,6 +118,11 @@ pub(crate) struct ObserverState {
     pub(crate) last_tick_at: Option<String>,
     #[serde(default)]
     pub(crate) last_tick_boot_id: Option<String>,
+    /// Per `identity_hash`: its over-bound state (`services_bound`),
+    /// persisted beside the events its transitions queue. Absent in a state
+    /// file written before it existed, which loads as "nothing over".
+    #[serde(default)]
+    pub(crate) over_bound: BTreeMap<String, OverBound>,
 }
 
 /// This tick's observation of one computer, as the deriver needs it.
@@ -693,6 +699,23 @@ fn sweep_orphan_temps(path: &Path) {
 mod tests {
     use super::super::services::{parse_systemctl_show, row_from_props, tests as svc};
     use super::*;
+
+    /// Review round 5, A2: a state file written before the over-bound state
+    /// was persisted loads, with nothing over.
+    #[test]
+    fn an_old_state_file_without_over_bound_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("computer-observer.json");
+        std::fs::write(
+            &path,
+            r#"{"computers":{},"pending":{},"last_tick_at":"2026-11-14T00:00:00Z","last_tick_boot_id":null}"#,
+        )
+        .unwrap();
+        let loaded = load(&path);
+        assert_eq!(loaded.last_tick_at.as_deref(), Some("2026-11-14T00:00:00Z"));
+        assert!(loaded.over_bound.is_empty());
+        assert!(!dir.path().join("computer-observer.json.corrupt").exists());
+    }
 
     /// Review round 4, A5: the first load sweeps temp files earlier saves
     /// left behind — another process's and the pre-unique name — but keeps

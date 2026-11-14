@@ -160,20 +160,91 @@ pub(crate) struct Over {
     /// that put it over (a lower bound). A held kind keeps its entry, so a
     /// partial scan's smaller count is never reported as the kind's size.
     pub(crate) last_counts: BTreeMap<&'static str, usize>,
-    /// When the last event was queued (in-memory: a reporter rebuild re-emits
-    /// on entering, which can add an event but never lose one).
+    /// When the last event was queued.
     pub(crate) emitted_at: chrono::DateTime<chrono::Utc>,
     /// A different kind set (empty = leaving) proposed by the last
     /// consecutive scans, and how many (see [`SETTLE_SCANS`]).
     pub(crate) proposed: Option<(BTreeSet<&'static str>, u32)>,
 }
 
-/// One computer's over-bound state.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// One computer's over-bound state. It is PERSISTED with the observer state
+/// (`ObserverState::over_bound`), in the same write as the events a
+/// transition queues: a reporter rebuild or runner restart resumes it, so a
+/// closing event is never lost to a restart, and a tick cancelled before its
+/// persist loses the transition and its event together — the next tick
+/// replays both.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(from = "OverBoundRecord", into = "OverBoundRecord")]
 pub(crate) enum OverBound {
     #[default]
     Within,
     Over(Over),
+}
+
+/// The on-disk form of [`OverBound`]: kinds as strings. A kind name this
+/// build does not know is dropped on load — no scan of this build can
+/// produce it.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct OverBoundRecord {
+    #[serde(default)]
+    over: bool,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default)]
+    held: Vec<String>,
+    #[serde(default)]
+    last_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    emitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    proposed: Option<(Vec<String>, u32)>,
+}
+
+fn known_kinds<'a>(names: impl IntoIterator<Item = &'a String>) -> BTreeSet<&'static str> {
+    names
+        .into_iter()
+        .filter_map(|n| services::kind_named(n))
+        .collect()
+}
+
+impl From<OverBound> for OverBoundRecord {
+    fn from(s: OverBound) -> Self {
+        let names = |k: &BTreeSet<&'static str>| k.iter().map(|k| k.to_string()).collect();
+        match s {
+            OverBound::Within => OverBoundRecord::default(),
+            OverBound::Over(o) => OverBoundRecord {
+                over: true,
+                kinds: names(&o.kinds),
+                held: names(&o.held),
+                last_counts: o
+                    .last_counts
+                    .iter()
+                    .map(|(k, n)| (k.to_string(), *n))
+                    .collect(),
+                emitted_at: Some(o.emitted_at),
+                proposed: o.proposed.as_ref().map(|(k, n)| (names(k), *n)),
+            },
+        }
+    }
+}
+
+impl From<OverBoundRecord> for OverBound {
+    fn from(r: OverBoundRecord) -> Self {
+        let (true, Some(emitted_at)) = (r.over, r.emitted_at) else {
+            return OverBound::Within;
+        };
+        OverBound::Over(Over {
+            kinds: known_kinds(&r.kinds),
+            held: known_kinds(&r.held),
+            last_counts: r
+                .last_counts
+                .iter()
+                .filter_map(|(k, n)| services::kind_named(k).map(|k| (k, *n)))
+                .collect(),
+            emitted_at,
+            proposed: r.proposed.as_ref().map(|(k, n)| (known_kinds(k), *n)),
+        })
+    }
 }
 
 impl OverBound {
@@ -235,8 +306,14 @@ impl OverBound {
             .collect();
         let observed: BTreeSet<&'static str> = scan.cut.union(&held).copied().collect();
         let mut last_counts = prev.last_counts.clone();
+        // Only a count a scan can vouch for replaces an earlier one: a scan
+        // that saw the kind completely, a kind this instrument can never
+        // complete (its count is all there is), or a kind with no count yet.
         for (k, n) in scan.counts {
-            if !held.contains(k) {
+            if scan.complete_kinds.contains(k)
+                || !scan.completable_kinds.contains(k)
+                || !last_counts.contains_key(k)
+            {
                 last_counts.insert(k, *n);
             }
         }
@@ -357,10 +434,12 @@ pub(crate) fn cleared_event(
 /// count drifts slowly across the bound (ephemeral runners registering near
 /// 256) can enter and leave every few ticks even with [`SETTLE_SCANS`]; each
 /// entry still queues its event, so coord's read surface stays truthful, but
-/// the WARN — a request for a human's attention — fires once per kind set per
-/// [`REEMIT_EVERY_SECS`], the cadence the event itself restates a standing
-/// condition at. A repeat inside the window is logged at debug, and so is
-/// the INFO that closes an entry whose WARN was suppressed.
+/// the WARN — a request for a human's attention — fires at most once per
+/// computer per [`REEMIT_EVERY_SECS`] (the cadence the event itself restates
+/// a standing condition at), whatever kind set it names, UNLESS the set
+/// names a kind the last WARN did not: a newly over kind always WARNs. A
+/// suppressed repeat is logged at debug, and so is the INFO that closes an
+/// entry whose WARN was suppressed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WarnLimit {
     last: Option<(BTreeSet<&'static str>, chrono::DateTime<chrono::Utc>)>,
@@ -377,7 +456,7 @@ impl WarnLimit {
     ) -> bool {
         let due = match &self.last {
             Some((last_kinds, at)) => {
-                last_kinds != kinds || (now - *at).num_seconds() >= REEMIT_EVERY_SECS
+                !kinds.is_subset(last_kinds) || (now - *at).num_seconds() >= REEMIT_EVERY_SECS
             }
             None => true,
         };
@@ -939,6 +1018,67 @@ mod tests {
         assert!(again.admit(&kinds, at("2026-11-15T00:00:00Z")));
         // A different kind set is not limited by the first.
         assert!(again.admit(&set(&[GH, QR]), at("2026-11-15T00:00:01Z")));
+    }
+
+    /// Review round 5, A3: the WARN limit is per computer, not per kind set —
+    /// two settled sets alternating WARN once each in the window (the second
+    /// names a newly over kind), not on every flip.
+    #[test]
+    fn alternating_kind_sets_do_not_warn_every_flip() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let mut limit = WarnLimit::default();
+        let (one, two) = (set(&[GH]), set(&[GH, QR]));
+        let warns = (0..20)
+            .filter(|i| {
+                let kinds = if i % 2 == 0 { &one } else { &two };
+                limit.admit(kinds, t0 + chrono::Duration::seconds(i * 90))
+            })
+            .count();
+        assert_eq!(warns, 2);
+        // A kind the last WARN did not name always WARNs.
+        assert!(limit.admit(
+            &set(&[GH, QR, OTHER]),
+            t0 + chrono::Duration::seconds(1_900)
+        ));
+    }
+
+    /// Review round 5, A4: only a count a scan can vouch for replaces the
+    /// last one — a partial scan's count of a completable kind does not, even
+    /// while that kind is still cut.
+    #[test]
+    fn a_partial_scan_never_replaces_a_vouched_count() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let (o, _) = step_with(&OverBound::Within, &[(GH, 300)], ALL, t0);
+        let (still_cut, _) = step_with(&o, &[(GH, 280)], &[QR], t0);
+        assert_eq!(over(&still_cut).last_counts.get(GH), Some(&300));
+        let (held, _) = step_with(&still_cut, &[(GH, 12)], &[QR], t0);
+        assert_eq!(over(&held).held, set(&[GH]));
+        let e = over_bound_event("h", Some(&counts(&[(GH, 12)])), over(&held), t0);
+        assert_eq!(
+            e.detail["held_last_counts"],
+            serde_json::json!({"gh_actions_runner": 300})
+        );
+    }
+
+    /// Review round 5, A2: the over-bound state round-trips through its
+    /// on-disk form, and a kind name this build does not know is dropped.
+    #[test]
+    fn the_over_bound_state_round_trips_through_serde() {
+        let t0 = at("2026-11-14T00:00:00Z");
+        let (two, _) = step_with(&OverBound::Within, &[(GH, 300), (QR, 300)], ALL, t0);
+        let (s, _) = step_with(&two, &[(GH, 12), (QR, 200)], &[QR], t0);
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<OverBound>(&json).unwrap(), s);
+        assert_eq!(
+            serde_json::from_str::<OverBound>(&serde_json::to_string(&OverBound::Within).unwrap())
+                .unwrap(),
+            OverBound::Within
+        );
+        let foreign = r#"{"over":true,"kinds":["gh_actions_runner","gpu_worker"],"emitted_at":"2026-11-14T00:00:00Z"}"#;
+        let OverBound::Over(o) = serde_json::from_str::<OverBound>(foreign).unwrap() else {
+            panic!("expected Over");
+        };
+        assert_eq!(o.kinds, set(&[GH]));
     }
 
     /// Review round 4, A2: a scan outage longer than the re-emit period still

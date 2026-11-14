@@ -238,7 +238,14 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
                 } else {
                     Vec::new()
                 },
-                completable_kinds: services::GUEST_COMPLETABLE_KINDS,
+                // While a runner reports from inside the guest, the host's
+                // probe is not the inventory's authority and can complete
+                // nothing: no kind may be held over waiting for it.
+                completable_kinds: if g.runner_active == Some(true) {
+                    &[]
+                } else {
+                    services::GUEST_COMPLETABLE_KINDS
+                },
             }
         } else {
             ServiceScan::default()
@@ -707,9 +714,6 @@ pub(crate) struct Reporter {
     parent_unresolved_logged: bool,
     /// The last `unknown_fields` set logged — a CHANGED set is logged again.
     last_unknown_fields: Vec<String>,
-    /// Per identity hash: whether its observed service scan is over coord's
-    /// per-computer bound, and when that was last put on coord's read surface.
-    over_bound: BTreeMap<String, services_bound::OverBound>,
     /// Per identity hash: the rate limit on its over-bound WARN.
     over_bound_warns: BTreeMap<String, services_bound::WarnLimit>,
     dedupe_logged: bool,
@@ -746,7 +750,6 @@ impl Reporter {
             conflict_logged: false,
             parent_unresolved_logged: false,
             last_unknown_fields: Vec::new(),
-            over_bound: BTreeMap::new(),
             over_bound_warns: BTreeMap::new(),
             dedupe_logged: false,
             failures_logged: 0,
@@ -1049,7 +1052,7 @@ impl Reporter {
                 complete_kinds: &o.scan.complete_kinds,
                 completable_kinds: o.scan.completable_kinds,
             });
-            let previous = self.over_bound.get(id).cloned().unwrap_or_default();
+            let previous = state.over_bound.get(id).cloned().unwrap_or_default();
             let (next_bound, actions) = previous.step(scan, now);
             let total: usize = counts.values().sum();
             let scan_counts = observed_rows.is_some().then_some(&counts);
@@ -1099,7 +1102,7 @@ impl Reporter {
                     (_, services_bound::OverBound::Within) => {}
                 }
             }
-            self.over_bound.insert(id.clone(), next_bound);
+            state.over_bound.insert(id.clone(), next_bound);
 
             if !evs.is_empty() {
                 events::push_pending(state, id, evs);
@@ -1110,10 +1113,10 @@ impl Reporter {
             debug!("fleet::computer: forgot {pruned} computer(s) unseen for a week");
         }
         // A forgotten computer's over-bound state goes with it.
-        self.over_bound
-            .retain(|id, _| state.computers.contains_key(id));
+        let computers = &state.computers;
+        state.over_bound.retain(|id, _| computers.contains_key(id));
         self.over_bound_warns
-            .retain(|id, _| state.computers.contains_key(id));
+            .retain(|id, _| computers.contains_key(id));
     }
 
     /// This tick's report, ready to send: each observed computer's full or
@@ -1879,7 +1882,7 @@ mod tests {
         assert!(over_bound_events(&delta[0].events).is_empty());
         assert!(
             matches!(
-                r.over_bound.get(HOST_ID),
+                r.state.as_ref().unwrap().over_bound.get(HOST_ID),
                 Some(services_bound::OverBound::Over(_))
             ),
             "a 44-row delta must not read as back within the bound"
@@ -1948,9 +1951,127 @@ mod tests {
             .clone();
         assert_eq!(closing.detail["truncated_kinds"], serde_json::json!([]));
         assert_eq!(
-            r.over_bound.get(HOST_ID),
+            r.state.as_ref().unwrap().over_bound.get(HOST_ID),
             Some(&services_bound::OverBound::Within)
         );
+    }
+
+    /// Review round 5, A1: while a runner reports from inside a WSL guest,
+    /// the host's probe of that guest can complete nothing, so a guest kind
+    /// over the bound is never HELD by it — the guest leaves the state on its
+    /// counts, with one closing event, instead of being re-emitted as over.
+    #[test]
+    fn a_guest_whose_runner_reports_is_never_held_over() {
+        let probe = |active: &str, n: usize| {
+            let units: String = (0..n)
+                .map(|i| format!("Id=actions.runner.r{i}.service\nActiveState=active\n\n"))
+                .collect();
+            wsl_guest::parse_guest_probe(&format!(
+                "MACHINE_ID\tfedcba9876543210fedcba9876543210\nPID1\tsystemd\nLIST_RC\t0\nRUNNER_ACTIVE\t{active}\nUNIT_COUNT\t{n}\nSHOW_BEGIN\n{units}SHOW_END\nSHOW_RC\t0\nPROBE_END\n"
+            ))
+            .unwrap()
+        };
+        let reporting = guest_observed(&probe("1", 10), HOST_ID);
+        assert!(reporting.scan.completable_kinds.is_empty());
+        assert_eq!(
+            guest_observed(&probe("0", 10), HOST_ID)
+                .scan
+                .completable_kinds,
+            services::GUEST_COMPLETABLE_KINDS
+        );
+
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(ObserverState::default());
+        let over = guest_observed(&probe("0", 300), HOST_ID);
+        let guest = over.base.identity_hash.clone();
+        r.derive_events(
+            std::slice::from_ref(&over),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        assert!(matches!(
+            r.state.as_ref().unwrap().over_bound.get(&guest),
+            Some(services_bound::OverBound::Over(_))
+        ));
+        for t in [
+            "2026-11-14T00:00:30Z",
+            "2026-11-14T00:01:00Z",
+            "2026-11-14T00:01:30Z",
+        ] {
+            r.derive_events(std::slice::from_ref(&reporting), HOST_ID, at(t));
+        }
+        let state = r.state.as_ref().unwrap();
+        assert_eq!(
+            state.over_bound.get(&guest),
+            Some(&services_bound::OverBound::Within)
+        );
+        let closing = state.pending[&guest]
+            .iter()
+            .filter(|e| e.detail["cleared"] == true)
+            .count();
+        assert_eq!(closing, 1);
+    }
+
+    /// Review round 5, A2: the over-bound state is persisted with the
+    /// observer state, so a reporter rebuilt while a computer is over still
+    /// queues the closing event when it leaves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_over_bound_state_survives_a_reporter_rebuild() {
+        let units = |n: usize| -> Observed {
+            let mut obs = observed(svc::HEALTHY_SHOW);
+            let template = obs.scan.units.as_ref().unwrap()[0].clone();
+            obs.scan.units = Some(
+                (0..n)
+                    .map(|i| {
+                        let mut w = template.clone();
+                        w.row.unit = format!("actions.runner.r{i}.service");
+                        w.row.kind = services::KIND_GH_ACTIONS_RUNNER.to_string();
+                        w
+                    })
+                    .collect(),
+            );
+            obs
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("computer-observer.json");
+        let mut first = Reporter {
+            state_path: Some(path.clone()),
+            ..Reporter::new()
+        };
+        first.state = Some(ObserverState::default());
+        first.derive_events(
+            std::slice::from_ref(&units(300)),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        first.persist().await;
+        drop(first);
+
+        let mut rebuilt = Reporter {
+            state_path: Some(path.clone()),
+            ..Reporter::new()
+        };
+        rebuilt.state = Some(events::load(&path));
+        assert!(matches!(
+            rebuilt.state.as_ref().unwrap().over_bound.get(HOST_ID),
+            Some(services_bound::OverBound::Over(_))
+        ));
+        let within = units(10);
+        for t in [
+            "2026-11-14T00:00:30Z",
+            "2026-11-14T00:01:00Z",
+            "2026-11-14T00:01:30Z",
+        ] {
+            rebuilt.derive_events(std::slice::from_ref(&within), HOST_ID, at(t));
+        }
+        let closing = rebuilt.state.as_ref().unwrap().pending[HOST_ID]
+            .iter()
+            .filter(|e| e.detail["cleared"] == true)
+            .count();
+        assert_eq!(closing, 1, "the rebuilt reporter closes the entry");
     }
 
     /// Review A3: when `events::prune` forgets a computer, its over-bound
@@ -1981,7 +2102,10 @@ mod tests {
             emitted_at: at("2026-11-01T00:00:00Z"),
             proposed: None,
         };
-        r.over_bound
+        r.state
+            .as_mut()
+            .unwrap()
+            .over_bound
             .insert(gone.clone(), services_bound::OverBound::Over(over));
         let obs = observed(svc::HEALTHY_SHOW);
         r.derive_events(
@@ -1994,12 +2118,12 @@ mod tests {
             "events::prune forgot the computer"
         );
         assert!(
-            !r.over_bound.contains_key(&gone),
+            !r.state.as_ref().unwrap().over_bound.contains_key(&gone),
             "{:?}",
-            r.over_bound.keys()
+            r.state.as_ref().unwrap().over_bound.keys()
         );
         assert_eq!(
-            r.over_bound.get(HOST_ID),
+            r.state.as_ref().unwrap().over_bound.get(HOST_ID),
             Some(&services_bound::OverBound::Within)
         );
     }
