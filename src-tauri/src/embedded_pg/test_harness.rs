@@ -32,6 +32,12 @@
 //!
 //! # Lifetime
 //!
+//! - **Directory** (`<cargo target dir>/qontinui-test-pg/`, or
+//!   [`HARNESS_DIR_ENV`]'s): created private and marked as the harness's
+//!   ([`MADE_MARKER`]), like every cache in it. On Unix every boot refuses it
+//!   unless it is private to the tester ([`require_private`]), and one
+//!   [`HARNESS_DIR_ENV`] names unless no other user could swap the tree above
+//!   it ([`require_safe_ancestors`]). Windows is not checked.
 //! - **Cache** (`<cargo target dir>/qontinui-test-pg/tpl-<key>/`): the
 //!   extracted bundled install plus a cleanly shut-down data directory whose
 //!   `qontinui_template` database holds the transformed schema. The key hashes
@@ -142,14 +148,17 @@ use super::{
 
 /// Relocates the whole harness — template cache and per-process roots — away
 /// from the default `<cargo target dir>/qontinui-test-pg` (to a RAM disk, or a
-/// roomier volume). The directory must be the tester's own: the harness runs
-/// PostgreSQL out of it and keeps each cluster's superuser password in it, so
-/// on Unix it refuses one that another user owns or that it cannot make private
-/// ([`require_private`]). Name a directory of your own, such as
-/// `/dev/shm/<you>/qontinui-test-pg` (missing parents are created private),
-/// never a shared one such as `/dev/shm` itself. It is also the boot-failure
-/// self-test's hook: pointed at a regular file, the harness cannot create its
-/// directory and must fail every test that asks it for a database.
+/// roomier volume). The harness runs PostgreSQL out of that directory and keeps
+/// each cluster's superuser password in it, so on Unix the boot fails on a
+/// directory that another user owns or that anyone else can reach
+/// ([`require_private`]), and on one with an ancestor another user could swap
+/// the tree through ([`require_safe_ancestors`]). The harness changes the mode
+/// only of a directory it made itself, never of one it found: name a directory
+/// that does not exist yet, such as `/dev/shm/<you>/qontinui-test-pg`, and the
+/// harness creates it, with any parent it lacks, private. Windows is not
+/// checked. It is also the boot-failure self-test's hook: pointed at a regular
+/// file, the harness cannot boot and must fail every test that asks it for a
+/// database.
 pub const HARNESS_DIR_ENV: &str = "QONTINUI_TEST_PG_DIR";
 
 /// Runs every harness database on this EXTERNAL server instead of the bundled
@@ -264,6 +273,10 @@ const LOG_TAIL_BYTES: usize = 2048;
 /// How long a removal keeps retrying a root whose files are still held open (on
 /// Windows, by postgres processes that are exiting).
 const REMOVE_RETRY_WINDOW: Duration = Duration::from_secs(10);
+/// The file the harness writes into each directory it creates and may later
+/// make private again: the harness directory and every template cache. The
+/// harness changes the mode of no directory that lacks it ([`require_private`]).
+const MADE_MARKER: &str = ".made-by-qontinui-test-pg";
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -789,8 +802,8 @@ fn bundled_defaults() -> BundledDefaults {
 async fn boot_embedded() -> Result<Server, String> {
     let booting = Instant::now();
     keep_std_handles_out_of_children();
-    let dir = harness_dir()?;
-    prepare_harness_dir(&dir)?;
+    let HarnessDir { path: dir, named } = harness_dir()?;
+    prepare_harness_dir(&dir, named)?;
     for line in sweep_dead_roots(&dir) {
         say(line);
     }
@@ -1038,13 +1051,15 @@ async fn build_template(
     for line in collect_stale_templates(dir, key) {
         say(line);
     }
-    // Private: it holds the cluster's superuser password (`pg-pass`).
+    // Private: it holds the cluster's superuser password (`pg-pass`). Marked as
+    // the harness's, so entering it may make it private again ([`MADE_MARKER`]).
     create_private_dir(template_dir).map_err(|e| {
         format!(
             "could not create the template cache {}: {e}",
             template_dir.display()
         )
     })?;
+    mark_made(template_dir)?;
     if let Err(e) = build_template_cluster(template_dir, defaults).await {
         let note = reap_postmaster(template_dir, None);
         let _ = remove_dir_all_retrying(template_dir);
@@ -1684,11 +1699,24 @@ fn env_nonblank(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Where the harness lives, and whether [`HARNESS_DIR_ENV`] chose it.
+struct HarnessDir {
+    path: PathBuf,
+    /// Named by [`HARNESS_DIR_ENV`]: it can be anywhere, so its ancestors are
+    /// checked as well ([`require_safe_ancestors`]). The default sits in the
+    /// cargo target directory beside the test binaries, whose ancestors it
+    /// shares: whoever could swap the tree under it could swap the binaries.
+    named: bool,
+}
+
 /// [`HARNESS_DIR_ENV`], else `qontinui-test-pg` in the directory
 /// [`cargo_target_dir_of`] finds for this test binary.
-fn harness_dir() -> Result<PathBuf, String> {
+fn harness_dir() -> Result<HarnessDir, String> {
     if let Some(dir) = env_nonblank(HARNESS_DIR_ENV) {
-        return Ok(PathBuf::from(dir));
+        return Ok(HarnessDir {
+            path: PathBuf::from(dir),
+            named: true,
+        });
     }
     let exe = std::env::current_exe().map_err(|e| {
         format!(
@@ -1697,7 +1725,10 @@ fn harness_dir() -> Result<PathBuf, String> {
         )
     })?;
     cargo_target_dir_of(&exe)
-        .map(|target| target.join(DEFAULT_DIR_NAME))
+        .map(|target| HarnessDir {
+            path: target.join(DEFAULT_DIR_NAME),
+            named: false,
+        })
         .ok_or_else(|| {
             format!(
                 "no ancestor of {} is a cargo target directory (none holds cargo's \
@@ -1818,7 +1849,7 @@ fn create_run_root(dir: &Path, key: &str) -> Result<PathBuf, String> {
         std::process::id(),
         process_nonce()
     ));
-    std::fs::create_dir(&root).map_err(|e| {
+    create_private_dir(&root).map_err(|e| {
         format!(
             "could not create this process's root {}: {e}",
             root.display()
@@ -2695,29 +2726,61 @@ fn private_dir_builder() -> std::fs::DirBuilder {
     builder
 }
 
-/// Enter the harness directory: create it private if it is missing, and
-/// require it private either way ([`require_private`]).
-fn prepare_harness_dir(dir: &Path) -> Result<(), String> {
+/// Enter the harness directory, refusing one this process cannot safely run
+/// PostgreSQL from and keep a cluster's superuser password in. A directory
+/// [`HARNESS_DIR_ENV`] names (`named`) must have safe ancestors first
+/// ([`require_safe_ancestors`]). A missing directory is created private, with
+/// any parent it lacks, and marked as the harness's ([`MADE_MARKER`]); either
+/// way it must then be private ([`require_private`]).
+fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
+    if named {
+        require_safe_ancestors(dir)?;
+    }
+    let made = !dir.exists();
     create_private_dir_all(dir).map_err(|e| {
         format!(
             "could not create the harness directory {}: {e}",
             dir.display()
         )
     })?;
+    if made {
+        mark_made(dir)?;
+    }
     require_private(dir)
 }
 
-/// Make `dir` private to this user, and refuse it if it is not.
+/// Mark `dir`, which the harness has just created, as the harness's own
+/// ([`MADE_MARKER`]).
+fn mark_made(dir: &Path) -> Result<(), String> {
+    let marker = dir.join(MADE_MARKER);
+    std::fs::write(
+        &marker,
+        "made by the qontinui test-pg harness, which makes only directories holding this \
+         file private again\n",
+    )
+    .map_err(|e| format!("could not mark {} as the harness's: {e}", dir.display()))
+}
+
+/// Refuse `dir` unless it is private to this user, making it private again
+/// first only when the harness made it.
 ///
 /// The harness runs PostgreSQL out of the template caches in its directory and
 /// keeps each cluster's superuser password there (`tpl-*/pg-pass`), so a
-/// directory another user owns, or can write to, could hand this process their
-/// binaries to run. On Unix a directory this process's effective user owns that
-/// is open to its group or to others is set to 0700 — creating a directory that
-/// exists leaves its mode as it is ([`create_private_dir_all`]) — and then the
-/// directory must be owned by that user and open to no one else
-/// ([`privacy_problem`]), or the boot fails with an error naming it and the
-/// remedy. Windows is not checked.
+/// directory another user owns, or one others can reach, could hand this process
+/// their binaries to run or hand them the password. On Unix:
+///
+/// - a directory holding [`MADE_MARKER`] — the harness directory or a template
+///   cache, which the harness created private — that this process's effective
+///   user owns and that is open to its group or others is set to 0700 again;
+/// - any other directory, such as one [`HARNESS_DIR_ENV`] names, is never
+///   chmodded: the harness does not change the mode of a directory it did not
+///   make;
+/// - then the directory must be owned by that user and open to no one else
+///   ([`privacy_problem`]), or the boot fails with an error naming it and the
+///   remedy.
+///
+/// Windows is not checked: its access lists are not modes, and the harness
+/// reads none.
 fn require_private(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -2735,7 +2798,8 @@ fn require_private(dir: &Path) -> Result<(), String> {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
         let (owner, mode) = owner_and_mode(dir)?;
-        let unchanged = if owner == me && mode & 0o077 != 0 {
+        let made = dir.join(MADE_MARKER).is_file();
+        let unchanged = if made && owner == me && mode & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).err()
         } else {
             None
@@ -2745,10 +2809,20 @@ fn require_private(dir: &Path) -> Result<(), String> {
             let tried = unchanged
                 .map(|e| format!(" (setting it to 0700 failed: {e})"))
                 .unwrap_or_default();
+            let remedy = if made {
+                "remove it, and the harness makes it again".to_string()
+            } else {
+                format!(
+                    "make it private yourself (chmod 700; the harness changes the mode only \
+                     of a directory it made), remove it if it is an old harness directory or \
+                     cache, or point {HARNESS_DIR_ENV} at a directory that does not exist \
+                     yet, which the harness then creates"
+                )
+            };
             return Err(format!(
                 "{} is {problem}{tried}. The harness runs PostgreSQL out of it and keeps a \
                  cluster's superuser password in it, so it must be private to this user: \
-                 remove it, or point {HARNESS_DIR_ENV} at a directory of your own",
+                 {remedy}",
                 dir.display()
             ));
         }
@@ -2769,6 +2843,78 @@ fn privacy_problem(owner: u32, mode: u32, me: u32) -> Option<String> {
         Some(format!(
             "open to its group or to others (mode {:o})",
             mode & 0o777
+        ))
+    } else {
+        None
+    }
+}
+
+/// Refuse a harness directory with an ancestor through which another user
+/// could swap the tree under it — between the check that a cache is private and
+/// the start of the `pg_ctl` in it. Every ancestor that exists, as the path
+/// names it and as it resolves through symlinks (whoever can write the
+/// directory holding a symlink can swap the symlink), must be owned by this
+/// process's effective user or by root, and writable by neither its group nor
+/// others unless it is sticky ([`ancestor_problem`]). Where a symlink's target
+/// itself passes through another symlink, the directory holding that second
+/// one is in neither chain and is not judged. The nearest ancestor is judged
+/// first, and the first that fails fails the boot; ancestors that do not exist
+/// yet the harness creates private. Only a directory [`HARNESS_DIR_ENV`] names
+/// is checked ([`HarnessDir`]). Windows is not checked.
+fn require_safe_ancestors(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let absolute = std::path::absolute(dir).map_err(|e| {
+            format!(
+                "could not resolve the harness directory {}: {e}",
+                dir.display()
+            )
+        })?;
+        let Some(existing) = absolute.ancestors().find(|path| path.exists()) else {
+            return Ok(());
+        };
+        let resolved = std::fs::canonicalize(existing)
+            .map_err(|e| format!("could not resolve {}: {e}", existing.display()))?;
+        // The directory itself, when it exists, is `require_private`'s to judge.
+        let skip = usize::from(existing == absolute.as_path());
+        let as_named = absolute.ancestors().filter(|path| path.exists()).skip(skip);
+        for ancestor in as_named.chain(resolved.ancestors().skip(skip)) {
+            let meta = std::fs::metadata(ancestor)
+                .map_err(|e| format!("could not read {}: {e}", ancestor.display()))?;
+            if let Some(problem) = ancestor_problem(meta.uid(), meta.mode() & 0o7777, me) {
+                return Err(format!(
+                    "{} cannot be the harness directory: its ancestor {} is {problem}, so \
+                     another user could swap the tree under it. Point {HARNESS_DIR_ENV} at a \
+                     directory whose every ancestor is this user's or root's and writable by no \
+                     one else, unless sticky, such as /dev/shm/<you>/qontinui-test-pg",
+                    dir.display(),
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Why an ancestor of the harness directory, owned by uid `owner` with
+/// permission bits `mode`, would let a user other than uid `me` swap the tree
+/// under it: a user other than `me` and root owns it, or its group or others
+/// can write to it and it is not sticky. `None` when it is safe.
+#[cfg(any(unix, test))]
+fn ancestor_problem(owner: u32, mode: u32, me: u32) -> Option<String> {
+    if owner != me && owner != 0 {
+        Some(format!(
+            "owned by uid {owner}, neither this user (uid {me}) nor root"
+        ))
+    } else if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        Some(format!(
+            "writable by its group or others and not sticky (mode {:o})",
+            mode & 0o7777
         ))
     } else {
         None
@@ -3696,7 +3842,12 @@ mod tests {
     }
 
     /// A harness that cannot boot FAILS the test that asked it for a database,
-    /// with the boot error — it never passes and is never ignored.
+    /// with the boot error — it never passes and is never ignored. Which boot
+    /// error depends on where the scratch directory is: under an ancestor its
+    /// group or others can write, the ancestor refusal comes first
+    /// ([`require_safe_ancestors`]); otherwise the harness cannot create its
+    /// directory where the regular file is. Either names the path, and that is
+    /// all this asserts of the error.
     #[test]
     fn a_harness_that_cannot_boot_fails_the_test_with_the_boot_error() {
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -3913,14 +4064,15 @@ mod tests {
         );
     }
 
-    /// A harness directory and template caches that already exist with a wider
-    /// mode — made before the harness made them private, or by hand — are made
-    /// private as the harness enters them, a READY cache and a just-built one
-    /// alike: creating a directory that exists leaves its mode as it is, and
-    /// every cache holds its cluster's superuser password (`pg-pass`).
+    /// A harness directory and template caches the harness made — they hold its
+    /// mark ([`MADE_MARKER`]) — that something has since opened to group or
+    /// others are made private again as the harness enters them, a READY cache
+    /// and a just-built one alike: creating a directory that exists leaves its
+    /// mode as it is, and every cache holds its cluster's superuser password
+    /// (`pg-pass`).
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_existing_harness_directory_and_cache_are_made_private_on_entry() {
+    async fn a_directory_the_harness_made_is_made_private_again_on_entry() {
         use std::os::unix::fs::PermissionsExt;
         let mode_of = |path: &Path| {
             std::fs::metadata(path)
@@ -3938,16 +4090,17 @@ mod tests {
         let dir = scratch.path().join("qontinui-test-pg");
         let ready = dir.join(format!("{TEMPLATE_PREFIX}ready"));
         std::fs::create_dir_all(&ready).expect("plant the READY cache");
-        std::fs::write(ready.join(READY_FILE), "built before caches were private\n")
-            .expect("mark it READY");
-        widen(&dir);
-        widen(&ready);
+        std::fs::write(ready.join(READY_FILE), "built by the harness\n").expect("mark it READY");
+        for made in [&dir, &ready] {
+            mark_made(made).expect("mark it as the harness's");
+            widen(made);
+        }
 
-        prepare_harness_dir(&dir).expect("enter the harness directory");
+        prepare_harness_dir(&dir, false).expect("enter the harness directory");
         assert_eq!(
             mode_of(&dir),
             0o700,
-            "entering the harness directory left it readable to other users"
+            "entering the harness directory it made left it readable to other users"
         );
 
         let lock = open_lock(&dir).expect("the cache lock");
@@ -3962,7 +4115,7 @@ mod tests {
         assert_eq!(
             mode_of(&ready),
             0o700,
-            "entering a READY cache left it, and its pg-pass, readable to other users"
+            "entering a READY cache it made left it, and its pg-pass, readable to other users"
         );
 
         let missing = dir.join(format!("{TEMPLATE_PREFIX}missing"));
@@ -3970,8 +4123,10 @@ mod tests {
         enter_or_build(
             &lock,
             building,
+            // As `build_template` makes a cache, but opened up afterwards.
             move || async move {
                 std::fs::create_dir(building).map_err(|e| e.to_string())?;
+                mark_made(building)?;
                 std::fs::set_permissions(building, std::fs::Permissions::from_mode(0o775))
                     .map_err(|e| e.to_string())?;
                 std::fs::write(building.join(READY_FILE), "built by the test\n")
@@ -3991,6 +4146,147 @@ mod tests {
         assert!(
             require_private(&dir.join("not-there")).is_err(),
             "a directory whose mode cannot be read must be refused, not passed over"
+        );
+    }
+
+    /// A directory the harness did not make is never chmodded: one open to its
+    /// group or others FAILS the boot — as the harness directory and as a
+    /// template cache alike — with an error naming it and the remedy, and keeps
+    /// the mode it had. Every fixture is made inside a scratch directory the
+    /// test owns. (A directory another user owns, or one the harness made and
+    /// cannot chmod, needs a fixture no unprivileged test can make; the
+    /// predicate's own test covers those arms.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_the_harness_did_not_make_is_refused_and_left_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|e| panic!("read the mode of {}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let plant_open = |path: &Path| {
+            std::fs::create_dir(path).unwrap_or_else(|e| panic!("plant {}: {e}", path.display()));
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))
+                .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        };
+        let scratch = tempfile::tempdir().expect("scratch directory");
+
+        // One a tester names, such as a project directory.
+        let found = scratch.path().join("found");
+        plant_open(&found);
+        let refused = prepare_harness_dir(&found, false)
+            .expect_err("a directory open to others that the harness did not make must fail");
+        assert!(
+            refused.contains(&found.display().to_string())
+                && refused.contains("chmod 700")
+                && refused.contains(HARNESS_DIR_ENV),
+            "the error names the directory and the remedy: {refused}"
+        );
+        assert_eq!(
+            mode_of(&found),
+            0o775,
+            "the harness changed the mode of a directory it did not make"
+        );
+        assert!(
+            !found.join(MADE_MARKER).exists(),
+            "the harness marked as its own a directory it did not make"
+        );
+
+        // A READY cache without the mark, inside a harness directory the
+        // harness made (and marked).
+        let dir = scratch.path().join("qontinui-test-pg");
+        prepare_harness_dir(&dir, false).expect("make the harness directory");
+        assert!(
+            dir.join(MADE_MARKER).is_file() && mode_of(&dir) == 0o700,
+            "a harness directory the harness makes is private and marked"
+        );
+        let unmarked = dir.join(format!("{TEMPLATE_PREFIX}unmarked"));
+        plant_open(&unmarked);
+        std::fs::write(unmarked.join(READY_FILE), "made by hand\n").expect("mark it READY");
+        let lock = open_lock(&dir).expect("the cache lock");
+        let entered = std::cell::Cell::new(false);
+        let refused = enter_or_build(
+            &lock,
+            &unmarked,
+            || async { Err::<Duration, _>("a READY cache is never rebuilt".to_string()) },
+            || {
+                entered.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a cache open to others that the harness did not make must not be entered");
+        assert!(
+            !entered.get() && refused.contains(&unmarked.display().to_string()),
+            "the cache was refused before it was entered, by name: {refused}"
+        );
+        assert_eq!(
+            mode_of(&unmarked),
+            0o775,
+            "the harness changed the mode of a cache it did not make"
+        );
+    }
+
+    /// A harness directory that HARNESS_DIR_ENV names is refused, before
+    /// anything is created, when an ancestor would let another user swap the
+    /// tree under it — here one this user owns that its group can write — and
+    /// the error names that ancestor. That holds for an ancestor the path names
+    /// on its way through a symlink as well as for one it resolves to. The
+    /// default location is not ancestor-checked ([`HarnessDir`]): it is
+    /// created, private and marked. (An ancestor another user owns, or root's,
+    /// cannot be made by a test; the predicate's own test covers those arms.)
+    #[cfg(unix)]
+    #[test]
+    fn a_named_harness_directory_under_an_open_ancestor_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let open = scratch.path().join("open");
+        std::fs::create_dir(&open).expect("plant the ancestor");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775))
+            .expect("open it to its group");
+        let open = std::fs::canonicalize(&open).expect("resolve the ancestor");
+        let named = open.join("qontinui-test-pg");
+
+        let refused = prepare_harness_dir(&named, true)
+            .expect_err("a named directory under a group-writable ancestor must fail the boot");
+        assert!(
+            refused.contains(&format!("its ancestor {} is", open.display()))
+                && refused.contains("not sticky"),
+            "the error names the ancestor and what is wrong with it: {refused}"
+        );
+        assert!(
+            !named.exists(),
+            "a refused harness directory must not have been created"
+        );
+
+        // Through a symlink in that open directory to a private one: whoever
+        // can write `open` can point the symlink elsewhere.
+        let private = scratch.path().join("private");
+        std::fs::create_dir(&private).expect("plant the symlink's target");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+            .expect("make the target private");
+        let link = open.join("link");
+        std::os::unix::fs::symlink(&private, &link).expect("plant the symlink");
+        let through_link = link.join("qontinui-test-pg");
+        let refused = prepare_harness_dir(&through_link, true)
+            .expect_err("a named directory through a symlink in an open directory must fail");
+        assert!(
+            refused.contains(&format!("its ancestor {} is", open.display())),
+            "the error names the open directory holding the symlink: {refused}"
+        );
+        assert!(
+            !private.join("qontinui-test-pg").exists(),
+            "a refused harness directory must not have been created"
+        );
+
+        prepare_harness_dir(&named, false)
+            .expect("the default location's ancestors are the test binaries' own");
+        assert!(
+            named.join(MADE_MARKER).is_file(),
+            "a harness directory the harness makes is marked as its own"
         );
     }
 
@@ -4023,42 +4319,44 @@ mod tests {
         }
     }
 
-    /// A directory that stays open to its group or others after the harness tried
-    /// to make it private FAILS the boot, as the harness directory and as a
-    /// template cache alike, and the error names it. `/proc/self` is such a
-    /// directory for every user, root included: it is the process's own and
-    /// readable by all, and procfs refuses to change its mode. (A directory
-    /// another user owns cannot be made by a test; the predicate's own test
-    /// covers that case, and the tightening of an open one is covered above.)
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_directory_that_cannot_be_made_private_is_refused() {
-        let open = Path::new("/proc/self");
-        let refused = prepare_harness_dir(open)
-            .expect_err("a harness directory open to others must fail the boot");
-        assert!(
-            refused.contains("/proc/self") && refused.contains(HARNESS_DIR_ENV),
-            "the error names the directory and the remedy: {refused}"
-        );
-
-        let scratch = tempfile::tempdir().expect("scratch directory");
-        let lock = open_lock(scratch.path()).expect("the cache lock");
-        let entered = std::cell::Cell::new(false);
-        let refused = enter_or_build(
-            &lock,
-            open,
-            || async { Ok::<_, String>(Duration::from_millis(1)) },
-            || {
-                entered.set(true);
-                Ok(())
-            },
-        )
-        .await
-        .expect_err("a template cache open to others must not be entered");
-        assert!(
-            !entered.get() && refused.contains("/proc/self"),
-            "the cache was refused before it was entered, by name: {refused}"
-        );
+    /// An ancestor of a named harness directory is safe only when no user but
+    /// this one can swap the tree under it: this user or root owns it, and its
+    /// group and others cannot write to it unless it is sticky (`/tmp`,
+    /// `/dev/shm`).
+    #[test]
+    fn an_ancestor_is_safe_only_when_no_other_user_can_swap_the_tree_under_it() {
+        let me = 1000;
+        for (owner, mode) in [
+            (me, 0o755),
+            (me, 0o700),
+            (0, 0o755),
+            (0, 0o711),
+            (0, 0o1777),
+            (me, 0o1777),
+        ] {
+            assert_eq!(
+                ancestor_problem(owner, mode, me),
+                None,
+                "an ancestor uid {owner} owns with mode {mode:o} is safe"
+            );
+        }
+        for (owner, mode) in [(me, 0o775), (me, 0o757), (0, 0o777), (0, 0o775)] {
+            let problem = ancestor_problem(owner, mode, me).unwrap_or_else(|| {
+                panic!("an ancestor uid {owner} owns with mode {mode:o} can be swapped by others")
+            });
+            assert!(
+                problem.contains(&format!("{mode:o}")) && problem.contains("not sticky"),
+                "the problem names the mode: {problem}"
+            );
+        }
+        for owner in [1001, 65534] {
+            let problem = ancestor_problem(owner, 0o755, me)
+                .unwrap_or_else(|| panic!("an ancestor uid {owner} owns is not safe"));
+            assert!(
+                problem.contains(&format!("uid {owner}")),
+                "the problem names the owner: {problem}"
+            );
+        }
     }
 
     /// A start attempt's failure is judged by the lines that attempt wrote to the
