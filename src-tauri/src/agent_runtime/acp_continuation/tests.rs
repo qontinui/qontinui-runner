@@ -773,11 +773,7 @@ for line in sys.stdin:
 #[tokio::test]
 async fn a_real_child_runs_spawn_prompt_verdict_close_and_is_reaped() {
     use std::os::unix::fs::PermissionsExt;
-    if std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if !have_python() {
         eprintln!("SKIPPED: python3 is not available to script the ACP child");
         return;
     }
@@ -821,12 +817,12 @@ async fn a_real_child_runs_spawn_prompt_verdict_close_and_is_reaped() {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    // `kill -0 <pid>` through the shell avoids a libc dependency in a test.
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+    // `kill -0 <pid>` through the shell avoids a libc dependency in a test; the
+    // bounded wrapper keeps even this probe from parking a thread.
+    let mut cmd = crate::process_helpers::no_window("kill");
+    cmd.args(["-0", &pid.to_string()]);
+    crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(10))
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
@@ -873,10 +869,9 @@ fn py_launch(dir: &std::path::Path, body: &str) -> AcpLaunch {
 
 #[cfg(unix)]
 fn have_python() -> bool {
-    std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_ok()
+    let mut cmd = crate::process_helpers::no_window("python3");
+    cmd.arg("--version");
+    crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(10)).is_ok()
 }
 
 /// Speaks ACP, then on stdin EOF ignores it and sleeps: only a kill ends it.
