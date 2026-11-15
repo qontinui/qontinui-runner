@@ -9499,8 +9499,22 @@ mod remote_admission_tests {
         let arm = end
             .find("end_under_create_grant(tm, data, force)")
             .expect("the create branch must run the create arm");
-        let attach_gate = end.find("admit_terminal_end(").expect("the attach gate");
+        // The attach gate is entered through `admit_relay_terminal_end`, the
+        // seam that resolves a coord id (shell or terminal_claude) to its pane
+        // and then runs `admit_terminal_end`.
+        let attach_gate = end
+            .find("admit_relay_terminal_end(")
+            .expect("the attach gate");
         assert!(branch < arm && arm < attach_gate, "create branch first");
+        let seam = SRC
+            .find("fn admit_relay_terminal_end<")
+            .and_then(|start| SRC.get(start..))
+            .and_then(|rest| rest.get(..rest.find("\n}\n").unwrap_or(rest.len())))
+            .expect("admit_relay_terminal_end is defined");
+        assert!(
+            seam.contains("admit_terminal_end("),
+            "the seam must still run the attach gate"
+        );
         assert!(
             end.contains("end_admitted_terminal("),
             "attach arm's driver"

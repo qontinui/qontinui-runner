@@ -564,8 +564,14 @@ mod tests {
             (
                 "commands/terminal.rs",
                 include_str!("../terminal.rs"),
-                None,
+                Some("door-scan: spawn"),
                 "finish_terminal_create(",
+            ),
+            (
+                "commands/terminal.rs (create_terminal_session_backend)",
+                include_str!("../terminal.rs"),
+                Some("fn create_terminal_session_backend"),
+                "coord_wiring::bind_registered_coord_session(",
             ),
         ];
         for (name, src, marker, call) in doors {
@@ -577,7 +583,7 @@ mod tests {
                 None => 0,
             };
             assert!(
-                production[from..].contains(call),
+                production.get(from..).is_some_and(|rest| rest.contains(call)),
                 "{name}: production code no longer calls `{call}`{} — the pane it \
                  creates would have no terminal_shell coord row",
                 marker.map(|m| format!(" after `{m}`")).unwrap_or_default()
