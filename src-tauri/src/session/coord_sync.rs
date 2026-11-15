@@ -2699,6 +2699,29 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "spawn_failed_report" => {
+            // A `spawn-failed` report the live POST could not deliver (plan
+            // 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling,
+            // Phase 6). POST /agents/:agent_id/spawn-failed with the body the
+            // live POST would have sent. The lane is synthetic (a refused launch
+            // has no session), so `scope` resolves Unresolved → the default
+            // device credential — the same one the live POST attaches. The
+            // generic arms below settle it: 2xx Ack, 4xx PermanentFailure
+            // (Ack-drop), transport / 5xx retry on this lane's backoff.
+            let Some((agent_id, body)) =
+                super::spawn_report_spool::replay_target(&rec.payload)
+            else {
+                return PushOutcome::PermanentFailure(
+                    "spawn_failed_report payload carries no parseable `agent_id` — the \
+                     spawn-failed URL cannot be built"
+                        .to_string(),
+                );
+            };
+            let url = format!("{base}/agents/{agent_id}/spawn-failed");
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .send()
+                .await
+        }
         "agent_notification" => {
             // Sensitive-action notification (plan
             // 2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work,
@@ -3107,7 +3130,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 /// `[connect]` tag, so a log line and `/health` `sessionOutbox.lastFailure`
 /// say WHICH transport fault it was instead of reqwest's generic
 /// "error sending request for url (…)".
-fn transport_error(e: &reqwest::Error) -> String {
+pub(crate) fn transport_error(e: &reqwest::Error) -> String {
     let chain = crate::util::error_chain::error_chain(e);
     if e.is_timeout() {
         format!("[timeout] {chain}")
@@ -4698,6 +4721,7 @@ mod tests {
             SessionEventKind::CoordTransportRung,
             SessionEventKind::AgentNotification,
             SessionEventKind::OperatorTouch,
+            SessionEventKind::SpawnFailedReport,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -5670,6 +5694,129 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// A fake coord serving only `POST /agents/:id/spawn-failed`, answering
+    /// each request with the next scripted status (then 200 once the script
+    /// is spent) and recording every request it saw.
+    async fn spawn_scripted_spawn_failed_coord(
+        script: Vec<u16>,
+    ) -> (String, Arc<TokMutex<(Vec<u16>, Vec<(Uuid, JsonValue)>)>>) {
+        let state = Arc::new(TokMutex::new((script, Vec::new())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/agents/{id}/spawn-failed",
+                post(
+                    |AxumState(state): AxumState<
+                        Arc<TokMutex<(Vec<u16>, Vec<(Uuid, JsonValue)>)>>,
+                    >,
+                     AxumPath(id): AxumPath<Uuid>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.1.push((id, body));
+                        let status = if g.0.is_empty() { 200 } else { g.0.remove(0) };
+                        (
+                            AxumStatus::from_u16(status).unwrap(),
+                            Json(json!({"agent_id": id})),
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    /// A spooled `spawn_failed_report` is replayed to coord's spawn-failed
+    /// route EXACTLY once on success — to the agent the payload names, with the
+    /// body the live POST would have sent — and a transient 5xx keeps it for a
+    /// retry rather than dropping it.
+    ///
+    /// Mutation: remove the `"spawn_failed_report"` arm from `push_record` (the
+    /// catch-all ACK-drops the row and coord sees nothing), or mark the kind
+    /// best-effort-dropped after one failure.
+    #[tokio::test]
+    async fn the_drain_replays_a_spooled_spawn_failed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        // First delivery attempt: coord 503 (transient). Then 200.
+        let (base, seen) = spawn_scripted_spawn_failed_coord(vec![503]).await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let agent_id = Uuid::new_v4();
+        let body = json!({
+            "reason": "deferred_load:thread_pressure:warn:380_over_376",
+            "exit_code": null,
+            "restarts_attempted": 0,
+            "phase": "blocked",
+        });
+        let spool = super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        super::super::spawn_report_spool::spool_spawn_failed(&spool, agent_id, &body)
+            .expect("spools");
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(20), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        // Let any (wrong) extra replay surface before counting.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let g = seen.lock().await;
+        assert_eq!(
+            g.1.len(),
+            2,
+            "one 503 (kept, retried) and one 200 (acked) — never dropped on the \
+             transient failure, never re-sent after the ack: {:?}",
+            g.1
+        );
+        for (id, sent) in &g.1 {
+            assert_eq!(*id, agent_id, "replayed to the agent the payload names");
+            assert_eq!(sent, &body, "the live POST's body, verbatim, minus agent_id");
+        }
+    }
+
+    /// A 4xx on replay is coord's verdict on the report: Ack-dropped after ONE
+    /// request, never retried.
+    ///
+    /// Mutation: map the 4xx to `Transport` (the row is retried forever).
+    #[tokio::test]
+    async fn a_4xx_on_replay_is_dropped_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, seen) = spawn_scripted_spawn_failed_coord(vec![404, 404, 404]).await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+        let spool = super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        super::super::spawn_report_spool::spool_spawn_failed(
+            &spool,
+            Uuid::new_v4(),
+            &json!({"reason": "spawn failure: x", "restarts_attempted": 0}),
+        )
+        .expect("spools");
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(10), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen.lock().await.1.len(), 1, "a 4xx is not retried");
     }
 
     /// The plan's highest-consequence risk, made concrete for the

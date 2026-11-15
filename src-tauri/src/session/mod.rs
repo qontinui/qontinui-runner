@@ -73,6 +73,7 @@ pub mod identity_stamp; // Reports every session id this machine can resolve (ac
 pub mod intent;
 pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
+pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
 pub mod pane_store;
@@ -419,6 +420,23 @@ pub enum SessionEventKind {
     /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
     #[serde(rename = "operator_touch")]
     OperatorTouch,
+    /// A `spawn-failed` report coord did not receive (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`,
+    /// Phase 6). Written by [`spawn_report_spool::spool_spawn_failed`] once the
+    /// live POST's bounded attempts end UNDELIVERED (transport class only — a
+    /// 4xx is coord's verdict and is never spooled), on a deterministic
+    /// per-agent synthetic lane, because a refused launch has no session.
+    ///
+    /// Drained to `POST /agents/<agent_id>/spawn-failed` under the device
+    /// credential, with the payload minus `agent_id` as the body
+    /// (`{reason, exit_code, restarts_attempted, phase?, push_ref?, pr?}`):
+    /// 2xx → Ack, 4xx → PermanentFailure (Ack-drop), transport/5xx → retry on
+    /// the lane's backoff. NOT best-effort: until coord hears it, coord counts
+    /// the allocation in flight.
+    ///
+    /// ⚠️ Like [`Self::CoordTransportRung`], a kind with no [`coord_sync`]
+    /// `push_record` arm is ACK-DROPPED silently. This kind HAS an arm.
+    SpawnFailedReport,
 }
 
 impl SessionEventKind {
@@ -443,6 +461,7 @@ impl SessionEventKind {
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
             SessionEventKind::AgentNotification => "agent_notification",
             SessionEventKind::OperatorTouch => "operator_touch",
+            SessionEventKind::SpawnFailedReport => "spawn_failed_report",
         }
     }
 }
