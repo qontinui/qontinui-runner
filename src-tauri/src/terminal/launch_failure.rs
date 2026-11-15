@@ -341,6 +341,10 @@ fn closed_session(outcome: &CloseOutcome) -> Option<&str> {
         CloseOutcome::AlreadyClosed { .. }
         | CloseOutcome::TerminalSuperseded { .. }
         | CloseOutcome::IgnoredDuringShutdown { .. }
+        // Held while a respawn proves the pane alive: nothing closed yet. The
+        // respawn replays it later through its own close, whose outcome is
+        // the one that says what closed.
+        | CloseOutcome::HeldInFlight { .. }
         | CloseOutcome::NotFound { .. } => None,
     }
 }
