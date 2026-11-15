@@ -1321,6 +1321,18 @@ pub struct SessionLifecycleStore {
     finish_forward: Mutex<()>,
 }
 
+/// What [`SessionLifecycleStore::redirect_finish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectFinish<R> {
+    /// The mark is no longer finished at the caller's `finished_at` (unmarked,
+    /// restamped) or its finish is in flight again: nothing was sent.
+    MarkChanged,
+    /// The mark's row already is the target (a concurrent redirect won).
+    AlreadyOnRow,
+    /// The sender ran, under `finish_forward`; its verdict.
+    Ran(R),
+}
+
 /// Boxed close-observer callback (see `SessionLifecycleStore::close_observer`).
 /// Newtype so the store can keep `#[derive(Debug)]`.
 struct CloseObserver(Box<dyn Fn(&str) + Send + Sync>);
@@ -3545,6 +3557,80 @@ impl SessionLifecycleStore {
             }],
         );
         true
+    }
+
+    /// Point a finished mark's finish at coord row `row` — the registrar's
+    /// re-offer after a move onto a pane row (plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D5) — as ONE critical section under `finish_forward`:
+    ///
+    /// 1. re-read the mark: it must still be finished at `finished_at` and its
+    ///    [`TerminalSessionRecord::finish_coord_session_id`] must name a row
+    ///    other than `row` ([`RedirectFinish::MarkChanged`] /
+    ///    [`RedirectFinish::AlreadyOnRow`] otherwise);
+    /// 2. withdraw its `finish_synced` stamp, if any;
+    /// 3. run `send` with the re-read record (it enqueues, or finds a pending
+    ///    row) — it answers its verdict and whether a finish for the mark now
+    ///    stands addressed to `row`;
+    /// 4. when it does, record `row` as the row the mark was sent to.
+    ///
+    /// Because the read, the clear, the send and the record share one hold of
+    /// `finish_forward`, an unmark either lands before (step 1 finds no mark,
+    /// nothing is queued) or after (its `working` follows the `Finished`), and
+    /// a second concurrent redirect to the same row finds step 1 answering
+    /// `AlreadyOnRow`. `send` must not call [`Self::set_finished`] or any other
+    /// `finish_forward` taker (the lock is not re-entrant).
+    pub fn redirect_finish<R>(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+        row: uuid::Uuid,
+        send: impl FnOnce(&TerminalSessionRecord) -> (R, bool),
+    ) -> RedirectFinish<R> {
+        let _forward = self
+            .finish_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on redirect_finish");
+                return RedirectFinish::MarkChanged;
+            }
+        };
+        let rec = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.finished_at == Some(finished_at) => rec,
+            _ => return RedirectFinish::MarkChanged,
+        };
+        match rec.finish_coord_session_id {
+            Some(r) if r == row => return RedirectFinish::AlreadyOnRow,
+            Some(_) => {}
+            // Its finish is in flight again (unmarked and re-marked since the
+            // caller read it): the caller's decision no longer applies.
+            None => return RedirectFinish::MarkChanged,
+        }
+        let snapshot = if rec.finish_synced {
+            rec.finish_synced = false;
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
+        } else {
+            let snapshot = rec.clone();
+            drop(m);
+            snapshot
+        };
+        let (verdict, addressed) = send(&snapshot);
+        if addressed {
+            // Map lock only — `finish_forward` stays held, so no unmark can
+            // land between the send and this record.
+            self.note_finish_sent_row(claude_session_id, Some(finished_at), row);
+        }
+        RedirectFinish::Ran(verdict)
     }
 
     /// Record what the wind-down executor did to this session — one of the
