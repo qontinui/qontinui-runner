@@ -134,6 +134,49 @@ pub async fn ui_bridge_design_clear_style_guide_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "design_clear_style_guide", payload).await)
 }
 
+/// Infer a draft style guide and a ranked token inventory from the computed
+/// styles of the registered elements (SDK action `inferStyleGuide`,
+/// `POST /design/style-guide/infer`).
+///
+/// A pure relay: the body is forwarded unchanged as the
+/// `design_infer_style_guide` IPC request and the webview's answer is passed
+/// through `wrap_ipc_result`. The inference itself is the SDK's
+/// (`specs/style-inference-request.ts`); the runner reimplements none of it.
+///
+/// This is the HTTP half only. The IPC type is handled by this repo's own
+/// webview dispatcher (`src/hooks/ui-bridge-events/useDesignEvents.ts`), which
+/// has no `design_infer_style_guide` case yet: that case needs an
+/// `@qontinui/ui-bridge` release exporting the SDK function first. Until it
+/// lands, the webview answers `Unknown request type`, which surfaces here as
+/// HTTP 400. The same holds for `design_diff_tokens` below.
+pub async fn ui_bridge_design_infer_style_guide_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - infer style guide");
+
+    let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_infer_style_guide", payload).await)
+}
+
+/// Report drift between the values the registered elements use and the
+/// declared design tokens (SDK action `diffDesignTokens`,
+/// `POST /design/tokens/drift`).
+///
+/// Same relay shape as [`ui_bridge_design_infer_style_guide_handler`]: body
+/// forwarded unchanged as `design_diff_tokens`, answer passed through.
+pub async fn ui_bridge_design_tokens_drift_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - diff design tokens");
+
+    let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_diff_tokens", payload).await)
+}
+
 /// Manual design-review routes (does not include the macro-generated
 /// `design/evaluate*` family — those stay in `mod.rs`).
 pub fn routes() -> axum::Router<Arc<ApiState>> {
@@ -208,6 +251,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(ui_bridge_design_get_style_guide_handler)
                 .delete(ui_bridge_design_clear_style_guide_handler),
         )
+        .route(
+            "/ui-bridge/design/style-guide/infer",
+            post(ui_bridge_design_infer_style_guide_handler),
+        )
+        .route(
+            "/ui-bridge/design/tokens/drift",
+            post(ui_bridge_design_tokens_drift_handler),
+        )
 }
 
 /// Static (method, path) tuples corresponding to every route registered
@@ -236,6 +287,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/design/style-guide/load"),
         ("GET", "/ui-bridge/design/style-guide"),
         ("DELETE", "/ui-bridge/design/style-guide"),
+        ("POST", "/ui-bridge/design/style-guide/infer"),
+        ("POST", "/ui-bridge/design/tokens/drift"),
     ]
 }
 
@@ -322,5 +375,36 @@ mod design_audit_envelope_tests {
         let data = serde_json::json!({"success": 1});
         let resp = wrap_ipc_result(Ok(data)).expect("numeric success must return Ok");
         assert!(resp.deref().success);
+    }
+}
+
+#[cfg(test)]
+mod style_inference_route_tests {
+    //! The two style-inference routes the SDK declares in `UI_BRIDGE_ROUTES`
+    //! (ui-bridge `inferStyleGuide` / `diffDesignTokens`). Whether `routes()`
+    //! mounts what `route_entries()` lists is pinned by
+    //! `manifest_drift_tests::manifest_matches_route_calls`, and agreement
+    //! with the SDK by `sdk_manifest_routes_are_exposed_by_runner`; this pins
+    //! the method and the exact paths so a typo cannot pass as a runner-only
+    //! extension.
+    use super::route_entries;
+
+    #[test]
+    fn style_inference_routes_are_listed_as_post() {
+        for path in [
+            "/ui-bridge/design/style-guide/infer",
+            "/ui-bridge/design/tokens/drift",
+        ] {
+            let methods: Vec<&str> = route_entries()
+                .iter()
+                .filter(|(_, p)| *p == path)
+                .map(|(m, _)| *m)
+                .collect();
+            assert_eq!(
+                methods,
+                vec!["POST"],
+                "{path} must be listed exactly once, as POST"
+            );
+        }
     }
 }
