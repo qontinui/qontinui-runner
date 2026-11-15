@@ -2324,6 +2324,16 @@ verdict you saw and what you re-acquired**. Silence here is the
 `silent-empty-is-unknown` failure: a dead loop looks exactly like a healthy
 one to anything that does not ask.
 
+**A `DEAD` loop may have been killed with its pane, and then the net may
+already have fired.** `status` prints a `launch: posture=…` line for the loop
+`start` last launched. Anything but `posture=scope` dies when its pane's systemd
+scope is torn down (an account migration, a closed tab), and `<ledger>.alert`
+`TERMINATED` records a trapped TERM from outside. In that case the plan reserve
+may already have expired, and Step 0.5's implement→ship net may already have
+dispatched a duplicate. So after re-acquiring, read
+`coord_gate_list {work_unit_id}` for that net. If it has cleared or dispatched,
+arm a fresh one exactly as Step 0.5 does, and say so in the report.
+
 #### `/loop` gap (documented limitation)
 
 `/loop` is built into Claude Code itself, NOT a user-editable slash

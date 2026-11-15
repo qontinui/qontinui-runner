@@ -342,10 +342,10 @@ def judge(verdict, reasons, facts, tx, now_ms, cooldown_h, include_complete=Fals
         # A screen that ends on an open usage-limit menu (cfs.MENU_OPEN_LINE, from
         # either of the close screen's LIMITED arms) stays LIMITED whatever the
         # reset says: /next-move typed into it would choose an option, and
-        # triage's limit step is the one that dismisses it with Esc and waits for
-        # the runner's hand-off.
+        # triage's limit step is the one that answers it: Esc and the runner's
+        # hand-off, or the menu's wait option chosen by its text.
         if cfs.MENU_OPEN_LINE in reasons:
-            return "LIMITED", reasons + ["left to triage's limit step, which dismisses the menu, whatever the reset"]
+            return "LIMITED", reasons + ["left to triage's limit step, which answers the menu, whatever the reset"]
         if tx is None:
             return "LIMITED", reasons + ["transcript unreadable at re-check"]
         reset = limit_reset_ms(tx["final_text"], tx["last_asst"])

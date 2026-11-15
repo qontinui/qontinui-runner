@@ -172,6 +172,9 @@ written at the end of a turn, so the git probes decide); no live claim
 sits in the step 0.5 ledger; and every owed item reads `landed` or `watched`.
 A primary checkout reads UNKNOWN, not not-closeable: peers' WIP in a shared tree
 is not this session's owed work.
+In a linked tree whose custody directory also holds another session's slot, a
+dirty path a peer could have written reads UNKNOWN for the same reason, and this
+session never commits or discards such a path.
 
 This step refuses a finish ONLY on a definite reason, because a definite reason
 means the work is not actually done. An UNKNOWN closeability does not block the
