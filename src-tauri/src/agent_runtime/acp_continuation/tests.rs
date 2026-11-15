@@ -609,9 +609,52 @@ async fn abnormal_stop_reasons_post_work_unreported_with_the_reason_and_no_nudge
         );
         assert_eq!(
             r.gate.calls(),
-            vec!["spawned".to_string(), format!("work_unreported: {detail}")]
+            // The gate is read BEFORE posting: a session that already
+            // reported keeps its own answer (see the next test).
+            vec![
+                "spawned".to_string(),
+                "read".to_string(),
+                format!("work_unreported: {detail}")
+            ]
         );
     }
+}
+
+#[tokio::test]
+async fn a_session_that_reported_then_stopped_abnormally_keeps_its_own_report() {
+    let r = run_with(
+        OnPrompt::Stop(StopReason::MaxTokens, vec![]),
+        vec![reported()],
+        true,
+    )
+    .await;
+    assert_eq!(r.verdict, AcpVerdict::Reported, "honour the self-report");
+    assert_eq!(
+        r.gate.calls(),
+        vec!["spawned", "read"],
+        "nothing posted over it"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_gate_gets_no_nudge_and_a_work_unreported_with_the_reason() {
+    let r = run_with(
+        OnPrompt::Stop(StopReason::EndTurn, vec![]),
+        vec![GateRead::Unknown("coord unreachable".to_string())],
+        true,
+    )
+    .await;
+    let AcpVerdict::Unreported { detail, failed } = r.verdict else {
+        panic!("an unknown gate is not a success");
+    };
+    assert!(!failed);
+    assert!(detail.contains("gate_outcome_unknown"), "{detail}");
+    assert_eq!(
+        r.seen.lock().unwrap().prompts.len(),
+        1,
+        "no nudge on a guess"
+    );
+    assert_eq!(r.gate.calls().len(), 3, "{:?}", r.gate.calls());
 }
 
 #[tokio::test]
@@ -787,14 +830,131 @@ fn process_is_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+// ---- reaping: escalation, drop, pre-handshake exit, handshake timeout -------
+
+/// Tolerates a zombie: an exited-but-unreaped child still answers `kill -0`, and
+/// what matters is that it no longer RUNS.
+#[cfg(unix)]
+fn process_runs(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z" && state != "X"),
+        Err(_) => process_is_alive(pid),
+    }
+}
+
+#[cfg(unix)]
+async fn wait_gone(pid: u32) -> bool {
+    for _ in 0..100 {
+        if !process_runs(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn py_launch(dir: &std::path::Path, body: &str) -> AcpLaunch {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("agent.py");
+    std::fs::write(&script, format!("#!/usr/bin/env python3\n{body}")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    AcpLaunch {
+        program: script,
+        args: vec![],
+        env: vec![],
+        cwd: dir.to_path_buf(),
+    }
+}
+
+#[cfg(unix)]
+fn have_python() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Speaks ACP, then on stdin EOF ignores it and sleeps: only a kill ends it.
+#[cfg(unix)]
+const PY_STUBBORN: &str = r#"
+import sys, json, time
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    m = json.loads(line)
+    meth, mid = m.get("method"), m.get("id")
+    if meth == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif meth == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "py-1"}})
+while True:
+    time.sleep(1000)
+"#;
+
 #[cfg(unix)]
 #[tokio::test]
-async fn a_child_that_exits_before_the_handshake_is_a_spawn_time_failure_and_is_reaped() {
+async fn close_escalates_to_a_kill_for_a_child_that_ignores_stdin_eof() {
+    if !have_python() {
+        eprintln!("SKIPPED: python3 is not available");
+        return;
+    }
     let _amb = crate::test_env::isolated_ambient();
     let dir = tempfile::tempdir().unwrap();
+    let served = crate::served_corpus::ServedCorpus::unknown("test");
+    let session = crate::acp_session::spawn_acp_agent(
+        py_launch(dir.path(), PY_STUBBORN),
+        crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+        &served,
+        base_cfg(dir.path(), false),
+    )
+    .await
+    .expect("handshake");
+    let pid = session.pid().unwrap();
+    assert!(process_runs(pid));
+    session.close().await;
+    assert!(
+        wait_gone(pid).await,
+        "the stubborn child {pid} must be killed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_session_without_close_still_reaps_the_child() {
+    if !have_python() {
+        eprintln!("SKIPPED: python3 is not available");
+        return;
+    }
+    let _amb = crate::test_env::isolated_ambient();
+    let dir = tempfile::tempdir().unwrap();
+    let served = crate::served_corpus::ServedCorpus::unknown("test");
+    let session = crate::acp_session::spawn_acp_agent(
+        py_launch(dir.path(), PY_STUBBORN),
+        crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+        &served,
+        base_cfg(dir.path(), false),
+    )
+    .await
+    .expect("handshake");
+    let pid = session.pid().unwrap();
+    drop(session);
+    assert!(wait_gone(pid).await, "a dropped session leaked child {pid}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_that_exits_before_the_handshake_is_reaped_and_reported() {
+    let _amb = crate::test_env::isolated_ambient();
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
     let launch = AcpLaunch {
-        program: PathBuf::from("/bin/true"),
-        args: vec![],
+        program: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), format!("echo $$ > {}", pidfile.display())],
         env: vec![],
         cwd: dir.path().to_path_buf(),
     };
@@ -807,8 +967,61 @@ async fn a_child_that_exits_before_the_handshake_is_a_spawn_time_failure_and_is_
     )
     .await
     {
-        Ok(_) => panic!("a child that never speaks ACP cannot be a session"),
+        Ok(_) => panic!("a child that never speaks ACP is not a session"),
         Err(e) => e,
     };
-    assert_eq!(err.kind, AcpErrorKind::TransportLost, "got {err}");
+    assert!(matches!(
+        err.kind,
+        AcpErrorKind::TransportLost | AcpErrorKind::Protocol
+    ));
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        wait_gone(pid).await,
+        "the pre-handshake child {pid} must be reaped"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_that_never_answers_the_handshake_is_timed_out_and_killed() {
+    let _amb = crate::test_env::isolated_ambient();
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let launch = AcpLaunch {
+        program: PathBuf::from("/bin/sh"),
+        args: vec![
+            "-c".into(),
+            format!("echo $$ > {}; exec sleep 1000", pidfile.display()),
+        ],
+        env: vec![],
+        cwd: dir.path().to_path_buf(),
+    };
+    let served = crate::served_corpus::ServedCorpus::unknown("test");
+    let mut cfg = base_cfg(dir.path(), false);
+    cfg.handshake_timeout = Duration::from_millis(500);
+    let err = match crate::acp_session::spawn_acp_agent(
+        launch,
+        crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+        &served,
+        cfg,
+    )
+    .await
+    {
+        Ok(_) => panic!("a silent child is not a session"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind, AcpErrorKind::TimedOut, "got {err}");
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        wait_gone(pid).await,
+        "the silent child {pid} must be killed"
+    );
 }

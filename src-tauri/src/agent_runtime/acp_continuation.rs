@@ -553,18 +553,54 @@ pub(crate) async fn drive_verdict(
         )
     };
 
+    /// A turn ended abnormally. If the SESSION already reported its own outcome
+    /// (it can report and then be cut off or hit a cap), that report stands and
+    /// nothing is posted over it; otherwise post the detail.
+    async fn settle_abnormal(gate: Option<&dyn GateBackend>, detail: String) -> AcpVerdict {
+        if let Some(g) = gate {
+            if g.read_outcome().await.self_reported() {
+                return AcpVerdict::Reported;
+            }
+        }
+        unreported(gate, detail).await
+    }
+    /// The gate could not be read, so "reported" and "not reported" are both
+    /// unknown: do not nudge on a guess. Post `work_unreported` (coord refuses it
+    /// over a session's own `work_*`, so it is safe either way) and say why.
+    async fn settle_unknown(
+        gate: &dyn GateBackend,
+        started: std::time::Instant,
+        acp_id: &str,
+        why: &str,
+    ) -> AcpVerdict {
+        let detail = unreported_detail(
+            "clean",
+            "0",
+            started.elapsed(),
+            acp_id,
+            &format!("reason=gate_outcome_unknown {}", first_line(why)),
+        );
+        gate.post_work_unreported(detail.clone()).await;
+        AcpVerdict::Unreported {
+            detail,
+            failed: false,
+        }
+    }
+
     let out = match session.prompt(prompt, bounds.work).await {
         Ok(o) => o,
         Err(e) => return unreported(gate, error_detail(&e, started)).await,
     };
     if out.stop_reason != AcpStopReason::EndTurn {
-        return unreported(gate, stop_reason_detail(&out.stop_reason)).await;
+        return settle_abnormal(gate, stop_reason_detail(&out.stop_reason)).await;
     }
     let Some(gate) = gate else {
         return AcpVerdict::Reported;
     };
-    if gate.read_outcome().await.self_reported() {
-        return AcpVerdict::Reported;
+    match gate.read_outcome().await {
+        r if r.self_reported() => return AcpVerdict::Reported,
+        GateRead::Unknown(why) => return settle_unknown(gate, started, acp_id, &why).await,
+        GateRead::Standing(_) => {}
     }
     // One bounded nudge, then settle.
     let nudge = match session.prompt(NUDGE_PROMPT, bounds.nudge).await {
@@ -572,10 +608,12 @@ pub(crate) async fn drive_verdict(
         Err(e) => return unreported(Some(gate), error_detail(&e, started)).await,
     };
     if nudge.stop_reason != AcpStopReason::EndTurn {
-        return unreported(Some(gate), stop_reason_detail(&nudge.stop_reason)).await;
+        return settle_abnormal(Some(gate), stop_reason_detail(&nudge.stop_reason)).await;
     }
-    if gate.read_outcome().await.self_reported() {
-        return AcpVerdict::Reported;
+    match gate.read_outcome().await {
+        r if r.self_reported() => return AcpVerdict::Reported,
+        GateRead::Unknown(why) => return settle_unknown(gate, started, acp_id, &why).await,
+        GateRead::Standing(_) => {}
     }
     let detail = unreported_detail(
         "clean",
@@ -629,6 +667,11 @@ pub(crate) struct AcpArm {
 
 /// Run one continuation under an ACP agent: spawn, post `spawned`, drive the
 /// verdict, close and reap, post the lifecycle result.
+///
+/// There is no operator-stop path here because the Claude headless arm it
+/// mirrors has none (`run_continuation_headless` runs its child to exit); the
+/// agent-spawn door, which does have a stop token, sends `session/cancel` before
+/// closing ([`run_agent_spawn_acp`]).
 ///
 /// `Err` means NOTHING ran (the caller posts `spawn_failed`); once the session
 /// exists every outcome is `Ok` — `spawned` has been posted by this arm, and a
@@ -696,6 +739,7 @@ pub(crate) async fn run_continuation_acp(
         })),
         transcript: super::agent_logs_root().map(|d| d.join(format!("{agent_id}.acp.jsonl"))),
         permission: std::sync::Arc::new(crate::session::permission_accept::stream_json_denies),
+        handshake_timeout: crate::acp_session::HANDSHAKE_TIMEOUT,
     };
 
     let mut session = match spawn_acp_agent(launch, coord_mcp, &served, cfg).await {
@@ -823,6 +867,7 @@ pub(crate) async fn run_agent_spawn_acp(
         })),
         transcript: super::agent_logs_root().map(|d| d.join(format!("{agent_id}.acp.jsonl"))),
         permission: std::sync::Arc::new(crate::session::permission_accept::stream_json_denies),
+        handshake_timeout: crate::acp_session::HANDSHAKE_TIMEOUT,
     };
     let mut session = match spawn_acp_agent(launch, coord_mcp, &served, cfg).await {
         Ok(s) => s,
@@ -842,7 +887,12 @@ pub(crate) async fn run_agent_spawn_acp(
     .await;
     let end = tokio::select! {
         biased;
-        _ = stop.cancelled() => AcpSpawnEnd::Stopped,
+        _ = stop.cancelled() => {
+            // Ask the agent to wind the turn down before the session is closed,
+            // rather than cutting it off mid tool call.
+            session.cancel();
+            AcpSpawnEnd::Stopped
+        },
         v = drive_verdict(&mut session, None, &prompt, &agent.id, TurnBounds::default()) => match v {
             AcpVerdict::Reported => AcpSpawnEnd::Clean,
             AcpVerdict::Unreported { detail, .. } => AcpSpawnEnd::Failed {

@@ -227,10 +227,14 @@ fn permission_response_is_pure_over_the_policy() {
             PermissionOption::new("r", "reject", PermissionOptionKind::RejectAlways),
         ],
     );
-    assert_eq!(
-        selected_id(&permission_response(&req, false).outcome),
-        "a",
-        "falls back to allow_always when no allow_once is offered"
+    // No allow_once on offer: allow_always would be a standing grant the tenant
+    // dial never made, so the answer is Cancelled, never allow_always.
+    assert!(
+        matches!(
+            permission_response(&req, false).outcome,
+            RequestPermissionOutcome::Cancelled
+        ),
+        "an allow with only allow_always on offer must cancel"
     );
     assert_eq!(selected_id(&permission_response(&req, true).outcome), "r");
 }
@@ -430,4 +434,124 @@ fn the_agent_child_env_is_finalized_exactly_like_the_claude_headless_path() {
         "the runner-context briefing env must reach the child"
     );
     assert_eq!(cmd.as_std().get_args().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_leaf_is_refused_dangling_or_live_and_never_followed_out() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("victim.txt");
+    std::fs::write(&target, "outside").unwrap();
+    let live_out = root.path().join("live-out");
+    symlink(&target, &live_out).unwrap();
+    let dangling = root.path().join("dangling");
+    symlink(outside.path().join("not-yet.txt"), &dangling).unwrap();
+    let inside = root.path().join("real.txt");
+    std::fs::write(&inside, "in").unwrap();
+    let live_in = root.path().join("live-in");
+    symlink(&inside, &live_in).unwrap();
+
+    let read = |p: &std::path::Path| {
+        super::client::read_confined(
+            root.path(),
+            &agent_client_protocol::v1::schema::ReadTextFileRequest::new("s", p),
+        )
+    };
+    let write = |p: &std::path::Path| {
+        super::client::write_confined(
+            root.path(),
+            &agent_client_protocol::v1::schema::WriteTextFileRequest::new("s", p, "pwned"),
+        )
+    };
+    assert!(read(&live_out).is_err(), "live link out of the root");
+    assert!(write(&live_out).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
+    assert!(write(&dangling).is_err(), "dangling link out of the root");
+    assert!(
+        !outside.path().join("not-yet.txt").exists(),
+        "the write must not have followed the dangling link out"
+    );
+    assert!(read(&live_in).is_err(), "even an in-root link is refused");
+    assert!(write(&live_in).is_err());
+    assert_eq!(read(&inside).unwrap(), "in", "the real file still reads");
+}
+
+#[test]
+fn a_read_over_the_size_cap_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let big = root.path().join("big.txt");
+    std::fs::write(&big, vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
+    let ok = root.path().join("ok.txt");
+    std::fs::write(&ok, vec![b'x'; 8 * 1024 * 1024]).unwrap();
+    let read = |p: &std::path::Path| {
+        super::client::read_confined(
+            root.path(),
+            &agent_client_protocol::v1::schema::ReadTextFileRequest::new("s", p),
+        )
+    };
+    assert!(read(&big).is_err());
+    assert_eq!(read(&ok).unwrap().len(), 8 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn an_agent_that_never_answers_the_handshake_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    // Keep the agent's halves of both pipes open and silent.
+    let (agent_w, client_r) = tokio::io::duplex(1024);
+    let (client_w, agent_r) = tokio::io::duplex(1024);
+    let transport = agent_client_protocol::ByteStreams::new(
+        tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(client_w),
+        tokio_util::compat::TokioAsyncReadCompatExt::compat(client_r),
+    );
+    let mut cfg = base_cfg(dir.path(), false);
+    cfg.handshake_timeout = Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    let err = match start_acp_session_over(transport, cfg).await {
+        Ok(_) => panic!("a silent agent cannot be a session"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind, AcpErrorKind::TimedOut, "got {err}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop((agent_w, agent_r));
+}
+
+#[test]
+fn the_acp_child_loses_the_runners_own_secrets_unless_granted() {
+    let launch = AcpLaunch {
+        program: "dummy".into(),
+        args: vec![],
+        // GH_TOKEN is deliberately granted by the caller and must survive.
+        env: vec![("GH_TOKEN".into(), "granted".into())],
+        cwd: std::env::temp_dir(),
+    };
+    let cmd = super::client::build_acp_command(
+        &launch,
+        crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+        &crate::served_corpus::ServedCorpus::unknown("test"),
+    );
+    // `env_remove` records `(name, None)`, which is how a removal of an
+    // inherited value shows on a Command.
+    let envs: std::collections::HashMap<String, Option<String>> = cmd
+        .as_std()
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().to_string(),
+                v.map(|v| v.to_string_lossy().to_string()),
+            )
+        })
+        .collect();
+    for name in ACP_EXTRA_SCRUB_ENV_VARS {
+        if *name == "GH_TOKEN" {
+            assert_eq!(envs.get(*name), Some(&Some("granted".to_string())));
+        } else {
+            assert_eq!(
+                envs.get(*name),
+                Some(&None),
+                "{name} must be explicitly removed from the child env"
+            );
+        }
+    }
 }

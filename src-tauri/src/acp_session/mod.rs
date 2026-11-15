@@ -46,6 +46,7 @@ mod tests;
 pub(crate) use client::start_acp_session_over;
 pub(crate) use client::{
     build_acp_command, spawn_acp_agent, AcpSession, McpChooser, PermissionPolicy, SessionConfig,
+    ACP_EXTRA_SCRUB_ENV_VARS, HANDSHAKE_TIMEOUT,
 };
 pub(crate) use map::AcpUsage;
 

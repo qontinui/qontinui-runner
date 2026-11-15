@@ -3,6 +3,7 @@
 //! and the only fake part is the model behind the agent.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
@@ -187,5 +188,6 @@ pub(crate) fn base_cfg(dir: &std::path::Path, denies: bool) -> super::SessionCon
         mcp: None,
         transcript: Some(dir.join("transcript.jsonl")),
         permission: Arc::new(move || denies),
+        handshake_timeout: Duration::from_secs(20),
     }
 }
