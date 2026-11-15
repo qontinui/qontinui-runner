@@ -188,7 +188,11 @@ const _: () = assert!(
 ///
 /// `2`: a cache is created private (0700 on Unix), so a `1` cache, created with
 /// the default mode around its superuser password, is never entered again.
-const HARNESS_VERSION: &str = "2";
+///
+/// `3`: a cache is marked as the harness's ([`MADE_MARKER`]), which is what lets
+/// entering it make it private again; a `2` cache has no mark, and opened up
+/// later it would only be refused.
+const HARNESS_VERSION: &str = "3";
 
 /// The `postgresql_embedded` release a cache was built with — a key input,
 /// because its `initdb` invocation shapes the data directory. Pinned against
