@@ -61,7 +61,7 @@ use qontinui_runner_lib::wind_down::{self, GridIdle, Sideband, SidebandState};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::session::session_lifecycle_store::{FinishSync, SessionLifecycleStore};
+use crate::session::session_lifecycle_store::{FinishChange, FinishSync, SessionLifecycleStore};
 use crate::session::wind_down_observer;
 
 /// How often the relay looks. The grace window it waits out is ten minutes by
@@ -405,8 +405,19 @@ fn relay_one(
     claude_session_id: &str,
     token: &'static str,
 ) {
+    // The candidate list was read at the start of the tick, before the coord
+    // awaits. A session that finished itself meanwhile must keep its own mark:
+    // a reason-carrying set_finished would restamp it (finish_synced cleared,
+    // its finish_reason replaced), so the write is conditional, decided under
+    // the store's own locks.
     let reason = format!("{REASON_PREFIX}{token}");
-    match store.set_finished(claude_session_id, true, Some(reason.clone())) {
+    match store.set_finished_if_unfinished(claude_session_id, reason.clone()) {
+        Ok(outcome) if outcome.changed == FinishChange::None => debug!(
+            terminal_id,
+            gate_id = %gate_id,
+            claude_session_id,
+            "continuation_finish_relay: hold — the session finished itself during this tick"
+        ),
         Ok(outcome) => match outcome.coord {
             FinishSync::Queued { coord_session_id } => info!(
                 terminal_id,
@@ -451,6 +462,53 @@ mod tests {
 
     fn outcome(s: Option<&str>) -> GateOutcomeRead {
         GateOutcomeRead::Outcome(s.map(String::from))
+    }
+
+    /// A session that finished itself between the tick's candidate read and the
+    /// relay's write keeps its own mark: no restamp, its reason unchanged.
+    #[test]
+    fn the_relay_never_restamps_a_session_that_finished_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let open = |csid: &str| -> crate::session::session_lifecycle_store::TerminalSessionRecord {
+            serde_json::from_value(json!({
+                "claudeSessionId": csid,
+                "pageId": "default",
+                "zoneIndex": 0,
+                "terminalId": format!("term-{csid}"),
+                "openedAt": 0,
+                "lastSeenAt": 0,
+                "state": "open",
+            }))
+            .unwrap()
+        };
+        store.record_open(open("self-finished"));
+        store
+            .set_finished("self-finished", true, Some("own_reason".to_string()))
+            .unwrap();
+        let before = store.get("self-finished").unwrap();
+
+        relay_one(
+            &store,
+            "term-self-finished",
+            uuid::Uuid::nil(),
+            "self-finished",
+            "work_completed",
+        );
+        let after = store.get("self-finished").unwrap();
+        assert_eq!(after.finish_reason.as_deref(), Some("own_reason"));
+        assert_eq!(after.finished_at, before.finished_at);
+
+        // An unfinished one is still relayed.
+        store.record_open(open("idle-cont"));
+        relay_one(&store, "term-idle-cont", uuid::Uuid::nil(), "idle-cont", "work_completed");
+        let relayed = store.get("idle-cont").unwrap();
+        assert!(relayed.finished_at.is_some());
+        assert_eq!(
+            relayed.finish_reason.as_deref(),
+            Some(format!("{REASON_PREFIX}work_completed").as_str())
+        );
     }
 
     #[test]
