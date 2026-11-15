@@ -260,10 +260,12 @@ mod armed {
     }
 
     fn is_runtime_frame(symbol: &str) -> bool {
+        // An unresolved frame, matched BEFORE `unqualified` strips its `<`.
+        if symbol == "<unknown>" {
+            return true;
+        }
         let symbol = unqualified(symbol);
-        symbol.starts_with("__rust")
-            || symbol == "<unknown>"
-            || RUNTIME_PREFIXES.iter().any(|p| symbol.starts_with(p))
+        symbol.starts_with("__rust") || RUNTIME_PREFIXES.iter().any(|p| symbol.starts_with(p))
     }
 
     fn is_door_frame(symbol: &str) -> bool {
