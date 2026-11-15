@@ -735,6 +735,9 @@ fn a_begin_line_with_no_end_is_left_alone() {
     assert_eq!(read_exclude_bytes(&c), before.into_bytes());
 }
 
+/// Pins behaviour this module had from its first revision (its reads always
+/// refused non-UTF-8); the publisher's roster heal, which did NOT, is pinned
+/// by `fleet`'s `ensure_repo_info_exclude_leaves_a_non_utf8_file_byte_identical`.
 #[test]
 fn a_non_utf8_exclude_file_is_never_rewritten() {
     let c = Canon::new();
@@ -890,4 +893,25 @@ async fn the_wired_sweep_spares_this_process_live_allocation_and_reaps_a_forgott
     forget_live_for_test(&c.path, AGENT_BRANCH);
     sweep_checkout(c.path.clone(), Some(base)).await;
     assert_block_removed_and_operator_visible(&c);
+}
+
+/// A branch probe that FAILS (git exit 128 — here, not a repository at all;
+/// equally a `safe.directory` refusal) is not "the branch is gone": the sweep
+/// keeps the block even though the holder lookup says nothing holds it.
+#[test]
+fn the_sweep_keeps_a_block_when_the_branch_probe_fails_fatally() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let not_a_repo = tmp.path().join("not-a-repo");
+    let info = not_a_repo.join(".git").join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    let before = format!("op\n{}", block_text(AGENT_BRANCH, "\n"));
+    std::fs::write(info.join("exclude"), &before).unwrap();
+
+    let out = sweep_stale_blocks(&not_a_repo, |_| HolderState::Free);
+
+    assert!(kept(&out), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(info.join("exclude")).unwrap(),
+        before
+    );
 }

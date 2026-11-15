@@ -270,19 +270,30 @@ fn resolve_prior(checkout: &Path, prior: &str) -> Result<Prior, RestoreKeep> {
     Err(RestoreKeep::PriorRefMissing(prior.to_string()))
 }
 
-/// `Ok(true)` when `rev` resolves, `Ok(false)` on git's own non-zero answer,
-/// `Err(ReadFailed)` when git did not answer at all.
+/// `Ok(true)` when `rev` resolves; `Ok(false)` ONLY on exit 1, which is how
+/// `rev-parse --verify --quiet` says "no such ref". Every other outcome — a
+/// fatal exit 128 (not a repository, a `safe.directory` dubious-ownership
+/// refusal, a corrupt ref), any other code, a timeout, a spawn failure — is
+/// `Err(ReadFailed)`: it says nothing about whether the ref exists.
 fn ref_exists(checkout: &Path, rev: &str, label: &str) -> Result<bool, RestoreKeep> {
-    use crate::process_helpers::{run_probe_quiet, DegradeReason, ProbeOutcome};
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.arg("-C")
         .arg(checkout)
         .args(["rev-parse", "--verify", "--quiet", rev]);
-    match run_probe_quiet(cmd, GIT_TIMEOUT, &format!("shared_branch_restore: {label}")) {
-        ProbeOutcome::Captured(_) => Ok(true),
-        ProbeOutcome::Degraded(DegradeReason::Status) => Ok(false),
-        ProbeOutcome::Degraded(why) => Err(RestoreKeep::ReadFailed(format!(
-            "git rev-parse --verify {rev} did not answer: {why:?}"
+    match crate::process_helpers::output_with_timeout_labeled(
+        cmd,
+        GIT_TIMEOUT,
+        &format!("shared_branch_restore: {label}"),
+    ) {
+        Ok(out) if out.status.success() => Ok(true),
+        Ok(out) if out.status.code() == Some(1) => Ok(false),
+        Ok(out) => Err(RestoreKeep::ReadFailed(format!(
+            "git rev-parse --verify {rev} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+        Err(e) => Err(RestoreKeep::ReadFailed(format!(
+            "git rev-parse --verify {rev} did not answer: {e}"
         ))),
     }
 }
