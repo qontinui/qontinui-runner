@@ -3933,7 +3933,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // read; converge never renames, rewrites or deletes one.
                 // Best-effort and fail-open: with no env override the
                 // candidate set is one path and this is a no-op.
-                let _ = qontinui_runner_lib::pair::converge_binding_store();
+                if qontinui_runner_lib::pair::converge_binding_store().wrote_canonical {
+                    commands::web_integration::notify_tenant_bindings_changed();
+                }
                 // After convergence, heal a canonical `paired_user.json` that
                 // is absent or blank while valid credentials coord still binds
                 // exist (plan 2026-09-29-vanished-paired-user-json-…, Phase 1).
@@ -3946,7 +3948,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = std::thread::Builder::new()
                     .name("paired-user-heal".into())
                     .spawn(|| {
-                        let _ = qontinui_runner_lib::pair::heal_vanished_paired_user();
+                        if qontinui_runner_lib::pair::heal_vanished_paired_user().wrote() {
+                            commands::web_integration::notify_tenant_bindings_changed();
+                        }
                     })
                 {
                     tracing::debug!(

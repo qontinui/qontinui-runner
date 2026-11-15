@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -491,6 +491,7 @@ export function FleetSessionPicker() {
     pin: tenantPin,
     candidates: tenantCandidates,
     credentials: tenantCredentials,
+    refreshCredentials: refreshTenantCredentials,
   } = useTenant();
   const [fleetTenantPick, setFleetTenantPick] = useState<FleetTenantChoice | undefined>(undefined);
   const fleetTenant: FleetTenantChoice = resolveFleetTenantChoice(
@@ -571,6 +572,29 @@ export function FleetSessionPicker() {
     limit: server.limit,
     tenants: walkTenants,
   });
+
+  // The selector's credential notes ("credential expired", "pair this tenant")
+  // come from the provider, which re-reads them on app start, a sign-in, a change
+  // to the bindings and a default-tenant change. A slot can expire or be renewed
+  // between those, so the list's read could succeed, or be refused by coord,
+  // beside a note saying the opposite. Re-read the notes each time that read
+  // settles: open, refresh, retry, load more or a tenant switch. Only the notes
+  // move (see `credentialsAfterReread`). A note can still age while the panel
+  // sits idle.
+  const listReadInFlight = useRef(false);
+  useEffect(() => {
+    // `loadingMore` too: a load-more page never moves `loading`.
+    if (loading || loadingMore) {
+      listReadInFlight.current = true;
+      return;
+    }
+    // Only a read that ran settles. The walk's first snapshot is idle as well.
+    if (!listReadInFlight.current) return;
+    listReadInFlight.current = false;
+    // One binding shows no selector and no per-tenant failure, so no note.
+    if (!showSwitcher) return;
+    void refreshTenantCredentials();
+  }, [loading, loadingMore, showSwitcher, refreshTenantCredentials]);
 
   /**
    * Sessions THIS UI saw end (`ended`) or found already gone (`not_found`).
