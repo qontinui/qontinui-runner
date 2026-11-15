@@ -43,8 +43,6 @@ const PAGE_EVENT_TYPES: ReadonlySet<PageEventTypes> = new Set<PageEventTypes>([
   "scroll_page",
   "query_selector",
   "page_evaluate",
-  "click_by_text",
-  "click_by_selector",
   "type_into",
   "read_value",
   "find_by_text",
@@ -525,125 +523,6 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
         // App-agnostic convenience endpoints (IPC fallback)
         // These delegate to the SDK handlers running in the same webview.
         // ============================================================
-
-        case "click_by_text": {
-          try {
-            const { text, tag, exact } = (payload.params || {}) as {
-              text?: string;
-              tag?: string;
-              exact?: boolean;
-            };
-            if (!text) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: "text is required",
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            const selector = tag || "*";
-            const searchText = text.toLowerCase();
-            const candidates = document.querySelectorAll<HTMLElement>(selector);
-            let clicked = false;
-            for (const el of candidates) {
-              const elText = el.textContent?.trim().toLowerCase() ?? "";
-              if (exact ? elText === searchText : elText.includes(searchText)) {
-                el.click();
-                clicked = true;
-                await sendResponse({
-                  requestId,
-                  type,
-                  success: true,
-                  data: {
-                    clicked: true,
-                    element: {
-                      tag: el.tagName.toLowerCase(),
-                      text: el.textContent?.trim().slice(0, 200),
-                    },
-                  },
-                  timestamp: Date.now(),
-                });
-                break;
-              }
-            }
-            if (!clicked) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: `No element found with text "${text}"`,
-                timestamp: Date.now(),
-              });
-            }
-          } catch (err) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error: String(err),
-              timestamp: Date.now(),
-            });
-          }
-          return true;
-        }
-
-        case "click_by_selector": {
-          try {
-            const { selector, index } = (payload.params || {}) as {
-              selector?: string;
-              index?: number;
-            };
-            if (!selector) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: "selector is required",
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            const el =
-              index != null
-                ? document.querySelectorAll<HTMLElement>(selector)[index]
-                : document.querySelector<HTMLElement>(selector);
-            if (!el) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: `No element found for selector "${selector}"`,
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            el.click();
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: {
-                clicked: true,
-                element: {
-                  tag: el.tagName.toLowerCase(),
-                  text: el.textContent?.trim().slice(0, 200),
-                },
-              },
-              timestamp: Date.now(),
-            });
-          } catch (err) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error: String(err),
-              timestamp: Date.now(),
-            });
-          }
-          return true;
-        }
 
         case "type_into": {
           try {
