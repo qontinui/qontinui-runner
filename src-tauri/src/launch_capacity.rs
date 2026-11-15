@@ -38,7 +38,12 @@
 //! off: no reading is taken and nothing is enforced — headroom is UNKNOWN, never
 //! 0 and never the cap), and `unreadable` (one lane's sensor gave no reading:
 //! that lane fails open exactly as the gate does, so the headroom is computed
-//! from the readable lane alone). coord's
+//! from the readable lane alone). An `unreadable` verdict deliberately HIDES
+//! the readable lane's own severity — a box whose thread table is unreadable
+//! and whose memory lane warns publishes `unreadable`, not `warn` — and no
+//! second field carries it: coord admits on `launch_headroom` alone (0 when
+//! the readable lane already trips), so the verdict is display and forensics,
+//! never the admission input. coord's
 //! `coord.device_resource_samples.launch_verdict` CHECK constraint carries the
 //! same five words, so renaming one here makes every sample this runner
 //! publishes fail ingest.
@@ -152,16 +157,20 @@ pub(crate) fn from_reading(
     )
 }
 
-/// The live launch capacity: ONE [`crate::resource_guard::AdmissionReading::live`]
-/// (the read `admit_launch` decides on) charged with the continuations admitted
-/// and not yet running. Synchronous OS reads — call it from a blocking context
-/// (the host-lane sampler runs inside `spawn_blocking_tracked`), never on an
-/// async worker.
-pub(crate) fn live() -> LaunchCapacity {
-    from_reading(
-        &crate::resource_guard::AdmissionReading::live(),
-        crate::agent_runtime::reserved_spawns_now(),
-    )
+/// The live launch capacity over a memory reading the caller already took —
+/// the same composition [`crate::resource_guard::AdmissionReading::live`]
+/// makes (both lanes plus the live projected cost), charged with the
+/// continuations admitted and not yet running. The host-lane sampler passes the
+/// `memory_status()` it publishes, so the sample's memory figures and its
+/// launch capacity are one reading. The thread reading is still a synchronous
+/// OS read — call it from a blocking context (the sampler runs inside
+/// `spawn_blocking_tracked`), never on an async worker.
+pub(crate) fn live_with_memory(memory: (&'static str, Option<u64>, Option<u64>)) -> LaunchCapacity {
+    let reading = crate::resource_guard::AdmissionReading {
+        lanes: crate::resource_guard::lane_verdicts_with_memory(memory),
+        cost: crate::resource_guard::ProjectedSpawnCost::live(),
+    };
+    from_reading(&reading, crate::agent_runtime::reserved_spawns_now())
 }
 
 #[cfg(test)]

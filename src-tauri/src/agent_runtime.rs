@@ -4306,7 +4306,7 @@ pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
 
 /// Admitted, not-yet-running continuations — the pending charge
 /// [`admit_launch`] applies — for the launch capacity the host-lane sample
-/// publishes ([`crate::launch_capacity::live`]).
+/// publishes ([`crate::launch_capacity::live_with_memory`]).
 pub(crate) fn reserved_spawns_now() -> usize {
     lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns
 }
