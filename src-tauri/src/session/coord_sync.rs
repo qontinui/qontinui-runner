@@ -4710,21 +4710,12 @@ mod tests {
         include!("coord_sync_finish_ack_drain_tests.rs");
     }
 
-    /// SOURCE GUARD: every session-outbox event kind has a dispatch arm.
-    ///
-    /// The drain matches on `&str`, not on [`SessionEventKind`], and its
-    /// fallthrough **quietly ACKs and drops** ("so the file doesn't grow"). So a
-    /// new variant added to the enum but missed here COMPILES CLEANLY and
-    /// silently discards every event of that kind — no exhaustiveness error, no
-    /// warning, and no failing test unless one is written on purpose. This is
-    /// that test.
-    ///
-    /// `MemoryRecord` is deliberately excluded: it is written to its own
-    /// `memory-outbox.jsonl` and the coord session drain never sees it. Any
-    /// OTHER kind reaching this list without an arm is a silent data-loss bug.
-    /// Every kind the coord session drain pushes (all but `MemoryRecord`,
-    /// which has its own outbox file) — shared by the dispatch-arm guard and
-    /// the credential-scope test so the two cannot cover different sets.
+    /// Every kind the coord session drain pushes — shared by the dispatch-arm
+    /// guard and the credential-scope test so the two cannot cover different
+    /// sets. Excluded: `MemoryRecord` (written to its own `memory-outbox.jsonl`;
+    /// this drain never sees it), and `HandoffRequest` / `AttachRequest`
+    /// (never pushed by the runner — they fall to `push_record`'s ACK-drop
+    /// catch-all on purpose).
     const DRAINED_KINDS: [SessionEventKind; 17] = [
         SessionEventKind::Started,
         SessionEventKind::StateChange,
@@ -4745,6 +4736,18 @@ mod tests {
         SessionEventKind::SpawnFailedReport,
     ];
 
+    /// SOURCE GUARD: every session-outbox event kind has a dispatch arm.
+    ///
+    /// The drain matches on `&str`, not on [`SessionEventKind`], and its
+    /// fallthrough **quietly ACKs and drops** ("so the file doesn't grow"). So a
+    /// new variant added to the enum but missed here COMPILES CLEANLY and
+    /// silently discards every event of that kind — no exhaustiveness error, no
+    /// warning, and no failing test unless one is written on purpose. This is
+    /// that test.
+    ///
+    /// `MemoryRecord` is deliberately excluded: it is written to its own
+    /// `memory-outbox.jsonl` and the coord session drain never sees it. Any
+    /// OTHER kind reaching this list without an arm is a silent data-loss bug.
     #[test]
     fn every_session_outbox_kind_has_a_dispatch_arm() {
         let src = include_str!("coord_sync.rs");
@@ -5815,7 +5818,7 @@ mod tests {
             .expect("the dispatch match must exist")
             .0;
         assert!(
-            head.contains("push_credential_scope(kind,"),
+            head.contains("let scope = push_credential_scope(kind,"),
             "push_record must route the record scope through push_credential_scope"
         );
     }
@@ -12864,6 +12867,23 @@ pub(crate) mod egress_tests {
         assert!(
             check < dispatch,
             "the check must run before any request is built"
+        );
+        // ...and only for output chunks: the check sits inside the
+        // `if kind == "output_chunk"` block, the nearest `if` above it.
+        let head = body.get(..check).expect("check index is a char boundary");
+        let gate = head
+            .rfind("if kind == \"output_chunk\" {")
+            .expect("the egress check must be gated on the output_chunk kind");
+        let gated = head.get(gate..).expect("gate index is a char boundary");
+        assert!(
+            !gated.contains("\n    }\n"),
+            "the egress check must sit INSIDE the output_chunk block, not after it"
+        );
+        assert_eq!(
+            gated.matches("if ").count(),
+            2,
+            "the output_chunk `if` must be the gate enclosing the check (it and \
+             the `if let Some(flow)` around the call, nothing else)"
         );
     }
 }
