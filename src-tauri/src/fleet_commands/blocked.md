@@ -201,12 +201,15 @@ recording it:
   becomes *eligible* to spawn then — coord still requires a resolved ONLINE target
   device and a non-sensitive anchor, else it notifies instead.
 
-**Always populate `hint` — it is the spawned agent's ONLY context.** coord
+**Always populate `hint` — it is the only field that can carry *why*.** coord
 flattens the continuation to `run /<skill> <args>` and appends `\n\n<hint>` only
-if a hint is present; no other key in the frame carries a plan body, a PR body,
-prior findings, or the predicate. So a hintless `/blocked` continuation spawns a
-fresh agent that knows neither which blocker it is resuming nor what you already
-tried. Six labelled lines, **references before bodies**, **≤2000 characters**:
+if a hint is present. Beside it coord attaches its own dispatch-time `brief`, but
+that holds only references coord can resolve (the work unit's slug, the PR the
+predicate names, its block reason, finding ids) and a fixed end-of-session step
+— never a plan body, a PR body, or anything only you know. So a hintless
+`/blocked` continuation spawns a fresh agent that may learn which plan or PR, but
+neither the blocker in your words nor what you already tried. Six labelled
+lines, **references before bodies**, **≤2000 characters**:
 
 ```
 Plan: <plan-stem>

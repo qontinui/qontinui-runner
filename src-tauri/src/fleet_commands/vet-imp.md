@@ -964,9 +964,10 @@ the vet report says `NO NET (no withdraw door: …)` so the gap is visible.
 
 > **The net's continuation carries a brief; `/vet-plan` §5.4 shows the shape in
 > step 5 and step 6 registers it.** The session coord dispatches has never read the plan and does
-> not know this chain existed: without a brief its whole context is
-> `run /implement-plan <path>`. This is the untagged `continuation_spawn` shape,
-> which has no `hint` field, so the brief is appended to `initial_prompt` after
+> not know this chain existed: without a brief it gets
+> `run /implement-plan <path>` and only what coord adds itself. This is the
+> untagged `continuation_spawn` shape, which has no `hint` field, so the brief
+> is appended to `initial_prompt` after
 > a blank line — byte-identical to what coord builds from a typed `hint`, less
 > the closing `/unattended` line coord adds only to a typed `run_skill`.
 > Canonical: `_gate-registration` → "The brief — a continuation with no `hint`

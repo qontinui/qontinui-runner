@@ -3068,9 +3068,10 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      `hint` field, so the brief goes into `initial_prompt` itself — coord would
      have produced the same text from a typed continuation's `hint`, plus a
      closing `/unattended` line it never adds to a legacy prompt. Without
-     it the spawned session's entire brief is `run /implement-plan <path>`: it
-     opens on a plan it has never read, with no idea why it was dispatched
-     instead of the vetting session finishing the work. Six labelled lines
+     it the spawned session gets `run /implement-plan <path>` and only what
+     coord's dispatch-time brief adds: it opens on a plan it has never read,
+     with no idea why it was dispatched instead of the vetting session finishing
+     the work. Six labelled lines
      (`Plan`/`Why`/`PR`/`Blocked`/`Resource-keys`/`Tried`), **references before
      bodies**, **≤2000 characters** — nothing enforces that cap and nothing
      truncates for you, so cut prose rather than references and end a cut brief
