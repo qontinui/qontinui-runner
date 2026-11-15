@@ -2736,8 +2736,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // while still answering 200. The generic arms below settle it: 2xx
             // Ack, 4xx PermanentFailure (Ack-drop), transport / 5xx retry on
             // this lane's backoff.
-            let Some((agent_id, body)) =
-                super::spawn_report_spool::replay_target(&rec.payload)
+            let Some((agent_id, body)) = super::spawn_report_spool::replay_target(&rec.payload)
             else {
                 return PushOutcome::PermanentFailure(
                     "spawn_failed_report payload carries no parseable `agent_id` — the \
@@ -5791,10 +5790,7 @@ mod tests {
             TenantScope::Device,
         ] {
             assert_eq!(
-                push_credential_scope(
-                    SessionEventKind::SpawnFailedReport.as_str(),
-                    record_scope
-                ),
+                push_credential_scope(SessionEventKind::SpawnFailedReport.as_str(), record_scope),
                 TenantScope::Device
             );
             for other in DRAINED_KINDS
@@ -5854,7 +5850,8 @@ mod tests {
             "restarts_attempted": 0,
             "phase": "blocked",
         });
-        let spool = super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        let spool =
+            super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
         super::super::spawn_report_spool::spool_spawn_failed(&spool, agent_id, &body)
             .expect("spools");
         let _drain = coord.start_drain_task();
@@ -5876,7 +5873,10 @@ mod tests {
         );
         for (id, sent) in &g.1 {
             assert_eq!(*id, agent_id, "replayed to the agent the payload names");
-            assert_eq!(sent, &body, "the live POST's body, verbatim, minus agent_id");
+            assert_eq!(
+                sent, &body,
+                "the live POST's body, verbatim, minus agent_id"
+            );
         }
     }
 
@@ -5890,7 +5890,12 @@ mod tests {
     /// the count assertion (5) fails.
     #[tokio::test]
     async fn a_spooled_spawn_failed_report_outlasts_the_best_effort_budget() {
-        const { assert!(BEST_EFFORT_MAX_ATTEMPTS < 4, "the script must exceed the budget") };
+        const {
+            assert!(
+                BEST_EFFORT_MAX_ATTEMPTS < 4,
+                "the script must exceed the budget"
+            )
+        };
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, seen) = spawn_scripted_spawn_failed_coord(vec![503, 503, 503, 503]).await;
@@ -5901,7 +5906,8 @@ mod tests {
             Duration::from_secs(10),
         );
         let _registry = build_registry(coord.clone());
-        let spool = super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        let spool =
+            super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
         super::super::spawn_report_spool::spool_spawn_failed(
             &spool,
             Uuid::new_v4(),
@@ -5940,7 +5946,8 @@ mod tests {
             Duration::from_secs(10),
         );
         let _registry = build_registry(coord.clone());
-        let spool = super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        let spool =
+            super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
         super::super::spawn_report_spool::spool_spawn_failed(
             &spool,
             Uuid::new_v4(),

@@ -3742,7 +3742,10 @@ MemAvailable:   15335424 kB
             "thread_warn_ceiling",
             "thread_critical_ceiling",
         ] {
-            assert!(wsl_json.get(key).is_none(), "the wsl lane must not carry {key}");
+            assert!(
+                wsl_json.get(key).is_none(),
+                "the wsl lane must not carry {key}"
+            );
         }
 
         let host = collect_host_lane();
@@ -3751,8 +3754,14 @@ MemAvailable:   15335424 kB
             .clone()
             .expect("the host lane must publish a launch verdict on every tick");
         assert!(
-            ["proceed", "warn", "critical", "guard_disabled", "unreadable"]
-                .contains(&verdict.as_str()),
+            [
+                "proceed",
+                "warn",
+                "critical",
+                "guard_disabled",
+                "unreadable"
+            ]
+            .contains(&verdict.as_str()),
             "{verdict}"
         );
         if verdict == "guard_disabled" {
@@ -3789,7 +3798,11 @@ MemAvailable:   15335424 kB
         assert_eq!(v["launch_verdict"], "warn");
         assert_eq!(v["thread_graded"], 380);
         assert_eq!(v["thread_warn_ceiling"], 376);
-        assert_eq!(v["thread_critical_ceiling"], i32::MAX, "saturates, never wraps");
+        assert_eq!(
+            v["thread_critical_ceiling"],
+            i32::MAX,
+            "saturates, never wraps"
+        );
         probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
             verdict: crate::launch_capacity::LaunchVerdict::GuardDisabled,
             headroom: None,

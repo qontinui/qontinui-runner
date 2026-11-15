@@ -75,7 +75,6 @@ pub mod identity_stamp; // Reports every session id this machine can resolve (ac
 pub mod intent;
 pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
-pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
 pub mod pane_store;
@@ -95,10 +94,11 @@ pub mod session_lifecycle_store;
 pub mod session_transcript_tailer; // Interactive-pane Claude Code transcript -> coord transcript stream (plan 2026-08-26-claude-code-session-repository-in-qontinui-web, Phase 2)
 pub mod shutdown_marker;
 pub mod snapshot_history;
-pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file (briefing + policy body) via --append-system-prompt-file (plan 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel, Phase 1)
-                      // Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
-                      // can read the same pin the proxy does — see the lib declaration for why.
-                      // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
+pub mod spawn_prompt;
+pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6) // The spawn-time system-prompt carrier: ONE composed file (briefing + policy body) via --append-system-prompt-file (plan 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel, Phase 1)
+                            // Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
+                            // can read the same pin the proxy does — see the lib declaration for why.
+                            // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
 pub mod finish_heal; // Heal finished marks stamped synced over a write coord never applied; the finish read-back's coord.observed (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 5)
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
