@@ -497,20 +497,19 @@ fn holder_from_command_lines(
 // ---------------------------------------------------------------------------
 
 /// Read the claude processes under `terminal_id`'s pane. `None` when the pane
-/// is gone or the process table is UNKNOWN (a failed or stale read): an empty
-/// list from it would read as "the resumed claude is not there". A read begun
-/// now (never the memo), since [`verify`] can disprove a resume from it.
+/// is gone, the process table is UNKNOWN (a failed or stale read), or the
+/// pane's `claude` set is UNDECIDED ([`claude_pids_under`]): an empty or
+/// partial list from any of them would read as "the resumed claude is not
+/// there". A read begun now (never the memo), since [`verify`] can disprove a
+/// resume from it.
 async fn read_claude_procs(
     tm: &Arc<TerminalManager>,
     terminal_id: &str,
 ) -> Option<Vec<ClaudeProc>> {
     use crate::process_capture::process_tree as pt;
     let root = tm.get(terminal_id)?.child_pid()?;
-    let snap = pt::snapshot_process_table_fresh().await;
-    if snap.is_unknown() {
-        return None;
-    }
-    let pids = pt::claude_pids_in_inclusive_subtree(root, &snap);
+    let look = crate::terminal::graceful_exit::PaneLook::take_fresh(&[root]).await;
+    let pids = claude_pids_under(&look, root)?;
     // An UNKNOWN command-line read skips this poll (`None`), exactly as an
     // UNKNOWN table does: a list built from it would drop every process (each
     // `ClaudeProc` needs its cmdline) and read as "the resumed claude is not
@@ -529,6 +528,22 @@ async fn read_claude_procs(
             })
             .collect(),
     )
+}
+
+/// Every live `claude` under `root` in `look` — an image-proven one, or a pid
+/// Claude Code's session registry names whatever its image, so a resumed
+/// npm-installed `claude` (`node … cli.js`) is seen. `None` (skip this poll)
+/// for an UNKNOWN table and for an UNDECIDED set: a pid the registry could not
+/// settle may be the resumed `claude`, and leaving it out would disprove a
+/// resume that happened.
+fn claude_pids_under(
+    look: &crate::terminal::graceful_exit::PaneLook,
+    root: u32,
+) -> Option<Vec<u32>> {
+    if look.snapshot().is_unknown() {
+        return None;
+    }
+    look.claude_pids(root).ok()
 }
 
 /// Poll the process table until the resumed claude is proven (or disproven).
@@ -1271,5 +1286,47 @@ mod tests {
         );
         assert_eq!((report.resumed, report.failed, report.skipped), (0, 1, 2));
         assert!(!report.generation_applied);
+    }
+
+    /// Shell 5 → `node` 50 (an npm-installed `claude`, `node … cli.js`).
+    fn npm_pane_table() -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot {
+            stale: false,
+            ..Default::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name, started) in [(5, "bash", 1_000), (50, "node", 1_050)] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    fn npm_look(
+        witness: crate::terminal::graceful_exit::RegistryWitness,
+    ) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::over_whole_table(npm_pane_table(), witness)
+    }
+
+    /// The resume verifier sees a resumed npm `claude` the registry names.
+    /// Partner: drop the witness and the pane reads claude-free (a resume
+    /// that happened would be disproven). Unsettled, the poll is skipped
+    /// (`None`), never an empty list.
+    #[test]
+    fn a_resumed_npm_claude_is_seen_and_an_unsettled_poll_is_skipped() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::naming(&[50])), 5),
+            Some(vec![50])
+        );
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::naming(&[])), 5),
+            Some(vec![])
+        );
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::unreadable("test")), 5),
+            None
+        );
     }
 }
