@@ -6460,7 +6460,7 @@ mod tests {
     // another row ACKed, on #2704's record.
     // ------------------------------------------------------------------
 
-    use super::finish_reoffer::{race_at, DoorStage};
+    use super::finish_reoffer::{race_after_decision, ReofferOutcome};
 
     /// A registrar and store wired as main.rs wires them (the store's finish
     /// observer forwards to the registrar), with mutable live pane rows
@@ -6470,7 +6470,7 @@ mod tests {
         store: Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
         live: Arc<Mutex<HashMap<Uuid, i64>>>,
         panes: Panes,
-        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        dirs: (tempfile::TempDir, tempfile::TempDir),
     }
 
     fn reoffer_rig() -> ReofferRig {
@@ -6497,7 +6497,7 @@ mod tests {
             store,
             live,
             panes,
-            _dirs: (dir, sdir),
+            dirs: (dir, sdir),
         }
     }
 
@@ -6591,23 +6591,127 @@ mod tests {
         assert_eq!(rig.mark(x), (true, Some(r)));
     }
 
-    /// D5 through the bind trigger: a pane pinned to X is bound to R after
-    /// R′ ACKed X's finish.
+    /// D5 review (MAJOR 1): the bind trigger on the REAL timestamp path. A
+    /// pane pinned to X is bound to R after R′ ACKed X's finish, through
+    /// `TerminalManager::bind_coord_session` wired as main.rs wires it. The
+    /// bind stamps the pane's bind instant at the bind itself, so X's
+    /// ownership of R begins after the finish: the bind moves the entry, but
+    /// neither it nor any later seam tick re-offers the finish (the bind
+    /// trigger is not a re-offer caller for exactly this reason).
     #[test]
-    fn a_finish_acked_by_a_stale_row_is_re_offered_to_the_pane_row_on_a_terminal_bind() {
+    fn a_pane_bound_after_the_finish_never_has_it_re_offered() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, _sdir) = attach_store(&reg);
+        {
+            let weak = Arc::downgrade(&reg);
+            store.attach_finish_observer(move |rec| match weak.upgrade() {
+                Some(r) => r.forward_finish_change(rec),
+                None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+            });
+        }
+        let tm = Arc::new(crate::terminal::manager::TerminalManager::new());
+        {
+            let tm = Arc::downgrade(&tm);
+            reg.attach_terminal_coord_lookup(move |csid| {
+                tm.upgrade()?.coord_session_id_for_pinned(csid)
+            });
+        }
+        {
+            let tm = Arc::downgrade(&tm);
+            reg.attach_pane_row_tenant(move |row| {
+                let Some(binding) = tm.upgrade().and_then(|t| t.coord_row_bound_at(row)) else {
+                    return PaneRowLookup::Unknown;
+                };
+                let Some((bound_at_ms, bind_seq)) = binding else {
+                    return PaneRowLookup::Gone;
+                };
+                PaneRowLookup::Live(PaneRowFacts {
+                    tenant: NewSessionTenant::Undetermined,
+                    bound_at_ms: Some(bound_at_ms),
+                    bind_seq: Some(bind_seq),
+                })
+            });
+        }
+        {
+            let weak = Arc::downgrade(&reg);
+            tm.attach_coord_bind_observer(move |pinned, terminal_id, coord_id| {
+                if let Some(r) = weak.upgrade() {
+                    r.on_terminal_coord_bind(pinned, terminal_id, coord_id);
+                }
+            });
+        }
+        // `make_test_session`'s spawn-time pin.
+        let x = "test-pinned-session";
+        open_on(&store, x, "term-x", None);
+        let stale = Uuid::new_v4();
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        let keys: Vec<(Uuid, i64)> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.session_id, r.seq))
+            .collect();
+        reg.inner.outbox.ack(&keys).unwrap();
+        store.mark_finish_synced_on(x, Some(at), Some(stale));
+
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        tm.insert_for_test("term-x", session.clone());
+        let r = Uuid::new_v4();
+        tm.bind_coord_session(&session, r);
+        assert_eq!(reg.session_id_for(x), Some(r), "the bind moved the entry");
+        let owned = reg
+            .live_terminal_row(x)
+            .and_then(|l| l.owned_since_ms)
+            .expect("the pin seed carries the real bind instant");
+        assert!(owned >= at, "stamped at the bind: {owned} < {at}");
+
+        for source in [RekeySource::Rung2, RekeySource::Hook] {
+            assert_eq!(reg.note_pane_row(r, x, source), MoveOutcome::Unchanged);
+        }
+        assert_eq!(
+            reg.reoffer_finish_to(x, r),
+            ReofferOutcome::OwnedAfterFinish
+        );
+        assert!(finished_rows(&reg).is_empty());
+        let rec = store.get(x).unwrap();
+        assert!(rec.finish_synced, "the mark keeps R′'s ACK");
+        assert_eq!(rec.finish_coord_session_id, Some(stale));
+    }
+
+    /// D5 review (MAJOR 2): a hook-grade source first confirms X on the row of
+    /// the pane PINNED to X only after X's finish. The pane has run X since
+    /// it was bound (no other id was ever seen there), so ownership dates
+    /// from the bind and the finish R′ ACKed is re-offered to R.
+    #[test]
+    fn a_hook_confirming_x_on_its_own_pinned_row_after_the_finish_still_re_offers() {
         let _env = env_lock();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let rig = reoffer_rig();
-        let x = "reoffer-bind-x";
-        let (_stale, at) = rig.finished_on_stale(x);
+        let x = "reoffer-hook-x";
+        let (stale, at) = rig.finished_on_stale(x);
         let r = Uuid::new_v4();
         rig.show_pane(x, r, 1_000);
 
-        rig.reg.on_terminal_coord_bind(x, "term-new", r);
-        assert_eq!(rig.reg.session_id_for(x), Some(r));
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Hook),
+            MoveOutcome::Moved { from: stale }
+        );
         assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
         assert_eq!(rig.mark(x), (false, Some(r)));
-
         rig.ack(x, at, r);
         assert_eq!(rig.mark(x), (true, Some(r)));
     }
@@ -6771,43 +6875,159 @@ mod tests {
         );
     }
 
-    /// An unmark racing the re-offer — after its decision, or between the
-    /// withdrawn stamp and the re-send — leaves no `Finished` queued: only
-    /// the unmark's own `working`, and a later tick queues nothing.
+    /// An unmark racing the re-offer — landing after its decision, before its
+    /// door — leaves no `Finished` queued: the door re-reads the mark under
+    /// `finish_forward`. Only the unmark's own `working` is queued, and a
+    /// later tick queues nothing. An unmark-and-re-mark in the same window
+    /// leaves only the new mark's own forward.
     #[test]
     fn an_unmark_racing_the_re_offer_leaves_nothing_queued() {
         let _env = env_lock();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        for stage in [DoorStage::AfterDecision, DoorStage::AfterClear] {
-            let rig = reoffer_rig();
-            let x = "reoffer-race-x";
-            let (stale, _) = rig.finished_on_stale(x);
-            let r = Uuid::new_v4();
-            rig.show_pane(x, r, 1_000);
-            let store = rig.store.clone();
-            race_at(stage, move || {
-                store.set_finished(x, false, None).unwrap();
-            });
+        let rig = reoffer_rig();
+        let x = "reoffer-race-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            store.set_finished(x, false, None).unwrap();
+        });
 
-            assert_eq!(
-                rig.reg.note_pane_row(r, x, RekeySource::Rung2),
-                MoveOutcome::Moved { from: stale },
-                "{stage:?}"
-            );
-            assert!(finished_rows(&rig.reg).is_empty(), "{stage:?}");
-            let working = rows_of_kind(&rig.reg, SessionEventKind::Progress);
-            assert_eq!(working.len(), 1, "{stage:?}: {working:?}");
-            assert_eq!(working[0].session_id, r, "{stage:?}");
-            assert_eq!(working[0].payload["session_status"], json!("working"));
-            let rec = rig.store.get(x).unwrap();
-            assert_eq!(rec.finished_at, None, "{stage:?}");
-            assert_eq!(rig.mark(x), (false, None), "{stage:?}");
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        let working = rows_of_kind(&rig.reg, SessionEventKind::Progress);
+        assert_eq!(working.len(), 1, "{working:?}");
+        assert_eq!(working[0].session_id, r);
+        assert_eq!(working[0].payload["session_status"], json!("working"));
+        assert_eq!(rig.store.get(x).unwrap().finished_at, None);
+        assert_eq!(rig.mark(x), (false, None));
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
 
-            assert_eq!(
-                rig.reg.note_pane_row(r, x, RekeySource::Rung2),
-                MoveOutcome::Unchanged
-            );
-            assert!(finished_rows(&rig.reg).is_empty(), "{stage:?}");
-        }
+        // Unmark and re-mark between the decision and the door.
+        let rig = reoffer_rig();
+        let y = "reoffer-race-y";
+        let (stale, at) = rig.finished_on_stale(y);
+        let r = Uuid::new_v4();
+        rig.show_pane(y, r, 1_000);
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            store.set_finished(y, false, None).unwrap();
+            store.set_finished(y, true, None).unwrap();
+        });
+        assert_eq!(
+            rig.reg.note_pane_row(r, y, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        let rows = rig.reg.inner.outbox.pending().unwrap();
+        let finishes: Vec<_> = rows
+            .iter()
+            .filter(|o| o.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(finishes.len(), 1, "only the new mark's own: {rows:?}");
+        assert_eq!(finishes[0].session_id, r);
+        assert_ne!(finishes[0].payload["finished_at"], json!(at));
+    }
+
+    /// The re-offer's dedupe: a `Finished` for this very mark already pending
+    /// to the pane row is not queued again; the stamp is withdrawn and R is
+    /// recorded, so R's ACK of the pending row stamps it.
+    #[test]
+    fn a_finish_already_pending_to_the_pane_row_is_not_queued_twice() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-pending-x";
+        let (_stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        rig.reg.enqueue_finished(x, r, Some(at), None);
+
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::AlreadyQueued
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        rig.ack(x, at, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// A failed outbox write: the stamp is withdrawn but R is NOT recorded,
+    /// so the next attempt re-offers once the outbox writes again.
+    #[test]
+    fn a_failed_outbox_write_leaves_the_re_offer_for_the_next_tick() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-outbox-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        // A directory where the outbox file belongs: every append fails.
+        let path = rig.dirs.0.path().join("outbox.jsonl");
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).unwrap();
+
+        assert_eq!(rig.reg.reoffer_finish_to(x, r), ReofferOutcome::NotQueued);
+        assert_eq!(
+            rig.mark(x),
+            (false, Some(stale)),
+            "the stamp is withdrawn, the row not recorded"
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::Reoffered { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+    }
+
+    /// Two re-offers of one mark that both pass their decision at once queue
+    /// exactly one `Finished`: the door is one `finish_forward` section, and
+    /// the loser re-reads the mark naming R.
+    #[test]
+    fn two_concurrent_re_offers_of_one_mark_queue_one_finish() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-concurrent-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let outcomes: Vec<ReofferOutcome> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let b = barrier.clone();
+                    let reg = &rig.reg;
+                    s.spawn(move || {
+                        // Both threads hold their decision until both have one.
+                        race_after_decision(move || {
+                            b.wait();
+                        });
+                        reg.reoffer_finish_to(x, r)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            outcomes.contains(&ReofferOutcome::Reoffered { from: stale })
+                && outcomes.contains(&ReofferOutcome::AlreadyOnRow),
+            "{outcomes:?}"
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
     }
 }

@@ -22,8 +22,9 @@
 //! | [`Mover::Seam`] | the re-key seam confirms (row, id) | `bind_transcript_session` entries only |
 //! | [`Mover::Repair`] | a finish finds the entry off the live pane row | `bind_transcript_session` entries only |
 //!
-//! After a move, a finish another row ACKed is re-offered to the pane row
-//! (plan D5, the sibling `finish_reoffer` module).
+//! After a live-pane adoption or a seam move, a finish another row ACKed is
+//! re-offered to the pane row (plan D5, the sibling `finish_reoffer` module;
+//! the bind trigger cannot qualify — see there).
 //!
 //! **Known gap — transcript history is not replayed onto the new row.** Chunks
 //! emitted after a move address the new row; those emitted before it stay on
@@ -438,10 +439,11 @@ impl AiCoordRegistrar {
     /// 2. THEN the finished marks owed to the row are delivered
     ///    ([`Self::deliver_owed_finish`]), so an owed mark resolves to the new
     ///    row, never the dead one.
-    /// 3. After a `Moved`, a finish the old row ACKed is re-offered to the new
-    ///    row ([`Self::reoffer_finish_to`], plan D5) — subject to the revival
-    ///    guard, so a finished session respawned or resumed into this pane is
-    ///    not re-finished here.
+    ///
+    /// The bind does NOT re-offer a finish the old row ACKed (plan D5): the
+    /// pane's bind instant is stamped at this very bind, so the id's ownership
+    /// of the new row begins after any finish already ACKed, and the revival
+    /// guard would refuse every time. See the `finish_reoffer` module.
     ///
     /// **The bind does NOT advance the row's owner** (plan D1: only the seam
     /// advances it; D4: the bind trigger checks the owner half only). A pin is
@@ -480,9 +482,7 @@ impl AiCoordRegistrar {
             return self.deliver_owed_finish(pinned_session_id, terminal_id, coord_session_id);
         }
         let tenant = self.pane_row_tenant(coord_session_id);
-        let moved =
-            self.move_onto_pane_row(pinned_session_id, coord_session_id, Mover::Bind, tenant);
-        match moved {
+        match self.move_onto_pane_row(pinned_session_id, coord_session_id, Mover::Bind, tenant) {
             MoveOutcome::NotOwner => warn!(
                 "ai_coord_register: terminal {} (pinned {}) bound to coord session {}, but \
                  another session owns that row — the registrar's entry stays where it is",
@@ -500,14 +500,7 @@ impl AiCoordRegistrar {
             ),
             _ => {}
         }
-        let owed = self.deliver_owed_finish(pinned_session_id, terminal_id, coord_session_id);
-        if let MoveOutcome::Moved { .. } = moved {
-            // Plan D5: a finish the old row ACKed is re-offered to the pane
-            // row — after the owed delivery, whose pending row it does not
-            // duplicate.
-            self.reoffer_finish_to(pinned_session_id, coord_session_id);
-        }
-        owed
+        self.deliver_owed_finish(pinned_session_id, terminal_id, coord_session_id)
     }
 
     /// The re-key seam's observer (plan D2): `SessionRegistry` has just
