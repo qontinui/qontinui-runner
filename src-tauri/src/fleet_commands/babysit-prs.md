@@ -1695,7 +1695,10 @@ an admin-merge happened — produces a plan so the defect class dies:
     landed IS its goal: Steps 2 and 4–7 apply in full. Two adjustments:
     - Step 1's auto-detection finds only branches this session owns, so pass
       the PRs as explicit pr-refs (a gate continuation carries them in its
-      args). Otherwise Step 1 finds none and exits.
+      args). Otherwise Step 1 finds none and exits. A DRAFT among PRs a gate's
+      continuation names explicitly with an ownerless-stranded hint
+      (`/dev-ops-steward`'s hand-off) is NOT a hold signal: its owner is gone,
+      so adopt it by route-around like any other.
     - Step 3 fixes only a PR this session authored. A red on someone else's
       branch goes to `/handoff-stuck-pr` while its author is live. Once the
       author is gone, adopt it per Step 6 → "Adopting a foreign branch",

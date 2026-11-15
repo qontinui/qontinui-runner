@@ -153,6 +153,10 @@ mod fixer;
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
 mod fleet_agents;
+// This device's row of coord's free-resource model, cached for a minute: the
+// loopback `GET /fleet/capacity` and in-process sizing read it (plan
+// 2026-11-05-one-free-resource-model-places-sessions-builds-and-ci, Phase 6).
+mod fleet_capacity;
 mod fleet_commands;
 mod fleet_skills;
 mod flow_control;
@@ -234,6 +238,8 @@ mod prompt_snippets;
 mod prompts;
 /// The `qontinui-provenance:` frontmatter key both fleet provisioners stamp.
 mod provenance;
+/// Excludes the paths the fleet provisioners wrote from the checkout's `git status`.
+mod provision_exclude;
 /// The shared tracked-destination guard every fleet provisioner consults.
 mod provision_guard;
 mod rag;
@@ -4405,14 +4411,51 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     ai_coord_registrar.attach_terminal_coord_lookup(move |csid| {
                         tm.upgrade()?.coord_session_id_for_pinned(csid)
                     });
+                    // Plan `2026-11-12-transcript-autobind-adopts-a-previous-
+                    // boot-row-that-a-live-pane-has-replaced`: a live pane's
+                    // own row (tenant per its SessionRegistry scope, bind
+                    // instant) for the live-pane adoption and the movers;
+                    // `on_terminal_coord_bind` moves the registrar's entry for
+                    // the pinned id onto a newly bound row BEFORE it delivers
+                    // owed marks; the re-key seam moves a stale auto-bind
+                    // entry onto the row it confirms.
+                    let tm = std::sync::Arc::downgrade(&term_for_session);
+                    let sreg = std::sync::Arc::downgrade(&registry);
+                    ai_coord_registrar.attach_pane_row_tenant(move |row| {
+                        use claude_session::pane_row_owner::{
+                            tenant_from_scope, PaneRowFacts, PaneRowLookup,
+                        };
+                        // An unreadable plane is Unknown, never "gone".
+                        let Some(binding) = tm.upgrade().and_then(|t| t.coord_row_bound_at(row))
+                        else {
+                            return PaneRowLookup::Unknown;
+                        };
+                        let Some((bound_at_ms, bind_seq)) = binding else {
+                            return PaneRowLookup::Gone;
+                        };
+                        let Some(scope) = sreg.upgrade().map(|s| s.tenant_scope_of(row)) else {
+                            return PaneRowLookup::Unknown;
+                        };
+                        PaneRowLookup::Live(PaneRowFacts {
+                            tenant: tenant_from_scope(scope),
+                            bound_at_ms: Some(bound_at_ms),
+                            bind_seq: Some(bind_seq),
+                        })
+                    });
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     term_for_session.attach_coord_bind_observer(
                         move |pinned, terminal_id, coord_id| {
                             if let Some(r) = reg.upgrade() {
-                                r.deliver_owed_finish(pinned, terminal_id, coord_id);
+                                r.on_terminal_coord_bind(pinned, terminal_id, coord_id);
                             }
                         },
                     );
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    registry.attach_rekey_observer(move |row, csid, source| {
+                        if let Some(r) = reg.upgrade() {
+                            r.note_pane_row(row, csid, source);
+                        }
+                    });
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     lifecycle_store.attach_finish_observer(move |rec| {
                         use session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
@@ -4422,11 +4465,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
-                    coord_sync_facade.attach_finished_ack_observer(move |csid, finished_at| {
-                        if let Some(s) = store.upgrade() {
-                            s.mark_finish_synced(csid, finished_at);
-                        }
-                    });
+                    coord_sync_facade.attach_finished_ack_observer_on(
+                        move |csid, finished_at, coord_row| {
+                            if let Some(s) = store.upgrade() {
+                                // The row whose answer read `finished` is kept
+                                // with the stamp, so the finish heal knows the
+                                // mark's own row after a restart.
+                                s.mark_finish_synced_on(csid, finished_at, Some(coord_row));
+                            }
+                        },
+                    );
+                    // A finish the drain gave up on (coord answered, its row
+                    // never read `finished`) keeps the row it was SENT to on
+                    // the mark, unstamped, for the boot heal sweep.
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    coord_sync_facade.attach_finished_unconfirmed_observer(
+                        move |csid, finished_at, coord_row| {
+                            if let Some(s) = store.upgrade() {
+                                s.note_finish_sent_row(csid, finished_at, coord_row);
+                            }
+                        },
+                    );
+                    // Once per runner start: heal marks stamped synced over a
+                    // finish coord never applied (plan 2026-11-05-finish-
+                    // synced-is-stamped-on-a-2xx-that-did-not-move-session-
+                    // status, Phase 5). Delayed, bounded, and it only
+                    // re-sends a session's own finish.
+                    session::finish_heal::spawn_boot_sweep(
+                        std::sync::Arc::downgrade(&lifecycle_store),
+                        std::sync::Arc::downgrade(&ai_coord_registrar),
+                    );
                 }
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full

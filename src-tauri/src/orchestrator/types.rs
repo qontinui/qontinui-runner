@@ -2,20 +2,21 @@
 //!
 //! The wire-format DTOs (`VerificationPlan`, `SuccessCriterion`,
 //! `CriterionType`, `VerificationMethod`, `WorkerSignal`, `Finding`,
-//! `CriterionOverride`, `OverrideCollection`, `StageTransition`, and the
-//! multi-worker support types) live in `qontinui_types::verification`; this
+//! `CriterionOverride`, `OverrideCollection`, `StageTransition`, and
+//! `WorkerDomain`) live in `qontinui_types::verification`; this
 //! module re-exports the ones the runner uses, so the rest of the runner can
 //! `use crate::orchestrator::types::*`. The list is explicit: the verification
 //! result DTOs (`VerificationResult`, `DomainVerificationResult`,
 //! `IterationVerificationResults`, `TaskCompletionResult`) were filled only by
-//! the deleted orchestrator verifier and are not re-exported.
+//! the deleted orchestrator verifier and are not re-exported, and the
+//! multi-worker `DomainAssignment` / `WorkerInstance` / `WorkerStatus` had no
+//! runner caller.
 //!
 //! Runner-side behavior (constructors that stamp timestamps / generate UUIDs,
-//! parsers that extract signals from AI output text, domain-assignment
-//! helpers) stays here. Because of Rust's orphan rule we can't define inherent
+//! parsers that extract signals from AI output text, override collection)
+//! stays here. Because of Rust's orphan rule we can't define inherent
 //! `impl` blocks on types defined in another crate, so the methods are
-//! exposed through extension traits (`DomainAssignmentExt`,
-//! `WorkerInstanceExt`, `WorkerSignalExt`, `CriterionOverrideExt`,
+//! exposed through extension traits (`WorkerSignalExt`, `CriterionOverrideExt`,
 //! `OverrideCollectionExt`). The traits are re-exported along with the DTOs so
 //! callers can keep using `CriterionOverride::new(...)`, etc. verbatim as long
 //! as this module's contents are brought into scope.
@@ -23,174 +24,9 @@
 #![allow(dead_code)]
 
 pub use qontinui_types::verification::{
-    Confidence, CriterionOverride, CriterionType, DomainAssignment, Finding, OverrideCollection,
-    StageTransition, SuccessCriterion, VerificationMethod, VerificationPlan, WorkerDomain,
-    WorkerInstance, WorkerSignal, WorkerStatus,
+    Confidence, CriterionOverride, CriterionType, Finding, OverrideCollection, StageTransition,
+    SuccessCriterion, VerificationMethod, VerificationPlan, WorkerDomain, WorkerSignal,
 };
-
-// ============================================================================
-// DomainAssignment behavior (extension trait)
-// ============================================================================
-
-/// Runner-side behavior for [`DomainAssignment`].
-pub trait DomainAssignmentExt: Sized {
-    /// Create a new domain assignment.
-    fn new(domain_id: &str, name: &str, description: &str) -> Self;
-    /// Add a file pattern to this domain.
-    fn with_file_pattern(self, pattern: &str) -> Self;
-    /// Add a keyword to this domain.
-    fn with_keyword(self, keyword: &str) -> Self;
-    /// Add system-prompt context for this domain.
-    fn with_system_prompt(self, prompt: &str) -> Self;
-    /// Check if a file path belongs to this domain.
-    fn matches_file(&self, file_path: &str) -> bool;
-    /// Assign a worker to this domain.
-    fn assign_worker(&mut self, worker_id: &str);
-    /// Remove a worker from this domain.
-    fn unassign_worker(&mut self, worker_id: &str);
-}
-
-impl DomainAssignmentExt for DomainAssignment {
-    fn new(domain_id: &str, name: &str, description: &str) -> Self {
-        Self {
-            domain_id: domain_id.to_string(),
-            name: name.to_string(),
-            description: description.to_string(),
-            file_patterns: Vec::new(),
-            keywords: Vec::new(),
-            assigned_workers: Vec::new(),
-            domain_criteria: Vec::new(),
-            system_prompt_context: None,
-        }
-    }
-
-    fn with_file_pattern(mut self, pattern: &str) -> Self {
-        self.file_patterns.push(pattern.to_string());
-        self
-    }
-
-    fn with_keyword(mut self, keyword: &str) -> Self {
-        self.keywords.push(keyword.to_string());
-        self
-    }
-
-    fn with_system_prompt(mut self, prompt: &str) -> Self {
-        self.system_prompt_context = Some(prompt.to_string());
-        self
-    }
-
-    fn matches_file(&self, file_path: &str) -> bool {
-        for pattern in &self.file_patterns {
-            if glob_match::glob_match(pattern, file_path) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn assign_worker(&mut self, worker_id: &str) {
-        if !self.assigned_workers.contains(&worker_id.to_string()) {
-            self.assigned_workers.push(worker_id.to_string());
-        }
-    }
-
-    fn unassign_worker(&mut self, worker_id: &str) {
-        self.assigned_workers.retain(|id| id != worker_id);
-    }
-}
-
-// ============================================================================
-// WorkerInstance behavior (extension trait)
-// ============================================================================
-
-/// Runner-side behavior for [`WorkerInstance`].
-pub trait WorkerInstanceExt: Sized {
-    /// Create a new worker instance.
-    fn new(worker_id: &str, name: &str, max_iterations: u32) -> Self;
-    /// Start this worker.
-    fn start(&mut self);
-    /// Mark this worker as awaiting verification.
-    fn await_verification(&mut self);
-    /// Mark this worker as completed.
-    fn complete(&mut self);
-    /// Mark this worker as errored.
-    fn error(&mut self, message: &str);
-    /// Assign this worker to a domain.
-    fn assign_to_domain(&mut self, domain_id: &str);
-    /// Record a finding from this worker.
-    fn record_finding(&mut self, finding: Finding);
-    /// Record a file that this worker touched.
-    fn record_touched_file(&mut self, file_path: &str);
-    /// Increment iteration and check if max reached.
-    fn increment_iteration(&mut self) -> bool;
-    /// Check if this worker is still active.
-    fn is_active(&self) -> bool;
-}
-
-impl WorkerInstanceExt for WorkerInstance {
-    fn new(worker_id: &str, name: &str, max_iterations: u32) -> Self {
-        Self {
-            worker_id: worker_id.to_string(),
-            name: name.to_string(),
-            status: WorkerStatus::Idle,
-            domain: None,
-            iteration: 0,
-            max_iterations,
-            last_signal: None,
-            findings: Vec::new(),
-            touched_files: Vec::new(),
-            started_at: None,
-            completed_at: None,
-            error_message: None,
-        }
-    }
-
-    fn start(&mut self) {
-        self.status = WorkerStatus::Active;
-        self.started_at = Some(chrono::Utc::now().to_rfc3339());
-    }
-
-    fn await_verification(&mut self) {
-        self.status = WorkerStatus::AwaitingVerification;
-    }
-
-    fn complete(&mut self) {
-        self.status = WorkerStatus::Completed;
-        self.completed_at = Some(chrono::Utc::now().to_rfc3339());
-    }
-
-    fn error(&mut self, message: &str) {
-        self.status = WorkerStatus::Error;
-        self.error_message = Some(message.to_string());
-        self.completed_at = Some(chrono::Utc::now().to_rfc3339());
-    }
-
-    fn assign_to_domain(&mut self, domain_id: &str) {
-        self.domain = Some(domain_id.to_string());
-    }
-
-    fn record_finding(&mut self, finding: Finding) {
-        self.findings.push(finding);
-    }
-
-    fn record_touched_file(&mut self, file_path: &str) {
-        if !self.touched_files.contains(&file_path.to_string()) {
-            self.touched_files.push(file_path.to_string());
-        }
-    }
-
-    fn increment_iteration(&mut self) -> bool {
-        self.iteration += 1;
-        self.iteration >= self.max_iterations
-    }
-
-    fn is_active(&self) -> bool {
-        matches!(
-            self.status,
-            WorkerStatus::Active | WorkerStatus::AwaitingVerification
-        )
-    }
-}
 
 // ============================================================================
 // WorkerSignal behavior (extension trait)

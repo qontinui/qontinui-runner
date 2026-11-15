@@ -26,7 +26,6 @@ import tempfile
 import threading
 import time
 import traceback
-from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -41,18 +40,6 @@ logging.basicConfig(
 if "--disable-console-logging" in sys.argv:
     os.environ["QONTINUI_DISABLE_CONSOLE_LOGGING"] = "1"
     sys.argv.remove("--disable-console-logging")
-
-# IMMEDIATE debug logging to verify executor is being invoked
-debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_executor_startup.log")
-try:
-    with open(debug_log_path, "a", encoding="utf-8") as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        f.write(f"[{timestamp}] EXECUTOR STARTED - qontinui_executor.py is running\n")
-        f.write(
-            f"[{timestamp}] Console logging disabled: {os.getenv('QONTINUI_DISABLE_CONSOLE_LOGGING') == '1'}\n"
-        )
-except Exception:
-    pass
 
 # CRITICAL: Send READY signal IMMEDIATELY to prevent timeout
 sys.stdout.write(
@@ -580,33 +567,20 @@ class QontinuiExecutor(
         Returns:
             True if successful, False otherwise
         """
-        # DEBUG: Log config loading
-        import os
-        import tempfile
-
-        debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_load_config_debug.log")
-        try:
-            with open(debug_log_path, "a") as f:
-                from datetime import datetime
-
-                f.write(f"\n=== LOAD_CONFIGURATION DEBUG {datetime.now()} ===\n")
-                f.write(f"config_path: {config_path}\n")
-                f.write(f"QONTINUI_AVAILABLE: {QONTINUI_AVAILABLE}\n")
-                f.flush()
-        except Exception:
-            pass
+        logger.debug(
+            "load_configuration: config_path=%s QONTINUI_AVAILABLE=%s",
+            config_path,
+            QONTINUI_AVAILABLE,
+        )
 
         success = self.executor_core.load_configuration(config_path)
 
-        # DEBUG: Log result
-        try:
-            with open(debug_log_path, "a") as f:
-                f.write(f"executor_core.load_configuration returned: {success}\n")
-                f.write(f"executor_core.action_executor: {self.executor_core.action_executor}\n")
-                f.write(f"executor_core.state_executor: {self.executor_core.state_executor}\n")
-                f.flush()
-        except Exception:
-            pass
+        logger.debug(
+            "executor_core.load_configuration returned %s (action_executor=%s, state_executor=%s)",
+            success,
+            self.executor_core.action_executor,
+            self.executor_core.state_executor,
+        )
 
         if success:
             # Store reference to config
@@ -761,19 +735,6 @@ class QontinuiExecutor(
             "info",
             f"[PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}",
         )
-        # Write to debug file for monitor tracing
-        try:
-            with open(
-                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(
-                    f"[{timestamp}] [PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}\n"
-                )
-        except Exception:
-            pass
 
         if self.is_running:
             self.event_manager.emit_log("warning", "Execution already in progress")
@@ -790,17 +751,6 @@ class QontinuiExecutor(
         self.event_manager.emit_log(
             "info", f"[PYTHON_EXECUTOR] Set self.target_monitor = {monitor}"
         )
-        # Write to debug file for monitor tracing
-        try:
-            with open(
-                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] Set self.target_monitor = {monitor}\n")
-        except Exception:
-            pass
         if monitor is not None:
             self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] Using monitor index: {monitor}")
             # Apply monitor setting to FrameworkSettings so qontinui core uses this monitor
@@ -821,33 +771,11 @@ class QontinuiExecutor(
                             "debug",
                             f"Set target monitor: {monitor} (library will look up position via MSS)",
                         )
-                        # Write to debug file
-                        try:
-                            with open(
-                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                f.write(
-                                    f"[{timestamp}] [PYTHON_EXECUTOR] Set target monitor: {monitor}\n"
-                                )
-                        except Exception:
-                            pass
                     else:
-                        # Debug: Log why we couldn't set monitor
-                        try:
-                            with open(
-                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                f.write(
-                                    f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: Cannot set monitor - executor_core or state_executor is None\n"
-                                )
-                        except Exception:
-                            pass
+                        self.event_manager.emit_log(
+                            "warning",
+                            "Cannot set monitor - executor_core or state_executor is None",
+                        )
                 except Exception as e:
                     self.event_manager.emit_log(
                         "warning", f"Failed to set monitor in FrameworkSettings: {e}"
@@ -1121,19 +1049,6 @@ class QontinuiExecutor(
             "info",
             f"[PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}",
         )
-        # Write to debug file for monitor tracing
-        try:
-            with open(
-                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(
-                    f"[{timestamp}] [PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})\n"
-                )
-        except Exception:
-            pass
         success = self.start_execution(
             workflow_id,
             monitor=monitor,

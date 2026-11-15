@@ -83,6 +83,22 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     // probe-confirmed no-op.
     "limit reached",
     "out of usage",
+    // Menu-only signal, after the catch-alls; any banner keeps the label (plan
+    // 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated).
+    // When a BACKGROUND subagent hits the limit, the pane paints only the
+    // /rate-limit-options menu ("What do you want to do? 1. Stop and wait for
+    // limit to reset …") under "Waiting for 1 background agent to finish" —
+    // no "hit your …" banner, so none of the entries above matched and the
+    // pane sat unmigrated for 14 h. The menu's stop option is matched, not
+    // its question, because "What do you want to do?" titles unrelated Claude
+    // Code menus too; claude-config's `LIMIT_MENU` (close-finished-sessions.py)
+    // reads this menu by the same option text. The label is conditional in
+    // the CLI (2.1.323): it is just "Stop" for a usage-billed account, and for
+    // a `credits_required` overage rejection on any account, and this entry
+    // does not match that shorter menu (plan follow-up d5c89e8e). A weekly or
+    // 5-hour limit on a subscription account, the measured case, draws the
+    // full text.
+    "stop and wait for limit to reset",
 ];
 
 /// Minimum gap between two hint firings for the same terminal. A limit message
@@ -100,7 +116,8 @@ fn normalized_indicates_usage_limit(normalized: &str) -> Option<&'static str> {
 }
 
 /// First matching usage-limit pattern in a raw (un-normalized) screen/window.
-/// Normalizes then delegates — the public matcher seam used by the unit tests.
+/// Normalizes then delegates — the matcher [`scan_grids_once`] runs on every
+/// due terminal's rendered screen, and the seam the unit tests enter through.
 pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
     normalized_indicates_usage_limit(&normalize(window))
 }
@@ -201,7 +218,9 @@ pub fn scan_grids_once() {
                 let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
                 guard.text_snapshot().text
             };
-            let matched = normalized_indicates_usage_limit(&normalize(&text));
+            // The same matcher the unit tests enter through, so every fixture
+            // there is a statement about this scan's matcher.
+            let matched = window_indicates_usage_limit(&text);
             // `entry` defaults to "never fired" → the first appearance fires
             // immediately; thereafter the debounce gates re-fires.
             let last_fired = map.entry(tid.clone()).or_insert(None);
@@ -331,6 +350,8 @@ mod tests {
     fn hit_your_banners_keep_their_label_beside_other_phrases() {
         // Priority order, not just reachability: these labels are what the
         // migration reads, so a co-painted generic phrase must not take over.
+        // The last block pins the menu-only entry below every banner AND both
+        // catch-alls (the plan names this test as that entry's priority test).
         assert_eq!(
             window_indicates_usage_limit("out of extra usage\nYou've hit your weekly limit"),
             Some("hit your weekly limit")
@@ -342,6 +363,79 @@ mod tests {
         assert_eq!(
             window_indicates_usage_limit("limit reached · You've hit your limit · out of usage"),
             Some("hit your limit")
+        );
+        // A banner painted beside the limit menu keeps the banner's label: the
+        // menu entry sits after the catch-alls.
+        assert_eq!(
+            window_indicates_usage_limit(&format!(
+                "{LIMIT_MENU_ONLY_TAIL}\nYou've hit your weekly limit"
+            )),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit(&format!(
+                "{LIMIT_MENU_ONLY_TAIL}\nlimit reached · resets 3am"
+            )),
+            Some("limit reached")
+        );
+        // ...and it sits after BOTH catch-alls, not between them.
+        assert_eq!(
+            window_indicates_usage_limit(&format!("{LIMIT_MENU_ONLY_TAIL}\nYou're out of usage")),
+            Some("out of usage")
+        );
+    }
+
+    /// The bottom of the rendered screen of a pane whose usage limit was hit by
+    /// a BACKGROUND subagent: the spinner, panel note, menu and bottom border
+    /// are reconstructed from the tail measured on 2026-11-12 (merytshost,
+    /// pane db0a8eb9; PTY bytes, ANSI-stripped) and laid out as the rendered
+    /// grid would show them, not copied byte for byte; the footer row
+    /// after the border is illustrative, not measured. No "hit your …" banner
+    /// anywhere (plan
+    /// 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated).
+    const LIMIT_MENU_ONLY_TAIL: &str = "\
+✻ Waiting for 1 background agent to finish
+
+ Background task update waiting while this panel is open
+
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Wait here, then continue automatically at Nov 18, 9pm
+   3. Switch to usage credits
+
+ Enter to confirm · Esc to cancel
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+";
+
+    #[test]
+    fn limit_menu_without_a_banner_matches() {
+        assert_eq!(
+            window_indicates_usage_limit(LIMIT_MENU_ONLY_TAIL),
+            Some("stop and wait for limit to reset")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_menu_question_does_not_match() {
+        // "What do you want to do?" opens other Claude Code menus too.
+        assert_eq!(
+            window_indicates_usage_limit("What do you want to do?\n 1. Yes\n 2. No"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_short_stop_label_is_not_matched() {
+        // The known limitation, pinned: the CLI's short "Stop" label (a
+        // usage-billed account, or a credits_required overage rejection) is
+        // not matched by the menu entry (plan follow-up d5c89e8e).
+        assert_eq!(
+            window_indicates_usage_limit(
+                "What do you want to do?\n ❯ 1. Stop\n   2. Switch to usage credits"
+            ),
+            None
         );
     }
 

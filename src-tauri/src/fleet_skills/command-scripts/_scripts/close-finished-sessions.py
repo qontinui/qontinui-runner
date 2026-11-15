@@ -2691,6 +2691,12 @@ def limit_menu_cases(bad):
     modal = {"grid_busy", "prompt_not_ready"}
     cases += [(f"{word} under the menu", LIMIT_MENU_SCREEN, {"reason": word}, base, [], "BUSY",
                (WIND_DOWN_VETO[word], "!" + said)) for word in sorted(set(WIND_DOWN_VETO) - modal)]
+    # The set-aside is for a pane whose menu IS open. With no menu drawn the same two words
+    # still veto, and the veto's own reason must be in the row (dropping the `menu and` term in
+    # classify() sets it aside, so the reason goes missing).
+    idle_prompt = "\u2500" * 40 + "\r\u276f \r" + "\u2500" * 40
+    cases += [(f"{word} with no menu", idle_prompt, {"reason": word}, base, [], "BUSY",
+               (WIND_DOWN_VETO[word], "!" + said)) for word in sorted(modal)]
     g = globals()
     keys = ("proc_facts", "split_strays", "live_session_ids", "raw_tail", "wrap_cols", "git_rev_parse_dirs",
             "transcript_facts")

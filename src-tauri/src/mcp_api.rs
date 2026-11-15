@@ -2527,6 +2527,12 @@ async fn health(
         // to its count (only non-zero kinds; the values sum to the scalar).
         // A stalled drain used to be invisible from here.
         "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
+        // The finish heal (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-
+        // that-did-not-move-session-status, Phase 5): boot sweeps and finish
+        // read-backs run, and every synced finished mark they judged counted
+        // by outcome — `resent`, or the reason it was left alone
+        // (`coord_finished`, `revived_after_finish`, `coord_unreadable`, …).
+        "finishHeal": crate::session::finish_heal::heal_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
         // resolves-on-a-guess, Phase 4): every tick the poller could not push
@@ -2745,12 +2751,36 @@ async fn health(
         // sessions close means coord is refusing the POSTs.
         "agent_log_emitter_agents":
             crate::claude_session::coord_register::agent_log_emitter_agents(),
+        // How many finishes found a harness id's registrar entry on a row
+        // other than its live pane's row and moved it there (plan
+        // 2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-
+        // live-pane-has-replaced, D4's finish-time repair). It should stay
+        // flat once a boot settles: a climb means the live-pane adoption, the
+        // bind trigger or the re-key seam missed an ordering.
+        "registrarTerminalRowDisagreements":
+            crate::claude_session::coord_register::registrar_terminal_row_disagreements(),
+        // Moves onto a pane row refused because another session owns it.
+        "registrarPaneRowMovesNotOwner":
+            crate::claude_session::coord_register::pane_row_moves_not_owner(),
+        // Distinct (row, session) pairs whose live-pane adoption was EVER
+        // deferred because only the pane's pin says it runs the session and
+        // another key holds the row (cumulative; once per pair, not per
+        // retry, and not decremented when resolved).
+        "registrarPinSeedTakesEverDeferred":
+            crate::claude_session::coord_register::pin_seed_takes_ever_deferred(),
         // Browser-origin guard (plan 2026-09-17-runner-loopback-api-accepts-
         // any-origin): kill-switch state, route-policy mode, per-class refusal
         // and shadow counts, and the last 20 non-admit tuples — withheld from a
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // systemd `sd_notify` state (plan 2026-10-19-ci-nodes-run-the-tauri-
+        // runner-always-on-as-ci-node-role, Phase 2b): whether a `Type=notify`
+        // unit launched this runner, whether `READY=1` went out, the armed
+        // `WatchdogSec=`, the last keepalive decision and the readiness
+        // snapshot that gated it. `notifySocket: false` = inert (every
+        // desktop/dev runner); `lastDecision: null` = UNKNOWN, not healthy.
+        "sdNotify": crate::sd_notify::health_json(),
         // The six per-tenant egress switches (plan
         // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7): for
         // each flow, whether it may send right now, which rung decided it
@@ -14275,6 +14305,10 @@ pub fn create_router(
         // App-installation metrics) plus the low-headroom watch loop this
         // `routes()` call starts.
         .merge(crate::mcp::github_budget_api::routes())
+        // Phase 6 of 2026-11-05-one-free-resource-model-places-sessions-builds-and-ci
+        // — GET /fleet/capacity: this device's row of coord's capacity model,
+        // for local tools that hold no coord credential.
+        .merge(crate::mcp::fleet_capacity_api::routes())
         // D4+D6 Phase 2 — Blind-Spot Recommender endpoint (GET /blind-spots).
         .merge(crate::mcp::blind_spots_api::routes())
         .merge(crate::mcp::debug_builder_prompt::routes())
@@ -15890,6 +15924,7 @@ mod self_id_chain_tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -21750,6 +21785,37 @@ mod coord_provision_session_gate_tests {
         assert_eq!(
             provenance["build"]["profile"],
             qontinui_runner_lib::build_provenance::build_profile_json()
+        );
+    }
+
+    /// Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// Phase 1 (taken from qontinui-runner#2711): `/health` serves the
+    /// finish-time repair count (same source-scan technique as the tests
+    /// around it).
+    #[test]
+    fn the_health_handler_emits_the_registrar_terminal_row_disagreements() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"registrarTerminalRowDisagreements\":"),
+            "{region}"
+        );
+        assert!(
+            region.contains(
+                "crate::claude_session::coord_register::registrar_terminal_row_disagreements()"
+            ),
+            "{region}"
+        );
+        assert!(
+            region.contains("\"registrarPaneRowMovesNotOwner\":"),
+            "{region}"
+        );
+        assert!(
+            region.contains("\"registrarPinSeedTakesEverDeferred\":"),
+            "{region}"
         );
     }
 

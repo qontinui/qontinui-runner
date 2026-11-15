@@ -6,7 +6,9 @@
 //! The orchestrator's own task state machine (`TaskOrchestrator`) and its
 //! deterministic + AI verifier (`VerificationOrchestrator`) were deleted: no
 //! production path constructed either. Product workflow verification is the
-//! unified workflow executor's (`crate::unified_workflow_executor`).
+//! unified workflow executor's (`crate::unified_workflow_executor`). The
+//! `OrchestratorRuntime` / `EnhancedOrchestratorConfig` integration layer was
+//! deleted for the same reason: nothing outside this module constructed it.
 //!
 //! ## New Modules (2026 Enhancements)
 //!
@@ -30,36 +32,12 @@
 //! - `checkpoint`: Checkpointing with time-travel debugging
 //! - `flow`: Flow orchestration mode for deterministic workflows
 //! - `learning`: Learning loop with post-task analysis
-//!
-//! ### Integration Layer
-//! - `config`: Unified configuration for all 15 modules
-//! - `runtime`: Integrated orchestrator runtime combining all modules
-//!
-//! ## Usage
-//!
-//! ```rust
-//! use crate::orchestrator::config::{ConfigPresets, EnhancedOrchestratorConfig};
-//! use crate::orchestrator::runtime::OrchestratorRuntime;
-//!
-//! // Create runtime with default config
-//! let mut runtime = OrchestratorRuntime::new(EnhancedOrchestratorConfig::default());
-//!
-//! // Or use presets
-//! let mut runtime = OrchestratorRuntime::new(ConfigPresets::autonomous());
-//!
-//! // Initialize and run task
-//! runtime.initialize_task("task-1", "Fix all type errors")?;
-//! runtime.start_iteration()?;
-//! // ... process work ...
-//! runtime.complete_task(true, None)?;
-//! ```
 
 pub mod agent_roles;
 pub mod agent_tool;
 pub mod brain_actor;
 pub mod checkpoint;
 pub mod compression;
-pub mod config;
 pub mod context_propagation;
 pub mod context_strategies;
 pub mod contract_validator;
@@ -80,7 +58,6 @@ pub mod planning;
 pub mod realtime_events;
 pub mod retry;
 pub mod role_specializations;
-pub mod runtime;
 pub mod state;
 pub mod status_events;
 pub mod structured_output;

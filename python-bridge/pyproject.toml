@@ -55,10 +55,37 @@ pytest = "^9.0"
 pytest-asyncio = "^1.4"
 ruff = "^0.14"
 mypy = "^1.14"
-pylint = "^3.3"
+pylint = "^4.0.9"
 flake8 = "^7.3"
 pre-commit = "^4.4"
 types-requests = "^2.31"
+
+# Transitive security floors: the same nine entries and floors as the optional
+# `security-floors` group in qontinui/pyproject.toml; keep them in step with it.
+# (The virtualenv comment states the exact bound: 21.10.0 is the first release
+# that allows filelock 4, per PyPI metadata.)
+# Poetry does not pass a path dependency's groups on to its consumers, so core's
+# floors never reach this lock unless they are restated here, and Poetry 2's
+# `poetry lock` keeps an already-locked version while it still satisfies every
+# constraint, so nothing else stops a later relock regressing below a fix. The
+# group is optional: nothing here is installed by default or becomes a runtime
+# requirement of the bridge, but every group is resolved into poetry.lock, so the
+# floors still bind the locked versions. Residue, not floorable here: setuptools
+# (torch 2.11 requires <82) and torch itself (fixed in 2.13; torchvision ^0.26 in
+# qontinui holds it at 2.11).
+[tool.poetry.group.security-floors]
+optional = true
+
+[tool.poetry.group.security-floors.dependencies]
+anyio = ">=4.14.2"
+certifi = ">=2026.10.18"
+filelock = ">=4.2.1"
+fsspec = ">=2026.6.0"
+h2 = ">=4.4.1"
+multidict = ">=6.9.1"
+ujson = ">=5.13.0"
+urllib3 = ">=2.8.0"
+virtualenv = ">=21.14.9"  # filelock 4 needs virtualenv 21.10.0 or newer (earlier releases cap filelock <4)
 
 [tool.mypy]
 python_version = "3.12"

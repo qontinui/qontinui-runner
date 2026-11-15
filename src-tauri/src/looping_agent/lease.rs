@@ -1533,12 +1533,16 @@ mod tests {
         displacement_confirm_ms(GRACE_SECS)
     }
 
+    // A constant floor, so it is checked where constants are: a violation
+    // fails compilation of the test target (`cargo check --all-targets`,
+    // `clippy --all-targets`, `cargo test`), not a test run.
+    const _: () = assert!(DISPLACED_MIN_HELD_TICKS >= 6);
+
     #[test]
     fn the_confirmation_window_outlasts_two_ttls_and_a_dead_tab_holders_grace() {
         assert_eq!(window(), 420_000);
         assert!(window() >= 2 * TTL_MS);
         assert!(window() >= orphan_grace_ms(GRACE_SECS) + TTL_MS);
-        assert!(DISPLACED_MIN_HELD_TICKS >= 6);
     }
 
     #[test]

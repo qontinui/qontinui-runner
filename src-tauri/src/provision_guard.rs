@@ -173,7 +173,7 @@ const PROBE_STDERR_MAX_CHARS: usize = 200;
 /// Carried only as far as the log line: the keep decision is the same for all
 /// three, and the provisioning report records the keep rather than its cause.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ProbeFailure {
+pub(crate) enum ProbeFailure {
     /// git could not be started (no `git` on `PATH`), could not be polled, or its
     /// stdout could not be stored or read back. `stage` names which.
     Io { stage: &'static str, error: String },
@@ -231,6 +231,9 @@ pub(crate) struct TrackedPaths {
     /// account-only command or skill, an untracked overlay agent) is written
     /// even in a versioned checkout — no commit will ever deliver it.
     roster: HashSet<PathBuf>,
+    /// `git ls-files` ran and exited 0: the probed root is inside a work tree
+    /// and `relative` is git's real answer, not the fail-soft empty set.
+    answered: bool,
 }
 
 impl TrackedPaths {
@@ -265,6 +268,7 @@ impl TrackedPaths {
             unknown_in_repo: false,
             root_versioned: false,
             roster: HashSet::new(),
+            answered: true,
         }
     }
 
@@ -294,7 +298,14 @@ impl TrackedPaths {
             unknown_in_repo,
             root_versioned: false,
             roster: HashSet::new(),
+            answered: false,
         }
+    }
+
+    /// True iff `git ls-files` answered: the root is inside a work tree and
+    /// [`Self::contains`] reflects git's index rather than a fail-soft guess.
+    pub(crate) fn is_answered(&self) -> bool {
+        self.answered
     }
 
     /// True iff the probe could not answer for a root inside a repository.
@@ -336,6 +347,13 @@ impl TrackedPaths {
     /// True iff git tracks `relative` (a path relative to the probed root).
     pub(crate) fn contains(&self, relative: &Path) -> bool {
         self.relative.contains(relative)
+    }
+
+    /// True iff git tracks `dir` itself or any path beneath it (`dir` relative
+    /// to the probed root). Used by [`crate::provision_exclude`]: a directory
+    /// holding even one tracked file is never excluded whole.
+    pub(crate) fn tracks_any_under(&self, dir: &Path) -> bool {
+        self.relative.iter().any(|p| p.starts_with(dir))
     }
 
     /// Why `dst` should be SKIPPED, or `None` when it should be written. It is
@@ -466,6 +484,15 @@ fn has_git_ancestor(root: &Path) -> bool {
 /// - `--literal-pathspecs` disables pathspec magic and globbing, so no path this
 ///   module is ever handed can be reinterpreted as a pattern.
 fn run_bounded_git_ls_files(root: &Path) -> Result<Vec<u8>, ProbeFailure> {
+    run_bounded_git(root, &["--literal-pathspecs", "ls-files", "-z", "--", "."])
+}
+
+/// Spawn `git -C <root> <args…>` under the same bound, environment scrub and
+/// temp-file capture as [`run_bounded_git_ls_files`] (whose notes apply), and
+/// return its stdout or the [`ProbeFailure`] that stopped it. Shared with
+/// [`crate::provision_exclude`], whose `git rev-parse` runs on the same spawn
+/// path and must not be able to hang it either.
+pub(crate) fn run_bounded_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, ProbeFailure> {
     let io = |stage: &'static str| {
         move |e: std::io::Error| ProbeFailure::Io {
             stage,
@@ -490,11 +517,7 @@ fn run_bounded_git_ls_files(root: &Path) -> Result<Vec<u8>, ProbeFailure> {
     let mut child = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(root)
-        .arg("--literal-pathspecs")
-        .arg("ls-files")
-        .arg("-z")
-        .arg("--")
-        .arg(".")
+        .args(args)
         .stdin(Stdio::null())
         // Tracing would put its own lines ahead of git's error, and
         // `first_stderr_line` would report those instead of the cause. Best

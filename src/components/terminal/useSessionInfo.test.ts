@@ -44,7 +44,6 @@ import {
   tenantBoundMembership,
   tenantRow,
   TENANT_DISPLAY_ABSENT_TEXT,
-  type SessionTenancy,
   type TenantBoundMembership,
   type TenantDisplay,
   LOADING_STATE,
@@ -69,8 +68,17 @@ import {
   type SessionInfoBody,
   type SessionInfoState,
   type SessionPrOpened,
-  type SessionPrs,
 } from "./useSessionInfo";
+import {
+  BAUHAUS,
+  body,
+  display,
+  MERYTS,
+  PIZZERIA,
+  prs,
+  QONTINUI,
+  tenancyWith,
+} from "./useSessionInfo.testkit";
 
 function opened(
   overrides: Partial<SessionPrOpened> & Pick<SessionPrOpened, "prNumber">,
@@ -80,63 +88,6 @@ function opened(
     branch: "feat/x",
     openedAt: null,
     prState: "open",
-    ...overrides,
-  };
-}
-
-function prs(overrides: Partial<SessionPrs> = {}): SessionPrs {
-  const base: SessionPrs = {
-    status: "ok",
-    reason: null,
-    opened: [],
-    landed: [],
-    unknown: [],
-    openCount: 0,
-    landedCount: 0,
-    unknownCount: 0,
-    // Default to SCANNED: the fixtures below are about the ledger's contents,
-    // and the not-scanned case has its own dedicated tests.
-    scanned: true,
-    scannedRepos: ["D:/qontinui-root/qontinui-runner"],
-  };
-  const merged = { ...base, ...overrides };
-  return {
-    ...merged,
-    openCount: overrides.openCount ?? merged.opened.length,
-    landedCount: overrides.landedCount ?? merged.landed.length,
-    unknownCount: overrides.unknownCount ?? merged.unknown.length,
-  };
-}
-
-function body(overrides: Partial<SessionInfoBody> = {}): SessionInfoBody {
-  return {
-    identity: {
-      claudeSessionId: "8b45800b-4b65-4c15-afd4-d0feaa0cb0d4",
-      terminalId: "term-1",
-      fleetSessionHandle: "fsh_abc",
-      tenantId: null,
-      taskRunId: null,
-    },
-    name: { value: "runner dropdown", source: "operator" },
-    account: { label: "paktis", wrapper: "clp", configDir: "C:/Users/x/.claude-paktis" },
-    placement: { pageId: "default", zoneIndex: 3, workingDir: "C:/qontinui-root/qontinui-runner" },
-    lifecycle: {
-      state: "open",
-      provider: "claude",
-      origin: "authoritative",
-      openedAt: 1_700_000_000_000,
-      lastSeenAt: 1_700_000_100_000,
-      closedAt: null,
-      closeReason: null,
-      confirmed: true,
-      transcriptExists: true,
-      restorable: true,
-      restoredFromBootAt: null,
-      restoreTier: null,
-      bypassPermissions: false,
-    },
-    prs: prs(),
-    tenancy: null,
     ...overrides,
   };
 }
@@ -1100,53 +1051,6 @@ describe("shared session-info poll — a zone switched to another session", () =
 // The Tenant row reads `tenancy.display` (plan
 // 2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant)
 // ---------------------------------------------------------------------------
-
-const QONTINUI = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
-const MERYTS = "11111111-1111-4111-8111-111111111111";
-const BAUHAUS = "22222222-2222-4222-8222-222222222222";
-const PIZZERIA = "33333333-3333-4333-8333-333333333333";
-
-function display(overrides: Partial<TenantDisplay> = {}): TenantDisplay {
-  return {
-    status: "resolved",
-    tenantId: QONTINUI,
-    tenantSlug: null,
-    source: "credential",
-    reason: null,
-    conflicts: [],
-    conflictDetail: null,
-    bound: { status: "measured", tenantIds: [MERYTS, QONTINUI, BAUHAUS, PIZZERIA], reason: null },
-    multiBound: true,
-    actingInBoundSet: true,
-    ...overrides,
-  };
-}
-
-/** A tenancy block with no spawn stamp — the ordinary multi-bound spawn. */
-function tenancyWith(d: TenantDisplay | null, rowTenant: string | null = null): SessionTenancy {
-  return {
-    row: {
-      tenantId: rowTenant,
-      spawnDeviceDefaultTenantId: QONTINUI,
-      spawnDeviceDefaultStatus: "recorded",
-      spawnDeviceDefaultReason: null,
-      currentDeviceDefaultTenantId: QONTINUI,
-    },
-    dataPlane: { status: "owned", tenantId: QONTINUI, reason: null },
-    credential: {
-      status: "resolved",
-      tenantId: QONTINUI,
-      slot: "tenant",
-      reason: null,
-      posture: { status: "observed", value: "live", canAnswer: true, reason: null },
-    },
-    repoExpected: null,
-    coordRow: { status: "registered", tenantId: QONTINUI, source: "registrar", reason: null },
-    display: d,
-    diverged: d?.status === "mismatch",
-    divergence: d?.status === "mismatch" ? "diverged" : "agree",
-  };
-}
 
 describe("tenantRow — the acting tenant, never the spawn stamp", () => {
   it("2026-10-17 regression: no stamp + resolved credential + 4 bindings names the tenant", () => {

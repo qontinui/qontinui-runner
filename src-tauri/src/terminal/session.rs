@@ -1506,6 +1506,11 @@ impl PaneExitFacts {
     }
 }
 
+/// Process-wide bind order for [`TerminalSession::coord_binding`]: every
+/// coord bind takes the next value, so "bound later" is a total order even
+/// between binds in the same clock tick.
+static COORD_BIND_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -1620,6 +1625,19 @@ pub struct TerminalSession {
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// When `coord_session_id` was last bound, as a process-wide monotonic
+    /// sequence ([`COORD_BIND_SEQ`]); `0` until bound. Lets
+    /// `TerminalManager::coord_session_id_for_pinned` pick the most recently
+    /// bound of several live panes pinned to one harness id (a respawn or
+    /// account migration whose old pane has not closed yet).
+    coord_bound_seq: AtomicU64,
+    /// The wall-clock instant `coord_session_id` was last bound, in unix
+    /// MILLISECONDS (the unit of a lifecycle record's `finished_at`); `0`
+    /// until bound. Stamped beside [`Self::coord_bound_seq`] — the sequence
+    /// orders binds, this dates them — so the registrar's pane-row owner can
+    /// say when a pin's ownership of the row began (plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
+    coord_bound_at_ms: std::sync::atomic::AtomicI64,
     /// The `claude --name` this session was spawned with (runner-spawned
     /// continuations only). Immutable once set; surfaced to the webview as the
     /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
@@ -2674,6 +2692,8 @@ impl TerminalSession {
             output_tx,
             grid,
             coord_session_id,
+            coord_bound_seq: AtomicU64::new(0),
+            coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),
@@ -4644,9 +4664,18 @@ impl TerminalSession {
 
     /// Set the coord-native session id after `register_external()` wires
     /// this terminal into the coordinator's session plane.
+    ///
+    /// Also stamps the bind order ([`Self::coord_binding`]), so the newest
+    /// bound pane wins among several pinned to one harness id.
     pub fn set_coord_session_id(&self, id: uuid::Uuid) {
         if let Ok(mut slot) = self.coord_session_id.lock() {
             *slot = Some(id);
+            self.coord_bound_seq.store(
+                COORD_BIND_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
+            self.coord_bound_at_ms
+                .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         }
     }
 
@@ -4693,6 +4722,41 @@ impl TerminalSession {
     /// Read the coord-native session id, if one has been wired.
     pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
         self.coord_session_id.lock().ok().and_then(|g| *g)
+    }
+
+    /// The coord-native session id together with its bind order (a
+    /// process-wide sequence; larger = bound later), if one has been wired.
+    /// Read under the slot lock, so the pair is never torn.
+    pub fn coord_binding(&self) -> Option<(uuid::Uuid, u64)> {
+        let slot = self.coord_session_id.lock().ok()?;
+        slot.map(|id| (id, self.coord_bound_seq.load(Ordering::Relaxed)))
+    }
+
+    /// The coord row, its bind instant (unix ms, the unit of a lifecycle
+    /// record's `finished_at`) and its bind sequence ([`Self::coord_binding`])
+    /// in one read under the slot lock: `Some(Some((row, at, seq)))` when
+    /// bound, `Some(None)` when not, and `None` when the slot's lock is
+    /// poisoned — UNKNOWN, never "not bound".
+    pub fn coord_row_with_bound_at(&self) -> Option<Option<(uuid::Uuid, i64, u64)>> {
+        let slot = self.coord_session_id.lock().ok()?;
+        Some(slot.map(|id| {
+            (
+                id,
+                self.coord_bound_at_ms.load(Ordering::Relaxed),
+                self.coord_bound_seq.load(Ordering::Relaxed),
+            )
+        }))
+    }
+
+    /// Test-only: poison this terminal's coord slot lock.
+    #[cfg(test)]
+    pub(crate) fn poison_coord_slot_for_test(&self) {
+        let slot = self.coord_session_id.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = slot.lock().unwrap();
+            panic!("poisoning the coord slot for a test");
+        })
+        .join();
     }
 
     /// This terminal's id (the [`super::manager::TerminalManager`] key, and
@@ -5992,6 +6056,8 @@ pub(crate) mod tests {
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            coord_bound_seq: AtomicU64::new(0),
+            coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),

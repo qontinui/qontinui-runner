@@ -373,6 +373,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /shell-commands",
     "GET /worktrees",
     "GET /hooks/{id}",
+    // a coord read made with this device's credential and handed to the
+    // caller, the same class as the `/coord-mcp/*` reads above (plan
+    // 2026-11-05-one-free-resource-model-places-sessions-builds-and-ci,
+    // Phase 6): its callers are local tools and agents, never a browser
+    "GET /fleet/capacity",
     // a browser origin must never be able to widen browser trust
     "/settings/api/allowed-origins",
     // re-points which tenant this device's new sessions, device-level surfaces

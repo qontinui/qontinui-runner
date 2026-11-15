@@ -824,6 +824,8 @@ pub fn watchdog_tick(backend_wedged: bool, monitor_fresh: bool) -> Option<Watchd
     let readiness = readiness_view();
     let ci_builds = ci_builds_in_flight();
     let decision = watchdog_decision(backend_wedged, monitor_fresh, ci_builds, &readiness);
+    LAST_DECISION.store(decision_code(Some(decision)), Ordering::SeqCst);
+    LAST_DECISION_AT_MS.store(monotonic_ms().max(1), Ordering::SeqCst);
     if let Some(msg) = watchdog_message(decision, ci_builds, &readiness) {
         // Best-effort: a failed or `WouldBlock` send is a missed tick, which
         // the service manager already tolerates up to `WatchdogSec=`.
@@ -832,9 +834,201 @@ pub fn watchdog_tick(backend_wedged: bool, monitor_fresh: bool) -> Option<Watchd
     Some(decision)
 }
 
+// ---------------------------------------------------------------------------
+// `/health` `sdNotify` — what this module has decided and sent
+// ---------------------------------------------------------------------------
+
+/// The last [`watchdog_tick`] decision, encoded by [`decision_code`]
+/// (`0` = no tick has decided anything: there is no `NOTIFY_SOCKET`, or the
+/// watchdog thread has not ticked yet).
+static LAST_DECISION: AtomicU8 = AtomicU8::new(0);
+
+/// When [`LAST_DECISION`] was written, in [`monotonic_ms`] (`0` = never). A
+/// decision with no age would read a dead watchdog thread's last healthy
+/// keepalive as health forever.
+static LAST_DECISION_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds since this module's first use, on the monotonic clock.
+fn monotonic_ms() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn decision_code(d: Option<WatchdogDecision>) -> u8 {
+    match d {
+        None => 0,
+        Some(WatchdogDecision::Keepalive(KeepaliveReason::Healthy)) => 1,
+        Some(WatchdogDecision::Keepalive(KeepaliveReason::HostingWork)) => 2,
+        Some(WatchdogDecision::Keepalive(KeepaliveReason::ReadinessUnknown)) => 3,
+        Some(WatchdogDecision::Withhold) => 4,
+    }
+}
+
+fn decision_label(code: u8) -> Option<&'static str> {
+    match code {
+        1 => Some("keepalive_healthy"),
+        2 => Some("keepalive_hosting_work"),
+        3 => Some("keepalive_readiness_unknown"),
+        4 => Some("withhold"),
+        _ => None,
+    }
+}
+
+fn ci_subscription_label(c: CiSubscription) -> &'static str {
+    match c {
+        CiSubscription::Pending => "pending",
+        CiSubscription::Up => "up",
+        CiSubscription::NotApplicable => "not_applicable",
+    }
+}
+
+fn readiness_json(v: &ReadinessView) -> serde_json::Value {
+    match v {
+        ReadinessView::NeverRan => serde_json::json!({ "state": "never_ran" }),
+        ReadinessView::Unreadable => serde_json::json!({ "state": "unreadable" }),
+        ReadinessView::Stale { age } => {
+            serde_json::json!({ "state": "stale", "ageSecs": age.as_secs() })
+        }
+        ReadinessView::Published(p) => serde_json::json!({
+            "state": "published",
+            "ageSecs": p.stamp.elapsed().as_secs(),
+            "safeToRestart": p.safe_to_restart,
+            "reason": p.reason,
+            "source": p.source,
+        }),
+    }
+}
+
+/// Everything [`health_json`] reports, gathered — the test seam.
+struct HealthInputs {
+    notify_socket: bool,
+    watchdog_interval: Option<Duration>,
+    http_serving_for: Option<Duration>,
+    ci_subscription: CiSubscription,
+    ready_sent: bool,
+    extend_sent: bool,
+    ci_builds_in_flight: usize,
+    last_decision: u8,
+    /// How long ago `last_decision` was made; `None` = never.
+    last_decision_age: Option<Duration>,
+    readiness: ReadinessView,
+}
+
+fn health_json_from(i: HealthInputs) -> serde_json::Value {
+    serde_json::json!({
+        // `false` on every non-Linux build: nothing is ever read or sent.
+        "platformSupported": cfg!(target_os = "linux"),
+        // `false` = not launched by a `Type=notify` unit; the module then
+        // sends nothing and decides nothing.
+        "notifySocket": i.notify_socket,
+        // systemd's `WatchdogSec=` for this pid; `null` = no watchdog armed.
+        "watchdogUsec": i.watchdog_interval.map(|d| d.as_micros() as u64),
+        "httpServingSecs": i.http_serving_for.map(|d| d.as_secs()),
+        "ciSubscription": ci_subscription_label(i.ci_subscription),
+        "readySent": i.ready_sent,
+        "extendTimeoutSent": i.extend_sent,
+        // Dispatches that would keep a wedged runner alive right now.
+        "ciBuildsInFlight": i.ci_builds_in_flight,
+        // The last wedge-watchdog tick's decision; `null` = none decided
+        // (no `NOTIFY_SOCKET`, or no tick yet) — UNKNOWN, not healthy.
+        "lastDecision": decision_label(i.last_decision),
+        // Read it beside `lastDecision`: the watchdog thread ticks every
+        // few seconds, so an age far past `watchdogUsec` means it has stopped
+        // ticking and `lastDecision` is history, not health.
+        "lastDecisionAgeSecs": i.last_decision_age.map(|d| d.as_secs()),
+        // The last-good readiness snapshot the keepalive gate reads.
+        "readinessSnapshot": readiness_json(&i.readiness),
+    })
+}
+
+/// The `/health` `sdNotify` block: whether this runner is under a
+/// `Type=notify` unit, whether `READY=1` went out, and what the watchdog gate
+/// last decided. Never blocks (atomics plus one `try_lock`). That `try_lock`
+/// can contend with a watchdog tick's: the tick then reads `Unreadable` and
+/// keeps alive, and this read reports `"unreadable"` — both fail closed.
+pub fn health_json() -> serde_json::Value {
+    let at = LAST_DECISION_AT_MS.load(Ordering::SeqCst);
+    health_json_from(HealthInputs {
+        notify_socket: notify_socket().is_some(),
+        watchdog_interval: watchdog_interval(),
+        http_serving_for: HTTP_SERVING_SINCE.get().map(|t| t.elapsed()),
+        ci_subscription: CiSubscription::from_u8(CI_SUBSCRIPTION.load(Ordering::SeqCst)),
+        ready_sent: READY_LATCH.ready_sent.load(Ordering::SeqCst),
+        extend_sent: READY_LATCH.extend_sent.load(Ordering::SeqCst),
+        ci_builds_in_flight: ci_builds_in_flight(),
+        last_decision: LAST_DECISION.load(Ordering::SeqCst),
+        last_decision_age: (at > 0)
+            .then(|| Duration::from_millis(monotonic_ms().saturating_sub(at))),
+        readiness: readiness_view(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sd_health_json_reports_every_field_and_a_null_decision() {
+        let v = health_json_from(HealthInputs {
+            notify_socket: false,
+            watchdog_interval: None,
+            http_serving_for: None,
+            ci_subscription: CiSubscription::Pending,
+            ready_sent: false,
+            extend_sent: false,
+            ci_builds_in_flight: 0,
+            last_decision: 0,
+            last_decision_age: None,
+            readiness: ReadinessView::NeverRan,
+        });
+        assert!(v["lastDecisionAgeSecs"].is_null());
+        assert_eq!(v["notifySocket"], false);
+        assert!(v["watchdogUsec"].is_null());
+        assert!(v["httpServingSecs"].is_null());
+        assert_eq!(v["ciSubscription"], "pending");
+        assert!(v["lastDecision"].is_null());
+        assert_eq!(v["readinessSnapshot"]["state"], "never_ran");
+
+        let v = health_json_from(HealthInputs {
+            notify_socket: true,
+            watchdog_interval: Some(Duration::from_secs(180)),
+            http_serving_for: Some(Duration::from_secs(42)),
+            ci_subscription: CiSubscription::Up,
+            ready_sent: true,
+            extend_sent: true,
+            ci_builds_in_flight: 2,
+            last_decision: decision_code(Some(WatchdogDecision::Withhold)),
+            last_decision_age: Some(Duration::from_secs(7)),
+            readiness: published(true),
+        });
+        assert_eq!(v["lastDecisionAgeSecs"], 7);
+        assert_eq!(v["watchdogUsec"], 180_000_000u64);
+        assert_eq!(v["httpServingSecs"], 42);
+        assert_eq!(v["ciSubscription"], "up");
+        assert_eq!(v["readySent"], true);
+        assert_eq!(v["extendTimeoutSent"], true);
+        assert_eq!(v["ciBuildsInFlight"], 2);
+        assert_eq!(v["lastDecision"], "withhold");
+        assert_eq!(v["readinessSnapshot"]["state"], "published");
+        assert_eq!(v["readinessSnapshot"]["safeToRestart"], true);
+        assert_eq!(v["readinessSnapshot"]["source"], "census");
+    }
+
+    #[test]
+    fn sd_decision_codes_map_to_distinct_labels() {
+        let all = [
+            WatchdogDecision::Keepalive(KeepaliveReason::Healthy),
+            WatchdogDecision::Keepalive(KeepaliveReason::HostingWork),
+            WatchdogDecision::Keepalive(KeepaliveReason::ReadinessUnknown),
+            WatchdogDecision::Withhold,
+        ];
+        let labels: std::collections::HashSet<_> = all
+            .iter()
+            .map(|d| decision_label(decision_code(Some(*d))).expect("labelled"))
+            .collect();
+        assert_eq!(labels.len(), all.len());
+        assert_eq!(decision_label(decision_code(None)), None);
+    }
 
     fn published(safe: bool) -> ReadinessView {
         ReadinessView::Published(PublishedReadiness {

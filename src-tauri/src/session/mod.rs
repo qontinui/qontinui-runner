@@ -64,6 +64,7 @@ pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_identity; // THE seam that re-keys a pane's coord row to the harness id pid-exact evidence names — hook, rung 2, R2 resume (plan 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row, D1)
 pub mod coord_sync;
+pub(crate) mod coord_sync_finish_ack; // What a coord answer to the runner's `finished` PATCH proves — finish_synced is stamped only on an observed `finished` row (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 4)
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
@@ -96,6 +97,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // can read the same pin the proxy does — see the lib declaration for why.
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
+pub mod finish_heal; // Heal finished marks stamped synced over a write coord never applied; the finish read-back's coord.observed (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 5)
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod stray_wait; // Tells a wait loop that can never end from work, so a finished session it holds can close (plan 2026-10-23-finished-sessions-stay-busy-behind-background-wait-loops-that-can-never-exit, Phase 4)
 pub mod tracking_health;
@@ -592,7 +594,14 @@ pub struct SessionRegistry {
     sessions: Mutex<HashMap<Uuid, SessionRecord>>,
     transports: SessionTransports,
     coord_sync: coord_sync::CoordSync,
+    /// The re-key seam's observer ([`Self::attach_rekey_observer`]), told
+    /// `(coord row, harness id, evidence source)` each time the seam answers
+    /// `Queued` or `AlreadyCurrent`.
+    rekey_observer: std::sync::OnceLock<RekeyObserver>,
 }
+
+/// See [`SessionRegistry::attach_rekey_observer`].
+type RekeyObserver = Box<dyn Fn(Uuid, &str, coord_identity::RekeySource) + Send + Sync>;
 
 /// Bag of per-kind transports.
 pub struct SessionTransports {
@@ -956,7 +965,41 @@ impl SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             transports,
             coord_sync,
+            rekey_observer: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the re-key seam's observer (once, at startup; plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D2). [`coord_identity`]'s seam calls it with `(coord row, harness id,
+    /// source)`
+    /// whenever it answers `Queued` or `AlreadyCurrent` — through every door
+    /// that reaches it (`confirm_for_terminal`, and `confirm_for_session` from
+    /// the restored, deferred and resume retries) — AFTER
+    /// [`Self::confirm_claude_code_session_id`] has returned and outside every
+    /// registry lock, so the observer may read this registry. main.rs wires it
+    /// to `AiCoordRegistrar::note_pane_row`.
+    pub fn attach_rekey_observer(
+        &self,
+        f: impl Fn(Uuid, &str, coord_identity::RekeySource) + Send + Sync + 'static,
+    ) {
+        if self.rekey_observer.set(Box::new(f)).is_err() {
+            tracing::warn!("session registry: re-key observer already attached — ignoring");
+        }
+    }
+
+    /// Tell the re-key observer, if one is attached, that the seam confirmed
+    /// `claude_id` on `coord_session_id`. Must be called with no registry lock
+    /// held (see [`Self::attach_rekey_observer`]).
+    pub(crate) fn notify_rekey_confirmed(
+        &self,
+        coord_session_id: Uuid,
+        claude_id: &str,
+        source: coord_identity::RekeySource,
+    ) {
+        if let Some(f) = self.rekey_observer.get() {
+            f(coord_session_id, claude_id, source);
+        }
     }
 
     pub fn machine_id(&self) -> Uuid {
