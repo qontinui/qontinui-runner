@@ -65,7 +65,9 @@
 
 use std::path::{Path, PathBuf};
 
-use qontinui_types::paths::{qontinui_workspace_root, WorkspaceAnchor, WorkspaceRoot};
+use qontinui_types::paths::{
+    qontinui_workspace_root, WorkspaceAnchor, WorkspaceRoot, WorkspaceRootUnresolved,
+};
 use tracing::{info, warn};
 
 use crate::capability_manifest::CapabilityObservation;
@@ -346,34 +348,33 @@ pub fn workspace_root_observation() -> CapabilityObservation {
 /// a wrong answer materialises a worktree at a fabricated location or runs a
 /// script from one.
 ///
-/// The error is the shared `WorkspaceRootUnresolved` sentence, rendered: it
-/// names the next action (the Workspace root setting) and, when the operator
-/// set an input that was at fault, which one. That is the product-code
-/// counterpart of the plan's "ask rather than guess": a resolver running inside
-/// a background poller has no operator to ask, so it refuses loudly instead of
-/// guessing.
-pub fn require_workspace_root() -> Result<PathBuf, String> {
-    require_rendered(runner_workspace_root())
+/// The error is the one typed [`WorkspaceRootUnresolved`]: its `Display` is the
+/// shared operator sentence (the next action — the Workspace root setting — and,
+/// when the operator set an input that was at fault, which one), and an HTTP
+/// caller builds the refusal envelope from it rather than re-wording it. A
+/// `String`-error caller renders it with `.map_err(|e| e.to_string())`. That is
+/// the product-code counterpart of the plan's "ask rather than guess": a
+/// resolver running inside a background poller has no operator to ask, so it
+/// refuses loudly instead of guessing.
+pub fn require_workspace_root() -> Result<PathBuf, WorkspaceRootUnresolved> {
+    require_logged(runner_workspace_root())
 }
 
-/// The rejection [`require_rendered`] last logged. Some of its callers
+/// The rejection [`require_logged`] last logged. Some of its callers
 /// (`default_canonical_path`) run once per repository per sweep, so a stale
 /// input behind a working rung is logged when it appears or changes, not on
 /// every call.
 static LAST_LOGGED_REJECTION: std::sync::Mutex<Option<qontinui_types::paths::RejectedRoot>> =
     std::sync::Mutex::new(None);
 
-/// [`WorkspaceRoot::require`], with its typed `WorkspaceRootUnresolved` rendered
-/// through its `Display` — the one operator sentence `qontinui_types::paths`
-/// defines for this case — for the `String`-error callers of
-/// [`require_workspace_root`]. Split out so the rendering is testable against
-/// injected inputs.
+/// [`WorkspaceRoot::require`], logging what the typed error's `Display` leaves
+/// out. Split out so the disposition is testable against injected inputs.
 ///
 /// The sentence deliberately omits the full probe order (it would name
 /// variables an operator may never have heard of); that diagnostic is
-/// `WorkspaceRootUnresolved::detail`, which a `String` caller has nowhere to
-/// show, so it is logged here instead of being dropped.
-fn require_rendered(resolved: WorkspaceRoot) -> Result<PathBuf, String> {
+/// `WorkspaceRootUnresolved::detail`, which most callers have nowhere to show,
+/// so it is logged here instead of being dropped.
+fn require_logged(resolved: WorkspaceRoot) -> Result<PathBuf, WorkspaceRootUnresolved> {
     // Only when a lower rung answered: when nothing did, `detail()` below already
     // names the rejection.
     if resolved.root.is_some() {
@@ -395,7 +396,7 @@ fn require_rendered(resolved: WorkspaceRoot) -> Result<PathBuf, String> {
             "workspace_paths: workspace root unresolved — {}",
             e.detail()
         );
-        e.to_string()
+        e
     })
 }
 
@@ -651,7 +652,7 @@ mod tests {
     /// does not depend on how the machine running the suite is configured.
     #[test]
     fn the_fail_closed_disposition_reports_an_actionable_error() {
-        let err = require_rendered(resolve_workspace_root(
+        let err = require_logged(resolve_workspace_root(
             None,
             None,
             Some("relative/path"),
@@ -659,7 +660,8 @@ mod tests {
             None,
             None,
         ))
-        .expect_err("a relative configured root must not resolve");
+        .expect_err("a relative configured root must not resolve")
+        .to_string();
 
         assert!(
             err.contains("Workspace root setting is not an absolute path"),
