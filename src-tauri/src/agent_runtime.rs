@@ -12630,6 +12630,11 @@ async fn report_spawn_failed(
 /// caller that had a child. A trust-gate refusal never started one, and
 /// reporting it as `exited` would tell coord a process ran and stopped — so that
 /// one call site says [`SpawnPhase::Blocked`] instead.
+///
+/// One live attempt; a report that does not reach coord is spooled to the
+/// session outbox for the `CoordSync` drain to replay (see
+/// [`settle_spawn_failed_report`]), so a transient outage no longer leaves
+/// coord counting the allocation in flight until its horizon.
 async fn report_spawn_failed_in_phase(
     agent_id: uuid::Uuid,
     reason: &str,
@@ -12638,13 +12643,15 @@ async fn report_spawn_failed_in_phase(
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
 ) {
-    let _ = post_spawn_failed(
+    let body = spawn_failed_body(reason, exit_code, restarts_attempted, push_ref, spawn_phase);
+    let spool = crate::session::closeout_spool::global();
+    settle_spawn_failed_report(
         agent_id,
-        reason,
-        exit_code,
-        restarts_attempted,
-        push_ref,
-        spawn_phase,
+        &body,
+        1,
+        launch_deferral_retry_delay,
+        || post_spawn_failed(agent_id, &body),
+        spool.as_deref(),
     )
     .await;
 }
@@ -12662,34 +12669,39 @@ enum SpawnReportOutcome {
     Undelivered,
 }
 
-/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
-/// two arms that used to return silently (no coord base, no client).
-async fn post_spawn_failed(
-    agent_id: uuid::Uuid,
+/// The `spawn-failed` request body — built once per report, so every live
+/// attempt and the spooled replay send the same bytes.
+fn spawn_failed_body(
     reason: &str,
     exit_code: Option<i64>,
     restarts_attempted: u32,
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
-) -> SpawnReportOutcome {
+) -> SpawnFailedBody {
+    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
+        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
+    } else {
+        (None, SpawnPrContext::default())
+    };
+    SpawnFailedBody {
+        reason: reason.to_string(),
+        exit_code,
+        restarts_attempted: Some(restarts_attempted),
+        phase,
+        pr_context,
+    }
+}
+
+/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
+/// two arms that used to return silently (no coord base, no client).
+async fn post_spawn_failed(agent_id: uuid::Uuid, body: &SpawnFailedBody) -> SpawnReportOutcome {
+    let reason = body.reason.as_str();
     let Some(base) = connected_coord_base() else {
         warn!(
             "agent_runtime: spawn-failed NOT posted agent_id={agent_id} — no connected coord \
              base; reason={reason}"
         );
         return SpawnReportOutcome::Undelivered;
-    };
-    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
-        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
-    } else {
-        (None, SpawnPrContext::default())
-    };
-    let body = SpawnFailedBody {
-        reason: reason.to_string(),
-        exit_code,
-        restarts_attempted: Some(restarts_attempted),
-        phase,
-        pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -12710,7 +12722,7 @@ async fn post_spawn_failed(
     // agent) is classed Rejected below and not retried.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
-        .json(&body)
+        .json(body)
         .send()
         .await
     {
@@ -12728,7 +12740,16 @@ async fn post_spawn_failed(
             }
         }
         Err(e) => {
-            warn!("agent_runtime: spawn-failed POST agent_id={agent_id} failed: {e:#}");
+            // The FULL source chain, tagged `[timeout]` / `[connect]`:
+            // reqwest's own Display is only "error sending request for url
+            // (…)", which on 2026-11-14 hid whether 296 failures on spaceship
+            // were timeouts (plan
+            // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+            // Phase 6 step 1).
+            warn!(
+                "agent_runtime: spawn-failed POST agent_id={agent_id} failed: {}",
+                crate::session::coord_sync::transport_error(&e)
+            );
             SpawnReportOutcome::Undelivered
         }
     }
@@ -12751,23 +12772,116 @@ fn launch_deferral_should_retry(outcome: SpawnReportOutcome) -> bool {
     outcome == SpawnReportOutcome::Undelivered
 }
 
-/// Report a load-deferred launch to coord, with a bounded retry. Phase
-/// `blocked`: the launch was refused before any child existed.
+/// Report a load-deferred launch to coord, with a bounded retry, spooling it
+/// durably when every attempt is undelivered. Phase `blocked`: the launch was
+/// refused before any child existed.
 async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
-    for attempt in 0..LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
-        let outcome = post_spawn_failed(agent_id, reason, None, 0, None, SpawnPhase::Blocked).await;
+    let body = spawn_failed_body(reason, None, 0, None, SpawnPhase::Blocked);
+    let spool = crate::session::closeout_spool::global();
+    settle_spawn_failed_report(
+        agent_id,
+        &body,
+        LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+        launch_deferral_retry_delay,
+        || post_spawn_failed(agent_id, &body),
+        spool.as_deref(),
+    )
+    .await;
+}
+
+/// What finally became of one `spawn-failed` report.
+#[derive(Debug, Clone)]
+enum ReportSettlement {
+    /// coord took it (2xx).
+    Delivered,
+    /// coord refused it (4xx) — its verdict; never spooled.
+    Rejected,
+    /// Undelivered after every live attempt, and written to the session outbox
+    /// for the `CoordSync` drain to replay.
+    Spooled(crate::session::closeout_spool::Spooled),
+    /// Undelivered and NOT durably kept: no spool is installed (a headless
+    /// harness) or the outbox write failed. Logged at warn as lost.
+    Lost,
+}
+
+/// Post one report up to `attempts` times (retrying only the undelivered
+/// class, with `retry_delay` between attempts), then settle it: a report still
+/// UNDELIVERED is spooled to the session outbox ([`crate::session::spawn_report_spool`])
+/// so the `CoordSync` drain replays it under the device credential. A 4xx is
+/// coord's verdict and stays one — it is never spooled.
+///
+/// Plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 6 (D6): before this, a deferral undelivered after its 3 attempts was
+/// logged and dropped, and coord counted the allocation in flight for 7200 s.
+async fn settle_spawn_failed_report<P, Fut>(
+    agent_id: uuid::Uuid,
+    body: &SpawnFailedBody,
+    attempts: u32,
+    retry_delay: fn(u32) -> Duration,
+    mut post: P,
+    spool: Option<&crate::session::closeout_spool::CloseoutSpool>,
+) -> ReportSettlement
+where
+    P: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SpawnReportOutcome>,
+{
+    let mut outcome = SpawnReportOutcome::Undelivered;
+    for attempt in 0..attempts {
+        outcome = post().await;
         if !launch_deferral_should_retry(outcome) {
-            return;
+            break;
         }
-        if attempt + 1 < LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
-            tokio::time::sleep(launch_deferral_retry_delay(attempt)).await;
+        if attempt + 1 < attempts {
+            tokio::time::sleep(retry_delay(attempt)).await;
         }
     }
-    warn!(
-        "agent_runtime: launch deferral for agent_id={agent_id} NOT delivered after \
-         {LAUNCH_DEFERRAL_REPORT_ATTEMPTS} attempts — coord keeps counting the allocation \
-         in-flight until its own horizon; reason={reason}"
-    );
+    match outcome {
+        SpawnReportOutcome::Delivered => ReportSettlement::Delivered,
+        SpawnReportOutcome::Rejected => ReportSettlement::Rejected,
+        SpawnReportOutcome::Undelivered => spool_undelivered_report(agent_id, body, attempts, spool),
+    }
+}
+
+/// The undelivered arm of [`settle_spawn_failed_report`].
+fn spool_undelivered_report(
+    agent_id: uuid::Uuid,
+    body: &SpawnFailedBody,
+    attempts: u32,
+    spool: Option<&crate::session::closeout_spool::CloseoutSpool>,
+) -> ReportSettlement {
+    let reason = body.reason.as_str();
+    let Some(spool) = spool else {
+        warn!(
+            "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after {attempts} \
+             attempt(s) and NO durable spool is installed — LOST; coord keeps counting the \
+             allocation in-flight until its own horizon; reason={reason}"
+        );
+        return ReportSettlement::Lost;
+    };
+    let written = serde_json::to_value(body)
+        .map_err(std::io::Error::other)
+        .and_then(|json| {
+            crate::session::spawn_report_spool::spool_spawn_failed(spool, agent_id, &json)
+        });
+    match written {
+        Ok(spooled) => {
+            warn!(
+                "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after \
+                 {attempts} attempt(s) — spooled to the session outbox (lane {}, seq {}); the \
+                 coord drain replays it; reason={reason}",
+                spooled.session_id, spooled.seq
+            );
+            ReportSettlement::Spooled(spooled)
+        }
+        Err(e) => {
+            warn!(
+                "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after \
+                 {attempts} attempt(s) and the outbox spool FAILED ({e}) — LOST; coord keeps \
+                 counting the allocation in-flight until its own horizon; reason={reason}"
+            );
+            ReportSettlement::Lost
+        }
+    }
 }
 
 // =============================================================================
@@ -19697,6 +19811,121 @@ mod tests {
             total <= Duration::from_secs(10),
             "total backoff stays small"
         );
+    }
+
+    fn report_spool_in(
+        dir: &std::path::Path,
+    ) -> (
+        crate::session::closeout_spool::CloseoutSpool,
+        std::sync::Arc<crate::session::local_store::OutboxWriter>,
+    ) {
+        let outbox = std::sync::Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.join("outbox.jsonl")).unwrap(),
+        );
+        (
+            crate::session::closeout_spool::CloseoutSpool::new(outbox.clone(), uuid::Uuid::new_v4()),
+            outbox,
+        )
+    }
+
+    /// A launch deferral every live attempt failed to deliver is SPOOLED to
+    /// the session outbox — on the agent's lane, carrying the deferral reason
+    /// and phase — not logged and dropped (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 6).
+    ///
+    /// Mutation: return `ReportSettlement::Lost` before the spool write in
+    /// `spool_undelivered_report` (the outbox stays empty).
+    #[tokio::test]
+    async fn an_undelivered_launch_deferral_is_spooled_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spool, outbox) = report_spool_in(dir.path());
+        let agent_id = uuid::Uuid::new_v4();
+        let reason = "deferred_load:thread_pressure:warn:380_over_376";
+        let body = spawn_failed_body(reason, None, 0, None, SpawnPhase::Blocked);
+        let posts = std::cell::Cell::new(0_u32);
+        let settled = settle_spawn_failed_report(
+            agent_id,
+            &body,
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                posts.set(posts.get() + 1);
+                async { SpawnReportOutcome::Undelivered }
+            },
+            Some(&spool),
+        )
+        .await;
+        assert_eq!(posts.get(), LAUNCH_DEFERRAL_REPORT_ATTEMPTS, "every attempt spent first");
+        assert!(matches!(settled, ReportSettlement::Spooled(_)), "{settled:?}");
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one durable row");
+        let row = &pending[0];
+        assert_eq!(row.event_kind, "spawn_failed_report");
+        assert_eq!(
+            row.session_id,
+            crate::session::spawn_report_spool::spawn_report_lane(agent_id)
+        );
+        let (replay_agent, replay_body) =
+            crate::session::spawn_report_spool::replay_target(&row.payload).expect("replayable");
+        assert_eq!(replay_agent, agent_id);
+        assert_eq!(replay_body["reason"], reason);
+        assert_eq!(replay_body, serde_json::to_value(&body).unwrap(), "the live body, verbatim");
+        if spawn_outcome_enrichment_enabled() {
+            assert_eq!(replay_body["phase"], "blocked");
+        }
+
+        // No spool installed: the loss is reported as a loss, never as kept.
+        let lost = settle_spawn_failed_report(
+            agent_id,
+            &body,
+            1,
+            |_| Duration::ZERO,
+            || async { SpawnReportOutcome::Undelivered },
+            None,
+        )
+        .await;
+        assert!(matches!(lost, ReportSettlement::Lost), "{lost:?}");
+    }
+
+    /// A 4xx is coord's verdict on the report: not retried, not spooled.
+    /// A delivered report is not spooled either.
+    ///
+    /// Mutation: spool on `Rejected` too (the outbox gains a row), or retry it.
+    #[tokio::test]
+    async fn a_4xx_spawn_failed_is_not_spooled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spool, outbox) = report_spool_in(dir.path());
+        let body = spawn_failed_body("spawn failure: x", Some(1), 0, None, SpawnPhase::Exited);
+        let posts = std::cell::Cell::new(0_u32);
+        let settled = settle_spawn_failed_report(
+            uuid::Uuid::new_v4(),
+            &body,
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                posts.set(posts.get() + 1);
+                async { SpawnReportOutcome::Rejected }
+            },
+            Some(&spool),
+        )
+        .await;
+        assert!(matches!(settled, ReportSettlement::Rejected), "{settled:?}");
+        assert_eq!(posts.get(), 1, "a 4xx is not retried");
+        assert!(outbox.pending().unwrap().is_empty(), "a 4xx is never spooled");
+
+        let delivered = settle_spawn_failed_report(
+            uuid::Uuid::new_v4(),
+            &body,
+            1,
+            |_| Duration::ZERO,
+            || async { SpawnReportOutcome::Delivered },
+            Some(&spool),
+        )
+        .await;
+        assert!(matches!(delivered, ReportSettlement::Delivered), "{delivered:?}");
+        assert!(outbox.pending().unwrap().is_empty());
     }
 
     /// The fixed count cap is GONE (operator direction 2026-10-03): with
