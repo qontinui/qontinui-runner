@@ -457,14 +457,33 @@ impl LiveClaudeProcess {
 /// Windows — and a `bash` holding one `python3` it started in the first minute
 /// of a session spawned WITH a prompt is, image for image and second for
 /// second, the same tree as a `bash -c` MCP wrapper. Only argv tells them
-/// apart, and the census carries none. Claude Code runs no tool under `cmd`
-/// (its tool shells are `bash` and PowerShell), so a direct `cmd` child of a
-/// `claude` is its own MCP launch.
+/// apart, and the census carries none.
+///
+/// A `cmd` child is NOT always an MCP launch: Claude Code's PowerShell tool
+/// runs under one too (`cmd.exe /d /s /c ""…chcp.com" 65001 >nul &
+/// "…powershell.exe" …"`, measured as a direct child of `claude`). What keeps
+/// a tool shell from reading as infrastructure is the wrapper's grandchild: a
+/// `cmd` holding `powershell` holds a shell ([`WORK_CHILD_IMAGES`]), and one
+/// holding the launcher's transient `chcp` holds a non-server
+/// ([`WRAPPER_NON_SERVER_IMAGES`]) — both read as work.
+///
+/// Residual, toward closing early: a boot-time `shell: true` spawn of one
+/// non-shell program that is NOT an MCP server — a `SessionStart` hook run as
+/// `cmd` → `python3 hook.py` — reads as infrastructure while it lives. Hooks
+/// run while the session starts, never beside a `finished` verdict, which is
+/// the only reading this exemption can change the outcome of.
 pub const MCP_WRAPPER_SHELL_IMAGES: [&str; 1] = ["cmd"];
 
 /// The console host Windows attaches under a console process started from a
 /// hidden-console parent: the wrapper's plumbing, never the server.
 const CONSOLE_HOST_IMAGES: [&str; 1] = ["conhost"];
+
+/// Grandchildren that prove a `cmd` is NOT wrapping a server: `chcp`, the
+/// code-page step Claude Code's PowerShell-tool launcher runs before
+/// `powershell` (`cmd` → {`conhost`, `chcp`} is that launcher mid-start). It
+/// is `chcp.com`, and [`normalize_image`] strips only `.exe`, so both
+/// spellings are listed.
+const WRAPPER_NON_SERVER_IMAGES: [&str; 2] = ["chcp", "chcp.com"];
 
 /// PURE: is `kid` (a direct child of the `claude` `parent`) a shell WRAPPING
 /// one stdio MCP server Claude Code started while the session booted — and so
@@ -477,10 +496,12 @@ const CONSOLE_HOST_IMAGES: [&str; 1] = ["conhost"];
 ///   `parent` both have known creation times, `kid`'s inside
 ///   [`SESSION_START_CHILD_WINDOW_S`] of `parent`'s;
 /// - leaving out console hosts, `kid` has EXACTLY ONE child, whose image is
-///   readable and is neither a shell nor a `claude` ([`WORK_CHILD_IMAGES`]): a
-///   wrapper holding a shell is a command line, one holding a `claude` a nested
-///   agent, one holding two processes not a single server's launch, and one
-///   holding nothing (no `parent_map` entry) a bare shell;
+///   readable and is neither a shell nor a `claude` ([`WORK_CHILD_IMAGES`]) nor
+///   a [`WRAPPER_NON_SERVER_IMAGES`] step: a wrapper holding a shell is a
+///   command line (the PowerShell tool's `cmd` → `powershell` among them), one
+///   holding `chcp` that same launcher mid-start, one holding a `claude` a
+///   nested agent, one holding two processes not a single server's launch, and
+///   one holding nothing (no `parent_map` entry) a bare shell;
 /// - that one child also has a known creation time inside the window of
 ///   `parent`;
 /// - every console host's image is readable (an unreadable sibling could be
@@ -529,7 +550,11 @@ pub fn is_mcp_server_shell_wrapper(kid: u32, parent: u32, snapshot: &ProcessSnap
             return false;
         }
     }
-    server.is_some_and(|(pid, name)| !WORK_CHILD_IMAGES.contains(&name.as_str()) && in_window(pid))
+    server.is_some_and(|(pid, name)| {
+        !WORK_CHILD_IMAGES.contains(&name.as_str())
+            && !WRAPPER_NON_SERVER_IMAGES.contains(&name.as_str())
+            && in_window(pid)
+    })
 }
 
 /// Does `kid`, a direct child of the `claude` `parent`, count as WORK, read
@@ -2501,6 +2526,55 @@ mod tests {
         assert_eq!(row.has_live_children, Some(false));
     }
 
+    /// Phase 7b, through the census entry ONLY: the measured Windows session
+    /// (finding `a1e753fd`) — `claude` → `cmd.exe` (+1 s) → {`conhost.exe`,
+    /// `python3.exe` (+1 s)} — read by `evaluate`, the pass every
+    /// `has_live_children` consumer (restart-readiness, wind-down) is fed by.
+    ///
+    /// Mutation caught: remove the wrapper look-through (the `cmd` child read
+    /// by its image alone) and the row reads `Some(true)`.
+    #[test]
+    fn a_boot_time_mcp_wrapper_session_reads_no_live_children() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let born = now_s - 3_600;
+        let snap = snap_with(
+            &[(1, &[40]), (40, &[400]), (400, &[4000, 4001])],
+            &[
+                (40, born),
+                (400, born + 1),
+                (4000, born + 1),
+                (4001, born + 1),
+            ],
+            &[
+                (40, "claude.exe"),
+                (400, "C:\\Windows\\System32\\cmd.exe"),
+                (4000, "C:\\Windows\\System32\\conhost.exe"),
+                (4001, "C:\\Python312\\python3.exe"),
+            ],
+        );
+        let agent_runtime: HashSet<u32> = [40u32].into_iter().collect();
+        let report = evaluate(
+            &snap,
+            1,
+            &[],
+            &HashMap::new(),
+            &agent_runtime,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+            &HolderCensus::default(),
+        );
+        let row = report
+            .headless_exempt
+            .iter()
+            .find(|p| p.pid == 40)
+            .expect("claude 40 is in the census");
+        assert_eq!(row.has_live_children, Some(false));
+    }
+
     /// Phase 7b: everything that is NOT exactly a boot-time wrapper of one
     /// non-shell server keeps counting as work, because the reading gates a
     /// session close. One case per condition of `is_mcp_server_shell_wrapper`;
@@ -2626,6 +2700,55 @@ mod tests {
         let mut no_parent_time = tree(boot, &[conhost, python]);
         no_parent_time.creation_times.remove(&parent);
         assert!(is_work(&no_parent_time), "claude start unknown");
+        // A creation time of 0 is an unread one, not the epoch. With all three
+        // at 0 every gap is 0 s, so only the `s > 0` filter keeps this work;
+        // each one alone at 0 is work too.
+        let zero = Some(0);
+        let mut all_zero = tree(
+            zero,
+            &[
+                (3000, Some("conhost.exe"), zero),
+                (3001, Some("python3.exe"), zero),
+            ],
+        );
+        all_zero.creation_times.insert(parent, 0);
+        assert!(is_work(&all_zero), "claude, wrapper and server all at 0");
+        let mut parent_zero = tree(
+            Some(1),
+            &[
+                (3000, Some("conhost.exe"), Some(1)),
+                (3001, Some("python3.exe"), Some(1)),
+            ],
+        );
+        parent_zero.creation_times.insert(parent, 0);
+        assert!(is_work(&parent_zero), "claude created at 0");
+        assert!(
+            is_work(&tree(zero, &[conhost, python])),
+            "wrapper created at 0"
+        );
+        assert!(
+            is_work(&tree(boot, &[conhost, (3001, Some("python3.exe"), zero)])),
+            "server created at 0"
+        );
+        // Claude Code's PowerShell-tool launcher is a `cmd` child of `claude`
+        // too: mid-start it holds `chcp`, then `powershell`. Neither is a server.
+        assert!(
+            is_work(&tree(
+                boot,
+                &[
+                    conhost,
+                    (3001, Some("C:\\Windows\\System32\\chcp.com"), boot)
+                ]
+            )),
+            "cmd -> {{conhost, chcp}} is the PowerShell tool launching"
+        );
+        assert!(
+            is_work(&tree(
+                boot,
+                &[conhost, (3001, Some("powershell.exe"), boot)]
+            )),
+            "cmd -> {{conhost, powershell}} is the PowerShell tool"
+        );
         // Only `cmd` is looked through: a `bash`/`sh` holding one boot-time
         // python3 is the Bash tool's shape too, and argv is not in the census.
         for shell in ["bash", "sh", "/usr/bin/bash", "pwsh.exe"] {

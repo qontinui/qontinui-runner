@@ -21,8 +21,10 @@
 //! still refuses any session whose `claude` holds a child process, and that
 //! count has no image or age filter, so the stdio MCP servers a session starts
 //! at boot (a fleet session holds `coord-mcp-shim.py`) keep it open. The
-//! boot-time MCP exemption in `tracking_health::child_signals_work` changes
-//! only the idleness reading; it does not reach that refusal.
+//! boot-time MCP exemption in `tracking_health::child_signals_work_in` —
+//! including its look-through of the `cmd.exe` Claude Code wraps a stdio MCP
+//! server in on Windows (`tracking_health::is_mcp_server_shell_wrapper`) —
+//! changes only the idleness reading; it does not reach that refusal.
 //!
 //! ## The switch (D3)
 //!
