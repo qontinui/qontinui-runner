@@ -820,7 +820,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
           />
           <p className="text-[10px] text-muted-foreground">
-            Free space required on the QONTINUI_ROOT volume to START a build. Cannot be 0 — a zero
+            Free space required on the Workspace root volume to START a build. Cannot be 0 — a zero
             floor disables the guard rather than relaxing it.
           </p>
         </div>
