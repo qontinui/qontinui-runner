@@ -2951,6 +2951,30 @@ impl SessionLifecycleStore {
         finished: bool,
         reason: Option<String>,
     ) -> Result<FinishOutcome, SetFinishedError> {
+        self.set_finished_inner(claude_session_id, finished, reason, false)
+    }
+
+    /// Mark `claude_session_id` finished with `reason` ONLY if it is not
+    /// finished already — decided under the same locks as the write, so a
+    /// session that finished itself concurrently keeps its own mark and reason
+    /// (a reason-carrying [`Self::set_finished`] would restamp it). An already
+    /// finished record is returned unchanged (`FinishChange::None`, nothing
+    /// forwarded).
+    pub fn set_finished_if_unfinished(
+        &self,
+        claude_session_id: &str,
+        reason: String,
+    ) -> Result<FinishOutcome, SetFinishedError> {
+        self.set_finished_inner(claude_session_id, true, Some(reason), true)
+    }
+
+    fn set_finished_inner(
+        &self,
+        claude_session_id: &str,
+        finished: bool,
+        reason: Option<String>,
+        only_if_unfinished: bool,
+    ) -> Result<FinishOutcome, SetFinishedError> {
         // Held to the end of this call: see `finish_forward`. It guards no
         // data, so a poisoned guard is simply taken over.
         let _forward = self
@@ -2968,6 +2992,13 @@ impl SessionLifecycleStore {
         let rec = m
             .get_mut(claude_session_id)
             .ok_or(SetFinishedError::UnknownSession)?;
+        if only_if_unfinished && rec.finished_at.is_some() {
+            return Ok(FinishOutcome {
+                record: rec.clone(),
+                changed: FinishChange::None,
+                coord: FinishSync::LocalOnly(LocalOnlyReason::NotRequeued),
+            });
+        }
 
         // A blank reason is no reason.
         let reason = non_empty(reason);
