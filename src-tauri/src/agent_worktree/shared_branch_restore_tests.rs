@@ -654,3 +654,240 @@ fn an_unanswered_claude_read_adds_no_block() {
     // The roster half is unconditional and still applied.
     assert!(exclude(&c).lines().any(|l| l.trim() == ".mcp.json"));
 }
+
+// ------------------------------------------------ block bytes and guards
+
+fn exclude_path(c: &Canon) -> PathBuf {
+    c.path.join(".git").join("info").join("exclude")
+}
+
+fn write_exclude(c: &Canon, bytes: &[u8]) {
+    let path = exclude_path(c);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn read_exclude_bytes(c: &Canon) -> Vec<u8> {
+    std::fs::read(exclude_path(c)).unwrap()
+}
+
+/// The block `add_allocation_excludes` writes for `branch`, with `eol`.
+fn block_text(branch: &str, eol: &str) -> String {
+    let mut s = format!("{BLOCK_BEGIN}{branch}{eol}");
+    for pat in PROVISIONED_CLAUDE_EXCLUDES {
+        s.push_str(pat);
+        s.push_str(eol);
+    }
+    s.push_str(&format!("{BLOCK_END}{branch}{eol}"));
+    s
+}
+
+#[test]
+fn removal_keeps_crlf_line_endings_outside_the_block() {
+    let c = Canon::new();
+    let before = format!("a\r\n{}b\r\n", block_text(AGENT_BRANCH, "\r\n"));
+    write_exclude(&c, before.as_bytes());
+
+    remove_allocation_excludes(&c.path, AGENT_BRANCH);
+
+    assert_eq!(read_exclude_bytes(&c), b"a\r\nb\r\n".to_vec());
+}
+
+#[test]
+fn removal_keeps_a_missing_final_newline() {
+    let c = Canon::new();
+    let before = format!("a\n{}b", block_text(AGENT_BRANCH, "\n"));
+    write_exclude(&c, before.as_bytes());
+
+    remove_allocation_excludes(&c.path, AGENT_BRANCH);
+
+    assert_eq!(read_exclude_bytes(&c), b"a\nb".to_vec());
+}
+
+#[test]
+fn removal_spares_another_branchs_block_even_one_this_branch_prefixes() {
+    let c = Canon::new();
+    // `agent/sb-test` is a prefix of `agent/sb-test-2`; that block comes first.
+    let other = format!("{AGENT_BRANCH}-2");
+    let before = format!(
+        "a\n{}{}b\n",
+        block_text(&other, "\n"),
+        block_text(AGENT_BRANCH, "\n")
+    );
+    write_exclude(&c, before.as_bytes());
+
+    remove_allocation_excludes(&c.path, AGENT_BRANCH);
+
+    assert_eq!(
+        String::from_utf8(read_exclude_bytes(&c)).unwrap(),
+        format!("a\n{}b\n", block_text(&other, "\n"))
+    );
+}
+
+#[test]
+fn a_begin_line_with_no_end_is_left_alone() {
+    let c = Canon::new();
+    let before = format!("a\n{BLOCK_BEGIN}{AGENT_BRANCH}\n.claude/commands/\nb\n");
+    write_exclude(&c, before.as_bytes());
+
+    remove_allocation_excludes(&c.path, AGENT_BRANCH);
+
+    assert_eq!(read_exclude_bytes(&c), before.into_bytes());
+}
+
+#[test]
+fn a_non_utf8_exclude_file_is_never_rewritten() {
+    let c = Canon::new();
+    let mut before = b"op\xff\n".to_vec();
+    before.extend_from_slice(block_text(AGENT_BRANCH, "\n").as_bytes());
+    write_exclude(&c, &before);
+
+    remove_allocation_excludes(&c.path, AGENT_BRANCH);
+    assert_eq!(read_exclude_bytes(&c), before, "remove left it as is");
+
+    assert!(add_allocation_excludes(&c.path, "agent/other").is_err());
+    assert_eq!(read_exclude_bytes(&c), before, "add left it as is");
+}
+
+#[test]
+fn a_context_that_switched_nothing_leaves_a_live_allocations_block_alone() {
+    let c = Canon::new();
+    git(&c.path, &["checkout", "-q", "-b", AGENT_BRANCH]);
+    // A LIVE allocation on the same branch owns this block.
+    add_allocation_excludes(&c.path, AGENT_BRANCH).expect("add");
+    let sb = c.switch();
+    assert_eq!(sb.prior_ref, sb.branch, "this allocation switched nothing");
+    let ctx = shared_branch_context(&c, &sb, "sb-noswitch-agent");
+
+    drop(ctx);
+
+    assert!(
+        has_block(&c),
+        "the live allocation's block survives: {:?}",
+        exclude(&c)
+    );
+    forget_live_for_test(&c.path, AGENT_BRANCH);
+}
+
+// ------------------------------------------------------- the stale sweep
+
+/// A switched checkout whose runner went away without removing its block:
+/// the checkout was put back by hand and the process forgot the allocation.
+fn abandoned_block() -> Canon {
+    let c = Canon::new();
+    seed_operator_line(&c);
+    c.switch();
+    append_operator_line(&c);
+    forget_live_for_test(&c.path, AGENT_BRANCH);
+    assert!(has_block(&c));
+    c
+}
+
+fn kept(out: &[SweepOutcome]) -> bool {
+    matches!(out, [SweepOutcome::Kept { .. }])
+}
+
+#[test]
+fn the_sweep_removes_a_stale_block() {
+    let c = abandoned_block();
+    git(&c.path, &["checkout", "-q", "main"]);
+
+    let out = sweep_stale_blocks(&c.path, |_| HolderState::Free);
+
+    assert_eq!(
+        out,
+        vec![SweepOutcome::Removed {
+            branch: AGENT_BRANCH.into()
+        }]
+    );
+    assert_block_removed_and_operator_visible(&c);
+}
+
+#[test]
+fn the_sweep_keeps_a_block_on_the_current_head_with_a_live_holder() {
+    let c = abandoned_block();
+    let out = sweep_stale_blocks(&c.path, |_| HolderState::Held);
+    assert!(kept(&out), "{out:?}");
+    assert!(has_block(&c));
+}
+
+#[test]
+fn the_sweep_keeps_a_block_on_the_current_head_even_with_no_holder() {
+    let c = abandoned_block();
+    let out = sweep_stale_blocks(&c.path, |_| HolderState::Free);
+    assert!(kept(&out), "{out:?}");
+    assert!(has_block(&c));
+}
+
+#[test]
+fn the_sweep_keeps_a_block_whose_checkout_has_a_live_holder() {
+    let c = abandoned_block();
+    git(&c.path, &["checkout", "-q", "main"]);
+    let out = sweep_stale_blocks(&c.path, |_| HolderState::Held);
+    assert!(kept(&out), "{out:?}");
+    assert!(has_block(&c));
+}
+
+#[test]
+fn the_sweep_keeps_a_block_when_the_holder_is_unknown() {
+    let c = abandoned_block();
+    git(&c.path, &["checkout", "-q", "main"]);
+    let out = sweep_stale_blocks(&c.path, |_| HolderState::Unknown("no answer".into()));
+    assert!(kept(&out), "{out:?}");
+    assert!(has_block(&c));
+}
+
+#[test]
+fn the_sweep_removes_a_block_whose_branch_is_gone() {
+    let c = abandoned_block();
+    git(&c.path, &["checkout", "-q", "main"]);
+    git(&c.path, &["branch", "-q", "-D", AGENT_BRANCH]);
+    let out = sweep_stale_blocks(&c.path, |_| HolderState::Unknown("no answer".into()));
+    assert_eq!(
+        out,
+        vec![SweepOutcome::Removed {
+            branch: AGENT_BRANCH.into()
+        }]
+    );
+    assert_block_removed_and_operator_visible(&c);
+}
+
+/// The wired sweep: this process's own live allocation is never swept even
+/// when coord reports no holder; once the process has forgotten it (an exit or
+/// crash), coord's `null` holder lets the sweep reap the block.
+#[tokio::test]
+async fn the_wired_sweep_spares_this_process_live_allocation_and_reaps_a_forgotten_one() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _amb = super::super::test_coord::isolate();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        // coord's `by-resource` answer for an unheld checkout: `null`.
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull",
+                )
+                .await;
+        }
+    });
+    let c = Canon::new();
+    seed_operator_line(&c);
+    c.switch();
+    append_operator_line(&c);
+    git(&c.path, &["checkout", "-q", "main"]);
+
+    sweep_checkout(c.path.clone(), Some(base.clone())).await;
+    assert!(
+        has_block(&c),
+        "this process's live allocation is never swept"
+    );
+
+    forget_live_for_test(&c.path, AGENT_BRANCH);
+    sweep_checkout(c.path.clone(), Some(base)).await;
+    assert_block_removed_and_operator_visible(&c);
+}
