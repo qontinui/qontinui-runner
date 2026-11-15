@@ -7794,6 +7794,24 @@ mod read_value_payload_tests {
         assert!(p["params"].get("windowLabel").is_none());
     }
 
+    /// The relay `/sdk/page/read-value` IPC fallback must build its payload
+    /// with the same helper, or a `windowLabel` there lands inside `params`
+    /// and the read silently targets the main window.
+    #[test]
+    fn the_relay_fallback_uses_the_same_payload_builder() {
+        let src = include_str!("../sdk_client.rs");
+        let start = src
+            .find("\nasync fn handle_read_value(")
+            .expect("handle_read_value exists");
+        let end = start + src[start + 1..].find("\n}\n").expect("fn end") + 1;
+        let body = &src[start..end];
+        assert!(
+            body.contains("read_value_ipc_payload(&body)"),
+            "handle_read_value must build its IPC payload via read_value_ipc_payload"
+        );
+        assert!(!body.contains(r#"json!({ "params": body })"#));
+    }
+
     #[test]
     fn absent_window_label_is_empty_for_the_main_window() {
         let p = read_value_ipc_payload(&json!({"selector":"#a"}));
