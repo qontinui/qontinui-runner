@@ -3653,6 +3653,49 @@ mod tests {
             && is_postmaster_of(facts.postmaster_pid, &facts.data_dir)
     }
 
+    /// Ends a child's postmaster, once it is proven to be the child's
+    /// ([`reap_postmaster`]), and removes the child's root when a child-process
+    /// self-test ends — above all when it ends in a panic, which is when the
+    /// child left them: a red run must not leave a live cluster on a shared or
+    /// self-hosted runner. A no-op when both are already gone.
+    struct ReapChildCluster(Option<EmbeddedFacts>);
+
+    impl ReapChildCluster {
+        /// Armed with the cluster the child reported, if it reported one: taken
+        /// before anything about the child is asserted, so no assertion can
+        /// fail ahead of it and leave that cluster running.
+        fn reported(report: &Path) -> Self {
+            Self(
+                std::fs::read_to_string(report)
+                    .ok()
+                    .as_deref()
+                    .and_then(parse_facts),
+            )
+        }
+    }
+
+    impl Drop for ReapChildCluster {
+        fn drop(&mut self) {
+            if let Some(facts) = self.0.take() {
+                let ended = reap_postmaster(&facts.root, Some(facts.postmaster_pid));
+                let removed = if !facts.root.exists() {
+                    "already gone".to_string()
+                } else {
+                    match remove_dir_all_retrying(&facts.root) {
+                        Ok(()) => "removed".to_string(),
+                        Err(e) => format!("NOT removed ({e})"),
+                    }
+                };
+                if std::thread::panicking() {
+                    say(format!(
+                        "after a failed child-process self-test: {ended}; root {} {removed}",
+                        facts.root.display()
+                    ));
+                }
+            }
+        }
+    }
+
     /// A test process whose tests all pass leaves neither its postmaster nor its
     /// root behind: the `atexit` teardown stops one and removes the other.
     #[test]
@@ -3660,6 +3703,7 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let report = scratch.path().join("child-report");
         let run = run_child("pass", &report, None);
+        let _reap = ReapChildCluster::reported(&report);
         assert!(
             run.status.success(),
             "the passing child failed:\n{}",
@@ -3700,6 +3744,7 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let report = scratch.path().join("child-report");
         let run = run_child("fail", &report, None);
+        let _reap = ReapChildCluster::reported(&report);
         assert!(
             !run.status.success(),
             "the failing child exited successfully:\n{}",
@@ -3787,6 +3832,9 @@ mod tests {
             .env(CHILD_REPORT_ENV, &report)
             .stdout(output_file.try_clone().expect("share the output file"))
             .stderr(output_file);
+        // Declared before the child, so dropped after it: killing the child
+        // orphans its postmaster, which this then ends.
+        let mut reap = ReapChildCluster(None);
         let mut child = Hanging(command.spawn().expect("spawn the hang child"));
         let output = || {
             format!(
@@ -3802,6 +3850,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("the hang child wrote no report ({e}):\n{}", output()));
         let facts = parse_facts(&text)
             .unwrap_or_else(|| panic!("the child's report is malformed: {text:?}\n{}", output()));
+        reap.0 = Some(facts.clone());
         #[cfg(target_os = "linux")]
         let (segment, shm_files) = {
             let segment = sysv_segment_of(&facts.data_dir).unwrap_or_else(|| {
