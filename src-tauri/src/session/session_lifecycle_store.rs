@@ -891,6 +891,16 @@ pub struct TerminalSessionRecord {
     /// field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_coord_session_id: Option<uuid::Uuid>,
+    /// [`Self::finish_coord_session_id`] was set by the finish heal's
+    /// RE-ADDRESS (plan
+    /// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`,
+    /// Phase 4): coord named it as the session's live row while the
+    /// in-process resolvers still name a stale one. While the mark is unsynced
+    /// the registrar sends its finish to THAT row, not to the in-process
+    /// resolution (`AiCoordRegistrar::forward_finish_change`). Cleared on an
+    /// unmark, and when a different sent row is recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finish_coord_readdressed: bool,
     /// The machine's default tenant for new sessions AS READ WHEN THIS SESSION
     /// WAS SPAWNED (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
@@ -3048,6 +3058,7 @@ impl SessionLifecycleStore {
             rec.finish_reason = None;
             rec.finish_synced = false;
             rec.finish_coord_session_id = None;
+            rec.finish_coord_readdressed = false;
         }
 
         let changed = rec.clone();
@@ -3125,6 +3136,10 @@ impl SessionLifecycleStore {
             {
                 rec.finish_synced = true;
                 if coord_session_id.is_some() {
+                    if rec.finish_coord_session_id != coord_session_id {
+                        // A different confirming row is not the re-addressed one.
+                        rec.finish_coord_readdressed = false;
+                    }
                     rec.finish_coord_session_id = coord_session_id;
                 }
                 rec.clone()
@@ -3171,6 +3186,8 @@ impl SessionLifecycleStore {
                     && rec.finish_coord_session_id != Some(coord_session_id) =>
             {
                 rec.finish_coord_session_id = Some(coord_session_id);
+                // A different sent row is not the re-addressed one.
+                rec.finish_coord_readdressed = false;
                 rec.clone()
             }
             _ => return,
@@ -3181,6 +3198,56 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed),
             }],
         );
+    }
+
+    /// Record that the finish heal RE-ADDRESSED this mark to `coord_session_id`
+    /// (plan
+    /// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`,
+    /// Phase 4) — BEFORE the re-send, so no finish sent in between can go to
+    /// the stale row. Touches only a still-finished mark whose `finished_at`
+    /// is `finished_at`; a SYNCED one has its stamp withdrawn in the same
+    /// step (the heal's [`Self::clear_finish_synced`] half, done atomically
+    /// with the flag so no re-finish can see the mark unsynced but not yet
+    /// re-addressed). `expect_synced` is the sync state the caller decided on:
+    /// a mark whose state moved since (another heal withdrew the stamp first)
+    /// is refused, so two heals over one snapshot queue one re-send. Taken
+    /// under `finish_forward`. Returns whether it recorded.
+    pub fn note_finish_readdressed(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+        coord_session_id: uuid::Uuid,
+        expect_synced: bool,
+    ) -> bool {
+        let _forward = self
+            .finish_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on note_finish_readdressed");
+                return false;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec)
+                if rec.finished_at == Some(finished_at) && rec.finish_synced == expect_synced =>
+            {
+                rec.finish_synced = false;
+                rec.finish_coord_session_id = Some(coord_session_id);
+                rec.finish_coord_readdressed = true;
+                rec.clone()
+            }
+            _ => return false,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
     }
 
     /// Withdraw a `finish_synced` stamp that coord's own row contradicts — the
@@ -6192,6 +6259,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finish_reason: None,
         finish_synced: false,
         finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
@@ -6427,6 +6495,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -10521,6 +10590,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,

@@ -523,6 +523,29 @@ impl AiCoordRegistrar {
         self.repair_onto_live_pane(&rec.claude_session_id);
         let resolved =
             self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None);
+        // A mark the finish heal RE-ADDRESSED (plan
+        // `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+        // Phase 4) goes to the row coord named as live while it is unsynced —
+        // never back to the stale row the in-process resolvers may still name,
+        // whose ack would stamp the mark synced on it.
+        let resolved = match (
+            rec.finished_at,
+            rec.finish_synced,
+            rec.finish_coord_readdressed,
+            rec.finish_coord_session_id,
+        ) {
+            (Some(_), false, true, Some(sent)) => {
+                if resolved.is_some_and(|r| r != sent) {
+                    info!(
+                        "ai_coord_register: {}'s finish was re-addressed to coord session {} — \
+                         sending it there, not to {:?}",
+                        rec.claude_session_id, sent, resolved
+                    );
+                }
+                Some(sent)
+            }
+            _ => resolved,
+        };
         match rec.finished_at {
             Some(at) => self.finish_session_on(
                 &rec.claude_session_id,
@@ -5475,6 +5498,7 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
@@ -5584,6 +5608,7 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
