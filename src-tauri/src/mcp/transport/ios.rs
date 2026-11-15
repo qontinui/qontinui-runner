@@ -244,18 +244,6 @@ impl IosTransport {
         });
     }
 
-    /// Kill the sidecar. Safe to call when not running. Its forward ports are then
-    /// free for anything to bind, so they stop counting as cables.
-    pub async fn stop_service(&self) {
-        let mut inner = self.inner.lock().await;
-        if let Some(mut child) = inner.child.take() {
-            if let Err(e) = child.kill().await {
-                warn!(error = %e, "failed to kill ios_bridge child");
-            }
-        }
-        inner.forget_child();
-    }
-
     /// Current sidecar port, if started.
     pub async fn port(&self) -> Option<u16> {
         self.inner.lock().await.port
@@ -284,9 +272,9 @@ impl IosTransport {
     ///
     /// The far end is the phone, and the sidecar holds the port while it runs, so
     /// the port is marked as a cable. The sidecar has no close call: the mark is
-    /// dropped when it stops or exits. It is marked under the same lock that
-    /// records it, and only while the sidecar that opened it still runs, so a stop
-    /// in between leaves no mark that nothing would drop.
+    /// dropped when the sidecar exits or is replaced. It is marked under the same
+    /// lock that records it, and only while the sidecar that opened it still runs,
+    /// so an exit in between leaves no mark that nothing would drop.
     pub async fn forward_port(&self, udid: &str, device_port: u16) -> Result<u16, TransportError> {
         let (port, generation) = self.start_service_generation().await?;
         let local_port = request_forward(port, udid, device_port).await?;
@@ -297,18 +285,6 @@ impl IosTransport {
             });
         }
         Ok(local_port)
-    }
-
-    /// Initiate pairing (triggers the 'Trust this computer' dialog).
-    pub async fn initiate_pair(&self, udid: &str) -> Result<(), TransportError> {
-        let port = self.start_service().await?;
-        let url = format!("http://127.0.0.1:{port}/pair/{udid}");
-        reqwest::Client::new()
-            .post(&url)
-            .send()
-            .await
-            .map_err(|e| TransportError::PairingError(e.to_string()))?;
-        Ok(())
     }
 }
 

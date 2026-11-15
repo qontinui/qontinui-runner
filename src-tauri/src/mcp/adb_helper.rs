@@ -212,20 +212,6 @@ pub async fn shell_capture_string(serial: String, command: String) -> Result<Str
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-/// Pull a remote file into memory.
-pub async fn pull_bytes(serial: String, remote_path: String) -> Result<Vec<u8>, String> {
-    spawn_blocking_tracked(move || -> Result<Vec<u8>, String> {
-        let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
-        let mut out: Vec<u8> = Vec::new();
-        device
-            .pull(&remote_path, &mut out)
-            .map_err(|e| e.to_string())?;
-        Ok(out)
-    })
-    .await
-    .map_err(|e| format!("task join failed: {e}"))?
-}
-
 /// Capture a device screenshot as PNG bytes, skipping the `screencap -p`/`pull`/`rm`
 /// dance. Uses `ADBDeviceExt::framebuffer_bytes`.
 pub async fn screenshot_png(serial: String) -> Result<Vec<u8>, String> {
@@ -284,17 +270,6 @@ pub async fn get_wlan_ipv4(serial: String) -> Result<Option<String>, String> {
         }
     }
     Ok(None)
-}
-
-/// Sanity-check that the adb server is reachable. Used by discovery to decide
-/// whether to attempt a `list_devices()` call at all.
-pub async fn server_reachable() -> bool {
-    spawn_blocking_tracked(|| {
-        let mut server = ADBServer::new(default_server_addr());
-        server.version().is_ok()
-    })
-    .await
-    .unwrap_or(false)
 }
 
 /// Establish an `adb forward tcp:<local> tcp:<remote>` on the given device.
