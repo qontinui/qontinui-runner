@@ -40,7 +40,44 @@ const CANCEL_GRACE: Duration = Duration::from_secs(30);
 
 /// How long `close` waits for the connection task, then for the child, before
 /// escalating.
+#[cfg(not(test))]
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
+/// Shortened under test so the escalation path (a child that ignores stdin EOF)
+/// runs in a second, not five.
+#[cfg(test)]
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
+
+/// How long `initialize` + `session/new` may take, in total, before the session
+/// is declared lost, the connection task aborted and the child reaped. An agent
+/// that never answers (an unauthenticated CLI waiting on a login prompt, a
+/// wedged runtime) must not hold the worktree and the gate forever.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The largest file `fs/read_text_file` will serve. Larger is refused rather
+/// than loaded whole into the runner's memory.
+const MAX_FS_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Env names of the RUNNER's own secrets that a third-party ACP agent has no
+/// business holding, removed from the child after the shared scrub
+/// (`CREDENTIAL_VALUE_ENV_VARS`, applied by `finalize_headless_child_env`).
+///
+/// Kept as an ACP-only extension rather than widening the shared list: that list
+/// feeds eight spawn seams including the Claude sessions, several of which
+/// legitimately use `GH_TOKEN` / `GITHUB_TOKEN`, so changing it would change
+/// their behaviour. A third-party agent CLI sends its context to a model
+/// provider the fleet does not control, which is the reason for the stricter
+/// rule here. A name the caller explicitly sets in `AcpLaunch::env` is kept: that
+/// is a deliberate grant. Provider keys the agent itself needs (`GEMINI_API_KEY`,
+/// `OPENAI_API_KEY`, ...) are deliberately NOT listed.
+pub(crate) const ACP_EXTRA_SCRUB_ENV_VARS: &[&str] = &[
+    "COORD_DEVICE_JWT",
+    "COORD_AGENT_JWT",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
 
 /// The tenant's permission policy as a predicate: does it DENY a request right
 /// now? Production passes `permission_accept::stream_json_denies` — the same
@@ -64,6 +101,9 @@ pub(crate) struct SessionConfig {
     /// JSONL transcript of every `session/update`. `None` records nothing.
     pub transcript: Option<PathBuf>,
     pub permission: PermissionPolicy,
+    /// Bound on `initialize` + `session/new` ([`HANDSHAKE_TIMEOUT`] in
+    /// production).
+    pub handshake_timeout: Duration,
 }
 
 enum Cmd {
@@ -82,6 +122,9 @@ pub(crate) struct AcpSession {
     cmd: mpsc::Sender<Cmd>,
     task: Option<tokio::task::JoinHandle<()>>,
     child: Option<ChildRuntime>,
+    /// Out-of-band cancel of the turn in flight (the command channel is not
+    /// read while a turn runs).
+    cancel: Arc<tokio::sync::Notify>,
 }
 
 /// The child process and its tree guard. The guard kills the process tree when
@@ -129,6 +172,14 @@ impl AcpSession {
                 "the connection task ended before answering the prompt",
             )
         })?
+    }
+
+    /// Ask the agent to cancel the turn in flight (`session/cancel`). Safe with
+    /// no turn running (the request is held and applies to the next turn only if
+    /// one starts before `close`). Used before `close` on an operator stop so the
+    /// agent can wind its tool calls down instead of being cut off.
+    pub(crate) fn cancel(&self) {
+        self.cancel.notify_one();
     }
 
     /// End the session and reap the child. Always reaps: a connection task that
@@ -180,6 +231,13 @@ pub(crate) fn build_acp_command(
     // LAST: the runner-context marker, the git posture, then the credential
     // scrub (last-write-wins by construction).
     crate::agent_runtime::finalize_headless_child_env(&mut cmd, coord_mcp, served);
+    // The ACP-only extension of the scrub (see `ACP_EXTRA_SCRUB_ENV_VARS`),
+    // sparing anything the caller deliberately granted.
+    for name in ACP_EXTRA_SCRUB_ENV_VARS {
+        if !launch.env.iter().any(|(k, _)| k == name) {
+            cmd.env_remove(name);
+        }
+    }
     cmd
 }
 
@@ -261,6 +319,9 @@ async fn start_acp_session(
     let permission = cfg.permission.clone();
     let fs_root = cfg.cwd.clone();
     let fs_root_w = cfg.cwd.clone();
+    let handshake_timeout = cfg.handshake_timeout;
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let cancel_task = cancel.clone();
     let task = tokio::spawn(async move {
         let result = Client
             .v1()
@@ -271,20 +332,29 @@ async fn start_acp_session(
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: ReadTextFileRequest, responder, _cx| match read_confined(
-                    &fs_root, &req,
-                ) {
-                    Ok(content) => responder.respond(ReadTextFileResponse::new(content)),
-                    Err(e) => responder.respond_with_error(e),
+                async move |req: ReadTextFileRequest, responder, _cx| {
+                    // Blocking fs work stays off the connection's dispatch loop.
+                    let root = fs_root.clone();
+                    let out = tokio::task::spawn_blocking(move || read_confined(&root, &req))
+                        .await
+                        .unwrap_or_else(|e| Err(fs_refusal(format!("read task failed: {e}"))));
+                    match out {
+                        Ok(content) => responder.respond(ReadTextFileResponse::new(content)),
+                        Err(e) => responder.respond_with_error(e),
+                    }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: WriteTextFileRequest, responder, _cx| match write_confined(
-                    &fs_root_w, &req,
-                ) {
-                    Ok(()) => responder.respond(WriteTextFileResponse::new()),
-                    Err(e) => responder.respond_with_error(e),
+                async move |req: WriteTextFileRequest, responder, _cx| {
+                    let root = fs_root_w.clone();
+                    let out = tokio::task::spawn_blocking(move || write_confined(&root, &req))
+                        .await
+                        .unwrap_or_else(|e| Err(fs_refusal(format!("write task failed: {e}"))));
+                    match out {
+                        Ok(()) => responder.respond(WriteTextFileResponse::new()),
+                        Err(e) => responder.respond_with_error(e),
+                    }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -300,7 +370,7 @@ async fn start_acp_session(
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
-                drive(cx, cfg, ready_tx, cmd_rx, upd_rx).await;
+                drive(cx, cfg, ready_tx, cmd_rx, upd_rx, cancel_task).await;
                 Ok(())
             })
             .await;
@@ -311,18 +381,37 @@ async fn start_acp_session(
         }
     });
 
-    match ready_rx.await {
-        Ok(Ok(info)) => Ok(AcpSession {
+    // The handshake is bounded: an agent that never answers must not hold the
+    // worktree forever. On expiry the connection task is aborted (dropping the
+    // transport, so the child's stdin closes) and the child is handed back for
+    // the caller to reap.
+    let ready = tokio::time::timeout(handshake_timeout, ready_rx).await;
+    match ready {
+        Err(_) => {
+            task.abort();
+            Err((
+                AcpError::new(
+                    AcpErrorKind::TimedOut,
+                    format!(
+                        "the agent did not complete initialize + session/new within {}s",
+                        handshake_timeout.as_secs()
+                    ),
+                ),
+                child,
+            ))
+        }
+        Ok(Ok(Ok(info))) => Ok(AcpSession {
             info,
             cmd: cmd_tx,
             task: Some(task),
             child,
+            cancel,
         }),
-        Ok(Err(e)) => {
+        Ok(Ok(Err(e))) => {
             task.abort();
             Err((e, child))
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             task.abort();
             Err((
                 AcpError::new(
@@ -388,6 +477,7 @@ async fn drive(
     ready: oneshot::Sender<Result<SessionInfo, AcpError>>,
     mut cmds: mpsc::Receiver<Cmd>,
     mut updates: mpsc::UnboundedReceiver<(String, Value)>,
+    cancel: Arc<tokio::sync::Notify>,
 ) {
     let mut transcript = Transcript::open(cfg.transcript.as_deref());
     let setup = handshake(&cx, cfg).await;
@@ -417,6 +507,7 @@ async fn drive(
                     bound,
                     &mut updates,
                     &mut transcript,
+                    &cancel,
                 )
                 .await;
                 let lost = out
@@ -517,6 +608,7 @@ async fn run_turn(
     bound: Duration,
     updates: &mut mpsc::UnboundedReceiver<(String, Value)>,
     transcript: &mut Transcript,
+    cancel: &tokio::sync::Notify,
 ) -> Result<PromptOutcome, AcpError> {
     let mut fut = Box::pin(
         cx.send_request(PromptRequest::new(
@@ -536,6 +628,13 @@ async fn run_turn(
                 if let Some((method, params)) = u {
                     stats.record(&method, &params, transcript);
                 }
+            }
+            // An operator stop: ask the agent to wind the turn down, once, and
+            // give it the same grace as a bound-expiry cancel.
+            _ = cancel.notified(), if !cancelled => {
+                cancelled = true;
+                deadline = tokio::time::Instant::now() + CANCEL_GRACE;
+                let _ = cx.send_notification(CancelNotification::new(session_id.clone()));
             }
             _ = tokio::time::sleep_until(deadline) => {
                 if cancelled {
@@ -644,16 +743,16 @@ pub(crate) fn permission_response(
     req: &RequestPermissionRequest,
     denies: bool,
 ) -> RequestPermissionResponse {
-    let wanted: [PermissionOptionKind; 2] = if denies {
-        [
+    // An allow is only ever `allow_once`: `allow_always` would be a standing
+    // grant the tenant dial never made, so an agent that offers no `allow_once`
+    // gets `Cancelled`. A deny takes the narrower reject first.
+    let wanted: &[PermissionOptionKind] = if denies {
+        &[
             PermissionOptionKind::RejectOnce,
             PermissionOptionKind::RejectAlways,
         ]
     } else {
-        [
-            PermissionOptionKind::AllowOnce,
-            PermissionOptionKind::AllowAlways,
-        ]
+        &[PermissionOptionKind::AllowOnce]
     };
     let chosen = wanted.iter().find_map(|kind| {
         req.options
@@ -680,6 +779,14 @@ fn confine(root: &Path, requested: &Path) -> Result<PathBuf, agent_client_protoc
     }
     let root = std::fs::canonicalize(root)
         .map_err(|e| fs_refusal(format!("session cwd is not resolvable: {e}")))?;
+    // The leaf itself must not be a symlink. `canonicalize` follows a live link
+    // (so a link inside the root pointing outside is caught by the containment
+    // test, but one pointing at another in-root path would alias it) and FAILS on
+    // a dangling one, which would fall through to the parent-join below and let
+    // a write follow the link out of the root. Refuse both outright.
+    if std::fs::symlink_metadata(requested).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(fs_refusal("path is a symlink"));
+    }
     let resolved = match std::fs::canonicalize(requested) {
         Ok(p) => p,
         Err(_) => {
@@ -705,9 +812,25 @@ pub(super) fn read_confined(
     root: &Path,
     req: &ReadTextFileRequest,
 ) -> Result<String, agent_client_protocol::Error> {
+    use std::io::Read;
     let path = confine(root, &req.path)?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| fs_refusal(format!("cannot read {}: {e}", req.path.display())))?;
+    let refuse = |e: std::io::Error| fs_refusal(format!("cannot read {}: {e}", req.path.display()));
+    // Read at most cap+1 bytes through the open handle, so a file that grows
+    // between a size check and the read is still bounded.
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(refuse)?
+        .take(MAX_FS_READ_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(refuse)?;
+    if bytes.len() as u64 > MAX_FS_READ_BYTES {
+        return Err(fs_refusal(format!(
+            "{} is larger than the {} byte read limit",
+            req.path.display(),
+            MAX_FS_READ_BYTES
+        )));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| fs_refusal("file is not valid UTF-8 text"))?;
     // `line` is 1-based; `limit` is a line count.
     let start = req.line.map_or(0, |l| l.saturating_sub(1) as usize);
     if start == 0 && req.limit.is_none() {
