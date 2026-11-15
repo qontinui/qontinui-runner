@@ -544,7 +544,8 @@ static OWED_IN_FLIGHT: std::sync::LazyLock<Mutex<std::collections::HashSet<Strin
 /// guard releases the claim when the schedule ends, however it ends.
 fn claim_owed_bind(csid: &str) -> Option<OwedBindClaim> {
     let mut set = OWED_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    set.insert(csid.to_string()).then(|| OwedBindClaim(csid.to_string()))
+    set.insert(csid.to_string())
+        .then(|| OwedBindClaim(csid.to_string()))
 }
 
 struct OwedBindClaim(String);
