@@ -9,7 +9,11 @@
 //! device drained. This arm closes a finished, idle TERMINAL session on any
 //! tick, drained or not, once `wind_down::eligibility` rates it `Eligible`
 //! AND `wind_down::custody_gate` says every worktree it touched is clean and
-//! pushed. Looping agents and stewards are never its candidates: their
+//! pushed AND `wind_down::obligations_gate` says every item coord attributes
+//! to it is watched. The last two are the LOCAL and REMOTE halves of
+//! `closeable` (plan
+//! `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+//! D1, Phase 6); an unreadable half is UNKNOWN and closes nothing. Looping agents and stewards are never its candidates: their
 //! supervisors respawn them, so closing one outside a drain is churn, not
 //! tidying (D1).
 //!
@@ -46,7 +50,9 @@ use crate::session::tracking_health::LiveClaudeProcess;
 use crate::session::wind_down_executor::{select_candidates, ClockVerdict, TICK};
 use crate::session::wind_down_observer::ObservedInputs;
 use crate::settings::FinishedSessionClose;
-use qontinui_runner_lib::wind_down::{CustodyVerdict, CustodyView, SessionKind};
+use qontinui_runner_lib::wind_down::{
+    CustodyVerdict, CustodyView, ObligationsVerdict, ObligationsView, SessionKind,
+};
 
 /// Machine kill switch: exactly `0` in the runner's spawn environment turns
 /// the arm off whatever the setting says. Absent, `1`, or anything else defers
@@ -242,6 +248,66 @@ pub fn attach_last_custody(processes: &mut [LiveClaudeProcess]) {
         if let Some(view) = process.wind_down.as_mut() {
             view.custody = last_custody(&session_id);
         }
+    }
+}
+
+/// `claude_session_id` → the obligations view the arm's most recent pass
+/// reached. Only a session whose custody was already clean is ever read here.
+fn last_obligations_map() -> &'static Mutex<HashMap<String, ObligationsView>> {
+    static MAP: OnceLock<Mutex<HashMap<String, ObligationsView>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Replace the published obligations verdicts with one pass's — REPLACED, not
+/// merged, for the same reason as [`publish_custody`].
+pub fn publish_obligations(verdicts: &[(String, ObligationsVerdict)], judged_at_ms: i64) {
+    let next: HashMap<String, ObligationsView> = verdicts
+        .iter()
+        .map(|(session_id, verdict)| {
+            (
+                session_id.clone(),
+                ObligationsView::from_verdict(verdict, judged_at_ms),
+            )
+        })
+        .collect();
+    let mut map = match last_obligations_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    *map = next;
+}
+
+/// The arm's last obligations view for a session, if its latest pass read it.
+pub fn last_obligations(claude_session_id: &str) -> Option<ObligationsView> {
+    let map = match last_obligations_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    map.get(claude_session_id).cloned()
+}
+
+/// Attach [`last_obligations`] to every top-level process carrying a `windDown`
+/// view — the readiness report's `windDown.obligations`.
+pub fn attach_last_obligations(processes: &mut [LiveClaudeProcess]) {
+    for process in processes.iter_mut() {
+        let Some(session_id) = process.session_id.clone() else {
+            continue;
+        };
+        if let Some(view) = process.wind_down.as_mut() {
+            view.obligations = last_obligations(&session_id);
+        }
+    }
+}
+
+/// One-line rendering of an obligations verdict for the arm's logs.
+pub fn describe_obligations(verdict: &ObligationsVerdict) -> String {
+    match verdict.detail() {
+        Some(detail) => format!(
+            "{} ({}): {detail}",
+            verdict.as_str(),
+            verdict.reason().unwrap_or("-")
+        ),
+        None => verdict.as_str().to_string(),
     }
 }
 
@@ -461,5 +527,73 @@ mod tests {
         );
         assert_eq!(json[1]["windDown"]["custody"]["verdict"], "unknown");
         assert_eq!(json[1]["windDown"]["custody"]["reason"], "no_session_dir");
+    }
+
+    /// The obligations map is its own process-global, so this test keys on ids
+    /// no other test publishes.
+    #[test]
+    fn published_obligations_are_replaced_per_pass_and_attached_to_their_session() {
+        publish_obligations(
+            &[
+                (
+                    "ob-a".to_string(),
+                    ObligationsVerdict::Watched { judged: 2 },
+                ),
+                (
+                    "ob-b".to_string(),
+                    ObligationsVerdict::unreadable("operation timed out"),
+                ),
+            ],
+            11,
+        );
+        let a = last_obligations("ob-a").unwrap();
+        assert_eq!(
+            (a.verdict, a.items_judged, a.judged_at),
+            ("watched", Some(2), 11)
+        );
+        assert_eq!(
+            last_obligations("ob-b").unwrap().reason,
+            Some("obligations_unreadable")
+        );
+
+        publish_obligations(&[], 12);
+        assert!(
+            last_obligations("ob-a").is_none(),
+            "a session the latest pass did not judge carries no verdict"
+        );
+
+        publish_obligations(
+            &[(
+                "ob-b".to_string(),
+                ObligationsVerdict::Watched { judged: 0 },
+            )],
+            13,
+        );
+        let process = |sid: &str| LiveClaudeProcess {
+            pid: 1,
+            parent_pid: None,
+            image: Some("claude".to_string()),
+            age_s: Some(60),
+            cwd: None,
+            has_live_children: Some(false),
+            nested_under_claude: false,
+            session_id: Some(sid.to_string()),
+            session_status: Some("finished".to_string()),
+            session_status_since: None,
+            blocks_restart: false,
+            wind_down: Some(qontinui_runner_lib::wind_down::WindDownView::from_verdict(
+                &qontinui_runner_lib::wind_down::Eligibility::Eligible { since_ms: 1 },
+                SessionKind::Terminal,
+            )),
+            stray_wait_shells: 0,
+        };
+        let mut processes = vec![process("ob-a"), process("ob-b")];
+        attach_last_obligations(&mut processes);
+        let json = serde_json::to_value(&processes).unwrap();
+        assert!(
+            json[0]["windDown"].get("obligations").is_none(),
+            "not judged by the latest pass → no obligations key, never `watched`"
+        );
+        assert_eq!(json[1]["windDown"]["obligations"]["verdict"], "watched");
     }
 }
