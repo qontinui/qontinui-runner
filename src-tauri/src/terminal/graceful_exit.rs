@@ -716,6 +716,14 @@ impl RegistryWitness {
 /// ([`under_native_claude`]), so its record can never change a verdict. A
 /// look rooted at the runner would otherwise read the environment of every
 /// `npx` MCP server under every native `claude` on every pass.
+///
+/// **Decided trade-off (plan 2026-11-05 review round 2):** an npm-installed
+/// `claude` NESTED under a native `claude` is therefore never named, and is
+/// not counted as a live process of its own. Its native ancestor is, and it
+/// still blocks a restart unless its session is `finished` (a nested process
+/// is never discounted, but here it is simply not seen); the skip is kept so
+/// that no `npx` server under any native `claude` costs an environ read. The
+/// census BOUNDARY (`mcp::restart_readiness::BOUNDARY`) says the same.
 fn registry_candidates(roots: &[u32], snapshot: &ProcessSnapshot) -> Vec<LivePid> {
     let parents = parent_index(snapshot);
     let read_roots: BTreeSet<u32> = roots.iter().copied().collect();
@@ -1247,11 +1255,17 @@ impl PaneLook {
 }
 
 /// Child → parent, inverted once from the snapshot's parent → children index.
+/// A table read from the OS lists each pid under one parent; should a
+/// malformed one list a pid under several, the LOWEST parent pid wins, so the
+/// answer never depends on `HashMap` iteration order.
 fn parent_index(snapshot: &ProcessSnapshot) -> std::collections::HashMap<u32, u32> {
-    let mut parents = std::collections::HashMap::new();
+    let mut parents: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     for (&parent, kids) in &snapshot.parent_map {
         for &kid in kids {
-            parents.entry(kid).or_insert(parent);
+            parents
+                .entry(kid)
+                .and_modify(|seen| *seen = (*seen).min(parent))
+                .or_insert(parent);
         }
     }
     parents
@@ -4535,6 +4549,53 @@ mod tests {
         assert!(matches!(unread.probe(100, &[]), ClaudeProbe::Unreadable(_)));
     }
 
+    /// Decided trade-off (review round 2), through the REAL candidate path: an
+    /// npm `claude` (`node` 202) nested under a native `claude` (200) is no
+    /// candidate, so even with its own record on disk the read never names it;
+    /// the pane is live through the native `claude` alone. Partner: the same
+    /// `node` with no native ancestor IS read and named.
+    #[tokio::test]
+    async fn an_npm_claude_nested_under_a_native_claude_is_never_named() {
+        const NATIVE: u32 = 7_200;
+        const NESTED: u32 = 7_202;
+        let root = tempfile::tempdir().unwrap();
+        let records = config_dir(
+            root.path(),
+            ".claude-npm",
+            &[(NESTED, npm_record(NESTED, 22))],
+        );
+        let nested = snapshot(&[
+            (100, 1, "bash", 10),
+            (NATIVE, 100, "claude", 20),
+            (NESTED, NATIVE, "node", 22),
+        ]);
+        let dirs = records.clone();
+        let witness = read_registry_witness_with(
+            &[100],
+            &nested,
+            move |_: &[u32]| vec![dirs],
+            no_kernel,
+            REGISTRY_READ_TIMEOUT,
+            &REGISTRY_READS_IN_FLIGHT,
+        )
+        .await;
+        let look = PaneLook::from_parts(&[100], nested, witness);
+        assert_eq!(look.claude_pids(100), Ok(vec![NATIVE]));
+
+        let bare = snapshot(&[(100, 1, "bash", 10), (NESTED, 100, "node", 22)]);
+        let witness = read_registry_witness_with(
+            &[100],
+            &bare,
+            move |_: &[u32]| vec![records],
+            no_kernel,
+            REGISTRY_READ_TIMEOUT,
+            &REGISTRY_READS_IN_FLIGHT,
+        )
+        .await;
+        let look = PaneLook::from_parts(&[100], bare, witness);
+        assert_eq!(look.claude_pids(100), Ok(vec![NESTED]));
+    }
+
     /// No image-only subtree liveness read may come back: outside the two
     /// modules that own the image witness, `is_countable_claude` is called
     /// only by the allowlisted whole-table readers below, and the three
@@ -4555,9 +4616,11 @@ mod tests {
             ),
             (
                 "process_capture/agent_cli.rs",
-                "the Keep-AI detector (`agent_by_image`): which agent CLI a pane runs, never \
-                 a liveness verdict; an npm `claude` is matched there by its argv package path \
-                 `@anthropic-ai/claude-code/`",
+                "the Keep-AI detector (`agent_by_image`, under `classify_panes`, which closes \
+                 a pane it reads Absent): the image check is only its first arm — an npm \
+                 `claude` is matched by `agent_by_cmdline` on its argv (the \
+                 `@anthropic-ai/claude-code/` package path, or a `bin/claude` entry), and an \
+                 argv it cannot read reads Unknown, never Absent",
             ),
             (
                 "session/claude_session_registry.rs",
