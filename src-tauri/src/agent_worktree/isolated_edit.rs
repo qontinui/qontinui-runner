@@ -1715,7 +1715,6 @@ fn read_device_id() -> Result<uuid::Uuid, String> {
 }
 
 #[cfg(test)]
-#[path = "isolated_edit_drop_tests.rs"]
 mod isolated_edit_drop_tests;
 
 #[cfg(test)]

@@ -9192,7 +9192,6 @@ pub(crate) mod teardown_poison_tests {
 }
 
 #[cfg(test)]
-#[path = "coord_mcp/release_workdir_proxy_nonces_tests.rs"]
 mod release_workdir_proxy_nonces_tests;
 
 /// Test-only: mint a persistent DEVICE proxy nonce for `workdir` exactly as a
