@@ -190,11 +190,15 @@ struct OwnerEntry {
 struct State {
     owners: HashMap<Uuid, OwnerEntry>,
     doors: HashMap<Uuid, BindDoor>,
-    /// Per row: the first id an entry ever named on it, and whether an entry
-    /// has since named ANY other id there. Kept until the row's pane is swept.
-    /// What lets the revival guard tell "the pane pinned to X has run X since
-    /// it was bound" from "the pane ran another id, then X was resumed into
-    /// it" ([`PaneRowOwners::owned_since_bind`]).
+    /// Per row: the first id the re-key seam was ever seen confirming on it
+    /// (from ANY source — an advance, or a plain observation from a source
+    /// that does not advance the owner), and whether it has since confirmed
+    /// ANY other id there. Kept while the row's pane is live, whether or not
+    /// the row still carries an owner entry, and dropped by the sweep once the
+    /// terminal plane says the pane is gone. What lets the revival guard tell
+    /// "the pane pinned to X has run X since it was bound" from "the pane ran
+    /// another id, then X was resumed into it"
+    /// ([`PaneRowOwners::owned_since_bind`]).
     history: HashMap<Uuid, (String, bool)>,
 }
 
@@ -256,24 +260,35 @@ impl PaneRowOwners {
                 pane_bind_seq,
             },
         );
-        match s.history.get_mut(&row) {
-            None => {
-                s.history.insert(row, (harness_id.to_string(), false));
-            }
-            Some((first, other)) if *first != harness_id => *other = true,
-            Some(_) => {}
-        }
+        note_seen(&mut s, row, harness_id);
         true
     }
 
-    /// Whether no entry `row` ever carried named an id other than
-    /// `harness_id` — no other id was ever seen running there (a row with no
-    /// history at all answers `true`). When the pane holding `row` is also
-    /// PINNED to `harness_id`, the id has run on the row since the pane was
-    /// bound, so the pin's bind instant is a truthful start of its ownership
-    /// (plan D5's revival guard). An in-pane `/clear` → `/resume` round trip
-    /// leaves another id in the history, and the guard then keeps the
-    /// entry's own (later) instant.
+    /// Record that the re-key seam saw `harness_id` running on `row` — from
+    /// any source, including the ones that may NOT advance the owner (rung 2's
+    /// argv, the R2 pane resume). It never advances the owner; it only feeds
+    /// the row's history, so an id seen there only through such a source
+    /// (an in-pane `/clear` successor with no hook) still marks the row as
+    /// having run another id. Only call it for a row a live terminal holds.
+    pub(crate) fn observe(&self, row: Uuid, harness_id: &str) {
+        let harness_id = harness_id.trim();
+        if harness_id.is_empty() {
+            return;
+        }
+        note_seen(&mut self.lock(), row, harness_id);
+    }
+
+    /// Whether the seam never saw an id other than `harness_id` running on
+    /// `row`, from any source (a row with no history at all answers `true`).
+    /// When the pane holding `row` is also PINNED to `harness_id`, the id has
+    /// run on the row since the pane was bound, so the pin's bind instant is
+    /// a truthful start of its ownership (plan D5's revival guard). An
+    /// in-pane `/clear` → `/resume` round trip leaves another id in the
+    /// history — provided the seam saw the `/clear` successor at all, through
+    /// any source — and the guard then keeps the entry's own (later) instant.
+    /// A successor the seam never observed on the row (no source named it
+    /// before the `/resume`) is invisible here: the residual of a guard that
+    /// can only date what was observed.
     pub(crate) fn owned_since_bind(&self, row: Uuid, harness_id: &str) -> bool {
         self.lock()
             .history
@@ -320,15 +335,25 @@ impl PaneRowOwners {
     /// closed pane). `gone` must answer `false` when it cannot tell: an
     /// unreadable terminal plane keeps every entry. Called with the lock
     /// RELEASED.
+    ///
+    /// Also drops the history of every row — with or without an owner entry
+    /// (one an advance's `retain` vacated, or one only ever observed) — whose
+    /// pane `gone` says is closed, so the history is bounded by the live panes.
     pub(crate) fn sweep(&self, gone: impl Fn(Uuid) -> bool) {
-        let judged: Vec<(Uuid, OwnerEntry)> = self
-            .lock()
-            .owners
-            .iter()
-            .map(|(r, e)| (*r, e.clone()))
-            .collect();
+        let (judged, history_only): (Vec<(Uuid, OwnerEntry)>, Vec<Uuid>) = {
+            let s = self.lock();
+            (
+                s.owners.iter().map(|(r, e)| (*r, e.clone())).collect(),
+                s.history
+                    .keys()
+                    .filter(|r| !s.owners.contains_key(r))
+                    .copied()
+                    .collect(),
+            )
+        };
         let dead: Vec<(Uuid, OwnerEntry)> = judged.into_iter().filter(|(r, _)| gone(*r)).collect();
-        if dead.is_empty() {
+        let dead_history: Vec<Uuid> = history_only.into_iter().filter(|r| gone(*r)).collect();
+        if dead.is_empty() && dead_history.is_empty() {
             return;
         }
         let mut s = self.lock();
@@ -340,6 +365,18 @@ impl PaneRowOwners {
                 s.history.remove(&r);
             }
         }
+        for r in dead_history {
+            // Likewise: a row that gained an entry while `gone` ran is kept.
+            if !s.owners.contains_key(&r) {
+                s.history.remove(&r);
+            }
+        }
+    }
+
+    /// How many rows carry history (test-only).
+    #[cfg(test)]
+    fn history_rows(&self) -> usize {
+        self.lock().history.len()
     }
 
     /// Tag `row` with the door that registered it.
@@ -363,6 +400,18 @@ impl PaneRowOwners {
         if let Some(d) = s.doors.remove(&from) {
             s.doors.insert(to, d);
         }
+    }
+}
+
+/// Record `harness_id` as seen on `row` in the row's history (see
+/// `State::history`).
+fn note_seen(s: &mut State, row: Uuid, harness_id: &str) {
+    match s.history.get_mut(&row) {
+        None => {
+            s.history.insert(row, (harness_id.to_string(), false));
+        }
+        Some((first, other)) if *first != harness_id => *other = true,
+        Some(_) => {}
     }
 }
 
@@ -522,6 +571,56 @@ mod tests {
         o.sweep(|row| row == r);
         assert!(o.advance(r, X, 2_000, Some(5)));
         assert!(o.owned_since_bind(r, X));
+    }
+
+    /// Round-2 review: an in-pane `/clear` successor P seen ONLY through a
+    /// source that does not advance the owner (rung 2, the R2 resume) still
+    /// marks the row; after `/resume X` and a hook confirmation, X's ownership
+    /// dates from that confirmation, not from the pane's bind.
+    #[test]
+    fn a_successor_seen_only_through_a_non_advancing_source_still_marks_the_row() {
+        let o = PaneRowOwners::default();
+        let r = Uuid::new_v4();
+        let live = |row: Uuid| (row == r).then(|| facts(5));
+        // X pinned and bound at 5; its pin confirmed through rung 2.
+        o.observe(r, X);
+        assert!(o.owned_since_bind(r, X));
+        // `/clear` → P, seen through rung 2 only: no entry, but history.
+        o.observe(r, P);
+        assert_eq!(o.owner_of(r), None, "observing never advances");
+        // `/resume X`; the hook confirms X.
+        assert!(o.advance(r, X, 3_000, Some(5)));
+        assert!(!o.owned_since_bind(r, X));
+        assert_eq!(
+            live_terminal_row(&o, X, |_| Some(r), live).map(|l| l.owned_since_ms),
+            Some(Some(3_000)),
+            "the confirmation's instant, never the bind's"
+        );
+    }
+
+    /// Round-2 review: a row an advance's `retain` vacated (the id moved to
+    /// another row), or one only ever observed, keeps its history while its
+    /// pane is live and loses it once the sweep finds the pane gone.
+    #[test]
+    fn a_vacated_or_observed_rows_history_is_swept_with_its_pane() {
+        let o = PaneRowOwners::default();
+        let (vacated, moved_to, observed) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        assert!(o.advance(vacated, X, 1, Some(1)));
+        assert!(o.advance(moved_to, X, 2, Some(2)));
+        assert_eq!(o.owner_of(vacated), None, "retain vacated it");
+        o.observe(observed, P);
+        assert_eq!(o.history_rows(), 3);
+
+        // Every pane live: nothing is dropped.
+        o.sweep(|_| false);
+        assert_eq!(o.history_rows(), 3);
+
+        // The vacated and observed panes close: their history goes; the row
+        // that still carries the entry keeps both.
+        o.sweep(|row| row == vacated || row == observed);
+        assert_eq!(o.history_rows(), 1);
+        assert_eq!(o.owner_of(moved_to).as_deref(), Some(X));
+        assert!(o.owned_since_bind(moved_to, X));
     }
 
     #[test]

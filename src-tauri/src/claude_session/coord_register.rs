@@ -6716,6 +6716,43 @@ mod tests {
         assert_eq!(rig.mark(x), (true, Some(r)));
     }
 
+    /// Round-2 review: X is pinned and bound before its finish, R′ ACKs it;
+    /// an in-pane `/clear` successor P is seen on R through rung 2 ONLY;
+    /// then `/resume X` and the hook confirms X. X runs again, so the finish
+    /// R′ ACKed must not be re-offered to R — the row's history carries P
+    /// although P never advanced the owner.
+    #[test]
+    fn a_clear_successor_seen_only_through_rung2_keeps_a_resumed_finish_off_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-clear-resume-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        let p = "clear-successor-p";
+        rig.reg.note_pane_row(r, p, RekeySource::Rung2);
+        assert_eq!(
+            rig.reg.inner.pane_rows.owner_of(r),
+            None,
+            "rung 2 never advances the owner"
+        );
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Hook),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(
+            finished_rows(&rig.reg).is_empty(),
+            "no finish onto a resumed session"
+        );
+        assert_eq!(rig.mark(x), (true, Some(stale)));
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::OwnedAfterFinish
+        );
+    }
+
     /// D5 through the finish-time repair: the operator re-states X's finish
     /// (a restamp) after R′ ACKed it. The repair moves X onto R inside the
     /// finish observer, the forward itself is the one `Finished` to R, and
