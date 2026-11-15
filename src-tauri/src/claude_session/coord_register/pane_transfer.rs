@@ -549,11 +549,17 @@ impl AiCoordRegistrar {
         if self.inner.pane_rows.sweep_due(now) {
             self.sweep_closed_pane_rows();
         }
+        // Only a row a live terminal holds may carry history or become an
+        // owner: a retried confirmation for a pane that has since closed must
+        // not displace the id's entry on the pane that runs it now.
+        let row_facts = self.pane_row_facts(row);
+        if row_facts.is_some() {
+            // EVERY source feeds the row's history (plan D5's revival guard):
+            // a `/clear` successor seen only through rung 2 or the R2 resume
+            // still marks the row as having run another id.
+            self.inner.pane_rows.observe(row, claude_session_id);
+        }
         if source.observes_running_id() {
-            // Only a row a live terminal holds may become an owner: a retried
-            // confirmation for a pane that has since closed must not displace
-            // the id's entry on the pane that runs it now.
-            let row_facts = self.pane_row_facts(row);
             let row_seq = row_facts.and_then(|f| f.bind_seq);
             // The same pin rule `live_terminal_row` applies: a pin whose row
             // another id owns (the pinned pane `/clear`ed) is not a later pane
