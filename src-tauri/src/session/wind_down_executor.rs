@@ -918,6 +918,14 @@ async fn save_stopped_by_drain(set: StoppedByDrain) {
     }
 }
 
+/// The drain arm's undecided population, logged once per change: while it is
+/// non-empty this arm closes nothing, box-wide.
+static WIND_DOWN_UNDECIDED_LOG: crate::session::tracking_health::UndecidedLog =
+    crate::session::tracking_health::UndecidedLog::new(
+        "wind_down_executor",
+        "the drained wind-down closes NOTHING while it lasts",
+    );
+
 /// One wind-down pass: observe, then close what is eligible.
 async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
     use tauri::Manager;
@@ -932,6 +940,7 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
     };
     // An incomplete census (a process the session registry could not settle
     // may be a live `claude`) is not safe to act on: close nothing this tick.
+    WIND_DOWN_UNDECIDED_LOG.observe(&pass.report.undecided);
     if !fresh.unknowns.is_empty() {
         debug!(
             unknowns = ?fresh.unknowns,
