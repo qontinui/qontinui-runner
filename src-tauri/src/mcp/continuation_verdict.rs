@@ -33,19 +33,40 @@
 //! would-be verdict and returns allow; `on` enforces. Unknown values read as
 //! `off` (fail-safe).
 //!
+//! ## Gate continuations are armed by default
+//!
+//! An UNSET flag ([`FlagReading::Unset`]) is not the same reading as an
+//! explicit `off`. For a **gate continuation** — a terminal the runner's own
+//! `ContinuationRegistry` holds with a `gate_id`
+//! ([`crate::agent_runtime::live_gate_continuation_gate_id`]) — an unset flag
+//! resolves to `on`: those sessions are the unattended population with no
+//! operator to close them, and they idled at their prompt holding a
+//! continuation slot forever (plan
+//! `2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap`,
+//! Phase 2). An explicit `off` stays the off-switch for them too. Every other
+//! session keeps the dark default.
+//!
+//! Scoping is by the registry lookup on the route's path id (the runner
+//! TERMINAL id), never by title and never by the session's environment, which
+//! this process cannot read ([`mode_for_terminal`]).
+//!
 //! ## Coord fetches + cache
 //!
 //! Coord reads are cached in process-global TTL caches (45s, mirroring
 //! `fleet_policy_poller`'s poll-into-process-global-cache posture — NOT ETag):
 //!
-//! - **session status** — `GET {coord}/coord/agent-sessions/{key}` (the
-//!   session-identity resolver card) with the device JWT. Today that route is
-//!   operator-SSO-gated in prod, so a device-JWT read typically 401s ⇒
-//!   `Unreachable` ⇒ allow — the Phase-3/4 coord phases add the fleet-authed
-//!   status read; the seam here is already shaped for it (an explicit
-//!   `session_status` field on the card is preferred the moment coord ships
-//!   one). A `session_not_found` 404 means coord IS reachable and has no row ⇒
-//!   status ABSENT (block-eligible), per the phase's decision rule.
+//! - **session status** — the device-authed bulk work-axis door
+//!   `GET {coord}/coord/sessions/work-status?claude_code_session_ids=<id>`
+//!   ([`crate::mcp::session_work_status::fetch_one`]), keyed by the Claude
+//!   session id the Stop payload carries. This read USED to go to the
+//!   session-identity resolver card (`/coord/agent-sessions/{key}`), which is
+//!   operator-gated: measured 2026-10-28 it answered 401 to the runner's
+//!   device JWT on three probes while the work-status door answered 200 on the
+//!   same token, so every verdict fail-opened to `allow` and the feature was
+//!   inert even where armed (coord finding 4eef6693). A row with no
+//!   `session_status` reads as ABSENT (block-eligible). An id coord names in
+//!   its `unknown` bucket, a payload with no session id, and a degraded read
+//!   are all `Unreachable` ⇒ allow.
 //! - **continuation rules** — `GET {coord}/coord/agent-prompt-documents/
 //!   continuation_rules/session-continuation`: coord's versioned
 //!   `prompt_documents` store (Phase 2), which serves the tenant's editable
@@ -139,6 +160,70 @@ impl Mode {
             Mode::On => "on",
         }
     }
+}
+
+/// What [`FLAG_ENV`] actually SAID, before any default is applied.
+///
+/// [`Mode::from_flag`] folds "unset" into `Off`, which is right for an ordinary
+/// session and wrong for a gate continuation: there the feature ships ON and an
+/// explicit `off` is the off-switch, so the two readings must stay apart until
+/// the caller knows which kind of session it is deciding for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagReading {
+    /// Absent or blank — nobody chose a mode.
+    Unset,
+    /// A value was set; unknown values have already folded to `Off`
+    /// (fail-safe), exactly as [`Mode::from_flag`] does.
+    Explicit(Mode),
+}
+
+impl FlagReading {
+    /// Pure parse of the raw flag value.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") => FlagReading::Unset,
+            Some(v) => FlagReading::Explicit(Mode::from_flag(Some(v))),
+        }
+    }
+
+    /// The RUNNER's own process env (the only env this process can read).
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var(FLAG_ENV).ok().as_deref())
+    }
+
+    /// The mode for one session. A gate continuation reads an unset flag as
+    /// `On`; everything else reads it as `Off`. An explicit value wins for
+    /// both, so `off` disarms gate continuations too.
+    pub fn mode_for(self, gate_continuation: bool) -> Mode {
+        match self {
+            FlagReading::Explicit(mode) => mode,
+            FlagReading::Unset if gate_continuation => Mode::On,
+            FlagReading::Unset => Mode::Off,
+        }
+    }
+}
+
+/// The mode the verdict route applies to the session in terminal
+/// `terminal_id`: [`FlagReading::mode_for`] with `gate_continuation` taken
+/// from the runner's own `ContinuationRegistry` (a live entry carrying a
+/// `gate_id`). A path id the registry does not hold — an operator pane, an AI
+/// task run, a work-unit dispatch, a continuation restored after a runner
+/// restart — gets the ordinary default.
+pub fn mode_for_terminal(terminal_id: &str) -> Mode {
+    mode_for_terminal_with(FlagReading::from_env(), terminal_id, &|tid| {
+        crate::agent_runtime::live_gate_continuation_gate_id(tid).is_some()
+    })
+}
+
+/// [`mode_for_terminal`] with the flag reading and the registry lookup
+/// injected (the test surface — process-global env and the process-global
+/// continuation registry both race the parallel harness).
+pub fn mode_for_terminal_with(
+    reading: FlagReading,
+    terminal_id: &str,
+    is_gate_continuation: &dyn Fn(&str) -> bool,
+) -> Mode {
+    reading.mode_for(is_gate_continuation(terminal_id))
 }
 
 // ===========================================================================
@@ -318,36 +403,24 @@ pub fn session_id_from(input: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Pull a `session_status` out of the session-identity resolver response
-/// (`GET /coord/agent-sessions/:id` ⇒ `{"resolved":[<card>...],"count":N}`).
+/// Map one work-status door answer onto the verdict's [`StatusFetch`]. Pure.
 ///
-/// Preference order (forward-compatible with the Phase-3/4 coord read):
-/// 1. an explicit `session_status` on the card,
-/// 2. an explicit `working_on.session.session_status`,
-/// 3. the card's liveness `status`: `closed` ⇒ treat as `finished` (a closed
-///    session is never continued); `live`/`stale` ⇒ NO status recorded ⇒
-///    `None` (absent, block-eligible).
-///
-/// Zero cards ⇒ `None` (coord reachable, session unknown ⇒ absent).
-pub fn status_from_resolve_body(body: &Value) -> Option<String> {
-    let card = body.get("resolved").and_then(|r| r.get(0))?;
-    let explicit = card
-        .get("session_status")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            card.get("working_on")
-                .and_then(|w| w.get("session"))
-                .and_then(|s| s.get("session_status"))
-                .and_then(Value::as_str)
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if explicit.is_some() {
-        return explicit;
-    }
-    match card.get("status").and_then(Value::as_str) {
-        Some("closed") => Some("finished".to_string()),
-        _ => None,
+/// Only a ROW is an answer about this session: its status, or `None` when its
+/// work axis is unset (ABSENT, block-eligible). coord's `unknown` bucket means
+/// "no `claude_code_session_id` row for this id in the acting tenant", which is
+/// not "this session has no status": an AI task run's row is keyed by its
+/// `task_run_id`, and a session homed in another tenant answers `unknown` too.
+/// So `NoRow` is `Unreachable` like every other unsettled read, and allows
+/// (fail-open) — never a default rendered as "absent" (served
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default`).
+pub fn status_fetch_from_one(one: crate::mcp::session_work_status::OneStatus) -> StatusFetch {
+    use crate::mcp::session_work_status::OneStatus;
+    match one {
+        OneStatus::Row(status) => StatusFetch::Reachable(status),
+        OneStatus::NoRow => StatusFetch::Unreachable(
+            "coord has no row keyed by this harness session id in the acting tenant".to_string(),
+        ),
+        OneStatus::Unresolved(why) => StatusFetch::Unreachable(why),
     }
 }
 
@@ -397,7 +470,7 @@ fn rules_cache() -> &'static Mutex<Option<(Instant, String)>> {
 ///
 /// Shared with [`crate::mcp::session_compliance`], which rides the same Stop
 /// hook and must present the same credential against the same coord base.
-pub(super) fn coord_client_parts() -> Result<(String, String), String> {
+pub(crate) fn coord_client_parts() -> Result<(String, String), String> {
     let jwt = crate::auth::AuthManager::new()
         .get_access_token()
         .ok()
@@ -411,7 +484,7 @@ pub(super) fn coord_client_parts() -> Result<(String, String), String> {
 /// Short-timeout HTTP client for turn-end coord reads. Shared with
 /// [`crate::mcp::session_compliance`] — a turn-end hook must never hang on a
 /// slow coord.
-pub(super) fn http_client() -> Result<reqwest::Client, String> {
+pub(crate) fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
         .build()
@@ -438,39 +511,19 @@ async fn fetch_session_status_uncached(session_key: &str) -> StatusFetch {
         }
     }
 
-    let (base, jwt) = match coord_client_parts() {
-        Ok(p) => p,
-        Err(e) => return StatusFetch::Unreachable(e),
-    };
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => return StatusFetch::Unreachable(e),
-    };
-    let url = format!("{base}/coord/agent-sessions/{session_key}");
-    let resp = match client.get(&url).bearer_auth(&jwt).send().await {
-        Ok(r) => r,
-        Err(e) => return StatusFetch::Unreachable(format!("request: {e}")),
-    };
-    let status = resp.status();
-    let body: Value = match resp.json().await {
-        Ok(b) => b,
-        Err(_) if status.is_success() => {
-            return StatusFetch::Unreachable(format!("undecodable 2xx body from {url}"));
-        }
-        Err(_) => Value::Null,
-    };
-    if status.is_success() {
-        return StatusFetch::Reachable(status_from_resolve_body(&body));
+    // The device-authed work-axis door (see module docs for why not the
+    // resolver card). Its credential, timeouts and decode path are shared with
+    // `/restart-readiness`, so the two reads cannot disagree about the door.
+    status_fetch_from_one(crate::mcp::session_work_status::fetch_one(session_key).await)
+}
+
+/// Whether `status` is a reading [`decide`] may block on (`working` or absent).
+fn is_block_eligible(status: &StatusFetch) -> bool {
+    match status {
+        StatusFetch::Reachable(None) => true,
+        StatusFetch::Reachable(Some(s)) => s.trim().eq_ignore_ascii_case("working"),
+        StatusFetch::Unreachable(_) => false,
     }
-    // A session_not_found 404 = coord IS reachable and has no row ⇒ status
-    // ABSENT (block-eligible). Any OTHER 404 (older coord without the route)
-    // and every auth/5xx outcome is Unreachable ⇒ allow.
-    if status == reqwest::StatusCode::NOT_FOUND
-        && body.get("error").and_then(Value::as_str) == Some("session_not_found")
-    {
-        return StatusFetch::Reachable(None);
-    }
-    StatusFetch::Unreachable(format!("coord status {}", status.as_u16()))
 }
 
 /// TTL-cached session-status read.
@@ -488,7 +541,14 @@ async fn fetch_session_status(session_key: &str) -> StatusFetch {
         // Opportunistic prune so the map can't grow unboundedly across many
         // short-lived sessions.
         g.retain(|_, (at, _)| now.duration_since(*at) < CACHE_TTL * 4);
-        g.insert(session_key.to_string(), (now, fresh.clone()));
+        // A block-eligible reading is NOT cached: a session blocked at
+        // `absent`/`working` that then records `finished` must be allowed on
+        // its very next stop, not re-blocked off a 45 s-old answer.
+        if is_block_eligible(&fresh) {
+            g.remove(session_key);
+        } else {
+            g.insert(session_key.to_string(), (now, fresh.clone()));
+        }
     }
     fresh
 }
@@ -688,10 +748,13 @@ fn deliver_compliance_nudge(
 }
 
 /// Compute the continuation verdict for `session_key` given the raw Stop-hook
-/// input payload. Fail-open end to end; never panics the caller.
-pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> VerdictResponse {
-    let mode = Mode::from_env();
-
+/// input payload, under `mode` (the route resolves it with
+/// [`mode_for_terminal`]). Fail-open end to end; never panics the caller.
+pub async fn continuation_verdict(
+    session_key: &str,
+    hook_input: &Value,
+    mode: Mode,
+) -> VerdictResponse {
     // Session compliance-report detection + verdict emit (plan
     // `2026-07-30-session-compliance-report-enforcement.md` §A1). Runs on
     // EVERY Stop, independent of [`FLAG_ENV`]: that flag governs the
@@ -728,7 +791,16 @@ pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> Verd
         // The guard decides alone — don't spend a coord round-trip.
         StatusFetch::Unreachable("unconsulted (stop_hook_active)".to_string())
     } else {
-        fetch_session_status(session_key).await
+        // The work-axis door is keyed by the HARNESS session id, which the
+        // Stop payload carries. `session_key` may instead be a coord session
+        // id (an AI task run the registrar maps), which that door does not key
+        // on — so a payload without one is UNKNOWN, never a guessed key.
+        match session_id_from(hook_input) {
+            Some(status_key) => fetch_session_status(&status_key).await,
+            None => StatusFetch::Unreachable(
+                "the Stop payload carries no session_id to read the work axis by".to_string(),
+            ),
+        }
     };
 
     let now = Instant::now();
@@ -957,41 +1029,114 @@ mod tests {
 
     // ── Wire-shape parsers ───────────────────────────────────────────────
 
+    // ── Status door: the work-status answer -> StatusFetch ──────────────
+
     #[test]
-    fn status_prefers_explicit_session_status_fields() {
-        // Forward-compatible: an explicit card-level session_status wins.
-        let b = json!({"resolved": [{"status": "live", "session_status": "waiting_human"}]});
+    fn only_a_work_status_row_is_reachable_and_everything_else_fails_open() {
+        use crate::mcp::session_work_status::OneStatus;
         assert_eq!(
-            status_from_resolve_body(&b),
-            Some("waiting_human".to_string())
+            status_fetch_from_one(OneStatus::Row(Some("finished".into()))),
+            reachable(Some("finished"))
         );
-        // Nested working_on.session.session_status is honored too.
-        let b = json!({"resolved": [{
-            "status": "live",
-            "working_on": {"session": {"session_status": "working"}}
-        }]});
-        assert_eq!(status_from_resolve_body(&b), Some("working".to_string()));
+        // A row whose work axis is unset is ABSENT — block-eligible.
+        assert_eq!(status_fetch_from_one(OneStatus::Row(None)), reachable(None));
+        // coord's `unknown` bucket is "not keyed here", not "no status":
+        // UNKNOWN, so it allows.
+        assert!(matches!(
+            status_fetch_from_one(OneStatus::NoRow),
+            StatusFetch::Unreachable(_)
+        ));
+        // A read coord did not settle (401, timeout, bridge column absent)
+        // fails OPEN.
+        assert!(matches!(
+            status_fetch_from_one(OneStatus::Unresolved("HTTP 401".into())),
+            StatusFetch::Unreachable(_)
+        ));
     }
 
     #[test]
-    fn status_derives_finished_from_closed_card() {
-        let b = json!({"resolved": [{"status": "closed"}], "count": 1});
-        assert_eq!(status_from_resolve_body(&b), Some("finished".to_string()));
+    fn only_non_blocking_readings_are_cacheable() {
+        assert!(is_block_eligible(&reachable(None)));
+        assert!(is_block_eligible(&reachable(Some(" Working "))));
+        assert!(!is_block_eligible(&reachable(Some("finished"))));
+        assert!(!is_block_eligible(&StatusFetch::Unreachable("x".into())));
+    }
+
+    // ── Gate-continuation arming (FlagReading + registry scoping) ───────
+
+    #[test]
+    fn flag_reading_keeps_unset_apart_from_off() {
+        assert_eq!(FlagReading::parse(None), FlagReading::Unset);
+        assert_eq!(FlagReading::parse(Some("  ")), FlagReading::Unset);
+        assert_eq!(
+            FlagReading::parse(Some("off")),
+            FlagReading::Explicit(Mode::Off)
+        );
+        assert_eq!(
+            FlagReading::parse(Some("bogus")),
+            FlagReading::Explicit(Mode::Off)
+        );
+        assert_eq!(
+            FlagReading::parse(Some("On")),
+            FlagReading::Explicit(Mode::On)
+        );
+        assert_eq!(
+            FlagReading::parse(Some("observe")),
+            FlagReading::Explicit(Mode::Observe)
+        );
     }
 
     #[test]
-    fn status_absent_for_live_card_without_session_status() {
-        let b = json!({"resolved": [{"status": "live"}], "count": 1});
-        assert_eq!(status_from_resolve_body(&b), None);
-        let b = json!({"resolved": [{"status": "stale"}], "count": 1});
-        assert_eq!(status_from_resolve_body(&b), None);
+    fn unset_flag_arms_gate_continuations_only_and_explicit_off_disarms_them() {
+        assert_eq!(FlagReading::Unset.mode_for(true), Mode::On);
+        assert_eq!(FlagReading::Unset.mode_for(false), Mode::Off);
+        assert_eq!(FlagReading::Explicit(Mode::Off).mode_for(true), Mode::Off);
+        assert_eq!(FlagReading::Explicit(Mode::On).mode_for(false), Mode::On);
+        assert_eq!(
+            FlagReading::Explicit(Mode::Observe).mode_for(true),
+            Mode::Observe
+        );
     }
 
     #[test]
-    fn status_absent_for_zero_cards_or_garbage() {
-        assert_eq!(status_from_resolve_body(&json!({"resolved": []})), None);
-        assert_eq!(status_from_resolve_body(&json!({})), None);
-        assert_eq!(status_from_resolve_body(&Value::Null), None);
+    fn registry_scoping_blocks_a_gate_continuation_with_no_status() {
+        // A terminal the continuation registry holds WITH a gate: an unset
+        // flag plus an absent coord status blocks at turn end.
+        let gate_tid = "verdict-test-gate";
+        let plain_tid = "verdict-test-plain";
+        let gateless_tid = "verdict-test-gateless";
+        // The registry lookup, injected: only `gate_tid` is a live entry with a
+        // gate (a work-unit dispatch's entry has none, so it reads false too).
+        let is_gate = |tid: &str| tid == gate_tid;
+
+        let mode = mode_for_terminal_with(FlagReading::Unset, gate_tid, &is_gate);
+        assert_eq!(mode, Mode::On);
+        assert_eq!(
+            decide(mode, false, &reachable(None), false).decision,
+            "block"
+        );
+
+        // No registry entry: the ordinary dark default — allowed.
+        let mode = mode_for_terminal_with(FlagReading::Unset, plain_tid, &is_gate);
+        assert_eq!(mode, Mode::Off);
+        assert_eq!(
+            decide(mode, false, &reachable(None), false).decision,
+            "allow"
+        );
+
+        // A registry entry WITHOUT a gate (a work-unit dispatch) is not a
+        // gate continuation.
+        assert_eq!(
+            mode_for_terminal_with(FlagReading::Unset, gateless_tid, &is_gate),
+            Mode::Off
+        );
+
+        // The gate continuation with the flag explicitly `off`: allowed.
+        let mode = mode_for_terminal_with(FlagReading::Explicit(Mode::Off), gate_tid, &is_gate);
+        assert_eq!(
+            decide(mode, false, &reachable(None), false).decision,
+            "allow"
+        );
     }
 
     #[test]
