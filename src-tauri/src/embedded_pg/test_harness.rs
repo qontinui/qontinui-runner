@@ -3528,9 +3528,11 @@ mod tests {
         })
     }
 
-    /// Inert — it passes at once — unless `QONTINUI_TEST_PG_CHILD` selects a
-    /// mode. The child-process self-tests below re-run this binary with exactly
-    /// this test selected:
+    /// Run only as a child process: it is `#[ignore]`d, so a run of the whole
+    /// binary never counts it, and it FAILS unless `QONTINUI_TEST_PG_CHILD`
+    /// selects a mode, so no run of it can count as a pass that exercised
+    /// nothing. The child-process self-tests below re-run this binary with
+    /// exactly this test selected (`--ignored --exact`, [`child_command`]):
     ///
     /// - `pass`: boot, report where the cluster is, and pass.
     /// - `fail`: the same, then fail, so libtest exits through
@@ -3540,10 +3542,14 @@ mod tests {
     ///   polling for it never reads half of one.
     /// - `boot-failure`: ask for a database from a harness that cannot boot.
     #[test]
+    #[ignore = "child-process helper; run by its parent test"]
     fn child_helper() {
-        let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
-            return;
-        };
+        let mode = std::env::var(CHILD_MODE_ENV).unwrap_or_else(|_| {
+            panic!(
+                "child_helper: run only by its parent test, which sets {CHILD_MODE_ENV}; run \
+                 alone it would pass having exercised nothing"
+            )
+        });
         match mode.as_str() {
             "pass" | "fail" => {
                 let database = fresh_database_blocking();
@@ -3589,17 +3595,27 @@ mod tests {
         output: String,
     }
 
-    fn run_child(mode: &str, report: &Path, harness_dir: Option<&Path>) -> ChildRun {
+    /// This test binary, to run [`child_helper`] alone in `mode` (`None`: with
+    /// no mode set). The helper is `#[ignore]`d, hence `--ignored`.
+    fn child_command(mode: Option<&str>) -> std::process::Command {
         let exe = std::env::current_exe().expect("this test binary's path");
         let mut command = crate::process_helpers::no_window(&exe);
         command
             .arg(child_test_name())
-            .args(["--exact", "--test-threads=1"])
-            .env(CHILD_MODE_ENV, mode)
-            .env(CHILD_REPORT_ENV, report)
+            .args(["--ignored", "--exact", "--test-threads=1"])
             // These tests are about the bundled cluster's teardown.
             .env_remove(EXTERNAL_URL_ENV)
             .stdin(std::process::Stdio::null());
+        match mode {
+            Some(mode) => command.env(CHILD_MODE_ENV, mode),
+            None => command.env_remove(CHILD_MODE_ENV),
+        };
+        command
+    }
+
+    fn run_child(mode: &str, report: &Path, harness_dir: Option<&Path>) -> ChildRun {
+        let mut command = child_command(Some(mode));
+        command.env(CHILD_REPORT_ENV, report);
         if let Some(dir) = harness_dir {
             command.env(HARNESS_DIR_ENV, dir);
         }
@@ -3616,7 +3632,7 @@ mod tests {
                 "the {mode} child (pid {pid}) did not finish within {} s",
                 CHILD_TIMEOUT.as_secs()
             ),
-            Err(e) => panic!("could not run the {mode} child {}: {e}", exe.display()),
+            Err(e) => panic!("could not run the {mode} child: {e}"),
         }
     }
 
@@ -3761,15 +3777,9 @@ mod tests {
         let report = scratch.path().join("child-report");
         let output_path = scratch.path().join("child-output");
         let output_file = std::fs::File::create(&output_path).expect("the child's output file");
-        let exe = std::env::current_exe().expect("this test binary's path");
-        let mut command = crate::process_helpers::no_window(&exe);
+        let mut command = child_command(Some("hang"));
         command
-            .arg(child_test_name())
-            .args(["--exact", "--test-threads=1"])
-            .env(CHILD_MODE_ENV, "hang")
             .env(CHILD_REPORT_ENV, &report)
-            .env_remove(EXTERNAL_URL_ENV)
-            .stdin(std::process::Stdio::null())
             .stdout(output_file.try_clone().expect("share the output file"))
             .stderr(output_file);
         let mut child = Hanging(command.spawn().expect("spawn the hang child"));
@@ -3942,6 +3952,32 @@ mod tests {
                 listed_key.map(|listed| listed as u32) == Some(key)
                     && fields.next().and_then(|field| field.parse().ok()) == Some(id)
             })
+    }
+
+    /// The child-process helper FAILS when no parent chose its mode, so no run
+    /// of it can count as a pass that exercised nothing.
+    #[test]
+    fn the_child_helper_fails_unless_a_parent_chose_its_mode() {
+        let output =
+            match crate::process_helpers::run_with_timeout(child_command(None), CHILD_TIMEOUT) {
+                Ok(crate::process_helpers::TimedOutput::Completed(output)) => output,
+                Ok(crate::process_helpers::TimedOutput::TimedOut { pid, .. }) => panic!(
+                    "the child with no mode (pid {pid}) did not finish within {} s",
+                    CHILD_TIMEOUT.as_secs()
+                ),
+                Err(e) => panic!("could not run the child with no mode: {e}"),
+            };
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success()
+                && shown.contains(&format!("{} ... FAILED", child_test_name()))
+                && shown.contains("run only by its parent test"),
+            "the helper must fail, saying why, when no parent chose its mode:\n{shown}"
+        );
     }
 
     /// A harness that cannot boot FAILS the test that asked it for a database,
