@@ -4836,8 +4836,11 @@ mod tests {
         let (shared, built) = enter_or_build(
             &lock,
             building,
+            // As `build_template` makes a cache: private, and marked as the
+            // harness's.
             move || async move {
-                std::fs::create_dir(building).map_err(|e| e.to_string())?;
+                create_private_dir(building).map_err(|e| e.to_string())?;
+                mark_made(building)?;
                 std::fs::write(building.join(READY_FILE), "built by the test\n")
                     .map_err(|e| e.to_string())?;
                 Ok::<_, String>(Duration::from_millis(1))
