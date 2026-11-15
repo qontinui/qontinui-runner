@@ -3855,6 +3855,37 @@ MemAvailable:   15335424 kB
         );
     }
 
+    /// The launch capacity on a host sample is judged against the SAME memory
+    /// reading the sample publishes: `collect_host_lane` takes exactly one
+    /// `memory_status()` and never reaches for a second, independent reading
+    /// through `lane_verdicts()` or an `AdmissionReading::live()` /
+    /// `launch_capacity::live()`-style call. A lexical guard.
+    ///
+    /// Mutation: call `crate::launch_capacity::live()` (or
+    /// `resource_guard::lane_verdicts()`) from `collect_host_lane`, or take a
+    /// second `memory_status()`.
+    #[test]
+    fn the_host_lane_judges_launch_capacity_on_the_memory_reading_it_publishes() {
+        let body = collect_host_lane_src();
+        assert_eq!(
+            body.matches("memory_status()").count(),
+            1,
+            "collect_host_lane must take exactly ONE memory reading"
+        );
+        assert!(
+            !body.contains("lane_verdicts()"),
+            "collect_host_lane must not take a second reading through lane_verdicts()"
+        );
+        assert!(
+            !body.contains("::live()"),
+            "collect_host_lane must not take a second reading through a ::live() constructor"
+        );
+        assert!(
+            body.contains("launch_capacity::live_with_memory("),
+            "the launch capacity must be built from the passed-in reading"
+        );
+    }
+
     /// The production body of [`collect_host_lane`], for the structural pins
     /// above and below. Split off the test module first, so a call site written
     /// inside a test cannot satisfy a pin that production code fails — the same

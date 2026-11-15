@@ -4722,6 +4722,29 @@ mod tests {
     /// `MemoryRecord` is deliberately excluded: it is written to its own
     /// `memory-outbox.jsonl` and the coord session drain never sees it. Any
     /// OTHER kind reaching this list without an arm is a silent data-loss bug.
+    /// Every kind the coord session drain pushes (all but `MemoryRecord`,
+    /// which has its own outbox file) — shared by the dispatch-arm guard and
+    /// the credential-scope test so the two cannot cover different sets.
+    const DRAINED_KINDS: [SessionEventKind; 17] = [
+        SessionEventKind::Started,
+        SessionEventKind::StateChange,
+        SessionEventKind::Closed,
+        SessionEventKind::Heartbeat,
+        SessionEventKind::ClaimStolen,
+        SessionEventKind::OutputChunk,
+        SessionEventKind::CommitReport,
+        SessionEventKind::Progress,
+        SessionEventKind::HelperTaskCreated,
+        SessionEventKind::RestoreRecord,
+        SessionEventKind::GateRegistration,
+        SessionEventKind::FindingPosted,
+        SessionEventKind::Finished,
+        SessionEventKind::CoordTransportRung,
+        SessionEventKind::AgentNotification,
+        SessionEventKind::OperatorTouch,
+        SessionEventKind::SpawnFailedReport,
+    ];
+
     #[test]
     fn every_session_outbox_kind_has_a_dispatch_arm() {
         let src = include_str!("coord_sync.rs");
@@ -4732,25 +4755,7 @@ mod tests {
             .expect("the dispatch function must exist")
             .1;
 
-        for kind in [
-            SessionEventKind::Started,
-            SessionEventKind::StateChange,
-            SessionEventKind::Closed,
-            SessionEventKind::Heartbeat,
-            SessionEventKind::ClaimStolen,
-            SessionEventKind::OutputChunk,
-            SessionEventKind::CommitReport,
-            SessionEventKind::Progress,
-            SessionEventKind::HelperTaskCreated,
-            SessionEventKind::RestoreRecord,
-            SessionEventKind::GateRegistration,
-            SessionEventKind::FindingPosted,
-            SessionEventKind::Finished,
-            SessionEventKind::CoordTransportRung,
-            SessionEventKind::AgentNotification,
-            SessionEventKind::OperatorTouch,
-            SessionEventKind::SpawnFailedReport,
-        ] {
+        for kind in DRAINED_KINDS {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
                 dispatch.contains(&arm),
@@ -5766,6 +5771,11 @@ mod tests {
     /// coord would class the report unverified and keep the dispatch marker).
     /// Every other kind keeps its record's own scope.
     ///
+    /// The source pin at the end is a LEXICAL wiring guard only: it proves
+    /// `push_record`'s head calls `push_credential_scope(kind, …)` before the
+    /// dispatch match, not what the call returns — the value asserts above it
+    /// do that.
+    ///
     /// Mutation: in `push_record`, use `record_session_tenant(inner, rec)`
     /// directly (the source pin fails), or return `record_scope` for this kind
     /// in `push_credential_scope` (the value asserts fail).
@@ -5784,13 +5794,15 @@ mod tests {
                 ),
                 TenantScope::Device
             );
-            for other in [
-                SessionEventKind::Started,
-                SessionEventKind::FindingPosted,
-                SessionEventKind::GateRegistration,
-                SessionEventKind::OperatorTouch,
-            ] {
-                assert_eq!(push_credential_scope(other.as_str(), record_scope), record_scope);
+            for other in DRAINED_KINDS
+                .into_iter()
+                .filter(|k| *k != SessionEventKind::SpawnFailedReport)
+            {
+                assert_eq!(
+                    push_credential_scope(other.as_str(), record_scope),
+                    record_scope,
+                    "{other:?} must keep its record's own scope"
+                );
             }
         }
         let src = include_str!("coord_sync.rs");
@@ -5803,7 +5815,7 @@ mod tests {
             .expect("the dispatch match must exist")
             .0;
         assert!(
-            head.contains("let scope = push_credential_scope(kind, record_session_tenant(inner, rec));"),
+            head.contains("push_credential_scope(kind,"),
             "push_record must route the record scope through push_credential_scope"
         );
     }
@@ -12837,9 +12849,11 @@ pub(crate) mod egress_tests {
         let check = body
             .find("output_chunk_egress_refusal(&rec.payload, scope.into())")
             .unwrap();
-        let scope = body
-            .find("let scope = record_session_tenant(inner, rec);")
-            .unwrap();
+        // The FIRST `let scope = ` after the signature is push_record's own
+        // head binding — robust to how the scope is composed (it now routes
+        // through `push_credential_scope`), and found before this test's own
+        // literals, which sit much later in the file.
+        let scope = body.find("let scope = ").unwrap();
         assert!(
             scope < check,
             "the owning session's tenant is resolved before the check"
