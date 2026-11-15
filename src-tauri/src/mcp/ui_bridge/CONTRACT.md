@@ -465,7 +465,7 @@ Two thread-through styles, mirroring the `tabId` split:
   than a 200 carrying `typed: false`, and the success payload is the SDK's
   declared `{typed, element}` plus `index` — the old `valueLength` field is
   gone; read a value back with `POST /control/page/read-value`.
-  Every JS-evaluating member of this family (plus `POST /control/page/summary`) parses the
+  `click-by-text`, `click-by-selector` and `type-into` (plus `POST /control/page/summary`) parse the
   evaluated result through `helpers::parse_eval_result`. **An unparseable
   result is HTTP 500**, naming the route and echoing the offending text — it
   is a runner-side failure, not a result. These routes used to answer HTTP 200
@@ -473,7 +473,9 @@ Two thread-through styles, mirroring the `tabId` split:
   which told the caller the click had succeeded and named neither the route nor
   the cause. Note this arm is reachable in normal operation: the direct-WebView
   fallback in `evaluate_js_expression` returns whatever string the WebView
-  produced, including `undefined` from a swallowed exception.
+  produced, including `undefined` from a swallowed exception. `find-by-text`
+  is the exception: it still maps an unparseable result to an empty `matches`
+  array (HTTP 200, `count: 0`).
 
 > **Still open (deliberately, on this family):** a *resolved miss* —
 > `click-by-text` / `click-by-selector` finding no match — is still an HTTP 200
