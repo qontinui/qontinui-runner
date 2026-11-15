@@ -31,7 +31,33 @@ fn observed(status: Option<&str>, since: Option<&str>, coord: Option<&str>) -> O
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.timestamp_millis()),
         coord_session_id: coord.map(str::to_string),
+        state: None,
+        started_at: None,
+        started_at_ms: None,
     }
+}
+
+/// [`observed`] for a row naming [`OTHER_ROW`], with its `state` and
+/// `started_at` (Phase 4 of plan
+/// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`).
+fn other(
+    status: Option<&str>,
+    since: Option<&str>,
+    state: Option<&str>,
+    started_at: Option<&str>,
+) -> ObservedRow {
+    ObservedRow {
+        state: state.map(str::to_string),
+        started_at: started_at.map(str::to_string),
+        started_at_ms: started_at
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.timestamp_millis()),
+        ..observed(status, since, Some(OTHER_ROW))
+    }
+}
+
+fn other_row() -> Uuid {
+    Uuid::parse_str(OTHER_ROW).unwrap()
 }
 
 fn decide(obs: &ObservedRow) -> HealDecision {
@@ -120,7 +146,8 @@ fn every_unknown_leaves_the_mark_alone() {
     );
     assert_eq!(
         decide(&observed(None, None, Some(OTHER_ROW))),
-        HealDecision::Leave(HealSkip::DifferentRow)
+        HealDecision::Leave(HealSkip::DifferentRowStateUnknown),
+        "a different row with no served state is UNKNOWN, never re-addressed"
     );
     assert_eq!(
         decide(&observed(None, None, None)),
@@ -189,8 +216,9 @@ struct FakePort {
 }
 
 impl HealPort for FakePort {
-    fn own_row(&self, _rec: &TerminalSessionRecord) -> Option<Uuid> {
-        self.own
+    fn own_row(&self, rec: &TerminalSessionRecord) -> Option<Uuid> {
+        // The production preference: the stored sent/confirmed row first.
+        rec.finish_coord_session_id.or(self.own)
     }
     fn redeliver(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<FinishSync> {
         self.store.with_unsynced_finished_records(|recs| {
@@ -207,9 +235,15 @@ impl HealPort for FakePort {
                 })
         })
     }
-    fn finish_queued(&self, _csid: &str, _finished_at: i64, _row: Uuid) -> Option<bool> {
-        // No outbox behind this port: nothing is ever still queued.
-        Some(false)
+    fn finish_queued(&self, csid: &str, finished_at: i64, row: Uuid) -> Option<bool> {
+        // Nothing behind this port ever drains: what it sent is still queued.
+        Some(
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(c, at, r)| c == csid && *at == finished_at && *r == row),
+        )
     }
 }
 
@@ -369,7 +403,7 @@ fn a_different_row_or_an_unresolved_own_row_changes_nothing() {
     let fetch =
         fetch_from_body_for_test(body("heal-other", json!(null), json!(null), OTHER_ROW), 1);
     let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
-    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::DifferentRow));
+    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::DifferentRowNotActive));
     let blind = FakePort {
         own: None,
         ..port(&store)
@@ -689,7 +723,7 @@ fn a_read_back_over_another_rows_finish_does_not_read_synced() {
     let rb = read_back_from(&store, Some(&p), "rb-other", &fetch, now);
     decorate_read_back(&mut resp, &rb, store.get("rb-other").as_ref());
     assert_eq!(resp["session"]["finishSynced"], false);
-    assert_eq!(resp["coord"]["heal"]["outcome"], "different_row");
+    assert_eq!(resp["coord"]["heal"]["outcome"], "different_row_not_active");
     assert!(
         store.get("rb-other").unwrap().finish_synced,
         "the stamp itself is untouched"
@@ -1091,4 +1125,424 @@ async fn the_sweep_skips_a_mark_whose_finish_is_still_queued() {
         rows(&outbox),
         vec![("finished".to_string(), "queued".to_string())]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Re-address (plan
+// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`,
+// Phase 4): a finish written to a different row than the one coord names
+// ---------------------------------------------------------------------------
+
+fn iso(ms: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp_millis(ms)
+        .unwrap()
+        .to_rfc3339()
+}
+
+/// A body whose row is [`OTHER_ROW`] with the given state and `started_at`.
+fn other_body(
+    csid: &str,
+    status: serde_json::Value,
+    since: serde_json::Value,
+    state: &str,
+    started_at: Option<&str>,
+) -> serde_json::Value {
+    let mut row = json!({"session_status": status, "since": since,
+                         "coord_session_id": OTHER_ROW, "state": state});
+    if let Some(s) = started_at {
+        row["started_at"] = json!(s);
+    }
+    json!({
+        "statuses": {csid: row},
+        "unknown": [], "invalid": [], "input_truncated": false,
+        "sessionBridgeColumnPresent": true
+    })
+}
+
+#[test]
+fn a_different_active_null_row_that_predates_the_finish_is_readdressed() {
+    assert_eq!(
+        decide(&other(None, None, Some("active"), Some(BEFORE))),
+        HealDecision::Readdress { row: other_row() }
+    );
+    assert_eq!(
+        decide(&other(None, Some(BEFORE), Some("active"), Some(BEFORE))),
+        HealDecision::Readdress { row: other_row() },
+        "a since before the finish is no revival"
+    );
+}
+
+#[test]
+fn every_other_different_row_is_left_and_counted_by_reason() {
+    let cases = [
+        (
+            other(None, None, Some("closed"), Some(BEFORE)),
+            HealSkip::DifferentRowNotActive,
+        ),
+        (
+            other(None, None, None, Some(BEFORE)),
+            HealSkip::DifferentRowStateUnknown,
+        ),
+        (
+            other(Some("working"), None, Some("active"), Some(BEFORE)),
+            HealSkip::DifferentRowStatusNotNull,
+        ),
+        (
+            other(Some("finished"), Some(AFTER), Some("active"), Some(BEFORE)),
+            HealSkip::DifferentRowStatusNotNull,
+        ),
+        (
+            other(None, Some(AFTER), Some("active"), Some(BEFORE)),
+            HealSkip::DifferentRowRevived,
+        ),
+        (
+            other(None, Some("not-a-time"), Some("active"), Some(BEFORE)),
+            HealSkip::SinceUnreadable,
+        ),
+        (
+            other(None, None, Some("active"), Some(AFTER)),
+            HealSkip::DifferentRowStartedAfterFinish,
+        ),
+        (
+            other(None, None, Some("active"), None),
+            HealSkip::DifferentRowStartedUnknown,
+        ),
+        (
+            other(None, None, Some("active"), Some("yesterday")),
+            HealSkip::DifferentRowStartedUnknown,
+        ),
+    ];
+    for (obs, skip) in cases {
+        assert_eq!(decide(&obs), HealDecision::Leave(skip), "{obs:?}");
+    }
+    // A row registered AT the finish instant is not before it.
+    let at = iso(FINISHED_AT);
+    assert_eq!(
+        decide(&other(None, None, Some("active"), Some(&at))),
+        HealDecision::Leave(HealSkip::DifferentRowStartedAfterFinish)
+    );
+}
+
+#[test]
+fn a_synced_mark_on_a_stale_row_is_readdressed_to_the_live_row_once() {
+    let (_d, store, at) = synced_store("re-live");
+    let p = port(&store);
+    let started = iso(at - 3_600_000);
+    let fetch = fetch_from_body_for_test(
+        other_body(
+            "re-live",
+            json!(null),
+            json!(null),
+            "active",
+            Some(&started),
+        ),
+        1,
+    );
+    let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
+    assert_eq!(
+        out,
+        vec![(
+            "re-live".to_string(),
+            HealOutcome::Readdressed {
+                from: row(),
+                row: other_row()
+            }
+        )]
+    );
+    assert!(!store.get("re-live").unwrap().finish_synced);
+    assert_eq!(
+        store.get("re-live").unwrap().finish_coord_session_id,
+        Some(other_row()),
+        "the re-address target is recorded as the mark's sent row"
+    );
+    assert_eq!(
+        *p.sent.lock().unwrap(),
+        vec![("re-live".to_string(), at, other_row())],
+        "addressed to the row coord OBSERVED, not the mark's own"
+    );
+
+    // The read-back arm again: the mark is unsynced, so nothing.
+    let again = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 2_000);
+    assert!(again.is_empty(), "{again:?}");
+    // The boot sweep again: the re-addressed Finished row is still queued.
+    let ids = vec!["re-live".to_string()];
+    let boot = apply_heal_observed(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &Observations::from_fetch(&ids, &fetch),
+        at + 3_000,
+        true,
+    );
+    assert_eq!(boot[0].1, HealOutcome::Left(HealSkip::FinishStillQueued));
+    assert_eq!(
+        p.sent.lock().unwrap().len(),
+        1,
+        "one re-send across three sweeps"
+    );
+
+    // The drain's ack on the observed row stamps it as the mark's own, so a
+    // later read of that row reading finished is the healthy case.
+    store.mark_finish_synced_on("re-live", Some(at), Some(other_row()));
+    let rec = store.get("re-live").unwrap();
+    assert!(rec.finish_synced);
+    assert_eq!(rec.finish_coord_session_id, Some(other_row()));
+    let finished = fetch_from_body_for_test(
+        other_body(
+            "re-live",
+            json!("finished"),
+            json!(iso(at + 500)),
+            "active",
+            Some(&started),
+        ),
+        1,
+    );
+    let out = apply_heal(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &finished,
+        at + 4_000,
+    );
+    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::CoordFinished));
+}
+
+#[test]
+fn a_different_row_that_is_closed_revived_or_newer_is_untouched() {
+    let (_d, store, at) = synced_store("re-no");
+    let p = port(&store);
+    let before = iso(at - 3_600_000);
+    let after = iso(at + 3_600_000);
+    for (b, skip) in [
+        (
+            other_body("re-no", json!(null), json!(null), "closed", Some(&before)),
+            HealSkip::DifferentRowNotActive,
+        ),
+        (
+            other_body("re-no", json!(null), json!(after), "active", Some(&before)),
+            HealSkip::DifferentRowRevived,
+        ),
+        (
+            other_body("re-no", json!(null), json!(null), "active", Some(&after)),
+            HealSkip::DifferentRowStartedAfterFinish,
+        ),
+        (
+            other_body("re-no", json!(null), json!(null), "active", None),
+            HealSkip::DifferentRowStartedUnknown,
+        ),
+    ] {
+        let fetch = fetch_from_body_for_test(b, 1);
+        let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
+        assert_eq!(out[0].1, HealOutcome::Left(skip));
+        assert!(store.get("re-no").unwrap().finish_synced, "{skip:?}");
+    }
+    assert!(p.sent.lock().unwrap().is_empty());
+}
+
+/// An unsynced mark whose `Finished` row is still pending to its OWN row is
+/// not re-addressed: the drain delivers that one first.
+#[test]
+fn an_unsynced_mark_still_queued_to_its_own_row_is_not_readdressed() {
+    let (_d, store, at) = unsynced_store("re-queued");
+    let p = port(&store);
+    p.sent
+        .lock()
+        .unwrap()
+        .push(("re-queued".to_string(), at, row()));
+    let started = iso(at - 3_600_000);
+    let ids = vec!["re-queued".to_string()];
+    let obs = Observations::from_fetch(
+        &ids,
+        &fetch_from_body_for_test(
+            other_body(
+                "re-queued",
+                json!(null),
+                json!(null),
+                "active",
+                Some(&started),
+            ),
+            1,
+        ),
+    );
+    let out = apply_heal_observed(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &obs,
+        at + 1_000,
+        true,
+    );
+    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::FinishStillQueued));
+    assert_eq!(p.sent.lock().unwrap().len(), 1);
+
+    p.sent.lock().unwrap().clear();
+    let out = apply_heal_observed(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &obs,
+        at + 1_000,
+        true,
+    );
+    assert_eq!(
+        out[0].1,
+        HealOutcome::Readdressed {
+            from: row(),
+            row: other_row()
+        }
+    );
+}
+
+#[test]
+fn a_read_back_over_a_stale_row_readdresses_and_reports_the_live_row() {
+    let (_d, store, at) = synced_store("rb-re");
+    let p = port(&store);
+    let mut resp = read_back_response(&store, "rb-re");
+    let started = iso(at - 3_600_000);
+    let fetch = fetch_from_body_for_test(
+        other_body("rb-re", json!(null), json!(null), "active", Some(&started)),
+        1,
+    );
+    let now = chrono::DateTime::<Utc>::from_timestamp_millis(at + 5_000).unwrap();
+    let rb = read_back_from(&store, Some(&p), "rb-re", &fetch, now);
+    decorate_read_back(&mut resp, &rb, store.get("rb-re").as_ref());
+    assert_eq!(resp["session"]["finishSynced"], false);
+    assert_eq!(resp["coord"]["heal"]["outcome"], "readdressed");
+    assert_eq!(resp["coord"]["queued"], true);
+    assert_eq!(resp["coord"]["coordSessionId"], OTHER_ROW);
+    assert_eq!(resp["coord"]["observed"]["state"], "active");
+    assert_eq!(resp["coord"]["observed"]["startedAt"], started);
+}
+
+/// Review A1: after a re-address, a reason-less re-run of the finish (the
+/// retry door) sends to the re-addressed row, never to the stale row the
+/// in-process resolvers still name — whose ack would stamp the mark synced on
+/// the stale row — even after the drain drops the re-addressed finish
+/// unconfirmed.
+#[test]
+fn the_retry_door_does_not_resend_to_the_stale_row_after_a_readdress() {
+    let (_d, outbox, reg, store) = wired();
+    store.record_open(test_open_record("re-retry"));
+    let at = store
+        .set_finished("re-retry", true, Some("done".into()))
+        .unwrap()
+        .record
+        .finished_at
+        .unwrap();
+    // The first finish went to the stale row and was confirmed there.
+    store.mark_finish_synced_on("re-retry", Some(at), Some(row()));
+    drain_all(&outbox);
+
+    let started = iso(at - 3_600_000);
+    let fetch = fetch_from_body_for_test(
+        other_body(
+            "re-retry",
+            json!(null),
+            json!(null),
+            "active",
+            Some(&started),
+        ),
+        1,
+    );
+    let out = apply_heal(
+        &store,
+        Some(reg.as_ref() as &dyn HealPort),
+        &store.all_records(),
+        &fetch,
+        at + 1_000,
+    );
+    assert_eq!(
+        out[0].1,
+        HealOutcome::Readdressed {
+            from: row(),
+            row: other_row()
+        }
+    );
+    let rec = store.get("re-retry").unwrap();
+    assert!(!rec.finish_synced);
+    assert_eq!(
+        rec.finish_coord_session_id,
+        Some(other_row()),
+        "the re-address target is the mark's sent row"
+    );
+    assert!(rec.finish_coord_readdressed);
+    let finished_to = |outbox: &OutboxWriter| -> Vec<Uuid> {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .map(|r| r.session_id)
+            .collect()
+    };
+    assert_eq!(finished_to(&outbox), vec![other_row()]);
+
+    // The retry door (a reason-less re-run): the terminal lookup still names
+    // the stale row, but the finish goes to the re-addressed one.
+    let again = store.set_finished("re-retry", true, None).unwrap();
+    assert_eq!(
+        again.coord,
+        FinishSync::Queued {
+            coord_session_id: other_row()
+        }
+    );
+    assert_eq!(finished_to(&outbox), vec![other_row(), other_row()]);
+
+    // The drain gives up on the re-addressed finish unconfirmed (it records
+    // the row it sent to — the same row): the retry door still goes there.
+    drain_all(&outbox);
+    store.note_finish_sent_row("re-retry", Some(at), other_row());
+    assert!(store.get("re-retry").unwrap().finish_coord_readdressed);
+    store.set_finished("re-retry", true, None).unwrap();
+    assert_eq!(
+        finished_to(&outbox),
+        vec![other_row()],
+        "never back to the stale row"
+    );
+
+    // An unmark clears the re-address with the mark.
+    store.set_finished("re-retry", false, None).unwrap();
+    let rec = store.get("re-retry").unwrap();
+    assert!(!rec.finish_coord_readdressed);
+    assert_eq!(rec.finish_coord_session_id, None);
+}
+
+/// The re-address flag is recorded only on the matching unsynced mark, and a
+/// DIFFERENT sent row recorded later clears it.
+#[test]
+fn the_readdress_flag_follows_only_its_own_row() {
+    let (_d, store, at) = unsynced_store("flag");
+    assert!(!store.note_finish_readdressed("flag", at + 1, other_row(), false));
+    assert!(!store.note_finish_readdressed("ghost", at, other_row(), false));
+    assert!(store.note_finish_readdressed("flag", at, other_row(), false));
+    let rec = store.get("flag").unwrap();
+    assert!(rec.finish_coord_readdressed);
+    assert_eq!(rec.finish_coord_session_id, Some(other_row()));
+
+    store.note_finish_sent_row("flag", Some(at), row());
+    let rec = store.get("flag").unwrap();
+    assert!(
+        !rec.finish_coord_readdressed,
+        "another sent row is not the re-addressed one"
+    );
+    assert_eq!(rec.finish_coord_session_id, Some(row()));
+
+    // A synced mark has its stamp withdrawn in the same step.
+    let (_d2, synced, sat) = synced_store("flag-synced");
+    assert!(synced.note_finish_readdressed("flag-synced", sat, other_row(), true));
+    // A second heal over the same synced snapshot is refused: one re-send.
+    assert!(!synced.note_finish_readdressed("flag-synced", sat, other_row(), true));
+    let rec = synced.get("flag-synced").unwrap();
+    assert!(!rec.finish_synced);
+    assert!(rec.finish_coord_readdressed);
+
+    // A different row confirming the finish clears the flag; the same row
+    // keeps it.
+    synced.mark_finish_synced_on("flag-synced", Some(sat), Some(other_row()));
+    assert!(synced.get("flag-synced").unwrap().finish_coord_readdressed);
+    assert!(synced.note_finish_readdressed("flag-synced", sat, other_row(), true));
+    synced.mark_finish_synced_on("flag-synced", Some(sat), Some(row()));
+    let rec = synced.get("flag-synced").unwrap();
+    assert!(!rec.finish_coord_readdressed);
+    assert_eq!(rec.finish_coord_session_id, Some(row()));
 }
