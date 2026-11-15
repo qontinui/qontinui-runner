@@ -883,7 +883,6 @@ mod tests {
         ));
     }
 
-
     /// Decode with NO contract check. Only for a fixture that sends, on
     /// purpose, a body coord cannot (a missing, extra or retired key) to
     /// exercise a defensive arm. Every caller says why.
