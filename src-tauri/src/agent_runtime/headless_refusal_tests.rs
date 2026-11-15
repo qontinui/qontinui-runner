@@ -192,7 +192,10 @@ async fn a_headless_continuation_refused_by_the_gateway_removes_its_fresh_tree()
         canonical: canonical.to_path_buf(),
     });
     let (canonical, tree) = (f.canonical.clone(), f.tree.clone());
-    assert!(worktree_listed(&canonical, &tree), "the fixture's worktree is listed");
+    assert!(
+        worktree_listed(&canonical, &tree),
+        "the fixture's worktree is listed"
+    );
 
     let (res, observed) = refuse_headless(f).await;
 
@@ -234,7 +237,10 @@ async fn a_headless_continuation_refused_by_the_gateway_keeps_a_shared_branch_tr
         .expect("the continuation held a context, so the removal reported");
     assert_eq!(report.trees.len(), 1, "{report:?}");
     assert!(
-        matches!(&report.trees[0].1, TreeOutcome::Kept(KeepReason::NotFresh(_))),
+        matches!(
+            &report.trees[0].1,
+            TreeOutcome::Kept(KeepReason::NotFresh(_))
+        ),
         "{report:?}"
     );
     assert!(tree.exists(), "a shared-branch tree is never removed");

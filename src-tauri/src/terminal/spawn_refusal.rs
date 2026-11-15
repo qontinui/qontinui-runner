@@ -1097,7 +1097,11 @@ mod tests {
                 &format!("            {tail}\n"),
                 &format!("            remove_unspawned(ctx);\n            {tail}\n"),
             );
-            assert!(exits_of(&removed).is_empty(), "{tail}: {:?}", exits_of(&removed));
+            assert!(
+                exits_of(&removed).is_empty(),
+                "{tail}: {:?}",
+                exits_of(&removed)
+            );
         }
         // A type that merely ends in `Result` is not the std path.
         assert!(value_position_err("        MyResult::Err(e)").is_none());
@@ -1875,12 +1879,7 @@ mod tests {
         );
         let exits = early_exits(&code, from, end + 1);
         let mut no_exits = false;
-        for (line, &in_code) in raw
-            .iter()
-            .zip(&starts_in_code)
-            .take(end + 1)
-            .skip(from + 1)
-        {
+        for (line, &in_code) in raw.iter().zip(&starts_in_code).take(end + 1).skip(from + 1) {
             match marker_reason(line, in_code, "no-exits", NO_EXIT_REASONS) {
                 Ok(Some(_)) => no_exits = true,
                 Ok(None) => {}
