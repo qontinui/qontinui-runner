@@ -1397,6 +1397,11 @@ mod script_tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let out = fake_claude(&real_dir);
+        // The freshly written fake `claude` must read as settled, or the shim
+        // waits out its settle check on every run.
+        crate::install_effects_producer::intercept::shim_test_support::install_settled_stat(
+            &real_dir,
+        );
         let rendered = IDENTITY_SHIM_BASH
             .replace("@@TOOL@@", "claude")
             .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy());

@@ -101,3 +101,15 @@ pub(crate) fn identity_cmd(shim_dir: &Path, real_dir: &Path, wait: &str) -> Comm
         wait,
     )
 }
+
+/// Install a fake `stat` in `dir` that reports every target as changed at epoch
+/// second 1 — long settled. The identity shim waits for a resolved `claude`
+/// whose target changed under 2 s ago (plan
+/// `2026-11-10-shim-settle-wait-and-in-memory-launch-liveness` Phase 3), and a
+/// change time cannot be backdated (`touch -d` moves only mtime), so a test
+/// that launches a freshly written fake `claude` with the real `stat` on PATH
+/// would pay that wait and see its line on stderr. Put `dir` on PATH ahead of
+/// the system dirs. Call it under the caller's executable-writing lock.
+pub(crate) fn install_settled_stat(dir: &Path) {
+    write_exe(&dir.join("stat"), "#!/bin/sh\necho 1\n");
+}
