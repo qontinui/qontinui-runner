@@ -26,9 +26,13 @@
 #   * DON'T DOUBLE-PIN: if the user already passed --session-id/--resume (or the
 #     resume subcommand), do NOT append our id — their explicit choice wins.
 #   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT, or is
-#     npm's placeholder stub (mid-reinstall), is re-scanned for at most QONTINUI_SHIM_RESOLVE_WAIT_SECS
-#     (default 10) before the fail-open fall-through; a resolved tool never
-#     waits, and the only output added is on STDERR, on the miss path alone.
+#     npm's placeholder stub (mid-reinstall), or resolved but CHANGED under 2 s
+#     ago (an install still writing it), is re-scanned for at most
+#     QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables both waits)
+#     before the fail-open fall-through. One deadline covers both waits; a
+#     candidate still changing at it is launched anyway. A SETTLED tool never
+#     waits, and the only output added is on STDERR, on the miss and
+#     still-changing paths alone.
 #   * LAUNCH FAILURE IS REPORTED: a top-level invocation that gives up on the
 #     real tool (`resolve-failed`) or cannot exec it (`exec-failed`) tells the
 #     runner so before it falls through, so the pane's session row can close
@@ -146,9 +150,10 @@ resolve_real() { scan_path real; }
 # which failed `not found` 73 ms after spawn and silently lost a runner-spawned
 # gate continuation (2026-10-01, merytshost). So a miss re-scans with short
 # sleeps for up to QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables)
-# before giving up. A HIT costs nothing extra — the wait is only ever paid by
-# an invocation that would otherwise have failed. One stderr line announces the
-# wait so a genuinely absent tool is not a silent 10 s stall.
+# before giving up. A SETTLED hit costs one `stat` and no wait (see the settle
+# check below) — the wait is only ever paid by an invocation that would
+# otherwise have failed, or launched a tool still being written. One stderr
+# line announces the wait so a genuinely absent tool is not a silent 10 s stall.
 # ---------------------------------------------------------------------------
 resolve_wait_secs() {
   local w="${QONTINUI_SHIM_RESOLVE_WAIT_SECS:-10}"
@@ -158,18 +163,98 @@ resolve_wait_secs() {
   printf '%s' "$((10#$w))"
 }
 
+# ---------------------------------------------------------------------------
+# SETTLE check (plan 2026-11-10-shim-settle-wait-and-in-memory-launch-liveness,
+# Phase 3, D3). npm re-links `bin/claude` and THEN writes the 340 MB native
+# image behind it, so a resolved, executable, non-stub `claude` can still be
+# mid-write: a sampler saw one as small as 14.9 MB for up to 1.5 s (coord
+# finding 25770a72). A candidate is SETTLED when its target's change time is
+# old enough -- the runner's intercept_core::settled predicate, carried here as
+# a copy the way is_npm_placeholder is. Both clocks are whole seconds here, so
+# settled means `now - ctime >= 3`, which guarantees more than 2 s.
+#
+# file_changed_at <path>: the TARGET's change time (`-L` follows a symlink,
+# so a long-standing bin/claude link to a freshly rewritten image reads the
+# image), in epoch seconds. GNU/MSYS `stat -c %Z`, else BSD/macOS
+# `stat -f %c`. Both run with 2>/dev/null: BSD stat rejects `-c` with a usage
+# error that would otherwise reach the pane on EVERY launch (TRANSPARENT), and
+# a missing `stat` stays silent too. Fails when neither prints an integer.
+file_changed_at() {
+  local t
+  t="$(stat -L -c %Z "$1" 2>/dev/null)" || t=''
+  case "$t" in ''|*[!0-9]*) t="$(stat -L -f %c "$1" 2>/dev/null)" || t='' ;; esac
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$t"
+}
+
+# now_epoch: the current time in epoch seconds. $EPOCHSECONDS is a builtin
+# from bash 5; macOS ships bash 3.2, which falls back to `date +%s`.
+now_epoch() {
+  local n="${EPOCHSECONDS:-}"
+  [ -n "$n" ] || n="$(date +%s 2>/dev/null)" || n=''
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+
+# is_settled <path>: 0 settled, 1 changing, 2 unknown (no readable change time
+# or clock). The caller treats unknown as settled: waiting on it would delay
+# every launch by the full bound on such a box, and launching at once is the
+# behaviour that predates this check. Sets SETTLE_AGE to the age in whole
+# seconds (0 for a change time in the future, which reads as changing).
+SETTLE_AGE=0
+is_settled() {
+  local changed now
+  changed="$(file_changed_at "$1")" || return 2
+  now="$(now_epoch)" || return 2
+  SETTLE_AGE=$((10#$now - 10#$changed))
+  if [ "$SETTLE_AGE" -ge 3 ]; then return 0; fi
+  [ "$SETTLE_AGE" -ge 0 ] || SETTLE_AGE=0
+  return 1
+}
+
+# One deadline over both waits: a MISS (absent, or only npm's stub) and a
+# candidate still CHANGING. Prints a settled (or unknown) candidate at once;
+# announces each kind of wait once on stderr; at the deadline prints the last
+# probe's still-changing candidate with a `launching it anyway` line (something
+# launchable DID resolve, so this is no resolve-failed -- FAIL-OPEN, and an
+# exec that then fails still reports exec-failed), or returns 1 so that
+# report_unresolved runs as before. A zero wait disables both: the first hit is
+# printed as found, with no stat.
 resolve_real_waiting() {
-  local found
-  if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
+  local found='' last='' rc=0 said_missing=0 said_changing=0
   local wait_secs; wait_secs="$(resolve_wait_secs)"
-  [ "$wait_secs" -gt 0 ] || return 1
-  printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it, or leaves the npm placeholder stub in its place)\n' \
-    "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
-  local deadline=$((SECONDS + wait_secs))
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    sleep 0.25 2>/dev/null || sleep 1
+  if [ "$wait_secs" -le 0 ]; then
     if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
+    return 1
+  fi
+  local deadline=$((SECONDS + wait_secs))
+  while :; do
+    if found="$(resolve_real)"; then
+      rc=0; is_settled "$found" || rc=$?
+      if [ "$rc" -ne 1 ]; then printf '%s' "$found"; return 0; fi
+      last="$found"
+      if [ "$said_changing" -eq 0 ]; then
+        said_changing=1
+        printf 'qontinui shim: %s changed %ss ago (an install may still be writing it); waiting up to %ss for it to settle\n' \
+          "$found" "$SETTLE_AGE" "$wait_secs" >&2
+      fi
+    else
+      last=''
+      if [ "$said_missing" -eq 0 ]; then
+        said_missing=1
+        printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it, or leaves the npm placeholder stub in its place)\n' \
+          "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
+      fi
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep 0.25 2>/dev/null || sleep 1
   done
+  if [ -n "$last" ]; then
+    printf 'qontinui shim: %s has not settled after %ss; launching it anyway\n' \
+      "$last" "$wait_secs" >&2
+    printf '%s' "$last"
+    return 0
+  fi
   return 1
 }
 
