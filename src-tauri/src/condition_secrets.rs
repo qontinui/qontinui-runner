@@ -40,7 +40,10 @@
 //!    and [`ipc_refusal`] refuses any placeholder that would reach it. The
 //!    `/ui-bridge/control/*`, `/ui-bridge/ai/*`, `/ui-bridge/relay/dispatch`
 //!    and `/ui-bridge/batch` routes the `/ui-bridge/*` composer serves never
-//!    substitute either: while a secret is held,
+//!    substitute either, nor do `/ui-bridge/apps/{app_id}/dispatch` and
+//!    `/wrappers/{id}/dispatch`, which send their `params` verbatim to an app,
+//!    nor the `/a11y/*` routes, whose `type_text` types its `text` verbatim
+//!    into a desktop app: while a secret is held,
 //!    [`refuse_unsubstituted_placeholders`] refuses any request to them that
 //!    carries a placeholder, before its handler runs.
 //! 4. **Never shown back.** While any map is held, [`scrub_sdk_responses`]
@@ -92,10 +95,11 @@
 //! - **Only the SDK element-action route substitutes.** The runner's own
 //!   routes do not, and the composer's refuse a placeholder only while a
 //!   secret is held: with nothing held a placeholder there is ordinary text.
-//!   Three `/ui-bridge/control/*` and `/ui-bridge/ai/*` routes are mounted
-//!   outside that composer (`ai/wait-for`, `control/wait-for-app`,
-//!   `control/sdk/spawn-headless`) and are not checked; none of them types
-//!   text. No secret ever reaches any of them.
+//!   The app dispatch, wrapper dispatch and `/a11y/*` routers carry the
+//!   same layer themselves, and so does `control/wait-for-app`, which shares
+//!   the app router. Two `/ui-bridge/control/*` and `/ui-bridge/ai/*` routes
+//!   are mounted outside every layered router (`ai/wait-for`,
+//!   `control/sdk/spawn-headless`) and are not checked; neither types text. No secret ever reaches any of them.
 //! - **Loopback replay.** `POST /ui-bridge/sdk/element/{id}/action` is a
 //!   `TRUSTED_ROUTES` door (`mcp::origin_guard`), so a local process, or a
 //!   page on a Trusted origin, that knows a ref can have its value typed into
@@ -1312,7 +1316,11 @@ fn scrub_failed() -> Response {
 /// Path prefixes of the runner's own UI Bridge action surface. None of its
 /// routes substitutes a placeholder (only the SDK element-action route does),
 /// so whatever text they carry to an app is typed or matched as it stands.
-const NON_SUBSTITUTING_PREFIXES: [&str; 2] = ["/ui-bridge/control/", "/ui-bridge/ai/"];
+///
+/// `/a11y/` is the accessibility surface (`mcp::accessibility`), whose
+/// `type_text` types its `text` verbatim into a desktop app and whose other
+/// routes match a caller's text as it stands, as `/ui-bridge/ai/*` does.
+const NON_SUBSTITUTING_PREFIXES: [&str; 3] = ["/ui-bridge/control/", "/ui-bridge/ai/", "/a11y/"];
 
 /// Routes outside those prefixes that also carry a caller's text to an app
 /// unsubstituted: the relay's dispatch, which forwards its `payload` verbatim
@@ -1320,22 +1328,45 @@ const NON_SUBSTITUTING_PREFIXES: [&str; 2] = ["/ui-bridge/control/", "/ui-bridge
 /// `fill_form` operations over the same path as `control/batch-actions`.
 const NON_SUBSTITUTING_PATHS: [&str; 2] = ["/ui-bridge/relay/dispatch", "/ui-bridge/batch"];
 
+/// Dispatch routes that send a caller's `params` verbatim to an app, each as
+/// a prefix before one `{id}` segment and [`DISPATCH_SUFFIX`] after it:
+/// `/ui-bridge/apps/{app_id}/dispatch` (`mcp::app_discovery`), to a
+/// registered app over either transport, and `/wrappers/{id}/dispatch`
+/// (`wrappers::dispatch`), to an installed wrapper or, on a secondary, to the
+/// primary that runs it.
+const DISPATCH_PREFIXES: [&str; 2] = ["/ui-bridge/apps/", "/wrappers/"];
+const DISPATCH_SUFFIX: &str = "/dispatch";
+
 /// Whether `path` is a route that never substitutes and carries text to an app.
 fn never_substitutes(path: &str) -> bool {
     NON_SUBSTITUTING_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
         || NON_SUBSTITUTING_PATHS.contains(&path)
+        || is_dispatch(path)
+}
+
+/// Whether `path` is one of [`DISPATCH_PREFIXES`], one non-empty `{id}`
+/// segment and [`DISPATCH_SUFFIX`], the only shape axum routes there.
+fn is_dispatch(path: &str) -> bool {
+    DISPATCH_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(DISPATCH_SUFFIX))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    })
 }
 
 /// Why [`refuse_unsubstituted_placeholders`] refused, for the refusal body.
 const NON_SUBSTITUTING_DETAIL: &str = "the runner's /ui-bridge/control/*, /ui-bridge/ai/*, \
-     /ui-bridge/relay/dispatch and /ui-bridge/batch routes never substitute a secret placeholder, so it would reach the app as literal text; \
+     /ui-bridge/relay/dispatch, /ui-bridge/batch, /ui-bridge/apps/{app_id}/dispatch, /wrappers/{id}/dispatch and /a11y/* routes never substitute a secret placeholder, so it would reach the app as literal text; \
      type it with a `type` action on POST /ui-bridge/sdk/element/{id}/action";
 
-/// Request layer for the `/ui-bridge/*` composer: while a condition session
+/// Request layer for the `/ui-bridge/*` composer, and for the routers that
+/// serve the other non-substituting routes (`mcp::app_discovery::routes`,
+/// `wrappers::routes::router`, `mcp::accessibility::routes`): while a condition session
 /// holds a secret, a request to a route that never substitutes
-/// ([`NON_SUBSTITUTING_PREFIXES`], [`NON_SUBSTITUTING_PATHS`]) that
+/// ([`NON_SUBSTITUTING_PREFIXES`], [`NON_SUBSTITUTING_PATHS`],
+/// [`DISPATCH_PREFIXES`]) that
 /// carries a `{{secret:<ref>}}` placeholder, in its query or anywhere in its
 /// body, is refused with `422` and [`UNKNOWN_REF_CODE`] (as [`ipc_refusal`]
 /// refuses the IPC fallback) before its handler runs. Without it those routes
@@ -2227,6 +2258,10 @@ mod tests {
             .route("/ui-bridge/ai/find", post(echo))
             .route("/ui-bridge/relay/dispatch", post(echo))
             .route("/ui-bridge/batch", post(echo))
+            .route("/ui-bridge/apps/{app_id}/dispatch", post(echo))
+            .route("/ui-bridge/apps/register", post(echo))
+            .route("/wrappers/{id}/dispatch", post(echo))
+            .route("/a11y/type_text", post(echo))
             .route("/ui-bridge/commands", post(echo))
             .layer(axum::middleware::from_fn(refuse_unsubstituted_placeholders));
         let send = |uri: &'static str, body: &'static str| {
@@ -2270,6 +2305,18 @@ mod tests {
                 "/ui-bridge/batch",
                 r#"{"operations":[{"op":"fill_form","text":"{{secret:cs-ctl-pw}}"}]}"#,
             ),
+            (
+                "/ui-bridge/apps/wrapper-1/dispatch",
+                r#"{"action":"type","params":{"text":"{{secret:cs-ctl-pw}}"}}"#,
+            ),
+            (
+                "/wrappers/w1/dispatch",
+                r#"{"action":"type","params":{"text":"{{secret:cs-ctl-pw}}"}}"#,
+            ),
+            (
+                "/a11y/type_text",
+                r##"{"selector":"#password","text":"{{secret:cs-ctl-pw}}"}"##,
+            ),
         ] {
             let before = REACHED.load(Ordering::SeqCst);
             let (status, answer) = send(uri, body).await;
@@ -2307,6 +2354,76 @@ mod tests {
             (StatusCode::OK, relayed.to_string()),
             "a route outside the non-substituting prefixes is never inspected"
         );
+        let registration = r#"{"appId":"{{secret:cs-ctl-pw}}"}"#;
+        assert_eq!(
+            send("/ui-bridge/apps/register", registration).await,
+            (StatusCode::OK, registration.to_string()),
+            "the app router's registration, under no matched prefix, is not inspected"
+        );
+    }
+
+    /// A dispatch route is its prefix, one non-empty `{id}` segment and
+    /// `/dispatch`; the wrapper registry's other routes are not inspected.
+    #[test]
+    fn a_dispatch_path_is_one_id_segment() {
+        assert!(never_substitutes("/ui-bridge/apps/wrapper-1/dispatch"));
+        assert!(never_substitutes("/wrappers/w1/dispatch"));
+        assert!(never_substitutes("/a11y/type_text"));
+        assert!(never_substitutes("/ui-bridge/control/wait-for-app"));
+        for path in [
+            "/ui-bridge/apps//dispatch",
+            "/ui-bridge/apps/dispatch",
+            "/ui-bridge/apps/a/b/dispatch",
+            "/ui-bridge/apps/register",
+            "/ui-bridge/apps/wrapper-1/dispatch/more",
+            "/wrappers/dispatch",
+            "/wrappers/w1/credentials/token",
+            "/wrappers/install",
+        ] {
+            assert!(!never_substitutes(path), "{path}");
+        }
+    }
+
+    /// Each router serving a non-substituting route outside the `/ui-bridge/*`
+    /// composer wraps it in the request refusal, so its layer must follow
+    /// every route it registers.
+    #[test]
+    fn every_other_non_substituting_router_refuses_placeholders_after_every_route() {
+        for (file, src, start) in [
+            (
+                "mcp/app_discovery.rs",
+                include_str!("mcp/app_discovery.rs"),
+                "\npub fn routes() -> ",
+            ),
+            (
+                "wrappers/routes.rs",
+                include_str!("wrappers/routes.rs"),
+                "\npub fn router() -> ",
+            ),
+            (
+                "mcp/accessibility.rs",
+                include_str!("mcp/accessibility.rs"),
+                "\npub fn routes() -> ",
+            ),
+        ] {
+            let routes = src
+                .split(start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{file}: no router fn"))
+                .split("\n}\n")
+                .next()
+                .unwrap_or_default();
+            let last_route = routes
+                .rfind(".route(")
+                .unwrap_or_else(|| panic!("{file}: no route"));
+            let layer = routes
+                .rfind("crate::condition_secrets::refuse_unsubstituted_placeholders")
+                .unwrap_or_else(|| panic!("{file}: carries no request refusal layer"));
+            assert!(
+                layer > last_route,
+                "{file}: the refusal layer must follow every route"
+            );
+        }
     }
 
     /// The query and both readings of the body are searched.
