@@ -370,11 +370,17 @@ where
 
 /// A `shared_branch` placement is never removed (the path IS the canonical
 /// checkout); instead the switch this allocation made is undone when
-/// [`super::shared_branch_restore`]'s proofs hold. Under the checkout's
-/// materialize lock, so no concurrent allocation switches or cuts from it
-/// mid-proof. The caller still holds the allocation's claims — including the
-/// `canonical_checkout` lease — because `IsolatedEditContext::remove_unspawned*`
-/// consume the context and its `Drop` releases them only after this returns.
+/// [`super::shared_branch_restore`]'s proofs hold.
+///
+/// What excludes a concurrent shared-branch SWITCH of this checkout is the
+/// `canonical_checkout` lease, not a lock: `checkout_shared_branches` takes no
+/// in-process lock, and a peer's switch is refused by coord while the lease is
+/// held. The caller still holds that lease, because
+/// `IsolatedEditContext::remove_unspawned*` consume the context and its `Drop`
+/// releases the claims only after this returns. The checkout's materialize
+/// lock is held as well; it serializes this restore against the in-process
+/// work that does take it — a `git worktree add` cut from this checkout, and
+/// the exclude-block removal `Drop` and `release_repo` perform.
 async fn restore_shared_checkout(
     checkout: PathBuf,
     branch: String,

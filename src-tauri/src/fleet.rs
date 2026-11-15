@@ -4288,15 +4288,6 @@ const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts
 /// canonical checkout itself, and a refused spawn's restore requires that
 /// checkout to read fully clean.
 pub(crate) fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
-    ensure_info_exclude_entries(repo_path, MANAGED_REPO_EXCLUDES);
-}
-
-/// Idempotently append each of `entries` that is not already a whole line of
-/// `<repo>/.git/info/exclude`, under the runner's
-/// [`MANAGED_EXCLUDE_MARKER`] header. The shared writer behind
-/// [`ensure_repo_info_exclude`]; same primary-checkout-only, best-effort
-/// contract.
-pub(crate) fn ensure_info_exclude_entries(repo_path: &std::path::Path, entries: &[&'static str]) {
     // `.git` as a directory == primary checkout. Skip worktree `.git` files
     // and bare/odd layouts.
     if !repo_path.join(".git").is_dir() {
@@ -4309,7 +4300,7 @@ pub(crate) fn ensure_info_exclude_entries(repo_path: &std::path::Path, entries: 
     // Match on whole (trimmed) lines so a substring like `.mcp.json.bak` never
     // counts as already-covered.
     let present: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
-    let missing: Vec<&str> = entries
+    let missing: Vec<&str> = MANAGED_REPO_EXCLUDES
         .iter()
         .copied()
         .filter(|pat| !present.contains(*pat))

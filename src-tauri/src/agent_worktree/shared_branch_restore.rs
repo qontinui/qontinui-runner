@@ -32,11 +32,20 @@
 //! read-back of HEAD. The agent branch is never deleted, even one this
 //! allocation created: it may already be pushed or claimed.
 //!
-//! The caller ([`super::remove_unspawned`]) runs this under
-//! [`super::checkout_materialize_lock`] and while the allocation's claims are
-//! still held: `IsolatedEditContext::remove_unspawned*` consume the context,
-//! so its `Drop` — which releases the `canonical_checkout` lease — runs only
-//! after the restore returns.
+//! The caller ([`super::remove_unspawned`]) runs this while the allocation's
+//! claims are still held: `IsolatedEditContext::remove_unspawned*` consume the
+//! context, so its `Drop` — which releases the `canonical_checkout` lease, the
+//! thing that keeps a peer's shared-branch switch off this checkout — runs
+//! only after the restore returns. It also holds
+//! [`super::checkout_materialize_lock`], which serializes it against the
+//! in-process work that takes that lock (a `git worktree add` cut from the
+//! checkout, and the exclude-block removal below).
+//!
+//! The runner's `.claude/` provisioning is hidden from proof 3 by a
+//! runner-managed block in the checkout's `.git/info/exclude`
+//! ([`prepare_canonical_excludes`]) that lives only as long as the
+//! allocation: it is removed after a `Restored`, on a switch rollback, by
+//! `release_repo`, and when the allocation's context drops.
 
 use std::path::Path;
 
@@ -219,7 +228,12 @@ fn judge_and_switch(
         Prior::Detached => (&["rev-parse", "HEAD"], prior_ref.to_ascii_lowercase()),
     };
     match git_stdout(checkout, args, "shared_branch_restore: read-back") {
-        Ok(got) if got.trim().eq_ignore_ascii_case(&want) => RestoreOutcome::Restored,
+        Ok(got) if got.trim().eq_ignore_ascii_case(&want) => {
+            // Back on the prior ref: this allocation's `.claude/` excludes
+            // must not outlive it there.
+            remove_allocation_excludes(checkout, branch);
+            RestoreOutcome::Restored
+        }
         Ok(got) => keep(SwitchFailed(format!(
             "`git switch` exited 0 but HEAD reads {:?}, not {want:?}",
             got.trim()
@@ -287,24 +301,41 @@ fn git_stdout(dir: &Path, args: &[&str], label: &str) -> Result<String, String> 
 pub(crate) const PROVISIONED_CLAUDE_EXCLUDES: &[&str] =
     &[".claude/commands/", ".claude/skills/", ".claude/agents/"];
 
+/// First line of the runner-managed block one shared-branch allocation adds to
+/// a canonical checkout's `.git/info/exclude`; the agent branch follows it.
+const BLOCK_BEGIN: &str = "# qontinui-runner managed: shared-branch allocation ";
+/// Last line of that block; the agent branch follows it.
+const BLOCK_END: &str = "# end qontinui-runner managed: shared-branch allocation ";
+
 /// Make the artifacts a session provisions into a just-switched canonical
 /// checkout invisible to `git status`, so a refused spawn's restore can
 /// require that checkout fully clean without filtering anything.
 ///
 /// - The machine-local roster ([`crate::fleet::ensure_repo_info_exclude`]:
-///   `.mcp.json`, `.coord-mcp-status`, …) — always; it is the roster the
-///   publisher already applies to every primary checkout it walks, and a
-///   canonical checkout it has not walked yet would otherwise read dirty.
-/// - [`PROVISIONED_CLAUDE_EXCLUDES`] — ONLY when `.claude` tracks nothing on
-///   the agent branch (the index, right after the switch) AND nothing on
-///   `prior_ref`, both reads answered. That is the same predicate under which
-///   provisioning writes these trees at all (a repo-authored `.claude/` is
-///   never provisioned into), so in such a checkout everything under them is
-///   the runner's bundle. Where `.claude/` IS authored, or either read fails,
-///   nothing is added: an operator's new `.claude/commands/*.md` there must
-///   stay visible, which is why the roster itself never carries `.claude/`.
-pub(crate) fn prepare_canonical_excludes(canonical: &Path, prior_ref: &str) {
+///   `.mcp.json`, `.coord-mcp-status`, …) — always. It is the roster the
+///   publisher already applies, permanently, to every primary checkout it
+///   walks; a canonical checkout it has not walked yet would otherwise read
+///   dirty.
+/// - [`PROVISIONED_CLAUDE_EXCLUDES`] — only for the LIFE OF THIS ALLOCATION,
+///   inside a block bracketed by [`BLOCK_BEGIN`]/[`BLOCK_END`] naming
+///   `branch`, which [`remove_allocation_excludes`] takes out again (on a
+///   restore, on a switch rollback, and when the allocation's context drops).
+///   Added only when a switch actually happened (`prior_ref != branch`) and
+///   `.claude` tracks nothing on the agent branch (the index, right after the
+///   switch) AND nothing on `prior_ref`, both reads answered. That is
+///   narrower than provisioning's own guard, which skips tracked files one by
+///   one and still writes the untracked ones into a checkout that versions
+///   some of `.claude/`: in such a checkout the block is not added, so the
+///   runner's files there stay visible and a refused spawn's restore keeps the
+///   checkout as `Dirty` — the safe side. Either read failing adds nothing too.
+///   While the block stands it hides operator files under those trees, which
+///   is why it never outlives the allocation and never carries `.claude/`
+///   itself.
+pub(crate) fn prepare_canonical_excludes(canonical: &Path, prior_ref: &str, branch: &str) {
     crate::fleet::ensure_repo_info_exclude(canonical);
+    if prior_ref == branch {
+        return;
+    }
     let index = git_stdout(
         canonical,
         &["ls-files", "--", ".claude"],
@@ -317,11 +348,16 @@ pub(crate) fn prepare_canonical_excludes(canonical: &Path, prior_ref: &str) {
     );
     match (index, prior) {
         (Ok(i), Ok(p)) if i.trim().is_empty() && p.trim().is_empty() => {
-            crate::fleet::ensure_info_exclude_entries(canonical, PROVISIONED_CLAUDE_EXCLUDES);
+            if let Err(e) = add_allocation_excludes(canonical, branch) {
+                warn!(
+                    checkout = %canonical.display(),
+                    "shared_branch_restore: could not add the allocation's exclude block: {e}"
+                );
+            }
         }
         (Ok(_), Ok(_)) => info!(
             checkout = %canonical.display(),
-            "shared_branch_restore: .claude/ is repo-authored here — the provisioned-bundle \
+            "shared_branch_restore: .claude/ is versioned here — the provisioned-bundle \
              excludes are not added"
         ),
         (i, p) => warn!(
@@ -333,6 +369,104 @@ pub(crate) fn prepare_canonical_excludes(canonical: &Path, prior_ref: &str) {
              the checkout as Dirty)"
         ),
     }
+}
+
+/// `<checkout>/.git/info/exclude` for a PRIMARY checkout (`.git` is a
+/// directory); `None` for a linked worktree or an odd layout, which is never
+/// written.
+fn info_exclude_path(checkout: &Path) -> Option<std::path::PathBuf> {
+    let git_dir = checkout.join(".git");
+    git_dir
+        .is_dir()
+        .then(|| git_dir.join("info").join("exclude"))
+}
+
+/// Read the exclude file; an absent file is empty. Any other read error is
+/// returned, so the caller never rewrites a file it could not read.
+fn read_exclude(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+/// Append this allocation's block (idempotent: a block already naming
+/// `branch` is left as it is). Lines outside the block are never touched.
+fn add_allocation_excludes(checkout: &Path, branch: &str) -> Result<(), String> {
+    let Some(path) = info_exclude_path(checkout) else {
+        return Ok(());
+    };
+    let existing = read_exclude(&path)?;
+    let begin = format!("{BLOCK_BEGIN}{branch}");
+    if existing.lines().any(|l| l.trim_end() == begin) {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&begin);
+    out.push('\n');
+    for pat in PROVISIONED_CLAUDE_EXCLUDES {
+        out.push_str(pat);
+        out.push('\n');
+    }
+    out.push_str(&format!("{BLOCK_END}{branch}\n"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Take out exactly the block [`prepare_canonical_excludes`] added for
+/// `branch` — its begin line through its end line — and nothing else.
+/// Idempotent (no block is a no-op). A begin line with no matching end is
+/// left alone and reported: removing to end-of-file could delete operator
+/// lines. Best-effort and logged; never fails the caller.
+pub(crate) fn remove_allocation_excludes(checkout: &Path, branch: &str) {
+    if let Err(e) = try_remove_allocation_excludes(checkout, branch) {
+        warn!(
+            checkout = %checkout.display(),
+            branch = %branch,
+            "shared_branch_restore: the allocation's exclude block was NOT removed: {e}"
+        );
+    }
+}
+
+fn try_remove_allocation_excludes(checkout: &Path, branch: &str) -> Result<(), String> {
+    let Some(path) = info_exclude_path(checkout) else {
+        return Ok(());
+    };
+    let existing = read_exclude(&path)?;
+    let begin = format!("{BLOCK_BEGIN}{branch}");
+    let end = format!("{BLOCK_END}{branch}");
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(b) = lines.iter().position(|l| l.trim_end() == begin) else {
+        return Ok(());
+    };
+    let Some(e) = lines[b..]
+        .iter()
+        .position(|l| l.trim_end() == end)
+        .map(|i| b + i)
+    else {
+        return Err(format!(
+            "{} has a begin line for {branch:?} with no end line — left as is",
+            path.display()
+        ));
+    };
+    let mut out = String::with_capacity(existing.len());
+    for line in lines[..b].iter().chain(lines[e + 1..].iter()) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|err| format!("write {}: {err}", path.display()))?;
+    info!(
+        checkout = %checkout.display(),
+        branch = %branch,
+        "shared_branch_restore: removed the allocation's exclude block"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -110,6 +110,62 @@ fn restore(c: &Canon, sb: &SharedBranchRepo) -> RestoreOutcome {
     restore_refused_shared_branch(&c.path, &sb.branch, &sb.prior_ref, &sb.switched_to_sha)
 }
 
+fn exclude(c: &Canon) -> String {
+    std::fs::read_to_string(c.path.join(".git").join("info").join("exclude")).unwrap_or_default()
+}
+
+fn has_block(c: &Canon) -> bool {
+    let ex = exclude(c);
+    ex.contains(&format!("{BLOCK_BEGIN}{AGENT_BRANCH}"))
+        || ex
+            .lines()
+            .any(|l| PROVISIONED_CLAUDE_EXCLUDES.contains(&l.trim()))
+}
+
+/// Seed an operator line before the allocation, as an operator's own
+/// `.git/info/exclude` would carry.
+fn seed_operator_line(c: &Canon) {
+    let path = c.path.join(".git").join("info").join("exclude");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut ex = std::fs::read_to_string(&path).unwrap_or_default();
+    ex.push_str("operator-before\n");
+    std::fs::write(&path, ex).unwrap();
+}
+
+/// An operator line appended WHILE the allocation (and its block) stands.
+fn append_operator_line(c: &Canon) {
+    let path = c.path.join(".git").join("info").join("exclude");
+    let mut ex = std::fs::read_to_string(&path).unwrap_or_default();
+    ex.push_str("operator-after\n");
+    std::fs::write(&path, ex).unwrap();
+}
+
+/// The block is gone, every line outside it survived, and an operator file
+/// under `.claude/commands/` shows in `git status` again.
+fn assert_block_removed_and_operator_visible(c: &Canon) {
+    let ex = exclude(c);
+    assert!(!has_block(c), "the allocation's block is gone: {ex:?}");
+    assert!(!ex.contains(BLOCK_END), "{ex:?}");
+    for kept in [
+        "operator-before",
+        "operator-after",
+        ".mcp.json",
+        ".coord-mcp-status",
+    ] {
+        assert!(
+            ex.lines().any(|l| l.trim() == kept),
+            "line {kept:?} outside the block survives: {ex:?}"
+        );
+    }
+    std::fs::create_dir_all(c.path.join(".claude").join("commands")).unwrap();
+    std::fs::write(c.path.join(".claude/commands/op.md"), "mine\n").unwrap();
+    let status = git(&c.path, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(
+        status.contains(".claude/commands/op.md"),
+        "an operator file under .claude/commands/ is visible again: {status:?}"
+    );
+}
+
 // ---------------------------------------------------------------- Restored
 
 #[test]
@@ -174,6 +230,10 @@ fn a_checkout_already_on_the_agent_branch_reads_nothing_switched() {
         RestoreOutcome::Kept(RestoreKeep::NothingSwitched)
     );
     assert_eq!(c.head_ref(), format!("refs/heads/{AGENT_BRANCH}"));
+    assert!(
+        !has_block(&c),
+        "an allocation that switched nothing adds no exclude block (it could be a live one's)"
+    );
 }
 
 #[test]
@@ -405,21 +465,36 @@ async fn the_restore_runs_before_drop_releases_the_shared_branch_claim() {
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let canon = c.path.clone();
     tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.expect("accept");
-        let mut buf = vec![0u8; 16 * 1024];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
-        let request = String::from_utf8_lossy(&buf[..n]).to_string();
-        // HEAD as it stands when the release ARRIVES.
-        let head = tokio::task::spawn_blocking(move || {
-            git(&canon, &["rev-parse", "--symbolic-full-name", "HEAD"])
-        })
-        .await
-        .expect("read HEAD");
-        let _ = sock
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-            .await;
-        assert!(request.contains("/claims/release"), "{request}");
-        let _ = tx.send(head);
+        // Answer every request; record HEAD at the first `/claims/release`.
+        // Any other Drop-time POST (an fs-observer push, say) is answered and
+        // skipped, so it cannot be mistaken for the release.
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let is_release = request.contains("/claims/release");
+            // HEAD as it stands when the release ARRIVES.
+            let head = if is_release {
+                let canon = canon.clone();
+                tokio::task::spawn_blocking(move || {
+                    git(&canon, &["rev-parse", "--symbolic-full-name", "HEAD"])
+                })
+                .await
+                .ok()
+            } else {
+                None
+            };
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+            if let Some(head) = head {
+                let _ = tx.send(head);
+                return;
+            }
+        }
     });
     ctx.set_coord_http_base_for_test(base);
 
@@ -440,4 +515,142 @@ async fn the_restore_runs_before_drop_releases_the_shared_branch_claim() {
         head_at_release, "refs/heads/main",
         "the lease was released while the checkout was still parked on the agent branch"
     );
+}
+
+// ------------------------------------------- the allocation's exclude block
+
+#[test]
+fn the_switch_adds_the_block_and_a_restore_removes_exactly_it() {
+    let c = Canon::new();
+    seed_operator_line(&c);
+    let sb = c.switch();
+    assert!(
+        has_block(&c),
+        "the switch adds the block: {:?}",
+        exclude(&c)
+    );
+    append_operator_line(&c);
+
+    assert_eq!(restore(&c, &sb), RestoreOutcome::Restored);
+    assert_block_removed_and_operator_visible(&c);
+}
+
+#[test]
+fn a_switch_rollback_removes_the_block() {
+    let first = Canon::new();
+    let second = Canon::new();
+    seed_operator_line(&first);
+    // `operator-after` is seeded up front here: the rollback happens inside
+    // the one call, so no line can be appended while the block stands.
+    append_operator_line(&first);
+    // The second checkout is dirty, so its switch is refused and the first
+    // one is rolled back.
+    std::fs::write(second.path.join("wip"), "uncommitted\n").unwrap();
+    let row = |c: &Canon| CoordAllocatedWorktree {
+        repo: "canon".to_string(),
+        branch: AGENT_BRANCH.to_string(),
+        parent_sha: c.parent_sha.clone(),
+        worktree_path: String::new(),
+        status: "allocated".to_string(),
+        push_ref: String::new(),
+        origin: Some("requested".to_string()),
+        sibling_store_sha: None,
+        parent_sha_provenance: ParentShaProvenance::default(),
+    };
+    let (r1, r2) = (row(&first), row(&second));
+
+    assert!(checkout_shared_branches(&[(&r1, &first.path), (&r2, &second.path)]).is_err());
+    assert_eq!(first.head_ref(), "refs/heads/main");
+    assert_block_removed_and_operator_visible(&first);
+}
+
+#[tokio::test]
+async fn a_shared_branch_context_dropping_normally_removes_the_block() {
+    let _amb = super::super::test_coord::isolate();
+    let c = Canon::new();
+    seed_operator_line(&c);
+    let sb = c.switch();
+    append_operator_line(&c);
+    let ctx = shared_branch_context(&c, &sb, "sb-drop-agent");
+    assert!(has_block(&c));
+
+    // The session ended: the context drops without any removal call.
+    drop(ctx);
+
+    // Drop removes the block on a spawned task (before the claim release).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while has_block(&c) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_block_removed_and_operator_visible(&c);
+    assert_eq!(
+        c.head_ref(),
+        format!("refs/heads/{AGENT_BRANCH}"),
+        "a normal session end does not switch the checkout"
+    );
+}
+
+#[test]
+fn a_shared_branch_context_dropped_with_no_runtime_still_removes_the_block() {
+    let c = Canon::new();
+    seed_operator_line(&c);
+    let sb = c.switch();
+    append_operator_line(&c);
+    let ctx = shared_branch_context(&c, &sb, "sb-drop-sync-agent");
+
+    drop(ctx);
+
+    assert_block_removed_and_operator_visible(&c);
+}
+
+#[tokio::test]
+async fn release_repo_removes_the_block() {
+    let _amb = super::super::test_coord::isolate();
+    let c = Canon::new();
+    seed_operator_line(&c);
+    let sb = c.switch();
+    append_operator_line(&c);
+    let mut ctx = shared_branch_context(&c, &sb, "sb-release-agent");
+
+    assert!(ctx.release_repo("canon").await);
+
+    assert_block_removed_and_operator_visible(&c);
+}
+
+#[test]
+fn a_versioned_claude_tree_gets_no_block_and_an_untracked_command_keeps_it_dirty() {
+    let c = Canon::new();
+    std::fs::create_dir_all(c.path.join(".claude").join("commands")).unwrap();
+    std::fs::write(c.path.join(".claude/commands/a.md"), "repo-authored\n").unwrap();
+    git(&c.path, &["add", ".claude/commands/a.md"]);
+    git(&c.path, &["commit", "-q", "-m", "authored command"]);
+    let c = Canon {
+        parent_sha: git(&c.path, &["rev-parse", "HEAD"]),
+        ..c
+    };
+    let sb = c.switch();
+    assert!(
+        !has_block(&c),
+        "versioned .claude/ gets no block: {:?}",
+        exclude(&c)
+    );
+
+    std::fs::write(c.path.join(".claude/commands/b.md"), "untracked\n").unwrap();
+    match restore(&c, &sb) {
+        RestoreOutcome::Kept(RestoreKeep::Dirty(p)) => {
+            assert!(p.contains(".claude/commands/b.md"), "{p:?}")
+        }
+        other => panic!("expected Kept(Dirty), got {other:?}"),
+    }
+    assert_eq!(c.head_ref(), format!("refs/heads/{AGENT_BRANCH}"));
+}
+
+#[test]
+fn an_unanswered_claude_read_adds_no_block() {
+    let c = Canon::new();
+    // `ls-tree` of a ref that does not resolve fails: UNKNOWN adds nothing.
+    prepare_canonical_excludes(&c.path, "refs/heads/no-such-ref", AGENT_BRANCH);
+    assert!(!has_block(&c), "{:?}", exclude(&c));
+    // The roster half is unconditional and still applied.
+    assert!(exclude(&c).lines().any(|l| l.trim() == ".mcp.json"));
 }
