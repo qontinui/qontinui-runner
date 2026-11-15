@@ -20,7 +20,8 @@
 //!   reached yet is skipped cleanly (the Plan 06 index block's posture).
 //!
 //! `project.component_health_snapshots.health_score` is deliberately left NOT
-//! NULL: snapshots are written only for a component whose health is known.
+//! NULL: it has no writer yet, and the one the plan adds (D5) will write only
+//! for a component whose health is known.
 
 /// The idempotent `DO` block run at every `PgDb::new` boot.
 pub(crate) const REFLECTION_UNKNOWN_IS_NULL_SELF_HEAL: &str = "DO $reflunknown$
@@ -90,8 +91,10 @@ mod tests {
         );";
 
     /// `(is_nullable, column_default, pg_attribute xmin)` for one column. The
-    /// catalog row's `xmin` moves on any `ALTER COLUMN … DROP NOT NULL`, so an
-    /// unchanged `xmin` proves a boot ran no DDL on the column.
+    /// `xmin` is context for a failure message only: `DROP NOT NULL` on an
+    /// already-nullable column updates no catalog row, so an unchanged `xmin`
+    /// does NOT prove a boot ran no DDL. The no-DDL property is asserted by
+    /// the lock-held boot at the end of `round_trip`.
     async fn column_state(
         client: &tokio_postgres::Client,
         table: &str,
@@ -231,6 +234,29 @@ mod tests {
             column_state(&client, "architecture_components", "health_score").await,
             health,
             "second boot must not touch health_score"
+        );
+
+        // A warm boot takes no lock on either table. ALTER TABLE takes ACCESS
+        // EXCLUSIVE before it checks whether anything changes, so a heal that
+        // ran its ALTERs unguarded would block here behind a reader. Hold
+        // ACCESS SHARE on both tables from a second connection and boot again.
+        let holder = connect(&url).await;
+        holder
+            .batch_execute(
+                "BEGIN; \
+                 LOCK TABLE project.convergence_snapshots IN ACCESS SHARE MODE; \
+                 LOCK TABLE project.architecture_components IN ACCESS SHARE MODE;",
+            )
+            .await
+            .expect("hold ACCESS SHARE on both tables");
+        let warm = tokio::time::timeout(std::time::Duration::from_secs(20), PgDb::new(&url)).await;
+        holder
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("release the held locks");
+        drop(
+            warm.expect("a warm boot must not wait on a lock over the two healed tables")
+                .expect("warm boot while the tables are read-locked"),
         );
 
         // An unknown is now storable, and an omitted health is NULL, not 1.0.
