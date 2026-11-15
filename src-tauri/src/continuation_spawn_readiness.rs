@@ -165,50 +165,65 @@ pub(crate) fn exec_seam_access(path: &Path) -> io::Result<()> {
 }
 
 /// [`claude_cli_readiness`] with the production predicate. Blocking (one
-/// `access` + one `stat`); cheap enough to share the resolve's blocking task.
+/// `access` + one `stat`, plus a PATH walk for a bare name) — callers on an
+/// async task run it through `spawn_blocking_tracked`.
 pub(crate) fn probe_claude_cli(resolved: &str) -> CliReadiness {
-    probe_claude_cli_with_path(resolved, std::env::var_os("PATH").as_deref())
+    probe_claude_cli_with_path(
+        resolved,
+        std::env::var_os("PATH").as_deref(),
+        qontinui_runner_lib::profile_cli::identity_shim_dir().as_deref(),
+    )
 }
 
-/// [`probe_claude_cli`] over an explicit `PATH` value, so tests never read the
-/// real process environment.
+/// [`probe_claude_cli`] over an explicit `PATH` value and persistent
+/// identity-shim dir, so tests never read the real process environment or
+/// home.
 pub(crate) fn probe_claude_cli_with_path(
     resolved: &str,
     path_var: Option<&std::ffi::OsStr>,
+    persistent_identity_dir: Option<&Path>,
 ) -> CliReadiness {
     match claude_cli_readiness(resolved, &exec_seam_access) {
         // A bare name is what the headless arm execs after `launchable_or_bare`
         // rejected a non-executable resolution; `execvp` searches PATH for it,
         // so it is launchable exactly when some PATH entry holds a REAL
-        // launchable file of that name. "Real" uses `resolve_claude_bin`'s own
-        // exclusions, so a resolve MISS (only shim dirs or npm's placeholder
-        // stub hold a `claude`) stays Unresolved and defers as `not_on_path`.
-        CliReadiness::Unresolved if bare_name_on_path(resolved, path_var) => CliReadiness::Ready,
+        // launchable file of that name. "Real" is decided by the SAME shared
+        // predicates `resolve_claude_bin` skips with — `is_qontinui_shim_dir`
+        // (name prefix, case-insensitive, OR an `IDENTITY_MARKER` inside),
+        // `is_persistent_identity_dir_in` and `is_npm_placeholder` — so a
+        // resolve MISS stays Unresolved and defers as `not_on_path`.
+        CliReadiness::Unresolved
+            if bare_name_on_path(resolved, path_var, persistent_identity_dir) =>
+        {
+            CliReadiness::Ready
+        }
         other => other,
     }
 }
 
 /// `execvp`'s search with the exec seam's predicate and `resolve_claude_bin`'s
-/// exclusions: does any non-empty, non-shim entry of `path_var` hold a
-/// launchable file named `name` that is not npm's placeholder? Unix only — on
-/// Windows a bare name already proceeds ([`CliReadiness::Unresolved`]).
+/// exclusions: does any non-empty PATH entry of `path_var` that is neither a
+/// qontinui shim dir nor `persistent_identity_dir` hold a launchable file
+/// named `name` that is not npm's placeholder? Unix only — on Windows a bare
+/// name already proceeds ([`CliReadiness::Unresolved`]).
 #[cfg(unix)]
-pub(crate) fn bare_name_on_path(name: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
-    use crate::install_effects_producer::intercept::shim_materializer::{
-        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
-    };
+pub(crate) fn bare_name_on_path(
+    name: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    persistent_identity_dir: Option<&Path>,
+) -> bool {
+    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
     use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
+    use qontinui_runner_lib::intercept_core::shim_dir::is_persistent_identity_dir_in;
     if name.is_empty() || name.contains('/') {
         return false;
     }
-    let is_shim_dir = |d: &Path| {
-        d.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(IDENTITY_DIR_PREFIX) || n.starts_with(SHIM_DIR_PREFIX))
-    };
     path_var.is_some_and(|p| {
         std::env::split_paths(p).any(|d| {
-            if d.as_os_str().is_empty() || is_shim_dir(&d) {
+            if d.as_os_str().is_empty()
+                || is_qontinui_shim_dir(&d)
+                || is_persistent_identity_dir_in(&d, persistent_identity_dir)
+            {
                 return false;
             }
             let cand = d.join(name);
@@ -218,7 +233,11 @@ pub(crate) fn bare_name_on_path(name: &str, path_var: Option<&std::ffi::OsStr>) 
 }
 
 #[cfg(not(unix))]
-pub(crate) fn bare_name_on_path(_name: &str, _path_var: Option<&std::ffi::OsStr>) -> bool {
+pub(crate) fn bare_name_on_path(
+    _name: &str,
+    _path_var: Option<&std::ffi::OsStr>,
+    _persistent_identity_dir: Option<&Path>,
+) -> bool {
     false
 }
 
@@ -484,7 +503,7 @@ pub(crate) fn failed_spawn_disposition(
 /// Phase 4: the `spawn_failed` detail for a failed spawn, BEFORE the first-line
 /// cap.
 ///
-/// A CLI refusal leads with `claude_cli_unavailable:<kind>: `, the head coord's
+/// A TRANSIENT CLI refusal leads with `claude_cli_unavailable:<kind>: `, the head coord's
 /// `classify_spawn_failure` (qontinui-coord `continuation_spawn_retry.rs`, the
 /// `claude_cli_unavailable:` arm) re-drives as a missing CLI. The PTY holder's
 /// own text (`PTY holder spawn failed: …`) matches none of coord's retriable
@@ -495,7 +514,17 @@ pub(crate) fn failed_spawn_disposition(
 /// refusal — the resource guard's text is matched by coord as it stands.
 pub(crate) fn outcome_detail(refusal: Option<&SeamRefusal>, raw: &str) -> String {
     match refusal {
-        Some(SeamRefusal::ClaudeCli(kind)) if !raw.starts_with(CLI_UNAVAILABLE_HEAD) => {
+        // ONLY a transient kind gets the head: coord re-drives anything that
+        // carries it, and its contract (qontinui-coord
+        // `continuation_spawn_retry.rs`, `classify_spawn_failure`) reserves the
+        // head for `enoent|eacces|enoexec|etxtbsy|sharing_violation`. A
+        // [`CliKind::Known`] is exactly those (it holds only
+        // `claude_cli_spawn::transient_kind`'s tokens); `errno_<n>`,
+        // `unknown` and `not_on_path` are deterministic, so their raw detail
+        // posts unprefixed and coord alerts instead of retrying for ever.
+        Some(SeamRefusal::ClaudeCli(kind @ CliKind::Known(_)))
+            if !raw.starts_with(CLI_UNAVAILABLE_HEAD) =>
+        {
             format!("{}: {raw}", claude_cli_unavailable_stamp_reason(kind))
         }
         _ => raw.to_string(),
