@@ -300,7 +300,8 @@ async fn start_acp_session(
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
-                Ok(drive(cx, cfg, ready_tx, cmd_rx, upd_rx).await)
+                drive(cx, cfg, ready_tx, cmd_rx, upd_rx).await;
+                Ok(())
             })
             .await;
         if let Err(e) = result {
