@@ -4143,10 +4143,7 @@ fn admit_launch(
 pub(crate) fn launch_admission(
     reading: &crate::resource_guard::AdmissionReading,
     pending: usize,
-) -> (
-    Result<(), String>,
-    Option<crate::resource_guard::SpawnGate>,
-) {
+) -> (Result<(), String>, Option<crate::resource_guard::SpawnGate>) {
     let (projected, shadowed) = reading.projected(pending);
     let decision = match launch_deferral_reason(&projected) {
         Some(reason) => Err(reason),
@@ -12733,7 +12730,9 @@ where
     match outcome {
         SpawnReportOutcome::Delivered => ReportSettlement::Delivered,
         SpawnReportOutcome::Rejected => ReportSettlement::Rejected,
-        SpawnReportOutcome::Undelivered => spool_undelivered_report(agent_id, body, attempts, spool),
+        SpawnReportOutcome::Undelivered => {
+            spool_undelivered_report(agent_id, body, attempts, spool)
+        }
     }
 }
 
@@ -19648,7 +19647,10 @@ mod tests {
             crate::session::local_store::OutboxWriter::open(dir.join("outbox.jsonl")).unwrap(),
         );
         (
-            crate::session::closeout_spool::CloseoutSpool::new(outbox.clone(), uuid::Uuid::new_v4()),
+            crate::session::closeout_spool::CloseoutSpool::new(
+                outbox.clone(),
+                uuid::Uuid::new_v4(),
+            ),
             outbox,
         )
     }
@@ -19681,8 +19683,15 @@ mod tests {
             Some(&spool),
         )
         .await;
-        assert_eq!(posts.get(), LAUNCH_DEFERRAL_REPORT_ATTEMPTS, "every attempt spent first");
-        assert!(matches!(settled, ReportSettlement::Spooled(_)), "{settled:?}");
+        assert_eq!(
+            posts.get(),
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            "every attempt spent first"
+        );
+        assert!(
+            matches!(settled, ReportSettlement::Spooled(_)),
+            "{settled:?}"
+        );
 
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1, "exactly one durable row");
@@ -19696,7 +19705,11 @@ mod tests {
             crate::session::spawn_report_spool::replay_target(&row.payload).expect("replayable");
         assert_eq!(replay_agent, agent_id);
         assert_eq!(replay_body["reason"], reason);
-        assert_eq!(replay_body, serde_json::to_value(&body).unwrap(), "the live body, verbatim");
+        assert_eq!(
+            replay_body,
+            serde_json::to_value(&body).unwrap(),
+            "the live body, verbatim"
+        );
         if spawn_outcome_enrichment_enabled() {
             assert_eq!(replay_body["phase"], "blocked");
         }
@@ -19738,7 +19751,10 @@ mod tests {
         .await;
         assert!(matches!(settled, ReportSettlement::Rejected), "{settled:?}");
         assert_eq!(posts.get(), 1, "a 4xx is not retried");
-        assert!(outbox.pending().unwrap().is_empty(), "a 4xx is never spooled");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a 4xx is never spooled"
+        );
 
         let delivered = settle_spawn_failed_report(
             uuid::Uuid::new_v4(),
@@ -19749,7 +19765,10 @@ mod tests {
             Some(&spool),
         )
         .await;
-        assert!(matches!(delivered, ReportSettlement::Delivered), "{delivered:?}");
+        assert!(
+            matches!(delivered, ReportSettlement::Delivered),
+            "{delivered:?}"
+        );
         assert!(outbox.pending().unwrap().is_empty());
     }
 

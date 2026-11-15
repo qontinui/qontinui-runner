@@ -184,7 +184,12 @@ mod tests {
     const WARN_FLOOR: u64 = 3_000;
     const CRITICAL_FLOOR: u64 = 1_000;
 
-    fn lanes(free: Option<u64>, graded: Option<usize>, warn: usize, critical: usize) -> LaneVerdicts {
+    fn lanes(
+        free: Option<u64>,
+        graded: Option<usize>,
+        warn: usize,
+        critical: usize,
+    ) -> LaneVerdicts {
         let ceilings = ThreadCeilings { warn, critical };
         let floors = SessionGuardSettings {
             warn_free_commit_bytes: WARN_FLOOR,
@@ -234,8 +239,9 @@ mod tests {
                         lanes: Some(lanes(Some(free), Some(graded), WARN, CRITICAL)),
                         cost: cost(100, 2),
                     };
-                    let refused =
-                        crate::agent_runtime::launch_admission(&reading, reserved).0.is_err();
+                    let refused = crate::agent_runtime::launch_admission(&reading, reserved)
+                        .0
+                        .is_err();
                     let capacity = from_reading(&reading, reserved);
                     assert_eq!(
                         capacity.headroom == Some(0),
@@ -357,7 +363,13 @@ mod tests {
         .collect();
         assert_eq!(
             words,
-            ["proceed", "warn", "critical", "guard_disabled", "unreadable"]
+            [
+                "proceed",
+                "warn",
+                "critical",
+                "guard_disabled",
+                "unreadable"
+            ]
         );
     }
 }
