@@ -2448,7 +2448,7 @@ const REAL_DIR_NAME: &str = "the-real-qontinui-identity-qontinui-shim-tool";
 mod resolve_wait_tests {
     use super::*;
     use crate::install_effects_producer::intercept::shim_test_support::{
-        bash, identity_cmd, write_exe, EXE_LOCK,
+        bash, identity_cmd, install_settled_stat, write_exe, EXE_LOCK,
     };
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -2479,6 +2479,7 @@ mod resolve_wait_tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let marker = tmp.path().join("ran");
+        install_settled_stat(&real_dir);
         let cmd = identity_cmd(&shim_dir, &real_dir, "10");
 
         // The tool reappears ~1.5 s into the shim's wait, as after a reify.
@@ -2531,6 +2532,7 @@ mod resolve_wait_tests {
         std::fs::create_dir_all(&real_dir).unwrap();
         let marker = tmp.path().join("ran");
         let real = real_dir.join("claude");
+        install_settled_stat(&real_dir);
         write_exe(&real, NPM_STUB);
         // "postinstall": the real binary, staged beside the stub and renamed
         // over it on the wait loop's first `sleep`.
@@ -2636,6 +2638,7 @@ mod resolve_wait_tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let seen = tmp.path().join("argv");
+        install_settled_stat(&real_dir);
         write_exe(
             &real_dir.join("claude"),
             &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", seen.display()),
@@ -2740,6 +2743,9 @@ mod resolve_wait_tests {
         );
     }
 
+    /// A SETTLED hit never waits and adds nothing to stderr (TRANSPARENT). The
+    /// fake `stat` reports the freshly written fake `claude` as long settled;
+    /// `identity_shim_settle_tests` covers the changing arms.
     #[test]
     fn identity_shim_resolved_tool_never_waits_or_writes_stderr() {
         if system_claude_present() {
@@ -2751,6 +2757,7 @@ mod resolve_wait_tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let marker = tmp.path().join("ran");
+        install_settled_stat(&real_dir);
         write_exe(&real_dir.join("claude"), &fake_claude_body(&marker));
         let out = crate::process_helpers::output_with_timeout(
             identity_cmd(&shim_dir, &real_dir, "10"),
@@ -2761,7 +2768,7 @@ mod resolve_wait_tests {
         assert!(marker.exists());
         assert!(
             out.stderr.is_empty(),
-            "TRANSPARENT: a hit adds no output: {}",
+            "TRANSPARENT: a settled hit adds no output: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
