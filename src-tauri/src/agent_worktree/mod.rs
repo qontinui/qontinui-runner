@@ -80,6 +80,7 @@ pub mod reclaim;
 pub(crate) mod remove_unspawned;
 pub(crate) mod retire_abandoned;
 pub mod session_env;
+pub(crate) mod shared_branch_restore;
 pub(crate) mod sibling_store;
 #[cfg(test)]
 mod test_coord;
@@ -1202,6 +1203,16 @@ pub struct SharedBranchRepo {
     pub push_ref: String,
     #[serde(flatten)]
     pub parent_sha_provenance: ParentShaProvenance,
+    /// The ref the canonical checkout was on BEFORE this allocation switched
+    /// it: a branch name, or the commit sha when HEAD was detached. Equal to
+    /// `branch` when the checkout was already on the agent branch and no
+    /// switch happened. What a refused spawn's restore
+    /// ([`shared_branch_restore`]) switches back to.
+    pub prior_ref: String,
+    /// `git rev-parse HEAD` read right after the switch succeeded — the commit
+    /// the restore requires HEAD to still be at, so a commit made on the agent
+    /// branch since is never switched away from.
+    pub switched_to_sha: String,
 }
 
 /// The leading token of a session refused because it got no worktree of its
@@ -2923,7 +2934,33 @@ fn checkout_shared_branches(
                 return Err(fail(e));
             }
         };
-        switched.push((canonical, prior, created));
+        switched.push((canonical, prior.clone(), created));
+        // The post-switch HEAD is what a refused spawn's restore proves it is
+        // still at. Unreadable means that restore could never act, so the
+        // switch is put back now instead, like a checkout whose prior ref
+        // could not be read.
+        let switched_to_sha = match run_git_command(canonical, &["rev-parse", "HEAD"])
+            .map(|s| s.trim().to_string())
+        {
+            Ok(sha) if !sha.is_empty() => sha,
+            Ok(_) => {
+                rollback(&switched);
+                return Err(fail(
+                    "`git rev-parse HEAD` printed nothing after the switch".into(),
+                ));
+            }
+            Err(e) => {
+                rollback(&switched);
+                return Err(fail(format!(
+                    "cannot read HEAD after the switch, so a refused spawn could not restore \
+                     it: {e}"
+                )));
+            }
+        };
+        // The session provisioned into this checkout writes `.mcp.json`,
+        // `.coord-mcp-status` and the fleet `.claude/` bundle into it; exclude
+        // exactly those here so a refused spawn's restore finds it clean.
+        shared_branch_restore::prepare_canonical_excludes(canonical, &prior);
         let push_ref = if w.push_ref.is_empty() {
             remote_agent_ref(&w.branch)
         } else {
@@ -2936,6 +2973,8 @@ fn checkout_shared_branches(
             checkout_path: (*canonical).clone(),
             push_ref,
             parent_sha_provenance: w.parent_sha_provenance.clone(),
+            prior_ref: prior,
+            switched_to_sha,
         });
     }
     Ok(branches)

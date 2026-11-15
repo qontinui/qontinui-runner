@@ -934,7 +934,15 @@ async fn materialize_repos(
             Ok((r, placed))
         }
         MaterializeOutcome::SharedBranch(sb) => {
-            let placed = vec![TreeProvenance::SharedBranch; sb.branches.len()];
+            let placed = sb
+                .branches
+                .iter()
+                .map(|b| TreeProvenance::SharedBranch {
+                    branch: b.branch.clone(),
+                    prior_ref: b.prior_ref.clone(),
+                    switched_to_sha: b.switched_to_sha.clone(),
+                })
+                .collect();
             Ok((
                 super::AllocateResult {
                     agent_id: sb.agent_id,
@@ -1838,6 +1846,12 @@ impl IsolatedEditContext {
     pub(crate) fn set_provenance_for_test(&mut self, path: &Path, provenance: TreeProvenance) {
         self.provenance
             .insert(super::worktree_resource_key(path), provenance);
+    }
+
+    /// Test-only: point `Drop`'s best-effort claim releases at a local double,
+    /// so a test can observe WHEN the release arrives.
+    pub(crate) fn set_coord_http_base_for_test(&mut self, base: String) {
+        self.coord_http_base = base;
     }
 
     /// Test-only view of the credential-install ids `Drop` will tear down:
