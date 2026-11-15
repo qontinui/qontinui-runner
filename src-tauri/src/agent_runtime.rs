@@ -16999,7 +16999,11 @@ mod tests {
         let got = resolve_waiting_with(
             || {
                 calls += 1;
-                if calls < 3 { "claude".to_string() } else { "/real/claude".to_string() }
+                if calls < 3 {
+                    "claude".to_string()
+                } else {
+                    "/real/claude".to_string()
+                }
             },
             "claude",
             std::time::Duration::from_secs(5),
@@ -17011,7 +17015,11 @@ mod tests {
 
     #[test]
     fn resolve_waiting_does_not_stall_on_an_absolute_override() {
-        let abs = if cfg!(windows) { r"C:\x\claude.exe" } else { "/x/claude" };
+        let abs = if cfg!(windows) {
+            r"C:\x\claude.exe"
+        } else {
+            "/x/claude"
+        };
         let start = std::time::Instant::now();
         let got = resolve_waiting_with(
             || abs.to_string(),
