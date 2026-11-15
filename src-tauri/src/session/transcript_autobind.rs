@@ -533,6 +533,31 @@ pub const OWED_BIND_BACKOFF: [Duration; 5] = [
     Duration::from_secs(600),
 ];
 
+/// Sessions with an owed-finish bind schedule running now. The finish observer
+/// fires on every reason-less re-finish of an unsynced mark (the read-back and
+/// retry doors), and the boot pass adds one more; without this set each would
+/// start its own ~12-minute schedule for the same session.
+static OWED_IN_FLIGHT: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Claim `csid`'s owed-finish schedule. `None` when one is already running; the
+/// guard releases the claim when the schedule ends, however it ends.
+fn claim_owed_bind(csid: &str) -> Option<OwedBindClaim> {
+    let mut set = OWED_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(csid.to_string()).then(|| OwedBindClaim(csid.to_string()))
+}
+
+struct OwedBindClaim(String);
+
+impl Drop for OwedBindClaim {
+    fn drop(&mut self) {
+        OWED_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// Bind ONE lifecycle-store record whose finished mark coord is OWED, so
 /// `register_inner` can deliver it. Unlike [`spawn_ensure_bound`] this does NOT
 /// go through the 60 s attempt throttle (that throttle exists to space tail
@@ -557,8 +582,16 @@ pub fn spawn_owed_finish_bind(
             // coord traffic, no binding — the same gate spawn_ensure_bound uses.
             return;
         }
+        let Some(claim) = claim_owed_bind(&identity.claude_session_id) else {
+            debug!(
+                "transcript_autobind: owed-finish bind for {} already running",
+                identity.claude_session_id
+            );
+            continue;
+        };
         let tailer = tailer.clone();
         tokio::spawn(async move {
+            let _claim = claim;
             for delay in OWED_BIND_BACKOFF {
                 tokio::time::sleep(delay).await;
                 if tailer.is_bound(&identity.claude_session_id) {
@@ -1131,6 +1164,25 @@ mod tests {
         };
         rec.working_dir = Some("/w".into());
         rec
+    }
+
+    #[test]
+    fn one_owed_bind_schedule_runs_per_session_at_a_time() {
+        let csid = "owed-claim-test-session";
+        let first = claim_owed_bind(csid).expect("the first claim wins");
+        assert!(
+            claim_owed_bind(csid).is_none(),
+            "a second schedule for the same session is refused while one runs"
+        );
+        assert!(
+            claim_owed_bind("owed-claim-test-other").is_some(),
+            "another session is independent"
+        );
+        drop(first);
+        assert!(
+            claim_owed_bind(csid).is_some(),
+            "the claim is released when the schedule ends"
+        );
     }
 
     #[test]
