@@ -388,11 +388,11 @@ pub const SESSION_START_CHILD_WINDOW_S: i64 = 60;
 ///
 /// Known limits, both in the direction of keeping a session open or of a
 /// short-lived misread while a turn is visibly running:
-/// - an MCP server launched through `sh -c …` / `bash -c …` (a hand-written
-///   server config; Claude Code itself spawns a stdio server directly off
-///   Windows) is a shell child and counts as work, so such a session never
-///   reads idle — without argv a `bash` wrapping one server cannot be told
-///   from the Bash tool's `bash` running one command, so only `cmd` is looked
+/// - an MCP server launched through `sh -c …` / `bash -c …` (e.g. a
+///   hand-written server config) is a shell child and counts as work, so
+///   such a session never reads idle — without argv a `bash` wrapping one
+///   server cannot be told from the Bash tool's `bash` running one command,
+///   so only `cmd` is looked
 ///   through ([`MCP_WRAPPER_SHELL_IMAGES`]);
 /// - an MCP server Claude Code RECONNECTS mid-session starts late and counts
 ///   as work, wrapped or not: the census carries no argv and no record of the
@@ -469,9 +469,11 @@ impl LiveClaudeProcess {
 ///
 /// Residual, toward closing early: a boot-time `shell: true` spawn of one
 /// non-shell program that is NOT an MCP server — a `SessionStart` hook run as
-/// `cmd` → `python3 hook.py` — reads as infrastructure while it lives. Hooks
-/// run while the session starts, never beside a `finished` verdict, which is
-/// the only reading this exemption can change the outcome of.
+/// `cmd` → `python3 hook.py` — reads as infrastructure while it lives. This
+/// predicate does not rule that out (a resumed session's hook runs under a
+/// fresh `claude` whose record may already read `finished`); what keeps it
+/// from closing such a session is the wind-down grace period, which a hook
+/// lasting seconds stays well inside.
 pub const MCP_WRAPPER_SHELL_IMAGES: [&str; 1] = ["cmd"];
 
 /// The console host Windows attaches under a console process started from a
