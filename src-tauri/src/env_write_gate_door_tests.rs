@@ -97,9 +97,12 @@ fn an_unguarded_worker_reaching_workspace_root_persists_nothing_into_the_fixture
     );
 }
 
-/// The `coord_sync` drain loop's door, entered from where the measured writes
-/// came from: a multi-thread runtime's `tokio-rt-worker`, which no test can
-/// hand its `env_lock`.
+/// The `coord_sync` drain loop's door, entered the way the measured writes
+/// were: `egress::transcript_sync_permitted()` → `transcript_gate_with` →
+/// `settings::get_cloud_sync_enabled()`, on a multi-thread runtime's
+/// `tokio-rt-worker`, which no test can hand its `env_lock`. The egress pin is
+/// thread-local, so the worker takes it: with the tenant switch ON the gate
+/// reads the user's consent from `settings.json`.
 #[test]
 fn an_unguarded_tokio_worker_reaching_get_cloud_sync_enabled_persists_nothing() {
     let amb = crate::test_env::isolated_ambient();
@@ -109,8 +112,12 @@ fn an_unguarded_tokio_worker_reaching_get_cloud_sync_enabled_persists_nothing() 
         .expect("build a multi-thread runtime");
     let (thread, refused) = rt.block_on(async {
         tokio::spawn(async {
+            let _tenant_switch = crate::egress::test_support::pin(
+                crate::egress::Flow::TranscriptSync,
+                crate::egress::Level::On,
+            );
             let before = refusals_on_this_thread();
-            let _ = crate::settings::get_cloud_sync_enabled();
+            let _ = crate::egress::transcript_sync_permitted();
             (
                 std::thread::current().name().map(str::to_string),
                 refusals_on_this_thread() - before,
