@@ -41,8 +41,9 @@ pub(crate) const TAIL_BYTES: u64 = 256 * 1024;
 /// The tail windows tried in order before the whole file. The bookkeeping that
 /// follows the deciding entry is not always short: `api-request-blob`,
 /// `attachment` and `api-request-shape` lines run to hundreds of KiB, and on
-/// nilan 2026-11-05 28 of 224 transcripts over 256 KiB had more than 256 KiB
-/// (up to 370 KB) after their last conversational entry. Widening in steps
+/// nilan in 2026-11 about one in ten transcripts over 256 KiB had more than
+/// 256 KiB after their last conversational entry (two counts: 28 of 224 and
+/// 25 of 266), every one under 1 MiB. Widening in steps
 /// keeps those reads bounded instead of jumping to a 5–15 MB whole-file read.
 const TAIL_WINDOWS: [u64; 3] = [TAIL_BYTES, 1024 * 1024, 4 * 1024 * 1024];
 
@@ -112,7 +113,7 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
     for window in TAIL_WINDOWS.into_iter().take_while(|&w| w < len) {
         // Read one byte before the tail too, to tell whether the tail starts
         // on a line boundary.
-        match read_from(&mut file, len - window - 1) {
+        match read_span(&mut file, len - window - 1, len) {
             Ok(bytes) => {
                 // Skip through the first newline: when the byte before the
                 // tail is `\n` that drops only that byte; otherwise it drops
@@ -136,7 +137,7 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
         }
     }
 
-    let bytes = match read_from(&mut file, 0) {
+    let bytes = match read_span(&mut file, 0, len) {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -160,10 +161,14 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
     (read, ReadSpan::Whole)
 }
 
-fn read_from(file: &mut File, offset: u64) -> std::io::Result<Vec<u8>> {
+/// Bytes `offset..end` of `file`. Bounded at the `end` measured once, so a
+/// transcript the CLI is still appending to is read as one snapshot: the
+/// window stays its nominal size, and only a line already partial at that
+/// moment can read as `Unreadable`.
+fn read_span(file: &mut File, offset: u64, end: u64) -> std::io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    file.take(end - offset).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -177,6 +182,9 @@ fn decide(bytes: &[u8]) -> Decision {
     // Lines are decoded one at a time, as they are visited: a bad byte above
     // the deciding entry does not make the read UNKNOWN, one at or below it
     // does.
+    // A final newline ends the last line; it does not start an empty one, so
+    // line numbers in the reasons below count real lines from the end.
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     for (from_end, raw) in bytes.split(|&b| b == b'\n').rev().enumerate() {
         let line = match std::str::from_utf8(raw) {
             Ok(l) => l.trim(),
@@ -255,7 +263,7 @@ mod tests {
 
     /// A seven-day stop: a user prompt, an assistant reply, the usage-limit
     /// API-error entry, then only bookkeeping lines (`system` `turn_duration`
-    /// first, as in all 49 measured jan transcripts). The error entry's field
+    /// first, as in all 49 jan transcripts the plan measured on merytshost). The error entry's field
     /// set and the trailing line types (`tools-used`, `file-history-snapshot`,
     /// `api-request-blob`, `api-request`, `attachment`, then the plan's
     /// `mode` … `cost-state` list) are copied from a real main-thread stop on
@@ -266,7 +274,7 @@ mod tests {
     const FIVE_HOUR_STOP: &str = include_str!("fixtures/limit_stop/five_hour_stop.jsonl");
 
     const SEVEN_DAY_UUID: &str = "7c1d2e3f-4a5b-4c6d-8e7f-90a1b2c3d4e5";
-    /// 2026-11-03T20:00:00Z, jan's measured reset.
+    /// 2026-11-03T20:00:00Z, jan's reset as the plan records it.
     const SEVEN_DAY_RESETS_AT_MS: i64 = 1_793_736_000_000;
 
     fn write_transcript(body: &[u8]) -> tempfile::NamedTempFile {
@@ -423,9 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn a_fractional_or_non_numeric_reset_time() {
+    fn a_fractional_reset_time_truncates_and_a_non_numeric_one_is_absent() {
         let mut entry = seven_day_error_entry();
-        entry["quotaLimits"]["resetsAt"] = serde_json::json!(1_793_736_000.0);
+        entry["quotaLimits"]["resetsAt"] = serde_json::json!(1_793_736_000.7);
         assert!(matches!(
             read(&format!("{entry}\n")),
             LimitStopRead::Stopped(LimitStop {
@@ -466,6 +474,13 @@ mod tests {
         let mut body = SEVEN_DAY_STOP.to_string();
         body.push_str(r#"{"type":"assistant","isSidechain":false,"uuid":"dd"#);
         assert!(matches!(read(&body), LimitStopRead::Unreadable(_)));
+        // The same partial line, newline-terminated, is still line 1 from the
+        // end: the final newline does not count as an empty line.
+        body.push('\n');
+        assert!(matches!(
+            read(&body),
+            LimitStopRead::Unreadable(ref why) if why.starts_with("transcript line 1 from the end")
+        ));
     }
 
     #[test]
