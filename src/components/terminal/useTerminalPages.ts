@@ -6,7 +6,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
 import { getPerfCaps, getPerfCapsLoadState, loadPerfCaps } from "@/lib/perfCaps";
 import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
-import { MAIN_WINDOW_LABEL, readWindowLabel } from "./contexts/WindowAssignmentsContext";
+import { MAIN_WINDOW_LABEL, readWindowLabel } from "@/lib/windowLabel";
 import {
   PAGES_VERSION,
   PAGES_VERSION_KEY,
