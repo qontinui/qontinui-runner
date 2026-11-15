@@ -2003,7 +2003,7 @@ mod tests {
             "mcpServers": {
                 "coord-mcp-static": {
                     "url": "http://127.0.0.1:9876/coord-mcp",
-                    "headers": { "Authorization": "Bearer xyz" }
+                    "headers": { "X-Unrelated": "no-nonce-here" }
                 },
                 "coord-mcp": {
                     "url": "http://127.0.0.1:9877/coord-mcp",
