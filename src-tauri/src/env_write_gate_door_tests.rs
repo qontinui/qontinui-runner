@@ -249,3 +249,73 @@ fn a_repeated_refusal_writes_one_line() {
     assert_eq!(refused, 3, "every refusal is counted");
     assert_eq!(reported_lines(name, "settings::update_settings"), 1);
 }
+
+/// Every whole-document save resolves its file through
+/// `settings::get_settings_path`, which refuses before its `create_dir_all`.
+#[test]
+fn an_unguarded_save_settings_returns_the_refusal_and_writes_nothing() {
+    let amb = crate::test_env::isolated_ambient();
+    let (verdict, refused) = run_unguarded("env-write-gate-door-save-settings", || {
+        crate::settings::save_settings(&crate::settings::Settings::default())
+    });
+    let err = verdict.expect_err("an unguarded whole-document save must be refused");
+    assert!(err.contains("holds no env_lock"), "{err}");
+    assert!(err.contains("`settings::get_settings_path`"), "{err}");
+    assert_eq!(refused, 1);
+    assert_eq!(settings_traces(amb.dir()), Vec::<String>::new());
+}
+
+/// `backup::restore_backup` resolves every destination from the env and writes
+/// without `get_settings_path`, so it gates each destination itself: a refused
+/// entry becomes that entry's error and nothing is restored. `cfg(unix)` for
+/// the roster test's reason: the destinations live under the platform config
+/// dir, which only `XDG_CONFIG_HOME` moves into this fixture.
+#[cfg(unix)]
+#[test]
+fn an_unguarded_restore_backup_restores_nothing() {
+    let amb = crate::test_env::isolated_ambient();
+    let _xdg = crate::test_env::EnvVarRestore::capture(&["XDG_CONFIG_HOME"]);
+    std::env::set_var("XDG_CONFIG_HOME", amb.dir().join("xdg-config"));
+    let base = qontinui_runner_lib::instance_env::runner_config_base().expect("a config base");
+    assert!(
+        base.starts_with(amb.dir()),
+        "the restore target must resolve inside the fixture: {}",
+        base.display()
+    );
+    let settings_json = base.join("settings.json");
+
+    // A real backup carrying settings.json, made on this (guarded) thread.
+    std::fs::create_dir_all(&base).expect("the config base");
+    std::fs::write(&settings_json, br#"{"setup_completed":true}"#).expect("seed settings.json");
+    let (archive, made) = crate::backup::create_backup().expect("a backup");
+    assert!(
+        made.files_backed_up.contains(&"settings.json".to_string()),
+        "the backup must carry settings.json: {:?}",
+        made.files_backed_up
+    );
+    std::fs::remove_file(&settings_json).expect("clear the restore target");
+
+    let (restored, refused) = run_unguarded("env-write-gate-door-restore-backup", move || {
+        crate::backup::restore_backup(&archive)
+    });
+    let restored = restored.expect("the archive opens");
+    assert!(
+        restored.files_restored.is_empty(),
+        "nothing may be restored: {:?}",
+        restored.files_restored
+    );
+    assert!(
+        restored
+            .errors
+            .iter()
+            .any(|e| e.contains("holds no env_lock") && e.contains("`backup::restore_backup`")),
+        "the refusal is the entry's error: {:?}",
+        restored.errors
+    );
+    assert_eq!(refused as usize, made.files_backed_up.len());
+    assert!(
+        !settings_json.exists(),
+        "the refused restore wrote {}",
+        settings_json.display()
+    );
+}
