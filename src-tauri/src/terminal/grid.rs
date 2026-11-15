@@ -1504,7 +1504,11 @@ mod tests {
             assert_eq!(cell.attrs & ATTR_DIM, 0, "{cell:?}");
         }
         assert_ne!(cells[1].attrs & ATTR_UNDERLINE, 0, "4:2 underlines");
-        assert_eq!(cells[2].fg, pack_rgb(1, 2, 2), "ITU form skips the colour space");
+        assert_eq!(
+            cells[2].fg,
+            pack_rgb(1, 2, 2),
+            "ITU form skips the colour space"
+        );
         assert_eq!(cells[3].bg, pack_rgb(3, 4, 2), "plain colon truecolour");
         assert_eq!(cells[4].fg, palette_256(2));
         assert_eq!(cells[5].attrs & ATTR_UNDERLINE, 0, "4:0 is no underline");
