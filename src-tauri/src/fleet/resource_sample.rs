@@ -1266,7 +1266,8 @@ fn collect_host_lane() -> ResourceSample {
     // already returned, and the spawn gate and the fleet dashboard are now
     // literally the same reading rather than two probes of the same quantity —
     // `spawn_gate_reading` calls this identical function.
-    if let Some(m) = memory_status() {
+    let memory = memory_status();
+    if let Some(m) = memory {
         if m.phys_total > 0 {
             s.mem_total_bytes = Some(m.phys_total);
             s.mem_available_bytes = Some(m.phys_available);
@@ -1353,12 +1354,17 @@ fn collect_host_lane() -> ResourceSample {
 
     // The launch capacity coord admits against (plan
     // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
-    // Phase 2): ONE admission reading, taken here — this function already runs
-    // inside `spawn_blocking_tracked`, so the synchronous thread-table and
-    // commit reads never land on an async worker. Host lane only, for the
+    // Phase 2): judged against the SAME memory reading this sample publishes
+    // (the `memory` taken above), plus the live thread reading — this function
+    // already runs inside `spawn_blocking_tracked`, so the synchronous
+    // thread-table read never lands on an async worker. Host lane only, for the
     // spawn-pressure pair's placement reason: it is this runner PROCESS's
     // admission, which no other lane owns.
-    s.set_launch_capacity(&crate::launch_capacity::live());
+    s.set_launch_capacity(&crate::launch_capacity::live_with_memory((
+        Lane::Host.as_str(),
+        memory.map(|m| m.commit_available),
+        memory.map(|m| m.phys_available),
+    )));
 
     s.blocking_lanes = Some(
         tracked_blocking_by_thread()

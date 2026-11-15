@@ -2438,6 +2438,31 @@ enum PushOutcome {
     Refused(String),
 }
 
+/// The credential scope one outbox row is pushed under: the record's own
+/// resolved tenant ([`record_session_tenant`]) for every kind, EXCEPT a
+/// `spawn_failed_report`, which always presents [`TenantScope::Device`].
+///
+/// Why that kind differs (plan
+/// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 6): it rides a synthetic per-agent lane that no session registry
+/// knows, so its record scope is [`TenantScope::Unresolved`] — which sends NO
+/// bearer on a multi-bound device. coord's `post_spawn_failed` never 401s; it
+/// classes a report without a paired device token as UNVERIFIED, abandons
+/// only an allocation still `allocated`, and does NOT retire the
+/// `deferred_load` dispatch marker — while still answering 200, so the drain
+/// would Ack a report that did half its job. The live POST
+/// (`agent_runtime::post_spawn_failed`) presents `attach_device_auth`, i.e.
+/// `TenantScope::Device`, and the route keys the row by the path `agent_id`
+/// and persists no tenant — exactly the shape `Device` names. The replay must
+/// present the same credential.
+fn push_credential_scope(kind: &str, record_scope: TenantScope) -> TenantScope {
+    if kind == SessionEventKind::SpawnFailedReport.as_str() {
+        TenantScope::Device
+    } else {
+        record_scope
+    }
+}
+
 /// coord's `SessionError` code for a PATCH re-key onto a harness id another
 /// ACTIVE row on the device and tenant holds (qontinui-coord `sessions.rs`).
 const HARNESS_SESSION_ALREADY_BOUND: &str = "harness_session_already_bound";
@@ -2506,7 +2531,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     // default slot on a single-bound device, byte-identical to the old
     // behaviour, and degrades to unauthenticated on a multi-bound one instead
     // of filing another tenant's session row.
-    let scope = record_session_tenant(inner, rec);
+    let scope = push_credential_scope(kind, record_session_tenant(inner, rec));
 
     // The last line of the per-tenant egress switches for BOTH session-output
     // streams (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
@@ -2703,11 +2728,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // A `spawn-failed` report the live POST could not deliver (plan
             // 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling,
             // Phase 6). POST /agents/:agent_id/spawn-failed with the body the
-            // live POST would have sent. The lane is synthetic (a refused launch
-            // has no session), so `scope` resolves Unresolved → the default
-            // device credential — the same one the live POST attaches. The
-            // generic arms below settle it: 2xx Ack, 4xx PermanentFailure
-            // (Ack-drop), transport / 5xx retry on this lane's backoff.
+            // live POST would have sent. `scope` here is `TenantScope::Device`
+            // (see `push_credential_scope`): the lane is synthetic, so the
+            // record's own resolution would be `Unresolved`, which sends NO
+            // bearer on a multi-bound device — and coord then treats the
+            // report as unverified and never retires the deferred_load marker,
+            // while still answering 200. The generic arms below settle it: 2xx
+            // Ack, 4xx PermanentFailure (Ack-drop), transport / 5xx retry on
+            // this lane's backoff.
             let Some((agent_id, body)) =
                 super::spawn_report_spool::replay_target(&rec.payload)
             else {
@@ -5732,14 +5760,64 @@ mod tests {
         (format!("http://{addr}"), state)
     }
 
+    /// The replay of a spooled spawn-failed report presents the DEVICE
+    /// credential the live POST presents, never the synthetic lane's
+    /// `Unresolved` scope (which sends no bearer on a multi-bound device, so
+    /// coord would class the report unverified and keep the dispatch marker).
+    /// Every other kind keeps its record's own scope.
+    ///
+    /// Mutation: in `push_record`, use `record_session_tenant(inner, rec)`
+    /// directly (the source pin fails), or return `record_scope` for this kind
+    /// in `push_credential_scope` (the value asserts fail).
+    #[test]
+    fn a_spooled_spawn_failed_report_replays_under_the_device_credential() {
+        let t = Uuid::new_v4();
+        for record_scope in [
+            TenantScope::Unresolved,
+            TenantScope::Owned(t),
+            TenantScope::Device,
+        ] {
+            assert_eq!(
+                push_credential_scope(
+                    SessionEventKind::SpawnFailedReport.as_str(),
+                    record_scope
+                ),
+                TenantScope::Device
+            );
+            for other in [
+                SessionEventKind::Started,
+                SessionEventKind::FindingPosted,
+                SessionEventKind::GateRegistration,
+                SessionEventKind::OperatorTouch,
+            ] {
+                assert_eq!(push_credential_scope(other.as_str(), record_scope), record_scope);
+            }
+        }
+        let src = include_str!("coord_sync.rs");
+        let dispatch = src
+            .split_once("async fn push_record(")
+            .expect("the dispatch function must exist")
+            .1;
+        let head = dispatch
+            .split_once("let result = match kind {")
+            .expect("the dispatch match must exist")
+            .0;
+        assert!(
+            head.contains("let scope = push_credential_scope(kind, record_session_tenant(inner, rec));"),
+            "push_record must route the record scope through push_credential_scope"
+        );
+    }
+
     /// A spooled `spawn_failed_report` is replayed to coord's spawn-failed
     /// route EXACTLY once on success — to the agent the payload names, with the
     /// body the live POST would have sent — and a transient 5xx keeps it for a
     /// retry rather than dropping it.
     ///
     /// Mutation: remove the `"spawn_failed_report"` arm from `push_record` (the
-    /// catch-all ACK-drops the row and coord sees nothing), or mark the kind
-    /// best-effort-dropped after one failure.
+    /// catch-all ACK-drops the row: coord sees ZERO requests and the count
+    /// assertion fails). Adding the kind to `is_best_effort_kind` is caught by
+    /// `a_spooled_spawn_failed_report_outlasts_the_best_effort_budget`, not
+    /// here — one 503 is inside that budget.
     #[tokio::test]
     async fn the_drain_replays_a_spooled_spawn_failed_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -5785,6 +5863,50 @@ mod tests {
             assert_eq!(*id, agent_id, "replayed to the agent the payload names");
             assert_eq!(sent, &body, "the live POST's body, verbatim, minus agent_id");
         }
+    }
+
+    /// More transient failures than the best-effort budget
+    /// ([`BEST_EFFORT_MAX_ATTEMPTS`], 3) still end in delivery: the kind is NOT
+    /// best-effort, because until coord hears the report it counts the
+    /// allocation in flight.
+    ///
+    /// Mutation: add `SpawnFailedReport` to `is_best_effort_kind` — the row is
+    /// Ack-dropped after its third 503, coord never sees the 200 attempt, and
+    /// the count assertion (5) fails.
+    #[tokio::test]
+    async fn a_spooled_spawn_failed_report_outlasts_the_best_effort_budget() {
+        assert!(BEST_EFFORT_MAX_ATTEMPTS < 4, "the script must exceed the budget");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, seen) = spawn_scripted_spawn_failed_coord(vec![503, 503, 503, 503]).await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+        let spool = super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        super::super::spawn_report_spool::spool_spawn_failed(
+            &spool,
+            Uuid::new_v4(),
+            &json!({"reason": "deferred_load:thread_pressure:warn:380_over_376", "restarts_attempted": 0}),
+        )
+        .expect("spools");
+        let _drain = coord.start_drain_task();
+        // Backoff 1+2+4+8 s across the four 503s, plus the loop's own cadence.
+        wait_until(Duration::from_secs(60), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let g = seen.lock().await;
+        assert_eq!(
+            g.1.len(),
+            5,
+            "four 503s retried, then the 200 that acked it: {:?}",
+            g.1
+        );
     }
 
     /// A 4xx on replay is coord's verdict on the report: Ack-dropped after ONE

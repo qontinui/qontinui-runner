@@ -34,13 +34,14 @@
 //! row stuck on a coord 5xx never holds up another agent's report — the
 //! per-session chain is per lane.
 //!
-//! ## Replay is idempotent on coord's side
+//! ## A replayed duplicate is harmless, not a no-op
 //!
-//! coord's `post_spawn_failed` sets the allocation `abandoned` and, for a
-//! `deferred_load:` reason, retires the dedup marker under a per-agent advisory
-//! lock; a second delivery of the same report finds the row already abandoned.
-//! So the window where the POST succeeded but the local ACK did not land costs
-//! a no-op, not a duplicate.
+//! The window where the POST succeeded but the local ACK did not land
+//! delivers the same report twice. coord does not dedupe it: it re-runs the
+//! status UPDATE (the allocation is already `abandoned`, so the state does not
+//! move), writes a SECOND `spawn_outcome` row, and — for a `deferred_load:`
+//! reason — re-runs the marker retirement, which is idempotent per agent under
+//! its advisory lock. The cost is one extra outcome row, never a wrong state.
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use uuid::Uuid;
