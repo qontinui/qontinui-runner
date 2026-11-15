@@ -3872,10 +3872,18 @@ MemAvailable:   15335424 kB
             1,
             "collect_host_lane must take exactly ONE memory reading"
         );
-        assert!(
-            !body.contains("lane_verdicts()"),
-            "collect_host_lane must not take a second reading through lane_verdicts()"
-        );
+        for second_reading in [
+            "lane_verdicts()",
+            "spawn_gate_reading()",
+            "available_commit_bytes()",
+            "available_phys_bytes()",
+            "exhaustion_memory_reading(",
+        ] {
+            assert!(
+                !body.contains(second_reading),
+                "collect_host_lane must not take a second memory reading through {second_reading}"
+            );
+        }
         assert!(
             !body.contains("::live()"),
             "collect_host_lane must not take a second reading through a ::live() constructor"
