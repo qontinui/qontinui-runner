@@ -28,9 +28,13 @@
 //! [`PaneKey`] from it so a restored pane maps back to its prior coord id.
 //!
 //! Collisions: two panes with the identical `(page_id, title, working_dir)`
-//! triple are genuinely indistinguishable to the operator and to coord's
-//! intent; mapping them to the same resumed row is the desired behavior
-//! (one logical "Terminal 1 in workspace X" session), not a bug.
+//! triple share one key. Across a restart that is the point — the restored
+//! pane resumes its predecessor's row. But two such panes LIVE AT ONCE must
+//! not share a row (one pane's exit would close the other's, and a remote end
+//! of the row could not tell them apart), so the create path resumes a
+//! persisted row only when no other pane is bound to it, and otherwise
+//! registers fresh (`commands/terminal/coord_wiring.rs`,
+//! `wire_coord_session`).
 //!
 //! ## Storage
 //!
