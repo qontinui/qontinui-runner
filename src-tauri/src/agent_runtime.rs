@@ -18424,7 +18424,13 @@ mod tests {
         let report =
             provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
         let why = report.skipped[0].reason.describe();
-        assert!(why.contains("this repository tracks"), "{why}");
+        // The sentence `overlay_absent_statement` renders for a floor that only
+        // KEPT definitions: the repository's copies, not the built-in one.
+        assert!(
+            why.contains("existing agent definition(s) on disk (tracked, or possibly tracked, by this repository"),
+            "{why}"
+        );
+        assert!(why.contains("were kept"), "{why}");
         assert!(
             !why.contains("This capability is served from the copy built into"),
             "{why}"
