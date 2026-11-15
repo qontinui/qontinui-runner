@@ -26,8 +26,11 @@
 //!    merytshost: 15 idle processes each holding a ~3-day-old
 //!    `coord-mcp-shim.py` stdio child, `shell` sessions holding 10-day
 //!    background `bash` loops. Since 2026-10-04 `has_live_children` counts
-//!    only WORK children (`tracking_health::child_signals_work`): a stdio MCP
-//!    server started with the session no longer counts, so a pane holding
+//!    only WORK children (`tracking_health::child_signals_work_in`): a stdio
+//!    MCP server started with the session no longer counts — nor, since plan
+//!    `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+//!    Phase 7b, the boot-time `cmd.exe` Claude Code wraps one in on Windows
+//!    (`tracking_health::is_mcp_server_shell_wrapper`) — so a pane holding
 //!    only that is decided `idle` here rather than falling through to the
 //!    record, while a background `bash` loop still does. `Some(true)` remains
 //!    only a VETO on a pane-idle verdict, and `None` (uncomputable) cannot
