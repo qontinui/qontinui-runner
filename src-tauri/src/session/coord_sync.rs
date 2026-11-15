@@ -8526,7 +8526,6 @@ mod tests {
         assert!(unobserved["lastFailure"].is_null());
         for key in [
             "heartbeatsSuperseded",
-            "heartbeatsMuted",
             "heartbeatsDroppedOnFailure",
             "heartbeatsDroppedOnFailureByKind",
         ] {
