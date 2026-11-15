@@ -259,7 +259,7 @@ pub fn pid_reuse_reference(pid: u32, verified: &HashSet<u32>, boot_unix_millis: 
 /// matter for it — `pid_alive(0)` is `false`, so classify reads the terminal
 /// dead and Closes — so the only thing that must not happen is forcing
 /// `snapshot_ok` false: it is the tick's own snapshot health. (At the base
-/// this replaces, root 0 walked about the whole table and read `true` when
+/// this replaces, root 0 walked the whole table and read `true` when
 /// any `claude` ran anywhere; that value was equally unread.)
 pub fn poll_claude_presence(
     look: &PaneLook,
