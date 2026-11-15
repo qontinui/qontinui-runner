@@ -564,16 +564,30 @@ impl Grid {
             self.reset_pen();
             return;
         }
-        let flat: Vec<u16> = params.iter().flatten().copied().collect();
+        // One entry per `;`-separated parameter, each holding its `:` sub-
+        // parameters. A colon group is ONE attribute (`4:2` is double
+        // underline, `38:2::R:G:B` one colour) and its sub-parameters are
+        // never read as SGR codes of their own: flattening them would turn a
+        // trailing `2` into DIM — and DIM on the input row is how ghost text
+        // is told from typed text.
+        let groups: Vec<&[u16]> = params.iter().collect();
         let mut i = 0;
-        while i < flat.len() {
-            let p = flat[i];
+        while i < groups.len() {
+            let group = groups[i];
+            let p = group.first().copied().unwrap_or(0);
             match p {
                 0 => self.reset_pen(),
                 1 => self.cur_attrs |= ATTR_BOLD,
                 2 => self.cur_attrs |= ATTR_DIM,
                 3 => self.cur_attrs |= ATTR_ITALIC,
-                4 => self.cur_attrs |= ATTR_UNDERLINE,
+                // `4:0` is "no underline"; any other `4:n` style underlines.
+                4 => {
+                    if group.get(1) == Some(&0) {
+                        self.cur_attrs &= !ATTR_UNDERLINE;
+                    } else {
+                        self.cur_attrs |= ATTR_UNDERLINE;
+                    }
+                }
                 7 => self.cur_attrs |= ATTR_INVERSE,
                 9 => self.cur_attrs |= ATTR_STRIKE,
                 22 => self.cur_attrs &= !(ATTR_BOLD | ATTR_DIM),
@@ -589,40 +603,51 @@ impl Grid {
                 49 => self.cur_bg = COLOR_DEFAULT,
                 // 58 is the underline colour: the grid does not keep it, but
                 // its parameters must be consumed like 38/48's, or a stray `2`
-                // in `58;2;R;G;B` reads as DIM — and DIM on the input row is
-                // how ghost text is told from typed text.
+                // in `58;2;R;G;B` reads as DIM.
                 38 | 48 | 58 => {
-                    let is_fg = p == 38;
-                    let is_bg = p == 48;
-                    if i + 1 < flat.len() {
-                        match flat[i + 1] {
+                    let color = if group.len() > 1 {
+                        // Colon form, self-contained: `38:5:n`, `38:2:R:G:B`,
+                        // or the ITU `38:2:CS:R:G:B` with a colour-space slot.
+                        match group[1] {
+                            5 => group.get(2).map(|&n| palette_256(n as u8)),
                             2 => {
-                                if i + 4 < flat.len() {
-                                    let r = flat[i + 2] as u8;
-                                    let g = flat[i + 3] as u8;
-                                    let b = flat[i + 4] as u8;
-                                    let c = pack_rgb(r, g, b);
-                                    if is_fg {
-                                        self.cur_fg = c;
-                                    } else if is_bg {
-                                        self.cur_bg = c;
-                                    }
-                                    i += 4;
-                                }
+                                let rgb = if group.len() >= 6 {
+                                    &group[3..6]
+                                } else {
+                                    group.get(2..5).unwrap_or(&[])
+                                };
+                                (rgb.len() == 3)
+                                    .then(|| pack_rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8))
                             }
-                            5 => {
-                                if i + 2 < flat.len() {
-                                    let n = flat[i + 2] as u8;
-                                    let c = palette_256(n);
-                                    if is_fg {
-                                        self.cur_fg = c;
-                                    } else if is_bg {
-                                        self.cur_bg = c;
-                                    }
-                                    i += 2;
-                                }
+                            _ => None,
+                        }
+                    } else {
+                        // Semicolon form: the selector and values are the
+                        // following parameters, consumed here.
+                        let next = |k: usize| groups.get(i + k).and_then(|g| g.first()).copied();
+                        match next(1) {
+                            Some(5) if i + 2 < groups.len() => {
+                                let n = next(2).unwrap_or(0) as u8;
+                                i += 2;
+                                Some(palette_256(n))
                             }
-                            _ => {}
+                            Some(2) if i + 4 < groups.len() => {
+                                let (r, g, b) = (
+                                    next(2).unwrap_or(0) as u8,
+                                    next(3).unwrap_or(0) as u8,
+                                    next(4).unwrap_or(0) as u8,
+                                );
+                                i += 4;
+                                Some(pack_rgb(r, g, b))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(c) = color {
+                        if p == 38 {
+                            self.cur_fg = c;
+                        } else if p == 48 {
+                            self.cur_bg = c;
                         }
                     }
                 }
@@ -1462,6 +1487,27 @@ mod tests {
             assert_eq!(cell.fg, COLOR_DEFAULT);
             assert_eq!(cell.bg, COLOR_DEFAULT);
         }
+    }
+
+    /// A colon group is one attribute: its sub-parameters never read as SGR
+    /// codes, so a trailing `2` (ITU colour-space form, double underline) is
+    /// not DIM, and colon colours land on the right channel.
+    #[test]
+    fn colon_subparameters_are_one_attribute_never_dim() {
+        let mut grid = Grid::new(20, 2);
+        feed(
+            &mut grid,
+            b"[58:2::0:0:2mA[4:2mB[38:2::1:2:2mC[48:2:3:4:2mD[38:5:2mE[4:0mF",
+        );
+        let cells = &grid.snapshot().cells;
+        for cell in &cells[..6] {
+            assert_eq!(cell.attrs & ATTR_DIM, 0, "{cell:?}");
+        }
+        assert_ne!(cells[1].attrs & ATTR_UNDERLINE, 0, "4:2 underlines");
+        assert_eq!(cells[2].fg, pack_rgb(1, 2, 2), "ITU form skips the colour space");
+        assert_eq!(cells[3].bg, pack_rgb(3, 4, 2), "plain colon truecolour");
+        assert_eq!(cells[4].fg, palette_256(2));
+        assert_eq!(cells[5].attrs & ATTR_UNDERLINE, 0, "4:0 is no underline");
     }
 
     #[test]
