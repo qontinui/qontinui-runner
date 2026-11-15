@@ -378,11 +378,26 @@ pub const SESSION_START_CHILD_WINDOW_S: i64 = 60;
 /// reconnected mid-session, a node-hosted nested agent) — is work, so the
 /// error is always toward keeping the session open.
 ///
+/// A shell is work HERE because this reads one process's image alone. The one
+/// shell that is NOT work — `cmd.exe` wrapping a stdio MCP server, which is how
+/// Claude Code launches EVERY stdio MCP server on Windows
+/// (`cmd /d /s /c "…python3.exe …coord-mcp-shim.py …"`, finding `a1e753fd`) —
+/// is recognised only from the wrapper's own children, over the snapshot, by
+/// [`is_mcp_server_shell_wrapper`]; every census reads a `claude`'s children
+/// through [`child_signals_work_in`], which applies both.
+///
 /// Known limits, both in the direction of keeping a session open or of a
 /// short-lived misread while a turn is visibly running:
-/// - an MCP server launched THROUGH a shell (`cmd /c npx …`, `sh -c …`) is a
-///   shell child and always counts as work, so such a session never reads
-///   idle — the fleet's `coord-mcp-shim.py` runs under `python3` directly;
+/// - an MCP server launched through `sh -c …` / `bash -c …` (a hand-written
+///   server config; Claude Code itself spawns a stdio server directly off
+///   Windows) is a shell child and counts as work, so such a session never
+///   reads idle — without argv a `bash` wrapping one server cannot be told
+///   from the Bash tool's `bash` running one command, so only `cmd` is looked
+///   through ([`MCP_WRAPPER_SHELL_IMAGES`]);
+/// - an MCP server Claude Code RECONNECTS mid-session starts late and counts
+///   as work, wrapped or not: the census carries no argv and no record of the
+///   session's configured MCP servers, so nothing here can tell a reconnected
+///   server from a tool's job;
 /// - a non-shell child a tool starts in the first
 ///   [`SESSION_START_CHILD_WINDOW_S`] (a direct `rg` from a turn that begins
 ///   at boot, a job `exec`'d into within the window) reads as infrastructure
@@ -397,9 +412,9 @@ pub const SESSION_START_CHILD_WINDOW_S: i64 = 60;
 /// process, these MCP servers included, so an idle session that holds one is
 /// still not closed.
 ///
-/// A shell is always work HERE, because this reads images alone. The one
-/// discount, a proven-stray wait loop under a FINISHED session, needs argv and
-/// is applied after the pass: [`TrackingHealthReport::discount_stray_shells`].
+/// The other discount, a proven-stray wait loop under a FINISHED session,
+/// needs argv and is applied after the pass:
+/// [`TrackingHealthReport::discount_stray_shells`].
 pub fn child_signals_work(
     image: Option<&str>,
     child_created_s: Option<i64>,
@@ -434,7 +449,102 @@ impl LiveClaudeProcess {
     }
 }
 
-/// `pid`'s direct children that [`child_signals_work`] counts, over one snapshot.
+/// The shell image Claude Code wraps a stdio MCP server in: on Windows it
+/// launches every stdio server as `cmd /d /s /c "<command> <args>"`.
+///
+/// Deliberately `cmd` alone, not `sh`/`bash`: Claude Code's Bash tool runs
+/// commands (and `run_in_background` jobs) under `bash`/`sh` — Git Bash on
+/// Windows — and a `bash` holding one `python3` it started in the first minute
+/// of a session spawned WITH a prompt is, image for image and second for
+/// second, the same tree as a `bash -c` MCP wrapper. Only argv tells them
+/// apart, and the census carries none. Claude Code runs no tool under `cmd`
+/// (its tool shells are `bash` and PowerShell), so a direct `cmd` child of a
+/// `claude` is its own MCP launch.
+pub const MCP_WRAPPER_SHELL_IMAGES: [&str; 1] = ["cmd"];
+
+/// The console host Windows attaches under a console process started from a
+/// hidden-console parent: the wrapper's plumbing, never the server.
+const CONSOLE_HOST_IMAGES: [&str; 1] = ["conhost"];
+
+/// PURE: is `kid` (a direct child of the `claude` `parent`) a shell WRAPPING
+/// one stdio MCP server Claude Code started while the session booted — and so
+/// infrastructure, not work?
+///
+/// Every condition must be positively read from `snapshot`; any gap is `false`
+/// (work), because this feeds the reading that decides whether a session may
+/// be wound down:
+/// - `kid`'s image is a [`MCP_WRAPPER_SHELL_IMAGES`] shell, and `kid` and
+///   `parent` both have known creation times, `kid`'s inside
+///   [`SESSION_START_CHILD_WINDOW_S`] of `parent`'s;
+/// - leaving out console hosts, `kid` has EXACTLY ONE child, whose image is
+///   readable and is neither a shell nor a `claude` ([`WORK_CHILD_IMAGES`]): a
+///   wrapper holding a shell is a command line, one holding a `claude` a nested
+///   agent, one holding two processes not a single server's launch, and one
+///   holding nothing (no `parent_map` entry) a bare shell;
+/// - that one child also has a known creation time inside the window of
+///   `parent`;
+/// - every console host's image is readable (an unreadable sibling could be
+///   anything).
+///
+/// The measured shape (finding `a1e753fd`: every one of 35-36 finished sessions
+/// on a Windows box held by it): `claude` → `cmd.exe` (+1 s) → {`conhost.exe`,
+/// `python3.exe` (+1 s)}. Work running UNDER the server is not looked at,
+/// exactly as for a server started without a wrapper.
+pub fn is_mcp_server_shell_wrapper(kid: u32, parent: u32, snapshot: &ProcessSnapshot) -> bool {
+    let known = |pid: u32| {
+        snapshot
+            .creation_times
+            .get(&pid)
+            .copied()
+            .filter(|&s| s > 0)
+    };
+    let Some(parent_s) = known(parent) else {
+        return false;
+    };
+    let in_window = |pid: u32| {
+        known(pid).is_some_and(|s| (0..=SESSION_START_CHILD_WINDOW_S).contains(&(s - parent_s)))
+    };
+    let image = |pid: u32| {
+        snapshot
+            .names
+            .get(&pid)
+            .map(|n| normalize_image(n))
+            .filter(|n| !n.is_empty())
+    };
+    let Some(wrapper) = image(kid) else {
+        return false;
+    };
+    if !MCP_WRAPPER_SHELL_IMAGES.contains(&wrapper.as_str()) || !in_window(kid) {
+        return false;
+    }
+    let mut server: Option<(u32, String)> = None;
+    for &grandkid in snapshot.parent_map.get(&kid).into_iter().flatten() {
+        let Some(name) = image(grandkid) else {
+            return false;
+        };
+        if CONSOLE_HOST_IMAGES.contains(&name.as_str()) {
+            continue;
+        }
+        if server.replace((grandkid, name)).is_some() {
+            return false;
+        }
+    }
+    server.is_some_and(|(pid, name)| !WORK_CHILD_IMAGES.contains(&name.as_str()) && in_window(pid))
+}
+
+/// Does `kid`, a direct child of the `claude` `parent`, count as WORK, read
+/// over one snapshot? [`child_signals_work`] on its own image and times, except
+/// that a [`is_mcp_server_shell_wrapper`] is infrastructure. The ONE predicate
+/// every census and stray pass reads a `claude`'s children through.
+pub fn child_signals_work_in(kid: u32, parent: u32, snapshot: &ProcessSnapshot) -> bool {
+    child_signals_work(
+        snapshot.names.get(&kid).map(String::as_str),
+        snapshot.creation_times.get(&kid).copied(),
+        snapshot.creation_times.get(&parent).copied(),
+    ) && !is_mcp_server_shell_wrapper(kid, parent, snapshot)
+}
+
+/// `pid`'s direct children that [`child_signals_work_in`] counts, over one snapshot.
 fn work_children(pid: u32, snapshot: &ProcessSnapshot) -> impl Iterator<Item = u32> + '_ {
     snapshot
         .parent_map
@@ -442,13 +552,7 @@ fn work_children(pid: u32, snapshot: &ProcessSnapshot) -> impl Iterator<Item = u
         .into_iter()
         .flatten()
         .copied()
-        .filter(move |kid| {
-            child_signals_work(
-                snapshot.names.get(kid).map(String::as_str),
-                snapshot.creation_times.get(kid).copied(),
-                snapshot.creation_times.get(&pid).copied(),
-            )
-        })
+        .filter(move |&kid| child_signals_work_in(kid, pid, snapshot))
 }
 
 /// One live `claude` process in the runner's inclusive subtree, with every
@@ -2334,6 +2438,201 @@ mod tests {
             );
         }
         assert!(verdict(children(20)).is_eligible(), "the shim alone");
+    }
+
+    /// Plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 7b, from finding `a1e753fd`'s measured fixture: on Windows Claude
+    /// Code launches every stdio MCP server as `cmd /d /s /c "…python3.exe
+    /// …coord-mcp-shim.py …"`, so the shim's direct parent is `cmd.exe` (with a
+    /// `conhost.exe` beside the server). That wrapper is infrastructure.
+    ///
+    /// Mutation caught: drop the `!is_mcp_server_shell_wrapper(..)` term from
+    /// `child_signals_work_in` (or make the predicate return `false`) and pid 30
+    /// reads `Some(true)` — every MCP-equipped Windows session `live_children`
+    /// forever, the 35-36 sessions the finding measured.
+    #[test]
+    fn a_boot_time_cmd_wrapping_one_mcp_server_is_not_work() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let born = now_s - 3_600;
+        let snap = snap_with(
+            &[(1, &[30]), (30, &[300]), (300, &[3000, 3001])],
+            &[
+                (30, born),
+                (300, born + 1),
+                (3000, born + 1),
+                (3001, born + 1),
+            ],
+            &[
+                (30, "claude.exe"),
+                (300, "C:\\Windows\\System32\\cmd.exe"),
+                (3000, "conhost.exe"),
+                (3001, "python3.exe"),
+            ],
+        );
+        assert!(is_mcp_server_shell_wrapper(300, 30, &snap));
+        assert!(!child_signals_work_in(300, 30, &snap));
+        // The image-only rule alone still calls the shell work; the
+        // look-through is what changes the reading.
+        assert!(child_signals_work(
+            Some("cmd.exe"),
+            Some(born + 1),
+            Some(born)
+        ));
+        let agent_runtime: HashSet<u32> = [30u32].into_iter().collect();
+        let report = evaluate(
+            &snap,
+            1,
+            &[],
+            &HashMap::new(),
+            &agent_runtime,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+            &HolderCensus::default(),
+        );
+        let row = report
+            .headless_exempt
+            .iter()
+            .find(|p| p.pid == 30)
+            .expect("claude 30 is in the census");
+        assert_eq!(row.has_live_children, Some(false));
+    }
+
+    /// Phase 7b: everything that is NOT exactly a boot-time wrapper of one
+    /// non-shell server keeps counting as work, because the reading gates a
+    /// session close. One case per condition of `is_mcp_server_shell_wrapper`;
+    /// each assertion fails under the mutation that drops that condition.
+    #[test]
+    fn a_cmd_that_is_not_exactly_a_boot_time_mcp_wrapper_is_still_work() {
+        let parent = 30u32;
+        let born = 1_000_000i64;
+        // claude -> cmd(at `cmd_at`) -> kids, each (pid, image, created).
+        let tree = |cmd_at: Option<i64>, kids: &[(u32, Option<&str>, Option<i64>)]| {
+            let mut s = snap_with(
+                &[(parent, &[300])],
+                &[(parent, born)],
+                &[(parent, "claude")],
+            );
+            s.names.insert(300, "cmd.exe".to_string());
+            if let Some(t) = cmd_at {
+                s.creation_times.insert(300, t);
+            }
+            if !kids.is_empty() {
+                s.parent_map
+                    .insert(300, kids.iter().map(|(pid, _, _)| *pid).collect());
+            }
+            for (pid, image, at) in kids {
+                if let Some(image) = image {
+                    s.names.insert(*pid, image.to_string());
+                }
+                if let Some(at) = at {
+                    s.creation_times.insert(*pid, *at);
+                }
+            }
+            s
+        };
+        let boot = Some(born + 1);
+        let conhost = (3000u32, Some("conhost.exe"), boot);
+        let python = (3001u32, Some("python3.exe"), boot);
+        let is_work = |s: &ProcessSnapshot| child_signals_work_in(300, parent, s);
+
+        // Control: the measured shape is infrastructure.
+        assert!(!is_work(&tree(boot, &[conhost, python])), "measured shape");
+        // A server needs no console host to be recognised.
+        assert!(!is_work(&tree(boot, &[python])), "no conhost");
+
+        // (a) the wrapper's start: late (the measured +45375 s reconnect —
+        // kept as work, since the census has no argv or configured-server list
+        // to identify a reconnected server by), unknown, or before its parent.
+        let reconnect = Some(born + 45_375);
+        assert!(
+            is_work(&tree(
+                reconnect,
+                &[
+                    (3000, Some("conhost.exe"), reconnect),
+                    (3001, Some("python3.exe"), reconnect)
+                ]
+            )),
+            "a reconnect's wrapper outside the window"
+        );
+        assert!(
+            is_work(&tree(None, &[conhost, python])),
+            "cmd start unknown"
+        );
+        assert!(
+            is_work(&tree(Some(born - 5), &[conhost, python])),
+            "cmd predates claude"
+        );
+        // (b) the wrapper's children: none, a shell, a claude, two, unreadable.
+        assert!(is_work(&tree(boot, &[])), "a cmd with no children");
+        assert!(
+            is_work(&tree(boot, &[conhost])),
+            "a cmd holding only its console host"
+        );
+        assert!(
+            is_work(&tree(
+                boot,
+                &[conhost, python, (3002, Some("bash.exe"), boot)]
+            )),
+            "cmd -> {{python3, bash}}"
+        );
+        assert!(
+            is_work(&tree(boot, &[(3002, Some("bash.exe"), boot)])),
+            "cmd -> bash"
+        );
+        assert!(
+            is_work(&tree(boot, &[(3002, Some("cmd.exe"), boot)])),
+            "cmd -> cmd"
+        );
+        assert!(
+            is_work(&tree(boot, &[(3002, Some("claude.exe"), boot)])),
+            "cmd -> claude"
+        );
+        assert!(
+            is_work(&tree(boot, &[python, (3002, Some("node.exe"), boot)])),
+            "two servers under one wrapper"
+        );
+        assert!(
+            is_work(&tree(boot, &[(3001, None, boot)])),
+            "server image unreadable"
+        );
+        assert!(
+            is_work(&tree(boot, &[(3000, None, boot), python])),
+            "an unreadable sibling of the server"
+        );
+        // (c) the server's start: late, or unknown.
+        assert!(
+            is_work(&tree(
+                boot,
+                &[
+                    conhost,
+                    (
+                        3001,
+                        Some("python3.exe"),
+                        Some(born + SESSION_START_CHILD_WINDOW_S + 1)
+                    )
+                ]
+            )),
+            "server started outside the window"
+        );
+        assert!(
+            is_work(&tree(boot, &[conhost, (3001, Some("python3.exe"), None)])),
+            "server start unknown"
+        );
+        // The parent's start unknown: nothing is inside a window of nothing.
+        let mut no_parent_time = tree(boot, &[conhost, python]);
+        no_parent_time.creation_times.remove(&parent);
+        assert!(is_work(&no_parent_time), "claude start unknown");
+        // Only `cmd` is looked through: a `bash`/`sh` holding one boot-time
+        // python3 is the Bash tool's shape too, and argv is not in the census.
+        for shell in ["bash", "sh", "/usr/bin/bash", "pwsh.exe"] {
+            let mut s = tree(boot, &[python]);
+            s.names.insert(300, shell.to_string());
+            assert!(is_work(&s), "{shell} is not looked through");
+        }
     }
 
     /// Every detail field comes from the snapshot (or the injected cwd map),
