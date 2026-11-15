@@ -469,8 +469,7 @@ mod tests {
     #[test]
     fn the_relay_never_restamps_a_session_that_finished_itself() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let open = |csid: &str| -> crate::session::session_lifecycle_store::TerminalSessionRecord {
             serde_json::from_value(json!({
                 "claudeSessionId": csid,
@@ -502,7 +501,13 @@ mod tests {
 
         // An unfinished one is still relayed.
         store.record_open(open("idle-cont"));
-        relay_one(&store, "term-idle-cont", uuid::Uuid::nil(), "idle-cont", "work_completed");
+        relay_one(
+            &store,
+            "term-idle-cont",
+            uuid::Uuid::nil(),
+            "idle-cont",
+            "work_completed",
+        );
         let relayed = store.get("idle-cont").unwrap();
         assert!(relayed.finished_at.is_some());
         assert_eq!(
