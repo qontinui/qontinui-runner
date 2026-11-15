@@ -233,9 +233,15 @@ impl From<OverBoundRecord> for OverBound {
         let (true, Some(emitted_at)) = (r.over, r.emitted_at) else {
             return OverBound::Within;
         };
+        let (kinds, held) = (known_kinds(&r.kinds), known_kinds(&r.held));
+        // Every kind name was unknown to this build (a downgrade or a rename):
+        // an Over with nothing in it could never settle, so it is not Over.
+        if kinds.is_empty() && held.is_empty() {
+            return OverBound::Within;
+        }
         OverBound::Over(Over {
-            kinds: known_kinds(&r.kinds),
-            held: known_kinds(&r.held),
+            kinds,
+            held,
             last_counts: r
                 .last_counts
                 .iter()
@@ -498,6 +504,18 @@ fn gap_event(
 
 #[cfg(test)]
 mod tests {
+    /// Review round 6, A1: a persisted Over record whose every kind name is
+    /// unknown to this build loads as Within, not as an Over that can never
+    /// settle.
+    #[test]
+    fn an_over_record_of_only_unknown_kinds_loads_within() {
+        let loaded: OverBound = serde_json::from_str(
+            r#"{"over":true,"kinds":["no_such_kind"],"held":[],"last_counts":{},"emitted_at":"2026-11-14T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(loaded, OverBound::Within);
+    }
+
     use super::*;
 
     fn row(unit: String) -> ServiceRow {
