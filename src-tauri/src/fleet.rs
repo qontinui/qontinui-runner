@@ -4330,7 +4330,10 @@ pub(crate) fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     let existing = match read_info_exclude(&exclude_path) {
         Ok(s) => s,
         Err(e) => {
-            debug!("fleet::ensure_repo_info_exclude: {e} — left as is");
+            warn!(
+                "fleet::ensure_repo_info_exclude: {e} — left as is, so the machine-local \
+                 artifacts are NOT excluded in this repo until the file is readable UTF-8"
+            );
             return;
         }
     };
@@ -8526,6 +8529,22 @@ mod tests {",
         assert_eq!(first, second, "second call must be a no-op");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `.git/info/exclude` that is not UTF-8 is left byte-identical: the heal
+    /// used to read it with `read_to_string(..).unwrap_or_default()` and then
+    /// rewrite it from an EMPTY string, deleting every operator line.
+    #[test]
+    fn ensure_repo_info_exclude_leaves_a_non_utf8_file_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info = dir.path().join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let before = b"operator-line\n\xff not utf-8\n".to_vec();
+        std::fs::write(info.join("exclude"), &before).unwrap();
+
+        ensure_repo_info_exclude(dir.path());
+
+        assert_eq!(std::fs::read(info.join("exclude")).unwrap(), before);
     }
 
     #[test]
