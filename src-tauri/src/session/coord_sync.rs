@@ -5875,7 +5875,7 @@ mod tests {
     /// the count assertion (5) fails.
     #[tokio::test]
     async fn a_spooled_spawn_failed_report_outlasts_the_best_effort_budget() {
-        assert!(BEST_EFFORT_MAX_ATTEMPTS < 4, "the script must exceed the budget");
+        const { assert!(BEST_EFFORT_MAX_ATTEMPTS < 4, "the script must exceed the budget") };
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, seen) = spawn_scripted_spawn_failed_coord(vec![503, 503, 503, 503]).await;
