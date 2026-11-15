@@ -65,6 +65,7 @@ pub mod queued_workflows;
 pub mod reasoning_traces;
 pub mod recordings;
 pub mod reflection;
+mod reflection_unknown_self_heal;
 pub mod regression;
 pub mod restate;
 pub mod reviews;
@@ -851,6 +852,18 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("CR-5 result_json text→jsonb self-heal failed: {}", e))?;
+
+        // Plan 2026-11-09-reflection-reports-only-what-it-judged (Phase 1, D4):
+        // `project.convergence_snapshots.effective_fix_rate` and
+        // `project.architecture_components.health_score` accept NULL (an
+        // UNKNOWN), and health_score loses its fabricated 1.0 default. Same
+        // posture as CR-5: alembic (`reflection_rates_01_unknown_is_null`) is
+        // the author, this applies the shape to runner databases that never ran
+        // it, runs no DDL once healed, and skips a database whose tables are
+        // absent. See `reflection_unknown_self_heal.rs`.
+        conn.batch_execute(reflection_unknown_self_heal::REFLECTION_UNKNOWN_IS_NULL_SELF_HEAL)
+            .await
+            .map_err(|e| format!("reflection unknown-is-NULL self-heal failed: {}", e))?;
 
         // Plan 06 Step 3 (G.3): expression indexes for the workflow-verification
         // dashboard hot paths. Each runs at every PgDb::new() boot — IF NOT
