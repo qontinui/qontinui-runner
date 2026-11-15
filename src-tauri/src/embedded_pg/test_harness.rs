@@ -682,7 +682,20 @@ impl Server {
         }
         let started = Instant::now();
         create_database(self.maintenance(state).await?, &database, &self.template).await?;
-        let provisioned = (template.provision)(self.url_for(&database)).await;
+        // A step that panics has failed like any other: its panic is caught
+        // here, so the template is still sealed and the failure recorded, and
+        // every later request fails with the panic's own message — not by
+        // creating the template again and failing on the one left behind.
+        let provisioned = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            (template.provision)(self.url_for(&database)),
+        ))
+        .await
+        .unwrap_or_else(|panic| {
+            Err(format!(
+                "the step panicked: {}",
+                panic_message(panic.as_ref())
+            ))
+        });
         // Whatever the step did, nothing may be cloned from the template until
         // it refuses connections and has none left.
         seal_template(
@@ -3002,6 +3015,15 @@ fn ancestor_problem(owner: u32, mode: u32, me: u32) -> Option<String> {
     }
 }
 
+/// The text of a panic's payload, where it carries one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_string())
+}
+
 /// How long a server log is now, in bytes: where whatever is written to it next
 /// begins. A log that does not exist yet is empty.
 fn log_len(path: &Path) -> u64 {
@@ -4501,6 +4523,36 @@ mod tests {
         .expect("a lock let go in time is taken");
         release.join().expect("the thread that let the lock go");
         let _ = waiter.unlock();
+    }
+
+    static PANICKING_TEMPLATE: DerivedTemplate =
+        DerivedTemplate::new("harness_panics", provision_by_panicking);
+
+    fn provision_by_panicking(_url: String) -> ProvisionFuture {
+        Box::pin(async { planted_provisioning_panic() })
+    }
+
+    fn planted_provisioning_panic() -> Result<(), String> {
+        panic!("the planted provisioning panic")
+    }
+
+    /// A provisioning step that PANICS fails the request that ran it and every
+    /// later one, each with the panic's own message: the template it left
+    /// behind is not created again, which would fail on that leftover and hide
+    /// the panic.
+    #[test]
+    fn a_provisioning_step_that_panics_fails_every_request_with_its_panic() {
+        for request in ["first", "second"] {
+            let failure =
+                std::panic::catch_unwind(|| fresh_database_from_blocking(&PANICKING_TEMPLATE))
+                    .expect_err("a template whose provisioning panicked must not be handed out");
+            let message = panic_message(failure.as_ref());
+            assert!(
+                message.contains("the planted provisioning panic"),
+                "the {request} request must fail with the step's own panic, not a \
+                 leftover's: {message}"
+            );
+        }
     }
 
     /// A start attempt's failure is judged by the lines that attempt wrote to the
