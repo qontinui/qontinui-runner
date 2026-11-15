@@ -44,9 +44,9 @@
 //! second field carries it: coord admits on `launch_headroom` alone (0 when
 //! the readable lane already trips), so the verdict is display and forensics,
 //! never the admission input. coord's
-//! `coord.device_resource_samples.launch_verdict` CHECK constraint carries the
-//! same five words, so renaming one here makes every sample this runner
-//! publishes fail ingest.
+//! `coord.device_resource_samples.launch_verdict` CHECK constraint carries
+//! (qontinui-web `lacap_01`, plan Phase 1) the same five words, so renaming one
+//! here makes every sample this runner publishes fail ingest.
 
 use crate::resource_guard::{projected_verdict, LaneVerdicts, ProjectedSpawnCost};
 
