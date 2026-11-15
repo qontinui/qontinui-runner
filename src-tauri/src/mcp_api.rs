@@ -2604,6 +2604,13 @@ async fn health(
         // `silent-empty-is-unknown`. It is what separates "441 threads of
         // load" from "441 threads, 325 of them an idle tokio blocking pool".
         "threadCensus": crate::health_monitor::thread_name_census_json(),
+        // Plan 2026-11-11-runner-glibc-arena-retention-and-whole-log-tail,
+        // Phase 3: the glibc allocator as the health monitor's 60 s tick last
+        // read it — the arena count against the cap `main` attempted, malloc's
+        // in-use / free / system totals, the last hourly `malloc_trim(0)`, and
+        // `sampledAt`. `status: unknown` before the first tick and
+        // `unsupported` off linux-gnu: never zeros.
+        "allocator": qontinui_runner_lib::malloc_tuning::health_json(),
         // Plan 2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-
         // guard-dialog-says-low-memory, Phase 2: the thread ceilings the spawn
         // guard ENFORCES right now, every machine input they were derived from

@@ -2179,6 +2179,11 @@ pub fn start_health_monitor() {
             METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
             let metrics = collect_metrics();
             log_metrics(&metrics);
+            // glibc allocator: a reading every tick (served on `/health`),
+            // `malloc_trim(0)` hourly, an INFO `allocator` line every 10 min.
+            // A no-op off linux-gnu. Plan
+            // `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail` Phase 3.
+            qontinui_runner_lib::malloc_tuning::on_metrics_tick(get_memory_usage);
             METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
 
             let mut slept = 0;

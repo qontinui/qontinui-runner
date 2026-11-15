@@ -186,6 +186,14 @@ pub mod util {
 // handle; only the runner bin registers the allocator.
 pub mod alloc_breadcrumb;
 
+// glibc malloc tuning (plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phases 1 and
+// 3): the arena cap `main()` applies as its first statement, the allocator
+// reading the health monitor takes every tick, and the hourly `malloc_trim(0)`.
+// In the LIB so the `arena_cap_holds` integration test applies and measures
+// the same cap the runner does. A no-op that says `unsupported` off linux-gnu.
+pub mod malloc_tuning;
+
 // Per-local-user connection guard for every runner TCP listener (plan
 // `2026-10-04-runner-loopback-api-refuses-other-local-users`): refuses a
 // loopback connection whose peer process runs as a different OS user. In the

@@ -1670,9 +1670,18 @@ static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
     qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
 
 fn main() {
+    // Cap glibc's malloc arenas FIRST, while this is surely the only thread:
+    // once more than 8 arenas exist glibc fixes its limit, and a later
+    // `mallopt` returns 1 and changes nothing. Logs nothing (logging does not
+    // exist yet); `run_app` reports the attempt. A no-op off linux-gnu. Plan
+    // `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail` Phase 1;
+    // `tests/arena_cap_is_mains_first_statement.rs` keeps it first.
+    qontinui_runner_lib::malloc_tuning::apply_arena_cap_at_startup();
+
     // A SUBJECT runner (`QONTINUI_INSTANCE_ROOT` set) validates its launch env
     // and roots its locations BEFORE anything below reads a path; a no-op for
-    // the primary. First, while still single-threaded — see the fn's doc.
+    // the primary. Right after the arena cap, while still single-threaded —
+    // see the fn's doc.
     instance::enforce_instance_root_at_startup();
 
     // The capability manifest (`--capability-manifest[ --json]`,
@@ -1813,6 +1822,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // The proxy rung `main` resolved before logging existed (and an explicit
     // UNKNOWN when a PAC script is configured, which is not evaluated).
     qontinui_runner_lib::outbound_net::log_startup_posture();
+    // The glibc arena cap `main` attempted before logging existed: requested
+    // N, source, mallopt's return code. An attempt, not proof; the health
+    // monitor's `allocator` line carries the arena count that shows it holds.
+    qontinui_runner_lib::malloc_tuning::log_startup_attempt();
 
     // Best-effort live crash writer for the CATCHABLE subset (Windows
     // deliverable structured exceptions). The panic hooks above already write
