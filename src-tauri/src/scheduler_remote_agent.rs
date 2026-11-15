@@ -611,9 +611,13 @@ mod tests {
     /// because `launch` spawns a real `claude`.
     #[test]
     fn scheduler_launch_provisions_through_the_operator_cwd_gate() {
-        let src = include_str!("scheduler_remote_agent.rs");
-        let launch = &src[src.find("pub(crate) async fn launch(").expect("launch")..];
-        let launch = &launch[..launch.find("\n}\n").expect("end of launch")];
+        // CRLF-normalised (a Windows checkout may carry `\r\n`), and split rather
+        // than sliced so `clippy::string_slice` holds.
+        let src = include_str!("scheduler_remote_agent.rs").replace("\r\n", "\n");
+        let (_, launch) = src
+            .split_once("pub(crate) async fn launch(")
+            .expect("launch");
+        let (launch, _) = launch.split_once("\n}\n").expect("end of launch");
         assert!(launch.contains("isolated_edit::provision_fleet_for_cwd(&workdir_s)"));
         for ungated in [
             "provision_agent_definitions_recorded(",
