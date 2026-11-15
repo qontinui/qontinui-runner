@@ -3120,9 +3120,10 @@ checkpoint at `RESUME_FROM` passed back verbatim rather than reconstructing
 its state. `UNKNOWN` (exit 4): nothing to act on; say so. A `failed`
 notification carrying a provider `429` with a stated reset is not retried
 blind: run `scripts/rate-limit-reset.sh schedule` **with `--hint`** (see
-`/vet-imp-sweep` Step 6 — without a brief the resumed agent's whole context is
-`run /<skill> <args>`) so the resume is a coord `time_elapsed` gate that
-survives this session, and quote its `gate_id`; a `529`/"Overloaded" is
+`/vet-imp-sweep` Step 6 — without a brief the resumed agent gets
+`run /<skill> <args>` and only what coord adds itself) so the resume is a
+coord `time_elapsed` gate that survives this session, and quote its `gate_id`;
+a `529`/"Overloaded" is
 `TRANSIENT` — retry once.
 
 **Claim release (per Step 0.6).** AFTER each phase Agent returns —
@@ -5300,12 +5301,15 @@ time window, operator approval). (canonical spec: `_gate-registration` →
     blocked-exit path says. The OFF-by-default headline above governs the other
     half: a Step 6 "follow-up plan with open items" that this session is still
     carrying.
-  - **When it IS on, populate `hint` — it is the spawned agent's only context.**
-    coord flattens the continuation to `run /<skill> <args>` and appends
-    `\n\n<hint>` only if a hint is present; no other key in the frame carries a
-    plan body, a PR body, prior findings or the predicate, so a hintless
-    continuation spawns an agent that knows nothing but the command line. Six
-    labelled lines, **references before bodies**, **≤2000 characters**:
+  - **When it IS on, populate `hint` — it is the only field that can carry
+    *why*.** coord flattens the continuation to `run /<skill> <args>` and appends
+    `\n\n<hint>` only if a hint is present; coord's own dispatch-time `brief`
+    beside it holds only references coord can resolve (the work unit's slug, the
+    PR the predicate names, its block reason, finding ids) and a fixed
+    end-of-session step, never a plan body, a PR body or what this session
+    tried, so a hintless continuation spawns an agent that knows the command
+    line and those references, not why it was sent. Six labelled lines,
+    **references before bodies**, **≤2000 characters**:
     `Plan: <plan-stem>` / `Why: <≤2 sentences>` / `PR: <owner/repo#N>` /
     `Blocked: <block_reason_code>[ ×N since <ISO8601>]` /
     `Resource-keys: <keys a peer's coord_recent_findings would match>` /

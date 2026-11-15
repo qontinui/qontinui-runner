@@ -149,18 +149,28 @@
 #                    RESIDUAL, stated: the .git internals above are read by
 #                    mtime and entries only (a fixture cannot age a ctime), so
 #                    one rewritten with a preserved or backdated mtime and no
-#                    log entry is not seen; a stash deleted outright (git
+#                    log entry is not seen (and so is an emptied log -- `git
+#                    reflog expire --expire=now --all` -- whose mtime was set
+#                    backwards: a PRESENT log with no entry is decided by its
+#                    mtime, so an expiry inside the window reads R moved and
+#                    one before it reads still); a stash deleted outright (git
 #                    stash clear, or a drop of its last entry, removes the ref
 #                    and its log alike) leaves nothing to read, and the sweep
-#                    never touches a stash; and git status, to compare a
-#                    stat-dirty tracked file's content, runs any clean filter
-#                    configured for it (git-lfs's among them) -- a process
-#                    this read starts, as repo_work()'s status does too, and
-#                    one that may write its own store (git-lfs writes
-#                    .git/lfs/objects). R
+#                    never touches a stash; and git's untracked cache (the
+#                    core.untrackedCache this status reads) may serve a
+#                    directory listing a file-system quirk left stale. NOT
+#                    adopted: `-c core.untrackedCache=false` would cost every
+#                    5-minute poll a full untracked scan of every primary to
+#                    remove a staleness the sweep's own census shares (its
+#                    classify-branch-state.sh status, `--porcelain=v2 --branch
+#                    -z -uall`, sets no such override), so the probe would be
+#                    more exact than the move it gates without making that
+#                    move safer. Revisit when that census gets the same flag
+#                    first (read-freshness.sh already sets it for its reads,
+#                    which is the precedent). R
 #                    also blocks when any of that cannot be read (HEAD naming
 #                    neither a branch nor an object id; a missing, unreadable,
-#                    torn, unparseable or emptied HEAD or branch log; an
+#                    torn or unparseable HEAD or branch log; an
 #                    unreadable stash log or refs/stash; a git dir rev-parse
 #                    cannot resolve; a failing git status; any exception
 #                    reading R, which is R's UNKNOWN and is named on stderr,
@@ -192,14 +202,87 @@
 #                    primary costs one read of HEAD and one git rev-parse,
 #                    plus a git status only when those leave it undecided (not
 #                    moved, not unreadable) -- each retried once, so one to
-#                    four git calls, each bounded at 30 s; a failure or a
-#                    timeout is that primary's UNKNOWN, so it blocks. Nothing
-#                    bounds the whole run to the scheduler's 120 s probe
-#                    ceiling (schedule-return-to-main.sh
-#                    PROBE_TIMEOUT_SECONDS): a probe that runs past it is
-#                    killed and reads NOT met (the runner's
-#                    scheduler_probe.rs), so the job does not fire -- the
-#                    safe direction.
+#                    four git calls, each bounded at min(30 s, the time the
+#                    run has left); a failure or a timeout is that primary's
+#                    UNKNOWN, so it blocks. The git work of the per-primary reads is
+#                    bounded too, below the scheduler's 120 s probe ceiling
+#                    (schedule-return-to-main.sh PROBE_TIMEOUT_SECONDS): a
+#                    deadline of QMQC_RUN_DEADLINE_S seconds (default 100; a
+#                    value that is not a finite number above 0 -- nan, inf,
+#                    1e999, 0 -- is the default, with one stderr line) is fixed
+#                    at script entry on the REAL clock (never QMQC_NOW), no git
+#                    call starts with under a second of it left, and the
+#                    primaries not yet read when it passes are UNKNOWN (they
+#                    block), with one stderr line and a probes[] entry
+#                    `generic_read: deadline reached after N of M primaries`
+#                    (the GENERIC-confinement read) or `lifetime_read: ... HEAD
+#                    logs` (checkout-return's lifetime rule) -- so a slow box
+#                    prints BUSY with a stated cause instead of being killed
+#                    silent (a killed probe reads NOT met, the runner's
+#                    scheduler_probe.rs). The same bound covers repo_work()'s
+#                    git calls under --exit-quiet-if-any-repo. The deadline only
+#                    ever adds UNKNOWN. WHAT IT DOES NOT BOUND, stated: the run
+#                    is NOT bounded as a whole. The readiness curl (up to 60 s
+#                    per port), the coord pages and the census run before the
+#                    python starts and count against the deadline but are not
+#                    cut by it, and the transcript walk and the file-system
+#                    reads inside _repo_of() / _linked_worktree_primary() are
+#                    unbounded; a run slow there is still killed at 120 s.
+#                    THE PROBE NEVER RUNS A CLEAN FILTER. A git status compares a
+#                    stat-dirty tracked file's content by running the clean (or
+#                    process) filter its path is attributed -- git-lfs's among
+#                    them -- a process this read would start and one that may
+#                    write its own store (.git/lfs/objects). So before any
+#                    status (this one and repo_work()'s) the primary's
+#                    `filter.<name>.clean|process` keys are read (git config
+#                    --show-origin --get-regexp, system, global and local, the
+#                    same git flags and the run deadline below); none
+#                    configured, the status runs as before; some configured,
+#                    the status is REFUSED -- the primary reads UNKNOWN (it
+#                    blocks, a probes[] `generic_read` entry and a stderr line
+#                    say "a clean filter is configured; the probe will not run
+#                    it") -- only when a configured name is referenced as
+#                    `filter=<name>` by an attributes source the status reads:
+#                    the .gitattributes of every directory holding a tracked file
+#                    (and the root), read from disk whether or not git IGNORES
+#                    it (an ignored one is still read by git), .git/
+#                    info/attributes, core.attributesFile (git var
+#                    GIT_ATTR_GLOBAL) and the system file (GIT_ATTR_SYSTEM).
+#                    A status also runs a CHILD status in each initialized
+#                    SUBMODULE under its own config and attributes, so each
+#                    submodule (a tracked gitlink whose directory holds a .git)
+#                    is checked the same way, to 3 levels (QMQC_SUBMODULE_DEPTH;
+#                    deeper is refused). Measured 2026-11-11 on the operator box:
+#                    0 of 49 primaries carry a gitlink (command: for each root/*/.git directory,
+#                    `git ls-files --stage | grep -c ^160000`; the box was the operator's
+#                    Linux workstation; a separate reviewer count of 124 .git dirs also
+#                    found 0), so the cost there is the
+#                    one ls-files --stage that now precedes every status. A
+#                    configured filter that no attributes line names never
+#                    runs, so a Git for Windows box whose git-lfs install
+#                    defines filter.lfs.* system-wide is not read UNKNOWN
+#                    wholesale; an attributes source that cannot be read, listed
+#                    or located counts as referencing it, and so does a config
+#                    read that fails. A repo_work() status refused this way is
+#                    reported as work (unknown), as any failed read is. Residual,
+#                    stated: only the clean/process keys are read (a
+#                    status never runs smudge); a `git status` reads attributes from a TREE too, when attr.tree
+#                    is set or GIT_ATTR_SOURCE is exported (measured on git
+#                    2.47.3 with a stat-dirty file and the attributes only in
+#                    a tree: the filter ran), so either one set while a filter
+#                    is configured refuses the primary (the tree is not parsed;
+#                    --attr-source is a command-line flag the probe never
+#                    passes). The branch name in a `checkout: moving
+#                    from X to Y` entry is compared byte for byte, so on a
+#                    case-insensitive file system a switch spelled `Feat` while
+#                    HEAD names `feat` is not seen as entering that branch
+#                    (stated, not fixed; the HEAD log's mtime fallback still
+#                    applies when no entry enters it); and the attributes files are
+#                    read as they sit on disk while git reads the index's blob
+#                    of a tracked one that is gone (that case is unreadable, so
+#                    refused); a status.ignoreSubmodules setting is not read, so
+#                    a submodule git would skip is still checked (refused more,
+#                    never less).
 #                    A ledger reader that serves no specific_* keeps the old
 #                    rule: any unattributed touch in the window blocks every
 #                    repo. Also: a session whose cwd is in R; a build that
@@ -218,20 +301,89 @@
 #                    repos, nor by coord rows (not read under checkout-ff: a
 #                    fast-forward kills no session).
 #   checkout-return  (switch R off a parked branch) is blocked by all of the
-#                    above -- except that the GENERIC confinement is
-#                    checkout-ff's alone: here ANY unattributed touch by a
-#                    working session within the window still blocks every
-#                    repo, unchanged (a return switches branches, and the
-#                    lifetime rule below is blind to a switch that landed
-#                    GENERIC) -- PLUS every session not `finished` (coord's
+#                    above -- except that the GENERIC confinement by R's ref
+#                    records is checkout-ff's alone: here ANY unattributed
+#                    touch by a working session within the window still blocks
+#                    every repo, unchanged (a return switches branches, and
+#                    the window rule has no record of a switch to lean on) --
+#                    PLUS every session not `finished` (coord's
 #                    sessionStatus; an unreadable coord reads "not finished")
 #                    that EVER touched R's primary checkout -- its next commit
 #                    would land on the wrong branch. Whole-life attribution is
 #                    UNKNOWN (so: every repo) for a session with no ledger, a
-#                    truncated one, or a SPECIFIC unattributed touch (an
-#                    unresolvable cd / git -C target). A generic unattributed
-#                    touch (a command naming no path) does not widen it, and a
-#                    worktree-only touch never blocks the primary's return.
+#                    truncated one, a SPECIFIC unattributed touch (an
+#                    unresolvable cd / git -C target), and a ledger reader that
+#                    serves no specific_count, no count or no first_epoch for
+#                    it (absent is UNKNOWN, never 0: GENERIC and SPECIFIC
+#                    cannot be told apart, nor the session's GENERIC calls
+#                    dated). A worktree-only touch never blocks the primary's
+#                    return. A GENERIC unattributed touch (a command naming no
+#                    path -- count minus specific_count lines in the session's
+#                    life) can hide a branch switch (GIT_DIR=, --git-dir=, -c
+#                    core.worktree=, xargs {}, a script), so it blocks, beyond
+#                    the primaries the session touched, each primary R the
+#                    sweep would RETURN (HEAD on a branch other than the
+#                    default, or DETACHED: return-to-main-sweep.sh reads
+#                    `BRANCH != DEFAULT || DETACHED` as parked -- the vetted
+#                    plan's sentence that a detached HEAD has nothing a return
+#                    would move was false in code) whose HEAD git's own record
+#                    says was moved at or after the session's first ledger line
+#                    (`first_epoch`, its first mutating call; the hook files
+#                    that line BEFORE the call runs, so a move the session made
+#                    cannot predate it, hence >=): a `checkout: moving from <x>
+#                    to <branch>` entry in R's logs/HEAD that enters R's
+#                    CURRENT branch (for a detached HEAD, any checkout), or an
+#                    entry of a kind that may have re-pointed HEAD -- an empty
+#                    message (`git symbolic-ref HEAD refs/heads/p`), a rebase
+#                    start on a detached HEAD, a kind not known to leave HEAD
+#                    alone (commit, reset, merge, pull, cherry-pick, revert and
+#                    a rebase that returns to its branch are the known ones) --
+#                    each read as the ENTRY's time and never a commit's (a
+#                    `commit:` entry after an older switch is not a switch). The
+#                    default is resolved as the sweep's classifier resolves its
+#                    upstream: origin/HEAD's target only when it is a commit
+#                    (a dangling one is skipped), else origin/main, else
+#                    origin/master; a git call that gave NO ANSWER (a timeout)
+#                    is UNKNOWN, never "no origin/HEAD". R on its default
+#                    branch has nothing a return would move and
+#                    is not blocked by this arm; the cost is one HEAD read per
+#                    primary and, for one parked off its default branch, a
+#                    few git calls and one log read. UNKNOWN, never "not
+#                    parked": a default branch that cannot be resolved, and a
+#                    HEAD log that is missing, unreadable, torn or holds a
+#                    line git's own reader would refuse, block R. A HEAD log
+#                    with no entry that enters the current branch (expired, or
+#                    emptied by `git reflog expire`) is decided by the file's
+#                    mtime against first_epoch: at or after blocks R. The
+#                    predicate is not owner-specific -- any not-finished
+#                    session with a GENERIC line whose first_epoch is at or
+#                    before the switch blocks R, whoever made it (it can
+#                    block a return that is in fact free; the safe direction).
+#                    RESIDUAL, stated: an entry is stamped with the committer
+#                    date, so a switch made under an exported
+#                    GIT_COMMITTER_DATE older than the session's first_epoch
+#                    reads as parked before the session began, and the HEAD
+#                    log's mtime cannot stand in for it, because every later
+#                    commit moves that.
+# WHAT A PATH IS: _repo_of() names the primary a path lands in -- under the
+# root as spelled or resolved, or agent-worktrees/<id>/<repo> (by SPELLING alone:
+# its .git is never read) -- and, since the
+# runner allocates its worktrees at qontinui-worktrees/<id>/<name> (a sibling of
+# the root by default, or inside it), also any path inside a VERIFIED linked
+# worktree wherever it sits: the nearest ancestor (8 levels at most) whose
+# `.git` is a regular file (never a symlink) reading `gitdir: <admin>`, with
+# <admin> = <primary>/.git/worktrees/<name>, <admin>/gitdir (absolute, or
+# relative to <admin> as git can write it with worktree.useRelativePaths) pointing back at that very `.git` file, and <primary> a direct child of the root that is in
+# the primaries. A build there blocks no primary; an AI session whose cwd is
+# there blocks that primary only; a working session whose cwd is there adds it.
+# Anything that fails a step keeps the OLD answer (a build under the root: every
+# repo; an AI session: every repo; a build outside the root: every repo when a .git
+# FILE sits above it, else none) -- never a guess. A build whose source is
+# unreadable and whose target dir is in such a worktree blocks every repo; a
+# cargo.lockdir under one directly under the root blocks every repo (its holder
+# is not in the census), one under qontinui-worktrees/<id>/ blocks the primaries
+# its path dependencies land in, one in a primary's shared target dir blocks that
+# primary.
 #   process-restart  today's machine-wide rule, unchanged: every repo takes
 #                    the machine verdict and its blocking list.
 # per_repo[R].verdict is BUSY when anything blocks R, else UNKNOWN when a
@@ -326,6 +478,8 @@
 #   QONTINUI_TOUCH_LEDGER_DIR  passed through to the reader
 #   QMQC_LIB_DIR        where hook-json.sh is (default: lib/ beside this script)
 #   QMQC_NOW            epoch seconds used as "now"
+#   QMQC_RUN_DEADLINE_S seconds the whole run may take on the real clock (default
+#                       100; a primary not read by then is UNKNOWN)
 #   QMQC_COORD_URL      coord base (default $COORD_HTTP_URL, then
 #                       https://coord.qontinui.io)
 #   SESSION_CENSUS_*    passed through to the census (see its header)
@@ -338,6 +492,9 @@
 #   3 no repo is QUIET and none is BUSY (every repo UNKNOWN)
 #   4 usage
 set -u
+# The run's start on the REAL clock (never QMQC_NOW, which tests pin): the python
+# reads it with QMQC_RUN_DEADLINE_S to bound the whole run.
+QMQC_RUN_START="$(date +%s)"; export QMQC_RUN_START
 
 ROOT_ARG=""; JSON=0
 SELF_SID="${CLAUDE_CODE_SESSION_ID:-}"
@@ -477,11 +634,49 @@ http_fetch() {
 http_code() { sed -n 's/^http \([0-9]*\)$/\1/p' "$WORK/http/$1.status" 2>/dev/null; }
 
 cat >"$WORK/qmqc.py" <<'PYEOF'
-import glob, json, os, re, subprocess, sys, time
+import glob, json, math, os, re, subprocess, sys, time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 NOW = float(os.environ.get("QMQC_NOW") or time.time())
+
+
+BAD_DEADLINE = []
+
+
+def _run_deadline():
+    """The monotonic instant the run must be done by: QMQC_RUN_DEADLINE_S (default
+    100, below the scheduler's 120 s probe ceiling so the JSON is printed before
+    the runner kills the probe) after QMQC_RUN_START, the bash entry's epoch. The
+    elapsed time is read from the REAL clock -- never NOW, which QMQC_NOW pins --
+    and the deadline is held on the monotonic one, so a clock step cannot move it.
+    An unusable value -- not a number, not finite (nan, inf, 1e999) or not above
+    zero -- falls back to the default with one stderr line, never to "no
+    deadline" (an infinite limit would make `remaining < 1` never true)."""
+    limit = 100.0
+    raw = os.environ.get("QMQC_RUN_DEADLINE_S")
+    if raw:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = float("nan")
+        if math.isfinite(v) and v > 0:
+            limit = v
+        else:
+            BAD_DEADLINE.append(raw)  # said once, by cmd_final (this module runs once per python call)
+    try:
+        start = float(os.environ.get("QMQC_RUN_START") or time.time())
+    except ValueError:
+        start = time.time()
+    return time.monotonic() + limit - max(0.0, time.time() - start)
+
+
+DEADLINE = _run_deadline()
+
+
+def _remaining():
+    """Seconds left of the run's deadline (negative once it has passed)."""
+    return DEADLINE - time.monotonic()
 
 
 def load(path):
@@ -635,11 +830,17 @@ def cmd_next_cursor(body):
 #                    a working session in the window is every repo, unchanged
 #                    -- PLUS any session not `finished` that touched R at any
 #                    point in its life (its next commit would land on the
-#                    wrong branch).
+#                    wrong branch), and, when its life holds a GENERIC
+#                    unattributed line, each R whose CURRENT branch HEAD's
+#                    log says was entered (`checkout: moving from <x> to
+#                    <branch>`) at or after the session's first ledger line
+#                    (R on its default branch: not blocked; a detached HEAD
+#                    is parked; a default, log or ledger field that cannot be read, and a
+#                    reader serving no specific_count: UNKNOWN, blocks).
 #   process-restart  today's machine-wide rule, unchanged, for every repo.
 # UNKNOWN activity or UNKNOWN attribution is the blocking case, never quiet
 # [policy: verification-and-evidence silent-empty-is-unknown].
-PER_REPO_ONLY_PROBES = {"touch_ledger"}
+PER_REPO_ONLY_PROBES = {"touch_ledger", "generic_read", "lifetime_read"}
 # The machine-level probes a checkout-* verdict stands on. An unknown one makes
 # every repo it has not already blocked UNKNOWN. coord_sessions is not among
 # them (a checkout kills no session; for checkout-return an unreadable finished
@@ -650,9 +851,73 @@ BLOCKING_CAP = 20
 ALL = None  # "every repo"
 
 
+_LINKED_WALK = 8  # levels a path is walked up looking for a linked worktree's `.git` file
+
+
+def _linked_worktree_primary(path, root_native, primaries):
+    """The primary (spelled as `primaries` holds it) a path inside a LINKED
+    worktree belongs to, or None -- and None is "unverified", never a guess. From
+    the path walk up at most _LINKED_WALK levels to the nearest directory holding
+    a `.git`; it must be a regular FILE (a symlink, a directory, or a missing
+    one ends the walk) whose first line is `gitdir: <admin>` (a relative <admin>
+    is anchored on that directory, as git reads it). <admin> must read
+    <primary>/.git/worktrees/<name>; <admin>/gitdir must point back at that very
+    `.git` file (a forged pointer is refused, as adhoc-worktree-reap.py's
+    gate_provenance refuses it); and <primary> must be a direct child of the
+    root that `primaries` names. This is how the runner's own worktrees under
+    qontinui-worktrees/<id>/<repo> (a sibling of the root by default, or inside
+    it) reach their primary."""
+    if not isinstance(path, str) or not path:
+        return None
+    by_case = {os.path.normcase(r): r for r in primaries}
+    try:
+        d = os.path.abspath(path.replace("\\", "/"))
+        for _ in range(_LINKED_WALK + 1):
+            g = os.path.join(d, ".git")
+            if os.path.islink(g):
+                return None
+            if os.path.isfile(g):
+                break
+            if os.path.lexists(g):
+                return None  # a directory: a primary or a clone, not a linked worktree
+            parent = os.path.dirname(d)
+            if parent == d:
+                return None
+            d = parent
+        else:
+            return None
+        with open(g, "rb") as fh:
+            first = fh.read(4096).decode("utf-8", "replace").split("\n", 1)[0].strip()
+        if not first.startswith("gitdir:"):
+            return None
+        admin = os.path.normpath(os.path.join(d, first[len("gitdir:"):].strip()))
+        wt_dir = os.path.dirname(admin)
+        git_dir = os.path.dirname(wt_dir)
+        primary = os.path.dirname(git_dir)
+        if os.path.basename(wt_dir) != "worktrees" or os.path.basename(git_dir) != ".git":
+            return None
+        with open(os.path.join(admin, "gitdir"), "rb") as fh:
+            back = fh.read(4096).decode("utf-8", "replace").strip()
+        if os.path.realpath(os.path.join(admin, back)) != os.path.realpath(g):
+            return None  # BACKPOINTER
+        name = by_case.get(os.path.normcase(os.path.basename(primary)))
+        if name is None:
+            return None
+        rt = os.path.realpath(root_native)
+        if os.path.normcase(os.path.realpath(primary)) != os.path.normcase(os.path.realpath(os.path.join(rt, name))):
+            return None
+        return name
+    except (OSError, ValueError):
+        return None
+
+
 def _repo_of(path, root_native, primaries):
     """(repo, worktree) a path lands in, or (None, False). A linked worktree
-    agent-worktrees/<id>/<repo>/... is (<repo>, True). The path is read as
+    agent-worktrees/<id>/<repo>/... is (<repo>, True), and so is any path in a
+    VERIFIED linked worktree of a primary (_linked_worktree_primary: the `.git`
+    file, its back-pointer, the primary a direct child of the root) wherever it
+    sits, under qontinui-worktrees/ or not; one that does not verify is
+    (None, False). The path is read as
     SPELLED first (its absolute form under the root's absolute form -- so a
     primary that is itself a symlink to a directory outside the root is still
     that primary), then RESOLVED (both sides realpath'd -- so a symlink from
@@ -671,20 +936,18 @@ def _repo_of(path, root_native, primaries):
             return (by_case.get(parts[2], parts[2]), True) if len(parts) >= 3 else (None, False)
         if by_case.get(parts[0]):
             return by_case[parts[0]], False
-    return None, False
+    linked = _linked_worktree_primary(p, root_native, primaries)
+    return (linked, True) if linked else (None, False)
 
 
 _DEP_CACHE = {}
 
 
-def path_dep_repos(repo, root_native, primaries):
-    """The primaries a Cargo workspace in <root>/<repo> path-depends on (the
-    runner's path dependency on its schemas sibling), transitively. A build in
-    R reads those working trees too."""
-    if repo in _DEP_CACHE:
-        return _DEP_CACHE[repo]
-    _DEP_CACHE[repo] = set()
-    out, base = set(), os.path.join(root_native, repo)
+def _dir_path_deps(base, root_native, primaries, skip=None):
+    """The primaries the Cargo workspace in directory `base` path-depends on
+    (each `path = "..."` resolved from the Cargo.toml that names it), direct
+    only; `skip` is the repo `base` is itself, never its own dependency."""
+    out = set()
     tomls = []
     for pat in ("Cargo.toml", "*/Cargo.toml", "*/*/Cargo.toml", "*/*/*/Cargo.toml"):
         tomls += [t for t in glob.glob(os.path.join(base, pat)) if "node_modules" not in t and "/target" not in t.replace("\\", "/")]
@@ -696,8 +959,19 @@ def path_dep_repos(repo, root_native, primaries):
             continue
         for m in re.finditer(r'\bpath\s*=\s*"([^"]+)"', txt):
             r, wt = _repo_of(os.path.join(os.path.dirname(t), m.group(1)), root_native, primaries)
-            if r and r != repo and not wt:
+            if r and r != skip and not wt:
                 out.add(r)
+    return out
+
+
+def path_dep_repos(repo, root_native, primaries):
+    """The primaries a Cargo workspace in <root>/<repo> path-depends on (the
+    runner's path dependency on its schemas sibling), transitively. A build in
+    R reads those working trees too."""
+    if repo in _DEP_CACHE:
+        return _DEP_CACHE[repo]
+    _DEP_CACHE[repo] = set()
+    out = _dir_path_deps(os.path.join(root_native, repo), root_native, primaries, repo)
     for r in list(out):
         out |= path_dep_repos(r, root_native, primaries)
     out.discard(repo)
@@ -705,13 +979,45 @@ def path_dep_repos(repo, root_native, primaries):
     return out
 
 
+def _git_file_above(path):
+    """True when a `.git` that is a FILE (a linked worktree's or a submodule's pointer) sits at
+    `path` or within 8 directories above it."""
+    d = os.path.abspath(path)
+    for _ in range(9):
+        g = os.path.join(d, ".git")
+        if os.path.isfile(g) or os.path.islink(g):
+            return True
+        if os.path.lexists(g) or os.path.dirname(d) == d:
+            return False  # a .git directory (a clone), or the top
+        d = os.path.dirname(d)
+    return False
+
+
+def _worktree_dep_repos(path, root_native, primaries):
+    """The primaries (transitively) that the path dependencies of the linked
+    worktree holding `path` land in: walk up (8 levels) to the directory with
+    the worktree's `.git`, read its Cargo.toml files' relative `path = ...`
+    entries as _repo_of() places them."""
+    base = path if os.path.isdir(path) else os.path.dirname(path)
+    deps = set()
+    for _ in range(8):
+        if os.path.exists(os.path.join(base, ".git")) or os.path.dirname(base) == base:
+            break
+        base = os.path.dirname(base)
+    for d in _dir_path_deps(base, root_native, primaries):
+        deps |= {d} | path_dep_repos(d, root_native, primaries)
+    return deps
+
+
 def build_repos(ba, root_native, primaries):
     """(repos-or-ALL, why) a build blocks. A build blocks the PRIMARY working
     trees it reads: its source checkout when that is a primary, and every
     primary its path dependencies land in. Its source is its cwd (Linux) or an
     absolute --manifest-path; a build sourced in a linked worktree reads none
-    of a primary's files and blocks none (its target dir, which may sit inside
-    a primary, is untracked and no checkout move touches it). Only a build
+    of a primary's OWN files (its target dir, which may sit inside a primary, is
+    untracked and no checkout move touches it), but its path dependencies
+    resolve from where the worktree sits, so the primaries they land in are
+    blocked (a worktree directly under the root reaches the primary siblings). Only a build
     whose source cannot be read falls back to its target dir -- blocking the
     repo that owns it, i.e. every repo sharing that target -- and one with no
     readable target either blocks every repo."""
@@ -726,18 +1032,33 @@ def build_repos(ba, root_native, primaries):
     if src:
         r, wt = _repo_of(src, root_native, primaries)
         if wt:
-            return set(), "sourced in a linked worktree of %s (%s): reads no primary working tree" % (r, src)
+            # A worktree's own files are no primary's, but its relative path dependencies resolve
+            # from WHERE IT SITS: co-allocated siblings (agent-worktrees/<id>/, qontinui-worktrees/<id>/)
+            # are worktrees too, while one directly under the root reaches the PRIMARY siblings
+            # (a dependency ../../<sibling> of root/<repo>-wt-x/<crate> is root/<sibling>). So the primaries
+            # its path deps land in are blocked, and a dependency that cannot be placed is not skipped.
+            deps = _worktree_dep_repos(src, root_native, primaries)
+            return deps, "sourced in a linked worktree of %s (%s): reads no primary's own files, but its path dependencies land in %s" % (r, src, ",".join(sorted(deps)) or "no primary")
         if r:
             return {r} | path_dep_repos(r, root_native, primaries), "reads %s (%s)" % (r, src)
         if _under_root(src, root_native):
             return ALL, "sourced at %s, which names no checkout" % src
+        if _git_file_above(src):
+            # A `.git` FILE above it that _repo_of() did not verify (a lookalike, a pruned or forged
+            # admin dir): a worktree whose path dependencies may read a primary and cannot be placed.
+            return ALL, "sourced outside the workspace root in a checkout whose .git file does not verify (%s)" % src
         return set(), "sourced outside the workspace root (%s)" % src
     if isinstance(tgt, str) and tgt:
         if not os.path.isabs(tgt):
             # A relative target resolves against the BUILD's cwd, which is the
             # thing that could not be read -- never against this checker's own.
             return ALL, "source unreadable and target dir %r is relative to it" % tgt
-        r, _wt = _repo_of(tgt, root_native, primaries)
+        r, wt = _repo_of(tgt, root_native, primaries)
+        if wt:
+            # The source could not be read, so what this build READS is unknown; a target dir
+            # inside a linked worktree says where it writes, not which checkout it reads. A
+            # primary-owned target blocks its owner below; a worktree's blocks every repo.
+            return ALL, "source unreadable and target dir %s is inside a linked worktree of %s, which does not say what it reads" % (tgt, r)
         if r:
             return {r} | path_dep_repos(r, root_native, primaries), "source unreadable; target dir %s is %s's, so it blocks the repos sharing it" % (tgt, r)
         return ALL, "source unreadable and target dir %s names no checkout" % tgt
@@ -755,30 +1076,45 @@ def _under_root(path, root_native):
     return False
 
 
-def _git(repo_dir, *args, raw=False):
-    """git's stdout, stripped; None when git fails or times out. raw=True gives
-    the BYTES unstripped -- `status -z` begins with a status column that may be
-    a space, and a path is not text. Every call READS a shared checkout, so it
-    takes no optional lock (--no-optional-locks, and GIT_OPTIONAL_LOCKS=0 for
-    any git it runs) and consults no file-system monitor (core.fsmonitor=false):
-    a configured hook would answer git status from its own state, and the
-    builtin daemon (core.fsmonitor=true) is STARTED by a git status that finds
-    it not running."""
+def _git_rc(repo_dir, *args, raw=False):
+    """(returncode, stdout) of one git call, or None when git could not be run,
+    timed out, or the run's deadline leaves under a second -- a call that GAVE NO
+    ANSWER, which is not the same as one that answered "no" (a nonzero code).
+    stdout is strictly-decoded stripped text, or the BYTES unstripped with raw=True (`status -z`
+    begins with a status column that may be a space, and a path is not text).
+    Every call READS a shared checkout, so it takes no optional lock
+    (--no-optional-locks, and GIT_OPTIONAL_LOCKS=0 for any git it runs) and
+    consults no file-system monitor (core.fsmonitor=false): a configured hook
+    would answer git status from its own state, and the builtin daemon
+    (core.fsmonitor=true) is STARTED by a git status that finds it not
+    running."""
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")}
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    rem = _remaining()
+    if rem < 1:
+        return None  # under a second left: a call started now cannot finish inside the deadline
     try:
         p = subprocess.run(["git", "--no-optional-locks", "-C", repo_dir, "-c", "core.fsmonitor=false"] + list(args),
-                           capture_output=True, timeout=30, env=env)
+                           capture_output=True, timeout=min(30, rem), env=env)
     except (OSError, subprocess.SubprocessError):
         return None
-    if p.returncode != 0:
-        return None
     if raw:
-        return p.stdout
-    # Parsed (refs, paths): a strict decode. UnicodeDecodeError is NOT caught here; each
-    # caller's own arm reads it UNKNOWN: _primary_verdict's per-primary backstop names it
-    # on stderr, and repo_work() reports "unknown: ..." (work, the safe direction).
-    return p.stdout.decode("utf-8").strip()
+        return p.returncode, p.stdout
+    # A strict decode (check #102): UnicodeDecodeError is NOT caught here; each caller's own arm
+    # reads it UNKNOWN (_primary_verdict's per-primary backstop and parked_states' name it on
+    # stderr; repo_work() reports "unknown: ..." -- work, the safe direction).
+    return p.returncode, p.stdout.decode("utf-8").strip()
+
+
+def _git(repo_dir, *args, raw=False, ok=(0,)):
+    """git's stdout, stripped; None when git fails (an exit code outside `ok`:
+    `git config --get-regexp` exits 1 for "no such key", an answer) or times
+    out. raw=True gives the BYTES unstripped. See _git_rc() for the flags every
+    call carries."""
+    r = _git_rc(repo_dir, *args, raw=raw)
+    if r is None or r[0] not in ok:
+        return None
+    return r[1]
 
 
 # One reflog line, matched over the WHOLE line and about as strict as git's own
@@ -806,10 +1142,18 @@ def _reflog_newest(path, missing_ok):
     entry's time and the file's mtime. 0 for a missing file when `missing_ok`
     (the stash log: no stash was ever made, or the last was dropped). None --
     UNKNOWN -- for a missing HEAD or branch log, a file that cannot be read, a
-    torn last line, any line git's own reader would refuse (_REFLOG_LINE, or a
-    time of 0), and a HEAD or branch log holding no entry at all
-    (`git reflog expire --expire=now --all` leaves one 0 bytes long, hiding
-    every move it held).
+    torn last line, and any line git's own reader would refuse (_REFLOG_LINE,
+    or a time of 0).
+
+    A PRESENT log holding no entry at all (`git reflog expire --expire=now
+    --all`, which the suite runs, leaves one 0 bytes long; whether gc's own
+    expiry does is not measured here) is decided by its own mtime: max(0, mtime), the value a log whose
+    entries are all older already returns. An expiry rewrites the file, so its
+    mtime is the expiry time: one inside the window reads the primary as moved,
+    and one before it hid only moves older than the window too; a later move
+    appends an entry or touches the file (git appends to an existing reflog
+    even under core.logAllRefUpdates=false). Residual, stated: an emptied log
+    whose mtime was set backwards is not seen.
 
     The FILE, never `git log -g`: when HEAD's own log is missing or empty, git's
     reflog walk falls back to the BRANCH's log (the review-arm corroborator's
@@ -837,8 +1181,7 @@ def _reflog_newest(path, missing_ok):
         if m is None or int(m.group(1)) == 0:
             return None  # a line git's own reader would refuse is UNKNOWN, never skipped
         epochs.append(int(m.group(1)))
-    if not epochs and not missing_ok:
-        return None  # a HEAD or branch log holding no entry was emptied, so it cannot say
+    # A present log with no entry (emptied by an expiry) has newest 0: its mtime alone decides.
     newest = max(epochs) if epochs else 0
     return max(newest, mtime)
 
@@ -951,6 +1294,175 @@ def _primary_records(d):
     return times
 
 
+# One `git checkout`/`git switch` entry's message, as git's checkout writes it
+# (builtin/checkout.c update_refs_for_switch: "checkout: moving from <old> to
+# <new>"). Ref names hold no space, so both operands are one token.
+_CHECKOUT_MOVE = re.compile(r"\Acheckout: moving from (\S+) to (\S+)\Z")
+# The KINDS of HEAD-log entry that move a branch's tip or add to it and leave
+# HEAD pointing where it pointed (commit, commit (amend|merge|initial), reset,
+# cherry-pick, revert, merge <x>, pull ...). Every other kind -- a symbolic-ref
+# (an EMPTY message), a clone, a branch -f, one this table has never heard of --
+# may have re-pointed HEAD, and counts as a move. A rebase is such a kind where
+# HEAD is DETACHED (a stopped rebase leaves it so, its `rebase (start)` entry
+# the move), and still where HEAD names a branch (start..finish returns to it).
+_STILL_KIND = re.compile(r"\A(?:commit|reset|cherry-pick|revert|merge|pull)\b")
+
+
+def _entry_kind(msg, detached):
+    """"still" for an entry that leaves HEAD's target alone, else "other"."""
+    kind = msg.split(":", 1)[0].strip()
+    if "rebase" in kind:
+        return "other" if detached else "still"
+    return "still" if _STILL_KIND.match(kind) else "other"
+
+
+def _reflog_head_moves(path, branch):
+    """(entered, other, mtime) for one HEAD log FILE, `branch` being the branch
+    HEAD names (None: HEAD is detached). `entered` is the newest time of a
+    `checkout: moving from <x> to <y>` entry that put HEAD on <y> == `branch`
+    (for a detached HEAD, on any <y>); `other` the newest time of an entry whose
+    message is neither a checkout move nor one of the _STILL_KIND kinds -- an
+    entry that may have re-pointed HEAD without a checkout (`git symbolic-ref
+    HEAD refs/heads/p` appends one with an empty message: Q16v); either is None
+    when no entry is one. `mtime` is the file's own. None -- UNKNOWN -- for a
+    missing or unreadable file, a torn last line, and any line git's own reader
+    would refuse: the grammar and the discipline are _reflog_newest()'s
+    (_REFLOG_LINE, the FILE and never `git log -g`), and the time is the
+    ENTRY's, the committer date git stamped it with, never a commit's own. The
+    newest by TIME, not by position: an exported GIT_COMMITTER_DATE writes
+    entries out of order, and the later reading is the blocking one. The
+    message is what follows the first TAB after the zone -- the identity
+    before it may hold a TAB itself."""
+    try:
+        with open(path, "rb") as fh:
+            mtime = os.fstat(fh.fileno()).st_mtime
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    lines = text.split("\n")
+    if lines[-1].strip():
+        return None  # a torn last line: git appends whole lines
+    entered = other = None
+    for ln in lines[:-1]:
+        if not ln.strip():
+            continue
+        m = _REFLOG_LINE.match(ln)
+        if m is None or int(m.group(1)) == 0:
+            return None  # a line git's own reader would refuse is UNKNOWN, never skipped
+        t = int(m.group(1))
+        parts = ln[m.end(1):].split("\t", 1)
+        msg = parts[1] if len(parts) == 2 else ""
+        mv = _CHECKOUT_MOVE.match(msg)
+        if mv:
+            if branch is None or mv.group(2) == branch:
+                entered = max(entered or 0, t)
+        elif _entry_kind(msg, branch is None) == "other":
+            other = max(other or 0, t)  # (a `checkout:` entry the pattern above cannot parse lands here too)
+    return entered, other, mtime
+
+
+def _parked_state(d):
+    """What checkout-return's lifetime rule needs of one primary: ("none", why)
+    when this arm has nothing to say (HEAD on the default branch: a return would
+    move nothing), ("unknown", why) when that cannot be read, or ("parked",
+    branch, entered, other, log_mtime) for a primary the sweep would RETURN --
+    HEAD on a branch other than the default, or DETACHED (return-to-main-sweep.sh
+    reads `BRANCH != DEFAULT || DETACHED` as parked and switches it to the
+    default; the plan's own premise that a detached HEAD has "nothing a return
+    would move" was false in code, Q16p). `branch` is None for a detached HEAD;
+    `entered`, `other` and `log_mtime` are _reflog_head_moves()'s reading of
+    HEAD's own log. UNKNOWN, never "not parked": a HEAD that names neither a
+    branch under refs/heads nor an object id, a default branch that cannot be
+    resolved (_default_branch), a git dir whose log path rev-parse cannot give,
+    a HEAD log that is missing, unreadable, torn or holds a refused line. The
+    git dir is NAMED (_named_git_dir), as _primary_records() names it. Cost:
+    one read of HEAD for every primary, and for one parked off its default
+    branch (or detached) a git call or two and one log read, plus the default
+    branch's resolution for one on a branch."""
+    g = os.path.join(d, ".git")
+    try:
+        with open(os.path.join(g, "HEAD"), "rb") as fh:
+            head = fh.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return "unknown", "HEAD cannot be read"
+    sym = _HEAD_SYMREF.match(head)
+    if sym and ".." not in sym.group(1) and sym.group(1).startswith("refs/heads/"):
+        branch = sym.group(1)[len("refs/heads/"):]
+    elif _OBJECT_ID.match(head):
+        branch = None  # detached: always parked, whatever the default is
+    else:
+        return "unknown", "HEAD names neither a branch under refs/heads nor an object id"
+    if branch is not None:
+        default = _default_branch(d, _named_git_dir(g))
+        if not default:
+            return "unknown", "no origin default branch could be read, so whether %s is parked is unknown" % branch
+        if branch == default:
+            return "none", "on %s" % default
+    q = [_named_git_dir(g), "rev-parse", "--path-format=absolute", "--git-path", "logs/HEAD"]
+    out = _git(d, *q)
+    if out is None:  # one retry: a transient failure on a loaded box is not blindness
+        out = _git(d, *q)
+    paths = (out or "").splitlines()
+    if len(paths) != 1:
+        return "unknown", "rev-parse cannot resolve HEAD's log path"
+    res = _reflog_head_moves(paths[0], branch)
+    if res is None:
+        return "unknown", "HEAD's log is missing, unreadable, torn or holds a line git would refuse"
+    return ("parked", branch) + res
+
+
+def parked_states(primaries, root_native):
+    """{primary: _parked_state()}: one primary's unanticipated input is that
+    primary's UNKNOWN, named on stderr, never the whole probe's crash (as
+    primary_generic_blockers() does)."""
+    states, todo = {}, sorted(primaries)
+    for i, r in enumerate(todo):
+        if _remaining() < 1:
+            states[r] = ("unknown", "the run's deadline was reached before it was read")
+            if i == 0 or states[todo[i - 1]][1] != states[r][1]:
+                DEADLINE_NOTES.append(("lifetime_read", "deadline reached after %d of %d primaries' HEAD logs" % (i, len(todo))))
+                sys.stderr.write("machine-quiesce-check: run deadline reached after %d of %d primaries' HEAD logs -- the other %d read as UNKNOWN\n"
+                                 % (i, len(todo), len(todo) - i))
+            continue
+        try:
+            states[r] = _parked_state(os.path.join(root_native, r))
+        except Exception as e:
+            sys.stderr.write("machine-quiesce-check: reading %s's HEAD log raised %s (%s) -- read as UNKNOWN\n"
+                             % (r, type(e).__name__, e))
+            states[r] = ("unknown", "reading it raised %s" % type(e).__name__)
+    return states
+
+
+def lifetime_parked_blockers(states, first_epoch):
+    """{primary: why} -- the primaries a not-finished session whose life holds a
+    GENERIC unattributed line blocks under checkout-return: every one the sweep
+    would return (HEAD on a branch other than the default, or detached) whose
+    HEAD git's own record says was moved at or after the session's first ledger
+    line (>=: the hook files its line before the call runs, so a switch the
+    session made cannot predate it) -- a checkout into the current branch (for a
+    detached HEAD, any checkout), or a log entry of a kind that may have
+    re-pointed HEAD (_reflog_head_moves) -- or whose state is UNKNOWN. With no
+    entry that enters the current branch (expired, or an emptied log) the HEAD
+    log's mtime stands in for it, at or after `first_epoch` blocking. A primary
+    on its default branch is not in the result."""
+    blocked = {}
+    for r, st in states.items():
+        if st[0] == "none":
+            continue
+        if st[0] == "unknown":
+            blocked[r] = "UNKNOWN (%s)" % st[1]
+            continue
+        _, branch, entered, other, mtime = st
+        label = "branch %s" % branch if branch is not None else "detached HEAD"
+        if entered is not None and entered >= first_epoch:
+            blocked[r] = "%s entered at %d" % (label, entered)
+        elif other is not None and other >= first_epoch:
+            blocked[r] = "%s: a HEAD log entry that may have re-pointed it at %d" % (label, other)
+        elif entered is None and mtime >= first_epoch:
+            blocked[r] = "no log entry enters %s and HEAD's log was written at %d" % (label, mtime)
+    return blocked
+
+
 def _path_written(path, root):
     """When one dirty path was last changed (_changed: mtime or ctime): its own
     (lstat: a tracked symlink is itself the change); for a path that is gone,
@@ -967,6 +1479,146 @@ def _path_written(path, root):
             p = os.path.dirname(p)  # a path that is gone: its nearest existing parent records the removal
         except OSError:
             return None
+
+
+_CLEAN_FILTER_WHY = "a clean filter is configured; the probe will not run it"
+UNREAD_REASONS = {}  # primary directory -> why the probe would not read it (read into probes[])
+
+
+def _attr_file_names(path, must_exist=False):
+    """The filter names an attributes FILE references (`filter=<name>`, on any
+    line that is not a comment -- a macro definition included), or None when it
+    exists and cannot be read. A missing file references nothing -- unless
+    `must_exist` (a path the index lists: git falls back to its blob, which this
+    does not read, so a listed file that is gone is unreadable)."""
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return None if must_exist else set()
+    except OSError:
+        return None
+    names = set()
+    for ln in text.splitlines():
+        if ln.lstrip().startswith("#"):
+            continue
+        for tok in ln.split():
+            if tok.startswith("filter=") and len(tok) > 7:
+                names.add(tok[7:])
+    return names
+
+
+try:
+    _SUBMODULE_DEPTH = max(0, int(os.environ.get("QMQC_SUBMODULE_DEPTH") or 3))
+except ValueError:
+    _SUBMODULE_DEPTH = 3  # nested submodule levels a status is followed into before it is refused (QMQC_SUBMODULE_DEPTH)
+
+
+def _clean_filter_refusal(d, top=True, depth=0):
+    """None when the probe's git status may run in checkout `d`; else the reason
+    it must not. A status compares a stat-dirty tracked file's CONTENT, which runs
+    the clean (or long-running process) filter configured for that path -- git-lfs
+    among them -- a process this read would start and which may write its own
+    store (.git/lfs/objects). So, before any status, the checkout's configured
+    `filter.<name>.clean|process` keys are read (git config --show-origin
+    --get-regexp, system, global and local scope, with the same _git flags and the
+    run deadline). None configured: the status runs, unchanged. Some configured:
+    the status is refused only when one of those names is referenced as
+    `filter=<name>` by an attributes source the status reads -- the
+    `.gitattributes` of EVERY directory that holds a tracked file (and the root),
+    present on disk whether or not git ignores it (an ignored .gitattributes is
+    still read), a tracked one that is gone from disk (git reads its blob, which
+    is not read here: unreadable), `.git/info/attributes`, the global attributes
+    file and the system one (git var GIT_ATTR_GLOBAL, GIT_ATTR_SYSTEM). A
+    configured filter no attributes line names never runs, so a box whose git-lfs
+    install defines filter.lfs.* for every repository is not read UNKNOWN
+    wholesale. A status also runs a CHILD status in each initialized submodule
+    (a tracked gitlink whose directory holds a `.git`), under that submodule's
+    OWN config and attributes, so each is checked the same way, nested to
+    _SUBMODULE_DEPTH levels and no further (deeper: refused). An attributes
+    source that cannot be read -- or listed, or located -- counts as referencing
+    it, and so does a config read that fails: UNKNOWN, never "no filter".
+    `top` is True for a primary (its git dir NAMED, its work tree named), False
+    for a submodule (discovered from its own directory: its `.git` is a file)."""
+    g = os.path.join(d, ".git")
+    pre = (_named_git_dir(g),) if top else ()
+    q = pre + ("config", "-z", "--show-origin", "--get-regexp", r"^(filter\..*\.(clean|process)|attr\.tree)$")
+    out = _git(d, *q, raw=True, ok=(0, 1))
+    if out is None:
+        out = _git(d, *q, raw=True, ok=(0, 1))
+    if out is None:
+        return "the configured filters could not be read, so whether a clean filter is configured is unknown; the probe will not run one"
+    cfg = out.split(b"\0")
+    names, attr_tree = set(), False
+    for i in range(1, len(cfg), 2):  # origin NUL key NL value NUL
+        key = cfg[i].split(b"\n", 1)[0].decode("utf-8", "replace")
+        if key == "attr.tree":
+            attr_tree = True
+        for suffix in (".clean", ".process"):
+            if key.startswith("filter.") and key.endswith(suffix) and len(key) > 7 + len(suffix):
+                names.add(key[7:-len(suffix)])
+    # Submodules are checked whatever this checkout's own config holds: theirs is separate.
+    listed = _git(d, *pre, *(("--work-tree=" + d,) if top else ()), "ls-files", "-z", "--stage", raw=True)
+    if listed is None:
+        return "%s (its tracked files could not be listed)" % _CLEAN_FILTER_WHY
+    dirs, tracked_attrs, gitlinks = {""}, [], []
+    for ent in listed.split(b"\0"):
+        meta, _, p = ent.partition(b"\t")
+        if not p:
+            continue
+        rel = os.fsdecode(p)
+        if os.name == "nt":
+            rel = rel.replace("\\", "/")  # git prints "/" everywhere; on POSIX a backslash is an ordinary name character
+        if meta.startswith(b"160000"):
+            gitlinks.append(rel)
+            continue
+        parts = rel.split("/")
+        for k in range(1, len(parts)):
+            dirs.add("/".join(parts[:k]))
+        if parts[-1] == ".gitattributes":
+            tracked_attrs.append(rel)
+    for rel in gitlinks:
+        sub = os.path.join(d, rel)
+        if not os.path.lexists(os.path.join(sub, ".git")):
+            continue  # not initialized: a status looks no further
+        if depth >= _SUBMODULE_DEPTH:
+            return "%s (submodule %s is nested deeper than %d levels)" % (_CLEAN_FILTER_WHY, rel, _SUBMODULE_DEPTH)
+        why = _clean_filter_refusal(sub, False, depth + 1)
+        if why:
+            return "%s [in submodule %s]" % (why, rel)
+    if not names:
+        return None
+    # attr.tree (config) and GIT_ATTR_SOURCE (environment) put attributes in a TREE, which a status
+    # reads for filters (measured on git 2.47.3, Q20cg: a stat-dirty file's filter ran with the
+    # attributes only in a tree). The tree's contents are not read here, so a configured filter
+    # is treated as referenced.
+    if attr_tree or os.environ.get("GIT_ATTR_SOURCE"):
+        return "%s (%s is set, so attributes come from a tree this read does not parse)" % (
+            _CLEAN_FILTER_WHY, "attr.tree" if attr_tree else "GIT_ATTR_SOURCE")
+    found = {os.path.join(d, rel, ".gitattributes"): False for rel in sorted(dirs)}  # on disk, ignored or not
+    for rel in tracked_attrs:
+        found[os.path.join(d, rel)] = True  # tracked: a copy gone from disk is unreadable, not absent
+    srcs = list(found.items())
+    info = os.path.join(g, "info", "attributes")
+    if not top:  # a submodule's .git is a FILE: its real git dir (under the superproject's .git/modules) is asked for
+        info = _git(d, "rev-parse", "--path-format=absolute", "--git-path", "info/attributes")
+        if not info:
+            return "%s (a submodule's info/attributes could not be located)" % _CLEAN_FILTER_WHY
+    srcs.append((info, False))
+    for var in ("GIT_ATTR_GLOBAL", "GIT_ATTR_SYSTEM"):
+        p = _git(d, *pre, "var", var)
+        if p is None:
+            return "%s (%s could not be read)" % (_CLEAN_FILTER_WHY, var)
+        if p:
+            srcs.append((p, False))
+    for path, must_exist in srcs:
+        got = _attr_file_names(path, must_exist)
+        if got is None:
+            return "%s (the attributes source %s cannot be read)" % (_CLEAN_FILTER_WHY, path)
+        hit = sorted(got & names)
+        if hit:
+            return "%s (filter %s, named by %s)" % (_CLEAN_FILTER_WHY, hit[0], path)
+    return None
 
 
 def _tree_changes_written(d, since):
@@ -1001,6 +1653,11 @@ def _tree_changes_written(d, since):
     core.fsmonitor=false, so it scans the tree itself rather than trusting a
     monitor's own state."""
     g = os.path.join(d, ".git")
+    refusal = _clean_filter_refusal(d)
+    if refusal:
+        UNREAD_REASONS[os.path.basename(d)] = refusal
+        sys.stderr.write("machine-quiesce-check: %s: %s -- read as UNKNOWN\n" % (os.path.basename(d), refusal))
+        return None
     q = (_named_git_dir(g), "--work-tree=" + d, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     out = _git(d, *q, raw=True)
     if out is None:  # one retry: a transient failure on a loaded box is not blindness
@@ -1027,6 +1684,9 @@ def _tree_changes_written(d, since):
     if None in times:
         return None
     return max(times) >= since
+
+
+DEADLINE_NOTES = []  # what a run that hit its deadline says about it (read into probes[])
 
 
 def primary_generic_blockers(primaries, root_native, since):
@@ -1063,13 +1723,22 @@ def primary_generic_blockers(primaries, root_native, since):
     when those leave it undecided (not moved, not unreadable) -- each retried
     once, so one to four git calls -- at _git()'s 30 s timeout, plus a few
     small file reads and one lstat per dirty path, untracked files included
-    (that status walks every directory that is not ignored). Nothing bounds
-    the whole run to the scheduler's 120 s probe ceiling
-    (schedule-return-to-main.sh PROBE_TIMEOUT_SECONDS): a probe that runs past
-    it is killed and reads NOT met (the runner's scheduler_probe.rs), so the
-    job does not fire -- the safe direction."""
+    (that status walks every directory that is not ignored). The whole run is
+    bounded by the run deadline (_run_deadline, QMQC_RUN_DEADLINE_S, default
+    100 s, under the scheduler's 120 s PROBE_TIMEOUT_SECONDS): _git() takes
+    min(30, remaining) and refuses to start under a second from it, and the
+    primaries not yet read when it passes are UNREAD, with one stderr line and a
+    DEADLINE_NOTES entry that becomes a probes[] row."""
     moved, dirty, unread = set(), set(), set()
-    for r in sorted(primaries):
+    todo = sorted(primaries)
+    for i, r in enumerate(todo):
+        if _remaining() < 1:
+            undone = todo[i:]
+            unread.update(undone)  # UNKNOWN blocks: a primary not read is not a primary found quiet
+            DEADLINE_NOTES.append(("generic_read", "deadline reached after %d of %d primaries" % (i, len(todo))))
+            sys.stderr.write("machine-quiesce-check: run deadline reached after %d of %d primaries -- the other %d read as UNKNOWN\n"
+                             % (i, len(todo), len(undone)))
+            break
         try:
             verdict = _primary_verdict(os.path.join(root_native, r), since)
         except Exception as e:  # one primary's unanticipated input is its own UNKNOWN, never the whole probe's crash
@@ -1110,6 +1779,49 @@ def _names(repos, cap=6):
     return ",".join(s) if len(s) <= cap else "%d: %s,..." % (len(s), ",".join(s[:cap]))
 
 
+def _default_branch(repo_dir, *pre):
+    """R's default branch as last fetched (NO fetch), resolved EXACTLY as the
+    sweep's own classifier resolves its upstream (classify-branch-state.sh
+    _resolve_upstream, whose upstream_ref is what return-to-main-sweep.sh takes
+    its DEFAULT_BRANCH from): origin/HEAD's target, but only when that target
+    resolves to a COMMIT -- a dangling origin/HEAD (a default branch renamed
+    upstream) is skipped, never taken -- else origin/main, else origin/master,
+    each by `rev-parse --verify --quiet <ref>^{commit}`. None when none
+    resolves, when origin/HEAD resolves to something outside origin/ (the sweep
+    reads that as no default at all and parks everything), and when ANY of the
+    calls GAVE NO ANSWER (a timeout, a failed run, an exit code other than the
+    "no such ref" 1): a failed call is UNKNOWN, never "no origin/HEAD" -- read
+    as that it would fall through to origin/main and call a branch the default
+    that the sweep, whose call succeeded, does not. `pre` are git options placed
+    before the subcommand (repo_work() passes none; the lifetime rule passes the
+    NAMED git dir, _named_git_dir()). One resolution for both callers, so what
+    repo_work() calls the default and what the return rule calls the default
+    cannot drift apart (Q16x feeds the sweep's classifier and this the same
+    fixtures)."""
+    def commit(ref):
+        r = _git_rc(repo_dir, *pre, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
+        if r is None or r[0] not in (0, 1):
+            return None  # no answer
+        return r[0] == 0 and bool(r[1])
+    r = _git_rc(repo_dir, *pre, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if r is None or r[0] not in (0, 1):
+        return None  # exit 1 is "not a symbolic ref / not there"; anything else is no answer
+    cand = r[1] if r[0] == 0 else ""
+    if cand:
+        ok = commit(cand)
+        if ok is None:
+            return None
+        if ok:
+            return cand[len("origin/"):] if cand.startswith("origin/") and len(cand) > 7 else None
+    for ref in ("origin/main", "origin/master"):
+        ok = commit(ref)
+        if ok is None:
+            return None
+        if ok:
+            return ref[len("origin/"):]
+    return None
+
+
 def repo_work(for_class, repo_dir):
     """(has_work, why) for one QUIET primary; see _repo_work. A git answer that is
     not UTF-8 is that repo's UNKNOWN, reported as work like every other unread."""
@@ -1140,13 +1852,7 @@ def _repo_work(for_class, repo_dir):
     checkout-return: HEAD on another branch or detached. A read that fails is
     reported as work (`unknown`): an unproven "nothing to do" must not keep
     the job from firing."""
-    default = _git(repo_dir, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
-    default = default[len("origin/"):] if default and default.startswith("origin/") else None
-    if not default:
-        for b in ("main", "master"):
-            if _git(repo_dir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/" + b) is not None:
-                default = b
-                break
+    default = _default_branch(repo_dir)
     if not default:
         return True, "unknown: no origin default branch could be read"
     head = _git(repo_dir, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -1160,6 +1866,9 @@ def _repo_work(for_class, repo_dir):
             return True, "unknown: behind-count on %s unreadable" % default
         if int(n) > 0:
             return True, "%s commit(s) behind origin/%s (as last fetched)" % (n, default)
+    refusal = _clean_filter_refusal(repo_dir)
+    if refusal:
+        return True, "unknown: " + refusal
     st = _git(repo_dir, "status", "--porcelain", "--untracked-files=no")
     if st is None:
         return True, "unknown: git status failed"
@@ -1207,12 +1916,30 @@ def per_repo_verdicts(for_class, machine_verdict, per_repo, census, blocking, pr
         since = NOW - touch_window_s
         generic_read = []  # primary_generic_blockers()'s one answer for this run
 
+        def flush_deadline_notes():
+            while DEADLINE_NOTES:
+                name, note = DEADLINE_NOTES.pop(0)
+                probe(name, "unknown", note)
+
         def generic_blockers():
             """(moved, dirty, unread) -- read only when some working session's
             in-window unattributed lines are all GENERIC, and at most once per run."""
             if not generic_read:
                 generic_read.append(primary_generic_blockers(primaries, root_native, since))
+                flush_deadline_notes()
+                for repo, why in sorted(UNREAD_REASONS.items()):
+                    probe("generic_read", "unknown", "%s: %s" % (repo, why))
             return generic_read[0]
+
+        parked_read = []  # parked_states()'s one answer for this run
+
+        def parked():
+            """{primary: _parked_state()} -- read only when a not-finished
+            session's life holds a GENERIC unattributed line, and once per run."""
+            if not parked_read:
+                parked_read.append(parked_states(primaries, root_native))
+                flush_deadline_notes()
+            return parked_read[0]
 
         def attribution(sid, lifetime):
             """(repos-or-ALL, why). Window touches for a working session;
@@ -1229,13 +1956,39 @@ def per_repo_verdicts(for_class, machine_verdict, per_repo, census, blocking, pr
             if lifetime:
                 if L.get("truncated"):
                     return ALL, "whole-life attribution UNKNOWN: the ledger was truncated at its rotation cap"
+                # Absent is UNKNOWN, not 0: a reader that serves no specific_count
+                # (a stub, an older one) cannot tell GENERIC from SPECIFIC.
+                if "specific_count" not in u:
+                    return ALL, ("whole-life attribution UNKNOWN: the ledger reader serves no specific_count, so "
+                                 "GENERIC and SPECIFIC unattributed calls cannot be told apart")
                 if (u.get("specific_count") or 0) > 0:
                     return ALL, ("changed directory to somewhere the ledger cannot name at some point (an unresolvable "
                                  "cd / -C / --manifest-path / --prefix / --directory / --cwd target)")
                 for r, v in (L.get("repos") or {}).items():
                     if (v.get("count") or 0) > 0:  # primary touches only: a worktree commit never lands on R's branch
                         repos.add(canon(r))
-                return repos, "touched %s in its life" % (",".join(sorted(repos)) or "no primary")
+                why = "touched %s in its life" % (",".join(sorted(repos)) or "no primary")
+                n, n_spec, first = u.get("count"), u.get("specific_count"), L.get("first_epoch")
+                # (specific_count > 0 returned above, so here n_spec <= 0: n < n_spec is a negative count, and a
+                # negative specific_count would make n - n_spec a GENERIC count nobody wrote.)
+                if not all(isinstance(x, int) and not isinstance(x, bool) for x in (n, n_spec, first)) or n < n_spec or n_spec < 0:
+                    return ALL, ("whole-life attribution UNKNOWN: the ledger reader serves no usable count / "
+                                 "first_epoch, so the session's GENERIC calls cannot be dated")
+                if n - n_spec <= 0:
+                    return repos, why
+                # GENERIC lines in its life (the no-path marker, a "generic":true `$` argument). One can hide
+                # a branch switch (GIT_DIR=, --git-dir=, -c core.worktree=, xargs {}, a script), and a return
+                # would move the branch under this session, so git's own record decides: every primary the
+                # sweep would return whose HEAD was moved at or after the session's first ledger line.
+                blocked = lifetime_parked_blockers(parked(), first)
+                repos.update(blocked)
+                named = "; ".join("%s: %s" % (r, blocked[r]) for r in sorted(blocked)[:6])
+                if len(blocked) > 6:
+                    named += "; ..."
+                return repos, ("%s; %d GENERIC unattributed call(s) in its life, so also every primary the sweep would "
+                               "return (a branch other than the default, or a detached HEAD) whose HEAD was moved at or "
+                               "after its first ledger line (%d) or cannot be read: %s"
+                               % (why, n - n_spec, first, named or "none"))
             for r, v in (L.get("repos") or {}).items():
                 if max(v.get("last_epoch") or 0, v.get("worktree_last_epoch") or 0) >= since:
                     repos.add(canon(r))
@@ -1244,9 +1997,11 @@ def per_repo_verdicts(for_class, machine_verdict, per_repo, census, blocking, pr
                 return repos, why
             # An unattributed mutating call inside the window. Every class but
             # checkout-ff keeps reading it as every repo (a return switches
-            # branches, and the lifetime rule is already blind to a switch that
-            # landed GENERIC), and so does a reader that serves no specific_*:
-            # it cannot tell GENERIC from SPECIFIC, and absent is not null.
+            # branches, and a GENERIC call can hide the switch -- the lifetime
+            # rule above confines GENERIC by git's own record of a branch
+            # entry, but the window rule has no such record to lean on), and so
+            # does a reader that serves no specific_*: it cannot tell GENERIC
+            # from SPECIFIC, and absent is not null.
             if for_class != "checkout-ff" or "specific_last_epoch" not in u:
                 return ALL, "an unattributed mutating call within %ds" % touch_window_s
             if (u.get("specific_last_epoch") or 0) >= since:
@@ -1331,13 +2086,24 @@ def per_repo_verdicts(for_class, machine_verdict, per_repo, census, blocking, pr
                         build_anc.add(int(m.group(1)))
         for e in blocking:
             if e.get("class") == "build_lock":
-                r, wt = _repo_of(os.path.dirname(os.path.dirname(os.path.dirname(e["lockdir"]))), root_native, primaries)
+                lock_base = os.path.dirname(os.path.dirname(os.path.dirname(e["lockdir"])))
+                r, wt = _repo_of(lock_base, root_native, primaries)
                 hp = e.get("holder_pid")
                 hp = int(hp) if isinstance(hp, str) and hp.isdigit() else None
                 if hp is not None and hp in build_anc:
                     continue  # its build processes are in the census and attributed there
-                if wt or r is None or r not in primaries:
-                    targets.append((set() if wt else ALL, dict(e, why="lock of a linked worktree's own target" if wt else "lockdir names no checkout")))
+                if wt:
+                    # Its own target dir touches no primary, but the build that holds it reads its path
+                    # dependencies, which a worktree directly under the root resolves to PRIMARY siblings
+                    # (the holder is not in the census, so this is all that is known): block those, and
+                    # every repo when it sits directly under the root and so could reach any sibling.
+                    direct = os.path.normcase(os.path.dirname(os.path.abspath(lock_base))) == os.path.normcase(os.path.abspath(root_native))
+                    targets.append((ALL if direct else _worktree_dep_repos(lock_base, root_native, primaries),
+                                    dict(e, why="lock of a linked worktree's own target; %s" % (
+                                        "it sits directly under the root, so its path dependencies may reach any primary" if direct
+                                        else "its path dependencies land in the primaries blocked"))))
+                elif r is None or r not in primaries:
+                    targets.append((ALL, dict(e, why="lockdir names no checkout")))
                 else:
                     targets.append(({r} | path_dep_repos(r, root_native, primaries),
                                     dict(e, why="guards %s's shared target and its holder's build is not in the census" % r)))
@@ -1392,6 +2158,8 @@ def per_repo_verdicts(for_class, machine_verdict, per_repo, census, blocking, pr
 # --------------------------------------------------------------------------
 def cmd_final(work, census_path, census_rc, root, root_native, self_sid, device_id, script_dir, mode,
               for_class="", touch_window_s="21600", exit_quiet="0", ledger_path="", ledger_rc=""):
+    if BAD_DEADLINE:
+        sys.stderr.write("machine-quiesce-check: QMQC_RUN_DEADLINE_S=%r is not a finite number of seconds above 0 -- using the default 100\n" % BAD_DEADLINE[0])
     probes, blocking, overridable, ide_ignored = [], [], [], []
     rd_items = []  # (repos-or-ALL, entry): readiness planes, itemised for --for checkout-*
 
@@ -1606,7 +2374,8 @@ def cmd_final(work, census_path, census_rc, root, root_native, self_sid, device_
     stale_ok = re.fullmatch(r"[1-9][0-9]{0,8}", stale_raw) is not None and int(stale_raw) > hb
     stale_after = int(stale_raw) if stale_ok else 0
     locks = sorted(set(glob.glob(os.path.join(root_native, "*", ".build-state", "locks", "cargo.lockdir")) +
-                       glob.glob(os.path.join(root_native, "agent-worktrees", "*", "*", ".build-state", "locks", "cargo.lockdir"))))
+                       glob.glob(os.path.join(root_native, "agent-worktrees", "*", "*", ".build-state", "locks", "cargo.lockdir")) +
+                       glob.glob(os.path.join(root_native, "qontinui-worktrees", "*", "*", ".build-state", "locks", "cargo.lockdir"))))
     if not locks:
         probe("cargo_guard_lock", "not_applicable", "no cargo.lockdir under any checkout")
     elif not stale_ok:
