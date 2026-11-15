@@ -299,12 +299,14 @@ impl PaneOps for ManagerPanes {
                 );
                 return CliPresence::Unknown;
             };
-            let snapshot =
-                crate::process_capture::process_tree::snapshot_process_table_public().await;
-            // The steward's own "does a claude live in this pane" read, which
-            // answers `None` for an unreadable (empty) process table — the
-            // lifecycle poll's `tick_snapshot_ok` guard.
-            match crate::mcp::steward::pane_hosts_claude(&snapshot, Some(pid)) {
+            // A FRESH look, never the memo: a `NoCli` here lets the respawn
+            // treat a pane as gone, so it must be a table read after this call.
+            let look = crate::terminal::graceful_exit::PaneLook::take_fresh(&[pid]).await;
+            // The steward's own "does a claude live in this pane" read: an
+            // image named `claude` or a pid Claude Code's registry names (an
+            // npm-installed CLI runs as `node`), `None` for an unreadable table
+            // — the lifecycle poll's `tick_snapshot_ok` guard.
+            match crate::mcp::steward::pane_hosts_claude(&look, Some(pid)) {
                 Some(true) => CliPresence::Hosts,
                 Some(false) => CliPresence::NoCli,
                 None => {
@@ -1000,6 +1002,7 @@ mod tests {
             lines: rows.iter().map(|r| r.to_string()).collect(),
             cursor_row,
             cursor_col: 2,
+            cursor_row_dim: None,
         }
     }
 
