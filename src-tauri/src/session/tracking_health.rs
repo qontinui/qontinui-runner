@@ -252,12 +252,20 @@ pub fn pid_reuse_reference(pid: u32, verified: &HashSet<u32>, boot_unix_millis: 
 /// `snapshot_ok = false`, so `classify` Skips the record and the poll never
 /// closes it on that tick; `claude_present` is then `false` only because the
 /// tuple needs a value, and nothing reads it.
+///
+/// `pid` is `0` for a live terminal that reports no pid. No look covers pid
+/// 0, so it would read undecided on every tick and the record would be
+/// Skipped forever; it reads as before the look existed instead — no
+/// `claude`, judged on the tick's own snapshot health.
 pub fn poll_claude_presence(
     look: &PaneLook,
     pid: u32,
     reference_unix_millis: i64,
     tick_snapshot_ok: bool,
 ) -> (bool, bool) {
+    if pid == 0 {
+        return (false, tick_snapshot_ok);
+    }
     match look.claude_present(pid, reference_unix_millis) {
         Some(present) => (present, tick_snapshot_ok),
         None => (false, false),
@@ -769,6 +777,72 @@ pub struct UndecidedProcess {
     pub image: Option<String>,
     /// Why the registry could not settle it.
     pub reason: String,
+}
+
+/// Logs the UNDECIDED population a census blocks on, once per change rather
+/// than once per pass — the same once-per-transition posture as
+/// `claude_activity::UnlistableLog`. A census that stays undecided (an
+/// unlistable `sessions/` dir) holds every restart and every wind-down close
+/// box-wide, so the stall must be visible; a per-pass line would bury the log
+/// (`/restart-readiness` answers every Stop turn).
+pub struct UndecidedLog {
+    reported: Mutex<Vec<u32>>,
+    site: &'static str,
+    consequence: &'static str,
+}
+
+impl UndecidedLog {
+    /// `site` names the reader; `consequence` says what an undecided census
+    /// costs it.
+    pub const fn new(site: &'static str, consequence: &'static str) -> Self {
+        Self {
+            reported: Mutex::new(Vec::new()),
+            site,
+            consequence,
+        }
+    }
+
+    /// Record one pass's undecided set: `warn!` when it changes to a
+    /// non-empty set, `info!` when it clears, nothing while it holds.
+    pub fn observe(&self, undecided: &[UndecidedProcess]) {
+        let mut pids: Vec<u32> = undecided.iter().map(|u| u.pid).collect();
+        pids.sort_unstable();
+        let mut reported = self
+            .reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *reported == pids {
+            return;
+        }
+        if pids.is_empty() {
+            tracing::info!(
+                "{}: every process the session registry could not settle is now decided",
+                self.site
+            );
+        } else {
+            let causes: Vec<String> = undecided
+                .iter()
+                .map(|u| {
+                    format!(
+                        "pid {} ({}): {}",
+                        u.pid,
+                        u.image.as_deref().unwrap_or("image unknown"),
+                        u.reason
+                    )
+                })
+                .collect();
+            warn!(
+                undecided_pids = ?pids,
+                causes = ?causes,
+                "{}: {} process(es) may be a live npm-installed `claude` that Claude Code's \
+                 session registry could not settle — {}",
+                self.site,
+                pids.len(),
+                self.consequence
+            );
+        }
+        *reported = pids;
+    }
 }
 
 /// Result of one cross-reference pass.
@@ -2651,7 +2725,7 @@ mod tests {
         ));
         let agent_runtime: HashSet<u32> = [30u32].into_iter().collect();
         let report = evaluate(
-            &snap,
+            &PaneLook::image_only(&snap),
             1,
             &[],
             &HashMap::new(),
@@ -2700,7 +2774,7 @@ mod tests {
         );
         let agent_runtime: HashSet<u32> = [40u32].into_iter().collect();
         let report = evaluate(
-            &snap,
+            &PaneLook::image_only(&snap),
             1,
             &[],
             &HashMap::new(),
@@ -4105,6 +4179,35 @@ mod tests {
         assert_eq!(
             poll_claude_presence(&look(RegistryWitness::naming(&[50])), 5, 0, false),
             (true, false)
+        );
+    }
+
+    /// Review A3: a live terminal that reports no pid (the poll maps it to
+    /// root 0, which no look covers) reads no `claude`, judged on the tick's
+    /// own snapshot health — it is never Skipped forever. Partner: without the
+    /// pid-0 guard the uncovered root reads undecided, `(false, false)`, on
+    /// every tick.
+    #[test]
+    fn a_pidless_live_terminal_is_judged_absent_on_the_ticks_health() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        let now_s = chrono::Utc::now().timestamp();
+        let look = |w| PaneLook::over_whole_table(npm_box(now_s), w);
+        assert_eq!(
+            poll_claude_presence(&look(RegistryWitness::naming(&[50])), 0, 0, true),
+            (false, true)
+        );
+        assert_eq!(
+            poll_claude_presence(&look(RegistryWitness::unreadable("test")), 0, 0, true),
+            (false, true)
+        );
+        assert_eq!(
+            poll_claude_presence(&look(RegistryWitness::naming(&[50])), 0, 0, false),
+            (false, false)
+        );
+        assert_eq!(
+            look(RegistryWitness::naming(&[50])).claude_present(0, 0),
+            None,
+            "root 0 is uncovered — what the guard exists for"
         );
     }
 }

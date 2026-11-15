@@ -70,6 +70,15 @@ use qontinui_runner_lib::wind_down::{
 /// with the restart-readiness tests so the two cannot drift.
 pub(crate) const TERMINAL_PLANE_TABLE_UNKNOWN: &str = "the terminal-session plane could not be determined: the process table is unreadable (the fresh process-table read failed or served only the stale last-good table, ProcessSnapshot::is_unknown), so live `claude` processes cannot be enumerated";
 
+/// The census's undecided population, logged once per change: while it is
+/// non-empty `/restart-readiness` reads unsafe and the wind-down closes
+/// nothing (see [`undecided_unknown`]).
+static CENSUS_UNDECIDED_LOG: crate::session::tracking_health::UndecidedLog =
+    crate::session::tracking_health::UndecidedLog::new(
+        "restart-readiness census",
+        "restart is blocked (safe_to_restart: false) while it lasts",
+    );
+
 /// The `unknowns` entry for a pass whose census holds processes Claude Code's
 /// session registry could not settle
 /// ([`crate::session::tracking_health::TrackingHealthReport::undecided`]): a
@@ -291,6 +300,7 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
                 // UNDECIDED reads as not-safe: the pass is kept (its counts
                 // are reported), but it is incomplete, and a caller that acts
                 // on a pass acts on none with an `unknowns` entry.
+                CENSUS_UNDECIDED_LOG.observe(&pass.report.undecided);
                 unknowns.extend(undecided_unknown(&pass.report));
                 Some(pass)
             }
