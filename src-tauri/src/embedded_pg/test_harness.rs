@@ -277,6 +277,22 @@ const REMOVE_RETRY_WINDOW: Duration = Duration::from_secs(10);
 /// make private again: the harness directory and every template cache. The
 /// harness changes the mode of no directory that lacks it ([`require_private`]).
 const MADE_MARKER: &str = ".made-by-qontinui-test-pg";
+/// How long a process waits for the template cache lock, and how it says so.
+/// A builder holds the lock exclusively for a whole build, whose `initdb` has
+/// no bound at all ([`COMMAND_TIMEOUT`]), so a wedged build would otherwise
+/// stall every process sharing the directory, silently and for ever.
+/// A line on the stderr handle after 30 s and every 60 s after, and a boot
+/// error after 10 min: twice [`COMMAND_TIMEOUT`], the bound meant for one
+/// `initdb` or `pg_ctl`, so a slow build that is not wedged is waited out; and
+/// inside CI's 20-minute `Run Rust tests` step timeout, so a wedged lock there
+/// fails the boot with this error instead of leaving only the step's expiry to
+/// read.
+const LOCK_PATIENCE: LockPatience = LockPatience {
+    first_report: Duration::from_secs(30),
+    report_every: Duration::from_secs(60),
+    give_up: Duration::from_secs(600),
+    poll: Duration::from_millis(250),
+};
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -918,7 +934,9 @@ async fn boot_embedded() -> Result<Server, String> {
 /// ready.
 ///
 /// Either way the cache is entered under the same lock through
-/// [`enter_private`]: required private, marked used, then entered.
+/// [`enter_private`]: required private, marked used, then entered. Each lock is
+/// waited for audibly and for a bounded time ([`take_cache_lock`],
+/// [`LOCK_PATIENCE`]).
 async fn enter_or_build<T, Built>(
     cache_lock: &std::fs::File,
     template_dir: &Path,
@@ -928,20 +946,14 @@ async fn enter_or_build<T, Built>(
 where
     Built: Future<Output = Result<Duration, String>>,
 {
-    let lock_failed = |e: std::io::Error| {
-        format!(
-            "could not take the cache lock for {}: {e}",
-            template_dir.display()
-        )
-    };
-    cache_lock.lock_shared().map_err(lock_failed)?;
+    take_cache_lock(cache_lock, false, template_dir, LOCK_PATIENCE, say).await?;
     if template_dir.join(READY_FILE).is_file() {
         let entered = enter_private(template_dir, enter);
         let _ = cache_lock.unlock();
         return entered.map(|entered| (entered, None));
     }
     let _ = cache_lock.unlock();
-    cache_lock.lock().map_err(lock_failed)?;
+    take_cache_lock(cache_lock, true, template_dir, LOCK_PATIENCE, say).await?;
     let outcome = async move {
         // Another process may have built it while this one waited.
         let built = if template_dir.join(READY_FILE).is_file() {
@@ -954,6 +966,75 @@ where
     .await;
     let _ = cache_lock.unlock();
     outcome
+}
+
+/// How long, and how audibly, [`take_cache_lock`] waits ([`LOCK_PATIENCE`]).
+#[derive(Clone, Copy, Debug)]
+struct LockPatience {
+    /// The first "still waiting" line comes after this long.
+    first_report: Duration,
+    /// Then one comes every this long.
+    report_every: Duration,
+    /// The wait fails the boot after this long.
+    give_up: Duration,
+    /// How often the lock is tried again.
+    poll: Duration,
+}
+
+/// Take the template cache lock — shared, or exclusive when `exclusive` — to
+/// enter or build the cache in `template_dir`. While the lock is held elsewhere
+/// it says so through `report`, first after `patience.first_report` and then
+/// every `patience.report_every`, and past `patience.give_up` it gives up with
+/// an error naming the cache: a holder that never lets go fails the boot,
+/// rather than stalling every test in this process without a word.
+async fn take_cache_lock(
+    lock: &std::fs::File,
+    exclusive: bool,
+    template_dir: &Path,
+    patience: LockPatience,
+    mut report: impl FnMut(String),
+) -> Result<(), String> {
+    let kind = if exclusive { "exclusive" } else { "shared" };
+    let started = Instant::now();
+    let mut next_report = patience.first_report;
+    loop {
+        let attempt = if exclusive {
+            lock.try_lock()
+        } else {
+            lock.try_lock_shared()
+        };
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!(
+                    "could not take the {kind} cache lock for {}: {e}",
+                    template_dir.display()
+                ));
+            }
+        }
+        let waited = started.elapsed();
+        if waited >= patience.give_up {
+            return Err(format!(
+                "gave up after {} s waiting for the {kind} cache lock for {}: the process \
+                 holding it is building or collecting a template cache and has not let go. A \
+                 wedged build there has to be ended; this boot fails rather than wait for ever",
+                waited.as_secs(),
+                template_dir.display()
+            ));
+        }
+        if waited >= next_report {
+            report(format!(
+                "still waiting, after {} s, for the {kind} cache lock for {}: another process \
+                 is building or collecting a template cache; this boot gives up after {} s",
+                waited.as_secs(),
+                template_dir.display(),
+                patience.give_up.as_secs()
+            ));
+            next_report += patience.report_every;
+        }
+        tokio::time::sleep(patience.poll.min(patience.give_up.saturating_sub(waited))).await;
+    }
 }
 
 /// Enter the template cache in `template_dir` with `enter` once it is proven
@@ -4357,6 +4438,69 @@ mod tests {
                 "the problem names the owner: {problem}"
             );
         }
+    }
+
+    /// A process waiting for the cache lock says so — after a delay, then at
+    /// intervals — and past its bound gives up with an error naming the cache,
+    /// rather than wait silently for ever behind a holder that never lets go; a
+    /// lock let go in time is taken.
+    #[tokio::test]
+    async fn a_cache_lock_wait_says_so_and_gives_up() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let template_dir = scratch.path().join(format!("{TEMPLATE_PREFIX}wedged"));
+        let named = template_dir.display().to_string();
+        let waiter = open_lock(scratch.path()).expect("the cache lock");
+        let holder = open_lock(scratch.path()).expect("another descriptor on the cache lock");
+        holder
+            .lock()
+            .expect("hold the lock, as a wedged build would");
+        let patience = LockPatience {
+            first_report: Duration::from_millis(50),
+            report_every: Duration::from_millis(100),
+            give_up: Duration::from_millis(500),
+            poll: Duration::from_millis(10),
+        };
+        let mut lines = Vec::new();
+        let waited = tokio::time::timeout(
+            Duration::from_secs(10),
+            take_cache_lock(&waiter, false, &template_dir, patience, |line| {
+                lines.push(line);
+            }),
+        )
+        .await
+        .expect("the wait must give up by itself, not hang");
+        let refused = waited.expect_err("a lock held past the bound must fail the boot");
+        assert!(
+            refused.contains("gave up") && refused.contains(&named),
+            "the error says it gave up, and on which cache: {refused}"
+        );
+        assert!(
+            lines.len() >= 3 && lines.iter().all(|line| line.contains(&named)),
+            "the wait must say so, and keep saying so: {lines:?}"
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(holder);
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            take_cache_lock(
+                &waiter,
+                true,
+                &template_dir,
+                LockPatience {
+                    give_up: Duration::from_secs(5),
+                    ..patience
+                },
+                drop,
+            ),
+        )
+        .await
+        .expect("the wait must end by itself")
+        .expect("a lock let go in time is taken");
+        release.join().expect("the thread that let the lock go");
+        let _ = waiter.unlock();
     }
 
     /// A start attempt's failure is judged by the lines that attempt wrote to the
