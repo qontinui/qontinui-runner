@@ -45,7 +45,12 @@
 //! runner-managed block in the checkout's `.git/info/exclude`
 //! ([`prepare_canonical_excludes`]) that lives only as long as the
 //! allocation: it is removed after a `Restored`, on a switch rollback, by
-//! `release_repo`, and when the allocation's context drops.
+//! `release_repo`, and when the allocation's context drops. A block all of
+//! those missed (a runner exit, crash or handoff restart, or a racing writer
+//! in another process resurrecting it) is reaped by [`sweep_stale_blocks`] at
+//! runner startup and on every tree-publisher cycle, and only once its
+//! allocation is provably not live. Every in-process writer of the file holds
+//! [`crate::fleet::info_exclude_lock`].
 
 use std::path::Path;
 
@@ -381,50 +386,87 @@ fn info_exclude_path(checkout: &Path) -> Option<std::path::PathBuf> {
         .then(|| git_dir.join("info").join("exclude"))
 }
 
-/// Read the exclude file; an absent file is empty. Any other read error is
-/// returned, so the caller never rewrites a file it could not read.
-fn read_exclude(path: &Path) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
-    }
+/// The allocations whose block THIS process added and has not removed —
+/// `(checkout key, branch)`. The sweep never removes one of these: they are
+/// live here by construction, whatever coord can be asked.
+fn live_here() -> std::sync::MutexGuard<'static, std::collections::HashSet<(String, String)>> {
+    static LIVE: once_cell::sync::Lazy<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = once_cell::sync::Lazy::new(Default::default);
+    LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn live_key(checkout: &Path, branch: &str) -> (String, String) {
+    (super::worktree_resource_key(checkout), branch.to_string())
+}
+
+/// Test-only: drop this process's record of a live allocation, as a runner
+/// exit or crash does, leaving its block on disk.
+#[cfg(test)]
+pub(crate) fn forget_live_for_test(checkout: &Path, branch: &str) {
+    live_here().remove(&live_key(checkout, branch));
+}
+
+/// The file's lines WITH their terminators (`\n` or `\r\n`, or none on a last
+/// line with no final newline), so a rewrite can keep every byte outside the
+/// block exactly as it was.
+fn lines_with_terminators(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n').collect()
+}
+
+/// A line's content: its terminator stripped.
+fn content(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
 }
 
 /// Append this allocation's block (idempotent: a block already naming
-/// `branch` is left as it is). Lines outside the block are never touched.
+/// `branch` is left as it is), under the shared exclude lock, in the file's
+/// own line ending. Lines outside the block are never touched.
 fn add_allocation_excludes(checkout: &Path, branch: &str) -> Result<(), String> {
     let Some(path) = info_exclude_path(checkout) else {
         return Ok(());
     };
-    let existing = read_exclude(&path)?;
+    let _excl = crate::fleet::info_exclude_lock();
+    let existing = crate::fleet::read_info_exclude(&path)?;
     let begin = format!("{BLOCK_BEGIN}{branch}");
-    if existing.lines().any(|l| l.trim_end() == begin) {
-        return Ok(());
+    if !lines_with_terminators(&existing)
+        .iter()
+        .any(|l| content(l) == begin)
+    {
+        let eol = if existing.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let mut out = existing;
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&begin);
+        out.push_str(eol);
+        for pat in PROVISIONED_CLAUDE_EXCLUDES {
+            out.push_str(pat);
+            out.push_str(eol);
+        }
+        out.push_str(&format!("{BLOCK_END}{branch}{eol}"));
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
-    let mut out = existing;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&begin);
-    out.push('\n');
-    for pat in PROVISIONED_CLAUDE_EXCLUDES {
-        out.push_str(pat);
-        out.push('\n');
-    }
-    out.push_str(&format!("{BLOCK_END}{branch}\n"));
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))
+    live_here().insert(live_key(checkout, branch));
+    Ok(())
 }
 
 /// Take out exactly the block [`prepare_canonical_excludes`] added for
-/// `branch` — its begin line through its end line — and nothing else.
+/// `branch` — its begin line through its end line — and nothing else; every
+/// byte outside it (line endings, a missing final newline) is kept.
 /// Idempotent (no block is a no-op). A begin line with no matching end is
 /// left alone and reported: removing to end-of-file could delete operator
-/// lines. Best-effort and logged; never fails the caller.
+/// lines. A file that cannot be read, or is not UTF-8, is not rewritten.
+/// Best-effort and logged; never fails the caller.
 pub(crate) fn remove_allocation_excludes(checkout: &Path, branch: &str) {
+    live_here().remove(&live_key(checkout, branch));
     if let Err(e) = try_remove_allocation_excludes(checkout, branch) {
         warn!(
             checkout = %checkout.display(),
@@ -438,16 +480,17 @@ fn try_remove_allocation_excludes(checkout: &Path, branch: &str) -> Result<(), S
     let Some(path) = info_exclude_path(checkout) else {
         return Ok(());
     };
-    let existing = read_exclude(&path)?;
+    let _excl = crate::fleet::info_exclude_lock();
+    let existing = crate::fleet::read_info_exclude(&path)?;
     let begin = format!("{BLOCK_BEGIN}{branch}");
     let end = format!("{BLOCK_END}{branch}");
-    let lines: Vec<&str> = existing.lines().collect();
-    let Some(b) = lines.iter().position(|l| l.trim_end() == begin) else {
+    let lines = lines_with_terminators(&existing);
+    let Some(b) = lines.iter().position(|l| content(l) == begin) else {
         return Ok(());
     };
     let Some(e) = lines[b..]
         .iter()
-        .position(|l| l.trim_end() == end)
+        .position(|l| content(l) == end)
         .map(|i| b + i)
     else {
         return Err(format!(
@@ -455,11 +498,7 @@ fn try_remove_allocation_excludes(checkout: &Path, branch: &str) -> Result<(), S
             path.display()
         ));
     };
-    let mut out = String::with_capacity(existing.len());
-    for line in lines[..b].iter().chain(lines[e + 1..].iter()) {
-        out.push_str(line);
-        out.push('\n');
-    }
+    let out: String = lines[..b].concat() + &lines[e + 1..].concat();
     std::fs::write(&path, out).map_err(|err| format!("write {}: {err}", path.display()))?;
     info!(
         checkout = %checkout.display(),
@@ -467,6 +506,177 @@ fn try_remove_allocation_excludes(checkout: &Path, branch: &str) -> Result<(), S
         "shared_branch_restore: removed the allocation's exclude block"
     );
     Ok(())
+}
+
+/// The agent branch of every allocation block in `checkout`'s exclude file
+/// (each begin line's suffix). Empty when there is no file, no block, or the
+/// file cannot be read.
+fn block_branches(checkout: &Path) -> Vec<String> {
+    let Some(path) = info_exclude_path(checkout) else {
+        return Vec::new();
+    };
+    let Ok(text) = crate::fleet::read_info_exclude(&path) else {
+        return Vec::new();
+    };
+    lines_with_terminators(&text)
+        .iter()
+        .filter_map(|l| content(l).strip_prefix(BLOCK_BEGIN))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a live session holds a checkout, as far as can be established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HolderState {
+    /// A live holder (this process's own allocation, or coord's claim).
+    Held,
+    /// coord answered: nothing holds it.
+    Free,
+    /// Could not be established — keeps the block.
+    Unknown(String),
+}
+
+/// What the sweep did with one block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SweepOutcome {
+    /// The allocation is provably not live; the block was taken out.
+    Removed { branch: String },
+    /// Kept, and why.
+    Kept { branch: String, why: String },
+}
+
+/// Reap allocation blocks left behind by a runner that exited, crashed, or
+/// was restarted before it removed its own (and any a racing writer in
+/// another process resurrected). A block is removed only when its allocation
+/// is PROVABLY not live:
+///
+/// - its `<branch>` no longer exists (git's own "no such ref"); or
+/// - the checkout's HEAD is not `refs/heads/<branch>` AND `holder` says
+///   nothing holds the checkout ([`HolderState::Free`]).
+///
+/// Every unknown — an unreadable HEAD, a branch probe that did not answer, an
+/// unanswered holder lookup — keeps the block, and says so. Blocking.
+pub(crate) fn sweep_stale_blocks(
+    checkout: &Path,
+    holder: impl Fn(&str) -> HolderState,
+) -> Vec<SweepOutcome> {
+    let mut out = Vec::new();
+    for branch in block_branches(checkout) {
+        let outcome = judge_block(checkout, &branch, &holder);
+        match &outcome {
+            SweepOutcome::Removed { branch } => {
+                remove_allocation_excludes(checkout, branch);
+                info!(
+                    checkout = %checkout.display(),
+                    branch = %branch,
+                    "shared_branch_restore: swept a stale allocation exclude block"
+                );
+            }
+            SweepOutcome::Kept { branch, why } => info!(
+                checkout = %checkout.display(),
+                branch = %branch,
+                "shared_branch_restore: kept an allocation exclude block — {why}"
+            ),
+        }
+        out.push(outcome);
+    }
+    out
+}
+
+fn judge_block(
+    checkout: &Path,
+    branch: &str,
+    holder: &impl Fn(&str) -> HolderState,
+) -> SweepOutcome {
+    let kept = |why: String| SweepOutcome::Kept {
+        branch: branch.to_string(),
+        why,
+    };
+    let removed = || SweepOutcome::Removed {
+        branch: branch.to_string(),
+    };
+    match ref_exists(checkout, &format!("refs/heads/{branch}"), "sweep branch") {
+        Ok(false) => return removed(),
+        Ok(true) => {}
+        Err(k) => return kept(format!("the branch probe did not answer: {k:?}")),
+    }
+    let head = match git_stdout(
+        checkout,
+        &["rev-parse", "--symbolic-full-name", "HEAD"],
+        "shared_branch_restore: sweep head",
+    ) {
+        Ok(h) => h.trim().to_string(),
+        Err(e) => return kept(format!("HEAD could not be read: {e}")),
+    };
+    if head == format!("refs/heads/{branch}") {
+        return kept("the checkout is on the allocation's branch".into());
+    }
+    match holder(branch) {
+        HolderState::Free => removed(),
+        HolderState::Held => kept("a live holder holds the checkout".into()),
+        HolderState::Unknown(e) => kept(format!(
+            "whether anything holds the checkout is unknown: {e}"
+        )),
+    }
+}
+
+/// [`sweep_stale_blocks`] for one checkout with its holder resolved: this
+/// process's own live allocation first, then coord's `kind=worktree` claim on
+/// the checkout (the claim a shared-branch session holds on the canonical
+/// checkout it works in). No coord base, or no answer, is
+/// [`HolderState::Unknown`]. Cheap when the file holds no block: nothing is
+/// asked.
+pub(crate) async fn sweep_checkout(checkout: std::path::PathBuf, coord_base: Option<String>) {
+    let probe = checkout.clone();
+    let branches = tokio::task::spawn_blocking(move || block_branches(&probe))
+        .await
+        .unwrap_or_default();
+    if branches.is_empty() {
+        return;
+    }
+    let coord = match coord_base {
+        Some(base) => {
+            let key = super::worktree_resource_key(&checkout);
+            match super::fs_backstop::canonical_checkout_claim_holder(&base, &key).await {
+                Ok(Some(_)) => HolderState::Held,
+                Ok(None) => HolderState::Free,
+                Err(e) => HolderState::Unknown(e),
+            }
+        }
+        None => HolderState::Unknown("no coord base configured".into()),
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        sweep_stale_blocks(&checkout, |branch| {
+            if live_here().contains(&live_key(&checkout, branch)) {
+                HolderState::Held
+            } else {
+                coord.clone()
+            }
+        })
+    })
+    .await;
+}
+
+/// Run [`sweep_checkout`] over every `qontinui-*` primary checkout under the
+/// workspace root — at runner startup, before any allocation of this process
+/// can hold a block.
+pub(crate) async fn sweep_workspace(coord_base: Option<String>) {
+    let Some(root) = super::census::qontinui_root() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_repo = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("qontinui-"));
+        if is_repo && path.join(".git").is_dir() {
+            sweep_checkout(path, coord_base.clone()).await;
+        }
+    }
 }
 
 #[cfg(test)]
