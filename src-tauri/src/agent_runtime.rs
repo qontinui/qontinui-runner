@@ -1195,6 +1195,19 @@ fn launchable_or_bare(resolved: String) -> String {
     resolved
 }
 
+/// The string a gate continuation's pre-claim CLI probe reads: what the
+/// presentation will actually exec. The headless arm execs
+/// `launchable_or_bare(claude_bin)` (a non-executable file falls back to the
+/// bare name, which `execvp` resolves past); the terminal arm execs the
+/// resolved path itself. Blocking (a `stat`) — run it with the probe.
+fn continuation_probe_target(headless: bool, claude_bin: &str) -> String {
+    if headless {
+        launchable_or_bare(claude_bin.to_string())
+    } else {
+        claude_bin.to_string()
+    }
+}
+
 /// Resolve `claude` to an absolute, directly-launchable executable path for
 /// PTY-spawned continuation terminals (condition-check, gate-continuation).
 ///
@@ -7640,22 +7653,22 @@ async fn run_gate_continuation_inner(
     // probe reads THAT string for headless; the terminal arm execs the
     // resolved path itself.
     let headless = matches!(payload.presentation, Presentation::Headless);
-    let probe_target = move |bin: &str| {
-        if headless {
-            launchable_or_bare(bin.to_string())
-        } else {
-            bin.to_string()
-        }
-    };
     let (claude_bin, cli_readiness) = spawn_blocking_tracked(move || {
         let bin = resolve_claude_bin();
-        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(&probe_target(&bin));
+        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(
+            &continuation_probe_target(headless, &bin),
+        );
         (bin, readiness)
     })
     .await
     .unwrap_or_else(|_| {
+        // The resolve task panicked: fall back to the bare name, probed
+        // through the SAME per-presentation mapping, so a headless spawn is
+        // judged on what it will exec.
         let bin = claude_bin_path();
-        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(&bin);
+        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(
+            &continuation_probe_target(headless, &bin),
+        );
         (bin, readiness)
     });
     // Posted AFTER the #469 guards pass and AWAITED — the claim's result
@@ -7854,7 +7867,7 @@ async fn run_gate_continuation_inner(
                 gate_id,
                 &result,
                 claim_sent,
-                &crate::continuation_spawn_readiness::probe_claude_cli,
+                crate::continuation_spawn_readiness::probe_claude_cli,
                 &crate::resource_guard::probe_for_spawn,
                 |resolution| {
                     post_spawn_outcome(
@@ -7981,29 +7994,50 @@ enum GateAck {
 /// [`crate::continuation_spawn_readiness::probe_claude_cli`],
 /// [`crate::resource_guard::probe_for_spawn`], [`post_spawn_outcome`] and
 /// [`defer_continuation_unclaimed`].
-async fn ack_gate_spawn_result<P, PFut, D, DFut>(
+async fn ack_gate_spawn_result<Q, P, PFut, D, DFut>(
     gate_id: uuid::Uuid,
     result: &anyhow::Result<Option<uuid::Uuid>>,
     claim_sent: Option<ClaimSent>,
-    cli_probe: &(dyn Fn(&str) -> crate::continuation_spawn_readiness::CliReadiness + Sync),
+    cli_probe: Q,
     critical_now: &(dyn Fn() -> crate::resource_guard::SpawnGate + Sync),
     post: P,
     defer_unclaimed: D,
 ) -> GateAck
 where
+    Q: Fn(&str) -> crate::continuation_spawn_readiness::CliReadiness + Send + 'static,
     P: FnOnce(SpawnResolution) -> PFut,
     PFut: std::future::Future<Output = ()>,
     D: FnOnce(String) -> DFut,
     DFut: std::future::Future<Output = ()>,
 {
     use crate::continuation_spawn_readiness::{
-        classify_seam_refusal, settle_failed_gate_spawn, FailedSpawnDisposition,
+        classify_seam_refusal, settle_failed_gate_spawn, CliReadiness, FailedSpawnDisposition,
+        TerminalSeamFailure,
     };
     let Err(error) = result else {
         post(spawn_resolution_outcome(result)).await;
         return GateAck::Posted;
     };
-    let refusal = classify_seam_refusal(error, cli_probe, critical_now);
+    // The re-probe `classify_seam_refusal` reads for a terminal seam failure
+    // is blocking filesystem work (`access` + `stat`, a PATH walk for a bare
+    // name), so it runs on the blocking pool like the pre-claim probe, never
+    // on this async worker. Only a terminal failure that is not the resource
+    // guard's is ever re-probed. A panicked probe reads `Ready`: the failure is
+    // then classified non-CLI and posted, never deferred on a guess.
+    let probed = match error.downcast_ref::<TerminalSeamFailure>() {
+        Some(failure)
+            if !error
+                .to_string()
+                .starts_with(crate::resource_guard::CRITICAL_REFUSAL_PREFIX) =>
+        {
+            let bin = failure.claude_bin.clone();
+            spawn_blocking_tracked(move || cli_probe(&bin))
+                .await
+                .unwrap_or(CliReadiness::Ready)
+        }
+        _ => CliReadiness::Ready,
+    };
+    let refusal = classify_seam_refusal(error, &|_bin| probed.clone(), critical_now);
     let disposition = settle_failed_gate_spawn(
         gate_id,
         claim_sent,
@@ -18478,6 +18512,35 @@ mod tests {
         );
     }
 
+    /// Review A4: the pre-claim probe (and its JoinError fallback) reads what
+    /// each presentation will EXEC — the headless arm `launchable_or_bare(bin)`,
+    /// the terminal arm `bin` itself — so a non-executable resolution is judged
+    /// as the bare name for headless and as the file for terminal.
+    #[cfg(unix)]
+    #[test]
+    fn the_headless_probe_target_is_launchable_or_bare() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
+        std::env::remove_var("QONTINUI_CLAUDE_BIN");
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("claude");
+        std::fs::write(&f, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let bin = f.to_string_lossy().into_owned();
+        assert_eq!(
+            continuation_probe_target(true, &bin),
+            launchable_or_bare(bin.clone())
+        );
+        assert_eq!(continuation_probe_target(true, &bin), "claude");
+        assert_eq!(continuation_probe_target(false, &bin), bin);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(continuation_probe_target(true, &bin), bin);
+        // The bare-name fallback maps to itself on both arms.
+        assert_eq!(continuation_probe_target(true, "claude"), "claude");
+        assert_eq!(continuation_probe_target(false, "claude"), "claude");
+    }
+
     #[test]
     fn claude_bin_respects_env_override() {
         let _env_lock = env_lock();
@@ -21032,7 +21095,7 @@ mod tests {
                 uuid::Uuid::now_v7(),
                 &result,
                 claim_sent,
-                &|_bin| cli.clone(),
+                move |_bin: &str| cli.clone(),
                 &|| now.clone(),
                 |r: SpawnResolution| {
                     fired.borrow_mut().push(Fired::Posted(r.outcome, r.detail));
@@ -25092,6 +25155,7 @@ mod unspawned_door_tests {
             AnchorReservation::none(),
             uuid::Uuid::new_v4(),
             None,
+            "claude".to_string(),
         )
         .await;
 

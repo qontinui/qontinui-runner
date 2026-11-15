@@ -106,7 +106,7 @@ fn a_directory_is_unlaunchable() {
 fn a_bare_name_is_unresolved() {
     // Over an explicit empty PATH, never the real process environment.
     assert_eq!(
-        probe_claude_cli_with_path("claude", None),
+        probe_claude_cli_with_path("claude", None, None),
         CliReadiness::Unresolved
     );
     // The injected predicate is never consulted for a bare name.
@@ -523,18 +523,18 @@ fn a_bare_name_is_launchable_only_when_a_path_entry_holds_an_executable() {
     std::fs::write(&s, b"#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o644)).unwrap();
     let only_stub = std::env::join_paths([stub.path()]).unwrap();
-    assert!(!bare_name_on_path("claude", Some(&only_stub)));
+    assert!(!bare_name_on_path("claude", Some(&only_stub), None));
     let r = real.path().join("claude");
     std::fs::write(&r, b"#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o755)).unwrap();
     let both = std::env::join_paths([stub.path(), real.path()]).unwrap();
-    assert!(bare_name_on_path("claude", Some(&both)));
+    assert!(bare_name_on_path("claude", Some(&both), None));
     // A directory named `claude` is skipped, as execve would refuse it.
     let dir_only = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir_only.path().join("claude")).unwrap();
     let dirs = std::env::join_paths([dir_only.path()]).unwrap();
-    assert!(!bare_name_on_path("claude", Some(&dirs)));
-    assert!(!bare_name_on_path("claude", None));
+    assert!(!bare_name_on_path("claude", Some(&dirs), None));
+    assert!(!bare_name_on_path("claude", None, None));
     // A shim dir is skipped even when it holds a launchable `claude`, as
     // `resolve_claude_bin` skips it: a resolve miss stays a miss.
     let shim_parent = tempfile::tempdir().unwrap();
@@ -547,14 +547,136 @@ fn a_bare_name_is_launchable_only_when_a_path_entry_holds_an_executable() {
     std::fs::write(&sc, b"#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&sc, std::fs::Permissions::from_mode(0o755)).unwrap();
     let shim_only = std::env::join_paths([shim.as_path()]).unwrap();
-    assert!(!bare_name_on_path("claude", Some(&shim_only)));
+    assert!(!bare_name_on_path("claude", Some(&shim_only), None));
     assert_eq!(
-        probe_claude_cli_with_path("claude", Some(&shim_only)),
+        probe_claude_cli_with_path("claude", Some(&shim_only), None),
         CliReadiness::Unresolved
     );
     assert_eq!(
-        probe_claude_cli_with_path("claude", Some(&both)),
+        probe_claude_cli_with_path("claude", Some(&both), None),
         CliReadiness::Ready
     );
-    assert!(!bare_name_on_path("a/claude", Some(&both)));
+    assert!(!bare_name_on_path("a/claude", Some(&both), None));
+}
+
+/// Review A1/A4: the bare-name walk skips exactly what `resolve_claude_bin`
+/// skips, through the SAME shared predicates — a dir identified only by its
+/// `IDENTITY_MARKER` (no shim-dir prefix in its name), a shim-prefixed dir
+/// spelled in a different case, the PERSISTENT identity dir, and a dir whose
+/// `claude` is npm's placeholder stub — while a plain dir with a real
+/// executable still counts.
+#[cfg(unix)]
+#[test]
+fn a_bare_name_walk_rejects_every_dir_resolve_claude_bin_skips() {
+    use qontinui_runner_lib::intercept_core::shim_dir::IDENTITY_MARKER;
+    use std::os::unix::fs::PermissionsExt;
+    let write_exec = |dir: &Path, body: &[u8]| {
+        std::fs::create_dir_all(dir).unwrap();
+        let f = dir.join("claude");
+        std::fs::write(&f, body).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Identified by its marker alone: the name carries no shim-dir prefix.
+    let marked = tmp.path().join("plain-looking-dir");
+    write_exec(&marked, b"#!/bin/sh\n");
+    std::fs::write(marked.join(IDENTITY_MARKER), b"build").unwrap();
+    let only_marked = std::env::join_paths([marked.as_path()]).unwrap();
+    assert!(!bare_name_on_path("claude", Some(&only_marked), None));
+
+    // A shim-prefixed dir in another case (the shared predicate folds case).
+    let upper = tmp.path().join(format!(
+        "{}X",
+        crate::install_effects_producer::intercept::shim_materializer::SHIM_DIR_PREFIX
+            .to_ascii_uppercase()
+    ));
+    write_exec(&upper, b"#!/bin/sh\n");
+    let only_upper = std::env::join_paths([upper.as_path()]).unwrap();
+    assert!(!bare_name_on_path("claude", Some(&only_upper), None));
+
+    // The persistent identity dir: nothing in its name or contents marks it,
+    // so it is skipped by path — and only when that path is the one passed.
+    let persistent = tmp.path().join("identity-shim");
+    write_exec(&persistent, b"#!/bin/sh\n");
+    let only_persistent = std::env::join_paths([persistent.as_path()]).unwrap();
+    assert!(!bare_name_on_path(
+        "claude",
+        Some(&only_persistent),
+        Some(persistent.as_path())
+    ));
+    assert!(bare_name_on_path("claude", Some(&only_persistent), None));
+
+    // npm's placeholder stub, executable, is a miss.
+    let stub = tmp.path().join("npm-bin");
+    write_exec(
+        &stub,
+        b"echo \"Error: claude native binary not installed.\" >&2\nexit 1\n",
+    );
+    let only_stub = std::env::join_paths([stub.as_path()]).unwrap();
+    assert!(!bare_name_on_path("claude", Some(&only_stub), None));
+
+    // All of them ahead of a real binary: the real one is what counts.
+    let real = tmp.path().join("real");
+    write_exec(&real, b"#!/bin/sh\n");
+    let all = std::env::join_paths([
+        marked.as_path(),
+        upper.as_path(),
+        persistent.as_path(),
+        stub.as_path(),
+    ])
+    .unwrap();
+    assert!(!bare_name_on_path(
+        "claude",
+        Some(&all),
+        Some(persistent.as_path())
+    ));
+    assert_eq!(
+        probe_claude_cli_with_path("claude", Some(&all), Some(persistent.as_path())),
+        CliReadiness::Unresolved
+    );
+    let all_then_real = std::env::join_paths([
+        marked.as_path(),
+        upper.as_path(),
+        persistent.as_path(),
+        stub.as_path(),
+        real.as_path(),
+    ])
+    .unwrap();
+    assert_eq!(
+        probe_claude_cli_with_path("claude", Some(&all_then_real), Some(persistent.as_path())),
+        CliReadiness::Ready
+    );
+}
+
+/// Review item 2: coord re-drives ANY detail carrying the
+/// `claude_cli_unavailable:` head, and reserves it for the transient kinds. A
+/// deterministic CLI failure (`errno_<n>`, `unknown`, `not_on_path`) posts its
+/// raw detail so coord alerts instead of retrying for ever.
+#[test]
+fn only_a_transient_cli_refusal_gets_the_retriable_head() {
+    let raw = "PTY holder spawn failed: holder failed [exit_status: 5]";
+    for transient in [
+        "enoent",
+        "eacces",
+        "enoexec",
+        "etxtbsy",
+        "sharing_violation",
+    ] {
+        let detail = outcome_detail(
+            Some(&SeamRefusal::ClaudeCli(CliKind::Known(transient))),
+            raw,
+        );
+        assert_eq!(
+            detail,
+            format!("claude_cli_unavailable:{transient}: {raw}"),
+            "{transient}"
+        );
+        assert!(coord_reads_as_missing_cli(&detail));
+    }
+    for deterministic in [CliKind::Errno(40), CliKind::Unknown, CliKind::NotOnPath] {
+        let detail = outcome_detail(Some(&SeamRefusal::ClaudeCli(deterministic.clone())), raw);
+        assert_eq!(detail, raw, "{deterministic:?}");
+        assert!(!coord_reads_as_missing_cli(&detail), "{deterministic:?}");
+    }
 }
