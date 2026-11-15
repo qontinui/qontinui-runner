@@ -303,7 +303,10 @@ const LOCK_PATIENCE: LockPatience = LockPatience {
 ///
 /// Dropping it drops the database — in the background, `WITH (FORCE)`, so a
 /// connection still open on it cannot keep it alive. A database still alive at
-/// exit goes with its cluster.
+/// exit goes with the bundled cluster, whose root the exit-time teardown
+/// removes. On an external server ([`EXTERNAL_URL_ENV`]) that teardown drops
+/// it instead, where `atexit` runs; a killed process leaves it there, and a
+/// later boot only reports it.
 pub struct TestDatabase {
     name: String,
     url: String,
@@ -3797,14 +3800,15 @@ mod tests {
 
     /// A test process that is KILLED runs no exit-time teardown, so its
     /// postmaster outlives it, and the next boot's sweep must STOP that
-    /// postmaster (`pg_ctl stop -m immediate`), not kill it: a stopped
-    /// postmaster removes its System V segment and its dynamic shared memory
-    /// as it exits, and a killed one leaves both behind for good once the sweep
-    /// has removed its data directory. On Linux both are checked — the segment
-    /// in `/proc/sysvipc/shm`, and the `/dev/shm` files of the cluster's
-    /// dynamic shared memory ([`dsm_files_of`]) — present while the child runs
-    /// and gone after the sweep. What a failing run leaves of either is removed
-    /// before anything is asserted.
+    /// postmaster, not kill it ([`end_postmaster`]: on Linux SIGQUIT through a
+    /// pidfd, which is what `pg_ctl stop -m immediate` sends; `pg_ctl` itself
+    /// elsewhere). A stopped postmaster removes its System V segment and its
+    /// dynamic shared memory as it exits, and a killed one leaves both behind
+    /// for good once the sweep has removed its data directory. On Linux both
+    /// are checked — the segment in `/proc/sysvipc/shm`, and the `/dev/shm`
+    /// files of the cluster's dynamic shared memory ([`dsm_files_of`]) —
+    /// present while the child runs and gone after the sweep. What a failing
+    /// run leaves of either is removed before anything is asserted.
     ///
     /// The child boots in the shared harness directory, where another boot
     /// running this same code — another test's child — may sweep the root

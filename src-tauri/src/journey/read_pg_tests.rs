@@ -5,13 +5,10 @@
 //! `2026-11-09-runner-postgres-backed-tests-never-run-so-hand-verified-sql-is-unretained`,
 //! Phase 2).
 //!
-//! qontinui-runner#2759 checked these constants by hand on an ephemeral
-//! Postgres and kept the result only in its PR body; CI pinned them by their
-//! text alone (`tests::a_since_read_partitions_the_ledger_and_hides_no_row`).
-//! These tests are that check, retained. Each runs on a fresh database of its
-//! own from the test harness (`PgDb::new_for_test`), which carries the full
-//! canonical schema, seeds the same ledger ([`seeded`]) and asserts one
-//! property, lettered as the plan letters them:
+//! Each test runs on a fresh database of its own from the test harness
+//! (`PgDb::new_for_test`), which carries the full canonical schema, seeds the
+//! same ledger ([`seeded`]) and asserts one property, lettered as the plan
+//! letters them:
 //!
 //! - (a) the partition is complete: the rows read in full plus the rows the
 //!   older groups stand for are the app's rows, each where the partition puts
@@ -24,32 +21,12 @@
 //!   reaches over every row, and the three corrected row totals are equal;
 //! - (g) Postgres accepts every edge-case bind [`since_bind`] makes.
 //!
-//! Each assertion the plan names a mutation for was seen to fail against it,
-//! with its own message: (b) when `<` became `<=` in `OLDER_EDGE_GROUPS_SQL`'s
-//! partition, (c) when `e.app_id = $1` became `$1::text IS NOT NULL` in the
-//! three since queries, and (e) when `(e.invalidated_at IS NOT NULL)` left that
-//! query's `GROUP BY`. (a), (f) and (g) went red under all three; (d), which
-//! asserts only stability and order, under none.
-//!
-//! (f)'s verdict (`test_fixtures::verdict`) reads each conclusion by identity,
-//! and was seen to need to. When the full since read handed every affordance
-//! row back under another `targetFingerprint`, (f) failed on the graph answer's
-//! edges alone; the verdict it replaced, which compared the graph's nodes by
-//! their number and read no edge, passed it. An older group never adds a node
-//! or an edge — the filter excludes it first — so a wrong representative shows
-//! in (f) only through the doubt it leaves: a representative naming its
-//! `fromNode` as its `toNode` failed (f) on the graph answer's unknown
-//! destinations, but one doing so only for `changed` groups left (f) green
-//! (every prior-knowledge candidate here is unsettled already), and (a), (b),
-//! (e) and (g) caught it. The verdict now also reads each graph node's open
-//! frontier entries and unconfirmed destination and each unexplored node's two
-//! flags, and (f) is still green under that last mutation.
-//!
-//! Every mutation above was a temporary edit to `read.rs`, reverted after its
-//! run, so its runs are kept with the pull request that added this module, not
-//! in the tree. Each ran before this branch was rebased onto `main` and again
-//! on the rebased branch, against the verdict as it stands now, with the same
-//! result; only the runs before the rebase also tried the replaced verdict.
+//! (f) compares answers through `test_fixtures::verdict`, which reads each
+//! conclusion by identity — which nodes, edges, dead ends and reached nodes an
+//! answer lists, with the fields that describe them — and reads no count, since
+//! a grouped read counts each group once. An older group never adds a node or
+//! an edge: the filter excludes it first, so it shows in (f) only through the
+//! doubt it leaves, such as an arrival whose destination is unknown.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
