@@ -583,7 +583,9 @@ mod tests {
                 None => 0,
             };
             assert!(
-                production.get(from..).is_some_and(|rest| rest.contains(call)),
+                production
+                    .get(from..)
+                    .is_some_and(|rest| rest.contains(call)),
                 "{name}: production code no longer calls `{call}`{} — the pane it \
                  creates would have no terminal_shell coord row",
                 marker.map(|m| format!(" after `{m}`")).unwrap_or_default()
