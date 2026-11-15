@@ -22849,7 +22849,6 @@ mod gateway_spawn_refusal_tests {
 /// Plan `2026-11-13-spawn-refused-tree-followups` Phase 2: the headless
 /// continuation's gateway refusal, driven end to end through the remover.
 #[cfg(test)]
-#[path = "agent_runtime/headless_refusal_tests.rs"]
 mod headless_refusal_tests;
 
 /// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
