@@ -45,6 +45,14 @@
 //!   served conditions; this only records what the session already stated.
 //! - It never reports success it did not get: a `set_finished` whose coord
 //!   write was not queued (`no_coord_session`, …) is logged UNRELAYED.
+//! - It never holds silently. Every per-gate hold is `debug`, so on its own a
+//!   relay that can never read coord would look exactly like one with nothing
+//!   to relay. The relay keeps each held gate's LAST read ([`LastRead`]) and
+//!   the last credential result, folds them into one [`Reading`], and logs its
+//!   [`Reading::headline`] whenever it changes: at `warn` while it is degraded
+//!   (a gate unreadable, or no credential), at `info` otherwise. A degraded
+//!   headline that does not change is logged again every [`DEGRADED_RELOG`],
+//!   so a failure that never clears is never just one old line in the log.
 //!
 //! The live children hint (`has_live_children`) is deliberately NOT a
 //! condition here. Every fleet session holds its boot-time `coord-mcp-shim.py`
@@ -106,6 +114,139 @@ pub enum RelayDecision {
     Relay(&'static str),
     /// Hold, for this reason (logged at debug).
     Hold(String),
+}
+
+/// What a held gate's last read said. It is kept per gate between ticks, so
+/// [`Reading`] describes every gate held after a read, not only the ones whose
+/// [`RE_READ_AFTER`] clock happened to fall due this tick.
+///
+/// It is LAST-KNOWN, not current. A gate whose pane has gone busy is not
+/// re-read, so it keeps its last read until it is read again or its session
+/// leaves the candidate set. A gate never read (its pane has been busy since
+/// the continuation opened) has no entry and is not counted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LastRead {
+    /// The gate carries no outcome: the session said nothing yet.
+    NoOutcome,
+    /// An outcome only the dispatcher writes (`spawned`, `work_unreported`, …).
+    NotRelayable,
+    /// The read failed (transport, non-2xx, no such row, undecodable body).
+    Unreadable(String),
+}
+
+impl LastRead {
+    /// The held class `read` leaves behind, or `None` for a relayable outcome:
+    /// that gate's session is about to be marked finished, not held.
+    pub fn from_read(read: &GateOutcomeRead) -> Option<Self> {
+        match read {
+            GateOutcomeRead::Unreadable(why) => Some(LastRead::Unreadable(why.clone())),
+            GateOutcomeRead::Outcome(None) => Some(LastRead::NoOutcome),
+            GateOutcomeRead::Outcome(Some(raw)) => match relayable_token(raw) {
+                Some(_) => None,
+                None => Some(LastRead::NotRelayable),
+            },
+        }
+    }
+}
+
+/// The relay's standing reading over every gate it holds after a read, plus
+/// the last credential result. This is what it logs above `debug`. Pure data.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Reading {
+    /// Held gates whose last read carried no outcome.
+    pub no_outcome: usize,
+    /// Held gates whose last read carried a non-relayable outcome.
+    pub not_relayable: usize,
+    /// Held gates whose last read failed.
+    pub unreadable: usize,
+    /// The lexicographically first unreadable reason. A fixed pick, so two
+    /// gates failing differently cannot make the headline alternate.
+    pub first_unreadable: Option<String>,
+    /// The last attempt to build a coord reader failed with this; `None`
+    /// once one succeeds.
+    pub reader_error: Option<String>,
+}
+
+impl Reading {
+    /// Fold the held gates' last reads and the credential result.
+    pub fn from_known<'a>(
+        known: impl IntoIterator<Item = &'a LastRead>,
+        reader_error: Option<&str>,
+    ) -> Self {
+        let mut r = Reading {
+            reader_error: reader_error.map(str::to_string),
+            ..Reading::default()
+        };
+        for last in known {
+            match last {
+                LastRead::NoOutcome => r.no_outcome += 1,
+                LastRead::NotRelayable => r.not_relayable += 1,
+                LastRead::Unreadable(why) => {
+                    r.unreadable += 1;
+                    if r.first_unreadable
+                        .as_deref()
+                        .is_none_or(|f| why.as_str() < f)
+                    {
+                        r.first_unreadable = Some(why.clone());
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    /// Nothing held after a read and no credential failure.
+    pub fn is_empty(&self) -> bool {
+        *self == Reading::default()
+    }
+
+    /// Whether the relay is blind somewhere: a gate unreadable, or no
+    /// credential. Logged at `warn`.
+    pub fn degraded(&self) -> bool {
+        self.reader_error.is_some() || self.unreadable > 0
+    }
+
+    /// The one-line summary compared between ticks.
+    pub fn headline(&self) -> String {
+        let mut h = format!(
+            "held_no_outcome={} held_not_relayable={} unreadable={}",
+            self.no_outcome, self.not_relayable, self.unreadable
+        );
+        if let Some(why) = &self.first_unreadable {
+            h.push_str(&format!(" first_unreadable=\"{why}\""));
+        }
+        if let Some(e) = &self.reader_error {
+            h.push_str(&format!(" reader_error=\"{e}\""));
+        }
+        h
+    }
+}
+
+/// A degraded headline that has not changed is logged again after this long.
+pub const DEGRADED_RELOG: Duration = Duration::from_secs(30 * 60);
+
+/// The headline to log now, or `None`. `last` is the last headline logged and
+/// when it was logged. Pure: the unit-test surface of the change gate.
+///
+/// - The first line is withheld until there is something to say, so a box
+///   with no held continuation logs nothing at all.
+/// - After that, a CHANGED headline is logged. That includes the return to
+///   empty, so a recovery is stated rather than left implied.
+/// - An unchanged headline is logged again only while degraded, once every
+///   [`DEGRADED_RELOG`].
+pub fn headline_to_log(
+    reading: &Reading,
+    last: Option<(&str, std::time::Instant)>,
+    now: std::time::Instant,
+) -> Option<String> {
+    let h = reading.headline();
+    match last {
+        None => (!reading.is_empty()).then_some(h),
+        Some((prev, _)) if prev != h => Some(h),
+        Some((_, at)) => {
+            (reading.degraded() && now.saturating_duration_since(at) >= DEGRADED_RELOG).then_some(h)
+        }
+    }
 }
 
 /// The relayable token a raw outcome carries, or `None`.
@@ -274,10 +415,68 @@ pub fn start() {
     info!("continuation_finish_relay: started");
 }
 
-/// What survives between ticks: when each gate was last read and held.
+/// What survives between ticks: when each gate was last read and held, what
+/// that read said, the last credential result, and the last headline logged.
 #[derive(Debug, Default)]
 struct RelayState {
     last_read: HashMap<uuid::Uuid, std::time::Instant>,
+    /// Each held gate's last read. A gate leaves it when its session is no
+    /// longer a candidate (finished, or its pane gone) or its read relays.
+    known: HashMap<uuid::Uuid, LastRead>,
+    /// The last ATTEMPT to build a coord reader, if it failed. It is cleared
+    /// by the next successful attempt, or once no candidate is held. It is
+    /// not re-tested on a tick that reads nothing (every pane busy or not
+    /// due), so it is last-known, like [`LastRead`].
+    reader_error: Option<String>,
+    /// The last headline logged and when: the change gate.
+    last_logged: Option<(String, std::time::Instant)>,
+}
+
+impl RelayState {
+    /// Drop every gate not in `held` (its session finished, its pane or
+    /// registry entry gone). With nothing held, nothing is blind, so a stale
+    /// credential failure is cleared too.
+    fn keep_only(&mut self, held: &HashSet<uuid::Uuid>) {
+        self.known.retain(|g, _| held.contains(g));
+        if held.is_empty() {
+            self.reader_error = None;
+        }
+    }
+
+    /// Record one attempt to build a coord reader.
+    fn record_reader(&mut self, result: Result<(), &str>) {
+        self.reader_error = result.err().map(str::to_string);
+    }
+
+    /// Record what one gate's read said. A relayable read leaves no entry: its
+    /// session is about to be marked finished, not held.
+    fn record_read(&mut self, gate_id: uuid::Uuid, read: &GateOutcomeRead) {
+        match LastRead::from_read(read) {
+            Some(last) => self.known.insert(gate_id, last),
+            None => self.known.remove(&gate_id),
+        };
+    }
+
+    /// The standing reading over everything recorded.
+    fn reading(&self) -> Reading {
+        Reading::from_known(self.known.values(), self.reader_error.as_deref())
+    }
+
+    /// Log the standing [`Reading`] if [`headline_to_log`] says so.
+    fn log_reading(&mut self) {
+        let reading = self.reading();
+        let now = std::time::Instant::now();
+        let last = self.last_logged.as_ref().map(|(h, at)| (h.as_str(), *at));
+        let Some(h) = headline_to_log(&reading, last, now) else {
+            return;
+        };
+        if reading.degraded() {
+            warn!(summary = %h, "continuation_finish_relay: DEGRADED — held continuations whose gate cannot be read, or no coord credential");
+        } else {
+            info!(summary = %h, "continuation_finish_relay: held continuations");
+        }
+        self.last_logged = Some((h, now));
+    }
 }
 
 async fn run_loop() {
@@ -288,6 +487,7 @@ async fn run_loop() {
     loop {
         ticker.tick().await;
         tick_once(&mut state).await;
+        state.log_reading();
     }
 }
 
@@ -321,6 +521,7 @@ async fn tick_once(state: &mut RelayState) {
     let continuations = crate::agent_runtime::live_gate_continuations();
     let live_gates: HashSet<uuid::Uuid> = continuations.iter().map(|(_, g)| *g).collect();
     state.last_read.retain(|g, _| live_gates.contains(g));
+    state.keep_only(&live_gates);
     if continuations.is_empty() {
         return;
     }
@@ -346,6 +547,10 @@ async fn tick_once(state: &mut RelayState) {
         .into_iter()
         .filter_map(|(tid, gate)| unfinished.get(&tid).map(|sid| (tid, gate, sid.clone())))
         .collect();
+    // A gate whose session finished (itself, or by this relay) or whose
+    // record is gone is no longer held.
+    let candidate_gates: HashSet<uuid::Uuid> = candidates.iter().map(|(_, g, _)| *g).collect();
+    state.keep_only(&candidate_gates);
     if candidates.is_empty() {
         return;
     }
@@ -377,15 +582,21 @@ async fn tick_once(state: &mut RelayState) {
                 reader = Some(coord_reader().await);
             }
             let r = match &reader {
-                Some(Ok(r)) => r,
+                Some(Ok(r)) => {
+                    state.record_reader(Ok(()));
+                    r
+                }
                 Some(Err(e)) => {
                     debug!(error = %e, "continuation_finish_relay: no coord reader this tick");
+                    state.record_reader(Err(e));
                     return;
                 }
                 None => return,
             };
             state.last_read.insert(gate_id, now);
-            fetch_gate_outcome(r, gate_id).await
+            let read = fetch_gate_outcome(r, gate_id).await;
+            state.record_read(gate_id, &read);
+            read
         };
         match decide(grid, sideband, now_ms, grace, &gate) {
             RelayDecision::Hold(why) => {
@@ -674,5 +885,134 @@ mod tests {
             row("t1", "old", 100, false),
         ]);
         assert_eq!(m.get("t1").map(String::as_str), Some("new"));
+    }
+
+    /// Each read leaves the right held class; a relayable one leaves none.
+    #[test]
+    fn last_read_classifies_each_read_and_a_relayable_one_is_not_held() {
+        assert_eq!(
+            LastRead::from_read(&outcome(None)),
+            Some(LastRead::NoOutcome)
+        );
+        assert_eq!(
+            LastRead::from_read(&outcome(Some("spawned"))),
+            Some(LastRead::NotRelayable)
+        );
+        assert_eq!(
+            LastRead::from_read(&GateOutcomeRead::Unreadable("HTTP 401".into())),
+            Some(LastRead::Unreadable("HTTP 401".into()))
+        );
+        assert_eq!(LastRead::from_read(&outcome(Some("work_completed"))), None);
+        assert_eq!(
+            LastRead::from_read(&outcome(Some("work_abandoned: x"))),
+            None
+        );
+    }
+
+    /// The reading counts every held gate, picks a FIXED first unreadable
+    /// reason whatever the order, and is degraded only when blind somewhere.
+    #[test]
+    fn the_reading_folds_every_held_gate_and_is_order_independent() {
+        let a = [
+            LastRead::NoOutcome,
+            LastRead::Unreadable("HTTP 500".into()),
+            LastRead::NotRelayable,
+            LastRead::Unreadable("HTTP 401".into()),
+            LastRead::NoOutcome,
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        let ra = Reading::from_known(a.iter(), None);
+        assert_eq!((ra.no_outcome, ra.not_relayable, ra.unreadable), (2, 1, 2));
+        assert_eq!(ra.first_unreadable.as_deref(), Some("HTTP 401"));
+        assert_eq!(ra, Reading::from_known(b.iter(), None));
+        assert!(ra.degraded());
+
+        let held = Reading::from_known([LastRead::NoOutcome].iter(), None);
+        assert!(!held.degraded() && !held.is_empty());
+
+        let blind = Reading::from_known(std::iter::empty(), Some("no credential (x)"));
+        assert!(blind.degraded() && !blind.is_empty());
+        assert!(blind
+            .headline()
+            .contains("reader_error=\"no credential (x)\""));
+        assert!(Reading::default().is_empty());
+    }
+
+    /// The change gate: nothing on an empty first reading; a change (the
+    /// return to empty included) is logged; an unchanged reading stays silent,
+    /// except a degraded one, which is logged again every DEGRADED_RELOG.
+    #[test]
+    fn a_headline_is_logged_on_change_and_a_standing_failure_is_re_logged() {
+        let t0 = std::time::Instant::now();
+        assert_eq!(headline_to_log(&Reading::default(), None, t0), None);
+
+        let held = Reading::from_known([LastRead::NoOutcome].iter(), None);
+        let first = headline_to_log(&held, None, t0).expect("first non-empty reading is logged");
+        let later = t0 + DEGRADED_RELOG * 3;
+        assert_eq!(
+            headline_to_log(&held, Some((&first, t0)), later),
+            None,
+            "an unchanged healthy reading is never re-logged"
+        );
+        assert!(
+            headline_to_log(&Reading::default(), Some((&first, t0)), t0).is_some(),
+            "the return to empty is a change and is stated"
+        );
+
+        let blind = Reading::from_known(std::iter::empty(), Some("timed out"));
+        let h = headline_to_log(&blind, Some((&first, t0)), t0).expect("a new failure is logged");
+        assert_eq!(
+            headline_to_log(&blind, Some((&h, t0)), t0 + DEGRADED_RELOG / 2),
+            None
+        );
+        assert!(headline_to_log(&blind, Some((&h, t0)), t0 + DEGRADED_RELOG).is_some());
+    }
+
+    /// The bookkeeping tick_once drives: reads replace a gate's entry, a
+    /// relayable read removes it, a credential result is recorded and cleared,
+    /// and dropping out of the held set removes the gate (and, with nothing
+    /// held, the credential failure).
+    #[test]
+    fn relay_state_bookkeeping_tracks_reads_credentials_and_dropouts() {
+        let (g1, g2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut st = RelayState::default();
+        st.record_read(g1, &GateOutcomeRead::Unreadable("HTTP 500".into()));
+        st.record_read(g2, &outcome(None));
+        let r = st.reading();
+        assert_eq!((r.no_outcome, r.unreadable), (1, 1));
+        assert!(r.degraded());
+
+        // A later read of the same gate REPLACES its entry.
+        st.record_read(g1, &outcome(Some("spawned")));
+        let r = st.reading();
+        assert_eq!((r.no_outcome, r.not_relayable, r.unreadable), (1, 1, 0));
+        assert!(!r.degraded());
+
+        // A relayable read leaves no entry.
+        st.record_read(g1, &outcome(Some("work_completed")));
+        assert_eq!(st.reading().not_relayable, 0);
+        assert_eq!(st.reading().no_outcome, 1);
+
+        // A credential failure is recorded, and a success clears it.
+        st.record_reader(Err("no credential (x)"));
+        assert_eq!(
+            st.reading().reader_error.as_deref(),
+            Some("no credential (x)")
+        );
+        st.record_reader(Ok(()));
+        assert_eq!(st.reading().reader_error, None);
+
+        // Dropping out of the held set removes the gate; an EMPTY held set
+        // also clears a standing credential failure.
+        st.record_reader(Err("timed out"));
+        st.keep_only(&HashSet::from([g1]));
+        assert_eq!(st.reading().no_outcome, 0);
+        assert!(
+            st.reading().reader_error.is_some(),
+            "still held ⇒ still blind"
+        );
+        st.keep_only(&HashSet::new());
+        assert!(st.reading().is_empty());
     }
 }
