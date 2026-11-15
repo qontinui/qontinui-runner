@@ -2880,6 +2880,11 @@ async fn health(
         // retry, and not decremented when resolved).
         "registrarPinSeedTakesEverDeferred":
             crate::claude_session::coord_register::pin_seed_takes_ever_deferred(),
+        // Finishes a move re-offered to a pane row after another row had
+        // ACKed them (plan 2026-11-12-transcript-autobind-..., D5). Each one
+        // is also logged at info ("re-offered ...'s finish to pane row").
+        "registrarFinishReoffers":
+            crate::claude_session::coord_register::registrar_finish_reoffers(),
         // Browser-origin guard (plan 2026-09-17-runner-loopback-api-accepts-
         // any-origin): kill-switch state, route-policy mode, per-class refusal
         // and shadow counts, and the last 20 non-admit tuples — withheld from a
@@ -21373,6 +21378,7 @@ mod coord_provision_session_gate_tests {
             region.contains("\"registrarPinSeedTakesEverDeferred\":"),
             "{region}"
         );
+        assert!(region.contains("\"registrarFinishReoffers\":"), "{region}");
     }
 
     /// Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-
