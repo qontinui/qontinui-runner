@@ -1228,9 +1228,10 @@ where
     .map_err(MigrateError::from)
 }
 
-/// The `claude` anchor (oldest `claude` image, pid + start time) in the pane
-/// `terminal_id`, from one process-table snapshot. `None` when the pane is
-/// gone, remote (no local pid), hosts no `claude`, or the table is unreadable.
+/// The `claude` anchor (oldest live `claude`, pid + start time) in the pane
+/// `terminal_id`, from one look. `None` when the pane is gone, remote (no
+/// local pid), hosts no `claude`, the table is unreadable, or the anchor is
+/// undecided ([`pane_claude_anchor`]).
 async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<ProcIdentity> {
     use tauri::Manager;
     let manager = app
@@ -1238,12 +1239,24 @@ async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<Pr
         .inner()
         .clone();
     let root = manager.get(terminal_id)?.pane_root_pid()?;
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    if snapshot.is_unknown() {
+    let look = crate::terminal::graceful_exit::PaneLook::take(&[root]).await;
+    pane_claude_anchor(&look, root)
+}
+
+/// The oldest live `claude` under `root` in `look` — an image-proven one, or a
+/// pid Claude Code's session registry names whatever its image, so an
+/// npm-installed `claude` (`node … cli.js`) is the old writer too. `None` for
+/// an unreadable table, for no `claude`, and for an UNDECIDED anchor (a pid
+/// the registry could not settle may be the older `claude`): an unresolved
+/// anchor names no writer, so the post-exit top-up migrates nothing from it.
+fn pane_claude_anchor(
+    look: &crate::terminal::graceful_exit::PaneLook,
+    root: u32,
+) -> Option<ProcIdentity> {
+    if look.snapshot().is_unknown() {
         return None;
     }
-    let (pid, started_at) =
-        crate::process_capture::process_tree::claude_anchor_in_subtree(root, &snapshot)?;
+    let (pid, started_at) = look.claude_anchor(root).ok()??;
     Some(ProcIdentity { pid, started_at })
 }
 
@@ -2594,5 +2607,50 @@ mod tests {
 
         let text = nudge_text(vec![agent("a1", None)], Ok(Vec::new())).await;
         assert_eq!(text, CONTINUE_NUDGE, "nothing resumable now: nothing named");
+    }
+
+    /// Shell 5 → `node` 50 (an npm-installed `claude`, `node … cli.js`).
+    fn npm_pane_table() -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot {
+            stale: false,
+            ..Default::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name, started) in [(5, "bash", 1_000), (50, "node", 1_050)] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    fn npm_look(
+        witness: crate::terminal::graceful_exit::RegistryWitness,
+    ) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::over_whole_table(npm_pane_table(), witness)
+    }
+
+    /// The migration anchor (the old writer the post-exit top-up waits on):
+    /// an npm `claude` the registry names is the writer. Partner: drop the
+    /// witness and there is no writer. Unsettled, the anchor is unresolved:
+    /// no writer, so the top-up migrates nothing from it.
+    #[test]
+    fn an_npm_claude_is_the_old_writer_and_an_unsettled_one_is_none() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        assert_eq!(
+            pane_claude_anchor(&npm_look(RegistryWitness::naming(&[50])), 5),
+            Some(ProcIdentity {
+                pid: 50,
+                started_at: 1_050
+            })
+        );
+        assert_eq!(
+            pane_claude_anchor(&npm_look(RegistryWitness::naming(&[])), 5),
+            None
+        );
+        assert_eq!(
+            pane_claude_anchor(&npm_look(RegistryWitness::unreadable("test")), 5),
+            None
+        );
     }
 }

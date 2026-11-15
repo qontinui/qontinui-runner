@@ -13121,7 +13121,7 @@ pub fn create_router(
         // The boot instant for the agent-binding liveness readback's PID-reuse
         // reference — captured HERE, before the task's 3s delay and before the
         // restore, exactly as `session::tracking_health` captures its own
-        // before its initial delay. `claude_present_in_inclusive_subtree`
+        // before its initial delay. `PaneLook::claude_present`
         // tolerates only `PID_REUSE_SKEW_MS` (5s) of skew, so a value read
         // after the sleep is already outside it and would start reporting live
         // terminal-bearing bindings as not-present.
