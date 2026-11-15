@@ -12,9 +12,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { invokeMock, listeners } = vi.hoisted(() => ({
+const { invokeMock, listeners, windowLabel } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
   listeners: new Map<string, () => void>(),
+  windowLabel: { current: "main" },
+}));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ label: windowLabel.current }),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -303,6 +307,19 @@ describe("what the prune never does", () => {
     expect(populatedNames(hook().allPages)).toEqual(POPULATED_NAMES);
     expect(hook().allPages.find((p) => p.id === "oct-page-20")?.name).toBe("Page 41");
     expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBe("2");
+  });
+
+  it("prunes and repairs nothing in an unpinned pop-out window", async () => {
+    windowLabel.current = "term-2";
+    try {
+      const hook = await mount();
+      expect(hook().allPages).toHaveLength(40);
+      expect(ids(hook().allPages)).toContain("3e86a8ae");
+      expect(hook().allPages.find((p) => p.id === "3e86a8ae")?.name).toBe("Terminal");
+      expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBeNull();
+    } finally {
+      windowLabel.current = "main";
+    }
   });
 
   it("prunes nothing while the off-switch is unread", async () => {

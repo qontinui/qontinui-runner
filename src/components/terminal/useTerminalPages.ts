@@ -6,6 +6,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
 import { getPerfCaps, getPerfCapsLoadState, loadPerfCaps } from "@/lib/perfCaps";
 import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
+import { MAIN_WINDOW_LABEL, readWindowLabel } from "./contexts/WindowAssignmentsContext";
 import {
   PAGES_VERSION,
   PAGES_VERSION_KEY,
@@ -537,6 +538,15 @@ export function useTerminalPages() {
   // A page-pinned pop-out window is fixed to one page for its whole lifetime.
   const [pinnedPageId] = useState<string | null>(readPinnedPageId);
   const isPinned = pinnedPageId !== null;
+  // Only the main window owns roster-wide writes (the auto-prune and the
+  // one-time repair). An UNPINNED pop-out also mounts this hook, but it sees
+  // only its own active page and keeps its own in-memory roster, so a prune
+  // there could drop a page active in the main window, or be undone by the
+  // main window's next save. Same gate as `shouldServePageRoster`; fixed for
+  // the window's lifetime.
+  const [ownsRosterWrites] = useState<boolean>(
+    () => pinnedPageId === null && readWindowLabel() === MAIN_WINDOW_LABEL,
+  );
 
   const [allPages, setPages] = useState<TerminalPageConfig[]>(loadPages);
   // Latest page roster, readable SYNCHRONOUSLY by `ensureProjectPage` (which
@@ -1122,8 +1132,8 @@ export function useTerminalPages() {
       return next;
     });
 
-    if (complete) await pruneAndRepair(ids);
-  }, [pruneAndRepair]);
+    if (complete && ownsRosterWrites) await pruneAndRepair(ids);
+  }, [pruneAndRepair, ownsRosterWrites]);
 
   // Run reconciliation once on mount and on a debounced `terminal-created` OR
   // `terminal-exit` event (a burst of continuations/exits collapses to a single
