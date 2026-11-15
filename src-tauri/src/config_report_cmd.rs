@@ -1457,7 +1457,11 @@ pub(crate) fn claude_settings_carrier_reading(
              `claude` directly with no shim in the chain. BOTH append `--settings` ONLY when \
              that file exists (fail-open), so a `false` here means spawned sessions get NO \
              hook: no SessionStart confirmation, no SessionStart policy injection, no \
-             PreCompact, and no Stop. {}",
+             PreCompact, and no Stop. A GATE continuation (the `dispatch_gate_continuation` \
+             spawn and its account-migration respawn) does NOT follow this variant: it is \
+             Stop-armed unless the flag is explicitly `off` \
+             (`claude_hook::spawn_settings_args(true)`), so on a box where this reads \
+             `omitted` its gate continuations still append the `registered` carrier. {}",
             path.display(),
             exists,
             reg.as_str(),
