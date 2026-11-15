@@ -254,9 +254,13 @@ pub fn pid_reuse_reference(pid: u32, verified: &HashSet<u32>, boot_unix_millis: 
 /// tuple needs a value, and nothing reads it.
 ///
 /// `pid` is `0` for a live terminal that reports no pid. No look covers pid
-/// 0, so it would read undecided on every tick and the record would be
-/// Skipped forever; it reads as before the look existed instead — no
-/// `claude`, judged on the tick's own snapshot health.
+/// 0, so it would read undecided and force `snapshot_ok = false`, and the
+/// record would be Skipped on every tick, forever. `claude_present` does not
+/// matter for it — `pid_alive(0)` is `false`, so classify reads the terminal
+/// dead and Closes — so the only thing that must not happen is forcing
+/// `snapshot_ok` false: it is the tick's own snapshot health. (At the base
+/// this replaces, root 0 walked about the whole table and read `true` when
+/// any `claude` ran anywhere; that value was equally unread.)
 pub fn poll_claude_presence(
     look: &PaneLook,
     pid: u32,
@@ -777,71 +781,137 @@ pub struct UndecidedProcess {
     pub image: Option<String>,
     /// Why the registry could not settle it.
     pub reason: String,
+    /// Another undecided process is its ancestor: it adds no unit of
+    /// undecided work of its own (an `npx` server, a test worker of an
+    /// undecided `node`), and only the ROOTS are worth a log line.
+    pub nested_under_undecided: bool,
 }
 
-/// Logs the UNDECIDED population a census blocks on, once per change rather
-/// than once per pass — the same once-per-transition posture as
-/// `claude_activity::UnlistableLog`. A census that stays undecided (an
-/// unlistable `sessions/` dir) holds every restart and every wind-down close
-/// box-wide, so the stall must be visible; a per-pass line would bury the log
-/// (`/restart-readiness` answers every Stop turn).
+/// How often a census that STAYS undecided is reported again.
+pub const UNDECIDED_REWARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What one [`UndecidedLog::observe_at`] emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndecidedLogLine {
+    /// Nothing: the undecided population is unchanged since the last line.
+    Silent,
+    /// `warn!`: it turned non-empty, or its roots or causes changed.
+    Warned,
+    /// `warn!` again: unchanged, but undecided for another
+    /// [`UNDECIDED_REWARN_INTERVAL`].
+    Rewarned,
+    /// `info!`: it cleared.
+    Cleared,
+}
+
+/// The part of an undecided population a log line is keyed on: its ROOTS
+/// (undecided processes no other undecided process is an ancestor of) and
+/// its distinct causes with each pid taken out. In the stall this exists for
+/// (an unlistable `sessions/` dir) short-lived `node` children — `npx` MCP
+/// servers, test workers — come and go every pass; keyed on the pid set, the
+/// line would repeat on nearly every pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UndecidedKey {
+    roots: Vec<u32>,
+    causes: std::collections::BTreeSet<String>,
+}
+
+impl UndecidedKey {
+    fn of(undecided: &[UndecidedProcess]) -> Self {
+        let mut roots: Vec<u32> = undecided
+            .iter()
+            .filter(|u| !u.nested_under_undecided)
+            .map(|u| u.pid)
+            .collect();
+        roots.sort_unstable();
+        Self {
+            roots,
+            causes: undecided.iter().map(pid_free_reason).collect(),
+        }
+    }
+}
+
+/// `u.reason` with its own pid taken out: the witness names the pid inside
+/// the sentence, and the cause — not the pid — is what a reader acts on.
+fn pid_free_reason(u: &UndecidedProcess) -> String {
+    u.reason.replace(&u.pid.to_string(), "<pid>")
+}
+
+/// Logs the UNDECIDED population a census blocks on — once when it appears,
+/// again when its roots or causes change, again every
+/// [`UNDECIDED_REWARN_INTERVAL`] while it lasts, and once at `info!` when it
+/// clears. The once-per-transition posture of `claude_activity::UnlistableLog`,
+/// plus a reminder: a census that stays undecided holds every restart and
+/// every wind-down close box-wide, so the stall must stay visible, while a
+/// per-pass line would bury the log (`/restart-readiness` answers every Stop
+/// turn).
 pub struct UndecidedLog {
-    reported: Mutex<Vec<u32>>,
+    /// The key last reported and when, or `None` while nothing is undecided.
+    reported: Mutex<Option<(UndecidedKey, std::time::Instant)>>,
     site: &'static str,
     consequence: &'static str,
 }
 
 impl UndecidedLog {
     /// `site` names the reader; `consequence` says what an undecided census
-    /// costs it.
+    /// costs.
     pub const fn new(site: &'static str, consequence: &'static str) -> Self {
         Self {
-            reported: Mutex::new(Vec::new()),
+            reported: Mutex::new(None),
             site,
             consequence,
         }
     }
 
-    /// Record one pass's undecided set: `warn!` when it changes to a
-    /// non-empty set, `info!` when it clears, nothing while it holds.
-    pub fn observe(&self, undecided: &[UndecidedProcess]) {
-        let mut pids: Vec<u32> = undecided.iter().map(|u| u.pid).collect();
-        pids.sort_unstable();
+    /// [`Self::observe_at`] now.
+    pub fn observe(&self, undecided: &[UndecidedProcess]) -> UndecidedLogLine {
+        self.observe_at(undecided, std::time::Instant::now())
+    }
+
+    /// Record one pass's undecided population as of `now`, and log what
+    /// changed (see the type docs).
+    pub fn observe_at(
+        &self,
+        undecided: &[UndecidedProcess],
+        now: std::time::Instant,
+    ) -> UndecidedLogLine {
         let mut reported = self
             .reported
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *reported == pids {
-            return;
-        }
-        if pids.is_empty() {
+        if undecided.is_empty() {
+            if reported.take().is_none() {
+                return UndecidedLogLine::Silent;
+            }
             tracing::info!(
                 "{}: every process the session registry could not settle is now decided",
                 self.site
             );
-        } else {
-            let causes: Vec<String> = undecided
-                .iter()
-                .map(|u| {
-                    format!(
-                        "pid {} ({}): {}",
-                        u.pid,
-                        u.image.as_deref().unwrap_or("image unknown"),
-                        u.reason
-                    )
-                })
-                .collect();
-            warn!(
-                undecided_pids = ?pids,
-                causes = ?causes,
-                "{}: {} process(es) may be a live npm-installed `claude` that Claude Code's \
-                 session registry could not settle — {}",
-                self.site,
-                pids.len(),
-                self.consequence
-            );
+            return UndecidedLogLine::Cleared;
         }
-        *reported = pids;
+        let key = UndecidedKey::of(undecided);
+        let line = match reported.as_ref() {
+            Some((last, at)) if *last == key => {
+                if now.saturating_duration_since(*at) < UNDECIDED_REWARN_INTERVAL {
+                    return UndecidedLogLine::Silent;
+                }
+                UndecidedLogLine::Rewarned
+            }
+            _ => UndecidedLogLine::Warned,
+        };
+        warn!(
+            undecided_roots = ?key.roots,
+            undecided_total = undecided.len(),
+            causes = ?key.causes,
+            still = line == UndecidedLogLine::Rewarned,
+            "{}: {} process tree(s) may be a live npm-installed `claude` that Claude Code's \
+             session registry could not settle — {}",
+            self.site,
+            key.roots.len(),
+            self.consequence
+        );
+        *reported = Some((key, now));
+        line
     }
 }
 
@@ -1327,6 +1397,7 @@ pub fn evaluate(
                 pid,
                 image: snapshot.names.get(&pid).cloned(),
                 reason,
+                nested_under_undecided: false,
             });
         }
     };
@@ -1559,6 +1630,21 @@ pub fn evaluate(
     // from, so no pid should be both live and undecided — but the partition
     // must never count one twice, and live is the reading that blocks too.
     undecided.retain(|u| !live_set.contains(&u.pid));
+    let undecided_pids: HashSet<u32> = undecided.iter().map(|u| u.pid).collect();
+    for u in &mut undecided {
+        let mut seen: HashSet<u32> = HashSet::from([u.pid]);
+        let mut ancestor = parent_of.get(&u.pid).copied();
+        while let Some(pid) = ancestor {
+            if undecided_pids.contains(&pid) {
+                u.nested_under_undecided = true;
+                break;
+            }
+            if !seen.insert(pid) {
+                break;
+            }
+            ancestor = parent_of.get(&pid).copied();
+        }
+    }
 
     TrackingHealthReport {
         checked_at_ms: now_ms,
@@ -1799,7 +1885,18 @@ async fn run_once(
             tracked_open = report.tracked_open_total,
             "session tracking health: clean"
         );
-    } else {
+    }
+    if !report.undecided.is_empty() {
+        let undecided_pids: Vec<u32> = report.undecided.iter().map(|u| u.pid).collect();
+        warn!(
+            undecided = report.undecided.len(),
+            undecided_pids = ?undecided_pids,
+            live_claude_total = report.live_claude_total,
+            "session tracking health: UNDECIDED — processes that may be a live npm-installed \
+             `claude` the session registry could not settle (a restart would be refused)"
+        );
+    }
+    if !report.live_untracked.is_empty() || !report.tracked_dead.is_empty() {
         let untracked_pids: Vec<u32> = report.live_untracked.iter().map(|p| p.pid).collect();
         let dead_sessions: Vec<&str> = report
             .tracked_dead
@@ -4209,5 +4306,108 @@ mod tests {
             None,
             "root 0 is uncovered — what the guard exists for"
         );
+    }
+
+    fn undecided(pid: u32, nested: bool) -> UndecidedProcess {
+        UndecidedProcess {
+            pid,
+            image: Some("node".to_string()),
+            reason: format!(
+                "Claude Code's session registry could not be listed in full, so whether pid \
+                 {pid} in the pane is a JS-runtime `claude` is unknown"
+            ),
+            nested_under_undecided: nested,
+        }
+    }
+
+    /// A new undecided population warns; a repeat is silent; clearing logs
+    /// once at info, and an already-clear census is silent.
+    #[test]
+    fn the_undecided_log_warns_on_a_new_set_and_logs_its_clearing_once() {
+        let log = UndecidedLog::new("test", "test consequence");
+        let t0 = std::time::Instant::now();
+        assert_eq!(log.observe_at(&[], t0), UndecidedLogLine::Silent);
+        assert_eq!(
+            log.observe_at(&[undecided(50, false)], t0),
+            UndecidedLogLine::Warned
+        );
+        assert_eq!(
+            log.observe_at(&[undecided(50, false)], t0),
+            UndecidedLogLine::Silent
+        );
+        assert_eq!(
+            log.observe_at(&[undecided(60, false)], t0),
+            UndecidedLogLine::Warned,
+            "a new undecided root is a new line"
+        );
+        assert_eq!(log.observe_at(&[], t0), UndecidedLogLine::Cleared);
+        assert_eq!(log.observe_at(&[], t0), UndecidedLogLine::Silent);
+    }
+
+    /// Short-lived children of an undecided process (npx servers, test
+    /// workers) come and go every pass: the line is keyed on the ROOTS and
+    /// the pid-free causes, so their churn is silent.
+    #[test]
+    fn the_undecided_log_is_silent_when_only_descendants_churn() {
+        let log = UndecidedLog::new("test", "test consequence");
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            log.observe_at(&[undecided(50, false), undecided(51, true)], t0),
+            UndecidedLogLine::Warned
+        );
+        assert_eq!(
+            log.observe_at(
+                &[
+                    undecided(50, false),
+                    undecided(52, true),
+                    undecided(53, true)
+                ],
+                t0
+            ),
+            UndecidedLogLine::Silent
+        );
+        assert_eq!(
+            log.observe_at(&[undecided(50, false)], t0),
+            UndecidedLogLine::Silent
+        );
+    }
+
+    /// A census that STAYS undecided is reported again every interval.
+    #[test]
+    fn the_undecided_log_rewarns_after_the_interval() {
+        let log = UndecidedLog::new("test", "test consequence");
+        let t0 = std::time::Instant::now();
+        let set = [undecided(50, false)];
+        assert_eq!(log.observe_at(&set, t0), UndecidedLogLine::Warned);
+        let almost = t0 + UNDECIDED_REWARN_INTERVAL - std::time::Duration::from_secs(1);
+        assert_eq!(log.observe_at(&set, almost), UndecidedLogLine::Silent);
+        let due = t0 + UNDECIDED_REWARN_INTERVAL;
+        assert_eq!(log.observe_at(&set, due), UndecidedLogLine::Rewarned);
+        assert_eq!(log.observe_at(&set, due), UndecidedLogLine::Silent);
+    }
+
+    /// `evaluate` marks an undecided process under another undecided one as
+    /// nested, so only the roots key the log.
+    #[test]
+    fn evaluate_marks_undecided_descendants_as_nested() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let mut snap = snap_with(
+            &[(1, &[5]), (5, &[50]), (50, &[51])],
+            &[(5, now_s), (50, now_s), (51, now_s)],
+            &[(5, "bash"), (50, "node"), (51, "node")],
+        );
+        snap.stale = false;
+        let look = PaneLook::over_whole_table(
+            snap,
+            crate::terminal::graceful_exit::RegistryWitness::unreadable("test"),
+        );
+        let report = eval_npm(&look, &[], now_ms);
+        let nested: Vec<(u32, bool)> = report
+            .undecided
+            .iter()
+            .map(|u| (u.pid, u.nested_under_undecided))
+            .collect();
+        assert_eq!(nested, vec![(50, false), (51, true)]);
     }
 }
