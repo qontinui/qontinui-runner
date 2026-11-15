@@ -10,7 +10,9 @@
 //! `apiError: "usage_limit_reached"` and `quotaLimits.resetsAt` (seconds) —
 //! followed only by non-conversational bookkeeping lines (`system`
 //! `turn_duration`, `mode`, `permission-mode`, `last-prompt`, `cost-state`,
-//! `tools-used`, …). That entry is the state, so this module reads it.
+//! `tools-used`, …) and, when the CLI opens its `/rate-limit-options` menu,
+//! by that local command's `user` entries, which never reach the model. That
+//! entry is the state, so this module reads it.
 //!
 //! The read is bounded: the last [`TAIL_BYTES`] of the file, widened through
 //! [`TAIL_WINDOWS`] while the window holds no conversational entry, and the
@@ -185,6 +187,10 @@ fn decide(bytes: &[u8]) -> Decision {
     // A final newline ends the last line; it does not start an empty one, so
     // line numbers in the reasons below count real lines from the end.
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    // Set once a local command's output has been passed over, so the
+    // `<command-name>` entry that ran it is passed over too (see
+    // [`local_command_part`]).
+    let mut in_local_command = false;
     for (from_end, raw) in bytes.split(|&b| b == b'\n').rev().enumerate() {
         let line = match std::str::from_utf8(raw) {
             Ok(l) => l.trim(),
@@ -212,9 +218,63 @@ fn decide(bytes: &[u8]) -> Decision {
         if !is_conversational(&entry) {
             continue;
         }
+        match local_command_part(&entry) {
+            Some(LocalCommandPart::Output) => {
+                in_local_command = true;
+                continue;
+            }
+            Some(LocalCommandPart::Caveat) => continue,
+            Some(LocalCommandPart::Invocation) if in_local_command => {
+                in_local_command = false;
+                continue;
+            }
+            Some(LocalCommandPart::Invocation) | None => {}
+        }
         return Decision::Decided(classify(&entry));
     }
     Decision::NoConversation
+}
+
+/// The pieces of a LOCAL slash command the CLI records as main-thread `user`
+/// entries. A local command (`/rate-limit-options`, which the CLI opens by
+/// itself on a limit stop; `/model`, …) runs in the CLI and never reaches the
+/// model, so it neither answers nor clears the stop above it. Measured shape
+/// (nilan, session `b9e123f1`, a seven-day stop parked on the menu): after
+/// the error entry come an `isMeta` `<local-command-caveat>` entry, a
+/// `<command-name>/rate-limit-options</command-name>` entry and a
+/// `<local-command-stdout>Claude Code will continue automatically at …`
+/// entry, then end of file.
+enum LocalCommandPart {
+    /// `<local-command-caveat>`: always local.
+    Caveat,
+    /// `<local-command-stdout>` / `<local-command-stderr>`: always local.
+    Output,
+    /// `<command-name>`: local only when its output follows it. A slash
+    /// command that IS sent to the model writes no local output, so it stays
+    /// conversational and decides the read.
+    Invocation,
+}
+
+fn local_command_part(entry: &Value) -> Option<LocalCommandPart> {
+    if entry.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let content = entry
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)?
+        .trim_start();
+    if content.starts_with("<local-command-caveat>") {
+        Some(LocalCommandPart::Caveat)
+    } else if content.starts_with("<local-command-stdout>")
+        || content.starts_with("<local-command-stderr>")
+    {
+        Some(LocalCommandPart::Output)
+    } else if content.starts_with("<command-name>") {
+        Some(LocalCommandPart::Invocation)
+    } else {
+        None
+    }
 }
 
 /// A main-thread `user` or `assistant` entry. `system`, `summary`,
@@ -365,6 +425,53 @@ mod tests {
         let body = format!("{main_reply}\n{sidechain}\n");
         assert_eq!(read(&body), LimitStopRead::NotStopped);
     }
+
+    /// The real menu-parked shape (nilan, session `b9e123f1`, ids edited): the
+    /// CLI opens `/rate-limit-options` itself after the stop and records it as
+    /// three main-thread `user` entries. They are local, so the stop decides.
+    /// Mutation partner for "count every `user` entry".
+    #[test]
+    fn a_stop_parked_on_the_rate_limit_options_menu_reads_stopped() {
+        let body = format!("{SEVEN_DAY_STOP}{RATE_LIMIT_OPTIONS_TAIL}");
+        assert_eq!(
+            read(&body),
+            LimitStopRead::Stopped(LimitStop {
+                entry_uuid: SEVEN_DAY_UUID.to_string(),
+                resets_at_ms: Some(SEVEN_DAY_RESETS_AT_MS),
+                rate_limit_type: Some("seven_day".to_string()),
+            })
+        );
+    }
+
+    /// A `<command-name>` entry with no local output after it was sent to the
+    /// model: it is conversational, so the session moved on from the stop.
+    #[test]
+    fn a_model_bound_slash_command_after_a_stop_is_not_stopped() {
+        let invocation = RATE_LIMIT_OPTIONS_TAIL.lines().nth(1).unwrap();
+        assert!(
+            invocation.contains("<command-name>/rate-limit-options"),
+            "{invocation}"
+        );
+        let sent = invocation.replace("/rate-limit-options", "/implement-plan");
+        let body = format!("{SEVEN_DAY_STOP}{sent}\n");
+        assert_eq!(read(&body), LimitStopRead::NotStopped);
+        // Local output ABOVE a later model-bound invocation does not hide it.
+        let out = RATE_LIMIT_OPTIONS_TAIL.lines().nth(2).unwrap();
+        let body = format!("{SEVEN_DAY_STOP}{out}\n{sent}\n");
+        assert_eq!(read(&body), LimitStopRead::NotStopped);
+    }
+
+    /// The three `user` entries the CLI writes when it opens the
+    /// `/rate-limit-options` menu, as measured on nilan (session `b9e123f1`,
+    /// CLI-written texts verbatim; ids, times and the reset text edited).
+    const RATE_LIMIT_OPTIONS_TAIL: &str = concat!(
+        r#"{"parentUuid":"7c1d2e3f-4a5b-4c6d-8e7f-90a1b2c3d4e5","isSidechain":false,"promptId":"p-1","type":"user","message":{"role":"user","content":"<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>"},"isMeta":true,"uuid":"e1000000-0000-4000-8000-000000000001","timestamp":"2026-11-02T16:31:05.000Z","userType":"external","entrypoint":"cli","cwd":"/w","sessionId":"s","version":"2.1.318","gitBranch":"main"}"#,
+        "\n",
+        r#"{"parentUuid":"e1000000-0000-4000-8000-000000000001","isSidechain":false,"promptId":"p-1","type":"user","message":{"role":"user","content":"<command-name>/rate-limit-options</command-name>\n            <command-message>rate-limit-options</command-message>\n            <command-args></command-args>"},"uuid":"e1000000-0000-4000-8000-000000000002","timestamp":"2026-11-02T16:31:05.001Z","userType":"external","entrypoint":"cli","cwd":"/w","sessionId":"s","version":"2.1.318","gitBranch":"main"}"#,
+        "\n",
+        r#"{"parentUuid":"e1000000-0000-4000-8000-000000000002","isSidechain":false,"promptId":"p-1","type":"user","message":{"role":"user","content":"<local-command-stdout>Claude Code will continue automatically at Nov 3, 9pm. Keep this session open; it may still pause for permission prompts. Press esc to cancel the wait.</local-command-stdout>"},"uuid":"e1000000-0000-4000-8000-000000000003","timestamp":"2026-11-02T16:31:05.002Z","userType":"external","entrypoint":"cli","cwd":"/w","sessionId":"s","version":"2.1.318","gitBranch":"main"}"#,
+        "\n",
+    );
 
     /// Mutation partner for "accept any `isApiErrorMessage`".
     #[test]

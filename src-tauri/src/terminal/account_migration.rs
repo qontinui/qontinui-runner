@@ -1805,6 +1805,7 @@ mod tests {
             lines: text.lines().map(str::to_string).collect(),
             cursor_row,
             cursor_col,
+            cursor_row_dim: None,
         }
     }
 
