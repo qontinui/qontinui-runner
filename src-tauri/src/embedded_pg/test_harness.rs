@@ -1410,8 +1410,13 @@ async fn boot_external(raw: String) -> Result<Server, String> {
         }),
         stats: Arc::clone(&stats),
     });
+    // From `template0`, which nothing connects to and nothing customises: a
+    // session on the default `template1` would refuse the copy, and whatever a
+    // server keeps in `template1` would land in every test database.
     maintenance
-        .batch_execute(&format!("CREATE DATABASE \"{template}\""))
+        .batch_execute(&format!(
+            "CREATE DATABASE \"{template}\" TEMPLATE template0"
+        ))
         .await
         .map_err(|e| {
             format!(
