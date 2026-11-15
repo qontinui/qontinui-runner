@@ -895,8 +895,9 @@ async fn the_supervised_recheck_drops_a_bearer_client_the_adb_list_names() {
         .await
         .unwrap_or_else(|e| panic!("the connect failed: {}", e.message));
     let handshake = requests_to(&seen, &format!("127.0.0.1:{port}"));
+    let after_probe = after_the_bare_health_probe(&handshake, "the fixture's connect");
     assert!(
-        !handshake.is_empty() && handshake.iter().all(Option::is_some),
+        !after_probe.is_empty() && after_probe.iter().all(Option::is_some),
         "the fixture's connect carries the bearer: {handshake:?}"
     );
 
