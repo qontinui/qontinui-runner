@@ -97,10 +97,11 @@ pub(crate) struct PaneRowFacts {
     /// `Undetermined` — never the machine default.
     pub tenant: NewSessionTenant,
     /// When the terminal was bound to the row, unix milliseconds (the unit of
-    /// a lifecycle record's `finished_at`). `None` when not known. Kept for the finish
-    /// re-offer's revival guard (plan D5, Phase 3 — not yet built; nothing reads
-    /// it today) — NEVER to rank panes: a wall
-    /// clock can step backwards, and two binds can share a millisecond.
+    /// a lifecycle record's `finished_at`). `None` when not known. Read, as a
+    /// pin seed's [`LivePaneRow::owned_since_ms`], by the finish re-offer's
+    /// revival guard (plan D5, `AiCoordRegistrar::reoffer_finish_to`) — NEVER
+    /// to rank panes: a wall clock can step backwards, and two binds can share
+    /// a millisecond.
     pub bound_at_ms: Option<i64>,
     /// The terminal's process-wide monotonic bind sequence
     /// (`TerminalSession::coord_binding`): larger = bound later. THE key two
@@ -157,9 +158,10 @@ pub(crate) struct LivePaneRow {
     /// The row's tenant per D3 (see [`PaneRowFacts::tenant`]).
     pub tenant: NewSessionTenant,
     /// When the id's ownership of the row began: the advance instant for an
-    /// entry, the terminal's bind instant for a pin seed. Kept for the finish
-    /// re-offer's revival guard (plan D5, Phase 3 — not yet built; nothing
-    /// reads it today).
+    /// entry, the terminal's bind instant for a pin seed. Read by the finish
+    /// re-offer's revival guard (plan D5, `AiCoordRegistrar::reoffer_finish_to`):
+    /// a finish is re-offered to the row only when this is strictly before the
+    /// mark's `finished_at`, and never when it is `None`.
     pub owned_since_ms: Option<i64>,
     /// The row's pane's monotonic bind sequence — what two panes are ranked
     /// by ([`PaneRowFacts::bind_seq`]).
