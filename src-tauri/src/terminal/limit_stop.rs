@@ -326,8 +326,11 @@ fn classify(entry: &Value) -> LimitStopRead {
 // yet is PARKED here until a due time, and the scan loop re-hands it to
 // `account_migration::handle_usage_limit_hint` once that time has passed
 // (Phase 3 drains it). In memory only, on purpose: it is not durable state. A
-// restart loses it and loses nothing, because each session's transcript still
-// ends at its stop and the next process re-derives the park from it.
+// restart loses it, and the next process re-derives a park from each
+// transcript that still ends at its stop. What a restart does lose is the
+// in-memory migration stamp the handler reads (`LAST_MIGRATED`), so a migrated
+// session whose continue nudge never landed is decided from its carried stop
+// again: parked until the OLD account's reset rather than continued at once.
 
 /// One parked session.
 #[derive(Debug, Clone, PartialEq, Eq)]

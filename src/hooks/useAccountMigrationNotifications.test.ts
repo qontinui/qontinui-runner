@@ -11,6 +11,7 @@ import {
   continuedBurstToast,
   createBurstCoalescer,
   gaveUpBurstToast,
+  parkIsToasted,
   migratedToast,
   parkedBurstToast,
   type MigratedPayload,
@@ -161,6 +162,15 @@ describe("usage-limit park and continue toasts (plan 2026-11-05 Phase 2)", () =>
       "Session 0c4e3025 stopped at a usage limit that has reset, but the runner could not continue it; it needs a prompt by hand",
     );
     expect(toast.type).toBe("error");
+    expect(gaveUpBurstToast([{}, {}]).message).toBe(
+      "2 sessions stopped at a usage limit that has reset, but the runner could not continue them; they need a prompt by hand",
+    );
+  });
+
+  it("raises no park toast for the runner's own continue retry", () => {
+    expect(parkIsToasted({ reason: "continue-retry" })).toBe(false);
+    expect(parkIsToasted({ reason: "not-yet-reset" })).toBe(true);
+    expect(parkIsToasted({})).toBe(true);
   });
 
   it("flushes one burst per window", () => {
