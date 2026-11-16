@@ -43,7 +43,10 @@
 //!    substitute either, nor do `/ui-bridge/apps/{app_id}/dispatch` and
 //!    `/wrappers/{id}/dispatch`, which send their `params` verbatim to an app,
 //!    nor the `/a11y/*` routes, whose `type_text` types its `text` verbatim
-//!    into a desktop app: while a secret is held,
+//!    into a desktop app, nor any `/ui-bridge/sdk/*` route but the element
+//!    action itself (`sdk/fill`, `sdk/page/type-into`, `page/send-keys`, a
+//!    batch, a component action, …), which proxy their body verbatim to the
+//!    connected app: while a secret is held,
 //!    [`refuse_unsubstituted_placeholders`] refuses any request to them that
 //!    carries a placeholder, before its handler runs.
 //! 4. **Never shown back.** While any map is held, [`scrub_sdk_responses`]
@@ -95,9 +98,13 @@
 //! - **Only the SDK element-action route substitutes.** The runner's own
 //!   routes do not, and the composer's refuse a placeholder only while a
 //!   secret is held: with nothing held a placeholder there is ordinary text.
-//!   The app dispatch, wrapper dispatch and `/a11y/*` routers carry the
-//!   same layer themselves, and so does `control/wait-for-app`, which shares
-//!   the app router. Two `/ui-bridge/control/*` and `/ui-bridge/ai/*` routes
+//!   The app dispatch, wrapper dispatch, `/a11y/*` and `/ui-bridge/sdk/*`
+//!   routers carry the same layer themselves, and so does
+//!   `control/wait-for-app`, which shares the app router. The SDK router's
+//!   layer skips only its two element-action paths, whose handler refuses a
+//!   misplaced placeholder in its body itself. A placeholder in that route's
+//!   `{id}` segment or `tabId` query is neither checked nor substituted; it
+//!   reaches the app as an element id or tab key, never as typed text. Two `/ui-bridge/control/*` and `/ui-bridge/ai/*` routes
 //!   are mounted outside every layered router (`ai/wait-for`,
 //!   `control/sdk/spawn-headless`) and are not checked; neither types text. No secret ever reaches any of them.
 //! - **Loopback replay.** `POST /ui-bridge/sdk/element/{id}/action` is a
@@ -1337,36 +1344,71 @@ const NON_SUBSTITUTING_PATHS: [&str; 2] = ["/ui-bridge/relay/dispatch", "/ui-bri
 const DISPATCH_PREFIXES: [&str; 2] = ["/ui-bridge/apps/", "/wrappers/"];
 const DISPATCH_SUFFIX: &str = "/dispatch";
 
-/// Whether `path` is a route that never substitutes and carries text to an app.
+/// The SDK proxy surface (`mcp::sdk_client::routes`). Every route there but
+/// the element action sends its body (or query) verbatim to the connected
+/// app (`fill`, `page/type-into`, `page/send-keys`, `control/batch`, a
+/// component action, `ai/execute`, …), so it never substitutes.
+const SDK_PREFIX: &str = "/ui-bridge/sdk/";
+
+/// The SDK element-action routes, each a prefix before one `{id}` segment
+/// and [`SDK_ELEMENT_ACTION_SUFFIX`] after it. They share
+/// `handle_element_action`, the one handler that substitutes a placeholder
+/// (in a `type` action's text) and refuses one anywhere else in its body.
+const SDK_ELEMENT_ACTION_PREFIXES: [&str; 2] =
+    ["/ui-bridge/sdk/element/", "/ui-bridge/sdk/control/element/"];
+const SDK_ELEMENT_ACTION_SUFFIX: &str = "/action";
+
+/// Whether `path` is a route that never substitutes and may carry a caller's
+/// text to an app (every `/ui-bridge/sdk/*` route but the element action is
+/// matched, including GETs that carry none: nothing is lost by checking them).
 fn never_substitutes(path: &str) -> bool {
     NON_SUBSTITUTING_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
         || NON_SUBSTITUTING_PATHS.contains(&path)
         || is_dispatch(path)
+        || (path.starts_with(SDK_PREFIX) && !is_sdk_element_action(path))
 }
 
-/// Whether `path` is one of [`DISPATCH_PREFIXES`], one non-empty `{id}`
-/// segment and [`DISPATCH_SUFFIX`], the only shape axum routes there.
-fn is_dispatch(path: &str) -> bool {
-    DISPATCH_PREFIXES.iter().any(|prefix| {
+/// Whether `path` is one of `prefixes`, one non-empty `{id}` segment and
+/// `suffix`, the only shape axum routes for a `{prefix}{id}{suffix}` route.
+fn is_one_id_segment(path: &str, prefixes: &[&str], suffix: &str) -> bool {
+    prefixes.iter().any(|prefix| {
         path.strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix(DISPATCH_SUFFIX))
+            .and_then(|rest| rest.strip_suffix(suffix))
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
     })
 }
 
+/// Whether `path` is one of [`DISPATCH_PREFIXES`], one `{id}` and
+/// [`DISPATCH_SUFFIX`].
+fn is_dispatch(path: &str) -> bool {
+    is_one_id_segment(path, &DISPATCH_PREFIXES, DISPATCH_SUFFIX)
+}
+
+/// Whether `path` is one of [`SDK_ELEMENT_ACTION_PREFIXES`], one `{id}` and
+/// [`SDK_ELEMENT_ACTION_SUFFIX`]: the substituting element action.
+fn is_sdk_element_action(path: &str) -> bool {
+    is_one_id_segment(
+        path,
+        &SDK_ELEMENT_ACTION_PREFIXES,
+        SDK_ELEMENT_ACTION_SUFFIX,
+    )
+}
+
 /// Why [`refuse_unsubstituted_placeholders`] refused, for the refusal body.
 const NON_SUBSTITUTING_DETAIL: &str = "the runner's /ui-bridge/control/*, /ui-bridge/ai/*, \
-     /ui-bridge/relay/dispatch, /ui-bridge/batch, /ui-bridge/apps/{app_id}/dispatch, /wrappers/{id}/dispatch and /a11y/* routes never substitute a secret placeholder, so it would reach the app as literal text; \
+     /ui-bridge/relay/dispatch, /ui-bridge/batch, /ui-bridge/apps/{app_id}/dispatch, /wrappers/{id}/dispatch, /a11y/* and \
+     /ui-bridge/sdk/* (but the element action) routes never substitute a secret placeholder, so it would reach the app as literal text; \
      type it with a `type` action on POST /ui-bridge/sdk/element/{id}/action";
 
 /// Request layer for the `/ui-bridge/*` composer, and for the routers that
 /// serve the other non-substituting routes (`mcp::app_discovery::routes`,
-/// `wrappers::routes::router`, `mcp::accessibility::routes`): while a condition session
+/// `wrappers::routes::router`, `mcp::accessibility::routes`,
+/// `mcp::sdk_client::routes`): while a condition session
 /// holds a secret, a request to a route that never substitutes
 /// ([`NON_SUBSTITUTING_PREFIXES`], [`NON_SUBSTITUTING_PATHS`],
-/// [`DISPATCH_PREFIXES`]) that
+/// [`DISPATCH_PREFIXES`], [`SDK_PREFIX`] but its element action) that
 /// carries a `{{secret:<ref>}}` placeholder, in its query or anywhere in its
 /// body, is refused with `422` and [`UNKNOWN_REF_CODE`] (as [`ipc_refusal`]
 /// refuses the IPC fallback) before its handler runs. Without it those routes
@@ -2262,6 +2304,9 @@ mod tests {
             .route("/ui-bridge/apps/register", post(echo))
             .route("/wrappers/{id}/dispatch", post(echo))
             .route("/a11y/type_text", post(echo))
+            .route("/ui-bridge/sdk/page/type-into", post(echo))
+            .route("/ui-bridge/sdk/fill", post(echo))
+            .route("/ui-bridge/sdk/element/{id}/action", post(echo))
             .route("/ui-bridge/commands", post(echo))
             .layer(axum::middleware::from_fn(refuse_unsubstituted_placeholders));
         let send = |uri: &'static str, body: &'static str| {
@@ -2317,6 +2362,14 @@ mod tests {
                 "/a11y/type_text",
                 r##"{"selector":"#password","text":"{{secret:cs-ctl-pw}}"}"##,
             ),
+            (
+                "/ui-bridge/sdk/page/type-into",
+                r##"{"selector":"#password","text":"{{secret:cs-ctl-pw}}"}"##,
+            ),
+            (
+                "/ui-bridge/sdk/fill",
+                r#"{"fields":[{"id":"password","value":"{{secret:cs-ctl-pw}}"}]}"#,
+            ),
         ] {
             let before = REACHED.load(Ordering::SeqCst);
             let (status, answer) = send(uri, body).await;
@@ -2360,12 +2413,20 @@ mod tests {
             (StatusCode::OK, registration.to_string()),
             "the app router's registration, under no matched prefix, is not inspected"
         );
+        let typed = r#"{"action":"type","params":{"text":"{{secret:cs-ctl-pw}}"}}"#;
+        assert_eq!(
+            send("/ui-bridge/sdk/element/password/action", typed).await,
+            (StatusCode::OK, typed.to_string()),
+            "the substituting SDK element action is left to its own handler"
+        );
     }
 
-    /// A dispatch route is its prefix, one non-empty `{id}` segment and
-    /// `/dispatch`; the wrapper registry's other routes are not inspected.
+    /// A dispatch route (and the SDK element action exempted from the SDK
+    /// prefix) is its prefix, one non-empty `{id}` segment and its suffix; the
+    /// wrapper registry's other routes are not inspected, and every other SDK
+    /// path is.
     #[test]
-    fn a_dispatch_path_is_one_id_segment() {
+    fn a_dispatch_or_sdk_element_action_path_is_one_id_segment() {
         assert!(never_substitutes("/ui-bridge/apps/wrapper-1/dispatch"));
         assert!(never_substitutes("/wrappers/w1/dispatch"));
         assert!(never_substitutes("/a11y/type_text"));
@@ -2379,8 +2440,23 @@ mod tests {
             "/wrappers/dispatch",
             "/wrappers/w1/credentials/token",
             "/wrappers/install",
+            "/ui-bridge/sdk/element/password/action",
+            "/ui-bridge/sdk/control/element/password/action",
         ] {
             assert!(!never_substitutes(path), "{path}");
+        }
+        for path in [
+            "/ui-bridge/sdk/fill",
+            "/ui-bridge/sdk/control/fill",
+            "/ui-bridge/sdk/page/type-into",
+            "/ui-bridge/sdk/control/page/send-keys",
+            "/ui-bridge/sdk/component/c1/action/submit",
+            "/ui-bridge/sdk/element/password",
+            "/ui-bridge/sdk/element//action",
+            "/ui-bridge/sdk/element/a/b/action",
+            "/ui-bridge/sdk/control/element/password/action/more",
+        ] {
+            assert!(never_substitutes(path), "{path}");
         }
     }
 
@@ -2403,6 +2479,11 @@ mod tests {
             (
                 "mcp/accessibility.rs",
                 include_str!("mcp/accessibility.rs"),
+                "\npub fn routes() -> ",
+            ),
+            (
+                "mcp/sdk_client.rs",
+                include_str!("mcp/sdk_client.rs"),
                 "\npub fn routes() -> ",
             ),
         ] {
