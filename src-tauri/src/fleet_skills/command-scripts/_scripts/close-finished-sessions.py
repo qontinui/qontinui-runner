@@ -15,7 +15,11 @@ runner serves none), is reported and never closed. A finish is read by
 finish_state, the one rule nudge-stopped-sessions.py reads too: any turn after
 it reopens it (REVIVED), and a finish its own final message contradicts is
 CONTRADICTED. A finished session whose directory is not a linked worktree is
-CUSTODY (finished-criteria condition 3), never closed.
+CUSTODY (finished-criteria condition 3), never closed. So is one whose runner serves a `windDown.custody`
+or `windDown.obligations` view that is not clean / not watched: those are the two halves of `closeable`
+the runner's finished_close arm judges (plan 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-
+lives-only-in-it-and-coord-owns-whether-its-watchers-work, Phase 6), and this script reads them rather than
+re-deriving either. An absent view means the arm did not judge the session, which adds nothing.
 Read-only unless --close. Stdlib only. The command /close-finished-sessions
 documents every verdict and the evidence it rests on.
 
@@ -1581,6 +1585,9 @@ FT = "Review found nothing to follow up.\n\n**POLICY_COMPLIANCE**\n"
 # The custody probe's stand-in for the selftests (git_rev_parse_dirs, finished-criteria
 # condition 3): git's answer per directory. A directory no case set up fails loudly.
 LINKED_CWD = "/w/agent-worktrees/a1/repo"
+# A `windDown` block whose two closeable halves both pass, as the runner serves them (selftest stand-in).
+WD_PASS = {"eligibility": "eligible", "custody": {"verdict": "clean"},
+           "obligations": {"verdict": "watched", "itemsJudged": 2}}
 GIT_ANSWERS = {
     LINKED_CWD: (0, "/w/repo/.git/worktrees/a1\n/w/repo/.git\n", ""),  # a linked worktree
     "/w/repo": (0, ".git\n.git\n", ""),  # a primary checkout, at its top (git answers relative paths)
@@ -2523,6 +2530,33 @@ def finish_time_cases(bad):
         ({}, at(after), dict(base, cwd="/w/slow"), "CUSTODY", "custody UNKNOWN: git did not answer"),
         ({}, at(after), dict(base, cwd="/w/broken"), "CUSTODY", "custody UNKNOWN: git rev-parse exited 128"),
         ({}, cf, dict(shut, cwd="/w/repo"), "CUSTODY", ("closeout phrase", "is a primary checkout")),
+        # Phase 6 of the closeable plan: the runner's two halves, read and never re-derived. A linked worktree
+        # the runner judged clean, with every obligation watched, still closes...
+        ({}, dict(at(after), windDown=WD_PASS), base, "FINISHED", "coord session_status=finished ("),
+        # ...no view at all (an older runner, or the arm has not judged it) adds nothing...
+        ({}, dict(at(after), windDown={"eligibility": "eligible"}), base, "FINISHED", "coord session_status=finished ("),
+        # ...and each half that is present and not passing withholds the close, alone or together.
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty", "reason": "uncommitted",
+                                                              "detail": "/w/a has uncommitted changes"})),
+         base, "CUSTODY", ("runner's custody verdict is dirty (uncommitted)", "/w/a has uncommitted changes")),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "unknown", "reason": "probe_failed"})),
+         base, "CUSTODY", "runner's custody verdict is unknown (probe_failed)"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations={"verdict": "unwatched", "reason": "not_watched",
+                                                                  "detail": "gates item g-1 reads `not_watched`"})),
+         base, "CUSTODY", ("runner's obligations verdict is unwatched (not_watched)", "g-1")),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations={"verdict": "unknown",
+                                                                  "reason": "obligations_unreadable"})),
+         base, "CUSTODY", "runner's obligations verdict is unknown (obligations_unreadable)"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations=None)), base, "CUSTODY",
+         "runner's obligations view is unreadable"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"reason": "x"})), base, "CUSTODY",
+         "runner's custody view is unreadable"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty"},
+                                           obligations={"verdict": "unknown"})),
+         base, "CUSTODY", ("runner's custody verdict is dirty", "runner's obligations verdict is unknown")),
+        # the script's own check still speaks beside the runner's
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty"})), dict(base, cwd="/w/repo"),
+         "CUSTODY", ("is a primary checkout", "runner's custody verdict is dirty")),
     ]
     # Served finished-criteria condition 1 (plan Phase 2): a live row coord does not read finished is never
     # closable, whatever finish signal it carries - a closeout phrase, a nothing-owed footer, a runner mark, or
@@ -6552,6 +6586,41 @@ def custody_refusal(cwd):
     return None
 
 
+# The two halves of `closeable` the runner's finished_close arm judges and serves on a readiness row's
+# `windDown` block (qontinui-runner wind_down.rs CustodyView / ObligationsView): the LOCAL half (every worktree
+# the session touched is clean and pushed) and the REMOTE half (every item coord's coord_session_obligations
+# attributes to it is watched). Only the arm's own word counts here, and only as a veto: an absent view means
+# the arm has not judged this session (it reads obligations only for a custody-clean one, and an older runner
+# serves neither), which is no information; a present view that is not the clean word, whatever else it says,
+# is a refusal. A view that is not an object, or carries no string verdict, is unreadable and refuses.
+RUNNER_HALVES = (("custody", "clean", "the worktrees it touched are not all clean and pushed"),
+                 ("obligations", "watched", "not every obligation coord attributes to it is watched"))
+
+
+def runner_halves_refusal(rp):
+    """None when the runner serves no view or only passing ones; else why the close is withheld. Pure."""
+    wd = rp.get("windDown") if isinstance(rp, dict) else None
+    if not isinstance(wd, dict):
+        return None
+    why = []
+    for key, passing, meaning in RUNNER_HALVES:
+        if key not in wd:
+            continue
+        view = wd[key]
+        verdict = view.get("verdict") if isinstance(view, dict) else None
+        if verdict == passing:
+            continue
+        if not isinstance(verdict, str):
+            why.append(f"runner's {key} view is unreadable ({type(view).__name__} without a string verdict)")
+            continue
+        reason = view.get("reason")
+        detail = view.get("detail")
+        why.append(f"runner's {key} verdict is {verdict}"
+                   + (f" ({reason})" if isinstance(reason, str) else "")
+                   + f": {meaning}" + (f" - {detail[:160]}" if isinstance(detail, str) and detail else ""))
+    return "; ".join(why) or None
+
+
 def classify(term, row, table, idle_min, own_tid, ready, strays=None):
     """Return (verdict, reasons[]). The verdicts are VERDICTS; CLOSABLE are the
     ones --close acts on.
@@ -6723,8 +6792,9 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
     else:
         finish = fs.why
     custody = custody_refusal(tx.get("cwd"))
-    if custody:
-        return "CUSTODY", finish + note + [custody] + binding
+    halves = runner_halves_refusal(rp)
+    if custody or halves:
+        return "CUSTODY", finish + note + [x for x in (custody, halves) if x] + binding
     return "FINISHED", finish + note + binding
 
 
