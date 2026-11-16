@@ -1751,6 +1751,8 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/agent-tokens/health"),
     ("GET", "/agent-worktrees/reclaimable"),
     ("GET", "/agent-worktrees/wip-orphans"),
+    // Test-only: the scripted coord stub in session/coord_sync.rs tests (spawn-failed spool replay).
+    ("POST", "/agents/{id}/spawn-failed"),
     ("GET", "/analytics/token-usage/by-model"),
     ("GET", "/analytics/token-usage/by-page"),
     ("GET", "/analytics/token-usage/by-phase"),
