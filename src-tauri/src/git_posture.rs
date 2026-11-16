@@ -152,40 +152,14 @@ pub fn prompt_proof_git_env() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The REPOSITORY-LOCAL git environment variables the runner scrubs from every
-/// git child it starts: what `git rev-parse --local-env-vars` prints (git
-/// 2.47.3) MINUS [`COMMAND_SCOPE_GIT_CONFIG_ENV`] — exactly the set git itself
-/// clears when it crosses into another repository (a submodule). Any of them
-/// inherited by a child makes git read a repository, index, object store or
-/// config file OTHER than the one `-C` / `current_dir` names: `-C` does not
-/// override an inherited `GIT_DIR`, so a runner started from a git hook (which
-/// exports `GIT_DIR`) or any shell that exported these would answer — and
-/// write — about the CALLER's repo. `GIT_CONFIG` (the legacy whole-config-FILE
-/// override) stays on the list: it names a file, which is repo-locating.
-/// `repo_local_git_env_covers_gits_own_list` pins this against the installed
-/// git, so a git that grows the list fails a test rather than silently
-/// reopening the hole.
-///
-/// Lives here, beside the credential posture, because it has consumers on both
-/// sides of the lib/bin split: [`crate::process_helpers::no_window`] /
-/// [`crate::process_helpers::tokio_no_window`] (owned by the lib and
-/// re-exported to the bin) apply it to every git subprocess the runner starts, and the bin-only
-/// `git_trunk` resolver applies it to the commands its seam tests hand it.
-pub const REPO_LOCAL_GIT_ENV: &[&str] = &[
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_IMPLICIT_WORK_TREE",
-    "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE",
-    "GIT_NO_REPLACE_OBJECTS",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_PREFIX",
-    "GIT_SHALLOW_FILE",
-    "GIT_COMMON_DIR",
-];
+// `REPO_LOCAL_GIT_ENV` — the 13 repository-local git env names — lives in
+// `git_posture/repo_local_git_env.rs` (its doc comment with it) so that ONE
+// copy serves every reader: this module, `build.rs` (which `include!`s the
+// same file, a build script being its own crate), and `vite.config.ts` /
+// `scripts/frontend-provenance.mjs`, which read it as text through
+// `scripts/lib/repo-local-git-env.mjs`. (A `///` comment cannot precede an
+// `include!` — rustc's `unused_doc_comments` fires — hence this `//` block.)
+include!("git_posture/repo_local_git_env.rs");
 
 /// The names on git's `--local-env-vars` list that are NOT scrubbed, because
 /// they carry COMMAND-SCOPE config (`git -c k=v`, and the `GIT_CONFIG_COUNT`
