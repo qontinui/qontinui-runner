@@ -129,6 +129,27 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     true
 }
 
+/// When each session last moved to another account in this process (unix
+/// millis), recorded once its replacement pane is up. Read by the usage-limit
+/// hint ([`super::limit_reset::HintInputs::migrated_at_ms`]).
+static LAST_MIGRATED: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+fn note_migrated(claude_session_id: &str, at_ms: i64) {
+    let mut last = LAST_MIGRATED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    last.get_or_insert_with(HashMap::new)
+        .insert(claude_session_id.to_string(), at_ms);
+}
+
+/// When `claude_session_id` last moved to another account in this process.
+fn last_migrated_at(claude_session_id: &str) -> Option<i64> {
+    let last = LAST_MIGRATED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    last.as_ref()?.get(claude_session_id).copied()
+}
+
 /// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
 /// migration that never ran (refused by [`begin_migration`]). Removes exactly
 /// one entry with that stamp under the history lock, so two hints that took
@@ -389,7 +410,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     let ai_settings = crate::settings::get_ai_settings();
     let auto_migrate = ai_settings.claude_cli.auto_migrate_on_token_exhaustion;
     let auto_continue = ai_settings.claude_cli.auto_continue_after_limit_reset;
-    if !auto_migrate && !auto_continue {
+    if !super::limit_reset::hint_wanted(auto_migrate, auto_continue) {
         info!(
             session = %record.claude_session_id,
             "usage-limit hint but both auto-migration and the reset-continue are disabled in settings"
@@ -405,11 +426,24 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // quote one; a resume repaint can re-render a historical one). Re-probe
     // before acting; `limit_reset::decide` combines the probe with the read.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    let probe = super::limit_reset::ProbeVerdict::from_probe(
-        &usage,
-        &src,
-        crate::ai_provider::account_known_exhausted(&src),
-    );
+    let probe = match super::limit_reset::row_for(&usage, &src) {
+        Some(row) => super::limit_reset::ProbeVerdict::from_row(
+            Some(row),
+            crate::ai_provider::account_known_exhausted(&src),
+        ),
+        // The roster probe returns no rows below two accounts. Only a stop
+        // needs the verdict there (the continue branch), so only a stop pays
+        // for probing the session's own account.
+        None if matches!(read, super::limit_stop::LimitStopRead::Stopped(_)) => {
+            let row = crate::commands::ai_settings::probe_account_usage(src.clone()).await;
+            let exhausted = crate::commands::ai_settings::probe_result_exhausted(&row);
+            super::limit_reset::ProbeVerdict::from_row(Some(&row), exhausted)
+        }
+        None => super::limit_reset::ProbeVerdict::from_row(
+            None,
+            crate::ai_provider::account_known_exhausted(&src),
+        ),
+    };
     let now_ms = chrono::Utc::now().timestamp_millis();
     let action = super::limit_reset::decide(&super::limit_reset::HintInputs {
         finished: record.finished_at.is_some(),
@@ -419,6 +453,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         auto_migrate,
         auto_continue,
         config_dir_count: crate::settings::get_claude_config_dirs().len(),
+        migrated_at_ms: last_migrated_at(&record.claude_session_id),
     });
     let park_fallback = match action {
         super::limit_reset::LimitAction::Migrate { park_fallback } => park_fallback,
@@ -574,6 +609,9 @@ fn skip_message(why: super::limit_reset::SkipReason) -> &'static str {
             "usage-limit confirmed-candidate but auto-migration is disabled in settings"
         }
         SkipReason::NoOtherAccount => "usage-limit hint but there is no other account to migrate to",
+        SkipReason::MigratedSinceStop => {
+            "limit stop predates this session's latest migration — its continue nudge owns it"
+        }
     }
 }
 
@@ -587,7 +625,6 @@ fn park_stop(
     due_at_ms: i64,
     reason: super::limit_reset::ParkReason,
 ) {
-    super::limit_stop::park(&record.terminal_id, &record.claude_session_id, due_at_ms);
     info!(
         terminal_id = %record.terminal_id,
         session = %record.claude_session_id,
@@ -596,11 +633,19 @@ fn park_stop(
         reason = reason.as_str(),
         "limit stop parked"
     );
-    let (event, payload) =
-        super::limit_reset::parked_event(&record.claude_session_id, src, due_at_ms, reason);
-    if let Err(e) = app.emit(event, payload) {
-        warn!(error = %e, "failed to emit {event}");
-    }
+    super::limit_reset::report_park(
+        &record.terminal_id,
+        &record.claude_session_id,
+        src,
+        due_at_ms,
+        reason,
+        super::limit_stop::park,
+        |event, payload| {
+            if let Err(e) = app.emit(event, payload) {
+                warn!(error = %e, "failed to emit {event}");
+            }
+        },
+    );
 }
 
 /// The cap or the target pick refused the migration: park a stop, report
@@ -701,6 +746,16 @@ async fn continue_after_reset(
                 let due_at_ms = chrono::Utc::now().timestamp_millis()
                     + super::limit_reset::LIMIT_RESET_MARGIN_MS;
                 park_stop(app, record, src, due_at_ms, ParkReason::ContinueRetry);
+            } else {
+                let (event, payload) = super::limit_reset::gave_up_event(
+                    &record.claude_session_id,
+                    src,
+                    &terminal_id,
+                    attempts,
+                );
+                if let Err(e) = app.emit(event, payload) {
+                    warn!(error = %e, "failed to emit {event}");
+                }
             }
         }
     }
@@ -1814,6 +1869,13 @@ fn migrate_session(
             return Err(e.into());
         }
     };
+    // The session now runs on `dst_config_dir`, and its carried transcript
+    // still ends at the stop that moved it: say when, so the usage-limit hint
+    // leaves that old stop to this migration's own continue nudge.
+    note_migrated(
+        &record.claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
 
     // 4. The replacement is up: close the old pane. Its lifecycle row already
     // belongs to the new terminal (step 3), so the exit hook's later

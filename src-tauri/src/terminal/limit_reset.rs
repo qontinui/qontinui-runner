@@ -7,9 +7,9 @@
 //! Before this, [`super::account_migration::handle_usage_limit_hint`] read a
 //! probe saying "this account is no longer exhausted" as "the limit message
 //! was echoed text" and returned with nothing scheduled. It could not tell a
-//! quoted banner from a real stop whose reset had passed, so on 2026-11-04 95
-//! hints on sessions parked at a weekly limit were dropped and those sessions
-//! stayed idle after their accounts reset. The transcript says which it is
+//! quoted banner from a real stop whose reset had passed: after the 2026-11-04
+//! restart 95 hints were dropped as echoed text, 53 of them on paktis after its
+//! reset, and those sessions stayed idle. The transcript says which it is
 //! ([`super::limit_stop::transcript_limit_stop`]), and [`decide`] combines that
 //! read with a fresh probe and the clock.
 //!
@@ -64,33 +64,50 @@ pub(crate) const PARKED_EVENT: &str = "session-limit-parked";
 /// The event a submitted reset-continue emits.
 pub(crate) const CONTINUED_EVENT: &str = "session-limit-reset-continued";
 
+/// The event a stop emits when its last continue attempt did not reach the
+/// pane: nothing more is tried, so the operator is told.
+pub(crate) const CONTINUE_GAVE_UP_EVENT: &str = "session-limit-reset-continue-gave-up";
+
 /// What a fresh usage probe said about the session's account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProbeVerdict {
-    /// The probe returned no clean row for the account (missing, or carrying
-    /// an `error`). The cached snapshot reads such a row as exhausted
-    /// (`probe_result_exhausted`), so for a STOP this is UNKNOWN.
+    /// The probe returned no clean row for the account (none at all, or one
+    /// carrying an `error`). The cached snapshot reads an errored row as
+    /// exhausted (`probe_result_exhausted`), so for a STOP whose reset has
+    /// passed this is UNKNOWN.
     pub unknown: bool,
-    /// `ai_provider::account_known_exhausted` after the probe: the verdict the
+    /// Whether the account reads exhausted after the probe: the verdict the
     /// handler has always migrated on.
     pub known_exhausted: bool,
 }
 
 impl ProbeVerdict {
-    /// The verdict for `config_dir` from one probe's rows.
-    pub(crate) fn from_probe(
-        usage: &[crate::commands::ai_settings::AccountUsageInfo],
-        config_dir: &str,
+    /// The verdict from the account's own probe row (`None`: no row).
+    pub(crate) fn from_row(
+        row: Option<&crate::commands::ai_settings::AccountUsageInfo>,
         known_exhausted: bool,
     ) -> Self {
-        let clean = usage
-            .iter()
-            .any(|i| i.config_dir == config_dir && i.error.is_none());
         Self {
-            unknown: !clean,
+            unknown: row.is_none_or(|r| r.error.is_some()),
             known_exhausted,
         }
     }
+}
+
+/// `config_dir`'s row in one probe's results. The roster probe returns no
+/// rows at all on a runner with fewer than two accounts, which is why the
+/// handler then probes the session's own account instead.
+pub(crate) fn row_for<'a>(
+    usage: &'a [crate::commands::ai_settings::AccountUsageInfo],
+    config_dir: &str,
+) -> Option<&'a crate::commands::ai_settings::AccountUsageInfo> {
+    usage.iter().find(|i| i.config_dir == config_dir)
+}
+
+/// Whether a hint is worth reading a transcript and probing for at all: not
+/// when both the migration and the reset-continue are switched off.
+pub(crate) fn hint_wanted(auto_migrate: bool, auto_continue: bool) -> bool {
+    auto_migrate || auto_continue
 }
 
 /// Everything [`decide`] reads.
@@ -107,6 +124,10 @@ pub(crate) struct HintInputs {
     pub auto_continue: bool,
     /// How many Claude config dirs (accounts) are configured.
     pub config_dir_count: usize,
+    /// When this session last migrated in this process (its migration-cap
+    /// stamp), if it did. A migration carries the transcript, so the copy
+    /// still ends at the stop that caused it, with the OLD account's reset.
+    pub migrated_at_ms: Option<i64>,
 }
 
 /// Why a stop was parked. The string is the event's `reason`.
@@ -160,6 +181,9 @@ pub(crate) enum SkipReason {
     MigrateDisabled,
     /// Not a stop, the account is exhausted, and there is no other account.
     NoOtherAccount,
+    /// The stop came before this session's latest migration: it was hit on
+    /// the old account, and the migration's own continue nudge owns it.
+    MigratedSinceStop,
 }
 
 /// What the hint does.
@@ -199,34 +223,36 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
     }
     match &i.read {
         LimitStopRead::Stopped(stop) => {
-            let reset_passed = stop.resets_at_ms.is_none_or(|r| r <= i.now_ms);
-            if i.probe.unknown {
-                // Never migrate, and never continue, on an unknown probe.
-                let due_at_ms = if reset_passed {
-                    i.now_ms + LIMIT_RESET_MARGIN_MS
-                } else {
-                    park_due_at(stop, i.now_ms)
-                };
-                return LimitAction::Park {
-                    due_at_ms,
-                    reason: ParkReason::ProbeUnknown,
-                };
+            if migrated_since(stop, i.migrated_at_ms) {
+                return LimitAction::Skip(SkipReason::MigratedSinceStop);
             }
-            if i.probe.known_exhausted {
+            let reset_passed = stop.resets_at_ms.is_none_or(|r| r <= i.now_ms);
+            if i.probe.unknown && reset_passed {
+                // Never migrate, and never continue, on an unknown probe.
+                return continue_or_skip(
+                    i,
+                    LimitAction::Park {
+                        due_at_ms: i.now_ms + LIMIT_RESET_MARGIN_MS,
+                        reason: ParkReason::ProbeUnknown,
+                    },
+                );
+            }
+            if i.probe.known_exhausted || i.probe.unknown {
+                // An unknown probe beside a reset still ahead: the stop itself
+                // says the account is limited, as an errored probe row does.
                 return migrate_or_park(i, Some(park_due_at(stop, i.now_ms)));
             }
             if !reset_passed {
                 // The probe and the stop disagree: wait for the stop's reset.
-                return LimitAction::Park {
-                    due_at_ms: park_due_at(stop, i.now_ms),
-                    reason: ParkReason::NotYetReset,
-                };
+                return continue_or_skip(
+                    i,
+                    LimitAction::Park {
+                        due_at_ms: park_due_at(stop, i.now_ms),
+                        reason: ParkReason::NotYetReset,
+                    },
+                );
             }
-            if i.auto_continue {
-                LimitAction::Continue(stop.clone())
-            } else {
-                LimitAction::Skip(SkipReason::ContinueDisabled)
-            }
+            continue_or_skip(i, LimitAction::Continue(stop.clone()))
         }
         LimitStopRead::NotStopped if i.probe.known_exhausted => migrate_or_park(i, None),
         LimitStopRead::NotStopped => LimitAction::Skip(SkipReason::Echoed),
@@ -235,8 +261,26 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
     }
 }
 
+/// The stop was hit before this session's latest migration. A stop with no
+/// timestamp beside a recorded migration is read the same way: the migration
+/// path owns that session's continue, and a second prompt would race it.
+fn migrated_since(stop: &LimitStop, migrated_at_ms: Option<i64>) -> bool {
+    migrated_at_ms.is_some_and(|m| stop.stopped_at_ms.is_none_or(|s| s <= m))
+}
+
+/// `action` when it can end in a continue, which needs the reset-continue
+/// switched on; otherwise nothing.
+fn continue_or_skip(i: &HintInputs, action: LimitAction) -> LimitAction {
+    if i.auto_continue {
+        action
+    } else {
+        LimitAction::Skip(SkipReason::ContinueDisabled)
+    }
+}
+
 /// The migration branch's own gates. A stop (`park_due` set) that cannot
-/// migrate is parked; anything else keeps the old return.
+/// migrate is parked until its reset, when only a continue can follow; any
+/// other read keeps the old return.
 fn migrate_or_park(i: &HintInputs, park_due: Option<i64>) -> LimitAction {
     let refusal = if !i.auto_migrate {
         Some((ParkReason::AutoMigrateOff, SkipReason::MigrateDisabled))
@@ -247,7 +291,9 @@ fn migrate_or_park(i: &HintInputs, park_due: Option<i64>) -> LimitAction {
     };
     match (refusal, park_due) {
         (None, park_fallback) => LimitAction::Migrate { park_fallback },
-        (Some((reason, _)), Some(due_at_ms)) => LimitAction::Park { due_at_ms, reason },
+        (Some((reason, _)), Some(due_at_ms)) => {
+            continue_or_skip(i, LimitAction::Park { due_at_ms, reason })
+        }
         (Some((_, skip)), None) => LimitAction::Skip(skip),
     }
 }
@@ -285,6 +331,42 @@ pub(crate) fn parked_event(
             "configDir": config_dir,
             "dueAtMs": due_at_ms,
             "reason": reason.as_str(),
+        }),
+    )
+}
+
+/// Park a stopped session and report it: `park` records it on the park list
+/// and `emit` sends [`parked_event`]. Both are parameters so a test sees what
+/// a park reports, and that it is never `session-account-migration-skipped`.
+pub(crate) fn report_park(
+    terminal_id: &str,
+    claude_session_id: &str,
+    config_dir: &str,
+    due_at_ms: i64,
+    reason: ParkReason,
+    park: impl FnOnce(&str, &str, i64),
+    emit: impl FnOnce(&'static str, Value),
+) {
+    park(terminal_id, claude_session_id, due_at_ms);
+    let (event, payload) = parked_event(claude_session_id, config_dir, due_at_ms, reason);
+    emit(event, payload);
+}
+
+/// The `session-limit-reset-continue-gave-up` event for a stop whose last
+/// allowed continue attempt did not reach the pane.
+pub(crate) fn gave_up_event(
+    claude_session_id: &str,
+    config_dir: &str,
+    terminal_id: &str,
+    attempts: u32,
+) -> (&'static str, Value) {
+    (
+        CONTINUE_GAVE_UP_EVENT,
+        json!({
+            "claudeSessionId": claude_session_id,
+            "configDir": config_dir,
+            "terminalId": terminal_id,
+            "attempts": attempts,
         }),
     )
 }

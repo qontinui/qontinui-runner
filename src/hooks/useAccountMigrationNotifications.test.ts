@@ -10,6 +10,7 @@ import {
   LIMIT_BURST_MS,
   continuedBurstToast,
   createBurstCoalescer,
+  gaveUpBurstToast,
   migratedToast,
   parkedBurstToast,
   type MigratedPayload,
@@ -131,16 +132,17 @@ describe("usage-limit park and continue toasts (plan 2026-11-05 Phase 2)", () =>
       ],
       hhmm,
     );
-    expect(toast.message).toBe(
-      "3 sessions are parked at a usage limit until T5; continued automatically once it resets",
-    );
+    expect(toast.message).toBe("3 sessions parked at a usage limit until T5");
     expect(toast.type).toBe("info");
     expect(toast.message).not.toContain("out of tokens");
   });
 
   it("names one session, and a span of due times", () => {
     expect(parkedBurstToast([{ claudeSessionId: "0c4e3025-8c5c", dueAtMs: 7 }], hhmm).message).toBe(
-      "Session 0c4e3025 is parked at a usage limit until T7; continued automatically once it resets",
+      "Session 0c4e3025 parked at a usage limit until T7",
+    );
+    expect(parkedBurstToast([{ dueAtMs: 7 }], hhmm).message).toBe(
+      "A session parked at a usage limit until T7",
     );
     expect(parkedBurstToast([{ dueAtMs: 9 }, { dueAtMs: 3 }], hhmm).message).toContain(
       "until T3–T9",
@@ -151,6 +153,14 @@ describe("usage-limit park and continue toasts (plan 2026-11-05 Phase 2)", () =>
     expect(continuedBurstToast([{ claudeSessionId: "0c4e3025-x" }, {}]).message).toBe(
       "2 sessions continued after the usage limit reset",
     );
+  });
+
+  it("is an error toast when the runner gave up continuing", () => {
+    const toast = gaveUpBurstToast([{ claudeSessionId: "0c4e3025-x", attempts: 3 }]);
+    expect(toast.message).toBe(
+      "Session 0c4e3025 stopped at a usage limit that has reset, but the runner could not continue it; it needs a prompt by hand",
+    );
+    expect(toast.type).toBe("error");
   });
 
   it("flushes one burst per window", () => {

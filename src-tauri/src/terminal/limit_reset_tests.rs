@@ -1,6 +1,7 @@
 //! The reset-continue decision, its dedup and the menu gate (plan 2026-11-05
 //! Phase 2). The probe, the clock and the transcript read are inputs, so the
 //! branch table is tested row by row.
+#![cfg(test)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,8 +16,12 @@ fn stop(resets_at_ms: Option<i64>) -> LimitStop {
         entry_uuid: "7d3c2a51-0000-4000-8000-000000000001".to_string(),
         resets_at_ms,
         rate_limit_type: Some("seven_day".to_string()),
+        stopped_at_ms: Some(STOPPED_AT),
     }
 }
+
+/// When the test stop was hit: well before [`NOW`].
+const STOPPED_AT: i64 = NOW - 10_000_000;
 
 fn probe(unknown: bool, known_exhausted: bool) -> ProbeVerdict {
     ProbeVerdict {
@@ -44,6 +49,7 @@ fn inputs(read: LimitStopRead, probe: ProbeVerdict) -> HintInputs {
         auto_migrate: true,
         auto_continue: true,
         config_dir_count: 2,
+        migrated_at_ms: None,
     }
 }
 
@@ -104,15 +110,132 @@ fn an_unknown_probe_parks_a_stop_and_never_migrates_it() {
             reason: ParkReason::ProbeUnknown,
         }
     );
-    // With the reset still ahead, it waits for the reset.
+    // With the reset still ahead the stop itself says the account is limited
+    // (as an errored header-probe 429 does), so it takes the migration.
     let ahead = inputs(stopped(Some(NOW + 600_000)), probe(true, true));
     assert_eq!(
         decide(&ahead),
-        LimitAction::Park {
-            due_at_ms: NOW + 600_000 + 120_000,
-            reason: ParkReason::ProbeUnknown,
+        LimitAction::Migrate {
+            park_fallback: Some(NOW + 600_000 + 120_000),
         }
     );
+    // A missing row (unknown, not read exhausted) with the reset ahead too.
+    let missing = inputs(stopped(Some(NOW + 600_000)), probe(true, false));
+    assert_eq!(
+        decide(&missing),
+        LimitAction::Migrate {
+            park_fallback: Some(NOW + 600_000 + 120_000),
+        }
+    );
+}
+
+#[test]
+fn with_the_continue_off_a_stop_waiting_only_for_a_continue_is_not_parked() {
+    let off = |read, probe| {
+        let mut i = inputs(read, probe);
+        i.auto_continue = false;
+        i
+    };
+    // Not yet reset, on a fine account: only a continue could follow.
+    assert_eq!(
+        decide(&off(stopped(Some(NOW + 60_000)), FINE)),
+        LimitAction::Skip(SkipReason::ContinueDisabled)
+    );
+    // Unknown probe after the reset: likewise.
+    assert_eq!(
+        decide(&off(stopped(Some(NOW - 1_000)), probe(true, true))),
+        LimitAction::Skip(SkipReason::ContinueDisabled)
+    );
+    // Still exhausted on one account: nothing can ever move it.
+    let mut single = off(stopped(Some(NOW + 60_000)), DRY);
+    single.config_dir_count = 1;
+    assert_eq!(
+        decide(&single),
+        LimitAction::Skip(SkipReason::ContinueDisabled)
+    );
+    // Still exhausted with a target possible: the migration (and its cap or
+    // no-target park) is unaffected.
+    assert_eq!(
+        decide(&off(stopped(Some(NOW + 60_000)), DRY)),
+        LimitAction::Migrate {
+            park_fallback: Some(NOW + 60_000 + 120_000),
+        }
+    );
+}
+
+#[test]
+fn a_stop_from_before_the_latest_migration_is_left_to_that_migration() {
+    // The carried transcript ends at the stop the migration answered, with
+    // the OLD account's reset still ahead: never park it until then.
+    let mut carried = inputs(stopped(Some(NOW + 86_400_000)), FINE);
+    carried.migrated_at_ms = Some(STOPPED_AT + 5_000);
+    assert_eq!(
+        decide(&carried),
+        LimitAction::Skip(SkipReason::MigratedSinceStop)
+    );
+    // A stop with no timestamp beside a recorded migration: the same.
+    let mut untimed = inputs(
+        LimitStopRead::Stopped(LimitStop {
+            stopped_at_ms: None,
+            ..stop(None)
+        }),
+        FINE,
+    );
+    untimed.migrated_at_ms = Some(STOPPED_AT);
+    assert_eq!(
+        decide(&untimed),
+        LimitAction::Skip(SkipReason::MigratedSinceStop)
+    );
+    // A NEW stop, hit on the target account after the migration, is decided.
+    let mut later = inputs(stopped(Some(NOW - 1_000)), FINE);
+    later.migrated_at_ms = Some(STOPPED_AT - 5_000);
+    assert_eq!(
+        decide(&later),
+        LimitAction::Continue(stop(Some(NOW - 1_000)))
+    );
+}
+
+#[test]
+fn the_probe_verdict_reads_a_missing_or_errored_row_as_unknown() {
+    use crate::commands::ai_settings::AccountUsageInfo;
+    let clean = AccountUsageInfo {
+        config_dir: "/a".to_string(),
+        ..Default::default()
+    };
+    let errored = AccountUsageInfo {
+        config_dir: "/b".to_string(),
+        error: Some("API error (429)".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        ProbeVerdict::from_row(Some(&clean), false),
+        probe(false, false)
+    );
+    assert_eq!(
+        ProbeVerdict::from_row(Some(&clean), true),
+        probe(false, true)
+    );
+    assert_eq!(
+        ProbeVerdict::from_row(Some(&errored), true),
+        probe(true, true)
+    );
+    assert_eq!(ProbeVerdict::from_row(None, false), probe(true, false));
+    let usage = vec![clean.clone(), errored.clone()];
+    assert_eq!(
+        row_for(&usage, "/b").map(|r| r.config_dir.as_str()),
+        Some("/b")
+    );
+    assert!(row_for(&usage, "/c").is_none());
+    // The roster probe returns no rows at all below two accounts.
+    assert!(row_for(&[], "/a").is_none());
+}
+
+#[test]
+fn a_hint_is_read_unless_both_switches_are_off() {
+    assert!(hint_wanted(true, true));
+    assert!(hint_wanted(false, true));
+    assert!(hint_wanted(true, false));
+    assert!(!hint_wanted(false, false));
 }
 
 #[test]
@@ -265,6 +388,36 @@ fn a_refused_migration_of_a_stop_parks_it_and_a_non_stop_reports_as_before() {
         migration_refused(None, ParkReason::MigrationCapReached),
         RefusalReport::Skipped("migration-cap-reached")
     );
+}
+
+#[test]
+fn report_park_parks_the_terminal_and_emits_session_limit_parked() {
+    let mut parked = None;
+    let mut emitted = Vec::new();
+    report_park(
+        "term-1",
+        "sid-1",
+        "/home/u/.claude-jan",
+        NOW + 120_000,
+        ParkReason::NoUsableTarget,
+        |t, s, due| parked = Some((t.to_string(), s.to_string(), due)),
+        |name, payload| emitted.push((name, payload)),
+    );
+    assert_eq!(
+        parked,
+        Some(("term-1".to_string(), "sid-1".to_string(), NOW + 120_000))
+    );
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].0, "session-limit-parked");
+    assert_eq!(emitted[0].1["reason"], "no-usable-target");
+}
+
+#[test]
+fn a_continue_that_runs_out_of_attempts_emits_its_own_event() {
+    let (name, payload) = gave_up_event("sid-1", "/home/u/.claude-jan", "term-1", 3);
+    assert_eq!(name, "session-limit-reset-continue-gave-up");
+    assert_eq!(payload["attempts"], 3);
+    assert_eq!(payload["terminalId"], "term-1");
 }
 
 #[test]
