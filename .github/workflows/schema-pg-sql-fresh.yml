@@ -274,11 +274,11 @@ jobs:
       # the client is the server's own binary: the same major AND minor by
       # construction. A host client is not one version pin away from that.
       # pg_dump refuses a server of a newer major, and even a minor skew
-      # changes the dump. 16.16 servers stamp a `pg_attver` attribute option
-      # on every column, which 16.16's pg_dump strips and 16.15's does not.
-      # Measured locally on 2026-11-16, by loading the checked-in dump into
-      # this image and dumping it both ways: Ubuntu 24.04's apt pg_dump 16.15
-      # emitted 7202 extra
+      # changes the dump. A 16.16 server stamps a `pg_attver` attribute option
+      # on every table column it creates, which 16.16's pg_dump strips and
+      # 16.15's does not. Measured locally on 2026-11-16, by loading the
+      # checked-in dump into this image and dumping it both ways: Ubuntu
+      # 24.04's apt pg_dump 16.15 emitted 7202 extra (one per table column)
       # `ALTER TABLE ONLY ... ALTER COLUMN ... SET (pg_attver=...)` lines that
       # the server's own 16.16 pg_dump omits, which the diff below would read
       # as drift.
