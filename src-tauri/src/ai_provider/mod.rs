@@ -35,6 +35,10 @@ pub(crate) mod pi_cli;
 pub(crate) mod process;
 pub mod retry;
 pub(crate) mod routing;
+// Out of line, and declared here rather than in `config`'s own test module, so
+// these tests travel with the production hunks that name the symbols they test.
+#[cfg(test)]
+mod spawn_account_tests;
 mod types;
 
 // Re-export public API
@@ -47,7 +51,8 @@ pub use config::{
     account_known_exhausted, get_account_statuses, get_effective_config_dir,
     get_effective_config_dir_with_override, get_resolved_config_dir,
     mark_account_rate_limited_with_duration, record_account_usage, rotate_account_on_rate_limit,
-    set_resolved_config_dir, switch_to_account, ClaudeConfigDirSource,
+    set_resolved_config_dir, spawn_account_ready, spawn_account_refusal, switch_to_account,
+    ClaudeConfigDirSource,
 };
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
 pub use oneshot::{
