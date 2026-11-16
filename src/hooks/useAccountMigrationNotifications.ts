@@ -15,7 +15,9 @@
  *   back to the usage-limit handler at its due time (plan Phase 3). A restart
  *   can park ~100 sessions at once, so parks are coalesced into one info toast
  *   per burst. A `continue-retry` park (a continue attempt that did not reach
- *   the pane, retried shortly) raises no toast.
+ *   the pane, retried shortly) and a `migration-nudge-wait` park (a migrated
+ *   session looked at again once its own continue nudge is done) raise no
+ *   toast.
  * - `session-limit-reset-continued` when such a session was continued in
  *   place after its reset — coalesced the same way.
  * - `session-limit-reset-continue-gave-up` when the runner stopped trying to
@@ -218,7 +220,7 @@ function clockTime(ms: number): string {
   return new Date(ms).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
-    hour12: false,
+    hourCycle: "h23",
   });
 }
 
@@ -278,7 +280,7 @@ export function gaveUpBurstToast(gaveUp: LimitGaveUpPayload[]): {
 
 /** Whether a park is worth a toast: not the runner's own short retry. */
 export function parkIsToasted(p: LimitParkedPayload): boolean {
-  return p.reason !== "continue-retry";
+  return p.reason !== "continue-retry" && p.reason !== "migration-nudge-wait";
 }
 
 /**

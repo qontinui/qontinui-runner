@@ -403,6 +403,15 @@ impl ParkList {
         taken
     }
 
+    /// Drop `terminal_id`'s pending park and its reported reason: its stop
+    /// was answered (a continue reached the pane, or the session was already
+    /// working), so a due re-entry would only re-read a session no longer
+    /// stopped, and a later stop's park is news again.
+    pub(crate) fn forget(&mut self, terminal_id: &str) {
+        self.by_terminal.remove(terminal_id);
+        self.reported.remove(terminal_id);
+    }
+
     /// The park on `terminal_id`, if any.
     #[cfg_attr(
         not(test),
@@ -900,5 +909,9 @@ mod tests {
         // A new reason is reported.
         assert!(parks.park("t1", "s1", 7_000, "not-yet-reset"));
         assert!(parks.park("t2", "s2", 7_000, "not-yet-reset"));
+        // Once its stop is answered, the pane's park and reason are gone.
+        parks.forget("t1");
+        assert!(parks.get("t1").is_none());
+        assert!(parks.park("t1", "s1", 9_000, "not-yet-reset"));
     }
 }

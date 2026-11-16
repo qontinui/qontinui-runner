@@ -415,14 +415,13 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         src: &src,
         matched_pattern,
     };
-    let (park_fallback, usage) =
-        match super::limit_hint::run_hint(&env, record.finished_at.is_some(), &src).await {
-            super::limit_hint::HintFlow::Done => return,
-            super::limit_hint::HintFlow::Migrate {
-                park_fallback,
-                usage,
-            } => (park_fallback, usage),
-        };
+    let (park_fallback, usage) = match super::limit_hint::run_hint(&env, &src).await {
+        super::limit_hint::HintFlow::Done => return,
+        super::limit_hint::HintFlow::Migrate {
+            park_fallback,
+            usage,
+        } => (park_fallback, usage),
+    };
 
     // Keep spawn-time selection off the dead account, and repoint the global
     // resolved dir so unrelated new sessions stop landing on it. When the
@@ -517,11 +516,11 @@ struct ProdHintEnv<'a> {
 
 impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
     fn switches(&self) -> (bool, bool) {
-        let ai = crate::settings::get_ai_settings();
-        (
-            ai.claude_cli.auto_migrate_on_token_exhaustion,
-            ai.claude_cli.auto_continue_after_limit_reset,
-        )
+        super::limit_hint::hint_switches(&crate::settings::get_ai_settings().claude_cli)
+    }
+
+    fn finished(&self) -> bool {
+        self.record.finished_at.is_some()
     }
 
     fn config_dir_count(&self) -> usize {
@@ -556,6 +555,12 @@ impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
         super::limit_reset::with_ledger(&super::limit_reset::LEDGER, |l| {
             l.note_unknown_park(&self.record.claude_session_id, entry_uuid)
         })
+    }
+
+    fn clear_unknown_parks(&self, entry_uuid: &str) {
+        super::limit_reset::with_ledger(&super::limit_reset::LEDGER, |l| {
+            l.clear_unknown_parks(&self.record.claude_session_id, entry_uuid)
+        });
     }
 
     fn now_ms(&self) -> i64 {
@@ -732,6 +737,7 @@ async fn continue_after_reset(
             outcome: IdlePromptOutcome::Submitted,
             ..
         } => {
+            super::limit_stop::with_parks(|p| p.forget(&terminal_id));
             info!(
                 terminal_id,
                 session = %record.claude_session_id,
@@ -752,12 +758,15 @@ async fn continue_after_reset(
         ContinueRun::Ran {
             settled: Settled::Kept,
             ..
-        } => info!(
+        } => {
+            super::limit_stop::with_parks(|p| p.forget(&terminal_id));
+            info!(
             terminal_id,
             session = %record.claude_session_id,
             entry_uuid = %stop.entry_uuid,
             "limit-reset-continue: the session was already working — nothing typed"
-        ),
+            )
+        }
         ContinueRun::Ran {
             outcome,
             settled: Settled::Released { attempts, retry },
@@ -2332,6 +2341,55 @@ mod tests {
             argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
             "extra_required tail must survive: {argv:?}"
         );
+    }
+
+    #[test]
+    fn a_recorded_migration_is_read_back() {
+        let sid = "4d1c0000-0000-4000-8000-00000000abcd";
+        assert_eq!(last_migrated_at(sid), None);
+        note_migrated(sid, 1_800_000_000_000);
+        assert_eq!(last_migrated_at(sid), Some(1_800_000_000_000));
+        note_migrated(sid, 1_800_000_060_000);
+        assert_eq!(last_migrated_at(sid), Some(1_800_000_060_000));
+    }
+
+    /// The slice of this file's source from `start` to the next `end`.
+    fn source_between(start: &str, end: &str) -> &'static str {
+        const SRC: &str = include_str!("account_migration.rs");
+        let from = SRC.find(start).expect("start marker");
+        let rest = SRC.get(from..).expect("a char boundary");
+        rest.get(..rest.find(end).expect("end marker"))
+            .expect("a char boundary")
+    }
+
+    /// Source pins on wiring no unit test reaches (plan 2026-11-05 Phase 2):
+    /// the migration records when it moved a session, and the usage-limit
+    /// handler leaves every gate to `limit_hint::run_hint` (which a fake env
+    /// tests) and parks a refused stop instead of reporting it as skipped.
+    #[test]
+    fn the_hint_handler_keeps_no_gate_of_its_own_and_the_migration_stamps_itself() {
+        let migrate = source_between("fn migrate_session(\n", "\nfn emit_skipped(");
+        assert!(
+            migrate.contains("note_migrated("),
+            "migrate_session must stamp"
+        );
+        let handler = source_between(
+            "pub async fn handle_usage_limit_hint(",
+            "\nstruct ProdHintEnv",
+        );
+        let (before, after) = handler
+            .split_once("run_hint(")
+            .expect("the handler runs the hint path");
+        for gate in [
+            "get_claude_config_dirs",
+            "auto_migrate_on_token_exhaustion",
+            "auto_continue_after_limit_reset",
+            "finished_at",
+        ] {
+            assert!(!before.contains(gate), "{gate} read before run_hint");
+        }
+        assert_eq!(after.matches("report_migration_refused(").count(), 2);
+        assert!(!after.contains("emit_skipped(&app, &record, &src, \""));
     }
 
     #[test]
