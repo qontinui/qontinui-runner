@@ -43,10 +43,14 @@
 //!    same way), respawn
 //!    `claude --permission-mode bypassPermissions --resume <sid>` in a fresh
 //!    PTY pinned to the target account, on the same grid page/zone, and only
-//!    THEN close the old pane. The respawn re-keys the session's lifecycle
-//!    row onto the new PTY; the old pane's exit is answered as
-//!    `TerminalSuperseded` and closes nothing. A failed respawn leaves the
-//!    old pane in place.
+//!    once that pane has survived a settle window
+//!    ([`MIGRATION_SETTLE_WINDOW`]) close the old pane. The respawn re-keys
+//!    the session's lifecycle row onto the new PTY; the old pane's exit is
+//!    answered as `TerminalSuperseded` and closes nothing. A failed respawn
+//!    leaves the old pane in place, and so does a resumed pane that dies
+//!    inside the window: the hand-off is rolled back
+//!    ([`hand_off_to_resumed_pane`]) — the continuation registration and the
+//!    lifecycle row go back to the old pane.
 //!
 //! Guards: per-session migration cap (no ping-pong when every account is
 //! dry), one migration in flight per session ([`begin_migration`], which also
@@ -1270,7 +1274,10 @@ fn pane_claude_anchor(
 /// destination → respawn under the target account (which re-keys the
 /// lifecycle row onto the new PTY) → close the old pane → emit event.
 ///
-/// **The old pane closes only after the respawn has succeeded.** Any failure
+/// **The old pane closes only after the respawn has succeeded AND the resumed
+/// pane has survived [`MIGRATION_SETTLE_WINDOW`].** A resumed pane that exits
+/// inside the window is rolled back ([`hand_off_to_resumed_pane`]) and the
+/// result is an error naming its exit code. Any failure
 /// before that — transcript, trust, the spawn itself — returns with the old
 /// pane untouched (and a session closed or moved while the carry ran is
 /// refused just before the respawn, [`still_migratable`]), still sitting at its usage-limit prompt, and the caller
@@ -1369,8 +1376,11 @@ fn migrate_session(
     // not come back as a respawn. Abort with the refusal before anything is
     // lifted or spawned; the carried files stay at the destination, which a
     // carry never makes worse. Above the step-2 lift on purpose (see GUARD).
-    still_migratable(record, src_config_dir, store.get(&record.claude_session_id))
-        .map_err(MigrateError::Refused)?;
+    // The row as it stands now is also the binding a rolled-back hand-off
+    // restores (step 4): the respawn below re-keys it onto the new terminal.
+    let current = store.get(&record.claude_session_id);
+    still_migratable(record, src_config_dir, current.clone()).map_err(MigrateError::Refused)?;
+    let prior_binding = current.unwrap_or_else(|| record.clone());
 
     // 2. Lift any gate-continuation registration off the old terminal
     // BEFORE the respawn: the new PTY is spawned with the carried gate identity
@@ -1427,6 +1437,16 @@ fn migrate_session(
     let carried_gate_identity = carried_continuation.as_ref().and_then(|(c, _reservation)| {
         carried_gate_identity_for(c, crate::agent_runtime::load_local_device_id())
     });
+    // 2b. Hold the session's closes for the hand-off: from the moment the
+    // respawn below re-keys the row onto the new PTY until the hand-off is
+    // decided, a close of the session that does not name the OLD terminal (the
+    // resumed pane dying at once, or a terminal-less closer reading it) must
+    // not end the session the old pane still runs. Placed before the spawn
+    // because the re-key happens inside it. Infallible, so it does not breach
+    // the GUARD window; released in the spawn's `Err` arm below and by
+    // [`hand_off_to_resumed_pane`] on both of its paths. The hold is a guard,
+    // so a panic anywhere in the spawn or the settle wait releases it too.
+    let close_hold = store.hold_session_closes(&record.claude_session_id, &record.terminal_id);
     let spawned = spawn_resumed_pane(
         app,
         &terminal_manager,
@@ -1461,7 +1481,7 @@ fn migrate_session(
             // that should. An account migration is not the creation of a new
             // session: the operator's session already exists, and this respawn
             // is the first half of a move whose second half (step 4) closes the
-            // old PTY the moment this one is up. Refusing here would not
+            // old PTY once this one has survived its settle window. Refusing here would not
             // protect a live session — it would strand one at a usage-limit
             // prompt, which inverts the whole point of the guard (plan §Part D
             // step 5: never touch an already-running session; this gate fires
@@ -1476,29 +1496,59 @@ fn migrate_session(
         },
     );
     // GUARD: anchor-held window closes at the `restore_continuation_registration`
-    // call INSIDE each arm below, not at this line — an early exit added in
-    // the `Ok` arm before that call would still drop the permit and free the
-    // anchor. This marker is where the two arms diverge; see the matching
-    // GUARD marker at the lift for what may not appear anywhere in between.
+    // call INSIDE each arm below (for the `Ok` arm, inside
+    // [`hand_off_to_resumed_pane`], which re-pins on every path), not at this
+    // line — an early exit added in either arm before that call would still
+    // drop the permit and free the anchor. This marker is where the two arms
+    // diverge; see the matching GUARD marker at the lift for what may not
+    // appear anywhere in between.
+    let re_pin = |terminal_id: &str,
+                  onto_resumed: bool,
+                  (mut carried, reservation): (
+        crate::agent_runtime::CarriedContinuation,
+        crate::agent_runtime::AnchorReservation,
+    )| {
+        // The respawned pane runs `claude --resume` as its direct child, so
+        // its exit facts are the agent's even when the old pane was a
+        // restored shell. A registration going BACK to the old pane keeps
+        // whatever it had there.
+        if onto_resumed {
+            carried.shell_hosted = false;
+        }
+        crate::agent_runtime::restore_continuation_registration(
+            terminal_id.to_string(),
+            carried,
+            reservation,
+        );
+    };
     let new_terminal_id = match spawned {
         Ok((terminal_id, _coord_session_id)) => {
-            // Re-pin the continuation onto the terminal that now hosts it, so
-            // the registry's dedup/cap view stays true and the eventual real
-            // exit still reports an outcome. The permit taken by the lift is
-            // handed on here: the live row replaces the reservation under one
-            // lock, so the anchor moves from held-by-permit to
-            // held-by-session with no gap.
-            if let Some((mut carried, reservation)) = carried_continuation {
-                // The respawned pane runs `claude --resume` as its direct
-                // child, so its exit facts are the agent's even when the old
-                // pane was a restored shell.
-                carried.shell_hosted = false;
-                crate::agent_runtime::restore_continuation_registration(
-                    terminal_id.clone(),
-                    carried,
-                    reservation,
-                );
-            }
+            // 3b + 4. Keep the old pane until the resumed one has survived the
+            // settle window, then close it — or, when the resumed pane dies
+            // inside the window, roll back: the continuation and the lifecycle
+            // row go back to the old pane, which is left running, and the
+            // caller emits `skipped` with the error. Until 2026-11-15 the old
+            // pane closed the moment the spawn returned, so a resumed CLI that
+            // died at once (a half-reinstalled npm `claude` whose interpreter or
+            // entry script is gone — exit 127 — or a failed resume)
+            // took the session with it. Runs on the blocking pool
+            // (`migrate_session_off_runtime`), so the wait blocks no worker.
+            hand_off_to_resumed_pane(
+                close_hold,
+                &prior_binding,
+                &terminal_id,
+                carried_continuation,
+                || {
+                    await_pane_settle(
+                        MIGRATION_SETTLE_WINDOW,
+                        MIGRATION_SETTLE_POLL,
+                        || pane_state(&terminal_manager, &terminal_id),
+                        std::thread::sleep,
+                    )
+                },
+                re_pin,
+                &*terminal_manager,
+            )?;
             terminal_id
         }
         Err(e) => {
@@ -1508,39 +1558,13 @@ fn migrate_session(
             // honestly. The caller emits `skipped` with this error. The permit
             // goes with it — the failed arm settles the reservation exactly
             // like the successful one, just onto the OLD terminal id.
-            if let Some((carried, reservation)) = carried_continuation {
-                crate::agent_runtime::restore_continuation_registration(
-                    record.terminal_id.clone(),
-                    carried,
-                    reservation,
-                );
+            if let Some(carried) = carried_continuation {
+                re_pin(&record.terminal_id, false, carried);
             }
+            drop(close_hold);
             return Err(e.into());
         }
     };
-
-    // 4. The replacement is up: close the old pane. Its lifecycle row already
-    // belongs to the new terminal (step 3), so the exit hook's later
-    // `(session id, old terminal)` close must not be resolved against the map
-    // — it would read as a mis-bound `NotFound`. Mark the hand-off first so the
-    // store answers that close with `TerminalSuperseded`: no mutation, no coord
-    // `Closed`, and the workdir nonce the resumed pane still uses is kept.
-    // There is no close-reason to record because the row is never closed —
-    // which is also what keeps boot-restore from ever offering the old pane.
-    store.mark_terminal_superseded(&record.terminal_id, &new_terminal_id);
-    if let Err(e) = terminal_manager.close(&record.terminal_id) {
-        // Old pane was already gone (user closed it after exhaustion) — not
-        // fatal, the replacement is what matters. Its exit-close then either
-        // arrived before the mark or never will, so withdraw the mark rather
-        // than leave an entry nothing consumes.
-        store.unmark_terminal_superseded(&record.terminal_id);
-        info!(
-            terminal_id = %record.terminal_id,
-            new_terminal_id = %new_terminal_id,
-            error = %e,
-            "old terminal close failed after a successful respawn"
-        );
-    }
 
     // 4b. Top up `<sid>/` with whatever the old pane wrote between the carry
     // and its exit — detached, because `close` does not wait for the `claude`
@@ -1606,6 +1630,238 @@ fn migrate_session(
         warn!(error = %e, "failed to emit session-account-migrated");
     }
     Ok(outcome)
+}
+
+/// How long a resumed pane must stay up before the migration closes the old
+/// one ([`hand_off_to_resumed_pane`]). A resumed CLI that cannot start — a
+/// half-reinstalled npm `claude` whose interpreter or entry script is gone
+/// (exit 127), a `--resume` the target account refuses — dies within seconds; one that is still running after
+/// this long has loaded its conversation. (A binary missing outright fails the
+/// spawn itself, before any window.) During the window two PTYs carry
+/// the session, and the old one is idle at its usage-limit prompt.
+pub(crate) const MIGRATION_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How often [`await_pane_settle`] looks at the resumed pane during the
+/// window.
+const MIGRATION_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One look at a pane, from the facts its waiter thread already records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneState {
+    Running,
+    /// The process ended (or the pane is gone). The exit code when known.
+    Exited(Option<i32>),
+}
+
+/// What became of the resumed pane during the settle window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneSettle {
+    /// Still running when the window closed.
+    Survived,
+    /// Ended inside the window, `after` into it.
+    ExitedEarly {
+        code: Option<i32>,
+        after: std::time::Duration,
+    },
+}
+
+/// The pane `terminal_id` as the terminal plane knows it — no new watcher: the
+/// waiter's frozen exit facts ([`super::session::TerminalSession::exit_snapshot`]),
+/// else the liveness flag. A pane the manager no longer holds has exited.
+fn pane_state(manager: &crate::terminal::TerminalManager, terminal_id: &str) -> PaneState {
+    let Some(session) = manager.get(terminal_id) else {
+        return PaneState::Exited(None);
+    };
+    if let Some((facts, _at)) = session.exit_snapshot() {
+        return PaneState::Exited(facts.code);
+    }
+    if session.is_alive() {
+        PaneState::Running
+    } else {
+        PaneState::Exited(session.exit_code())
+    }
+}
+
+/// Look at a pane every `poll` until it exits or `window` has been waited
+/// out. The pane is looked at once more at the end of the window, so an exit
+/// in the last poll interval still counts as early. Time is the sum of the
+/// sleeps, which keeps the verdict deterministic under an injected `sleep`;
+/// real sleeps only ever overshoot, so the window is a floor.
+fn await_pane_settle(
+    window: std::time::Duration,
+    poll: std::time::Duration,
+    mut probe: impl FnMut() -> PaneState,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> PaneSettle {
+    let poll = poll.max(std::time::Duration::from_millis(1));
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        if let PaneState::Exited(code) = probe() {
+            return PaneSettle::ExitedEarly {
+                code,
+                after: waited,
+            };
+        }
+        if waited >= window {
+            return PaneSettle::Survived;
+        }
+        let step = poll.min(window.saturating_sub(waited));
+        sleep(step);
+        waited += step;
+    }
+}
+
+/// The two pane operations the hand-off needs, so [`hand_off_to_resumed_pane`]
+/// runs against a fake in tests.
+trait HandoffPanes {
+    /// One look at the pane ([`pane_state`]).
+    fn state(&self, terminal_id: &str) -> PaneState;
+    /// Close the pane (`TerminalManager::close`).
+    fn close(&self, terminal_id: &str) -> Result<(), String>;
+}
+
+impl HandoffPanes for crate::terminal::TerminalManager {
+    fn state(&self, terminal_id: &str) -> PaneState {
+        pane_state(self, terminal_id)
+    }
+    fn close(&self, terminal_id: &str) -> Result<(), String> {
+        crate::terminal::TerminalManager::close(self, terminal_id)
+    }
+}
+
+/// Steps 3b and 4 of [`migrate_session`], free of the app handle so they are
+/// testable: settle the resumed pane, then either hand the session to it or
+/// roll the hand-off back.
+///
+/// `prior` is the session's row as read before the respawn (its
+/// `terminal_id` is the OLD pane); `new_terminal_id` is the resumed pane the
+/// respawn re-keyed that row onto. `hold` is the caller's hold on the
+/// session's closes ([`SessionLifecycleStore::hold_session_closes`], keeping
+/// the old pane), placed before the respawn; it is consumed here and released
+/// on both paths (or by its drop, on a panic). `carried` is the
+/// continuation registration lifted off the old pane, if any:
+/// `re_pin(terminal, onto_resumed, carried)` is called with it exactly once on
+/// every path, which is what closes the GUARD window [`migrate_session`]
+/// describes.
+///
+/// - **Survived:** the continuation goes onto the resumed pane, the old pane
+///   is marked superseded and closed, and the result is `Ok`. A failed close
+///   withdraws the mark — the old pane was already gone.
+/// - **Exited early:** the continuation goes BACK onto the old pane, the row
+///   is put back on the old pane's binding
+///   ([`SessionLifecycleStore::restore_terminal_binding`]), the dead resumed
+///   pane is closed (marked superseded first, so its exit close mutates
+///   nothing) and the old pane is never touched. The result is an `Err`
+///   naming the exit code and whether the old pane is still running — the
+///   operator may have closed it during the window.
+///
+/// Closing the dead pane matters: its tab carries the same session id as the
+/// old one, and a tab left in the grid can re-record the row onto its dead
+/// terminal (the zone backstop re-sends `terminal_session_record_open`),
+/// undoing the rollback.
+///
+/// What is NOT moved back: the coord registrar's entry, which the resumed
+/// pane's coord bind moved onto its fresh coord row
+/// (`AiCoordRegistrar::on_terminal_coord_bind`). By that function's own owner
+/// rule it returns to the old pane once the closed pane's row is swept and
+/// the old pane next confirms its id.
+///
+/// [`SessionLifecycleStore::hold_session_closes`]: crate::session::session_lifecycle_store::SessionLifecycleStore::hold_session_closes
+/// [`SessionLifecycleStore::restore_terminal_binding`]: crate::session::session_lifecycle_store::SessionLifecycleStore::restore_terminal_binding
+fn hand_off_to_resumed_pane<C>(
+    hold: crate::session::session_lifecycle_store::SessionCloseHold<'_>,
+    prior: &TerminalSessionRecord,
+    new_terminal_id: &str,
+    carried: Option<C>,
+    settle: impl FnOnce() -> PaneSettle,
+    re_pin: impl FnOnce(&str, bool, C),
+    panes: &impl HandoffPanes,
+) -> Result<(), String> {
+    let store = hold.store();
+    let old_terminal_id = prior.terminal_id.as_str();
+    let sid = prior.claude_session_id.as_str();
+    match settle() {
+        PaneSettle::Survived => {
+            drop(hold);
+            // Re-pin the continuation onto the terminal that now hosts it, so
+            // the registry's dedup/cap view stays true and the eventual real
+            // exit still reports an outcome. The permit taken by the lift is
+            // handed on: the live row replaces the reservation under one
+            // lock, so the anchor moves from held-by-permit to
+            // held-by-session with no gap.
+            if let Some(carried) = carried {
+                re_pin(new_terminal_id, true, carried);
+            }
+            // The replacement is up: close the old pane. Its lifecycle row
+            // already belongs to the new terminal (step 3), so the exit hook's
+            // later `(session id, old terminal)` close must not be resolved
+            // against the map — it would read as a mis-bound `NotFound`. Mark
+            // the hand-off first so the store answers that close with
+            // `TerminalSuperseded`: no mutation, no coord `Closed`, and the
+            // workdir nonce the resumed pane still uses is kept. There is no
+            // close-reason to record because the row is never closed — which
+            // is also what keeps boot-restore from ever offering the old pane.
+            store.mark_terminal_superseded(old_terminal_id, new_terminal_id);
+            if let Err(e) = panes.close(old_terminal_id) {
+                // Old pane was already gone (user closed it after exhaustion)
+                // — not fatal, the replacement is what matters. Its exit-close
+                // then either arrived before the mark or never will, so
+                // withdraw the mark rather than leave an entry nothing
+                // consumes.
+                store.unmark_terminal_superseded(old_terminal_id);
+                info!(
+                    terminal_id = %old_terminal_id,
+                    new_terminal_id = %new_terminal_id,
+                    error = %e,
+                    "old terminal close failed after a successful respawn"
+                );
+            }
+            Ok(())
+        }
+        PaneSettle::ExitedEarly { code, after } => {
+            if let Some(carried) = carried {
+                re_pin(old_terminal_id, false, carried);
+            }
+            let binding = store.restore_terminal_binding(prior, new_terminal_id);
+            // The dead pane's exit close may still be in flight, and so will
+            // the one its teardown sends: mark it superseded so whichever
+            // arrives after the hold is released mutates nothing, then take
+            // its tab out of the grid.
+            store.mark_terminal_superseded(new_terminal_id, old_terminal_id);
+            drop(hold);
+            if let Err(e) = panes.close(new_terminal_id) {
+                // Already gone — nothing left to take out; the mark stays for
+                // an exit close that may still arrive.
+                info!(
+                    terminal_id = %new_terminal_id,
+                    error = %e,
+                    "rolled-back resumed pane was already gone"
+                );
+            }
+            let old_running = panes.state(old_terminal_id) == PaneState::Running;
+            let code = code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
+            warn!(
+                session = %sid,
+                old_terminal_id = %old_terminal_id,
+                new_terminal_id = %new_terminal_id,
+                exit_code = %code,
+                after_ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
+                binding = ?binding,
+                old_pane_running = old_running,
+                "account migration rolled back: the resumed pane exited inside its settle window"
+            );
+            let old_pane = if old_running {
+                "the old pane keeps the session"
+            } else {
+                "the old pane is no longer running either (closed during the window) — the session's row names it and is restorable"
+            };
+            Err(format!(
+                "the resumed pane exited with code {code} {}ms after spawn, inside the {}s settle window — rolled back; {old_pane} (lifecycle row: {binding:?})",
+                after.as_millis(),
+                MIGRATION_SETTLE_WINDOW.as_secs(),
+            ))
+        }
+    }
 }
 
 fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &str, reason: &str) {
@@ -1881,6 +2137,331 @@ mod tests {
             argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
             "extra_required tail must survive: {argv:?}"
         );
+    }
+
+    // ── settle window + rollback (plan 2026-11-15-account-migration-respawn-
+    //    keeps-old-pane-until-new-one-survives) ────────────────────────────
+
+    /// Probe answers in order, then `Running` forever; sleeps are summed.
+    fn scripted_settle(
+        answers: Vec<PaneState>,
+        window: std::time::Duration,
+        poll: std::time::Duration,
+    ) -> (PaneSettle, std::time::Duration, usize) {
+        let mut answers = answers.into_iter();
+        let mut probes = 0usize;
+        let mut slept = std::time::Duration::ZERO;
+        let verdict = await_pane_settle(
+            window,
+            poll,
+            || {
+                probes += 1;
+                answers.next().unwrap_or(PaneState::Running)
+            },
+            |d| slept += d,
+        );
+        (verdict, slept, probes)
+    }
+
+    #[test]
+    fn a_pane_that_exits_inside_the_window_is_an_early_exit_with_its_code() {
+        let ms = std::time::Duration::from_millis;
+        let (verdict, slept, probes) = scripted_settle(
+            vec![
+                PaneState::Running,
+                PaneState::Running,
+                PaneState::Exited(Some(127)),
+            ],
+            ms(1_000),
+            ms(100),
+        );
+        assert_eq!(
+            verdict,
+            PaneSettle::ExitedEarly {
+                code: Some(127),
+                after: ms(200)
+            }
+        );
+        assert_eq!(slept, ms(200), "it stops looking the moment the pane exits");
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn a_pane_still_running_when_the_window_closes_survived_after_the_whole_window() {
+        let ms = std::time::Duration::from_millis;
+        // 250ms in 100ms polls: the last step is cut to the window's edge.
+        let (verdict, slept, probes) = scripted_settle(vec![], ms(250), ms(100));
+        assert_eq!(verdict, PaneSettle::Survived);
+        assert_eq!(slept, ms(250), "the full window is waited out, never more");
+        assert_eq!(probes, 4, "looked at once more at the window's end");
+
+        // An exit seen on that final look is still early.
+        let running = vec![PaneState::Running; 3];
+        let mut answers = running;
+        answers.push(PaneState::Exited(None));
+        let (verdict, _, _) = scripted_settle(answers, ms(250), ms(100));
+        assert_eq!(
+            verdict,
+            PaneSettle::ExitedEarly {
+                code: None,
+                after: ms(250)
+            }
+        );
+    }
+
+    /// A store holding `sid` open on `term-old` under account A, then re-keyed
+    /// onto `term-new` under account B the way the respawn's pinned
+    /// `record_open` does it. Returns the store and the pre-respawn row; each
+    /// test then takes the close hold `migrate_session` takes before the
+    /// spawn (no close lands in between here).
+    fn respawned_store(
+        dir: &std::path::Path,
+        sid: &str,
+    ) -> (
+        crate::session::session_lifecycle_store::SessionLifecycleStore,
+        TerminalSessionRecord,
+    ) {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, ORIGIN_AUTHORITATIVE,
+        };
+        let store = SessionLifecycleStore::open(dir.join("terminal-sessions.json")).unwrap();
+        let mut old = session_record(sid, "term-old", Some("C:/acct-a"));
+        old.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        store.record_open(old);
+        let prior = store.get(sid).unwrap();
+        let mut resumed = session_record(sid, "term-new", Some("C:/acct-b"));
+        resumed.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        resumed.zone_index = 3;
+        store.record_open(resumed);
+        assert_eq!(store.get(sid).unwrap().terminal_id, "term-new");
+        (store, prior)
+    }
+
+    /// Panes for the hand-off: records every close; the old pane's liveness
+    /// and whether a close fails are scripted.
+    struct FakePanes {
+        old_running: bool,
+        close_fails_for: Option<&'static str>,
+        closed: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakePanes {
+        fn new() -> Self {
+            Self {
+                old_running: true,
+                close_fails_for: None,
+                closed: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn closed(&self) -> Vec<String> {
+            self.closed.borrow().clone()
+        }
+    }
+
+    impl HandoffPanes for FakePanes {
+        fn state(&self, terminal_id: &str) -> PaneState {
+            if terminal_id == "term-old" && self.old_running {
+                PaneState::Running
+            } else {
+                PaneState::Exited(None)
+            }
+        }
+        fn close(&self, terminal_id: &str) -> Result<(), String> {
+            if self.close_fails_for == Some(terminal_id) {
+                return Err("terminal not found".to_string());
+            }
+            self.closed.borrow_mut().push(terminal_id.to_string());
+            Ok(())
+        }
+    }
+
+    fn early_exit(code: i32) -> PaneSettle {
+        PaneSettle::ExitedEarly {
+            code: Some(code),
+            after: std::time::Duration::from_millis(40),
+        }
+    }
+
+    #[test]
+    fn a_resumed_pane_that_dies_with_127_rolls_the_hand_off_back_onto_the_old_pane() {
+        use crate::session::session_lifecycle_store::CloseOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "test/account_migration/rollback-127";
+        let (store, prior) = respawned_store(dir.path(), sid);
+        let panes = FakePanes::new();
+        let mut pinned: Vec<(String, bool, &str)> = Vec::new();
+
+        let result = hand_off_to_resumed_pane(
+            store.hold_session_closes(sid, "term-old"),
+            &prior,
+            "term-new",
+            Some("the carried continuation"),
+            || early_exit(127),
+            |terminal, onto_resumed, carried| {
+                pinned.push((terminal.to_string(), onto_resumed, carried));
+            },
+            &panes,
+        );
+
+        let err = result.expect_err("an early exit is a failed migration");
+        assert!(err.contains("127"), "the error names the exit code: {err}");
+        assert!(err.contains("the old pane keeps the session"), "{err}");
+        assert_eq!(
+            panes.closed(),
+            vec!["term-new".to_string()],
+            "the dead resumed pane is taken out; the old pane is never closed"
+        );
+        assert_eq!(
+            pinned,
+            vec![("term-old".to_string(), false, "the carried continuation")],
+            "the continuation goes back onto the OLD terminal, exactly once"
+        );
+        let row = store.get(sid).unwrap();
+        assert_eq!(row.state, "open");
+        assert_eq!(
+            row.terminal_id, "term-old",
+            "the row names the old pane again"
+        );
+        assert_eq!(row.config_dir.as_deref(), Some("C:/acct-a"));
+        assert_eq!(row.zone_index, prior.zone_index);
+
+        // The dead pane's exit close, arriving after the rollback (and after
+        // the hold is released), closes nothing.
+        assert!(matches!(
+            store.record_close_checked(sid, Some("term-new"), "pty-exit"),
+            CloseOutcome::TerminalSuperseded { .. }
+        ));
+        assert_eq!(store.get(sid).unwrap().state, "open");
+        // The hold is released: the old pane's own later close is a real one.
+        assert!(matches!(
+            store.record_close_checked(sid, Some("term-old"), "explicit"),
+            CloseOutcome::Closed { .. }
+        ));
+    }
+
+    #[test]
+    fn the_resumed_pane_s_closes_during_the_window_do_not_close_the_row() {
+        use crate::session::session_lifecycle_store::CloseOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "test/account_migration/close-during-window";
+        let (store, prior) = respawned_store(dir.path(), sid);
+        let panes = FakePanes::new();
+
+        let result = hand_off_to_resumed_pane(
+            store.hold_session_closes(sid, "term-old"),
+            &prior,
+            "term-new",
+            None::<()>,
+            || {
+                // While the row sits on the dying pane: the webview's
+                // `pty-exit` close for it, and a terminal-less poll close.
+                for terminal in [Some("term-new"), None] {
+                    assert!(matches!(
+                        store.record_close_checked(sid, terminal, "pty-exit"),
+                        CloseOutcome::TerminalSuperseded { .. }
+                    ));
+                }
+                early_exit(1)
+            },
+            |_, _, ()| {},
+            &panes,
+        );
+
+        assert!(result.is_err());
+        let row = store.get(sid).unwrap();
+        assert_eq!(
+            row.state, "open",
+            "the session record survives its dead pane"
+        );
+        assert_eq!(row.terminal_id, "term-old");
+        assert!(!panes.closed().contains(&"term-old".to_string()));
+    }
+
+    #[test]
+    fn a_rollback_says_so_when_the_old_pane_was_closed_during_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "test/account_migration/old-closed-too";
+        let (store, prior) = respawned_store(dir.path(), sid);
+        let panes = FakePanes {
+            old_running: false,
+            ..FakePanes::new()
+        };
+        let err = hand_off_to_resumed_pane(
+            store.hold_session_closes(sid, "term-old"),
+            &prior,
+            "term-new",
+            None::<()>,
+            || early_exit(127),
+            |_, _, ()| {},
+            &panes,
+        )
+        .expect_err("an early exit is a failed migration");
+        assert!(!err.contains("keeps the session"), "{err}");
+        assert!(err.contains("no longer running"), "{err}");
+    }
+
+    #[test]
+    fn a_resumed_pane_that_survives_the_window_takes_the_session_and_the_old_pane_closes() {
+        use crate::session::session_lifecycle_store::CloseOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "test/account_migration/survived";
+        let (store, prior) = respawned_store(dir.path(), sid);
+        let panes = FakePanes::new();
+        let mut pinned: Vec<(String, bool)> = Vec::new();
+
+        let result = hand_off_to_resumed_pane(
+            store.hold_session_closes(sid, "term-old"),
+            &prior,
+            "term-new",
+            Some(()),
+            || PaneSettle::Survived,
+            |terminal, onto_resumed, ()| pinned.push((terminal.to_string(), onto_resumed)),
+            &panes,
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(panes.closed(), vec!["term-old".to_string()]);
+        assert_eq!(pinned, vec![("term-new".to_string(), true)]);
+        assert_eq!(store.get(sid).unwrap().terminal_id, "term-new");
+        // The old pane's exit is the hand-off, not a session end …
+        assert!(matches!(
+            store.record_close_checked(sid, Some("term-old"), "pty-exit"),
+            CloseOutcome::TerminalSuperseded { .. }
+        ));
+        // … and the window's hold is gone: the resumed pane's real exit closes
+        // the row as usual.
+        assert!(matches!(
+            store.record_close_checked(sid, Some("term-new"), "pty-exit"),
+            CloseOutcome::Closed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_survived_hand_off_whose_old_pane_is_already_gone_still_succeeds() {
+        use crate::session::session_lifecycle_store::CloseOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "test/account_migration/old-gone";
+        let (store, prior) = respawned_store(dir.path(), sid);
+        let panes = FakePanes {
+            close_fails_for: Some("term-old"),
+            ..FakePanes::new()
+        };
+        let result = hand_off_to_resumed_pane(
+            store.hold_session_closes(sid, "term-old"),
+            &prior,
+            "term-new",
+            None::<()>,
+            || PaneSettle::Survived,
+            |_, _, ()| {},
+            &panes,
+        );
+        assert_eq!(result, Ok(()));
+        // The withdrawn mark: a later close naming the old pane is the
+        // ordinary mis-bound answer, not a consumed hand-off.
+        assert!(matches!(
+            store.record_close_checked(sid, Some("term-old"), "pty-exit"),
+            CloseOutcome::NotFound { .. }
+        ));
     }
 
     #[test]

@@ -1187,6 +1187,16 @@ pub struct SessionLifecycleStore {
     /// superseded PTY cannot outlive the runner that spawned it, so there is
     /// nothing to persist. Consumed on first match.
     superseded_terminals: Mutex<HashSet<String>>,
+    /// Sessions whose row is mid-hand-off between two PTYs, each mapped to
+    /// the terminal that keeps the session if the hand-off fails
+    /// ([`Self::hold_session_closes`]). While held, a close of the session
+    /// naming any OTHER terminal — or none — is answered
+    /// [`CloseOutcome::TerminalSuperseded`] and mutates nothing: during an
+    /// account migration's settle window the row may sit on a resumed pane
+    /// that dies at once, and that pane's exit close must not end a session
+    /// the old pane still runs (nor release the workdir nonce it still uses).
+    /// Process-local, like the terminal register.
+    held_sessions: Mutex<HashMap<String, String>>,
     /// Process-local ORDER of provider SessionStart hooks: a monotonic counter
     /// and, per session id, the counter value of the most recent hook that
     /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
@@ -1482,6 +1492,7 @@ impl SessionLifecycleStore {
             wal: Mutex::new(WalWriter::default()),
             map: Mutex::new(map),
             superseded_terminals: Mutex::new(HashSet::new()),
+            held_sessions: Mutex::new(HashMap::new()),
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
             observation_epoch: OnceLock::new(),
@@ -2113,6 +2124,115 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Hold every close of `claude_session_id` that does not name
+    /// `keep_terminal_id` until [`Self::release_session_closes`]: each is
+    /// answered [`CloseOutcome::TerminalSuperseded`] with nothing mutated.
+    /// Placed BEFORE a hand-off respawn re-keys the row (so it covers the
+    /// window in which the row already names the new PTY but the hand-off is
+    /// not decided yet) and released once it is. A close naming
+    /// `keep_terminal_id` itself passes through.
+    ///
+    /// The hold lasts as long as the returned guard: dropping it releases the
+    /// hold, so a panic in the hand-off cannot leave a real session id whose
+    /// closes are answered `TerminalSuperseded` for the rest of the process.
+    pub fn hold_session_closes(
+        &self,
+        claude_session_id: &str,
+        keep_terminal_id: &str,
+    ) -> SessionCloseHold<'_> {
+        let sid = claude_session_id.trim().to_string();
+        if !sid.is_empty() {
+            match self.held_sessions.lock() {
+                Ok(mut held) => {
+                    held.insert(sid.clone(), keep_terminal_id.trim().to_string());
+                }
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on hold_session_closes")
+                }
+            }
+        }
+        SessionCloseHold {
+            store: self,
+            claude_session_id: sid,
+        }
+    }
+
+    /// End a [`Self::hold_session_closes`] — what [`SessionCloseHold`]'s drop
+    /// calls. Harmless for a session not held.
+    fn release_session_closes(&self, claude_session_id: &str) {
+        if let Ok(mut held) = self.held_sessions.lock() {
+            held.remove(claude_session_id.trim());
+        }
+    }
+
+    /// Put a session's row back onto the terminal it ran on before a respawn
+    /// re-keyed it — the inverse of the pinned `record_open` an account
+    /// migration's respawn performs. The migration calls it when the resumed
+    /// pane dies inside its settle window: the old pane is still running the
+    /// session, so the row must name it again (and its account, page and zone),
+    /// or a restore would resurrect the session on the dead pane's binding.
+    ///
+    /// Restores the binding fields — `terminal_id`, `config_dir`, the account
+    /// label and wrapper, `page_id`, `zone_index` — and the pane facts the
+    /// respawn stamped (`bypass_permissions`, `title`,
+    /// `last_session_start_at`) from `prior`,
+    /// the row as read before the respawn. Applied only while the row is open
+    /// AND still bound to `from_terminal_id`; any other state is reported, not
+    /// overwritten, because something other than the respawn moved or closed
+    /// the row and that is not this call's to undo. `last_seen_at`, `state`,
+    /// `origin` and the gate fields are left as they are.
+    pub fn restore_terminal_binding(
+        &self,
+        prior: &TerminalSessionRecord,
+        from_terminal_id: &str,
+    ) -> BindingRestore {
+        let restored = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on restore_terminal_binding");
+                    return BindingRestore::Missing;
+                }
+            };
+            let Some(rec) = m.get_mut(&prior.claude_session_id) else {
+                return BindingRestore::Missing;
+            };
+            if rec.state != "open" {
+                return BindingRestore::Closed {
+                    close_reason: rec.close_reason.clone(),
+                };
+            }
+            if rec.terminal_id != from_terminal_id.trim() {
+                return BindingRestore::BoundElsewhere {
+                    terminal_id: rec.terminal_id.clone(),
+                };
+            }
+            rec.terminal_id = prior.terminal_id.clone();
+            rec.config_dir = prior.config_dir.clone();
+            rec.account_label = prior.account_label.clone();
+            rec.account_wrapper = prior.account_wrapper.clone();
+            rec.page_id = prior.page_id.clone();
+            rec.zone_index = prior.zone_index;
+            // Facts the respawned pane stamped about ITSELF, which do not hold
+            // for the pane the row goes back to: its permission mode, the
+            // title it was spawned with, and its SessionStart (which feeds the
+            // launch-failure verdict).
+            rec.bypass_permissions = prior.bypass_permissions;
+            rec.title = prior.title.clone();
+            rec.last_session_start_at = prior.last_session_start_at;
+            let restored = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(restored.clone()),
+                }],
+            );
+            restored
+        };
+        self.snapshot_change(std::iter::once(restored));
+        BindingRestore::Restored
+    }
+
     #[cfg(test)]
     fn superseded_terminal_count(&self) -> usize {
         self.superseded_terminals
@@ -2271,6 +2391,34 @@ impl SessionLifecycleStore {
                 return CloseOutcome::TerminalSuperseded {
                     requested: claude_session_id.to_string(),
                     terminal_id: t.to_string(),
+                };
+            }
+        }
+        // A session mid-hand-off ([`Self::hold_session_closes`]): a close
+        // that does not name the terminal keeping it is the hand-off's other
+        // pane (or a terminal-less closer reading it) — not this session's end.
+        let held_for = match self.held_sessions.lock() {
+            Ok(held) => held.get(claude_session_id.trim()).cloned(),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "session_lifecycle_store: lock poisoned on the held-session register — treating the close as not held"
+                );
+                None
+            }
+        };
+        if let Some(keep) = held_for {
+            if expect != Some(keep.as_str()) {
+                debug!(
+                    claude_session_id = %claude_session_id,
+                    terminal_id = %expect.unwrap_or("<none>"),
+                    keep_terminal_id = %keep,
+                    reason = %reason,
+                    "session-close: session is mid-hand-off between PTYs — close held, no-op"
+                );
+                return CloseOutcome::TerminalSuperseded {
+                    requested: claude_session_id.to_string(),
+                    terminal_id: expect.unwrap_or_default().to_string(),
                 };
             }
         }
@@ -4683,6 +4831,42 @@ impl SessionLifecycleStore {
             self.compact();
         }
     }
+}
+
+/// A held session's closes ([`SessionLifecycleStore::hold_session_closes`]),
+/// released when this guard drops.
+#[must_use = "the hold is released the moment this guard drops"]
+pub struct SessionCloseHold<'a> {
+    store: &'a SessionLifecycleStore,
+    claude_session_id: String,
+}
+
+impl<'a> SessionCloseHold<'a> {
+    /// The store the hold is on — for as long as the store, not the guard, so
+    /// a caller can keep using it after dropping the hold.
+    pub fn store(&self) -> &'a SessionLifecycleStore {
+        self.store
+    }
+}
+
+impl Drop for SessionCloseHold<'_> {
+    fn drop(&mut self) {
+        self.store.release_session_closes(&self.claude_session_id);
+    }
+}
+
+/// What [`SessionLifecycleStore::restore_terminal_binding`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingRestore {
+    /// The row was open on the named terminal and now carries the prior
+    /// binding again.
+    Restored,
+    /// The row is open but bound to a different terminal — left alone.
+    BoundElsewhere { terminal_id: String },
+    /// The row is no longer open (a close landed first) — left alone.
+    Closed { close_reason: Option<String> },
+    /// No row for the session (or the map is unreadable).
+    Missing,
 }
 
 /// Typed outcome of [`SessionLifecycleStore::record_close_checked`].
@@ -8392,6 +8576,130 @@ mod tests {
             }
         );
         assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    /// A held session's closes are answered `TerminalSuperseded` unless they
+    /// name the terminal keeping it — including a terminal-less close — and
+    /// dropping the guard (also on a panic) restores ordinary closes.
+    #[test]
+    fn a_held_session_ignores_closes_that_do_not_name_its_keeping_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("moving", "term-new"));
+        let hold = store.hold_session_closes("moving", "term-old");
+
+        for t in [Some("term-new"), None] {
+            assert!(matches!(
+                store.record_close_checked("moving", t, "pty-exit"),
+                CloseOutcome::TerminalSuperseded { .. }
+            ));
+        }
+        assert_eq!(store.get("moving").unwrap().state, "open");
+
+        // A close naming the keeping terminal is not held (it resolves as
+        // usual — here no row is on term-old, so nothing is closed).
+        assert!(matches!(
+            store.record_close_checked("moving", Some("term-old"), "explicit"),
+            CloseOutcome::NotFound { .. }
+        ));
+
+        drop(hold);
+        assert_eq!(
+            store.record_close_checked("moving", Some("term-new"), "pty-exit"),
+            CloseOutcome::Closed {
+                claude_session_id: "moving".to_string()
+            }
+        );
+
+        // A panic while held still releases it.
+        store.record_open(auth_on("panicky", "term-new"));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _hold = store.hold_session_closes("panicky", "term-old");
+            panic!("the hand-off panicked");
+        }));
+        assert!(unwound.is_err());
+        assert!(matches!(
+            store.record_close_checked("panicky", Some("term-new"), "pty-exit"),
+            CloseOutcome::Closed { .. }
+        ));
+    }
+
+    /// A migration whose resumed pane died early puts the row back on the
+    /// pane that still runs the session: the inverse of the respawn's pinned
+    /// re-key restores terminal, account, page and zone, and persists — but
+    /// only while the row is open on the failed terminal. A row something else
+    /// moved or closed is reported and left alone.
+    #[test]
+    fn restore_terminal_binding_undoes_a_respawn_rekey_only_from_the_failed_terminal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let mut before = auth_on("moving", "term-old");
+        before.config_dir = Some("C:/acct-a".to_string());
+        before.account_label = Some("a".to_string());
+        before.zone_index = 1;
+        before.page_id = "page-a".to_string();
+        before.bypass_permissions = Some(false);
+        store.record_open(before);
+        let prior = store.get("moving").unwrap();
+
+        // The respawn's pinned record_open: same row, new terminal/account/zone.
+        let mut respawned = auth_on("moving", "term-new");
+        respawned.config_dir = Some("C:/acct-b".to_string());
+        respawned.account_label = Some("b".to_string());
+        respawned.zone_index = 4;
+        respawned.page_id = "page-b".to_string();
+        respawned.bypass_permissions = Some(true);
+        store.record_open(respawned);
+        assert_eq!(store.get("moving").unwrap().terminal_id, "term-new");
+
+        // Not from the failed terminal: nothing moves.
+        assert_eq!(
+            store.restore_terminal_binding(&prior, "term-other"),
+            BindingRestore::BoundElsewhere {
+                terminal_id: "term-new".to_string()
+            }
+        );
+        assert_eq!(store.get("moving").unwrap().terminal_id, "term-new");
+
+        assert_eq!(
+            store.restore_terminal_binding(&prior, "term-new"),
+            BindingRestore::Restored
+        );
+        let back = store.get("moving").unwrap();
+        assert_eq!(back.state, "open");
+        assert_eq!(back.terminal_id, "term-old");
+        assert_eq!(back.config_dir.as_deref(), Some("C:/acct-a"));
+        assert_eq!(back.account_label.as_deref(), Some("a"));
+        assert_eq!(back.zone_index, 1);
+        assert_eq!(back.page_id, "page-a");
+        assert_eq!(
+            back.bypass_permissions,
+            Some(false),
+            "the respawn's permission-mode stamp does not survive the rollback"
+        );
+        drop(store);
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("moving").unwrap().terminal_id,
+            "term-old",
+            "the restored binding is durable"
+        );
+
+        // A row the failed pane's exit already closed is reported, not reopened.
+        reopened.record_open(auth_on("gone", "term-dead"));
+        let gone_prior = reopened.get("gone").unwrap();
+        reopened.record_close_checked("gone", Some("term-dead"), "pty-exit");
+        assert_eq!(
+            reopened.restore_terminal_binding(&gone_prior, "term-dead"),
+            BindingRestore::Closed {
+                close_reason: Some("pty-exit".to_string())
+            }
+        );
+        assert_eq!(
+            reopened.restore_terminal_binding(&rec("absent"), "term-x"),
+            BindingRestore::Missing
+        );
     }
 
     /// The register is keyed by terminal id alone: a superseded entry must not
