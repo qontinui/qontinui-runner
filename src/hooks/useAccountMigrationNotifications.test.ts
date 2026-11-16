@@ -4,9 +4,16 @@
  * tested rather than the hook's `listen` wiring.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
-import { migratedToast, type MigratedPayload } from "./useAccountMigrationNotifications";
+import {
+  LIMIT_BURST_MS,
+  continuedBurstToast,
+  createBurstCoalescer,
+  migratedToast,
+  parkedBurstToast,
+  type MigratedPayload,
+} from "./useAccountMigrationNotifications";
 
 const base: MigratedPayload = {
   claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
@@ -109,5 +116,63 @@ describe("migratedToast", () => {
       "Session 0c4e3025 migrated: .claude-a ran out of tokens → resumed on .claude-b",
     );
     expect(toast.type).toBe("success");
+  });
+});
+
+describe("usage-limit park and continue toasts (plan 2026-11-05 Phase 2)", () => {
+  const hhmm = (ms: number) => `T${ms}`;
+
+  it("coalesces a burst of parks into one info toast naming the count and the time", () => {
+    const toast = parkedBurstToast(
+      [
+        { claudeSessionId: "aaaaaaaa-1", dueAtMs: 5, reason: "not-yet-reset" },
+        { claudeSessionId: "bbbbbbbb-2", dueAtMs: 5, reason: "not-yet-reset" },
+        { claudeSessionId: "cccccccc-3", dueAtMs: 5, reason: "no-usable-target" },
+      ],
+      hhmm,
+    );
+    expect(toast.message).toBe(
+      "3 sessions are parked at a usage limit until T5; continued automatically once it resets",
+    );
+    expect(toast.type).toBe("info");
+    expect(toast.message).not.toContain("out of tokens");
+  });
+
+  it("names one session, and a span of due times", () => {
+    expect(parkedBurstToast([{ claudeSessionId: "0c4e3025-8c5c", dueAtMs: 7 }], hhmm).message).toBe(
+      "Session 0c4e3025 is parked at a usage limit until T7; continued automatically once it resets",
+    );
+    expect(parkedBurstToast([{ dueAtMs: 9 }, { dueAtMs: 3 }], hhmm).message).toContain(
+      "until T3–T9",
+    );
+  });
+
+  it("says continued for a reset-continue burst", () => {
+    expect(continuedBurstToast([{ claudeSessionId: "0c4e3025-x" }, {}]).message).toBe(
+      "2 sessions continued after the usage limit reset",
+    );
+  });
+
+  it("flushes one burst per window", () => {
+    vi.useFakeTimers();
+    try {
+      const flushed: number[][] = [];
+      const c = createBurstCoalescer<number>(LIMIT_BURST_MS, (b) => flushed.push(b));
+      for (let i = 0; i < 97; i++) c.push(i);
+      vi.advanceTimersByTime(LIMIT_BURST_MS - 1);
+      expect(flushed).toHaveLength(0);
+      vi.advanceTimersByTime(1);
+      expect(flushed).toHaveLength(1);
+      expect(flushed[0]).toHaveLength(97);
+      c.push(100);
+      vi.advanceTimersByTime(LIMIT_BURST_MS);
+      expect(flushed).toEqual([flushed[0], [100]]);
+      c.push(101);
+      c.cancel();
+      vi.advanceTimersByTime(LIMIT_BURST_MS);
+      expect(flushed).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

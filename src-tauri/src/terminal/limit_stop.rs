@@ -23,17 +23,11 @@
 //! Interim arm: plan `2026-10-28-one-session-lifecycle-authority` Phase 99 (the
 //! Migrator) is to carry this classifier into its `decide()`.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until plan 2026-11-05 Phase 2 splits handle_usage_limit_hint"
-    )
-)]
-
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde_json::Value;
 
@@ -313,6 +307,97 @@ fn classify(entry: &Value) -> LimitStopRead {
         resets_at_ms,
         rate_limit_type,
     })
+}
+
+// ── The park list (plan 2026-11-05 Phase 2) ──────────────────────────────────
+//
+// A session that stopped at a usage limit and cannot be continued or migrated
+// yet is PARKED here until a due time, and the scan loop re-hands it to
+// `account_migration::handle_usage_limit_hint` once that time has passed
+// (Phase 3 drains it). In memory only, on purpose: it is not durable state. A
+// restart loses it and loses nothing, because each session's transcript still
+// ends at its stop and the next process re-derives the park from it.
+
+/// One parked session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Park {
+    pub terminal_id: String,
+    pub claude_session_id: String,
+    /// When the session is due to be handed back to the handler, in
+    /// milliseconds since the epoch.
+    pub due_at_ms: i64,
+}
+
+/// The parks, keyed by terminal: one pane has one pending re-entry.
+#[derive(Debug, Default)]
+pub(crate) struct ParkList {
+    by_terminal: HashMap<String, Park>,
+}
+
+impl ParkList {
+    /// Park `terminal_id` until `due_at_ms`. A second park of the same
+    /// terminal replaces the first: the newest decision about a pane is the
+    /// one that holds.
+    pub(crate) fn park(&mut self, terminal_id: &str, claude_session_id: &str, due_at_ms: i64) {
+        self.by_terminal.insert(
+            terminal_id.to_string(),
+            Park {
+                terminal_id: terminal_id.to_string(),
+                claude_session_id: claude_session_id.to_string(),
+                due_at_ms,
+            },
+        );
+    }
+
+    /// Remove and return every park due at `now_ms`, oldest due first.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "drained by the scan loop in plan 2026-11-05 Phase 3"
+        )
+    )]
+    pub(crate) fn take_due(&mut self, now_ms: i64) -> Vec<Park> {
+        let due: Vec<String> = self
+            .by_terminal
+            .iter()
+            .filter(|(_, p)| p.due_at_ms <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut taken: Vec<Park> = due
+            .iter()
+            .filter_map(|id| self.by_terminal.remove(id))
+            .collect();
+        taken.sort_by(|a, b| {
+            a.due_at_ms
+                .cmp(&b.due_at_ms)
+                .then_with(|| a.terminal_id.cmp(&b.terminal_id))
+        });
+        taken
+    }
+
+    /// The park on `terminal_id`, if any.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by plan 2026-11-05 Phase 3 and by tests")
+    )]
+    pub(crate) fn get(&self, terminal_id: &str) -> Option<&Park> {
+        self.by_terminal.get(terminal_id)
+    }
+}
+
+/// The process's park list.
+static PARKS: Mutex<Option<ParkList>> = Mutex::new(None);
+
+/// Run `f` on the process's park list.
+pub(crate) fn with_parks<T>(f: impl FnOnce(&mut ParkList) -> T) -> T {
+    let mut guard = PARKS.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(ParkList::default))
+}
+
+/// Park `terminal_id` until `due_at_ms` on the process's park list.
+pub(crate) fn park(terminal_id: &str, claude_session_id: &str, due_at_ms: i64) {
+    with_parks(|parks| parks.park(terminal_id, claude_session_id, due_at_ms));
 }
 
 #[cfg(test)]
@@ -712,5 +797,42 @@ mod tests {
         let (read, span) = read_limit_stop(f.path());
         assert_eq!(span, ReadSpan::Whole);
         assert!(matches!(read, LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID));
+    }
+
+    // ── The park list (plan 2026-11-05 Phase 2) ──────────────────────────────
+
+    #[test]
+    fn a_park_is_due_at_its_time_and_not_before() {
+        let mut parks = ParkList::default();
+        parks.park("t1", "s1", 1_000);
+        assert!(parks.take_due(999).is_empty());
+        assert_eq!(
+            parks.take_due(1_000),
+            vec![Park {
+                terminal_id: "t1".to_string(),
+                claude_session_id: "s1".to_string(),
+                due_at_ms: 1_000,
+            }]
+        );
+        assert!(parks.get("t1").is_none());
+    }
+
+    #[test]
+    fn due_parks_come_out_oldest_first_and_a_repark_replaces() {
+        let mut parks = ParkList::default();
+        parks.park("t2", "s2", 2_000);
+        parks.park("t1", "s1", 3_000);
+        parks.park("t1", "s1", 1_000);
+        parks.park("t3", "s3", 9_000);
+        let due: Vec<(String, i64)> = parks
+            .take_due(5_000)
+            .into_iter()
+            .map(|p| (p.terminal_id, p.due_at_ms))
+            .collect();
+        assert_eq!(
+            due,
+            vec![("t1".to_string(), 1_000), ("t2".to_string(), 2_000)]
+        );
+        assert_eq!(parks.get("t3").map(|p| p.due_at_ms), Some(9_000));
     }
 }
