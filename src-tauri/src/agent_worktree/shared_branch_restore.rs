@@ -469,6 +469,13 @@ fn add_allocation_excludes(checkout: &Path, branch: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Test door to [`add_allocation_excludes`], for the cross-module contract
+/// test in `provision_exclude` (the two blocks share one `info/exclude`).
+#[cfg(test)]
+pub(crate) fn add_allocation_excludes_for_test(checkout: &Path, branch: &str) {
+    add_allocation_excludes(checkout, branch).expect("the allocation block is written");
+}
+
 /// Take out exactly the block [`prepare_canonical_excludes`] added for
 /// `branch` — its begin line through its end line — and nothing else; every
 /// byte outside it (line endings, a missing final newline) is kept.

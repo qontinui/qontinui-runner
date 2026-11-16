@@ -4264,11 +4264,13 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
 ];
 
 /// The one in-process lock every `.git/info/exclude` writer holds across its
-/// read-modify-write: [`ensure_repo_info_exclude`] and the shared-branch
+/// read-modify-write: [`ensure_repo_info_exclude`], the shared-branch
 /// allocation block's add / remove / sweep
-/// (`agent_worktree::shared_branch_restore`). In-process only — another
-/// runner process on the same box is not excluded by it, and a block such a
-/// race resurrects is reaped by that module's stale-block sweep.
+/// (`agent_worktree::shared_branch_restore`), and the provisioners'
+/// per-path block (`provision_exclude::update_exclude`). In-process only —
+/// another runner process on the same box is not excluded by it, and a block
+/// such a race resurrects is reaped by the shared-branch module's stale-block
+/// sweep.
 pub(crate) fn info_exclude_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -4320,9 +4322,9 @@ pub(crate) fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     let info_dir = repo_path.join(".git").join("info");
     let exclude_path = info_dir.join("exclude");
     // Every writer of a `.git/info/exclude` holds this lock across its
-    // read-modify-write, so this roster heal and the shared-branch
-    // allocation block (`agent_worktree::shared_branch_restore`) never lose
-    // each other's edit.
+    // read-modify-write, so this roster heal, the shared-branch allocation
+    // block (`agent_worktree::shared_branch_restore`) and the provisioners'
+    // per-path block (`provision_exclude`) never lose each other's edit.
     let _excl = info_exclude_lock();
     // A file that exists but cannot be read (or is not UTF-8) is never
     // rewritten: rewriting it from an empty string would drop the operator's
