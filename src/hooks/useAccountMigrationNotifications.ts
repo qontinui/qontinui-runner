@@ -9,6 +9,13 @@
  * - `session-account-migration-skipped` when exhaustion was confirmed but no
  *   migration happened (no usable target / cap reached / mechanics failed) —
  *   surfaced as an error so the operator knows the session is stranded.
+ * - `session-limit-parked` when a session that stopped at a usage limit was
+ *   parked until its reset (backend `terminal::limit_reset`, plan 2026-11-05
+ *   Phase 2). Not an error: nothing failed, and the session is continued at
+ *   the reset. A restart can park ~100 sessions at once, so parks are
+ *   coalesced into one info toast per burst.
+ * - `session-limit-reset-continued` when such a session was continued in
+ *   place after its reset — coalesced the same way.
  *
  * Mount once at App level, next to `useErrorNotifications`.
  */
@@ -165,6 +172,102 @@ export function migratedToast(p: MigratedPayload): { message: string; type: Toas
   };
 }
 
+/** `session-limit-parked` — `limit_reset::parked_event` in the backend. */
+export interface LimitParkedPayload {
+  claudeSessionId?: string;
+  configDir?: string;
+  /** When the session is handed back, ms since the epoch. */
+  dueAtMs?: number;
+  /** `not-yet-reset`, `probe-unknown`, `no-usable-target`, … */
+  reason?: string;
+}
+
+/** `session-limit-reset-continued` — `limit_reset::continued_event`. */
+export interface LimitContinuedPayload {
+  claudeSessionId?: string;
+  configDir?: string;
+  terminalId?: string;
+  entryUuid?: string;
+}
+
+/** Events arriving within this window of a burst's first one share its toast. */
+export const LIMIT_BURST_MS = 2000;
+
+/** `HH:MM` in the operator's locale, 24-hour. */
+function clockTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+/** The one toast for a burst of parks. */
+export function parkedBurstToast(
+  parks: LimitParkedPayload[],
+  formatTime: (ms: number) => string = clockTime,
+): { message: string; type: ToastType } {
+  const dues = parks.map((p) => p.dueAtMs).filter((d): d is number => typeof d === "number");
+  let until = "";
+  if (dues.length > 0) {
+    const first = formatTime(Math.min(...dues));
+    const last = formatTime(Math.max(...dues));
+    until = first === last ? ` until ${first}` : ` until ${first}–${last}`;
+  }
+  const who =
+    parks.length === 1
+      ? `Session ${(parks[0].claudeSessionId ?? "").slice(0, 8)} is`
+      : `${parks.length} sessions are`;
+  return {
+    message: `${who} parked at a usage limit${until}; continued automatically once it resets`,
+    type: "info",
+  };
+}
+
+/** The one toast for a burst of reset-continues. */
+export function continuedBurstToast(continued: LimitContinuedPayload[]): {
+  message: string;
+  type: ToastType;
+} {
+  const who =
+    continued.length === 1
+      ? `Session ${(continued[0].claudeSessionId ?? "").slice(0, 8)}`
+      : `${continued.length} sessions`;
+  return {
+    message: `${who} continued after the usage limit reset`,
+    type: "info",
+  };
+}
+
+/**
+ * Collects items for `windowMs` after the first one, then hands the whole
+ * burst to `flush` once. `cancel` drops a pending burst (unmount).
+ */
+export function createBurstCoalescer<T>(
+  windowMs: number,
+  flush: (items: T[]) => void,
+): { push: (item: T) => void; cancel: () => void } {
+  let pending: T[] = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return {
+    push(item: T) {
+      pending.push(item);
+      if (timer !== null) return;
+      timer = setTimeout(() => {
+        const burst = pending;
+        pending = [];
+        timer = null;
+        flush(burst);
+      }, windowMs);
+    },
+    cancel() {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      pending = [];
+    },
+  };
+}
+
 export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
     const unlistenMigrated = listen<MigratedPayload>("session-account-migrated", (event) => {
@@ -180,9 +283,30 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
         "error",
       );
     });
+    const parked = createBurstCoalescer<LimitParkedPayload>(LIMIT_BURST_MS, (burst) => {
+      const toast = parkedBurstToast(burst);
+      showToast(toast.message, toast.type);
+    });
+    const continued = createBurstCoalescer<LimitContinuedPayload>(LIMIT_BURST_MS, (burst) => {
+      const toast = continuedBurstToast(burst);
+      showToast(toast.message, toast.type);
+    });
+    const unlistenParked = listen<LimitParkedPayload>("session-limit-parked", (event) => {
+      parked.push(event.payload ?? {});
+    });
+    const unlistenContinued = listen<LimitContinuedPayload>(
+      "session-limit-reset-continued",
+      (event) => {
+        continued.push(event.payload ?? {});
+      },
+    );
     return () => {
       unlistenMigrated.then((fn) => fn());
       unlistenSkipped.then((fn) => fn());
+      unlistenParked.then((fn) => fn());
+      unlistenContinued.then((fn) => fn());
+      parked.cancel();
+      continued.cancel();
     };
   }, [showToast]);
 }
