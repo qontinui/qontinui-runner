@@ -79,6 +79,11 @@ pub(crate) struct ProbeVerdict {
     /// Whether the account reads exhausted after the probe: the verdict the
     /// handler has always migrated on.
     pub known_exhausted: bool,
+    /// When the probe says the exhausted window resets, in milliseconds since
+    /// the epoch ([`exhausted_window_reset_ms`]). A stop whose own reset has
+    /// passed on an account exhausted again (another window, other sessions)
+    /// is parked until THIS time, not one margin from now.
+    pub resets_at_ms: Option<i64>,
 }
 
 impl ProbeVerdict {
@@ -90,7 +95,54 @@ impl ProbeVerdict {
         Self {
             unknown: row.is_none_or(|r| r.error.is_some()),
             known_exhausted,
+            resets_at_ms: row.and_then(exhausted_window_reset_ms),
         }
+    }
+}
+
+/// The reset of the window a probe row reads as exhausted: the five-hour
+/// session window when only it is at the exhaustion threshold, else the
+/// weekly window. Seconds in the row, milliseconds out.
+pub(crate) fn exhausted_window_reset_ms(
+    row: &crate::commands::ai_settings::AccountUsageInfo,
+) -> Option<i64> {
+    let threshold = crate::commands::ai_settings::EXHAUSTION_UTILIZATION;
+    let session_only =
+        row.utilization < threshold && row.session_utilization.is_some_and(|u| u >= threshold);
+    let secs = if session_only {
+        row.session_resets_at
+    } else {
+        row.resets_at
+    };
+    secs.and_then(|s| i64::try_from(s).ok())
+        .and_then(|s| s.checked_mul(1000))
+}
+
+/// Which probe the handler reads for the session's account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeSource {
+    /// The roster probe's row for the account.
+    Roster,
+    /// Probe the session's own account: the roster returned no row for it
+    /// (below two accounts it returns none at all), and a stop whose continue
+    /// is on needs the verdict.
+    OwnAccount,
+    /// No row, and nothing would read one: decide on the cached verdict.
+    NoRow,
+}
+
+/// Pure: where the handler's probe verdict comes from.
+pub(crate) fn probe_source(
+    roster_has_row: bool,
+    read: &LimitStopRead,
+    auto_continue: bool,
+) -> ProbeSource {
+    if roster_has_row {
+        ProbeSource::Roster
+    } else if auto_continue && matches!(read, LimitStopRead::Stopped(_)) {
+        ProbeSource::OwnAccount
+    } else {
+        ProbeSource::NoRow
     }
 }
 
@@ -174,8 +226,9 @@ pub(crate) enum SkipReason {
     /// The transcript could not be read, and the account is fine. UNKNOWN,
     /// so nothing is typed.
     TranscriptUnreadable,
-    /// A stop whose account has reset, but the operator turned the
-    /// reset-continue off.
+    /// A stop that only a reset-continue could resolve (its account has
+    /// reset, or will before anything else can move it), and the operator
+    /// turned the reset-continue off.
     ContinueDisabled,
     /// Not a stop, the account is exhausted, and auto-migration is off.
     MigrateDisabled,
@@ -216,6 +269,21 @@ pub(crate) fn park_due_at(stop: &LimitStop, now_ms: i64) -> i64 {
     }
 }
 
+/// When a stop on an account that is (still, or again) exhausted is handed
+/// back: the later of the stop's own reset and the probe's exhausted-window
+/// reset, plus the margin, never sooner than one margin from now, and
+/// [`PARK_WITHOUT_RESET_MS`] from now when neither is known.
+pub(crate) fn exhausted_park_due_at(stop: &LimitStop, probe: &ProbeVerdict, now_ms: i64) -> i64 {
+    let latest = match (stop.resets_at_ms, probe.resets_at_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    match latest {
+        Some(resets) => (resets + LIMIT_RESET_MARGIN_MS).max(now_ms + LIMIT_RESET_MARGIN_MS),
+        None => now_ms + PARK_WITHOUT_RESET_MS,
+    }
+}
+
 /// The branch table (plan Phase 2), top to bottom.
 pub(crate) fn decide(i: &HintInputs) -> LimitAction {
     if i.finished {
@@ -224,7 +292,13 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
     match &i.read {
         LimitStopRead::Stopped(stop) => {
             if migrated_since(stop, i.migrated_at_ms) {
-                return LimitAction::Skip(SkipReason::MigratedSinceStop);
+                // The stop was hit on the OLD account. A destination that is
+                // itself dry still takes the next hop, as it always has.
+                return if i.probe.known_exhausted {
+                    migrate_or_park(i, None)
+                } else {
+                    LimitAction::Skip(SkipReason::MigratedSinceStop)
+                };
             }
             let reset_passed = stop.resets_at_ms.is_none_or(|r| r <= i.now_ms);
             if i.probe.unknown && reset_passed {
@@ -240,7 +314,7 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
             if i.probe.known_exhausted || i.probe.unknown {
                 // An unknown probe beside a reset still ahead: the stop itself
                 // says the account is limited, as an errored probe row does.
-                return migrate_or_park(i, Some(park_due_at(stop, i.now_ms)));
+                return migrate_or_park(i, Some(exhausted_park_due_at(stop, &i.probe, i.now_ms)));
             }
             if !reset_passed {
                 // The probe and the stop disagree: wait for the stop's reset.
@@ -290,7 +364,11 @@ fn migrate_or_park(i: &HintInputs, park_due: Option<i64>) -> LimitAction {
         None
     };
     match (refusal, park_due) {
-        (None, park_fallback) => LimitAction::Migrate { park_fallback },
+        // The cap's or target's refusal parks a stop only when a continue can
+        // follow at its reset; with the continue off it reports as before.
+        (None, park_fallback) => LimitAction::Migrate {
+            park_fallback: park_fallback.filter(|_| i.auto_continue),
+        },
         (Some((reason, _)), Some(due_at_ms)) => {
             continue_or_skip(i, LimitAction::Park { due_at_ms, reason })
         }

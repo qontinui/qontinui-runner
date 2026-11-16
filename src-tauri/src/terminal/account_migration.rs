@@ -538,20 +538,21 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // quote one; a resume repaint can re-render a historical one). Re-probe
     // before acting; `limit_reset::decide` combines the probe with the read.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    let probe = match super::limit_reset::row_for(&usage, &src) {
-        Some(row) => super::limit_reset::ProbeVerdict::from_row(
-            Some(row),
+    let roster_row = super::limit_reset::row_for(&usage, &src);
+    let probe = match super::limit_reset::probe_source(roster_row.is_some(), &read, auto_continue) {
+        super::limit_reset::ProbeSource::Roster => super::limit_reset::ProbeVerdict::from_row(
+            roster_row,
             crate::ai_provider::account_known_exhausted(&src),
         ),
         // The roster probe returns no rows below two accounts. Only a stop
-        // needs the verdict there (the continue branch), so only a stop pays
-        // for probing the session's own account.
-        None if matches!(read, super::limit_stop::LimitStopRead::Stopped(_)) => {
+        // the continue could resolve needs the verdict there, so only such a
+        // stop pays for probing the session's own account.
+        super::limit_reset::ProbeSource::OwnAccount => {
             let row = crate::commands::ai_settings::probe_account_usage(src.clone()).await;
             let exhausted = crate::commands::ai_settings::probe_result_exhausted(&row);
             super::limit_reset::ProbeVerdict::from_row(Some(&row), exhausted)
         }
-        None => super::limit_reset::ProbeVerdict::from_row(
+        super::limit_reset::ProbeSource::NoRow => super::limit_reset::ProbeVerdict::from_row(
             None,
             crate::ai_provider::account_known_exhausted(&src),
         ),
@@ -715,14 +716,14 @@ fn skip_message(why: super::limit_reset::SkipReason) -> &'static str {
             "limit stop UNKNOWN — transcript unreadable; account not exhausted, so nothing is typed"
         }
         SkipReason::ContinueDisabled => {
-            "limit stop whose account has reset, but auto_continue_after_limit_reset is disabled in settings"
+            "limit stop that only a reset-continue could resolve, and auto_continue_after_limit_reset is disabled in settings"
         }
         SkipReason::MigrateDisabled => {
             "usage-limit confirmed-candidate but auto-migration is disabled in settings"
         }
         SkipReason::NoOtherAccount => "usage-limit hint but there is no other account to migrate to",
         SkipReason::MigratedSinceStop => {
-            "limit stop predates this session's latest migration — its continue nudge owns it"
+            "limit stop predates this session's latest migration, onto an account that is not exhausted — left to the migration (its continue nudge runs when auto_continue_after_migration is on)"
         }
     }
 }

@@ -27,16 +27,19 @@ fn probe(unknown: bool, known_exhausted: bool) -> ProbeVerdict {
     ProbeVerdict {
         unknown,
         known_exhausted,
+        resets_at_ms: None,
     }
 }
 
 const FINE: ProbeVerdict = ProbeVerdict {
     unknown: false,
     known_exhausted: false,
+    resets_at_ms: None,
 };
 const DRY: ProbeVerdict = ProbeVerdict {
     unknown: false,
     known_exhausted: true,
+    resets_at_ms: None,
 };
 
 /// Both toggles on, two accounts, not finished.
@@ -153,13 +156,93 @@ fn with_the_continue_off_a_stop_waiting_only_for_a_continue_is_not_parked() {
         decide(&single),
         LimitAction::Skip(SkipReason::ContinueDisabled)
     );
-    // Still exhausted with a target possible: the migration (and its cap or
-    // no-target park) is unaffected.
+    // Still exhausted with a target possible: it migrates, and a cap or
+    // no-target refusal reports as before instead of parking for a continue
+    // that is switched off.
     assert_eq!(
         decide(&off(stopped(Some(NOW + 60_000)), DRY)),
         LimitAction::Migrate {
-            park_fallback: Some(NOW + 60_000 + 120_000),
+            park_fallback: None
         }
+    );
+}
+
+#[test]
+fn a_still_exhausted_account_parks_until_its_own_window_resets() {
+    // The stop's five-hour reset has passed, but the weekly window is out:
+    // park until the probe's reset, not one margin from now.
+    let weekly = ProbeVerdict {
+        resets_at_ms: Some(NOW + 3 * 86_400_000),
+        ..DRY
+    };
+    let mut single = inputs(stopped(Some(NOW - 60_000)), weekly);
+    single.config_dir_count = 1;
+    assert_eq!(
+        decide(&single),
+        LimitAction::Park {
+            due_at_ms: NOW + 3 * 86_400_000 + 120_000,
+            reason: ParkReason::SingleAccount,
+        }
+    );
+    // The later of the two resets wins.
+    assert_eq!(
+        exhausted_park_due_at(&stop(Some(NOW + 9_000_000)), &weekly, NOW),
+        NOW + 3 * 86_400_000 + 120_000
+    );
+    assert_eq!(
+        exhausted_park_due_at(&stop(None), &DRY, NOW),
+        NOW + 3_600_000
+    );
+}
+
+#[test]
+fn the_exhausted_window_reset_is_the_session_window_only_when_only_it_is_full() {
+    use crate::commands::ai_settings::AccountUsageInfo;
+    let session_full = AccountUsageInfo {
+        utilization: 0.4,
+        resets_at: Some(1_800_500_000),
+        session_utilization: Some(1.0),
+        session_resets_at: Some(1_800_010_000),
+        ..Default::default()
+    };
+    assert_eq!(
+        exhausted_window_reset_ms(&session_full),
+        Some(1_800_010_000_000)
+    );
+    let weekly_full = AccountUsageInfo {
+        utilization: 1.0,
+        ..session_full.clone()
+    };
+    assert_eq!(
+        exhausted_window_reset_ms(&weekly_full),
+        Some(1_800_500_000_000)
+    );
+    assert_eq!(
+        exhausted_window_reset_ms(&AccountUsageInfo::default()),
+        None
+    );
+}
+
+#[test]
+fn the_handler_probes_its_own_account_only_for_a_stop_it_could_continue() {
+    let stop_read = stopped(None);
+    assert_eq!(probe_source(true, &stop_read, true), ProbeSource::Roster);
+    assert_eq!(
+        probe_source(true, &LimitStopRead::NotStopped, false),
+        ProbeSource::Roster
+    );
+    assert_eq!(
+        probe_source(false, &stop_read, true),
+        ProbeSource::OwnAccount
+    );
+    assert_eq!(probe_source(false, &stop_read, false), ProbeSource::NoRow);
+    assert_eq!(
+        probe_source(false, &LimitStopRead::NotStopped, true),
+        ProbeSource::NoRow
+    );
+    assert_eq!(
+        probe_source(false, &LimitStopRead::Unreadable("x".to_string()), true),
+        ProbeSource::NoRow
     );
 }
 
@@ -186,6 +269,15 @@ fn a_stop_from_before_the_latest_migration_is_left_to_that_migration() {
         decide(&untimed),
         LimitAction::Skip(SkipReason::MigratedSinceStop)
     );
+    // A destination that is itself dry still takes the next hop.
+    let mut dry_target = inputs(stopped(Some(NOW + 86_400_000)), DRY);
+    dry_target.migrated_at_ms = Some(STOPPED_AT + 5_000);
+    assert_eq!(
+        decide(&dry_target),
+        LimitAction::Migrate {
+            park_fallback: None
+        }
+    );
     // A NEW stop, hit on the target account after the migration, is decided.
     let mut later = inputs(stopped(Some(NOW - 1_000)), FINE);
     later.migrated_at_ms = Some(STOPPED_AT - 5_000);
@@ -210,6 +302,15 @@ fn the_probe_verdict_reads_a_missing_or_errored_row_as_unknown() {
     assert_eq!(
         ProbeVerdict::from_row(Some(&clean), false),
         probe(false, false)
+    );
+    let clean_with_reset = AccountUsageInfo {
+        utilization: 1.0,
+        resets_at: Some(1_800_500_000),
+        ..clean.clone()
+    };
+    assert_eq!(
+        ProbeVerdict::from_row(Some(&clean_with_reset), true).resets_at_ms,
+        Some(1_800_500_000_000)
     );
     assert_eq!(
         ProbeVerdict::from_row(Some(&clean), true),
@@ -518,8 +619,18 @@ async fn two_concurrent_hints_for_one_stop_submit_once() {
         release.send(true).expect("gate receiver alive");
         run
     };
-    let (a, b) = tokio::join!(first, second);
-    assert_eq!(watched.load(Ordering::SeqCst), 1);
+    // Bounded: with the claim taken only on submit, the second hint starts a
+    // second watcher that waits on the gate for ever — a red, not a hang.
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await;
+    assert_eq!(
+        watched.load(Ordering::SeqCst),
+        1,
+        "a second watcher started for the same stop"
+    );
+    let (a, b) = joined.expect("the two continue runs did not finish");
     assert_eq!(
         a,
         ContinueRun::Ran {
