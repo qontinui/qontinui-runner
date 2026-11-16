@@ -12,7 +12,8 @@
  * occupied set (see `fixtures/terminalPageRoster.ts`).
  */
 
-import { act, createElement, useLayoutEffect } from "react";
+import { StrictMode, act, createElement, startTransition, useLayoutEffect } from "react";
+import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -403,7 +404,7 @@ describe("a pop-out window opened before the repair", () => {
 });
 
 describe("the repair's version", () => {
-  it("is not recorded when the page-list save failed, so the repair runs again", async () => {
+  it("is not recorded when the page-list save failed, and is once a save succeeds", async () => {
     backend.perf = { prune_empty_auto_pages: false };
     failWritesTo(PAGES_STORAGE_KEY);
     const hook = await mount();
@@ -412,11 +413,10 @@ describe("the repair's version", () => {
     expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Terminal");
     expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBeNull();
 
-    // The store recovers; the next mount repairs and records.
+    // The store recovers. The next roster write builds on this window's copy
+    // (the store refused its last save, so the copy is newer) and saves it.
     vi.mocked(Storage.prototype.setItem).mockRestore();
-    act(() => root.unmount());
-    root = createRoot(container);
-    await mount();
+    act(() => hook().reorderPage("operator-2", "operator-1"));
     expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
     expect(new Set(names(persisted())).size).toBe(40);
     expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBe("2");
@@ -442,6 +442,69 @@ describe("the repair's version", () => {
     expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
     expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBeNull();
     expect(hook().pruneNotice?.renames.map((r) => r.id)).toContain("3e86a8ae");
+  });
+});
+
+describe("writes the store refuses or React reorders", () => {
+  it("a refused save does not undo this window's earlier writes", async () => {
+    backend.perf = { prune_empty_auto_pages: false };
+    const hook = await mount();
+    failWritesTo(PAGES_STORAGE_KEY);
+    let alpha = "";
+    let beta = "";
+    act(() => void (alpha = hook().addPage("alpha")));
+    act(() => void (beta = hook().addPage("beta")));
+    expect(ids(hook().allPages)).toContain(alpha);
+    expect(ids(hook().allPages)).toContain(beta);
+    expect(names(hook().allPages).slice(-2)).toEqual(["alpha", "beta"]);
+  });
+
+  it("a prune whose saves are refused keeps its removals in memory", async () => {
+    failWritesTo(PAGES_STORAGE_KEY);
+    const hook = await mount();
+    expect(hook().pruneNotice?.removed.map((r) => r.page.id)).toEqual(EMPTY_AUTO_IDS);
+    for (const id of EMPTY_AUTO_IDS) expect(ids(hook().allPages)).not.toContain(id);
+    expect(hook().allPages).toHaveLength(28);
+  });
+
+  it("a write that overtakes a pending transition write does not drop it", async () => {
+    // React renders the rename first, skipping the transition, then re-runs
+    // the rename after the skipped writes: that re-run must build on what
+    // they saved.
+    backend.perf = { prune_empty_auto_pages: false };
+    const hook = await mount();
+    act(() => {
+      startTransition(() => {
+        hook().reorderPage("operator-2", "operator-1");
+        hook().setPageDefaultWorkingDir("operator-4", "/x");
+      });
+      flushSync(() => {
+        hook().renamePage("operator-3", "zzz");
+      });
+    });
+    const byId = (list: TerminalPageConfig[], id: string) => list.find((p) => p.id === id);
+    expect(byId(hook().allPages, "operator-4")?.defaultWorkingDir).toBe("/x");
+    expect(byId(hook().allPages, "operator-3")?.name).toBe("zzz");
+    expect(byId(persisted(), "operator-4")?.defaultWorkingDir).toBe("/x");
+    expect(byId(persisted(), "operator-3")?.name).toBe("zzz");
+    expect(ids(persisted()).indexOf("operator-2")).toBe(ids(persisted()).indexOf("operator-1") - 1);
+  });
+
+  it("adds exactly one page under StrictMode's double invoke", async () => {
+    backend.perf = { prune_empty_auto_pages: false };
+    let latest: Hook | null = null;
+    function Probe() {
+      latest = useTerminalPages();
+      return null;
+    }
+    latestHook = () => latest!;
+    await act(async () => root.render(createElement(StrictMode, null, createElement(Probe))));
+    await settle();
+    const before = persisted().length;
+    act(() => void latest!.addPage("solo"));
+    expect(persisted()).toHaveLength(before + 1);
+    expect(latest!.allPages).toHaveLength(before + 1);
+    expect(persisted().filter((p) => p.name === "solo")).toHaveLength(1);
   });
 });
 

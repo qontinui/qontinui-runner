@@ -41,11 +41,13 @@ export const instanceStorage = {
       return fallback;
     }
   },
-  setJSON(key: string, value: unknown): void {
+  /** Store `value` as JSON. `false` when the store refused it (quota exceeded). */
+  setJSON(key: string, value: unknown): boolean {
     try {
       localStorage.setItem(namespacedKey(key), JSON.stringify(value));
+      return true;
     } catch {
-      /* quota exceeded */
+      return false;
     }
   },
   /**

@@ -114,8 +114,9 @@ export function loadKnownPageIds(): string[] {
   return loadPages().map((p) => p.id);
 }
 
-function savePages(pages: TerminalPageConfig[]) {
-  instanceStorage.setJSON(STORAGE_KEY, pages);
+/** Persist the roster; `false` when the store refused it (quota exceeded). */
+function savePages(pages: TerminalPageConfig[]): boolean {
+  return instanceStorage.setJSON(STORAGE_KEY, pages);
 }
 
 /**
@@ -142,8 +143,9 @@ function persistActivePage(id: string) {
 
 /**
  * Record the one-time roster repair as done (plan 2026-11-05 Phase 6, D2), but
- * only when the PERSISTED roster, read back, needs no rename. `savePages`
- * swallows a full-storage error, so a repair whose save failed stays
+ * only when the PERSISTED roster, read back, needs no rename. A page-list
+ * save the store refused is not an error anywhere, so a repair whose save
+ * failed stays
  * unrecorded and runs again, instead of being marked done over a roster that
  * still has the duplicates. A version write that throws is left unrecorded the
  * same way. Returns whether the version was written.
@@ -595,9 +597,14 @@ export function useTerminalPages() {
     allPagesRef.current = allPages;
   }, [allPages]);
 
+  // Whether this window's last page-list save was refused (a full store).
+  // While it was, this window's copy is NEWER than the store.
+  const lastSaveRefusedRef = useRef(false);
+
   /**
-   * `setPages` for every roster write. `mutate` gets the roster to build on
-   * and returns it unchanged for a no-op (state then keeps `prev`).
+   * The ONE roster writer: `mutate` gets the roster to build on and returns
+   * the new roster, or that roster unchanged for a no-op (nothing is saved and
+   * state keeps `prev`). The result is saved here.
    *
    * That roster is the PERSISTED one, not this window's in-memory copy. The
    * main window and every pop-out mount this hook, each with its own copy,
@@ -606,20 +613,30 @@ export function useTerminalPages() {
    * one-time repair would write the pruned pages and the duplicate names back,
    * after the repair's version key is set, so nothing would repair them
    * again; and the main window would revert a rename made in a pop-out (and
-   * then prune that page) or drop a page a pop-out added. An empty or
-   * unreadable store falls back to `prev` (`readPersistedPages`).
+   * then prune that page) or drop a page a pop-out added. Two exceptions build
+   * on `prev`: an empty or unreadable store (`readPersistedPages`), and a
+   * store that refused this window's last save, which would otherwise undo
+   * every write since.
    *
-   * The read is made inside the updater, so it comes after every write queued
-   * before this one has saved, and it is made ONCE per write: a StrictMode
-   * double invoke reuses it rather than reading this write's own first save.
+   * The store is read inside the updater, so it comes after every write
+   * queued before this one has saved. It is read once per `prev`: a
+   * StrictMode double invoke passes the same `prev` and reuses the read
+   * rather than reading this write's own first save, while React re-running
+   * the update on a rebased `prev` (after an update it skipped) reads again,
+   * and so builds on what the skipped write saved.
    */
   const updatePages = useCallback(
     (mutate: (base: TerminalPageConfig[]) => TerminalPageConfig[]) => {
-      let base: TerminalPageConfig[] | undefined;
+      let read: { prev: TerminalPageConfig[]; base: TerminalPageConfig[] } | undefined;
       setPages((prev) => {
-        base ??= readPersistedPages() ?? prev;
-        const next = mutate(base);
-        return next === base ? prev : next;
+        if (read?.prev !== prev) {
+          const stored = lastSaveRefusedRef.current ? null : readPersistedPages();
+          read = { prev, base: stored ?? prev };
+        }
+        const next = mutate(read.base);
+        if (next === read.base) return prev;
+        lastSaveRefusedRef.current = !savePages(next);
+        return next;
       });
     },
     [],
@@ -742,9 +759,7 @@ export function useTerminalPages() {
           createdAt,
           origin,
         };
-        const updated = [...base, newPage];
-        savePages(updated);
-        return updated;
+        return [...base, newPage];
       });
       setActivePageId(id);
       return id;
@@ -787,12 +802,8 @@ export function useTerminalPages() {
         instanceStorage.removeByPrefix(prefix);
       }
 
-      updatePages((base) => {
-        if (base.length <= 1) return base; // Can't remove last page
-        const updated = base.filter((p) => p.id !== id);
-        savePages(updated);
-        return updated;
-      });
+      // Can't remove the last page.
+      updatePages((base) => (base.length <= 1 ? base : base.filter((p) => p.id !== id)));
 
       // Switch to "default" if the active page was deleted; the normalize
       // effect below moves on to the first visible page when it has no tab.
@@ -857,9 +868,7 @@ export function useTerminalPages() {
         const at = base.findIndex((p) => p.id === id);
         if (at < 0) return base;
         removed.index = at;
-        const updated = drop(base);
-        savePages(updated);
-        return updated;
+        return drop(base);
       });
       if (activePageIdRef.current === id) {
         activePageIdRef.current = "default";
@@ -937,11 +946,7 @@ export function useTerminalPages() {
     for (const r of notice.removed) instanceStorage.restoreEntries(r.entries);
     const restore = (list: TerminalPageConfig[]) => restoreRemovedPages(list, notice.removed);
     allPagesRef.current = restore(allPagesRef.current);
-    updatePages((base) => {
-      const updated = restore(base);
-      savePages(updated);
-      return updated;
-    });
+    updatePages(restore);
   }, [clearPruneNotice, updatePages]);
 
   /**
@@ -1009,11 +1014,7 @@ export function useTerminalPages() {
             renames = duplicateNameRepairs(allPagesRef.current, fresh.ids);
             if (renames.length > 0) {
               allPagesRef.current = applyRenames(allPagesRef.current, renames);
-              updatePages((base) => {
-                const updated = applyRenames(base, renames);
-                savePages(updated);
-                return updated;
-              });
+              updatePages((base) => applyRenames(base, renames));
             }
             // Recorded now when the persisted roster is already clean; else
             // after the commit that saves this pass's removals and renames.
@@ -1069,10 +1070,8 @@ export function useTerminalPages() {
           }
           return base;
         }
-        const updated = claim(base);
-        savePages(updated);
         allPagesRef.current = claim(allPagesRef.current);
-        return updated;
+        return claim(base);
       });
       return true;
     },
@@ -1091,12 +1090,7 @@ export function useTerminalPages() {
       // The ref takes the same move, applied to ITSELF: a roster built on
       // `base` can lag it (see `renamePage`).
       allPagesRef.current = reorderPagesArray(allPagesRef.current, sourceId, targetId);
-      updatePages((base) => {
-        const updated = reorderPagesArray(base, sourceId, targetId);
-        if (updated === base) return base;
-        savePages(updated);
-        return updated;
-      });
+      updatePages((base) => reorderPagesArray(base, sourceId, targetId));
     },
     [updatePages],
   );
@@ -1109,12 +1103,8 @@ export function useTerminalPages() {
     (id: string, dir: string | null | undefined) => {
       // Applied to the ref itself, never copied from `base` (see `renamePage`).
       allPagesRef.current = applyPageDefaultWorkingDir(allPagesRef.current, id, dir);
-      updatePages((base) => {
-        const updated = applyPageDefaultWorkingDir(base, id, dir);
-        if (updated === base) return base; // no change — no persist, no re-render
-        savePages(updated);
-        return updated;
-      });
+      // No change: no persist, no re-render (same reference back).
+      updatePages((base) => applyPageDefaultWorkingDir(base, id, dir));
     },
     [updatePages],
   );
@@ -1153,15 +1143,8 @@ export function useTerminalPages() {
         // tick), pinning the id already reported to the caller so the two
         // resolutions cannot diverge: with `seed.pageId` as the bound id this
         // is idempotent — present → no-op, absent → created under that id.
-        const { pages: updated } = resolveProjectPage(
-          base,
-          seed.pageId,
-          opts.projectName,
-          opts.defaultWorkingDir,
-        );
-        if (updated === base) return base;
-        savePages(updated);
-        return updated;
+        return resolveProjectPage(base, seed.pageId, opts.projectName, opts.defaultWorkingDir)
+          .pages;
       });
       setActivePageId(seed.pageId);
       return { pageId: seed.pageId, created: seed.created };
@@ -1189,9 +1172,7 @@ export function useTerminalPages() {
           createdAt: Date.now(),
           origin: "operator",
         };
-        const updated = [...base, page];
-        savePages(updated);
-        return updated;
+        return [...base, page];
       });
       setActivePageId(id);
     },
@@ -1241,12 +1222,7 @@ export function useTerminalPages() {
 
     const mint = (list: TerminalPageConfig[]) => reconcilePages(list, reconcileIds);
     allPagesRef.current = mint(allPagesRef.current);
-    updatePages((base) => {
-      const next = mint(base);
-      if (next === base) return base; // nothing missing — no persist / no re-render
-      savePages(next);
-      return next;
-    });
+    updatePages(mint); // nothing missing: same reference, no persist / no re-render
 
     if (complete && ownsRosterWrites) await pruneAndRepair(ids);
   }, [pruneAndRepair, ownsRosterWrites, updatePages]);
