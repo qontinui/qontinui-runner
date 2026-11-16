@@ -101,6 +101,17 @@ pub struct AiSessionConfig {
     /// checked post-hoc as defense-in-depth. `None` ⇒ byte-for-byte identical
     /// to today's spawn (back-compat).
     pub tool_policy: Option<crate::workflow::dag_schema::ToolPolicy>,
+    /// This one session's account, overriding the executor's (the workflow's
+    /// pick) when `Some`. The agentic resume arm sets it to
+    /// `AccountChoice::Pinned(<dir holding the transcript>)`, because a
+    /// `--resume` finds its conversation only under the account that wrote it.
+    pub account: Option<crate::ai_provider::AccountChoice>,
+    /// Run this one session under the ambient default account — no account
+    /// set, and no pick taken. The agentic resume arm sets it when the
+    /// transcript is under the ambient default location (see
+    /// `terminal::transcript::ResumeAccount::Ambient`). Ignored when
+    /// `account` is `Some`.
+    pub inherit_ambient_account: bool,
 }
 
 impl AiSessionConfig {
@@ -129,6 +140,8 @@ impl AiSessionConfig {
             cli_session_ctx: None,
             db_flush_ctx: None,
             tool_policy: None,
+            account: None,
+            inherit_ambient_account: false,
         }
     }
 
@@ -157,6 +170,8 @@ impl AiSessionConfig {
             cli_session_ctx: None,
             db_flush_ctx: None,
             tool_policy: None,
+            account: None,
+            inherit_ambient_account: false,
         }
     }
 
@@ -186,6 +201,8 @@ impl AiSessionConfig {
             cli_session_ctx: None,
             db_flush_ctx: None,
             tool_policy: None,
+            account: None,
+            inherit_ambient_account: false,
         }
     }
 
@@ -553,6 +570,15 @@ fn strip_completion_marker_instructions(prompt: &str) -> String {
 // Unified AI Session Executor
 // =============================================================================
 
+/// The cwd every workflow AI session's `claude` child runs in — and therefore
+/// the project path its transcript is stored under
+/// (`terminal::transcript::session_transcript_path`).
+pub(crate) fn workspace_root_for_claude() -> String {
+    crate::mcp::shared::get_workspace_paths_internal()
+        .map(|(root, _, _)| root.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
 /// Unified executor for AI sessions across all workflow phases.
 ///
 /// This consolidates the duplicated AI session handling logic from SetupExecutor,
@@ -568,6 +594,11 @@ pub struct UnifiedAiSessionExecutor {
     /// When present, pre_call middleware is applied during prompt transformation
     /// and post_call middleware is applied to the session output.
     pub(crate) middleware_chain: Option<crate::ai_provider::middleware::AiMiddlewareChain>,
+    /// The workflow's own account pick (`loop_controller`), carried into every
+    /// session context this executor builds as its `account`, so the inline
+    /// and interactive children run under the workflow's account rather than
+    /// whatever a sibling spawn last wrote to the shared resolved dir.
+    pub(crate) account: Option<crate::ai_provider::AccountChoice>,
 }
 
 impl UnifiedAiSessionExecutor {
@@ -583,6 +614,7 @@ impl UnifiedAiSessionExecutor {
             pid_tracker,
             session_manager: None,
             middleware_chain: None,
+            account: None,
         }
     }
 
@@ -669,10 +701,7 @@ impl UnifiedAiSessionExecutor {
             };
         }
 
-        // Get workspace root
-        let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let workspace_root = workspace_root_for_claude();
 
         // Clone necessary values for the blocking task
         let pid_tracker = self.pid_tracker.clone();
@@ -1160,7 +1189,7 @@ impl UnifiedAiSessionExecutor {
         config: &AiSessionConfig,
         available_tools: Vec<String>,
     ) -> Option<AiSessionContext> {
-        let ctx = match config.phase {
+        let mut ctx = match config.phase {
             WorkflowPhase::Setup => {
                 AiSessionContext::setup(&config.task_run_id, &config.workflow_name)
                     .with_runtime_env()
@@ -1211,8 +1240,28 @@ impl UnifiedAiSessionExecutor {
                     .with_turn_count(completion_turn)
             }
         };
+        Self::apply_session_account(&mut ctx, config, self.account.as_ref());
 
         Some(ctx)
+    }
+
+    /// Set a session context's account, in precedence order: this session's
+    /// own `config.account` when the caller set one (a resume pinned to its
+    /// transcript's account); else, for an ambient resume
+    /// (`config.inherit_ambient_account`), NO account at all — not even the
+    /// workflow's pick — plus the inherit flag; else the workflow's own pick
+    /// (`AccountChoice::Picked`). PURE over its arguments.
+    fn apply_session_account(
+        ctx: &mut AiSessionContext,
+        config: &AiSessionConfig,
+        workflow_pick: Option<&crate::ai_provider::AccountChoice>,
+    ) {
+        if config.account.is_none() && config.inherit_ambient_account {
+            ctx.account = None;
+            ctx.inherit_ambient_account = true;
+        } else {
+            ctx.account = config.account.clone().or_else(|| workflow_pick.cloned());
+        }
     }
 
     /// Build the FindingContext based on the phase.
@@ -1354,6 +1403,43 @@ impl UnifiedAiSessionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A session's account precedence:** the session's own account beats
+    /// the workflow pick; an ambient resume clears the workflow pick (and sets
+    /// the inherit flag); otherwise the workflow pick rides.
+    #[test]
+    fn a_session_account_precedence_is_own_then_ambient_then_workflow_pick() {
+        use crate::ai_provider::AccountChoice;
+        let pick = AccountChoice::Picked("/acct/workflow".into());
+        let fresh_ctx = || AiSessionContext::agentic("task-prec", "Prec", 1);
+
+        let mut own = AiSessionConfig::agentic("task-prec", "Prec", 1);
+        own.account = Some(AccountChoice::Pinned("/acct/transcript".into()));
+        own.inherit_ambient_account = true;
+        let mut ctx = fresh_ctx();
+        UnifiedAiSessionExecutor::apply_session_account(&mut ctx, &own, Some(&pick));
+        assert_eq!(
+            ctx.account,
+            Some(AccountChoice::Pinned("/acct/transcript".into()))
+        );
+        assert!(!ctx.inherit_ambient_account);
+
+        let mut ambient = AiSessionConfig::agentic("task-prec", "Prec", 1);
+        ambient.inherit_ambient_account = true;
+        let mut ctx = fresh_ctx();
+        UnifiedAiSessionExecutor::apply_session_account(&mut ctx, &ambient, Some(&pick));
+        assert_eq!(
+            ctx.account, None,
+            "an ambient resume carries no workflow pick"
+        );
+        assert!(ctx.inherit_ambient_account);
+
+        let plain = AiSessionConfig::agentic("task-prec", "Prec", 1);
+        let mut ctx = fresh_ctx();
+        UnifiedAiSessionExecutor::apply_session_account(&mut ctx, &plain, Some(&pick));
+        assert_eq!(ctx.account, Some(pick));
+        assert!(!ctx.inherit_ambient_account);
+    }
 
     #[test]
     fn test_strip_completion_marker_instructions() {

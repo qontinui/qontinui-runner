@@ -2422,6 +2422,13 @@ mod tests {
             "the ambient Claude config (`~/.claude.json`) a child with no account reads",
         ),
         (
+            "terminal/transcript.rs",
+            1,
+            "`ambient_claude_config_dir`: the `~/.claude` a `claude` child with no \
+             `CLAUDE_CONFIG_DIR` inherits (Claude Code's own default account home), \
+             which a resume compares its transcript's account against — never runner state",
+        ),
+        (
             "claude_cli_update.rs",
             1,
             "Claude Code's own `~/.claude/settings.json`, read only for the user's \

@@ -440,7 +440,7 @@
       "class": "os_bound_tooling",
       "file": "src/config_report_cmd.rs",
       "symbol": "seam_reports",
-      "excerpt": "&crate::claude_session::runner::build_inline_child_command(\"cmd.exe\", &[], \".\"),",
+      "excerpt": "&crate::claude_session::runner::build_inline_child_command(\"cmd.exe\", &[], \".\", None),",
       "count": 1,
       "disposition": "unreviewed"
     },

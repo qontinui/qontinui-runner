@@ -273,7 +273,7 @@ _No hits._
 | `src/commands/saved_projects.rs` | `resolve_subst_once` | `cfg(windows)-only fn 'resolve_subst_once' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `rewrite_msys_root` | `cfg(windows)-only fn 'rewrite_msys_root' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/config_report.rs` | `render_layer_doc` | `docs/runner-config-layers.md'. NOT from PowerShell, whose '>' writes UTF-16 \` | 1 | unreviewed |
-| `src/config_report_cmd.rs` | `seam_reports` | `&crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], "."),` | 1 | unreviewed |
+| `src/config_report_cmd.rs` | `seam_reports` | `&crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], ".", None),` | 1 | unreviewed |
 | `src/coord_doctor.rs` | `const CHECK_SPECS` | `dev-start.ps1 / the supervisor); spawns are stripped either way` | 1 | unreviewed |
 | `src/crash_observability.rs` | `format_harvest_breadcrumb` | `abort, OOM kill, taskkill /F, or power loss). This artifact was\n\` | 1 | unreviewed |
 | `src/crash_observability.rs` | `install` | `cfg(windows)-only fn 'install' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

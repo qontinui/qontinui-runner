@@ -25,6 +25,42 @@ use super::{
 };
 
 // =============================================================================
+// Agentic resume account
+// =============================================================================
+
+/// Apply a resume decision to this iteration's session config.
+///
+/// `Ok(account)` means `--resume`, with `account` naming what it runs under
+/// for the log: [`ResumeAccount::Pinned`](crate::terminal::transcript::ResumeAccount::Pinned)
+/// pins the session to the transcript's account (not the workflow's pick);
+/// [`ResumeAccount::Ambient`](crate::terminal::transcript::ResumeAccount::Ambient)
+/// clears any account and marks the session to inherit the ambient default.
+/// `Err(reason)` means start fresh on the workflow's own pick; the config is
+/// left untouched.
+pub(crate) fn apply_resume_account(
+    ai_config: &mut AiSessionConfig,
+    decision: crate::terminal::transcript::ResumeAccount,
+) -> Result<String, String> {
+    let (account, inherit_ambient_account) = decision.into_session_account()?;
+    let label = account.as_ref().map_or_else(
+        || "the ambient default account".to_string(),
+        |a| a.dir().to_string(),
+    );
+    ai_config.account = account;
+    ai_config.inherit_ambient_account = inherit_ambient_account;
+    Ok(label)
+}
+
+/// Undo [`apply_resume_account`] after the `--resume` failed: the account it
+/// set existed only so `--resume` could find its conversation. A fresh session
+/// has no transcript to follow, and the failure may have been that account's
+/// own (auth, rate limit), so it goes back to the workflow's own pick.
+pub(crate) fn release_resume_account(ai_config: &mut AiSessionConfig) {
+    ai_config.account = None;
+    ai_config.inherit_ambient_account = false;
+}
+
+// =============================================================================
 // Agentic Phase Executor
 // =============================================================================
 
@@ -68,6 +104,11 @@ impl AgenticExecutor {
         chain: crate::ai_provider::middleware::AiMiddlewareChain,
     ) {
         self.ai_executor.middleware_chain = Some(chain);
+    }
+
+    /// Set the workflow's account pick on the inner AI session executor.
+    pub fn set_account(&mut self, account: Option<crate::ai_provider::AccountChoice>) {
+        self.ai_executor.account = account;
     }
 
     /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers.
@@ -1134,11 +1175,51 @@ impl AgenticExecutor {
             .await
         {
             Ok(Some((prev_cli_id, prev_status))) if prev_status == "interrupted" => {
-                info!(
-                    "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume",
-                    prev_cli_id, iteration
-                );
-                (prev_cli_id, true)
+                // A `--resume` finds its conversation only under the account
+                // that wrote it, and the inline child pins CLAUDE_CONFIG_DIR to
+                // the session's account — so resume under the transcript's
+                // account, not the workflow's pick.
+                // Blocking (a config-dir sweep, canonicalize, credential reads
+                // and, on macOS, the `security` subprocess): off the async
+                // worker, as the workflow's own pick is.
+                let cwd = crate::unified_ai_session::workspace_root_for_claude();
+                let extra = self
+                    .ai_executor
+                    .account
+                    .as_ref()
+                    .map(|c| c.dir().to_string());
+                let resume_id = prev_cli_id.clone();
+                let decision =
+                    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                        crate::terminal::transcript::resume_account_on_this_machine(
+                            extra.as_deref(),
+                            &cwd,
+                            &resume_id,
+                            &crate::settings::get_ai_settings().claude_cli,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        crate::terminal::transcript::ResumeAccount::NotResumable {
+                            reason: format!("the resume-account probe task failed: {e}"),
+                        }
+                    });
+                match apply_resume_account(&mut ai_config, decision) {
+                    Ok(account) => {
+                        info!(
+                            "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume under the account holding its transcript ({})",
+                            prev_cli_id, iteration, account
+                        );
+                        (prev_cli_id, true)
+                    }
+                    Err(reason) => {
+                        warn!(
+                            "AGENTIC-PHASE: Interrupted CLI session {} for iteration {} is not resumable ({}) — starting a fresh session on the workflow's own account pick",
+                            prev_cli_id, iteration, reason
+                        );
+                        (uuid::Uuid::new_v4().to_string(), false)
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -1240,6 +1321,7 @@ impl AgenticExecutor {
                 result.error,
                 result.output.len()
             );
+            release_resume_account(&mut ai_config);
             // Create a fresh CLI session
             let fresh_cli_id = uuid::Uuid::new_v4().to_string();
             ai_config.cli_session_ctx = Some(crate::claude_session::runner::CliSessionContext {
@@ -1723,5 +1805,58 @@ impl AgenticExecutor {
     fn get_progress_marker_context(&self, _execution_id: &str, _iteration: u32) -> Option<String> {
         // Progress marker context removed — all persistence now via PgDb.
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai_provider::AccountChoice;
+    use crate::terminal::transcript::ResumeAccount;
+
+    fn config() -> AiSessionConfig {
+        AiSessionConfig::agentic("exec-1", "Workflow", 1)
+    }
+
+    /// **The agentic resume arm sets this session's account and the fallback
+    /// clears it.** A pinned resume carries `AccountChoice::Pinned(<transcript
+    /// dir>)`; an ambient resume carries no account and inherits the ambient
+    /// default; not-resumable leaves the config on the workflow's own pick;
+    /// the post-failure fallback returns it to the workflow's own pick.
+    #[test]
+    fn the_resume_arm_sets_the_account_and_the_fallback_clears_it() {
+        let mut pinned = config();
+        assert_eq!(
+            apply_resume_account(&mut pinned, ResumeAccount::Pinned("/acct/owner".into())),
+            Ok("/acct/owner".to_string())
+        );
+        assert_eq!(
+            pinned.account,
+            Some(AccountChoice::Pinned("/acct/owner".into()))
+        );
+        assert!(!pinned.inherit_ambient_account);
+        release_resume_account(&mut pinned);
+        assert_eq!(pinned.account, None);
+        assert!(!pinned.inherit_ambient_account);
+
+        let mut ambient = config();
+        assert!(apply_resume_account(&mut ambient, ResumeAccount::Ambient).is_ok());
+        assert_eq!(ambient.account, None);
+        assert!(ambient.inherit_ambient_account);
+        release_resume_account(&mut ambient);
+        assert!(!ambient.inherit_ambient_account);
+
+        let mut fresh = config();
+        assert_eq!(
+            apply_resume_account(
+                &mut fresh,
+                ResumeAccount::NotResumable {
+                    reason: "no transcript".into()
+                }
+            ),
+            Err("no transcript".to_string())
+        );
+        assert_eq!(fresh.account, None);
+        assert!(!fresh.inherit_ambient_account);
     }
 }

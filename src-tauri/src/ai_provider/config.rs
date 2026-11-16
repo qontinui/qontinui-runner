@@ -1,6 +1,7 @@
 use crate::settings::{self, AccountSelectionMode};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -150,9 +151,19 @@ impl Drop for ResolvedConfigDirRestore {
 /// report (layer 11) and are meant to be greppable across machines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeConfigDirSource {
-    /// A per-request account override was supplied and returned verbatim. Only
-    /// reachable through [`get_effective_config_dir_with_override`].
+    /// The caller PINNED an account ([`AccountChoice::Pinned`]) and it was
+    /// returned verbatim, with no credential check here. Only reachable through
+    /// [`get_effective_config_dir_for`].
     RequestOverride,
+    /// The spawn's OWN pick ([`AccountChoice::Picked`], the value
+    /// [`pick_best_account`](super::account_usage::pick_best_account) returned
+    /// to this spawn) re-passed the credential check. Distinct from
+    /// [`Self::LeastUsageResolved`] on purpose: that arm reads the shared
+    /// `RESOLVED_CONFIG_DIR`, which a concurrent sibling pick may have
+    /// rewritten, so a report showing `least_usage_resolved` on a spawn path
+    /// names a site that still reads the global. Only reachable through
+    /// [`get_effective_config_dir_for`].
+    PickedForThisSpawn,
     /// `LeastUsage` mode; the credential-aware picker's resolved dir won
     /// ([`get_resolved_config_dir`]).
     LeastUsageResolved,
@@ -182,6 +193,7 @@ impl ClaudeConfigDirSource {
     pub fn as_str(self) -> &'static str {
         match self {
             ClaudeConfigDirSource::RequestOverride => "request_override",
+            ClaudeConfigDirSource::PickedForThisSpawn => "picked_for_this_spawn",
             ClaudeConfigDirSource::LeastUsageResolved => "least_usage_resolved",
             ClaudeConfigDirSource::LeastUsageConfigDirFallback => "least_usage_config_dir_fallback",
             ClaudeConfigDirSource::Manual => "manual_config_dir",
@@ -267,33 +279,199 @@ pub fn get_effective_config_dir(
     }
 }
 
-/// Like [`get_effective_config_dir`], but honours an explicit per-request
-/// account override. Same `(value, source)` shape.
+/// One spawn's account, as the caller decided it — the typed carrier that keeps
+/// a PICK distinct from a PIN all the way to [`get_effective_config_dir_for`].
 ///
-/// When `override_dir` is `Some`, it is returned verbatim with
-/// [`ClaudeConfigDirSource::RequestOverride`] — the caller is responsible for
-/// validating it first (per-request account selection resolves it via
-/// [`super::account_usage::resolve_requested_account`], which restricts the
-/// choice to credential-valid roster dirs), which is exactly why the arm must
-/// name it: this is the one path that did NOT go through the credential check
-/// here, and a reader of the report has to be able to tell.
-/// When `None`, delegates to the global [`get_effective_config_dir`] resolution
-/// (unchanged default behaviour).
-pub fn get_effective_config_dir_with_override(
+/// The two are resolved differently and reported differently, which is why
+/// they cannot share a bare `Option<String>`:
+///
+/// - [`Self::Pinned`] — the caller pinned an account (a per-request
+///   `LaunchPayload::account`, already validated against the roster and its
+///   credentials by `resolve_requested_account`). Returned verbatim as
+///   [`ClaudeConfigDirSource::RequestOverride`]; it is what
+///   `SpawnPreconditions.account` records.
+/// - [`Self::Picked`] — the dir
+///   [`pick_best_account`](super::account_usage::pick_best_account) returned
+///   to THIS spawn. Re-checked for credentials and reported as
+///   [`ClaudeConfigDirSource::PickedForThisSpawn`]; it is the runner's own
+///   rotation, so it is never recorded as a pin.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "dir", rename_all = "snake_case")]
+pub enum AccountChoice {
+    Pinned(String),
+    Picked(String),
+}
+
+impl AccountChoice {
+    /// The config dir, whichever way it was chosen.
+    pub fn dir(&self) -> &str {
+        match self {
+            AccountChoice::Pinned(dir) | AccountChoice::Picked(dir) => dir,
+        }
+    }
+
+    /// The dir when — and only when — the caller PINNED it. A pick is the
+    /// runner's own rotation, so it answers `None`: this is what
+    /// `SpawnPreconditions.account` records.
+    pub fn pin(&self) -> Option<&str> {
+        match self {
+            AccountChoice::Pinned(dir) => Some(dir),
+            AccountChoice::Picked(_) => None,
+        }
+    }
+}
+
+/// One spawn's account, resolved ONCE by [`resolve_spawn_account_choice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSpawnAccount {
+    /// What the spawn carried: the caller's choice, else its own fresh pick
+    /// (`None` when the pick published nothing).
+    pub choice: Option<AccountChoice>,
+    /// The config dir the child runs under, per [`get_effective_config_dir_for`].
+    pub dir: Option<String>,
+    /// Which arm of [`get_effective_config_dir_for`] produced `dir`.
+    pub source: ClaudeConfigDirSource,
+}
+
+/// Resolve the account for ONE spawn: the caller's [`AccountChoice`] when it
+/// supplied one (a pin, or a pick it already took for this unit of work), else
+/// a fresh `pick()` of this spawn's own, carried as [`AccountChoice::Picked`] —
+/// then through the one resolver, [`get_effective_config_dir_for`].
+///
+/// `pick` is [`pick_best_account`](super::account_usage::pick_best_account) in
+/// production; it is a parameter so a test can prove the spawn holds its OWN
+/// draw even when a sibling's draw rewrites `RESOLVED_CONFIG_DIR` between the
+/// pick and the resolution. It is not called when the caller supplied a
+/// choice — except a caller [`AccountChoice::Picked`] whose dir has since
+/// been COOLED (see [`refresh_cooled_pick`]). Blocking (the pick reads
+/// settings and cooldown state): call it from a blocking context.
+pub fn resolve_spawn_account_choice(
     cli_settings: &settings::ClaudeCliSettings,
-    override_dir: Option<&str>,
+    caller: Option<AccountChoice>,
+    pick: impl FnOnce() -> Option<String>,
+) -> ResolvedSpawnAccount {
+    let (caller, pick) = match refresh_cooled_pick(caller, pick) {
+        Ok(choice) => (choice, None),
+        Err(pick) => (None, Some(pick)),
+    };
+    let choice = caller.or_else(|| pick.and_then(|p| p()).map(AccountChoice::Picked));
+    let (dir, source) = get_effective_config_dir_for(cli_settings, choice.as_ref());
+    ResolvedSpawnAccount {
+        choice,
+        dir,
+        source,
+    }
+}
+
+/// A caller-carried [`AccountChoice::Picked`] is the runner's OWN earlier
+/// pick (a workflow picks once and hands it to every phase), not a decision
+/// the caller owns. When rate-limit rotation has since COOLED that dir, the
+/// pick is stale: honour it and every later spawn of the unit re-runs on the
+/// limited account. So a cooled `Picked` is re-drawn with `pick`, and the
+/// re-pick is logged. A [`AccountChoice::Pinned`] is the caller's decision and
+/// is never re-drawn, cooled or not.
+///
+/// `Ok(choice)` — use `choice` as-is (a pin, a live pick, a cooled pick whose
+/// re-draw found nothing better, or a fresh re-pick); `pick` was consumed only
+/// in the re-draw case. `Err(pick)` — the caller supplied nothing; `pick` is
+/// handed back untouched for the no-choice arm.
+pub(crate) fn refresh_cooled_pick<P: FnOnce() -> Option<String>>(
+    caller: Option<AccountChoice>,
+    pick: P,
+) -> Result<Option<AccountChoice>, P> {
+    match caller {
+        None => Err(pick),
+        Some(AccountChoice::Picked(dir)) if is_account_cooled_down(&dir) => match pick() {
+            Some(fresh) if fresh == dir => {
+                warn!(
+                    "Carried account pick '{}' is cooled down (rate-limited); \
+                     re-pick returned the same cooled account",
+                    short_label(&dir)
+                );
+                Ok(Some(AccountChoice::Picked(fresh)))
+            }
+            Some(fresh) => {
+                info!(
+                    "Carried account pick '{}' is cooled down (rate-limited); \
+                     re-picked '{}' for this spawn",
+                    short_label(&dir),
+                    short_label(&fresh)
+                );
+                Ok(Some(AccountChoice::Picked(fresh)))
+            }
+            None => {
+                warn!(
+                    "Carried account pick '{}' is cooled down (rate-limited) and a \
+                     re-pick found no account; keeping it",
+                    short_label(&dir)
+                );
+                Ok(Some(AccountChoice::Picked(dir)))
+            }
+        },
+        Some(choice) => Ok(Some(choice)),
+    }
+}
+
+/// The ONE per-spawn account resolver: [`get_effective_config_dir`]'s
+/// `(value, source)` shape, for a spawn that carries its own
+/// [`AccountChoice`] — and, crucially, one that never reads the shared
+/// `RESOLVED_CONFIG_DIR` in an auto mode.
+///
+/// - A declared model gateway wins over everything, a pin included: a pin is a
+///   subscription account, and with a gateway declared those are off.
+/// - [`AccountChoice::Pinned`] is returned verbatim with
+///   [`ClaudeConfigDirSource::RequestOverride`]. The caller validated it first,
+///   which is exactly why the arm must name it: this is the one path that did
+///   NOT go through the credential check here.
+/// - [`AccountChoice::Picked`] is re-checked with `has_valid_credentials`
+///   (the account can expire between the pick and the spawn) and yields
+///   [`ClaudeConfigDirSource::PickedForThisSpawn`], or `None` with
+///   [`ClaudeConfigDirSource::RejectedNoCredentials`].
+/// - `None` in an auto mode falls back to the configured `config_dir`
+///   ([`ClaudeConfigDirSource::LeastUsageConfigDirFallback`]) or nothing
+///   ([`ClaudeConfigDirSource::Unconfigured`]). It deliberately does NOT read
+///   the global: `pick_best_account` publishes nothing when a gateway is
+///   declared, the mode is `Manual`, no dirs are configured or no account is
+///   credential-valid, so whatever the global holds at that point is stale or
+///   a concurrent sibling's draw — never this spawn's.
+/// - `None` in `Manual` mode is [`get_effective_config_dir`]'s `Manual` arm,
+///   unchanged.
+pub fn get_effective_config_dir_for(
+    cli_settings: &settings::ClaudeCliSettings,
+    choice: Option<&AccountChoice>,
 ) -> (Option<String>, ClaudeConfigDirSource) {
-    // A per-request account is a subscription account; with a gateway declared
-    // those are off, so the gateway dir wins over the override as well.
     if let Some(dir) = crate::model_gateway::session_config_dir_override() {
         return (Some(dir), ClaudeConfigDirSource::ModelGateway);
     }
-    match override_dir {
-        Some(dir) => (
-            Some(dir.to_string()),
-            ClaudeConfigDirSource::RequestOverride,
-        ),
-        None => get_effective_config_dir(cli_settings),
+    let (candidate, source) = match choice {
+        Some(AccountChoice::Pinned(dir)) => {
+            return (Some(dir.clone()), ClaudeConfigDirSource::RequestOverride);
+        }
+        Some(AccountChoice::Picked(dir)) => {
+            (Some(dir.clone()), ClaudeConfigDirSource::PickedForThisSpawn)
+        }
+        // The EFFECTIVE mode, resolved off `cli_settings` exactly as
+        // `get_effective_config_dir` does, so the two cannot disagree on
+        // whether this machine is in an auto mode.
+        None => match crate::claude_accounts::resolve_for_cli_settings(cli_settings) {
+            AccountSelectionMode::LeastUsage
+            | AccountSelectionMode::HighestExpectedUsage
+            | AccountSelectionMode::WeightedRandom
+            | AccountSelectionMode::AlternatingHandoff => (
+                cli_settings.config_dir.clone(),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback,
+            ),
+            AccountSelectionMode::Manual => (
+                cli_settings.config_dir.clone(),
+                ClaudeConfigDirSource::Manual,
+            ),
+        },
+    };
+
+    match candidate {
+        Some(dir) if super::oauth_refresh::has_valid_credentials(&dir) => (Some(dir), source),
+        Some(_) => (None, ClaudeConfigDirSource::RejectedNoCredentials),
+        None => (None, ClaudeConfigDirSource::Unconfigured),
     }
 }
 
@@ -628,49 +806,79 @@ pub fn account_known_exhausted(config_dir: &str) -> bool {
     false
 }
 
-/// Rotate to the next available account after a rate-limit hit.
+/// Rotate away from `limited` — the account the failing call or session RAN
+/// UNDER — after a rate-limit hit.
 ///
-/// Marks the current account as rate-limited (with the default cooldown,
-/// **but only if it isn't already marked** — so a precise `Retry-After`
-/// duration set by [`mark_account_rate_limited_with_duration`] survives),
-/// then picks the first non-cooled-down account from the configured
-/// `claude_config_dirs`. Returns `true` if a switch happened, `false` if
-/// no alternative is available.
-pub fn rotate_account_on_rate_limit() -> bool {
+/// Marks `limited` as rate-limited (with the default cooldown, **but only if
+/// it isn't already marked** — so a precise `Retry-After` duration set by
+/// [`mark_account_rate_limited_with_duration`] survives), then picks the first
+/// non-cooled-down account from the configured `claude_config_dirs`. Returns
+/// the dir it rotated to, or `None` when no alternative is available.
+///
+/// `limited` is `None` when the caller could not name the account it ran under
+/// (an API provider call issued while `RESOLVED_CONFIG_DIR` was unset). Then
+/// nothing is cooled — there is no account to blame — and rotation still
+/// switches to the first non-cooled account, because the API providers read
+/// their account off the published global and need one set to retry under.
+///
+/// The limited account is the caller's to name. It used to be read off the
+/// shared `RESOLVED_CONFIG_DIR`, but under per-spawn draws that global is
+/// usually a concurrent sibling's pick, so the wrong account was cooled and the
+/// exhausted one stayed selectable. The rotated-to dir is still published to
+/// `RESOLVED_CONFIG_DIR` for the display readers and for the API providers,
+/// which read it per call.
+pub fn rotate_account_on_rate_limit(limited: Option<&str>) -> Option<String> {
     if crate::model_gateway::gateway_declared() {
         crate::model_gateway::note_subscription_path_off("rotate_account_on_rate_limit");
-        return false;
+        return None;
     }
-    let config_dirs = settings::get_claude_config_dirs();
+    rotate_within(limited, &settings::get_claude_config_dirs())
+}
+
+/// [`rotate_account_on_rate_limit`] over an explicit roster — the seam its
+/// tests drive, since the live roster comes from `settings.json`.
+fn rotate_within(limited: Option<&str>, config_dirs: &[String]) -> Option<String> {
     if config_dirs.len() < 2 {
-        return false;
+        return None;
     }
 
-    let current = get_resolved_config_dir();
+    // The limited dir may be spelled differently from its roster entry (the
+    // ambient `C:\Users\x\.claude` against a roster `C:/Users/x/.claude`).
+    // Exclusion and the cooldown key are exact strings, and `pick_best_account`
+    // reads cooldowns by roster entry — so name the limited account by its
+    // roster spelling, or rotation could hand back the limited account itself
+    // and cool a key nothing reads.
+    let limited = limited.map(|l| {
+        config_dirs
+            .iter()
+            .find(|d| crate::terminal::transcript::same_dir(Path::new(d), Path::new(l)))
+            .map_or(l, String::as_str)
+    });
+
     let default_cooldown = Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS);
 
-    // Single lock acquisition: mark current as rate-limited + find best alternative
+    // Single lock acquisition: mark the limited account + find best alternative
     let next_dir = if let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() {
         let map = cooldowns.get_or_insert_with(HashMap::new);
 
-        // Mark the current account as rate-limited — but only if it isn't
+        // Mark the limited account as rate-limited — but only if it isn't
         // already in the map. API providers may have already inserted a
         // precise `Retry-After`-derived duration; don't clobber that with
         // the shorter default.
-        if let Some(ref dir) = current {
-            if !map.contains_key(dir) {
+        if let Some(limited) = limited {
+            if !map.contains_key(limited) {
                 info!(
                     "Marking account '{}' as rate-limited for {}s",
-                    short_label(dir),
+                    short_label(limited),
                     default_cooldown.as_secs()
                 );
-                map.insert(dir.clone(), (Instant::now(), default_cooldown));
+                map.insert(limited.to_string(), (Instant::now(), default_cooldown));
             }
         }
 
         // Find the first account that is not in cooldown
         let available = config_dirs.iter().find(|d| {
-            current.as_ref() != Some(*d)
+            Some(d.as_str()) != limited
                 && map
                     .get(*d)
                     .is_none_or(|(marked_at, cooldown)| marked_at.elapsed() >= *cooldown)
@@ -683,7 +891,7 @@ pub fn rotate_account_on_rate_limit() -> bool {
             // (smallest remaining = `cooldown - elapsed`).
             let best = config_dirs
                 .iter()
-                .filter(|d| current.as_ref() != Some(*d))
+                .filter(|d| Some(d.as_str()) != limited)
                 .min_by_key(|d| {
                     map.get(*d)
                         .map(|(marked_at, cooldown)| cooldown.saturating_sub(marked_at.elapsed()))
@@ -692,29 +900,25 @@ pub fn rotate_account_on_rate_limit() -> bool {
             best.cloned()
         }
     } else {
-        return false;
+        return None;
     };
     // Lock is dropped here before calling set_resolved_config_dir
 
-    if let Some(dir) = next_dir {
-        let was_all_limited = is_account_cooled_down(&dir);
-        if was_all_limited {
-            warn!(
-                "All accounts rate-limited, switching to closest-to-expiry: '{}'",
-                short_label(&dir)
-            );
-        } else {
-            info!(
-                "Rotating account: '{}' -> '{}'",
-                current.as_deref().map(short_label).unwrap_or("none"),
-                short_label(&dir)
-            );
-        }
-        set_resolved_config_dir(Some(dir));
-        true
+    let dir = next_dir?;
+    if is_account_cooled_down(&dir) {
+        warn!(
+            "All accounts rate-limited, switching to closest-to-expiry: '{}'",
+            short_label(&dir)
+        );
     } else {
-        false
+        info!(
+            "Rotating account: '{}' -> '{}'",
+            limited.map_or("<unknown>", short_label),
+            short_label(&dir)
+        );
     }
+    set_resolved_config_dir(Some(dir.clone()));
+    Some(dir)
 }
 
 /// How long until the next account becomes available (cooldown expires).
@@ -863,6 +1067,43 @@ pub fn switch_to_account(config_dir: &str) -> bool {
     true
 }
 
+/// Test fixtures shared with the spawn seams' own account-resolution tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A config dir with live credentials: a `.credentials.json` expiring a
+    /// day out and carrying no refresh token, so the check is pure (no
+    /// refresh is ever requested) and passes on expiry alone.
+    pub(crate) fn dir_with_live_credentials() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expires_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 86_400_000;
+        let body = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-oauth-test",
+                "refreshToken": "",
+                "expiresAt": expires_at_ms,
+                "scopes": ["user:inference"],
+            }
+        });
+        std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
+        let path = dir.path().to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    /// Remove `dir`'s cooldown from the shared static — a test cools only a
+    /// unique temp dir and clears only that entry.
+    pub(crate) fn clear_cooldown(dir: &str) {
+        if let Ok(mut cooldowns) = super::ACCOUNT_COOLDOWNS.lock() {
+            if let Some(map) = cooldowns.as_mut() {
+                map.remove(dir);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,28 +1172,7 @@ mod tests {
         );
     }
 
-    /// A config dir with live credentials: a `.credentials.json` expiring a
-    /// day out and carrying no refresh token, so the check is pure (no
-    /// refresh is ever requested) and passes on expiry alone.
-    fn dir_with_live_credentials() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let expires_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
-            + 86_400_000;
-        let body = serde_json::json!({
-            "claudeAiOauth": {
-                "accessToken": "sk-oauth-test",
-                "refreshToken": "",
-                "expiresAt": expires_at_ms,
-                "scopes": ["user:inference"],
-            }
-        });
-        std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
-        let path = dir.path().to_string_lossy().to_string();
-        (dir, path)
-    }
+    use super::test_support::dir_with_live_credentials;
 
     /// **The half-apply guarantee, pinned at the decision site.** Under a fleet
     /// auto mode an UNPINNED machine whose local mode is `Manual` must take an
@@ -1022,12 +1242,11 @@ mod tests {
         );
     }
 
-    /// A per-request override is returned VERBATIM and names itself — it is the
-    /// one path that skips the credential check here, so a report that showed
-    /// it as `manual_config_dir` would be claiming a validation that did not
-    /// happen.
+    /// A pin is returned VERBATIM and names itself — it is the one path that
+    /// skips the credential check here, so a report that showed it as
+    /// `manual_config_dir` would be claiming a validation that did not happen.
     #[test]
-    fn effective_config_dir_override_is_verbatim_and_names_itself() {
+    fn effective_config_dir_pin_is_verbatim_and_names_itself() {
         let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let cli = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
@@ -1035,12 +1254,106 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            get_effective_config_dir_with_override(&cli, Some("/pinned/by/request")),
+            get_effective_config_dir_for(
+                &cli,
+                Some(&AccountChoice::Pinned("/pinned/by/request".to_string()))
+            ),
             (
                 Some("/pinned/by/request".to_string()),
                 ClaudeConfigDirSource::RequestOverride
             )
         );
+    }
+
+    /// Settings for an UNPINNED machine under the fleet auto mode the caller
+    /// pins, with `config_dir` as the manual fallback.
+    fn auto_mode_cli(config_dir: Option<String>) -> settings::ClaudeCliSettings {
+        settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::WeightedRandom,
+            account_selection_pinned: false,
+            config_dir,
+            ..Default::default()
+        }
+    }
+
+    /// **The race this resolver exists to close.** A spawn picks A; before it
+    /// resolves, a concurrent sibling's pick publishes B to
+    /// `RESOLVED_CONFIG_DIR`. Carried as `Picked(A)`, the spawn still resolves
+    /// to A — and says it took its OWN pick, not the shared one.
+    #[test]
+    fn a_sibling_pick_between_this_pick_and_resolution_does_not_move_this_spawn() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) = dir_with_live_credentials();
+        let (_sibling_guard, sibling) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+
+        // This spawn's pick, published as `pick_best_account` publishes it …
+        set_resolved_config_dir(Some(mine.clone()));
+        let choice = AccountChoice::Picked(mine.clone());
+        // … then a sibling's draw overwrites the global.
+        set_resolved_config_dir(Some(sibling.clone()));
+
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(None), Some(&choice)),
+            (Some(mine), ClaudeConfigDirSource::PickedForThisSpawn)
+        );
+        assert_eq!(get_resolved_config_dir(), Some(sibling));
+    }
+
+    /// A pick is re-checked: an account whose credentials died between the
+    /// pick and the spawn yields no dir rather than a 401-zombie child — unlike
+    /// a pin, which the caller validated and which is returned verbatim.
+    #[test]
+    fn a_pick_without_live_credentials_is_rejected() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let dead = "/qontinui-test/no-such-account-dir/picked_for_this_spawn".to_string();
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(None), Some(&AccountChoice::Picked(dead))),
+            (None, ClaudeConfigDirSource::RejectedNoCredentials)
+        );
+    }
+
+    /// With NO choice in an auto mode the resolver never reads the shared
+    /// `RESOLVED_CONFIG_DIR`, even when it holds a live account: whatever it
+    /// holds is a sibling's draw or stale, never this spawn's. It falls back to
+    /// the configured `config_dir`, else to nothing.
+    #[test]
+    fn no_choice_in_an_auto_mode_never_takes_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_manual_guard, manual) = dir_with_live_credentials();
+        let (_global_guard, global) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+        set_resolved_config_dir(Some(global.clone()));
+
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(Some(manual.clone())), None),
+            (
+                Some(manual),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback
+            )
+        );
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(None), None),
+            (None, ClaudeConfigDirSource::Unconfigured)
+        );
+        // The global-reading resolver WOULD have taken it — the contrast is the
+        // point of the test, and proves the fixture really is an auto mode.
+        assert_eq!(
+            get_effective_config_dir(&auto_mode_cli(None)),
+            (Some(global), ClaudeConfigDirSource::LeastUsageResolved)
+        );
+    }
+
+    #[test]
+    fn account_choice_dir_names_the_dir_either_way() {
+        assert_eq!(AccountChoice::Pinned("/p".to_string()).dir(), "/p");
+        assert_eq!(AccountChoice::Picked("/q".to_string()).dir(), "/q");
     }
 
     /// The arm vocabulary is a WIRE contract (it is printed verbatim in
@@ -1051,6 +1364,10 @@ mod tests {
         assert_eq!(
             ClaudeConfigDirSource::RequestOverride.as_str(),
             "request_override"
+        );
+        assert_eq!(
+            ClaudeConfigDirSource::PickedForThisSpawn.as_str(),
+            "picked_for_this_spawn"
         );
         assert_eq!(
             ClaudeConfigDirSource::LeastUsageResolved.as_str(),
@@ -1066,6 +1383,10 @@ mod tests {
             "rejected_no_credentials"
         );
         assert_eq!(ClaudeConfigDirSource::Unconfigured.as_str(), "unconfigured");
+        assert_eq!(
+            ClaudeConfigDirSource::ModelGateway.as_str(),
+            "model_gateway"
+        );
     }
 
     #[test]
@@ -1377,5 +1698,194 @@ mod tests {
             remaining.as_secs()
         );
         clear_dir(dir);
+    }
+
+    /// **Rotation cools the account that was limited, not the global's.** The
+    /// shared `RESOLVED_CONFIG_DIR` holds a sibling's draw; the call that hit
+    /// the limit ran under `limited`. Rotation must cool `limited`, leave the
+    /// sibling's account selectable, and rotate to an account other than
+    /// `limited`.
+    #[test]
+    fn rotation_cools_the_dir_it_was_given_not_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = ResolvedConfigDirRestore::capture();
+        let limited = "/qontinui-test/rotate-given/limited".to_string();
+        let sibling = "/qontinui-test/rotate-given/sibling".to_string();
+        clear_dir(&limited);
+        clear_dir(&sibling);
+        set_resolved_config_dir(Some(sibling.clone()));
+
+        let rotated = rotate_within(Some(&limited), &[limited.clone(), sibling.clone()]);
+
+        assert!(
+            is_account_cooled_down(&limited),
+            "the limited account is cooled"
+        );
+        assert!(
+            !is_account_cooled_down(&sibling),
+            "the sibling's account (the global) must stay selectable"
+        );
+        assert_eq!(rotated, Some(sibling.clone()));
+        assert_eq!(get_resolved_config_dir(), Some(sibling.clone()));
+        clear_dir(&limited);
+        clear_dir(&sibling);
+    }
+
+    /// **A limited dir spelled differently from its roster entry is that
+    /// entry.** The ambient `C:\Users\x\.claude` names the roster's
+    /// `C:/Users/x/.claude`: rotation must not hand it back, and must cool it
+    /// under the roster's spelling — the key `pick_best_account` reads.
+    #[test]
+    fn rotation_maps_a_respelled_limited_dir_onto_its_roster_entry() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = ResolvedConfigDirRestore::capture();
+        let roster_spelling = "C:/qontinui-test/rotate-respelled/.claude".to_string();
+        let ambient_spelling = r"C:\qontinui-test\rotate-respelled\.claude".to_string();
+        let sibling = "C:/qontinui-test/rotate-respelled/.claude-sibling".to_string();
+        clear_dir(&roster_spelling);
+        clear_dir(&ambient_spelling);
+        clear_dir(&sibling);
+
+        let rotated = rotate_within(
+            Some(&ambient_spelling),
+            &[roster_spelling.clone(), sibling.clone()],
+        );
+
+        assert_eq!(
+            rotated,
+            Some(sibling.clone()),
+            "never back to the limited account"
+        );
+        assert!(
+            is_account_cooled_down(&roster_spelling),
+            "the cooldown lands under the roster's spelling"
+        );
+        clear_dir(&roster_spelling);
+        clear_dir(&ambient_spelling);
+        clear_dir(&sibling);
+    }
+
+    /// **An unnamed limited account rotates to the first non-cooled account and
+    /// cools nothing.** When the caller cannot name the account it ran under
+    /// (`None`), rotation must still publish an account — the API providers
+    /// read the global — and must not cool any dir, since none is to blame.
+    #[test]
+    fn rotation_with_no_limited_dir_switches_to_the_first_non_cooled_account() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = ResolvedConfigDirRestore::capture();
+        let cooled = "/qontinui-test/rotate-unnamed/cooled".to_string();
+        let first_free = "/qontinui-test/rotate-unnamed/first-free".to_string();
+        let second_free = "/qontinui-test/rotate-unnamed/second-free".to_string();
+        clear_dir(&cooled);
+        clear_dir(&first_free);
+        clear_dir(&second_free);
+        mark_account_rate_limited(&cooled);
+        set_resolved_config_dir(None);
+
+        let rotated = rotate_within(
+            None,
+            &[cooled.clone(), first_free.clone(), second_free.clone()],
+        );
+
+        assert_eq!(rotated, Some(first_free.clone()));
+        assert_eq!(get_resolved_config_dir(), Some(first_free.clone()));
+        assert!(
+            !is_account_cooled_down(&first_free) && !is_account_cooled_down(&second_free),
+            "no dir is cooled when the limited account is unknown"
+        );
+        clear_dir(&cooled);
+        clear_dir(&first_free);
+        clear_dir(&second_free);
+    }
+
+    /// A spawn with no caller choice takes its OWN pick and holds it even when
+    /// a sibling's draw rewrites the global between the pick and the
+    /// resolution; a caller's choice is used as-is and no pick is taken.
+    #[test]
+    fn a_spawn_with_no_choice_resolves_its_own_pick_not_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) = dir_with_live_credentials();
+        let (_sibling_guard, sibling) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+        let cli = auto_mode_cli(None);
+
+        let drawn = mine.clone();
+        let raced = sibling.clone();
+        let resolved = resolve_spawn_account_choice(&cli, None, move || {
+            set_resolved_config_dir(Some(drawn.clone()));
+            // A sibling spawn's draw lands before this spawn resolves.
+            set_resolved_config_dir(Some(raced));
+            Some(drawn)
+        });
+        assert_eq!(
+            resolved,
+            ResolvedSpawnAccount {
+                choice: Some(AccountChoice::Picked(mine.clone())),
+                dir: Some(mine.clone()),
+                source: ClaudeConfigDirSource::PickedForThisSpawn,
+            }
+        );
+
+        let pinned =
+            resolve_spawn_account_choice(&cli, Some(AccountChoice::Pinned(mine.clone())), || {
+                panic!("a caller's choice must not take a pick")
+            });
+        assert_eq!(pinned.dir, Some(mine));
+        assert_eq!(pinned.source, ClaudeConfigDirSource::RequestOverride);
+    }
+
+    /// **A carried pick that rotation has since cooled is re-drawn.** A
+    /// workflow picks A once and hands `Picked(A)` to every phase; once A is
+    /// rate-limited, the next phase's spawn takes a fresh pick (B) instead of
+    /// re-running on A.
+    #[test]
+    fn a_cooled_carried_pick_takes_a_fresh_pick() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_a_guard, a) = dir_with_live_credentials();
+        let (_b_guard, b) = dir_with_live_credentials();
+        mark_account_rate_limited(&a);
+        let cli = auto_mode_cli(None);
+
+        let fresh = b.clone();
+        let resolved =
+            resolve_spawn_account_choice(&cli, Some(AccountChoice::Picked(a.clone())), move || {
+                Some(fresh)
+            });
+        assert_eq!(
+            resolved,
+            ResolvedSpawnAccount {
+                choice: Some(AccountChoice::Picked(b.clone())),
+                dir: Some(b),
+                source: ClaudeConfigDirSource::PickedForThisSpawn,
+            }
+        );
+        clear_dir(&a);
+    }
+
+    /// **A cooled PIN is the caller's decision and is kept** — no re-pick is
+    /// taken, cooled or not.
+    #[test]
+    fn a_cooled_pin_is_not_re_picked() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_a_guard, a) = dir_with_live_credentials();
+        mark_account_rate_limited(&a);
+        let cli = auto_mode_cli(None);
+
+        let resolved =
+            resolve_spawn_account_choice(&cli, Some(AccountChoice::Pinned(a.clone())), || {
+                panic!("a pin must not take a re-pick, even when cooled")
+            });
+        assert_eq!(resolved.choice, Some(AccountChoice::Pinned(a.clone())));
+        assert_eq!(resolved.dir, Some(a.clone()));
+        assert_eq!(resolved.source, ClaudeConfigDirSource::RequestOverride);
+        clear_dir(&a);
     }
 }
