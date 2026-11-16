@@ -57,6 +57,11 @@ pub(crate) struct LimitStop {
     pub resets_at_ms: Option<i64>,
     /// `quotaLimits.rateLimitType` (`seven_day`, `five_hour`, …), as written.
     pub rate_limit_type: Option<String>,
+    /// The error entry's own `timestamp` (RFC 3339), in milliseconds since
+    /// the epoch: when the session stopped. `None` when absent or unparseable.
+    /// A caller compares it with a later account migration, whose carried
+    /// transcript still ends at this stop.
+    pub stopped_at_ms: Option<i64>,
 }
 
 /// What the transcript says about a usage-limit stop.
@@ -302,10 +307,16 @@ fn classify(entry: &Value) -> LimitStopRead {
         .and_then(|q| q.get("rateLimitType"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let stopped_at_ms = entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.timestamp_millis());
     LimitStopRead::Stopped(LimitStop {
         entry_uuid: entry_uuid.to_string(),
         resets_at_ms,
         rate_limit_type,
+        stopped_at_ms,
     })
 }
 
@@ -452,6 +463,8 @@ mod tests {
                 entry_uuid: SEVEN_DAY_UUID.to_string(),
                 resets_at_ms: Some(SEVEN_DAY_RESETS_AT_MS),
                 rate_limit_type: Some("seven_day".to_string()),
+                // 2026-11-02T16:29:41Z, the error entry's own timestamp.
+                stopped_at_ms: Some(1_793_636_981_000),
             })
         );
         // The fixture really does end in non-conversational lines: the last
@@ -469,6 +482,8 @@ mod tests {
                 // 2026-11-02T21:00:00Z
                 resets_at_ms: Some(1_793_653_200_000),
                 rate_limit_type: Some("five_hour".to_string()),
+                // 2026-11-02T18:37:12Z
+                stopped_at_ms: Some(1_793_644_632_000),
             })
         );
     }
@@ -524,6 +539,8 @@ mod tests {
                 entry_uuid: SEVEN_DAY_UUID.to_string(),
                 resets_at_ms: Some(SEVEN_DAY_RESETS_AT_MS),
                 rate_limit_type: Some("seven_day".to_string()),
+                // 2026-11-02T16:29:41Z, the error entry's own timestamp.
+                stopped_at_ms: Some(1_793_636_981_000),
             })
         );
     }
@@ -618,8 +635,22 @@ mod tests {
                 entry_uuid: SEVEN_DAY_UUID.to_string(),
                 resets_at_ms: None,
                 rate_limit_type: None,
+                stopped_at_ms: Some(1_793_636_981_000),
             })
         );
+    }
+
+    #[test]
+    fn a_stop_with_no_timestamp_has_no_stop_time() {
+        let mut entry = seven_day_error_entry();
+        entry.as_object_mut().unwrap().remove("timestamp");
+        assert!(matches!(
+            read(&format!("{entry}\n")),
+            LimitStopRead::Stopped(LimitStop {
+                stopped_at_ms: None,
+                ..
+            })
+        ));
     }
 
     #[test]

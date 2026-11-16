@@ -16,6 +16,9 @@
  *   coalesced into one info toast per burst.
  * - `session-limit-reset-continued` when such a session was continued in
  *   place after its reset — coalesced the same way.
+ * - `session-limit-reset-continue-gave-up` when the runner stopped trying to
+ *   continue such a session (its continue never reached the pane) — a
+ *   coalesced error toast, since the session now needs the operator.
  *
  * Mount once at App level, next to `useErrorNotifications`.
  */
@@ -190,6 +193,21 @@ export interface LimitContinuedPayload {
   entryUuid?: string;
 }
 
+/** `session-limit-reset-continue-gave-up` — `limit_reset::gave_up_event`. */
+export interface LimitGaveUpPayload {
+  claudeSessionId?: string;
+  configDir?: string;
+  terminalId?: string;
+  attempts?: number;
+}
+
+/** "Session 0c4e3025" for one burst member, "N sessions" for several. */
+function burstSubject(items: { claudeSessionId?: string }[]): string {
+  if (items.length !== 1) return `${items.length} sessions`;
+  const id = (items[0].claudeSessionId ?? "").slice(0, 8);
+  return id ? `Session ${id}` : "A session";
+}
+
 /** Events arriving within this window of a burst's first one share its toast. */
 export const LIMIT_BURST_MS = 2000;
 
@@ -214,12 +232,8 @@ export function parkedBurstToast(
     const last = formatTime(Math.max(...dues));
     until = first === last ? ` until ${first}` : ` until ${first}–${last}`;
   }
-  const who =
-    parks.length === 1
-      ? `Session ${(parks[0].claudeSessionId ?? "").slice(0, 8)} is`
-      : `${parks.length} sessions are`;
   return {
-    message: `${who} parked at a usage limit${until}; continued automatically once it resets`,
+    message: `${burstSubject(parks)} parked at a usage limit${until}`,
     type: "info",
   };
 }
@@ -229,13 +243,20 @@ export function continuedBurstToast(continued: LimitContinuedPayload[]): {
   message: string;
   type: ToastType;
 } {
-  const who =
-    continued.length === 1
-      ? `Session ${(continued[0].claudeSessionId ?? "").slice(0, 8)}`
-      : `${continued.length} sessions`;
   return {
-    message: `${who} continued after the usage limit reset`,
+    message: `${burstSubject(continued)} continued after the usage limit reset`,
     type: "info",
+  };
+}
+
+/** The one toast for a burst of reset-continues the runner gave up on. */
+export function gaveUpBurstToast(gaveUp: LimitGaveUpPayload[]): {
+  message: string;
+  type: ToastType;
+} {
+  return {
+    message: `${burstSubject(gaveUp)} stopped at a usage limit that has reset, but the runner could not continue it; it needs a prompt by hand`,
+    type: "error",
   };
 }
 
@@ -291,6 +312,16 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
       const toast = continuedBurstToast(burst);
       showToast(toast.message, toast.type);
     });
+    const gaveUp = createBurstCoalescer<LimitGaveUpPayload>(LIMIT_BURST_MS, (burst) => {
+      const toast = gaveUpBurstToast(burst);
+      showToast(toast.message, toast.type);
+    });
+    const unlistenGaveUp = listen<LimitGaveUpPayload>(
+      "session-limit-reset-continue-gave-up",
+      (event) => {
+        gaveUp.push(event.payload ?? {});
+      },
+    );
     const unlistenParked = listen<LimitParkedPayload>("session-limit-parked", (event) => {
       parked.push(event.payload ?? {});
     });
@@ -305,8 +336,10 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
       unlistenSkipped.then((fn) => fn());
       unlistenParked.then((fn) => fn());
       unlistenContinued.then((fn) => fn());
+      unlistenGaveUp.then((fn) => fn());
       parked.cancel();
       continued.cancel();
+      gaveUp.cancel();
     };
   }, [showToast]);
 }
