@@ -206,12 +206,38 @@ mod tests {
         assert_eq!(normalize_limit(Some(MAX_LIST_LIMIT)), MAX_LIST_LIMIT);
     }
 
-    #[test]
-    #[ignore = "requires a live postgres with schema.pg.sql applied"]
-    fn roundtrip_insert_and_list() {
-        // Round-trip test skipped because the project's PG test harness
-        // is not trivially reachable from here. The insert/list SQL is
-        // exercised end-to-end in manual testing and by the Tauri command
-        // it's wired into.
+    #[tokio::test]
+    async fn roundtrip_insert_and_list() {
+        let pg = PgDb::new_for_test().await;
+        let id = pg
+            .insert_wsv_disagreement(WsvDisagreementInsert {
+                task_run_id: "run-wsv-1",
+                iteration: 3,
+                text_status: "pass",
+                wsm_status: "fail",
+                text_confidence: 0.75,
+                wsm_confidence: 0.5,
+                intent: "click the button",
+                wsm_observations: "button not visible",
+            })
+            .await
+            .expect("insert must return the new id");
+        let rows = pg
+            .list_wsv_disagreements(Some("run-wsv-1"), 10)
+            .await
+            .expect("list by task");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].iteration, 3);
+        assert_eq!(rows[0].text_status, "pass");
+        assert_eq!(rows[0].wsm_status, "fail");
+        assert_eq!(rows[0].intent, "click the button");
+        let other = pg
+            .list_wsv_disagreements(Some("run-wsv-other"), 10)
+            .await
+            .expect("list other task");
+        assert!(other.is_empty());
+        let all = pg.list_wsv_disagreements(None, 10).await.expect("list all");
+        assert_eq!(all.len(), 1);
     }
 }

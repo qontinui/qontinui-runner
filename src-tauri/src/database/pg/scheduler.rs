@@ -1822,11 +1822,7 @@ mod tests {
         }
     }
 
-    // PG-gated, per the `database/pg/*` convention (see event_log.rs):
-    //   DATABASE_URL=... cargo test --bin qontinui-runner \
-    //     database::pg::scheduler -- --ignored
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn conditions_and_condition_status_survive_insert_read_and_update() {
         let db = PgDb::new_for_test().await;
         let mut task = ScheduledTask::new(
@@ -1934,7 +1930,6 @@ mod tests {
     /// (fail closed), the API sees it flagged, and a PUT that carries
     /// conditions repairs it without the stored value ever being parsed.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn an_unreadable_conditions_row_is_flagged_refused_and_repairable() {
         let db = PgDb::new_for_test().await;
         let task = ScheduledTask::new(
@@ -2017,7 +2012,6 @@ mod tests {
     /// never touches an unmanaged task with the same name; a stale or absent
     /// read is a Conflict, not a write.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn managed_key_and_timezone_round_trip_and_upsert_by_key() {
         let db = PgDb::new_for_test().await;
         let agent = format!("phase-4a-{}", uuid::Uuid::new_v4());

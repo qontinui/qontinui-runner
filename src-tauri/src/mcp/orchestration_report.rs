@@ -352,7 +352,6 @@ mod tests {
     /// report is then accepted and written. This is the path the `/coord-mcp`
     /// `orchestration_report_subtask` tool and the HTTP route both take.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn a_malformed_report_leaves_the_row_working_and_a_retry_lands() {
         use crate::orchestration_loop::ledger::{Subtask, SubtaskState};
 

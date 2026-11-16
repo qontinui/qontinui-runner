@@ -872,13 +872,7 @@ mod tests {
     }
 
     /// Round-trip a run + a small subtask DAG and an artifact write.
-    ///
-    /// `#[ignore]` to match the `database/pg/*` test convention — needs a live
-    /// PG fixture (DATABASE_URL) with the `orchestration` schema present (the
-    /// runner self-heals it at `PgDb::new`). Run with:
-    /// `cargo test -p qontinui-runner orchestration::tests::run_and_subtask_dag_round_trip -- --ignored --nocapture`
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn run_and_subtask_dag_round_trip() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
@@ -1095,7 +1089,6 @@ mod tests {
     /// existing `run_id` returns the stored row instead of a 23505, and the
     /// stored row wins every field; the config and owner round-trip.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn create_or_get_run_is_idempotent_and_round_trips_owner_and_config() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
@@ -1143,7 +1136,6 @@ mod tests {
     /// The sweep reads only its own `running` rows: a foreign-owned row, an
     /// unowned row and a terminal own row are all excluded.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn the_sweep_lists_only_its_own_running_runs() {
         let pg = PgDb::new_for_test().await;
         let me = test_owner();
@@ -1188,7 +1180,6 @@ mod tests {
     /// reads the reason back, and a lost worker failed by the boot sweep
     /// carries its own reason.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn fail_subtask_records_its_reason() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
@@ -1231,7 +1222,6 @@ mod tests {
     /// cleared and `restart_resets = 1`, and a live worker is left alone.
     /// Two more losses of the same row fail it.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn lost_workers_are_settled_before_relaunch() {
         use crate::orchestration_loop::loop_engine::{settle_lost_workers, LostWorkerCounts};
 

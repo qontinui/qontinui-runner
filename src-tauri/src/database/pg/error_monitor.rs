@@ -1035,21 +1035,15 @@ mod normalize_log_timestamp_tests {
 ///   -> {text,text,text,text,bigint}
 /// ```
 ///
-/// Point `DATABASE_URL` at an **isolated scratch cluster** (never the
-/// machine-shared one) and run with `--ignored`.
+/// They run on the bundled-Postgres test harness (`PgDb::new_for_test`), one
+/// fresh database per test.
 #[cfg(test)]
 mod timestamptz_parameter_binding_pg_tests {
     use super::PgDb;
     use crate::error_monitor::types::{ErrorEvent, ErrorSeverity, ErrorStatus};
 
-    fn db_url() -> String {
-        std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must point at an ISOLATED scratch cluster")
-    }
-
-    /// One runtime per test, owning the pool it builds. `new_blocking_for_test`
-    /// makes and drops its own runtime, which would leave the connection tasks
-    /// orphaned for the rest of the test.
+    /// One runtime per test, owning the pool it builds, so the connection
+    /// tasks live for the whole test.
     #[expect(
         clippy::disallowed_types,
         reason = "owned tokio Runtime predates the disallowed_types gate — dropping one from an async context panics; hold a Handle or use tauri::async_runtime; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
@@ -1062,8 +1056,7 @@ mod timestamptz_parameter_binding_pg_tests {
     {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
         rt.block_on(async {
-            let db =
-                std::sync::Arc::new(PgDb::new(&db_url()).await.expect("connect to scratch PG"));
+            let db = PgDb::new_for_test().await;
             f(&db).await
         })
     }
@@ -1103,7 +1096,7 @@ mod timestamptz_parameter_binding_pg_tests {
         if let Some(tid) = task_run_id {
             let conn = db.pool().get().await.expect("pool");
             conn.execute(
-                "INSERT INTO task_runs (id, workflow_name) VALUES ($1, 'tstz-probe') \
+                "INSERT INTO task_runs (id, task_name, workflow_name) VALUES ($1, 'tstz-probe', 'tstz-probe') \
                  ON CONFLICT (id) DO NOTHING",
                 &[&tid],
             )
@@ -1141,7 +1134,6 @@ mod timestamptz_parameter_binding_pg_tests {
     }
 
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn acknowledge_error_persists_across_a_refetch() {
         run(|db| {
             Box::pin(async move {
@@ -1165,7 +1157,6 @@ mod timestamptz_parameter_binding_pg_tests {
     }
 
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn resolve_error_persists_across_a_refetch() {
         run(|db| {
             Box::pin(async move {
@@ -1188,7 +1179,6 @@ mod timestamptz_parameter_binding_pg_tests {
     }
 
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn ignore_error_persists_across_a_refetch() {
         run(|db| {
             Box::pin(async move {
@@ -1209,7 +1199,6 @@ mod timestamptz_parameter_binding_pg_tests {
     }
 
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn update_error_status_persists_across_a_refetch() {
         run(|db| {
             Box::pin(async move {
@@ -1228,7 +1217,6 @@ mod timestamptz_parameter_binding_pg_tests {
     }
 
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn acknowledge_all_errors_persists_across_a_refetch() {
         run(|db| {
             Box::pin(async move {
@@ -1267,7 +1255,6 @@ mod timestamptz_parameter_binding_pg_tests {
     /// The dynamic sibling of the same defect: `query_error_events` builds
     /// `captured_at >= ${n}::TIMESTAMPTZ` with `format!` and pushes a `String`.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn captured_after_filter_binds_a_string() {
         run(|db| {
             Box::pin(async move {
@@ -1316,7 +1303,6 @@ mod timestamptz_parameter_binding_pg_tests {
     /// gates on `ErrorStatus::from_str` before touching the database — so the
     /// gate is asserted here, together with the row being left untouched.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn an_invalid_status_is_still_rejected_before_the_write() {
         run(|db| {
             Box::pin(async move {

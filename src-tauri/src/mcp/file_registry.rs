@@ -252,6 +252,65 @@ fn confidence_for_conflict(
     best
 }
 
+/// Predict which live holdings the probed `candidates` would collide with.
+///
+/// A holding collides when it is held at exactly a candidate path (confidence
+/// 1.0), OR when [`confidence_for_conflict`] scores it above zero against the
+/// candidate set: a basename or substring match (0.7) or a shared parent
+/// directory (0.4). Exact-path detection alone never reached those two arms,
+/// because the registry is keyed by full path, so the rubric scored only
+/// conflicts that were already literal matches.
+async fn predict_collisions(
+    registry: &crate::executor::file_registry::FileRegistryManager,
+    candidates: &[String],
+    hinted_set: &std::collections::HashSet<String>,
+) -> Vec<PredictedCollision> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // `<probe>` is a sentinel task_run_id — distinct from any real session
+    // UUID, so every holder of every candidate is returned (no self-exclusion).
+    let mut conflicts = registry
+        .check_conflicts_for_files(candidates, "<probe>", None)
+        .await;
+
+    let exact: std::collections::HashSet<String> =
+        conflicts.iter().map(|c| c.file_path.clone()).collect();
+    let mut fuzzy: std::collections::BTreeMap<String, Vec<_>> = std::collections::BTreeMap::new();
+    for holding in registry.info().await {
+        if holding.worktree_id.is_some() || exact.contains(&holding.file_path) {
+            continue;
+        }
+        if confidence_for_conflict(&holding.file_path, candidates, hinted_set) > 0.0 {
+            fuzzy.entry(holding.file_path.clone()).or_default().push(
+                crate::executor::file_registry::ConflictHolder {
+                    task_run_id: holding.holder_task_run_id,
+                    holder_name: holding.holder_name,
+                    registered_at: holding.registered_at,
+                },
+            );
+        }
+    }
+    for (file_path, other_holders) in fuzzy {
+        conflicts.push(crate::executor::file_registry::FileConflict {
+            file_path,
+            worktree_id: None,
+            other_holders,
+        });
+    }
+
+    conflicts
+        .into_iter()
+        .map(|conflict| {
+            let confidence = confidence_for_conflict(&conflict.file_path, candidates, hinted_set);
+            PredictedCollision {
+                conflict,
+                confidence,
+            }
+        })
+        .collect()
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
@@ -839,30 +898,12 @@ async fn probe_conflicts(
         }
     }
 
-    let raw_collisions = if candidates.is_empty() {
-        Vec::new()
-    } else {
-        // `<probe>` is a sentinel task_run_id — distinct from any real
-        // session UUID, so `check_conflicts_for_files` returns every
-        // holder of every candidate (no self-exclusion).
-        state
-            .app_state
-            .file_registry_manager
-            .check_conflicts_for_files(&candidates, "<probe>", None)
-            .await
-    };
-
-    // Score each conflict against the candidate set (extracted + hints).
-    let predicted_collisions: Vec<PredictedCollision> = raw_collisions
-        .into_iter()
-        .map(|conflict| {
-            let confidence = confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
-            PredictedCollision {
-                conflict,
-                confidence,
-            }
-        })
-        .collect();
+    let predicted_collisions = predict_collisions(
+        &state.app_state.file_registry_manager,
+        &candidates,
+        &hinted_set,
+    )
+    .await;
 
     let recent_editors = if candidates.is_empty() {
         Vec::new()
@@ -1154,8 +1195,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
 // instead drive the same composition the handler does, against a real
 // `FileRegistryManager` and a real `PgDb`. The result is the same
 // `ConflictReport` the handler would produce; gating on
-// `#[ignore = "requires PG via DATABASE_URL"]` matches the convention
-// established in `database/pg/session_touched_files.rs::tests`.
+// they run on a fresh database from the test harness
+// (`PgDb::new_for_test`), as in `database/pg/session_touched_files.rs::tests`.
 
 #[cfg(test)]
 mod tests {
@@ -1193,25 +1234,7 @@ mod tests {
             }
         }
 
-        let raw_collisions = if candidates.is_empty() {
-            Vec::new()
-        } else {
-            registry
-                .check_conflicts_for_files(&candidates, "<probe>", None)
-                .await
-        };
-
-        let predicted_collisions: Vec<PredictedCollision> = raw_collisions
-            .into_iter()
-            .map(|conflict| {
-                let confidence =
-                    confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
-                PredictedCollision {
-                    conflict,
-                    confidence,
-                }
-            })
-            .collect();
+        let predicted_collisions = predict_collisions(registry, &candidates, &hinted_set).await;
 
         let recent_editors = if candidates.is_empty() {
             Vec::new()
@@ -1255,19 +1278,12 @@ mod tests {
         )
     }
 
-    /// Connect to the test PG instance from inside an async test. We can't
-    /// reuse `PgDb::new_blocking_for_test()` here because it calls
-    /// `rt.block_on(...)` and `#[tokio::test]` is already inside a runtime,
-    /// which `tokio::Runtime::new().block_on(...)` rejects with
-    /// "Cannot start a runtime from within a runtime."
+    /// A fresh harness-backed database (`PgDb::new_for_test`).
     async fn pg_for_test() -> std::sync::Arc<PgDb> {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string());
-        std::sync::Arc::new(PgDb::new(&url).await.expect("PgDb connection for test"))
+        PgDb::new_for_test().await
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn probe_conflicts_empty_prompt_empty_registry() {
         let registry = FileRegistryManager::new();
         let pg_db = pg_for_test().await;
@@ -1281,7 +1297,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn probe_conflicts_predicts_live_collision() {
         use crate::executor::file_registry::normalize_path;
 
@@ -1349,7 +1364,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn probe_conflicts_surfaces_recent_editor_when_no_live_holder() {
         use crate::executor::file_registry::normalize_path;
 
@@ -1405,7 +1419,6 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn probe_conflicts_confidence_exact_match() {
         use crate::executor::file_registry::normalize_path;
 
@@ -1451,7 +1464,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn probe_conflicts_confidence_basename_match() {
         use crate::executor::file_registry::normalize_path;
 
@@ -1501,7 +1513,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn probe_conflicts_confidence_directory_overlap() {
         use crate::executor::file_registry::normalize_path;
 
@@ -1550,7 +1561,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn probe_conflicts_hinted_files_unioned() {
         use crate::executor::file_registry::normalize_path;
 

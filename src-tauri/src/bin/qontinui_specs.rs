@@ -162,6 +162,21 @@ async fn main() -> ExitCode {
     }
 }
 
+/// The server's own message for a failed statement. `tokio_postgres::Error`
+/// displays a server-side failure as the bare words "db error", which names no
+/// cause; the `DbError` behind it carries the message, detail and hint.
+fn pg_msg(e: &tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => match (db.detail(), db.hint()) {
+            (Some(d), Some(h)) => format!("{} (detail: {d}; hint: {h})", db.message()),
+            (Some(d), None) => format!("{} (detail: {d})", db.message()),
+            (None, Some(h)) => format!("{} (hint: {h})", db.message()),
+            (None, None) => db.message().to_string(),
+        },
+        None => e.to_string(),
+    }
+}
+
 /// Validate a `--app <id>` filter against the registry. Returns Ok if the id
 /// is present in `project.apps`; otherwise returns a multi-line error string
 /// listing the valid ids so the user can correct the typo.
@@ -186,7 +201,7 @@ async fn validate_app_filter(client: &Client, app_id: &str) -> Result<(), String
             &[&app_id],
         )
         .await
-        .map_err(|e| format!("validate_app_filter: {}", e))?;
+        .map_err(|e| format!("validate_app_filter: {}", pg_msg(&e)))?;
     if hit.get::<_, bool>(0) {
         return Ok(());
     }
@@ -194,7 +209,7 @@ async fn validate_app_filter(client: &Client, app_id: &str) -> Result<(), String
     let rows = client
         .query("SELECT app_id FROM project.apps ORDER BY app_id", &[])
         .await
-        .map_err(|e| format!("validate_app_filter list: {}", e))?;
+        .map_err(|e| format!("validate_app_filter list: {}", pg_msg(&e)))?;
     let valid: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
     Err(format!(
         "--app '{}' is not registered. Valid app_ids: [{}]",
@@ -258,8 +273,21 @@ async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String
     // `state_discovery_artifacts` and `cached_specs`, both of which may not
     // exist on every dev DB shape. Fall back gracefully so the CLI is still
     // useful when only one side is populated.
-    let observed_exists = table_exists(client, "project", "state_discovery_artifacts").await?;
-    let specs_exists = table_exists(client, "project", "cached_specs").await?;
+    // The queries below read `pathname` and `captured_at` from
+    // `state_discovery_artifacts` and `page_id` from `cached_specs`. A table of
+    // that name that lacks them (the canonical schema's
+    // `state_discovery_artifacts` holds `artifact jsonb`, not per-page rows)
+    // cannot answer, so it reads as unavailable rather than failing the command.
+    let observed_exists = table_exists(client, "project", "state_discovery_artifacts").await?
+        && columns_exist(
+            client,
+            "project",
+            "state_discovery_artifacts",
+            &["pathname", "captured_at"],
+        )
+        .await?;
+    let specs_exists = table_exists(client, "project", "cached_specs").await?
+        && columns_exist(client, "project", "cached_specs", &["page_id"]).await?;
 
     let (pages_observed, backlog) = if observed_exists && specs_exists {
         let row = client
@@ -286,7 +314,7 @@ async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String
                 &[&days, &min_obs],
             )
             .await
-            .map_err(|e| format!("coverage observed query failed: {}", e))?;
+            .map_err(|e| format!("coverage observed query failed: {}", pg_msg(&e)))?;
         let count: i64 = row.get(0);
         let backlog: Option<Vec<String>> = row.try_get(1).ok();
         (Some(count), backlog.unwrap_or_default())
@@ -306,7 +334,7 @@ async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String
                 &[&days, &min_obs],
             )
             .await
-            .map_err(|e| format!("coverage observed-only query failed: {}", e))?;
+            .map_err(|e| format!("coverage observed-only query failed: {}", pg_msg(&e)))?;
         (Some(row.get::<_, i64>(0)), Vec::new())
     } else {
         (None, Vec::new())
@@ -319,7 +347,7 @@ async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String
                 &[],
             )
             .await
-            .map_err(|e| format!("coverage specced query failed: {}", e))?;
+            .map_err(|e| format!("coverage specced query failed: {}", pg_msg(&e)))?;
         Some(row.get(0))
     } else {
         None
@@ -397,7 +425,7 @@ async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String
         match pages_observed {
             Some(n) => println!("  pages_observed:  {:>6}", n),
             None => println!(
-                "  pages_observed:  unavailable (project.state_discovery_artifacts not present)"
+                "  pages_observed:  unavailable (project.state_discovery_artifacts missing, or lacks pathname/captured_at)"
             ),
         }
         match coverage_pct {
@@ -497,7 +525,7 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
                 &[&days, &page_id_filter, &min_rows],
             )
             .await
-            .map_err(|e| format!("match-rate by-state query failed: {}", e))?;
+            .map_err(|e| format!("match-rate by-state query failed: {}", pg_msg(&e)))?;
 
         let parsed: Vec<MatchRateStateRow> = rows
             .iter()
@@ -576,7 +604,7 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
             &[&days, &page_id_filter, &min_rows],
         )
         .await
-        .map_err(|e| format!("match-rate per-page query failed: {}", e))?;
+        .map_err(|e| format!("match-rate per-page query failed: {}", pg_msg(&e)))?;
 
     let parsed: Vec<MatchRatePageRow> = rows
         .iter()
@@ -859,7 +887,7 @@ async fn query_queue_counts(
             &[],
         )
         .await
-        .map_err(|e| format!("queue-counts query failed: {}", e))?;
+        .map_err(|e| format!("queue-counts query failed: {}", pg_msg(&e)))?;
     let mut out = std::collections::HashMap::new();
     for r in &rows {
         out.insert(r.get::<_, String>(0), r.get::<_, i64>(1));
@@ -900,7 +928,7 @@ async fn query_recent_events(
             &[&app_filter],
         )
         .await
-        .map_err(|e| format!("recent-events query failed: {}", e))?;
+        .map_err(|e| format!("recent-events query failed: {}", pg_msg(&e)))?;
     Ok(rows
         .iter()
         .map(|r| ProposalEventRow {
@@ -940,7 +968,7 @@ async fn count_proposal_events_in_window(
             &[&days, &event_type, &app_filter],
         )
         .await
-        .map_err(|e| format!("count_proposal_events_in_window failed: {}", e))?;
+        .map_err(|e| format!("count_proposal_events_in_window failed: {}", pg_msg(&e)))?;
     Ok(row.get(0))
 }
 
@@ -974,7 +1002,7 @@ async fn query_drift_event_count(
             &[&days, &event_type, &app_filter],
         )
         .await
-        .map_err(|e| format!("drift event count query failed: {}", e))?;
+        .map_err(|e| format!("drift event count query failed: {}", pg_msg(&e)))?;
     Ok(row.get(0))
 }
 
@@ -993,13 +1021,39 @@ async fn list_app_ids(client: &Client) -> Result<Vec<String>, String> {
     let rows = client
         .query("SELECT app_id FROM project.apps ORDER BY app_id", &[])
         .await
-        .map_err(|e| format!("list_app_ids: {}", e))?;
+        .map_err(|e| format!("list_app_ids: {}", pg_msg(&e)))?;
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
+
+/// Whether `schema.table` carries every one of `columns`, read from `pg_catalog`
+/// for the same reason as [`table_exists`]: `information_schema` hides what the
+/// caller may not read.
+async fn columns_exist(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    columns: &[&str],
+) -> Result<bool, String> {
+    let wanted: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+    let row = client
+        .query_one(
+            "SELECT count(DISTINCT a.attname)::bigint = cardinality($3::text[]) \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p') \
+               AND a.attnum > 0 AND NOT a.attisdropped AND a.attname = ANY($3::text[])",
+            &[&schema, &table, &wanted],
+        )
+        .await
+        .map_err(|e| format!("columns_exist({}.{}) failed: {}", schema, table, pg_msg(&e)))?;
+    row.try_get(0)
+        .map_err(|e| format!("columns_exist({}.{}) failed: {}", schema, table, pg_msg(&e)))
+}
 
 /// Whether `schema.name` exists as a table, read from `pg_catalog` (which,
 /// unlike `information_schema`, lists relations the caller did not author).
@@ -1014,9 +1068,9 @@ async fn table_exists(client: &Client, schema: &str, name: &str) -> Result<bool,
             &[&schema, &name],
         )
         .await
-        .map_err(|e| format!("table_exists({}.{}) failed: {}", schema, name, e))?;
+        .map_err(|e| format!("table_exists({}.{}) failed: {}", schema, name, pg_msg(&e)))?;
     row.try_get(0)
-        .map_err(|e| format!("table_exists({}.{}) failed: {}", schema, name, e))
+        .map_err(|e| format!("table_exists({}.{}) failed: {}", schema, name, pg_msg(&e)))
 }
 
 fn round1(v: f64) -> f64 {

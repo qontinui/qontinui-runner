@@ -10,8 +10,8 @@
 //! `spec_authoring::merge_patch_into_ir`.
 //!
 //! Tests that require a live PG (e.g. concurrent-scan UNIQUE-constraint
-//! exercise) are gated behind `--features pg_integration_tests` to match
-//! the sibling proposals::tests::pg pattern.
+//! exercise) run on a fresh database from the test harness
+//! (`PgDb::new_for_test`), like the sibling proposals::tests::pg tests.
 //!
 //! Each test maps to one of the six required invariants in Step 11:
 //!
@@ -529,10 +529,9 @@ fn slugify_pathname(pathname: &str) -> String {
 //   (UNIQUE constraint kicks). PgDb::insert_proposal returns Ok(true) on
 //   first insert and Ok(false) on the duplicate.
 //
-// PG-bound — gated behind `pg_integration_tests`. Mirrors the dedup test
+// PG-bound — runs on the test harness database. Mirrors the dedup test
 // pattern in `proposals.rs::tests::pg::insert_dedupes_on_kind_and_target`.
 
-#[cfg(feature = "pg_integration_tests")]
 #[tokio::test(flavor = "multi_thread")]
 async fn flywheel_dedupes_concurrent_scans() {
     use crate::database::pg::PgDb;

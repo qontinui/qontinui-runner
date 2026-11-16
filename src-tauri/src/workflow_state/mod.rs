@@ -364,7 +364,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires PG via DATABASE_URL"]
     fn test_state_machine_transitions() {
         let db = PgDb::new_blocking_for_test();
         let mut sm = StateMachine::new(db, "test-exec-1", "test", TestState::Created);
@@ -385,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires PG via DATABASE_URL"]
     fn test_state_machine_with_reason() {
         let db = PgDb::new_blocking_for_test();
         let mut sm = StateMachine::new(db, "test-exec-2", "test", TestState::Created);

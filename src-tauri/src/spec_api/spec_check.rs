@@ -1874,15 +1874,9 @@ mod tests {
     /// D.8 #8 (PG-gated): unknown app_id → 404 + cause `app-not-found`.
     /// Verified at the resolver level — the same code path the handler uses.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn post_spec_check_unknown_app_id_returns_404_app_not_found() {
         use crate::database::pg::PgDb;
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
-        });
-        let pg = PgDb::new(&url)
-            .await
-            .expect("PgDb::new for Stream D spec_check tests");
+        let pg = PgDb::new_for_test().await;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1904,16 +1898,10 @@ mod tests {
     /// cause `spec-not-found`. Verified at the storage layer (the handler
     /// short-circuits on `read_ir` returning `Ok(None)`).
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn post_spec_check_known_app_unknown_page_returns_404_spec_not_found() {
         use crate::database::pg::PgDb;
         use qontinui_types::apps::RegisterAppRequest;
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
-        });
-        let pg = PgDb::new(&url)
-            .await
-            .expect("PgDb::new for Stream D spec_check tests");
+        let pg = PgDb::new_for_test().await;
 
         let tmp = tempfile::tempdir().unwrap();
         let specs_root = tmp.path().join("specs");

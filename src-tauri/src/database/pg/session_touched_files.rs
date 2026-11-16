@@ -540,7 +540,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn record_then_get_returns_file() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("basic");
@@ -561,7 +560,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn record_same_file_twice_is_one_row() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("upsert");
@@ -590,7 +588,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn get_files_touched_sorted_oldest_first() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("sort");
@@ -627,7 +624,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn upsert_moves_file_to_bottom_of_sort() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("upsert-sort");
@@ -657,7 +653,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn clear_removes_only_target_task_run() {
         let db = PgDb::new_blocking_for_test();
         let target = unique_task_run_id("clear-target");
@@ -695,7 +690,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn worktree_id_preserved_null_and_some() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("worktree");
@@ -738,7 +732,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn upsert_updates_worktree_id_on_re_touch() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("worktree-upsert");
@@ -772,7 +765,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn get_sessions_for_files_returns_owners_most_recent_first() {
         let db = PgDb::new_blocking_for_test();
         let session_a = unique_task_run_id("rev-a");
@@ -840,7 +832,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn get_files_touched_empty_for_unknown_task_run() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("empty");
@@ -959,7 +950,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn cleanup_deletes_only_rows_past_the_retention_window() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("retention");
@@ -1003,7 +993,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn cleanup_keeps_everything_inside_a_wide_window() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("retention-wide");
@@ -1043,7 +1032,6 @@ mod tests {
     /// reaching this method must delete nothing rather than issue
     /// `NOW() - 0 days` and empty the table under every live session.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn cleanup_of_zero_days_deletes_nothing() {
         let db = PgDb::new_blocking_for_test();
         let task_run_id = unique_task_run_id("retention-zero");

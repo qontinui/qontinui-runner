@@ -3957,13 +3957,7 @@ mod tests {
     /// `depends_on` containing the parent, `idx` after the parent); the SECOND
     /// harvest of the SAME artifact inserts 0 (insert-if-not-exists ⇒
     /// idempotent across the stateless reconciler's re-reads).
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture
-    /// (DATABASE_URL) with the `orchestration` schema (self-heals at
-    /// `PgDb::new`). Run with:
-    /// `cargo test -p qontinui-runner orchestration_loop::conductor::tests::harvest_splices_then_is_idempotent -- --ignored --nocapture`
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn harvest_splices_then_is_idempotent() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
@@ -4483,12 +4477,7 @@ mod tests {
 
     // --- apply_tick PG-fixture end-to-end (gate persistence + remediation) ---
 
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture
-    /// (DATABASE_URL) with the `orchestration` schema (self-heals at `PgDb::new`,
-    /// incl. the Phase-6 gate columns). Run with:
-    /// `cargo test -p qontinui-runner orchestration_loop::conductor::tests::gate_register_persists_and_clears_then_dispatches -- --ignored --nocapture`
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn gate_register_persists_and_clears_then_dispatches() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
@@ -4622,9 +4611,7 @@ mod tests {
 
     /// DriftVerdict: no-drift → verify Completed + artifact["drift_verdict"] set;
     /// drift → a remediation subtask spliced (depends on verify) + verdict stored.
-    /// `#[ignore]` — needs PG fixture.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn drift_verify_no_drift_completes_drift_splices_remediation() {
         let pg = PgDb::new_for_test().await;
         let dispatcher = FakeDispatcher::default();
@@ -6179,13 +6166,7 @@ mod tests {
     /// `finish_run` writes the exit to the run ROW (status + reason) before it
     /// touches the in-memory loop state; `orchestration_run_status`'s
     /// reader then finds the reason after the reconciler is gone.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture
-    /// (DATABASE_URL); the `orchestration` schema (incl. `runs.status_reason`)
-    /// self-heals at `PgDb::new`. Run with:
-    /// `cargo test -p qontinui-runner orchestration_loop::conductor::tests::finish_run_writes_status_and_reason_to_the_run_row -- --ignored --nocapture`
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn finish_run_writes_status_and_reason_to_the_run_row() {
         let pg = PgDb::new_for_test().await;
         let cases: [(RunExit, &str, Option<&str>, LoopPhase); 3] = [
@@ -6257,10 +6238,7 @@ mod tests {
     /// moves `running → stopped`, and the conductor is mid-tick with its exit
     /// already decided — one tick wide, and `finish_run`'s write used to be
     /// unconditional, so `stopped` became `stalled`/`complete`.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn finish_run_does_not_overwrite_a_run_stopped_out_from_under_it() {
         let pg = PgDb::new_for_test().await;
         for exit in [
@@ -6317,10 +6295,7 @@ mod tests {
     /// A DriftVerdict read that fails is recorded on the VERIFY row (which is
     /// `Working`, so no §5 deadline and no `W:` fingerprint entry bound it),
     /// and a later successful read clears the block before the verdict lands.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention (needs DATABASE_URL).
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn drift_verdict_failure_is_recorded_on_the_verify_row_then_cleared() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
@@ -6415,10 +6390,7 @@ mod tests {
     /// coord answered and refused — keeping `gate_id` so a registered gate
     /// resumes polling, correcting a stale token rather than leaving it, and
     /// clearing the block once a call succeeds.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention (needs DATABASE_URL).
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn coord_blocks_are_recorded_on_the_subtask_and_clear_on_recovery() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
@@ -6702,10 +6674,7 @@ mod tests {
     /// A dispatch that THROWS produces `apply_failures = ["dispatch:A"]` and an
     /// empty `dispatched` — the claim the whole `TickOutcome` split rests on,
     /// asserted against a real `apply_tick` rather than a hand-built outcome.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn apply_tick_records_a_thrown_dispatch_and_lands_nothing() {
         let (pg, run_id, rows) = one_row_run(mk("A", 0, &[], SubtaskState::Submitted)).await;
         let c = cfg();
@@ -6778,10 +6747,7 @@ mod tests {
     /// 30-minute window rather than an exemption. This used to assert the row
     /// was not watched at all, which is exactly how a bound that never freed
     /// left a run ticking at `running` forever with nothing able to see it.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn a_full_fanout_bound_is_transient_and_never_stalls_a_run_inside_its_window() {
         let (pg, run_id, rows) = one_row_run(mk("A", 0, &[], SubtaskState::Submitted)).await;
         let c = cfg();
@@ -6866,10 +6832,7 @@ mod tests {
     /// §5 deadline that FAILS the row is never armed, the row is `Working` with a
     /// `task_run_id` (excluded from the fingerprint) and `ReadyIdle` (so the
     /// silence deadline was cleared). The plan alone can never end this run.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn a_reprompt_that_never_lands_is_recorded_and_bounded() {
         let trid = Uuid::new_v4();
         let mut row = mk("A", 0, &[], SubtaskState::Working);
@@ -6953,10 +6916,7 @@ mod tests {
     /// register variant is the expensive one: the row stays ungated, so the next
     /// tick registers a NEW coord gate — one leaked gate row per tick, with the
     /// run reading `running` and nothing on the subtask to show for it.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn a_gate_verdict_that_will_not_persist_is_recorded() {
         let (pg, run_id, rows) = one_row_run(mk_gated(
             "test",
@@ -7213,10 +7173,7 @@ mod tests {
     /// with a `task_run_id`, so the PLAN's fingerprint is EMPTY and a `tick_exit`
     /// that ran first (or ignored the outcome) would loop at `running` forever.
     /// Only the applied re-prompt failure can end this run.
-    ///
-    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn run_orchestration_decides_the_exit_from_the_applied_outcome() {
         let trid = Uuid::new_v4();
         let mut row = mk("A", 0, &[], SubtaskState::Working);
