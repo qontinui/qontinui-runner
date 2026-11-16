@@ -1516,7 +1516,7 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
 /// for selection — close enough to the cap that it won't reliably serve a
 /// request. A backstop alongside the server `status` / probe-error signals in
 /// [`probe_result_exhausted`].
-const EXHAUSTION_UTILIZATION: f64 = 0.99;
+pub(crate) const EXHAUSTION_UTILIZATION: f64 = 0.99;
 
 /// Whether a probe result means the account **won't serve a request right
 /// now**. True when the probe call itself failed (the probe hits the same

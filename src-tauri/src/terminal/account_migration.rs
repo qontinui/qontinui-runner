@@ -96,11 +96,10 @@ use crate::terminal::session_carry::{
 pub(crate) const MIGRATION_CAP: usize = 3;
 const MIGRATION_CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Cooldown stamped on the exhausted source account so spawn-time selection
-/// (`pick_best_account` / `rotate_account_on_rate_limit`) stays off it. One
-/// hour — matches `EXHAUSTION_STALE_TTL`'s trust window for the probe's
-/// `exhausted` flag; a weekly/5-hour cap doesn't clear in minutes.
-const EXHAUSTED_ACCOUNT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
+// Cooldown stamped on the exhausted source account so spawn-time selection
+// (`pick_best_account` / `rotate_account_on_rate_limit`) stays off it, when
+// the probe names no reset. The ONE shared floor, owned by `ai_provider`.
+use crate::ai_provider::limit_hit::EXHAUSTED_ACCOUNT_COOLDOWN;
 
 /// Per-session migration timestamps (unix millis), for the cap.
 static MIGRATION_HISTORY: Mutex<Option<HashMap<String, Vec<i64>>>> = Mutex::new(None);
