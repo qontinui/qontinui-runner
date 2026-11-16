@@ -53,6 +53,7 @@ fn inputs(read: LimitStopRead, probe: ProbeVerdict) -> HintInputs {
         auto_continue: true,
         config_dir_count: 2,
         migrated_at_ms: None,
+        continue_after_migration: true,
     }
 }
 
@@ -144,9 +145,20 @@ fn with_the_continue_off_a_stop_waiting_only_for_a_continue_is_not_parked() {
         decide(&off(stopped(Some(NOW + 60_000)), FINE)),
         LimitAction::Skip(SkipReason::ContinueDisabled)
     );
-    // Unknown probe after the reset: likewise.
+    // Unknown probe after the reset: still parked while a re-probe could
+    // migrate it (an errored probe is often the limit itself) ...
     assert_eq!(
         decide(&off(stopped(Some(NOW - 1_000)), probe(true, true))),
+        LimitAction::Park {
+            due_at_ms: NOW + 120_000,
+            reason: ParkReason::ProbeUnknown,
+        }
+    );
+    // ... and skipped once nothing could follow.
+    let mut nothing = off(stopped(Some(NOW - 1_000)), probe(true, true));
+    nothing.auto_migrate = false;
+    assert_eq!(
+        decide(&nothing),
         LimitAction::Skip(SkipReason::ContinueDisabled)
     );
     // Still exhausted on one account: nothing can ever move it.
@@ -157,8 +169,8 @@ fn with_the_continue_off_a_stop_waiting_only_for_a_continue_is_not_parked() {
         LimitAction::Skip(SkipReason::ContinueDisabled)
     );
     // Still exhausted with a target possible: it migrates, and a cap or
-    // no-target refusal reports as before instead of parking for a continue
-    // that is switched off.
+    // no-target refusal parks (for at most the hour) so a re-entry can still
+    // migrate it.
     assert_eq!(
         decide(&off(stopped(Some(NOW + 60_000)), DRY)),
         LimitAction::Migrate {
@@ -311,6 +323,25 @@ fn a_stop_from_before_the_latest_migration_is_left_to_that_migration() {
         }
     );
     assert_eq!(probe_park_due_at(&DRY, NOW), NOW + 3_600_000);
+    // An errored destination probe never migrates a carried stop.
+    let mut unknown_target = inputs(stopped(Some(NOW + 86_400_000)), probe(true, true));
+    unknown_target.migrated_at_ms = Some(NOW - 60_000);
+    assert_eq!(
+        decide(&unknown_target),
+        LimitAction::Park {
+            due_at_ms: NOW + 120_000,
+            reason: ParkReason::ProbeUnknown,
+        }
+    );
+    // With the migration's own nudge switched off, the operator chose that a
+    // migrated session is not prompted.
+    let mut no_nudge = inputs(stopped(Some(NOW + 86_400_000)), FINE);
+    no_nudge.migrated_at_ms = Some(NOW - 600_000);
+    no_nudge.continue_after_migration = false;
+    assert_eq!(
+        decide(&no_nudge),
+        LimitAction::Skip(SkipReason::MigratedSinceStop)
+    );
     // A NEW stop, hit on the target account after the migration, is decided.
     let mut later = inputs(stopped(Some(NOW - 1_000)), FINE);
     later.migrated_at_ms = Some(STOPPED_AT - 5_000);
