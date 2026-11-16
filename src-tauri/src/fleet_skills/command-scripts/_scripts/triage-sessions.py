@@ -3935,7 +3935,33 @@ def record_pass(doc, proxy=None, direct=None):
     if sent is not None and parse_rfc3339(stored.get("runner_started_at")) != sent:
         return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds runner_started_at="
                 f"{stored.get('runner_started_at')!r}, not {doc['runner_started_at']}{via}")
+    # The same for each row's measured prompt: a coord that accepts the key but
+    # does not store it would otherwise read back as recorded.
+    lost = measured_not_stored(doc["rows"], stored.get("rows"))
+    if lost and not isinstance(stored.get("rows"), list):
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back carries no rows list, "
+                f"so the nudge_measured_at of {len(lost)} row(s) is unconfirmed{via}")
+    if lost:
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds no matching "
+                f"nudge_measured_at for {len(lost)} row(s) that sent one (first: {lost[0]}){via}")
     return f"ledger: recorded pass {pid} ({n} rows, read back){via}"
+
+
+def measured_not_stored(sent_rows, stored_rows):
+    """The terminal ids whose sent nudge_measured_at the read-back does not
+    hold. An unreadable row list counts every sent value as not stored."""
+    def key(r):  # coord stores text fields trimmed
+        tid = r.get("terminal_id")
+        return tid.strip() if isinstance(tid, str) else tid
+    want = {key(r): parse_rfc3339(r.get("nudge_measured_at")) for r in sent_rows}
+    want = {tid: at for tid, at in want.items() if at is not None}
+    if not want:
+        return []
+    got = {}
+    if isinstance(stored_rows, list):
+        got = {key(r): parse_rfc3339(r.get("nudge_measured_at"))
+               for r in stored_rows if isinstance(r, dict)}
+    return [str(tid) for tid, at in want.items() if got.get(tid) != at]
 
 
 class PassRecorder:
@@ -4451,19 +4477,36 @@ def ledger_selftest():
     # The read-back observes runner_started_at, not only row_count.
     start = "2026-11-14T10:00:00.000Z"
     new_doc = {"pass_id": "p-3", "runner_started_at": start,
-               "rows": [{"nudge_measured_at": start}, {}]}
+               "rows": [{"terminal_id": "t-a", "nudge_measured_at": start}, {"terminal_id": "t-b"}]}
+    stored_ok = [{"terminal_id": "t-a", "nudge_measured_at": start}, {"terminal_id": "t-b", "nudge_measured_at": None}]
 
-    def new_coord(served):
+    def new_coord(served, rows=stored_ok):
         def call(tool, args):
             if tool == WRITE_TOOL:
                 return {"ok": True, "pass_id": args["pass_id"]}
-            return {"ok": True, "pass": {"pass_id": "p-3", "row_count": 2, "runner_started_at": served}}
+            return {"ok": True, "pass": {"pass_id": "p-3", "row_count": 2, "runner_started_at": served,
+                                         "rows": rows}}
         return call
     for served, ok in ((start, True), ("2026-11-14T10:00:00+00:00", True), (None, False),
                        ("2026-11-14T10:00:05Z", False)):
         line = record_pass(dict(new_doc), proxy=new_coord(served))
         if line.startswith("ledger: recorded") != ok:
             bad.append(f"record_pass(read-back runner_started_at={served!r}) = {line!r}, want ok={ok}")
+    # ...and each row's nudge_measured_at: a row that sent one must hold it.
+    for rows, ok in ((stored_ok, True),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": "2026-11-14T10:00:00+00:00"}, {"terminal_id": "t-b"}], True),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": None}, {"terminal_id": "t-b"}], False),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": "2026-11-14T10:00:01Z"}], False),
+                     ([{"terminal_id": "t-b"}], False), (None, False),
+                     ([{"terminal_id": " t-a ", "nudge_measured_at": start}], True)):
+        line = record_pass(dict(new_doc), proxy=new_coord(start, rows))
+        if line.startswith("ledger: recorded") != ok:
+            bad.append(f"record_pass(read-back rows={rows!r}) = {line!r}, want ok={ok}")
+    # A pass that sent no measured prompt needs none back, whatever the rows read.
+    line = record_pass(dict(new_doc, rows=[{"terminal_id": "t-b"}, {"terminal_id": "t-c"}]),
+                       proxy=new_coord(start, None))
+    if not line.startswith("ledger: recorded"):
+        bad.append(f"record_pass(no measured prompt, no rows read back) = {line!r}")
 
     bad += door_wording_selftest()
 
