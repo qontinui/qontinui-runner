@@ -19,6 +19,7 @@
 
 use crate::execution_core::builtin_tools::{execute_builtin_tool, BuiltinToolRegistry};
 use qontinui_runner_lib::file_tail;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -198,9 +199,6 @@ impl EmbeddedMcp {
             .unwrap_or("all");
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
 
-        let mut result: std::collections::HashMap<String, Vec<Value>> =
-            std::collections::HashMap::new();
-
         let log_files = match log_type {
             "general" => vec![("general", "runner-general.jsonl")],
             "actions" => vec![("actions", "runner-actions.jsonl")],
@@ -217,21 +215,12 @@ impl EmbeddedMcp {
             }
         };
 
-        for (key, filename) in log_files {
-            let path = self.dev_logs_path.join(filename);
-            if path.exists() {
-                let tail = file_tail::tail_lines(&path, limit, file_tail::LOG_TAIL_CAP)
-                    .map_err(|e| format!("Failed to read log: {}", e))?;
-                let entries: Vec<Value> = tail
-                    .lines
-                    .iter()
-                    .rev()
-                    .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-
-                result.insert(key.to_string(), entries);
-            }
-        }
+        // Blocking file reads: on the blocking pool, off the async executor.
+        let dev_logs_path = self.dev_logs_path.clone();
+        let result =
+            spawn_blocking_tracked(move || read_log_tails(&dev_logs_path, &log_files, limit))
+                .await
+                .map_err(|e| format!("Log read failed: {e}"))??;
 
         Ok(json!({
             "logs": result,
@@ -239,6 +228,34 @@ impl EmbeddedMcp {
             "limit": limit,
         }))
     }
+}
+
+/// The newest `limit` JSON entries of each `(key, file)` under `dir`, newest
+/// first, from a bounded tail of each file ([`file_tail::tail_lines`], at most
+/// [`file_tail::LOG_TAIL_CAP`] bytes per file). A file that does not exist is
+/// left out. Blocking file I/O: [`EmbeddedMcp::read_runner_logs`] runs it on
+/// the blocking pool.
+fn read_log_tails(
+    dir: &std::path::Path,
+    log_files: &[(&str, &str)],
+    limit: usize,
+) -> Result<HashMap<String, Vec<Value>>, String> {
+    let mut result = HashMap::new();
+    for (key, filename) in log_files {
+        let path = dir.join(filename);
+        if path.exists() {
+            let tail = file_tail::tail_lines(&path, limit, file_tail::LOG_TAIL_CAP)
+                .map_err(|e| format!("Failed to read log: {}", e))?;
+            let entries: Vec<Value> = tail
+                .lines
+                .iter()
+                .rev()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            result.insert(key.to_string(), entries);
+        }
+    }
+    Ok(result)
 }
 
 impl Default for EmbeddedMcp {
