@@ -24,8 +24,9 @@
 # Where a job's closure could not be bounded below the whole tree, the
 # target says `**`. Read at qontinui-runner origin/main bf090571b
 # (2026-11-15) from:
-#   - .github/workflows/*.yml — every job that runs on a `pull_request` to
-#     main or on a `merge-candidate*/**` push (coord's merge predicate
+#   - .github/workflows/*.yml — every job that runs on a `pull_request` (to
+#     main or, for stacked PRs, to any other base) or on a
+#     `merge-candidate*/**` push (coord's merge predicate
 #     observes EVERY check, not only the `main-merge-gates` ruleset contexts,
 #     so each such job is a target), mirroring each workflow's `paths:`
 #     filter as the target's roots;
@@ -66,9 +67,13 @@
 # change's OWN diff; their verdict on a composition is the OR of the parts'
 # verdicts, so they create no sharing. They observe only their own config.
 #
-# MAINTENANCE. This map must be updated in the same PR whenever a CI job is
-# added, removed or re-scoped (a new workflow, a changed `paths:` filter, a
-# new compile-time, import or test-time read outside the compiling package).
+# MAINTENANCE. Enforced in part by
+# src-tauri/tests/ci_targets_map_covers_every_gating_job.rs: every gating
+# job has a target, every target names a gating job, every literal path
+# exists. Re-scoping is not mechanical. This map must be updated in the
+# same PR whenever a CI job is added, removed or re-scoped (a new workflow,
+# a changed `paths:` filter, a new compile-time, import or test-time read
+# outside the compiling package).
 # A stale map is unsound in one direction only: a path a target observes but
 # that the map lists ONLY under a different target. Omitting a path entirely
 # is safe (it touches every target).
