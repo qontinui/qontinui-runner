@@ -292,12 +292,13 @@ jobs:
       # construction. That matters doubly here, because a skewed client's dump
       # is not just a red night: this job would self-heal it into a refresh PR.
       # The host `apt-get install -y postgresql-client-16` this replaced fails
-      # on Ubuntu 26.04, which ubuntu-latest now resolves to and which ships
-      # only postgresql-client-18; every night from 2026-11-12 went red at that
-      # step (coord finding 8a344609). This step refuses an empty container id
-      # up front, because fresh_check below would otherwise fall back to a host
-      # pg_dump of unknown version, and it logs which pg_dump the dump is taken
-      # with.
+      # on an Ubuntu 26.04 runner image, which ubuntu-latest has been moving to
+      # and which ships only postgresql-client-18; the scheduled runs from
+      # 2026-11-12 went red at that step (coord finding
+      # 8a344609-11e9-467b-bb95-04923f20a7d3). This step refuses an empty
+      # container id up front, because fresh_check below would otherwise fall
+      # back to a host pg_dump of unknown version, and it logs which pg_dump
+      # the dump is taken with.
       - name: Resolve pg_dump (the postgres service container's own)
         env:
           PG_CONTAINER: ${{ job.services.postgres.id }}
