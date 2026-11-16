@@ -234,6 +234,9 @@ pub(crate) enum ParkReason {
     NoUsableTarget,
     /// A continue attempt ended without the prompt in the pane.
     ContinueRetry,
+    /// A stop carried by a migration whose own continue nudge may still be
+    /// running: looked at again once that nudge cannot be.
+    MigrationNudgeWait,
 }
 
 impl ParkReason {
@@ -246,6 +249,7 @@ impl ParkReason {
             Self::MigrationCapReached => "migration-cap-reached",
             Self::NoUsableTarget => "no-usable-target",
             Self::ContinueRetry => "continue-retry",
+            Self::MigrationNudgeWait => "migration-nudge-wait",
         }
     }
 }
@@ -320,6 +324,17 @@ pub(crate) fn exhausted_park_due_at(stop: &LimitStop, probe: &ProbeVerdict, now_
     }
 }
 
+/// When a carried stop on an exhausted destination is handed back: the
+/// probe's own reset plus the margin (never sooner than one margin from now),
+/// or [`PARK_WITHOUT_RESET_MS`] from now when the probe gives none.
+pub(crate) fn probe_park_due_at(probe: &ProbeVerdict, now_ms: i64) -> i64 {
+    probe
+        .resets_at_ms
+        .map_or(now_ms + PARK_WITHOUT_RESET_MS, |r| {
+            (r + LIMIT_RESET_MARGIN_MS).max(now_ms + LIMIT_RESET_MARGIN_MS)
+        })
+}
+
 /// The branch table (plan Phase 2), top to bottom.
 pub(crate) fn decide(i: &HintInputs) -> LimitAction {
     if i.finished {
@@ -335,9 +350,22 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
                 // stop says it never landed, and the old account's reset time
                 // is not this account's.
                 return if i.probe.known_exhausted {
-                    migrate_or_park(i, None)
+                    // Parked, if the hop is refused, until THIS account's
+                    // reset: the stop's own reset is the old account's.
+                    migrate_or_park(i, Some(probe_park_due_at(&i.probe, i.now_ms)))
                 } else if i.now_ms - migrated_at <= MIGRATION_NUDGE_WINDOW_MS {
-                    LimitAction::Skip(SkipReason::MigratedSinceStop)
+                    // Looked at again once the nudge cannot be running: a
+                    // landed nudge then reads NotStopped, a lost one is
+                    // continued.
+                    continue_or_skip(
+                        i,
+                        LimitAction::Park {
+                            due_at_ms: migrated_at
+                                + MIGRATION_NUDGE_WINDOW_MS
+                                + LIMIT_RESET_MARGIN_MS,
+                            reason: ParkReason::MigrationNudgeWait,
+                        },
+                    )
                 } else {
                     continue_or_skip(i, LimitAction::Continue(stop.clone()))
                 };
@@ -407,11 +435,10 @@ fn migrate_or_park(i: &HintInputs, park_due: Option<i64>) -> LimitAction {
         None
     };
     match (refusal, park_due) {
-        // The cap's or target's refusal parks a stop only when a continue can
-        // follow at its reset; with the continue off it reports as before.
-        (None, park_fallback) => LimitAction::Migrate {
-            park_fallback: park_fallback.filter(|_| i.auto_continue),
-        },
+        // A refusal by the cap or the target pick parks the stop for at most
+        // an hour (`migration_refused`): a re-entry can migrate it then,
+        // whether or not the continue is on.
+        (None, park_fallback) => LimitAction::Migrate { park_fallback },
         (Some((reason, _)), Some(due_at_ms)) => {
             continue_or_skip(i, LimitAction::Park { due_at_ms, reason })
         }
@@ -570,6 +597,17 @@ pub(crate) struct ContinueLedger {
 }
 
 impl ContinueLedger {
+    /// A probe answered for this stop: the next unknown park backs off from
+    /// the start again.
+    pub(crate) fn clear_unknown_parks(&mut self, claude_session_id: &str, entry_uuid: &str) {
+        if let Some(e) = self
+            .entries
+            .get_mut(&(claude_session_id.to_string(), entry_uuid.to_string()))
+        {
+            e.unknown_parks = 0;
+        }
+    }
+
     /// Count one more probe-unknown park of this stop; returns the count.
     pub(crate) fn note_unknown_park(&mut self, claude_session_id: &str, entry_uuid: &str) -> u32 {
         let e = self

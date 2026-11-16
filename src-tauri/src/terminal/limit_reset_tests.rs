@@ -162,7 +162,7 @@ fn with_the_continue_off_a_stop_waiting_only_for_a_continue_is_not_parked() {
     assert_eq!(
         decide(&off(stopped(Some(NOW + 60_000)), DRY)),
         LimitAction::Migrate {
-            park_fallback: None
+            park_fallback: Some(NOW + 60_000 + 120_000)
         }
     );
 }
@@ -267,7 +267,10 @@ fn a_stop_from_before_the_latest_migration_is_left_to_that_migration() {
     carried.migrated_at_ms = Some(NOW - 60_000);
     assert_eq!(
         decide(&carried),
-        LimitAction::Skip(SkipReason::MigratedSinceStop)
+        LimitAction::Park {
+            due_at_ms: NOW - 60_000 + 300_000 + 120_000,
+            reason: ParkReason::MigrationNudgeWait,
+        }
     );
     // Past that window the stop was never answered: continue it, whatever
     // the OLD account's reset says.
@@ -286,19 +289,28 @@ fn a_stop_from_before_the_latest_migration_is_left_to_that_migration() {
         FINE,
     );
     untimed.migrated_at_ms = Some(NOW - 60_000);
-    assert_eq!(
+    assert!(matches!(
         decide(&untimed),
-        LimitAction::Skip(SkipReason::MigratedSinceStop)
-    );
+        LimitAction::Park {
+            reason: ParkReason::MigrationNudgeWait,
+            ..
+        }
+    ));
     // A destination that is itself dry still takes the next hop.
-    let mut dry_target = inputs(stopped(Some(NOW + 86_400_000)), DRY);
+    // Refused, it parks until the DESTINATION's reset, not the old one's.
+    let dry_here = ProbeVerdict {
+        resets_at_ms: Some(NOW + 5_000_000),
+        ..DRY
+    };
+    let mut dry_target = inputs(stopped(Some(NOW + 86_400_000)), dry_here);
     dry_target.migrated_at_ms = Some(NOW - 60_000);
     assert_eq!(
         decide(&dry_target),
         LimitAction::Migrate {
-            park_fallback: None
+            park_fallback: Some(NOW + 5_000_000 + 120_000)
         }
     );
+    assert_eq!(probe_park_due_at(&DRY, NOW), NOW + 3_600_000);
     // A NEW stop, hit on the target account after the migration, is decided.
     let mut later = inputs(stopped(Some(NOW - 1_000)), FINE);
     later.migrated_at_ms = Some(STOPPED_AT - 5_000);

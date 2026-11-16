@@ -181,6 +181,7 @@ describe("usage-limit park and continue toasts (plan 2026-11-05 Phase 2)", () =>
 
   it("raises no park toast for the runner's own continue retry", () => {
     expect(parkIsToasted({ reason: "continue-retry" })).toBe(false);
+    expect(parkIsToasted({ reason: "migration-nudge-wait" })).toBe(false);
     expect(parkIsToasted({ reason: "not-yet-reset" })).toBe(true);
     expect(parkIsToasted({})).toBe(true);
   });
