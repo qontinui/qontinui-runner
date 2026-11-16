@@ -113,3 +113,45 @@ describe("ClaudeCliSection under a fleet account-selection policy", () => {
     expect(html).not.toContain("account-selection-fleet-unread");
   });
 });
+
+describe("the usage-limit reset toggle (plan 2026-11-05 Phase 2)", () => {
+  function renderWith(dirs: string[], autoContinue: boolean | undefined) {
+    const settings: AiSettings = {
+      ...DEFAULT_AI_SETTINGS,
+      claude_cli: {
+        ...DEFAULT_AI_SETTINGS.claude_cli,
+        config_dir: dirs[0],
+        auto_continue_after_limit_reset: autoContinue,
+      },
+    };
+    return renderToStaticMarkup(
+      <ClaudeCliSection
+        settings={settings}
+        setSettings={() => {}}
+        onLog={() => {}}
+        cliAuth={null}
+        refreshingAuth={false}
+        onRefreshAuth={() => {}}
+        onCheckAuth={() => {}}
+        claudeConfigDirs={dirs}
+        setClaudeConfigDirs={() => {}}
+        accountUsages={[]}
+        setAccountUsages={() => {}}
+      />,
+    );
+  }
+  const checkedCount = (html: string) => (html.match(/checked=""/g) ?? []).length;
+
+  it("shows with one account, where the migration toggles do not", () => {
+    const html = renderWith([DIRS[0]], undefined);
+    expect(html).toContain("Continue sessions after their usage limit resets");
+    expect(html).not.toContain("Token-Exhaustion Failover");
+  });
+
+  it("is on by default and reflects a stored off", () => {
+    const on = renderWith(DIRS, undefined);
+    const off = renderWith(DIRS, false);
+    expect(on).toContain("Continue sessions after their usage limit resets");
+    expect(checkedCount(on) - checkedCount(off)).toBe(1);
+  });
+});

@@ -20,16 +20,11 @@
 //! be read or parsed where the decision is made is [`LimitStopRead::Unreadable`]
 //! — UNKNOWN — and never [`LimitStopRead::NotStopped`].
 //!
+//! The caller is [`super::account_migration::handle_usage_limit_hint`], through
+//! [`super::limit_reset::decide_hint`] (Phase 2).
+//!
 //! Interim arm: plan `2026-10-28-one-session-lifecycle-authority` Phase 99 (the
 //! Migrator) is to carry this classifier into its `decide()`.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until plan 2026-11-05 Phase 2 splits handle_usage_limit_hint"
-    )
-)]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

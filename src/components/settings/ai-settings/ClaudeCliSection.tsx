@@ -815,6 +815,38 @@ export function ClaudeCliSection({
             </label>
           </div>
 
+          <div className="space-y-2 pt-2">
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+              Usage-Limit Reset
+            </span>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.claude_cli.auto_continue_after_limit_reset ?? true}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      auto_continue_after_limit_reset: e.target.checked,
+                    },
+                  }))
+                }
+                className="mt-0.5 accent-primary"
+              />
+              <span>
+                <span className="text-xs font-medium block">
+                  Continue sessions after their usage limit resets
+                </span>
+                <span className="text-[10px] text-muted-foreground block">
+                  When a session stopped at its account&apos;s usage limit and that limit has since
+                  reset, type a short continue prompt into it, on the same account, once per stop.
+                  Works with one account too.
+                </span>
+              </span>
+            </label>
+          </div>
+
           {claudeConfigDirs.length > 1 && (
             <div className="space-y-2 pt-2">
               <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">

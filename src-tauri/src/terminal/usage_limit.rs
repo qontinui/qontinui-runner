@@ -101,6 +101,10 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "stop and wait for limit to reset",
 ];
 
+/// Due parks re-entered per scan tick (`limit_reset::take_due`), earliest
+/// first; the rest wait for the next tick.
+const MAX_DUE_PARKS_PER_TICK: usize = 2;
+
 /// Minimum gap between two hint firings for the same terminal. A limit message
 /// that stays painted (full-screen TUI) must not hammer the probe path.
 const HINT_DEBOUNCE: Duration = Duration::from_secs(300);
@@ -235,6 +239,29 @@ pub fn scan_grids_once() {
         map.retain(|tid, _| live.contains(tid));
         gate.retain_live(&live);
     } // fire-state + scan-gate locks released
+
+    // Parked limit stops whose time has come re-enter the hint (plan
+    // 2026-11-05 Phase 3's due dispatch; the parks are written by
+    // `limit_reset::run_hint`). Re-entry needs no screen change, so the scan
+    // gate above is not consulted. A closed terminal's park is dropped. The
+    // continue the hint may type is paced by `limit_reset::ContinuePacer`;
+    // this bound only spreads the hints' probes across ticks.
+    let live_ids: HashSet<&str> = sessions.iter().map(|(t, _)| t.as_str()).collect();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for park in super::limit_reset::take_due(now_ms, MAX_DUE_PARKS_PER_TICK, |tid| {
+        live_ids.contains(tid)
+    }) {
+        info!(
+            terminal_id = %park.terminal_id,
+            session = %park.claude_session_id,
+            reason = park.reason.as_str(),
+            "parked limit stop is due — re-entering the usage-limit hint"
+        );
+        tauri::async_runtime::spawn(super::account_migration::handle_usage_limit_hint(
+            park.terminal_id,
+            "limit-reset-due",
+        ));
+    }
 
     for (tid, pattern) in to_fire {
         info!(

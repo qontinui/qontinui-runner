@@ -9,6 +9,12 @@
  * - `session-account-migration-skipped` when exhaustion was confirmed but no
  *   migration happened (no usable target / cap reached / mechanics failed) —
  *   surfaced as an error so the operator knows the session is stranded.
+ * - `session-limit-parked` when a session whose transcript says it stopped at
+ *   a usage limit cannot move yet (its reset is still ahead, or a migration
+ *   was wanted and cannot run) and is parked (backend `terminal::limit_reset`,
+ *   plan 2026-11-05 Phase 2). Not an error: one coalesced info toast per burst.
+ * - `session-limit-reset-continued` when such a session's limit had reset and
+ *   the runner typed a continue prompt into it, in place. Coalesced the same way.
  *
  * Mount once at App level, next to `useErrorNotifications`.
  */
@@ -165,8 +171,155 @@ export function migratedToast(p: MigratedPayload): { message: string; type: Toas
   };
 }
 
+/** `session-limit-parked` — `terminal::limit_reset::parked_payload`. */
+export interface LimitParkedPayload {
+  claudeSessionId?: string;
+  terminalId?: string;
+  configDir?: string;
+  /** When the park is due (unix ms): the stop's reset plus a margin, or a retry. */
+  dueAtMs?: number;
+  /** `reset-pending`, `probe-unknown`, `migration-disabled`, `single-account`,
+   * `migration-cap-reached` or `no-usable-target`. */
+  reason?: string;
+}
+
+/** `session-limit-reset-continued` — `terminal::limit_reset::continued_payload`. */
+export interface LimitContinuedPayload {
+  claudeSessionId?: string;
+  terminalId?: string;
+  configDir?: string;
+  entryUuid?: string;
+}
+
+/** How long a burst of limit events is gathered into one toast. A restart can
+ * park ~100 sessions within seconds; one toast each would bury the screen. */
+export const LIMIT_EVENT_COALESCE_MS = 2000;
+
+/** Wall-clock `HH:MM` in the operator's locale, with the date when it is not
+ * today — a weekly reset is often days away. */
+function clockTime(ms: number): string {
+  const at = new Date(ms);
+  if (at.toDateString() === new Date().toDateString()) {
+    return at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return at.toLocaleString([], {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** One key per session, so a session parked twice in a burst counts once. */
+function sessionKey(p: { claudeSessionId?: string; terminalId?: string }): string {
+  return p.claudeSessionId ?? p.terminalId ?? "unknown";
+}
+
+/**
+ * The one toast for a burst of `session-limit-parked` events, or `null` for
+ * an empty burst. The time is the LATEST due time in the burst: every parked
+ * session is due by then. `formatTime` is injectable for tests.
+ */
+export function limitParkedToast(
+  parks: LimitParkedPayload[],
+  formatTime: (ms: number) => string = clockTime,
+): { message: string; type: ToastType } | null {
+  const latest = new Map<string, LimitParkedPayload>();
+  for (const p of parks) latest.set(sessionKey(p), p);
+  if (latest.size === 0) return null;
+  const dues = [...latest.values()]
+    .map((p) => p.dueAtMs)
+    .filter((d): d is number => typeof d === "number" && Number.isFinite(d));
+  const until = dues.length > 0 ? ` until ${formatTime(Math.max(...dues))}` : "";
+  if (latest.size === 1) {
+    const [only] = latest.values();
+    return {
+      message: `Session ${sessionKey(only).slice(0, 8)} stopped at its usage limit on ${accountLabel(
+        only.configDir,
+      )} and is parked${until} (${only.reason ?? "unknown reason"})`,
+      type: "info",
+    };
+  }
+  return {
+    message: `${latest.size} sessions stopped at their usage limit and are parked${until}`,
+    type: "info",
+  };
+}
+
+/** The one toast for a burst of `session-limit-reset-continued` events. */
+export function limitContinuedToast(
+  continued: LimitContinuedPayload[],
+): { message: string; type: ToastType } | null {
+  const sessions = new Map<string, LimitContinuedPayload>();
+  for (const c of continued) sessions.set(sessionKey(c), c);
+  if (sessions.size === 0) return null;
+  if (sessions.size === 1) {
+    const [only] = sessions.values();
+    return {
+      message: `Session ${sessionKey(only).slice(0, 8)}'s usage limit on ${accountLabel(
+        only.configDir,
+      )} has reset — told it to continue`,
+      type: "success",
+    };
+  }
+  return {
+    message: `${sessions.size} sessions' usage limits have reset — told each to continue`,
+    type: "success",
+  };
+}
+
+/**
+ * Gathers items pushed within `windowMs` of the first one and hands them to
+ * `flush` together. `cancel` drops a pending burst (unmount).
+ */
+export function createBurstCoalescer<T>(
+  windowMs: number,
+  flush: (items: T[]) => void,
+): { push: (item: T) => void; cancel: () => void } {
+  let items: T[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return {
+    push(item: T) {
+      items.push(item);
+      if (timer !== undefined) return;
+      timer = setTimeout(() => {
+        const burst = items;
+        items = [];
+        timer = undefined;
+        flush(burst);
+      }, windowMs);
+    },
+    cancel() {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      items = [];
+    },
+  };
+}
+
 export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
+    const parked = createBurstCoalescer<LimitParkedPayload>(LIMIT_EVENT_COALESCE_MS, (burst) => {
+      const toast = limitParkedToast(burst);
+      if (toast) showToast(toast.message, toast.type);
+    });
+    const continued = createBurstCoalescer<LimitContinuedPayload>(
+      LIMIT_EVENT_COALESCE_MS,
+      (burst) => {
+        const toast = limitContinuedToast(burst);
+        if (toast) showToast(toast.message, toast.type);
+      },
+    );
+    const unlistenParked = listen<LimitParkedPayload>("session-limit-parked", (event) => {
+      parked.push(event.payload ?? {});
+    });
+    const unlistenContinued = listen<LimitContinuedPayload>(
+      "session-limit-reset-continued",
+      (event) => {
+        continued.push(event.payload ?? {});
+      },
+    );
     const unlistenMigrated = listen<MigratedPayload>("session-account-migrated", (event) => {
       const toast = migratedToast(event.payload ?? {});
       showToast(toast.message, toast.type);
@@ -183,6 +336,10 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
     return () => {
       unlistenMigrated.then((fn) => fn());
       unlistenSkipped.then((fn) => fn());
+      unlistenParked.then((fn) => fn());
+      unlistenContinued.then((fn) => fn());
+      parked.cancel();
+      continued.cancel();
     };
   }, [showToast]);
 }

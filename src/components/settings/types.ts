@@ -128,6 +128,10 @@ export interface ClaudeCliSettings {
   /** After a migration respawn, nudge the resumed session to continue its
    * task once the CLI is idle. Runner default: true. */
   auto_continue_after_migration?: boolean;
+  /** When a session stopped at its account's usage limit and that limit has
+   * since reset, type a continue prompt into it, in place, once per stop.
+   * Independent of migration and of the account count. Runner default: true. */
+  auto_continue_after_limit_reset?: boolean;
   /** Let the runner install Claude Code CLI updates on this machine: one
    * runner-side updater installs a newly published release once, when it is
    * newer than the installed one. Runner-spawned sessions never update

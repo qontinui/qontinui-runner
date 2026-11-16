@@ -4,9 +4,15 @@
  * tested rather than the hook's `listen` wiring.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
-import { migratedToast, type MigratedPayload } from "./useAccountMigrationNotifications";
+import {
+  createBurstCoalescer,
+  limitContinuedToast,
+  limitParkedToast,
+  migratedToast,
+  type MigratedPayload,
+} from "./useAccountMigrationNotifications";
 
 const base: MigratedPayload = {
   claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
@@ -109,5 +115,98 @@ describe("migratedToast", () => {
       "Session 0c4e3025 migrated: .claude-a ran out of tokens → resumed on .claude-b",
     );
     expect(toast.type).toBe("success");
+  });
+});
+
+describe("limitParkedToast (plan 2026-11-05 Phase 2)", () => {
+  const hhmm = (ms: number) => `T${ms}`;
+
+  it("is an info toast, never the error the skipped event raises", () => {
+    const toast = limitParkedToast(
+      [
+        {
+          claudeSessionId: "aaaaaaaa-1111",
+          configDir: "/home/u/.claude-jan",
+          dueAtMs: 5,
+          reason: "reset-pending",
+        },
+      ],
+      hhmm,
+    );
+    expect(toast?.type).toBe("info");
+    expect(toast?.message).toBe(
+      "Session aaaaaaaa stopped at its usage limit on .claude-jan and is parked until T5 (reset-pending)",
+    );
+    expect(toast?.message).not.toContain("out of tokens");
+  });
+
+  it("coalesces a burst into one count, by session, until the latest due time", () => {
+    const toast = limitParkedToast(
+      [
+        { claudeSessionId: "s1", dueAtMs: 10 },
+        { claudeSessionId: "s2", dueAtMs: 30 },
+        { claudeSessionId: "s1", dueAtMs: 20 },
+        { claudeSessionId: "s3", dueAtMs: 15 },
+      ],
+      hhmm,
+    );
+    expect(toast?.message).toBe("3 sessions stopped at their usage limit and are parked until T30");
+  });
+
+  it("says no time when none was sent, and nothing for an empty burst", () => {
+    expect(
+      limitParkedToast([{ claudeSessionId: "s1" }, { claudeSessionId: "s2" }], hhmm)?.message,
+    ).toBe("2 sessions stopped at their usage limit and are parked");
+    expect(limitParkedToast([], hhmm)).toBeNull();
+  });
+});
+
+describe("limitContinuedToast", () => {
+  it("names one session, and counts a burst", () => {
+    expect(
+      limitContinuedToast([
+        { claudeSessionId: "bbbbbbbb-2222", configDir: "C:\\claude\\.claude-x" },
+      ])?.message,
+    ).toBe("Session bbbbbbbb's usage limit on .claude-x has reset — told it to continue");
+    const many = limitContinuedToast([{ claudeSessionId: "a" }, { claudeSessionId: "b" }]);
+    expect(many?.message).toBe("2 sessions' usage limits have reset — told each to continue");
+    expect(many?.type).toBe("success");
+    expect(limitContinuedToast([])).toBeNull();
+  });
+});
+
+describe("createBurstCoalescer", () => {
+  it("flushes everything pushed within the window once, then starts a new burst", () => {
+    vi.useFakeTimers();
+    try {
+      const flushed: number[][] = [];
+      const c = createBurstCoalescer<number>(2000, (items) => flushed.push(items));
+      c.push(1);
+      vi.advanceTimersByTime(1000);
+      c.push(2);
+      c.push(3);
+      expect(flushed).toEqual([]);
+      vi.advanceTimersByTime(1000);
+      expect(flushed).toEqual([[1, 2, 3]]);
+      c.push(4);
+      vi.advanceTimersByTime(2000);
+      expect(flushed).toEqual([[1, 2, 3], [4]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops a pending burst on cancel", () => {
+    vi.useFakeTimers();
+    try {
+      const flushed: number[][] = [];
+      const c = createBurstCoalescer<number>(2000, (items) => flushed.push(items));
+      c.push(1);
+      c.cancel();
+      vi.advanceTimersByTime(5000);
+      expect(flushed).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
