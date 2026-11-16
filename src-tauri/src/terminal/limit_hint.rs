@@ -23,8 +23,11 @@ use super::limit_stop::{LimitStop, LimitStopRead};
 
 /// What the hint path reads and does, for one session.
 pub(crate) trait HintEnv {
-    /// `(auto_migrate_on_token_exhaustion, auto_continue_after_limit_reset)`.
+    /// `(auto_migrate_on_token_exhaustion, auto_continue_after_limit_reset)`,
+    /// as [`hint_switches`] reads them.
     fn switches(&self) -> (bool, bool);
+    /// The session's lifecycle record has `finished_at` set.
+    fn finished(&self) -> bool;
     /// How many Claude config dirs (accounts) are configured.
     fn config_dir_count(&self) -> usize;
     /// The session transcript's limit-stop read.
@@ -41,6 +44,8 @@ pub(crate) trait HintEnv {
     fn migrated_at(&self) -> Option<i64>;
     /// Count one more probe-unknown park of this stop; returns the count.
     fn note_unknown_park(&self, entry_uuid: &str) -> u32;
+    /// A probe answered for this stop: restart its unknown-park backoff.
+    fn clear_unknown_parks(&self, entry_uuid: &str);
     fn now_ms(&self) -> i64;
     /// Nothing to do: log why.
     fn skip(&self, why: SkipReason, read: &LimitStopRead);
@@ -64,9 +69,18 @@ pub(crate) enum HintFlow {
     },
 }
 
-/// The hint path for a session whose record is open: `finished` is whether
-/// that record has `finished_at` set, `config_dir` its account.
-pub(crate) async fn run_hint(env: &impl HintEnv, finished: bool, config_dir: &str) -> HintFlow {
+/// The two switches the hint path reads, from the Claude CLI settings:
+/// `(auto_migrate_on_token_exhaustion, auto_continue_after_limit_reset)`.
+pub(crate) fn hint_switches(cli: &crate::settings::ClaudeCliSettings) -> (bool, bool) {
+    (
+        cli.auto_migrate_on_token_exhaustion,
+        cli.auto_continue_after_limit_reset,
+    )
+}
+
+/// The hint path for a session whose record is open; `config_dir` is its
+/// account.
+pub(crate) async fn run_hint(env: &impl HintEnv, config_dir: &str) -> HintFlow {
     let (auto_migrate, auto_continue) = env.switches();
     let no_stop = LimitStopRead::NotStopped;
     if !hint_wanted(auto_migrate, auto_continue) {
@@ -93,9 +107,12 @@ pub(crate) async fn run_hint(env: &impl HintEnv, finished: bool, config_dir: &st
         }
         ProbeSource::NoRow => ProbeVerdict::from_row(None, env.known_exhausted()),
     };
+    if let (false, LimitStopRead::Stopped(stop)) = (probe.unknown, &read) {
+        env.clear_unknown_parks(&stop.entry_uuid);
+    }
     let now_ms = env.now_ms();
     let action = decide(&HintInputs {
-        finished,
+        finished: env.finished(),
         read: read.clone(),
         probe,
         now_ms,
