@@ -57,11 +57,12 @@ pub(crate) const MIGRATION_NUDGE_WINDOW_MS: i64 = 300_000;
 /// session stays on its own account, so its subagents' transcripts are where
 /// they were.
 pub(crate) const LIMIT_RESET_NUDGE: &str = "This session stopped when its Claude account hit a \
-usage limit, and that limit has now reset. Continue the task you were working on from where it \
-left off; if you were idle awaiting operator input, say so and wait. Subagents interrupted by the \
-limit still have their transcripts on this account: resume each one with SendMessage to its agent \
-id instead of spawning a replacement (cancel any resume gate you booked for it first), and only if \
-SendMessage reports \"No transcript found\" fall back to its checkpoint or worktree.";
+usage limit, and it can run again now: the limit has reset, or the session was moved to an account \
+with capacity. Continue the task you were working on from where it left off; if you were idle \
+awaiting operator input, say so and wait. Subagents interrupted by the limit should still have \
+their transcripts on this account: resume each one with SendMessage to its agent id instead of \
+spawning a replacement (cancel any resume gate you booked for it first), and only if SendMessage \
+reports \"No transcript found\" fall back to its checkpoint or worktree.";
 
 /// The event a park emits. Not `session-account-migration-skipped`: that one
 /// is shown as an ERROR toast reading "out of tokens … NOT migrated", which is
@@ -208,6 +209,10 @@ pub(crate) struct HintInputs {
     pub auto_migrate: bool,
     /// `claude_cli.auto_continue_after_limit_reset`.
     pub auto_continue: bool,
+    /// `claude_cli.auto_continue_after_migration`: whether a migration types
+    /// its own continue nudge. Off, a stop the migration carried is left
+    /// alone, as the operator chose.
+    pub continue_after_migration: bool,
     /// How many Claude config dirs (accounts) are configured.
     pub config_dir_count: usize,
     /// When this session last migrated in this process (its migration-cap
@@ -272,8 +277,9 @@ pub(crate) enum SkipReason {
     MigrateDisabled,
     /// Not a stop, the account is exhausted, and there is no other account.
     NoOtherAccount,
-    /// The stop came before this session's latest migration, within the
-    /// window that migration's own continue nudge can still be running.
+    /// The stop came before this session's latest migration, onto an account
+    /// that is fine, and `auto_continue_after_migration` is off: the operator
+    /// chose that a migrated session is not prompted.
     MigratedSinceStop,
     /// Both the migration and the reset-continue are switched off.
     Disabled,
@@ -349,10 +355,21 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
                 // can no longer be running, a transcript still ending at the
                 // stop says it never landed, and the old account's reset time
                 // is not this account's.
-                return if i.probe.known_exhausted {
+                return if i.probe.unknown {
+                    // Never migrate, and never continue, on an unknown probe.
+                    retry_or_skip(
+                        i,
+                        LimitAction::Park {
+                            due_at_ms: i.now_ms + LIMIT_RESET_MARGIN_MS,
+                            reason: ParkReason::ProbeUnknown,
+                        },
+                    )
+                } else if i.probe.known_exhausted {
                     // Parked, if the hop is refused, until THIS account's
                     // reset: the stop's own reset is the old account's.
                     migrate_or_park(i, Some(probe_park_due_at(&i.probe, i.now_ms)))
+                } else if !i.continue_after_migration {
+                    LimitAction::Skip(SkipReason::MigratedSinceStop)
                 } else if i.now_ms - migrated_at <= MIGRATION_NUDGE_WINDOW_MS {
                     // Looked at again once the nudge cannot be running: a
                     // landed nudge then reads NotStopped, a lost one is
@@ -373,7 +390,7 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
             let reset_passed = stop.resets_at_ms.is_none_or(|r| r <= i.now_ms);
             if i.probe.unknown && reset_passed {
                 // Never migrate, and never continue, on an unknown probe.
-                return continue_or_skip(
+                return retry_or_skip(
                     i,
                     LimitAction::Park {
                         due_at_ms: i.now_ms + LIMIT_RESET_MARGIN_MS,
@@ -411,6 +428,17 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
 /// Returns the migration's time when it came after the stop.
 fn migrated_since(stop: &LimitStop, migrated_at_ms: Option<i64>) -> Option<i64> {
     migrated_at_ms.filter(|m| stop.stopped_at_ms.is_none_or(|s| s <= *m))
+}
+
+/// `action` (a probe-unknown park) when its re-entry can lead anywhere: a
+/// continue, or a migration once the probe answers exhausted (an errored probe
+/// is often the limit itself).
+fn retry_or_skip(i: &HintInputs, action: LimitAction) -> LimitAction {
+    if i.auto_continue || (i.auto_migrate && i.config_dir_count >= 2) {
+        action
+    } else {
+        LimitAction::Skip(SkipReason::ContinueDisabled)
+    }
 }
 
 /// `action` when it can end in a continue, which needs the reset-continue

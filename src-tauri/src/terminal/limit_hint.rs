@@ -23,9 +23,8 @@ use super::limit_stop::{LimitStop, LimitStopRead};
 
 /// What the hint path reads and does, for one session.
 pub(crate) trait HintEnv {
-    /// `(auto_migrate_on_token_exhaustion, auto_continue_after_limit_reset)`,
-    /// as [`hint_switches`] reads them.
-    fn switches(&self) -> (bool, bool);
+    /// The three switches, as [`hint_switches`] reads them.
+    fn switches(&self) -> HintSwitches;
     /// The session's lifecycle record has `finished_at` set.
     fn finished(&self) -> bool;
     /// How many Claude config dirs (accounts) are configured.
@@ -51,6 +50,9 @@ pub(crate) trait HintEnv {
     fn skip(&self, why: SkipReason, read: &LimitStopRead);
     /// Park the session and report the park.
     fn park(&self, due_at_ms: i64, reason: ParkReason);
+    /// The session no longer stops at a limit: drop its pane's pending park
+    /// and reported reason, so a later stop's park is news again.
+    fn forget_park(&self);
     /// Continue the session in place.
     fn continue_stop(&self, stop: LimitStop) -> impl Future<Output = ()> + Send;
 }
@@ -69,19 +71,34 @@ pub(crate) enum HintFlow {
     },
 }
 
-/// The two switches the hint path reads, from the Claude CLI settings:
-/// `(auto_migrate_on_token_exhaustion, auto_continue_after_limit_reset)`.
-pub(crate) fn hint_switches(cli: &crate::settings::ClaudeCliSettings) -> (bool, bool) {
-    (
-        cli.auto_migrate_on_token_exhaustion,
-        cli.auto_continue_after_limit_reset,
-    )
+/// The switches the hint path reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HintSwitches {
+    /// `claude_cli.auto_migrate_on_token_exhaustion`.
+    pub auto_migrate: bool,
+    /// `claude_cli.auto_continue_after_limit_reset`.
+    pub auto_continue: bool,
+    /// `claude_cli.auto_continue_after_migration`.
+    pub continue_after_migration: bool,
+}
+
+/// The switches the hint path reads, from the Claude CLI settings.
+pub(crate) fn hint_switches(cli: &crate::settings::ClaudeCliSettings) -> HintSwitches {
+    HintSwitches {
+        auto_migrate: cli.auto_migrate_on_token_exhaustion,
+        auto_continue: cli.auto_continue_after_limit_reset,
+        continue_after_migration: cli.auto_continue_after_migration,
+    }
 }
 
 /// The hint path for a session whose record is open; `config_dir` is its
 /// account.
 pub(crate) async fn run_hint(env: &impl HintEnv, config_dir: &str) -> HintFlow {
-    let (auto_migrate, auto_continue) = env.switches();
+    let HintSwitches {
+        auto_migrate,
+        auto_continue,
+        continue_after_migration,
+    } = env.switches();
     let no_stop = LimitStopRead::NotStopped;
     if !hint_wanted(auto_migrate, auto_continue) {
         env.skip(SkipReason::Disabled, &no_stop);
@@ -90,6 +107,9 @@ pub(crate) async fn run_hint(env: &impl HintEnv, config_dir: &str) -> HintFlow {
     // Did the session STOP at a limit? The transcript says; the screen match
     // that brought the hint here is only a hint.
     let read = env.read_stop().await;
+    if matches!(read, LimitStopRead::NotStopped) {
+        env.forget_park();
+    }
     let config_dir_count = env.config_dir_count();
     // CONFIRM with a fresh probe: conversation text can quote a limit, and a
     // resume repaint can re-render a historical one.
@@ -120,6 +140,7 @@ pub(crate) async fn run_hint(env: &impl HintEnv, config_dir: &str) -> HintFlow {
         auto_continue,
         config_dir_count,
         migrated_at_ms: env.migrated_at(),
+        continue_after_migration,
     });
     match action {
         LimitAction::Skip(why) => {
