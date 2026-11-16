@@ -79,8 +79,9 @@ pub(crate) enum CoordRegistration {
     /// The Tauri command's pane identity: RESUME the coord row persisted for
     /// `pane_key` if there is one and no other pane is bound to it (falling
     /// back to a fresh register when coord has GC'd it), otherwise register
-    /// fresh — and persist the resulting id over `pane_key` so the next runner start resumes the same row. Keyed by
-    /// the pane's pinned harness session id either way.
+    /// fresh — and persist the resulting id over `pane_key` so the next runner
+    /// start resumes the same row. Keyed by the pane's pinned harness session
+    /// id either way.
     PaneKeyed {
         pane_store: Arc<PaneSessionStore>,
         pane_key: PaneKey,
@@ -168,6 +169,10 @@ pub(crate) async fn wire_coord_session(
 
     let mut resumed = false;
     let mut persist_to: Option<(Arc<PaneSessionStore>, PaneKey)> = None;
+    // Held from before the bound-row check until the pane is bound, so a
+    // concurrent same-key create cannot pass the check across the
+    // `resume_external` await. Released right after the bind below.
+    let mut resume_claim: Option<crate::session::pane_store::ResumeClaim> = None;
     let registration: Result<Uuid, SessionError> = match registration {
         CoordRegistration::PaneKeyed {
             pane_store,
@@ -181,36 +186,55 @@ pub(crate) async fn wire_coord_session(
             // requires exactly one live pane). Register fresh instead. An unreadable
             // terminal map is UNKNOWN and takes the same fresh arm: one extra
             // row is recoverable, a shared one is not. Finding 77046422.
+            //
+            // The check is taken under a resume claim on the row: another
+            // create in this process mid-resume of the same row holds it,
+            // and that is treated as a live holder (it will be bound the
+            // moment its await returns).
             let persisted = match pane_store.get(&pane_key) {
-                Some(prior_id) => match terminal_manager.coord_row_bound_at(prior_id) {
-                    Some(None) => {
-                        persist_to = Some((pane_store, pane_key));
-                        Some(prior_id)
-                    }
-                    held_or_unknown => {
-                        // An EXITED holder lingers in the map, still bound,
-                        // until its tab closes — and closing it closes the row
-                        // again, so even a dead holder's row is not safe to
-                        // share. But it will never be resumed by that pane, so
-                        // the key moves to this pane's fresh row; a live holder
-                        // (or an unreadable map) keeps the key.
-                        let holder_alive = held_or_unknown.is_none()
-                            || live_pane_holds(terminal_manager, prior_id);
-                        if !holder_alive {
-                            persist_to = Some((pane_store, pane_key));
-                        }
+                Some(prior_id) => match pane_store.claim_resume(prior_id) {
+                    None => {
                         warn!(
                             terminal_id = %terminal_id,
                             coord_session = %prior_id,
                             door,
-                            held = held_or_unknown.is_some(),
-                            holder_alive,
-                            "terminal create: the pane key's persisted coord row is still bound \
-                             to another pane (or the terminal map is unreadable) — registering \
-                             a fresh row instead of resuming it"
+                            "terminal create: another create is resuming the pane key's \
+                             persisted coord row right now (or the claim set is unreadable) \
+                             — registering a fresh row instead of resuming it"
                         );
                         None
                     }
+                    Some(claim) => match terminal_manager.coord_row_bound_at(prior_id) {
+                        Some(None) => {
+                            resume_claim = Some(claim);
+                            persist_to = Some((pane_store, pane_key));
+                            Some(prior_id)
+                        }
+                        held_or_unknown => {
+                            // An EXITED holder lingers in the map, still bound,
+                            // until its tab closes — and closing it closes the row
+                            // again, so even a dead holder's row is not safe to
+                            // share. But it will never be resumed by that pane, so
+                            // the key moves to this pane's fresh row; a live holder
+                            // (or an unreadable map) keeps the key.
+                            let holder_alive = held_or_unknown.is_none()
+                                || live_pane_holds(terminal_manager, prior_id);
+                            if !holder_alive {
+                                persist_to = Some((pane_store, pane_key));
+                            }
+                            warn!(
+                                terminal_id = %terminal_id,
+                                coord_session = %prior_id,
+                                door,
+                                held = held_or_unknown.is_some(),
+                                holder_alive,
+                                "terminal create: the pane key's persisted coord row is still bound \
+                                 to another pane (or the terminal map is unreadable) — registering \
+                                 a fresh row instead of resuming it"
+                            );
+                            None
+                        }
+                    },
                 },
                 None => {
                     persist_to = Some((pane_store, pane_key));
@@ -270,14 +294,21 @@ pub(crate) async fn wire_coord_session(
         }
     };
 
+    bind_registered_coord_session(terminal_manager, registry, terminal_id, coord_id, door);
+    // The row is now visible as bound in the terminal map, so the map check
+    // alone protects it from here on.
+    drop(resume_claim);
+
     // Persist (or refresh) the pane → coord-id mapping so the NEXT restart
     // resumes this same row. On the GC'd-fallback path `coord_id` is a fresh
-    // id replacing the stale one.
+    // id replacing the stale one. AFTER the bind: a same-key create that
+    // reads the key from here on finds the row already bound and registers
+    // fresh. Written before the bind, a fresh row would be visible under the
+    // key with no pane bound to it and no claim on it, and a racing create
+    // could resume it.
     if let Some((pane_store, pane_key)) = persist_to {
         pane_store.put(&pane_key, coord_id);
     }
-
-    bind_registered_coord_session(terminal_manager, registry, terminal_id, coord_id, door);
     info!(
         terminal_id = %terminal_id,
         coord_session = %coord_id,
@@ -618,6 +649,41 @@ mod tests {
             Some(first_coord),
             "the key stays with its holder"
         );
+    }
+
+    /// A row another create is mid-resume of (its claim held across the
+    /// `resume_external` await, before its bind) is not resumed a second time:
+    /// the racing create registers fresh and leaves the key alone. Once the
+    /// claim is released the row is resumable again. The #2972 residual.
+    #[tokio::test]
+    async fn a_row_another_create_is_resuming_registers_fresh() {
+        let fx = test_support::registry();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PaneSessionStore::open(dir.path().join("panes.json")).unwrap());
+        let key = PaneKey::from_create_in_window("default", "wiring test", "", "main");
+        let tm = TerminalManager::new();
+        let registration = || CoordRegistration::PaneKeyed {
+            pane_store: store.clone(),
+            pane_key: key.clone(),
+        };
+        let prior = Uuid::new_v4();
+        store.put(&key, prior);
+        let in_flight = store.claim_resume(prior).expect("claim");
+        let racer = pane(&tm, "t-racer");
+        let racer_coord = wire_coord_session(
+            &tm,
+            &fx.registry,
+            "t-racer",
+            intent(),
+            registration(),
+            "test",
+        )
+        .await
+        .expect("registers");
+        assert_ne!(racer_coord, prior, "a row mid-resume is not shared");
+        assert_eq!(racer.coord_session_id(), Some(racer_coord));
+        assert_eq!(store.get(&key), Some(prior), "the key stays put");
+        drop(in_flight);
     }
 
     /// A holder whose PTY has exited still gets no shared row — closing its
