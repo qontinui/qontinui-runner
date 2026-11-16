@@ -158,6 +158,11 @@ pub struct LaunchPayload {
     /// is indistinguishable from one honoured.
     #[serde(default)]
     pub account: Option<String>,
+    /// The launch model / effort coord decided for this spawn
+    /// (`launch_model`, `launch_effort`, `launch_settings`). Validated and
+    /// applied at the launch seam; see [`crate::claude_session::frame_launch`].
+    #[serde(flatten)]
+    pub launch: crate::claude_session::frame_launch::FrameLaunchKeys,
 }
 
 impl LaunchPayload {
@@ -349,6 +354,11 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The launch model / effort coord decided for this spawn
+    /// (`launch_model`, `launch_effort`, `launch_settings`). Validated and
+    /// applied at the launch seam; see [`crate::claude_session::frame_launch`].
+    #[serde(flatten)]
+    pub launch: crate::claude_session::frame_launch::FrameLaunchKeys,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -813,6 +823,11 @@ pub struct ConditionCheckPayload {
     /// no placeholders.
     #[serde(default)]
     pub secrets: crate::condition_secrets::FrameSecrets,
+    /// The launch model / effort coord decided for this spawn
+    /// (`launch_model`, `launch_effort`, `launch_settings`). Validated and
+    /// applied at the launch seam; see [`crate::claude_session::frame_launch`].
+    #[serde(flatten)]
+    pub launch: crate::claude_session::frame_launch::FrameLaunchKeys,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -7574,6 +7589,7 @@ async fn run_gate_continuation_inner(
                 reservation,
                 pinned_session_id,
                 ctx,
+                &payload.launch.resolve(),
             )
             .await;
             presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
@@ -7758,6 +7774,36 @@ pub(crate) fn build_continuation_claude_command(
     hook_settings_args: Vec<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
 ) -> Vec<String> {
+    build_continuation_claude_command_with(
+        claude_bin,
+        pinned_session_id,
+        session_name,
+        add_dir_args,
+        prompt,
+        system_prompt,
+        hook_settings_args,
+        launch_cfg,
+        &crate::claude_session::frame_launch::FrameLaunch::default(),
+    )
+}
+
+/// [`build_continuation_claude_command`] with the spawn frame's launch choice
+/// bound into `LaunchSpec.model` / `.effort` (plan
+/// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` Phase 4).
+/// A default [`FrameLaunch`](crate::claude_session::frame_launch::FrameLaunch)
+/// leaves the argv byte-identical to the historical one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_continuation_claude_command_with(
+    claude_bin: String,
+    pinned_session_id: &str,
+    session_name: Option<&str>,
+    add_dir_args: Vec<String>,
+    prompt: String,
+    system_prompt: Option<crate::session::spawn_prompt::SystemPromptCarrier>,
+    hook_settings_args: Vec<String>,
+    launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    frame_launch: &crate::claude_session::frame_launch::FrameLaunch,
+) -> Vec<String> {
     use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
 
     // `extra_required` is the caller-authoritative, verbatim tail — never
@@ -7803,6 +7849,8 @@ pub(crate) fn build_continuation_claude_command(
         permission: PermissionMode::DangerouslySkip,
         session_id: Some(pinned_session_id.to_string()),
         name: session_name.map(str::to_string),
+        model: frame_launch.model.clone(),
+        effort: frame_launch.effort.clone(),
         extra_required,
         ..Default::default()
     };
@@ -8134,7 +8182,8 @@ async fn run_continuation_terminal(
         // The marker the policy hook's route trusts as proof of delivery — taken
         // from the very carrier the argv uses, never recomputed.
         let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
-        let argv = build_continuation_claude_command(
+        let frame_launch = payload.launch.resolve();
+        let argv = build_continuation_claude_command_with(
             claude_bin.clone(),
             &pinned_session_id,
             spawn_name.as_deref(),
@@ -8149,6 +8198,7 @@ async fn run_continuation_terminal(
             // must be checked (plan 2026-10-28-finished-gate-continuations-…).
             crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
+            &frame_launch,
         );
         // ...unless an operator template put a replacement prompt in the final
         // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
@@ -9180,7 +9230,8 @@ async fn run_condition_check_terminal(
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
-    let argv = build_continuation_claude_command(
+    let frame_launch = payload.launch.resolve();
+    let argv = build_continuation_claude_command_with(
         claude_bin,
         &pinned_session_id,
         spawn_name.as_deref(),
@@ -9192,6 +9243,7 @@ async fn run_condition_check_terminal(
         // with no SessionStart/PreCompact/Stop hook at all.
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
+        &frame_launch,
     );
     // Withheld when an operator template adds a replacement prompt.
     let policy_delivery =
@@ -9710,6 +9762,8 @@ async fn run_continuation_headless(
     // subprocess exits), matching the agent-spawn path's heartbeat-then-release
     // lifecycle; handed to the remover when the spawn fails before its child.
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    // The spawn frame's validated launch model / effort (empty ⇒ unchanged).
+    frame_launch: &crate::claude_session::frame_launch::FrameLaunch,
 ) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -9735,10 +9789,11 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    let session_args = headless_agent_args(
+    let mut session_args = headless_agent_args(
         &crate::settings::get_claude_session_permission(),
         pinned_session_args(pinned_session_id),
     );
+    session_args.extend(frame_launch.headless_args());
     match spawn_claude_child(
         workdir,
         initial_prompt,
@@ -10312,6 +10367,8 @@ async fn run_agent_subprocess(
     // materialized here and one allocated via the coord HTTP path land at the
     // same on-disk location.
     let agent_id = payload.agent_id;
+    // Decided by coord once; logged once per spawn, not per restart attempt.
+    let frame_launch = payload.launch.resolve();
     for wt in &mut payload.worktrees {
         // Reuse the canonical-checkout resolver (do NOT re-derive `root/name`).
         // `worktree_source_checkout` is the same door `materialize_worktrees`
@@ -10666,10 +10723,11 @@ async fn run_agent_subprocess(
         // Pin this attempt's Claude session id so coord can be told which
         // session the dispatch launched. Minted INSIDE the loop, fresh per
         // attempt: a restart is a new session, and the CLI refuses a reused id.
-        let session_args = headless_agent_args(
+        let mut session_args = headless_agent_args(
             &crate::settings::get_claude_session_permission(),
             session_pins.next_attempt(),
         );
+        session_args.extend(frame_launch.headless_args());
         match spawn_claude_child(
             &primary_wt,
             &payload.initial_prompt,
@@ -13608,6 +13666,7 @@ mod tests {
             report_token: report_token.map(|s| s.to_string()),
             condition_name: None,
             secrets: Default::default(),
+            launch: Default::default(),
         }
     }
 
@@ -14646,6 +14705,151 @@ mod tests {
         }
     }
 
+    // ---- plan 2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type, Phase 4 ----
+
+    fn frame_with(launch: serde_json::Value) -> serde_json::Value {
+        let mut inner = serde_json::json!({
+            "source": GATE_CONTINUATION_SOURCE,
+            "target_device_id": uuid::Uuid::nil(),
+            "initial_prompt": "go",
+        });
+        inner.as_object_mut().unwrap().extend(launch.as_object().unwrap().clone());
+        serde_json::json!({ "payload": inner })
+    }
+
+    /// Seam 1 (terminal continuation / condition check): a frame's
+    /// `launch_model: "sonnet"` renders exactly one `--model sonnet` over a
+    /// template `--model opus`, and an invalid `launch_effort` renders nothing.
+    #[test]
+    fn frame_launch_model_beats_template_model_and_invalid_effort_renders_nothing() {
+        let payload = parse_gate_continuation_payload(&frame_with(serde_json::json!({
+            "launch_model": "sonnet",
+            "launch_effort": "turbo",
+            "launch_settings": {"spawn_type": "post_merge", "model_source": "operator_setting"},
+        })))
+        .unwrap();
+        let launch = payload.launch.resolve();
+        let cfg = crate::claude_session::launch_spec::LaunchConfig {
+            default_template: Some("claude --model opus".to_string()),
+            ..Default::default()
+        };
+        let cmd = build_continuation_claude_command_with(
+            "claude".to_string(),
+            "abc-123",
+            None,
+            Vec::new(),
+            "p".to_string(),
+            None,
+            Vec::new(),
+            &cfg,
+            &launch,
+        );
+        assert_eq!(cmd.iter().filter(|a| *a == "--model").count(), 1);
+        let i = cmd.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(cmd[i + 1], "sonnet");
+        assert!(!cmd.iter().any(|a| a.starts_with("--effort")));
+    }
+
+    #[test]
+    fn frame_launch_effort_renders_once_over_a_template_effort() {
+        let payload = parse_gate_continuation_payload(&frame_with(serde_json::json!({
+            "launch_effort": "low",
+        })))
+        .unwrap();
+        let cfg = crate::claude_session::launch_spec::LaunchConfig {
+            default_template: Some("claude --effort max".to_string()),
+            ..Default::default()
+        };
+        let cmd = build_continuation_claude_command_with(
+            "claude".to_string(),
+            "abc-123",
+            None,
+            Vec::new(),
+            "p".to_string(),
+            None,
+            Vec::new(),
+            &cfg,
+            &payload.launch.resolve(),
+        );
+        assert_eq!(cmd.iter().filter(|a| *a == "--effort").count(), 1);
+        let i = cmd.iter().position(|a| a == "--effort").unwrap();
+        assert_eq!(cmd[i + 1], "low");
+    }
+
+    /// A frame with no launch keys leaves the argv exactly as before.
+    #[test]
+    fn frame_without_launch_keys_leaves_the_argv_unchanged() {
+        let payload =
+            parse_gate_continuation_payload(&frame_with(serde_json::json!({}))).unwrap();
+        let cfg = crate::claude_session::launch_spec::LaunchConfig::default();
+        let args = |launch: &crate::claude_session::frame_launch::FrameLaunch| {
+            build_continuation_claude_command_with(
+                "claude".to_string(),
+                "abc-123",
+                None,
+                Vec::new(),
+                "p".to_string(),
+                None,
+                Vec::new(),
+                &cfg,
+                launch,
+            )
+        };
+        assert_eq!(
+            args(&payload.launch.resolve()),
+            build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                None,
+                Vec::new(),
+                "p".to_string(),
+                None,
+                Vec::new(),
+                &cfg,
+            )
+        );
+    }
+
+    /// Seams 2 and 3 (headless continuation, coord agent spawn): the frame's
+    /// choice is appended to the headless child's args.
+    #[test]
+    fn headless_seams_append_the_frame_choice() {
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let launch = crate::claude_session::frame_launch::FrameLaunch::from_frame(
+            Some("haiku"),
+            Some("medium"),
+            None,
+        );
+        let mut args = headless_agent_args(
+            &crate::claude_session::launch_spec::SessionPermissionSetting::SiteDefault,
+            pinned_session_args(id),
+        );
+        args.extend(launch.headless_args());
+        assert_eq!(
+            &args[args.len() - 4..],
+            ["--model", "haiku", "--effort", "medium"]
+        );
+    }
+
+    /// The coord agent-spawn and condition-check shapes read the same keys.
+    #[test]
+    fn launch_and_condition_payloads_read_the_launch_keys() {
+        let lp: LaunchPayload = serde_json::from_value(serde_json::json!({
+            "agent_id": uuid::Uuid::nil(),
+            "target_device_id": uuid::Uuid::nil(),
+            "worktrees": [],
+            "initial_prompt": "go",
+            "claim_token": "t",
+            "launch_model": "fable",
+            "launch_effort": "xhigh",
+        }))
+        .unwrap();
+        let l = lp.launch.resolve();
+        assert_eq!((l.model.as_deref(), l.effort.as_deref()), (Some("fable"), Some("xhigh")));
+        let cp = condition_payload(None, "p".to_string());
+        assert!(cp.launch.resolve().is_empty());
+    }
+
     #[test]
     fn launch_payload_round_trips_through_envelope() {
         let payload = LaunchPayload {
@@ -14670,6 +14874,7 @@ mod tests {
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
             account: None,
+            launch: Default::default(),
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -17885,6 +18090,7 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            launch: Default::default(),
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -18024,6 +18230,7 @@ mod tests {
             AnchorReservation::none(),
             pinned,
             None,
+            &Default::default(),
         )
         .await;
         assert!(
@@ -21692,6 +21899,7 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                launch: Default::default(),
             }
         }
         let gate = uuid::Uuid::now_v7();

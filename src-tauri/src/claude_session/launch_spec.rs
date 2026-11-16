@@ -235,6 +235,10 @@ pub struct LaunchSpec {
     /// Caller-provided model ⇒ `--model <m>`; subsumes model overrides and any
     /// failover sniff. When set, drops any `--model` from the template.
     pub model: Option<String>,
+    /// Caller-provided reasoning effort => `--effort <level>`, rendered once.
+    /// When set, drops any `--effort` (spaced or `=`-attached) from the
+    /// template. The coord spawn frame's `launch_effort` binds here.
+    pub effort: Option<String>,
     /// Display name ⇒ `--name <v>` (shown in the prompt box, `/resume` picker and
     /// terminal title). Passed through [`sanitize_session_name`]; a name that
     /// sanitises to nothing is omitted. When set, drops any `--name` / `-n` (and
@@ -508,6 +512,9 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 }
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
+                // Effort is spec-owned when the caller supplies one.
+                "--effort" if spec.effort.is_some() => {}
+                n if spec.effort.is_some() && n.starts_with("--effort=") => {}
                 // Name is spec-owned when the caller supplies one: drop the
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
@@ -566,6 +573,13 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     } else if let Some(model) = template_model {
         out.push("--model".to_string());
         out.push(model);
+    }
+
+    // 2b. Effort - only when the spec supplies it; a template's own `--effort`
+    //     otherwise rides with the other template flags, unchanged.
+    if let Some(effort) = &spec.effort {
+        out.push("--effort".to_string());
+        out.push(effort.clone());
     }
 
     // 3. Session — appended only when the template did not position it via
@@ -985,6 +999,25 @@ mod tests {
             .position(|a| a == flag)
             .and_then(|i| argv.get(i + 1))
             .map(String::as_str)
+    }
+
+    #[test]
+    fn spec_effort_renders_once_and_beats_a_template_effort() {
+        let mut s = spec();
+        s.effort = Some("low".to_string());
+        let argv = render_argv(&s, &tmpl("claude --effort high --model opus"), "claude");
+        assert_eq!(argv.iter().filter(|a| *a == "--effort").count(), 1);
+        assert_eq!(value_after(&argv, "--effort"), Some("low"));
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+        let argv = render_argv(&s, &tmpl("claude --effort=high"), "claude");
+        assert_eq!(argv.iter().filter(|a| a.starts_with("--effort")).count(), 1);
+        assert_eq!(value_after(&argv, "--effort"), Some("low"));
+    }
+
+    #[test]
+    fn no_spec_effort_leaves_the_template_effort_alone() {
+        let argv = render_argv(&spec(), &tmpl("claude --effort high"), "claude");
+        assert_eq!(value_after(&argv, "--effort"), Some("high"));
     }
 
     #[test]

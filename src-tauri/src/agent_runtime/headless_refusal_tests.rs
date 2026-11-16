@@ -174,6 +174,7 @@ async fn refuse_headless(
                 AnchorReservation::none(),
                 uuid::Uuid::new_v4(),
                 Some(f.ctx),
+                &Default::default(),
             )
             .await;
             (res, OBSERVED_REMOVAL.with(|slot| slot.borrow_mut().take()))
