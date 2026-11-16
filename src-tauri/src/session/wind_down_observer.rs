@@ -672,6 +672,42 @@ pub async fn fetch_obligations(claude_session_id: &str) -> Result<serde_json::Va
     .await
 }
 
+/// The first worktree in coord's obligations answer (`worktrees.items[]`)
+/// that the custody gate did NOT cover — the rule that keeps the remote half
+/// of `closeable` from vouching for a tree the local half never looked at
+/// (#2981 review concern 3, coord finding `9f265810`).
+///
+/// coord's obligations read and the custody gate's keyed ownership read both
+/// derive from `coord.agent_worktrees`, but through different keys and at
+/// different moments, so they can disagree: a row allocated between the two
+/// reads, or one keyed to the session one way and not the other. Each item's
+/// `worktree_path` must match a path in `covered` (the gather's
+/// [`wind_down::CustodyInputs::covered`]) by [`custody::worktree_path_matches`]
+/// — exact after normalization, or the covered absolute path ending in coord's
+/// relative ledger path. An item with no `worktree_path` cannot be matched and
+/// is returned as `<absent>`. A body with no `worktrees` block, or one whose
+/// `items` is not a list, returns `None`: the obligations gate judges that
+/// block's coverage itself.
+///
+/// `Some` makes a `watched` obligations verdict UNKNOWN
+/// (`ObligationsUnknown::WorktreeNotProbed`), never the reverse: it only ever
+/// withholds a close.
+pub fn first_uncovered_coord_worktree(
+    doc: &serde_json::Value,
+    covered: &[String],
+) -> Option<String> {
+    let items = doc.get("worktrees")?.get("items")?.as_array()?;
+    items.iter().find_map(|item| {
+        match item.get("worktree_path").and_then(serde_json::Value::as_str) {
+            Some(path) if !path.trim().is_empty() => (!covered
+                .iter()
+                .any(|c| custody::worktree_path_matches(c, path)))
+            .then(|| path.to_string()),
+            _ => Some("<absent>".to_string()),
+        }
+    })
+}
+
 /// What the runner knows about one candidate before any probe runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCustodyContext {
@@ -851,10 +887,20 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             session_dir,
             ownership,
             members: Vec::new(),
+            covered: Vec::new(),
         };
     };
 
     let mut members: Vec<CustodyMember> = Vec::new();
+    // Every path this gather looked at — what the obligations cross-check
+    // holds coord's `worktrees` block against. An attributed path is covered
+    // whatever its probe found (a failed probe is already this gate's own
+    // Unknown, and a reaped one was positively seen gone).
+    let mut covered: Vec<String> = attributed
+        .iter()
+        .map(|w| w.path.display().to_string())
+        .chain(isolated.iter().map(|p| p.display().to_string()))
+        .collect();
     let mut named: Vec<(&Path, bool)> = vec![(dir.as_path(), true)];
     for worktree in &attributed {
         if worktree.retired {
@@ -902,6 +948,7 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             }),
         }
     }
+    covered.extend(roots.iter().map(|r| r.display().to_string()));
     for root in roots {
         let state = probe.member_state(&root).await;
         let slot_wip_state = probe.slot_wip_state(&root, claude_session_id).await;
@@ -915,6 +962,7 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
         session_dir,
         ownership,
         members,
+        covered,
     }
 }
 

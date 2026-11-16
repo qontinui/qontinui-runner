@@ -978,6 +978,27 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
     close_batch(CloseArm::Drain, candidates, &effects).await;
 }
 
+/// What judging one candidate's custody established: the verdict, and every
+/// worktree path the gather covered ([`wind_down::CustodyInputs::covered`]) —
+/// the set [`judge_obligations`] holds coord's `worktrees` block against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CustodyJudged {
+    pub verdict: CustodyVerdict,
+    pub covered: Vec<String>,
+}
+
+impl From<CustodyVerdict> for CustodyJudged {
+    /// A verdict with nothing covered — what a test double answers. Its
+    /// obligations cross-check then admits only a body whose `worktrees`
+    /// block is empty.
+    fn from(verdict: CustodyVerdict) -> Self {
+        Self {
+            verdict,
+            covered: Vec::new(),
+        }
+    }
+}
+
 /// The custody verdict for one candidate of the `finished_close` arm: its
 /// attributed worktrees from `ownership`, every member probed fresh through
 /// `probe` (D2b, D2c). Shared by the pass and by the per-close re-check, so
@@ -988,7 +1009,7 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
     ownership: &OwnershipRead,
     workspace_root: Option<&Path>,
     session_id: &str,
-) -> CustodyVerdict {
+) -> CustodyJudged {
     let attributed =
         wind_down_observer::attributed_worktrees(ownership, session_id, workspace_root);
     let inputs = wind_down_observer::gather_custody(probe, context, attributed, session_id).await;
@@ -1000,27 +1021,64 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
         custody = %finished_close::describe(&verdict),
         "wind_down_executor: finished_close custody judged"
     );
-    verdict
+    CustodyJudged {
+        verdict,
+        covered: inputs.covered,
+    }
 }
 
-/// The obligations verdict for one candidate of the `finished_close` arm: coord's
-/// `coord_session_obligations` read for it, judged by
-/// [`wind_down::obligations_gate`]. This is the REMOTE half of `closeable`; the
-/// local half is [`judge_custody`]. Shared by the pass and by the per-close
-/// re-check, so the two can never judge it two different ways. A read that
-/// fails in any way is UNKNOWN, which never closes (plan
+/// coord's obligations answer for one candidate, as read — the raw body, or
+/// why the read failed. ONE read serves both the obligations gate and (from
+/// Phase 1 of plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`)
+/// the close guard's first-verdict hold, so the two can never judge two
+/// different answers.
+pub(crate) type ObligationsRead = Result<serde_json::Value, String>;
+
+/// The obligations verdict for one candidate of the `finished_close` arm,
+/// judged from coord's `coord_session_obligations` read for it. This is the
+/// REMOTE half of `closeable`; the local half is [`judge_custody`]. The ONE
+/// production judge: the pass and the per-close re-check both hand it the raw
+/// read their world/effects made, so a test double supplies a coord body and
+/// this function still runs. A read that fails in any way is UNKNOWN, which
+/// never closes (plan
 /// `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
 /// Phase 6).
-pub(crate) async fn judge_obligations(session_id: &str) -> ObligationsVerdict {
-    let read = wind_down_observer::fetch_obligations(session_id).await;
-    let verdict = wind_down::obligations_gate(&read);
-    debug!(
-        session_id = %session_id,
-        obligations = %finished_close::describe_obligations(&verdict),
-        "wind_down_executor: finished_close obligations judged"
-    );
-    verdict
+///
+/// Two rules, in order:
+///
+/// 1. [`wind_down::obligations_gate`] over the body.
+/// 2. Only for a `Watched` answer: every worktree coord's `worktrees` block
+///    attributes to the session must be one the custody gate COVERED
+///    (`covered`, from [`CustodyJudged`]). One it did not is
+///    `Unknown(WorktreeNotProbed)` — coord saying the session owns a tree that
+///    no probe looked at is not evidence the tree is clean (#2981 review
+///    concern 3; [`wind_down_observer::first_uncovered_coord_worktree`]).
+pub(crate) fn judge_obligations(read: &ObligationsRead, covered: &[String]) -> ObligationsVerdict {
+    let verdict = wind_down::obligations_gate(read);
+    if !verdict.is_watched() {
+        return verdict;
+    }
+    match read
+        .as_ref()
+        .ok()
+        .and_then(|doc| wind_down_observer::first_uncovered_coord_worktree(doc, covered))
+    {
+        Some(worktree) => {
+            ObligationsVerdict::Unknown(ObligationsUnknown::WorktreeNotProbed { worktree })
+        }
+        None => verdict,
+    }
 }
+
+/// How many obligations READS one `finished_close` pass may make. Each read
+/// can wait out [`wind_down_observer::OBLIGATIONS_REQUEST_TIMEOUT`], and a
+/// custody-clean session whose obligations stay unwatched is re-read on every
+/// pass, so without a cap a box holding many such sessions would spend minutes
+/// of every pass on serial coord reads (#2981 review concern 4). Twice the
+/// batch budget leaves room for the unwatched ones ahead of a full batch; a
+/// candidate past the cap is `Unknown(Deferred)` this pass, never watched.
+pub const OBLIGATIONS_READS_PER_PASS: usize = MAX_CLOSES_PER_TICK * 2;
 
 /// Everything ONE `finished_close` tick reads from, or does to, the world —
 /// the seam that makes [`finished_close_tick`] testable end to end. The
@@ -1062,8 +1120,10 @@ pub(crate) trait FinishedCloseWorld: Sync {
     /// Publish this pass's custody verdicts for `/restart-readiness`.
     fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]);
     /// The REMOTE half of `closeable` for one candidate: coord's obligations
-    /// read, judged. Asked only for a candidate whose custody was clean.
-    async fn obligations(&self, claude_session_id: &str) -> ObligationsVerdict;
+    /// read, as read (judged by [`judge_obligations`]). Asked only for a
+    /// candidate whose custody was clean, and at most
+    /// [`OBLIGATIONS_READS_PER_PASS`] times per pass.
+    async fn obligations(&self, claude_session_id: &str) -> ObligationsRead;
     /// Publish this pass's obligations verdicts for `/restart-readiness`.
     fn publish_obligations(&self, verdicts: &[(String, ObligationsVerdict)]);
     /// Run [`close_batch`] for the `finished_close` arm over `clean`, through
@@ -1119,7 +1179,9 @@ pub(crate) enum FinishedCloseTick {
 ///    watched, and a read that fails is UNKNOWN. That is the remote half of
 ///    `closeable`; the two halves are one conjunction and neither stands in for
 ///    the other. Once one read fails, the rest of the pass does not repeat it
-///    (each would wait out the same deadline): they are UNKNOWN too.
+///    (each would wait out the same deadline): they are UNKNOWN too. And no
+///    pass makes more than [`OBLIGATIONS_READS_PER_PASS`] reads: past that,
+///    a candidate is UNKNOWN (`obligations_deferred`) until a later pass.
 /// 4. Every verdict reached is published (replacing the previous pass's),
 ///    and ONLY the candidates that are both go to the SAME [`close_batch`] the
 ///    drain arm uses — which re-checks eligibility, custody and obligations
@@ -1181,12 +1243,14 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     let mut clean: Vec<(String, String)> = Vec::new();
     // Set by the first obligations read of this pass that could not be made.
     let mut obligations_down: Option<String> = None;
+    let mut obligations_reads = 0usize;
+    let mut cap_logged = false;
     for (session_id, terminal_id) in candidates {
         if clean.len() >= MAX_CLOSES_PER_TICK {
             break;
         }
         let context = world.custody_context(&pass, &session_id, &terminal_id);
-        let verdict = judge_custody(
+        let CustodyJudged { verdict, covered } = judge_custody(
             world.probe(),
             &context,
             &ownership,
@@ -1195,19 +1259,35 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         )
         .await;
         if verdict.is_clean() {
-            let obligations = match &obligations_down {
-                Some(why) => ObligationsVerdict::unreadable(format!(
+            let obligations = if let Some(why) = &obligations_down {
+                ObligationsVerdict::unreadable(format!(
                     "not re-read: an earlier read this pass failed ({why})"
-                )),
-                None => {
-                    let read = world.obligations(&session_id).await;
-                    if let ObligationsVerdict::Unknown(ObligationsUnknown::Unreadable { detail }) =
-                        &read
-                    {
-                        obligations_down = Some(detail.clone());
-                    }
-                    read
+                ))
+            } else if obligations_reads >= OBLIGATIONS_READS_PER_PASS {
+                if !cap_logged {
+                    cap_logged = true;
+                    info!(
+                        cap = OBLIGATIONS_READS_PER_PASS,
+                        "wind_down_executor: finished_close spent its obligations-read budget \
+                         for this pass — the remaining custody-clean candidates are UNKNOWN \
+                         until a later pass"
+                    );
                 }
+                ObligationsVerdict::Unknown(ObligationsUnknown::Deferred {
+                    detail: format!(
+                        "this pass already made {OBLIGATIONS_READS_PER_PASS} obligations reads"
+                    ),
+                })
+            } else {
+                obligations_reads += 1;
+                let read = world.obligations(&session_id).await;
+                let judged = judge_obligations(&read, &covered);
+                if let ObligationsVerdict::Unknown(ObligationsUnknown::Unreadable { detail }) =
+                    &judged
+                {
+                    obligations_down = Some(detail.clone());
+                }
+                judged
             };
             if obligations.is_watched() {
                 clean.push((session_id.clone(), terminal_id));
@@ -1343,8 +1423,8 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
         finished_close::publish_custody(verdicts, Utc::now().timestamp_millis());
     }
 
-    async fn obligations(&self, claude_session_id: &str) -> ObligationsVerdict {
-        judge_obligations(claude_session_id).await
+    async fn obligations(&self, claude_session_id: &str) -> ObligationsRead {
+        wind_down_observer::fetch_obligations(claude_session_id).await
     }
 
     fn publish_obligations(&self, verdicts: &[(String, ObligationsVerdict)]) {
@@ -1493,10 +1573,12 @@ pub(crate) trait CloseEffects {
     async fn recheck(&self, session_id: &str, terminal_id: &str)
         -> Option<wind_down::WindDownView>;
     /// (c) `finished_close` only: re-judge ONE candidate's custody, fresh.
-    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyVerdict;
+    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyJudged;
     /// (d) `finished_close` only: re-read ONE candidate's obligations from
-    /// coord, fresh. The remote half of `closeable`, asked after custody.
-    async fn recheck_obligations(&self, session_id: &str) -> ObligationsVerdict;
+    /// coord, fresh, as read. The remote half of `closeable` — read FIRST,
+    /// because it is the slow one (up to 45 s), so the local re-checks sit
+    /// next to the close; [`close_batch`] judges it with [`judge_obligations`].
+    async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead;
     /// `finished_close` in `shadow`: log that this candidate WOULD be closed,
     /// with the inputs it was judged on — `custody` is the verdict the
     /// re-check just reached, not the pass's.
@@ -1568,10 +1650,17 @@ pub(crate) trait CloseEffects {
 ///   included. The drain arm never consults custody.
 ///
 /// * **OBLIGATIONS, for `finished_close`.** The remote half of `closeable`:
-///   coord's `coord_session_obligations` is read again immediately before every
-///   close, after custody holds. A gate can be withdrawn, or a watcher can die,
-///   in the minutes a batch takes; an unreadable answer is UNKNOWN and never
-///   closes. The drain arm never consults it.
+///   coord's `coord_session_obligations` is read again before every close. A
+///   gate can be withdrawn, or a watcher can die, in the minutes a batch takes;
+///   an unreadable answer is UNKNOWN and never closes. The drain arm never
+///   consults it.
+///
+/// **The order, for `finished_close`** (#2981 review concern 2): the coord
+/// obligations read FIRST — it can take up to 45 s — then the eligibility and
+/// custody re-checks, then the judgement of that read against what custody
+/// covered, then the close. So the freshest LOCAL reads (is the session still
+/// idle and finished, are its trees still clean) are the ones nearest the
+/// `/exit`, and no eligibility answer is 45 s stale by the time it is acted on.
 ///
 /// In `shadow`, every one of those checks still runs, and the close is logged
 /// instead of made. `graceful_exit`'s own refusals (a child process, a nested
@@ -1595,6 +1684,13 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
             outcomes.push(CandidateOutcome::ArmWithdrawn);
             return outcomes;
         }
+        // `finished_close` reads coord's obligations FIRST (see the order
+        // above); the drain arm never reads them.
+        let obligations_read = if arm == CloseArm::FinishedClose {
+            Some(effects.recheck_obligations(&session_id).await)
+        } else {
+            None
+        };
         let rechecked = if recheck_is_owed(arm, index) {
             effects.recheck(&session_id, &terminal_id).await
         } else {
@@ -1613,8 +1709,11 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         }
         // `finished_close` re-judges custody immediately before EVERY close
         // (see `recheck_is_owed`); the drain arm never consults it.
-        let custody = if arm == CloseArm::FinishedClose {
-            let custody = effects.recheck_custody(&session_id, &terminal_id).await;
+        let custody = if let Some(obligations_read) = &obligations_read {
+            let CustodyJudged {
+                verdict: custody,
+                covered,
+            } = effects.recheck_custody(&session_id, &terminal_id).await;
             if !custody.is_clean() {
                 info!(
                     session_id = %session_id,
@@ -1625,9 +1724,9 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
                 outcomes.push(CandidateOutcome::CustodyNotClean);
                 continue;
             }
-            // The remote half: asked only once the local half holds, so a
-            // dirty tree never costs a coord read.
-            let obligations = effects.recheck_obligations(&session_id).await;
+            // The remote half, read first and judged now against the trees
+            // custody just covered.
+            let obligations = judge_obligations(obligations_read, &covered);
             if !obligations.is_watched() {
                 info!(
                     session_id = %session_id,
@@ -1828,7 +1927,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
         }
     }
 
-    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyVerdict {
+    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyJudged {
         let reused = self
             .pass_ownership
             .filter(|(_, read_at)| ownership_reusable(*read_at, Instant::now()))
@@ -1854,8 +1953,8 @@ impl CloseEffects for LiveCloseEffects<'_> {
         .await
     }
 
-    async fn recheck_obligations(&self, session_id: &str) -> ObligationsVerdict {
-        judge_obligations(session_id).await
+    async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead {
+        wind_down_observer::fetch_obligations(session_id).await
     }
 
     fn would_close(&self, session_id: &str, terminal_id: &str, custody: Option<&CustodyVerdict>) {
@@ -2663,8 +2762,9 @@ mod tests {
         verdicts: HashMap<String, wind_down::WindDownView>,
         /// What `recheck_custody` answers, by terminal id. Absent = `Clean`.
         custody: HashMap<String, CustodyVerdict>,
-        /// What `recheck_obligations` answers, by terminal id. Absent = `Watched`.
-        obligations: HashMap<String, ObligationsVerdict>,
+        /// What `recheck_obligations` answers, by terminal id. Absent = a
+        /// watched body ([`watched_read`]).
+        obligations: HashMap<String, ObligationsRead>,
         /// What `wind_down_one` answers, by terminal id. Absent = `Exited`
         /// with one pid — the ordinary case.
         outcomes: HashMap<String, Result<GracefulExitOutcome, String>>,
@@ -2718,8 +2818,8 @@ mod tests {
             self.custody.insert(terminal_id.to_string(), verdict);
             self
         }
-        fn obligations(mut self, terminal_id: &str, verdict: ObligationsVerdict) -> Self {
-            self.obligations.insert(terminal_id.to_string(), verdict);
+        fn obligations(mut self, terminal_id: &str, read: ObligationsRead) -> Self {
+            self.obligations.insert(terminal_id.to_string(), read);
             self
         }
         fn steward(mut self, terminal_id: &str, kind: &str) -> Self {
@@ -2955,14 +3055,15 @@ mod tests {
                 .get(n)
                 .unwrap_or(self.admissions.last().unwrap())
         }
-        async fn recheck_custody(&self, _session_id: &str, terminal_id: &str) -> CustodyVerdict {
+        async fn recheck_custody(&self, _session_id: &str, terminal_id: &str) -> CustodyJudged {
             self.log(format!("custody:{terminal_id}"));
             self.custody
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or(CustodyVerdict::Clean)
+                .into()
         }
-        async fn recheck_obligations(&self, session_id: &str) -> ObligationsVerdict {
+        async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead {
             // Keyed by terminal id in the script, and `s-<t>` is the session id
             // of terminal `<t>` everywhere this double is used.
             let terminal_id = session_id.strip_prefix("s-").unwrap_or(session_id);
@@ -2970,7 +3071,7 @@ mod tests {
             self.obligations
                 .get(terminal_id)
                 .cloned()
-                .unwrap_or(ObligationsVerdict::Watched { judged: 1 })
+                .unwrap_or_else(watched_read)
         }
         fn would_close(
             &self,
@@ -3307,11 +3408,11 @@ mod tests {
         ) -> Option<wind_down::WindDownView> {
             Some(finished_and_idle())
         }
-        async fn recheck_custody(&self, _session_id: &str, _terminal_id: &str) -> CustodyVerdict {
-            CustodyVerdict::Clean
+        async fn recheck_custody(&self, _session_id: &str, _terminal_id: &str) -> CustodyJudged {
+            CustodyVerdict::Clean.into()
         }
-        async fn recheck_obligations(&self, _session_id: &str) -> ObligationsVerdict {
-            ObligationsVerdict::Watched { judged: 0 }
+        async fn recheck_obligations(&self, _session_id: &str) -> ObligationsRead {
+            watched_read()
         }
         fn would_close(&self, _session_id: &str, terminal_id: &str, _: Option<&CustodyVerdict>) {
             panic!("admission is Close, never Shadow: would_close({terminal_id})");
@@ -4310,8 +4411,8 @@ mod tests {
         /// marking every candidate's coord session live.
         ownership_override: Option<OwnershipRead>,
         /// What the pass's obligations read answers, by SESSION id. Absent =
-        /// `Watched`.
-        obligations: HashMap<String, ObligationsVerdict>,
+        /// a watched body ([`watched_read`]).
+        obligations: HashMap<String, ObligationsRead>,
         /// Every session the pass read obligations for, in order.
         obligations_read: std::sync::Mutex<Vec<String>>,
         published_obligations: std::sync::Mutex<Vec<Vec<(String, ObligationsVerdict)>>>,
@@ -4352,8 +4453,8 @@ mod tests {
             }
         }
         /// Script the pass's obligations answer for `session_id`.
-        fn obligations(mut self, session_id: &str, verdict: ObligationsVerdict) -> Self {
-            self.obligations.insert(session_id.to_string(), verdict);
+        fn obligations(mut self, session_id: &str, read: ObligationsRead) -> Self {
+            self.obligations.insert(session_id.to_string(), read);
             self
         }
         fn obligations_read(&self) -> Vec<String> {
@@ -4435,7 +4536,7 @@ mod tests {
         fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]) {
             self.published.lock().unwrap().push(verdicts.to_vec());
         }
-        async fn obligations(&self, claude_session_id: &str) -> ObligationsVerdict {
+        async fn obligations(&self, claude_session_id: &str) -> ObligationsRead {
             self.obligations_read
                 .lock()
                 .unwrap()
@@ -4443,7 +4544,7 @@ mod tests {
             self.obligations
                 .get(claude_session_id)
                 .cloned()
-                .unwrap_or(ObligationsVerdict::Watched { judged: 1 })
+                .unwrap_or_else(watched_read)
         }
         fn publish_obligations(&self, verdicts: &[(String, ObligationsVerdict)]) {
             self.published_obligations
@@ -4566,12 +4667,54 @@ mod tests {
     // `tick_once` runs, so deleting the call that consults the obligations gate
     // fails here and not only in the pure gate's own tests.
 
-    fn unwatched() -> ObligationsVerdict {
-        ObligationsVerdict::Unwatched(wind_down::ObligationsUnwatched {
-            source: "gates".to_string(),
-            item: r#"{"gate_id":"g-1"}"#.to_string(),
-            reasons: "the gate is muted".to_string(),
+    /// A coord obligations answer shaped like `session_obligations_core`'s:
+    /// every tracked source `read`, `spawned_followup` `not_tracked`.
+    fn obligations_body(
+        prs: serde_json::Value,
+        gates: serde_json::Value,
+        worktrees: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "claude_code_session_id": "11111111-1111-1111-1111-111111111111",
+            "all_tracked_sources_read": true,
+            "session_proven_in_tenant": true,
+            "prs": {"coverage": "read", "items": prs, "truncated": false},
+            "gates": {"coverage": "read", "items": gates, "truncated": false},
+            "worktrees": {"coverage": "read", "items": worktrees, "truncated": false},
+            "work_units": {"coverage": "read", "items": [], "truncated": false},
+            "findings": {"coverage": "read", "items": [], "truncated": false},
+            "spawned_followup": {"coverage": "not_tracked", "note": "n", "items": []},
         })
+    }
+
+    fn gate_obligation(verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "item": {"gate_id": "g-1"}, "verdict": verdict,
+            "reasons": ["the gate is muted"], "attribution": "proven",
+        })
+    }
+
+    /// A body whose `n` gates are all watched, and which names no worktree.
+    fn watched_n(n: usize) -> ObligationsRead {
+        let gates: Vec<serde_json::Value> = (0..n).map(|_| gate_obligation("watched")).collect();
+        Ok(obligations_body(
+            serde_json::json!([]),
+            serde_json::json!(gates),
+            serde_json::json!([]),
+        ))
+    }
+
+    /// The default the doubles answer: one watched gate, no worktree.
+    fn watched_read() -> ObligationsRead {
+        watched_n(1)
+    }
+
+    fn unwatched() -> ObligationsRead {
+        Ok(obligations_body(
+            serde_json::json!([]),
+            serde_json::json!([gate_obligation("not_watched")]),
+            serde_json::json!([]),
+        ))
     }
 
     /// (a) A finished, idle session whose custody is clean AND whose every
@@ -4579,7 +4722,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_idle_session_with_watched_obligations_and_clean_custody_is_closed() {
         let world = FakeWorld::with_sessions(&["t1"])
-            .obligations("s-t1", ObligationsVerdict::Watched { judged: 3 });
+            .obligations("s-t1", watched_n(3));
         let FinishedCloseTick::Ran {
             judged,
             obligations,
@@ -4630,10 +4773,8 @@ mod tests {
     /// not answer.
     #[tokio::test]
     async fn an_unreadable_obligations_read_is_unknown_and_closes_nothing() {
-        let world = FakeWorld::with_sessions(&["t1"]).obligations(
-            "s-t1",
-            ObligationsVerdict::unreadable("GET …: operation timed out"),
-        );
+        let world = FakeWorld::with_sessions(&["t1"])
+            .obligations("s-t1", Err("GET …: operation timed out".to_string()));
         let FinishedCloseTick::Ran {
             obligations,
             outcomes,
@@ -4667,7 +4808,7 @@ mod tests {
                 },
             )
             // Even a fully watched answer cannot rescue it.
-            .obligations("s-t1", ObligationsVerdict::Watched { judged: 9 });
+            .obligations("s-t1", watched_n(9));
         let FinishedCloseTick::Ran {
             judged,
             obligations,
@@ -4693,10 +4834,8 @@ mod tests {
     /// does not wait out the same deadline once per candidate. Each is UNKNOWN.
     #[tokio::test]
     async fn after_one_failed_obligations_read_the_pass_stops_asking() {
-        let world = FakeWorld::with_sessions(&["t1", "t2", "t3"]).obligations(
-            "s-t1",
-            ObligationsVerdict::unreadable("GET …: operation timed out"),
-        );
+        let world = FakeWorld::with_sessions(&["t1", "t2", "t3"])
+            .obligations("s-t1", Err("GET …: operation timed out".to_string()));
         let FinishedCloseTick::Ran { obligations, .. } = tick(&world).await else {
             panic!("the census should have run");
         };
@@ -4732,24 +4871,32 @@ mod tests {
         let calls = effects.calls();
         assert!(calls.contains(&"exit:t1".to_string()), "{calls:?}");
         assert!(!calls.contains(&"exit:t2".to_string()), "{calls:?}");
-        // Local half first: custody is re-judged before obligations are read.
+        // #2981 review concern 2: the slow coord read comes FIRST, and the
+        // local re-checks — eligibility, then custody — sit next to the close.
         let at = |needle: &str| calls.iter().position(|c| c == needle).unwrap();
-        assert!(at("custody:t1") < at("obligations:t1"), "{calls:?}");
-        assert!(at("obligations:t1") < at("exit:t1"), "{calls:?}");
+        assert!(at("obligations:t1") < at("recheck:t1"), "{calls:?}");
+        assert!(at("recheck:t1") < at("custody:t1"), "{calls:?}");
+        assert!(at("custody:t1") < at("exit:t1"), "{calls:?}");
+        assert_eq!(
+            at("exit:t1"),
+            at("custody:t1") + 1,
+            "nothing runs between the custody re-check and the exit: {calls:?}"
+        );
 
         // Unknown at the re-check is no better.
         let unknown = RecordingEffects::new()
             .eligible("t1")
-            .obligations("t1", ObligationsVerdict::unreadable("503"));
+            .obligations("t1", Err("503".to_string()));
         let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1"]), &unknown).await;
         assert_eq!(outcomes, vec![CandidateOutcome::ObligationsNotWatched]);
         assert!(!unknown.calls().contains(&"exit:t1".to_string()));
     }
 
-    /// Dirty custody at the re-check short-circuits before any coord read, and
-    /// the drain arm never consults obligations at all.
+    /// #2981 review concern 2: at the re-check the coord read is made FIRST,
+    /// so dirty custody still blocks — after it — and the drain arm never
+    /// consults obligations at all.
     #[tokio::test]
-    async fn the_recheck_reads_obligations_only_after_custody_holds_and_never_for_the_drain() {
+    async fn the_recheck_reads_obligations_first_and_never_for_the_drain() {
         let dirty = RecordingEffects::new().eligible("t1").custody(
             "t1",
             CustodyVerdict::Dirty(wind_down::CustodyDirty::Uncommitted {
@@ -4758,7 +4905,16 @@ mod tests {
         );
         let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1"]), &dirty).await;
         assert_eq!(outcomes, vec![CandidateOutcome::CustodyNotClean]);
-        assert!(!dirty.calls().iter().any(|c| c.starts_with("obligations:")));
+        let calls: Vec<String> = dirty
+            .calls()
+            .into_iter()
+            .filter(|c| !c.starts_with("admitted?:"))
+            .collect();
+        assert_eq!(
+            calls,
+            vec!["obligations:t1", "recheck:t1", "custody:t1"],
+            "the obligations read precedes both local re-checks"
+        );
 
         let drain = RecordingEffects::new()
             .eligible("t1")
@@ -4781,6 +4937,190 @@ mod tests {
         assert_eq!(
             off.published_obligations.lock().unwrap().clone(),
             vec![Vec::new()]
+        );
+    }
+
+    // ── #2981 review concerns 3, 4 and 5 ─────────────────────────────────
+
+    /// Concern 3: a worktree coord's obligations read attributes to the
+    /// session that the custody gate did not cover makes a watched answer
+    /// UNKNOWN; a covered one — exactly, or by coord's relative ledger path —
+    /// does not; and a row with no path is never matched.
+    #[test]
+    fn a_coord_worktree_custody_did_not_probe_makes_watched_obligations_unknown() {
+        let body = |path: serde_json::Value| -> ObligationsRead {
+            Ok(obligations_body(
+                serde_json::json!([]),
+                serde_json::json!([gate_obligation("watched")]),
+                serde_json::json!([{"agent_id": "a", "repo": "r", "branch": "b",
+                                    "worktree_path": path, "status": "active",
+                                    "attribution": "proven"}]),
+            ))
+        };
+        let covered = vec!["/ws/agent-worktrees/a1/qontinui-runner".to_string()];
+
+        let outside = judge_obligations(
+            &body(serde_json::json!("/ws/agent-worktrees/zz/qontinui-runner")),
+            &covered,
+        );
+        assert_eq!(outside.as_str(), "unknown");
+        assert_eq!(outside.reason(), Some("worktree_not_probed"));
+        assert!(outside.detail().unwrap().contains("zz"), "{outside:?}");
+
+        for matched in [
+            serde_json::json!("/ws/agent-worktrees/a1/qontinui-runner"),
+            serde_json::json!("agent-worktrees/a1/qontinui-runner"),
+            serde_json::json!("\\ws\\agent-worktrees\\a1\\qontinui-runner\\"),
+        ] {
+            assert!(
+                judge_obligations(&body(matched.clone()), &covered).is_watched(),
+                "{matched}"
+            );
+        }
+        for absent in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!(7)] {
+            assert_eq!(
+                judge_obligations(&body(absent.clone()), &covered).reason(),
+                Some("worktree_not_probed"),
+                "{absent}"
+            );
+        }
+        // Nothing covered at all (a double, or a gather that stopped early):
+        // only an empty `worktrees` block is admitted.
+        assert!(judge_obligations(&watched_read(), &[]).is_watched());
+        assert_eq!(
+            judge_obligations(
+                &body(serde_json::json!("/ws/agent-worktrees/a1/qontinui-runner")),
+                &[]
+            )
+            .reason(),
+            Some("worktree_not_probed")
+        );
+        // It only ever withholds: an unwatched or unreadable answer keeps its
+        // own, more specific verdict.
+        assert_eq!(judge_obligations(&unwatched(), &[]).as_str(), "unwatched");
+        assert_eq!(
+            judge_obligations(&Err("503".to_string()), &covered).reason(),
+            Some("obligations_unreadable")
+        );
+    }
+
+    /// Concern 3 end to end: a candidate whose coord answer names a tree its
+    /// custody gather never covered is not closed; one naming the tree custody
+    /// probed (`/ws/<session>` in [`FakeWorld`]) is.
+    #[tokio::test]
+    async fn finished_close_tick_never_closes_over_a_coord_worktree_custody_did_not_probe() {
+        let naming = |path: &str| -> ObligationsRead {
+            Ok(obligations_body(
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!([{"worktree_path": path, "status": "active"}]),
+            ))
+        };
+        let world = FakeWorld::with_sessions(&["t1", "t2"])
+            .obligations("s-t1", naming("/ws/elsewhere"))
+            .obligations("s-t2", naming("/ws/s-t2"));
+        let FinishedCloseTick::Ran { obligations, .. } = tick(&world).await else {
+            panic!("the census should have run");
+        };
+        assert_eq!(obligations[0].1.reason(), Some("worktree_not_probed"));
+        assert!(obligations[1].1.is_watched(), "{obligations:?}");
+        assert_eq!(world.exits(), vec!["exit:t2".to_string()]);
+    }
+
+    /// Concern 4: a pass makes at most [`OBLIGATIONS_READS_PER_PASS`] coord
+    /// reads, however many custody-clean candidates stay unwatched; the rest
+    /// are UNKNOWN (`obligations_deferred`), never watched.
+    #[tokio::test]
+    async fn a_pass_makes_at_most_its_budget_of_obligations_reads() {
+        let ids: Vec<String> = (0..OBLIGATIONS_READS_PER_PASS + 3)
+            .map(|i| format!("t{i}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut world = FakeWorld::with_sessions(&refs);
+        for id in &ids {
+            world = world.obligations(&format!("s-{id}"), unwatched());
+        }
+        let FinishedCloseTick::Ran { obligations, .. } = tick(&world).await else {
+            panic!("the census should have run");
+        };
+        assert_eq!(world.obligations_read().len(), OBLIGATIONS_READS_PER_PASS);
+        assert_eq!(obligations.len(), ids.len());
+        assert!(obligations[..OBLIGATIONS_READS_PER_PASS]
+            .iter()
+            .all(|(_, v)| v.as_str() == "unwatched"));
+        for (session, verdict) in &obligations[OBLIGATIONS_READS_PER_PASS..] {
+            assert_eq!(verdict.reason(), Some("obligations_deferred"), "{session}");
+        }
+        assert!(world.exits().is_empty());
+    }
+
+    /// Concern 5: the PRODUCTION judge — the one the live pass and the live
+    /// re-check both run — over coord bodies shaped as `session_obligations_core`
+    /// serves them (recorded shapes: a PR card's `facts`, a gate's `reasons`,
+    /// `attribution`, `sources`). The doubles above supply a body, so this is
+    /// the same function [`close_batch`] and [`finished_close_tick`] call.
+    #[test]
+    fn the_production_obligations_judge_over_recorded_coord_bodies() {
+        let recorded = |prs: &str, gates: &str| -> serde_json::Value {
+            let text = format!(
+                r#"{{
+                  "claude_code_session_id": "d30f7c5f-0000-4000-8000-000000000001",
+                  "all_tracked_sources_read": true,
+                  "session_windows": [{{"device_id": "d", "started_at": "2026-11-15T10:00:00Z", "closed_at": null}}],
+                  "session_proven_in_tenant": true,
+                  "prs": {{"coverage": "read", "items": {prs}, "count": 0, "truncated": false}},
+                  "gates": {{"coverage": "read", "items": {gates}, "count": 0, "truncated": false}},
+                  "worktrees": {{"coverage": "read", "items": [], "count": 0, "truncated": false}},
+                  "work_units": {{"coverage": "read", "items": [], "count": 0, "truncated": false}},
+                  "findings": {{"coverage": "read", "items": [], "count": 0, "truncated": false}},
+                  "spawned_followup": {{"coverage": "not_tracked", "note": "coord records no spawned-follow-up edge", "items": []}},
+                  "note": "Each source's coverage is read only when every query behind it ran."
+                }}"#
+            );
+            serde_json::from_str(&text).expect("a recorded body parses")
+        };
+        // Phase 0's d30f7c5f shape: every gate retired, no PRs.
+        let retired = r#"[{"item": {"gate_id": "6a771def-e097-40e5-96f4-0bddefcd3c34"}, "verdict": "retired",
+                           "reasons": ["the gate cleared and its continuation reported work_completed"],
+                           "facts": {"state": "cleared"}, "attribution": "proven"}]"#;
+        let watched_pr = r#"[{"item": {"repo": "qontinui/qontinui-runner", "pr_number": 2981}, "verdict": "watched",
+                              "reasons": ["CI is running"], "attribution": "proven", "sources": ["authored"],
+                              "facts": {"repo": "qontinui/qontinui-runner", "pr_number": 2981, "pr_state": "open",
+                                        "head_sha": "e605bb893", "confidence": "fresh", "checks": []}}]"#;
+        let v = judge_obligations(&Ok(recorded(watched_pr, retired)), &[]);
+        assert_eq!(v, ObligationsVerdict::Watched { judged: 2 });
+
+        // Phase 0's 5472e347 shape: not_watched items whose attribution is
+        // uncertain — UNKNOWN, never a definite owed word, never watched.
+        let uncertain = r#"[{"item": {"gate_id": "7d2ddc08-11ec-4c8b-a019-44af6c128414"}, "verdict": "not_watched",
+                             "reasons": ["no continuation and no live owner"], "attribution": "uncertain"}]"#;
+        let v = judge_obligations(&Ok(recorded("[]", uncertain)), &[]);
+        assert_eq!(v.reason(), Some("item_unknown"));
+        assert!(v.detail().unwrap().contains("attribution uncertain"), "{v:?}");
+
+        // Phase 0's 9c869e35 shape: a proven not_watched item.
+        let proven = uncertain.replace("\"uncertain\"", "\"proven\"");
+        assert_eq!(
+            judge_obligations(&Ok(recorded("[]", &proven)), &[]).as_str(),
+            "unwatched"
+        );
+
+        // A degraded source: its list is not evidence of absence.
+        let mut degraded = recorded("[]", retired);
+        degraded["all_tracked_sources_read"] = serde_json::json!(false);
+        degraded["gates"]["coverage"] = serde_json::json!("degraded");
+        assert_eq!(
+            judge_obligations(&Ok(degraded), &[]).reason(),
+            Some("sources_not_read")
+        );
+
+        // The read ran as a tenant that cannot place the session: every list
+        // is empty, and that is the absence of a session, not of obligations.
+        let mut unproven = recorded("[]", "[]");
+        unproven["session_proven_in_tenant"] = serde_json::json!(false);
+        assert_eq!(
+            judge_obligations(&Ok(unproven), &[]).reason(),
+            Some("session_not_proven")
         );
     }
 

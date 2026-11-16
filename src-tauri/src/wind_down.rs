@@ -453,6 +453,14 @@ pub struct CustodyInputs {
     /// root), its coord-attributed worktrees, and its isolated-edit context's
     /// materialized worktrees.
     pub members: Vec<CustodyMember>,
+    /// Every worktree path the gather COVERED: each attributed path it was
+    /// handed (a reaped one included, since the gather positively saw it
+    /// gone), each isolated-edit worktree, and each member root it probed. The
+    /// obligations cross-check reads it: a worktree coord's obligations read
+    /// attributes to the session that is not covered here was never probed,
+    /// so its state is UNKNOWN (see `ObligationsUnknown::WorktreeNotProbed`).
+    /// Empty when the gather stopped before probing anything.
+    pub covered: Vec<String>,
 }
 
 /// Why custody rules a session out.
@@ -730,6 +738,14 @@ pub enum ObligationsUnknown {
         verdict: String,
         uncertain: bool,
     },
+    /// A worktree coord attributes to the session (its `worktrees` block)
+    /// that the custody gate did not cover: no probe looked at it, so whether
+    /// it holds unpushed or uncommitted work is UNKNOWN. A `worktree_path`
+    /// coord served as null is the same, spelled `<absent>`.
+    WorktreeNotProbed { worktree: String },
+    /// Not read on this pass: the pass's obligations-read budget was spent
+    /// (`OBLIGATIONS_READS_PER_PASS` in the executor). UNKNOWN, never watched.
+    Deferred { detail: String },
 }
 
 /// The obligations verdict. Only [`ObligationsVerdict::Watched`] lets the
@@ -755,6 +771,8 @@ impl ObligationsUnknown {
             Self::SessionNotProven { .. } => "session_not_proven",
             Self::SourceNotRead { .. } => "source_not_read",
             Self::ItemUnknown { .. } => "item_unknown",
+            Self::WorktreeNotProbed { .. } => "worktree_not_probed",
+            Self::Deferred { .. } => "obligations_deferred",
         }
     }
 
@@ -790,6 +808,10 @@ impl ObligationsUnknown {
                 };
                 format!("{source} item {item} reads `{verdict}`, which is not a watched verdict{uncertain}")
             }
+            Self::WorktreeNotProbed { worktree } => format!(
+                "coord attributes worktree {worktree} to the session, but the custody gate never probed it, so its state is unknown"
+            ),
+            Self::Deferred { detail } => format!("not read this pass: {detail}"),
         }
     }
 }
@@ -1550,6 +1572,7 @@ mod tests {
             session_dir: Some("/ws/agent-worktrees/a/repo".to_string()),
             ownership: Ok(()),
             members,
+            covered: Vec::new(),
         }
     }
 
