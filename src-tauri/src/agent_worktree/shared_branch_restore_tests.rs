@@ -907,6 +907,28 @@ fn the_sweep_keeps_a_block_when_the_branch_probe_fails_fatally() {
     let before = format!("op\n{}", block_text(AGENT_BRANCH, "\n"));
     std::fs::write(info.join("exclude"), &before).unwrap();
 
+    // Precondition: git walks PAST an invalid `.git` directory into the
+    // parents, so this fixture is fatal (exit 128) only while no work tree sits
+    // above the temp dir. A `TMPDIR` inside a repo would answer exit 1 from that
+    // parent instead; name that environment fault here rather than as a sweep bug.
+    let mut probe = crate::process_helpers::no_window("git");
+    probe.arg("-C").arg(&not_a_repo).args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{AGENT_BRANCH}"),
+    ]);
+    let probed =
+        crate::process_helpers::output_with_timeout(probe, std::time::Duration::from_secs(60))
+            .expect("git runs");
+    assert_eq!(
+        probed.status.code(),
+        Some(128),
+        "fixture precondition: the temp dir {} must not sit inside a git work tree \
+         (the branch probe must fail fatally, not answer from a parent repo): {probed:?}",
+        tmp.path().display()
+    );
+
     let out = sweep_stale_blocks(&not_a_repo, |_| HolderState::Free);
 
     assert!(kept(&out), "{out:?}");
