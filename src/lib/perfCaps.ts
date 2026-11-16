@@ -48,7 +48,9 @@ export interface PerfCaps {
   max_sessions_warn: number;
   /**
    * Remove empty terminal pages the runner auto-created once restore has
-   * settled (plan 2026-11-05 Phase 6). Operator-made pages are never pruned.
+   * settled (plan 2026-11-05 Phase 6). A page the operator renamed, or added
+   * since `origin` was recorded, is never pruned; a "Page N" persisted before
+   * that counts as runner-made, whoever added it (`classifyLegacyOrigin`).
    */
   prune_empty_auto_pages: boolean;
 }

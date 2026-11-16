@@ -6,9 +6,10 @@
  * `terminal-exit`. The backend serves the 2026-11-05 merytshost roster
  * FIXTURE. Measured (coord finding `8c9e1419`): the totals (40 persisted
  * pages, 22 occupied), the two "Terminal" pages, the duplicate names, the six
- * operator names, and that "Page 19" onward is populated. Reconstructed: every
- * other id, the October names below "Page 19", every `createdAt`, and the
- * exact 22-page occupied set (see `fixtures/terminalPageRoster.ts`).
+ * operator names, `3e86a8ae`'s creation time, the 20:51:51Z batch, and that
+ * "Page 19" onward is populated. Reconstructed: every other id, the October
+ * names below "Page 19", every other `createdAt`, and the exact 22-page
+ * occupied set (see `fixtures/terminalPageRoster.ts`).
  */
 
 import { act, createElement, useLayoutEffect } from "react";
@@ -349,6 +350,38 @@ describe("a pop-out window opened before the repair", () => {
     }
   });
 
+  it("keeps a page the pop-out renamed, and a page it added, through the main window's prune", async () => {
+    backend.sweepSettled = false;
+    const popOut = await mountPopOut();
+    try {
+      // Mounted last, so the `terminal-exit` listener is the main window's.
+      const main = await mount();
+      expect(popOut.hook().renamePage("oct-page-2", "mine")).toBe(true);
+      let added = "";
+      act(() => void (added = popOut.hook().addPage()));
+      // The main window's copy has caught up with neither.
+      expect(main().allPages.find((p) => p.id === "oct-page-2")?.origin).toBe("auto");
+
+      backend.sweepSettled = true;
+      await terminalExit();
+
+      const roster = persisted();
+      expect(roster.find((p) => p.id === "oct-page-2")).toMatchObject({
+        name: "mine",
+        origin: "operator",
+      });
+      expect(ids(roster)).toContain(added);
+      expect(main().pruneNotice?.removed.map((r) => r.page.id)).toEqual(
+        EMPTY_AUTO_IDS.filter((id) => id !== "oct-page-2"),
+      );
+      // The main window's writes were built on the store, so it now shows both.
+      expect(main().allPages.find((p) => p.id === "oct-page-2")?.name).toBe("mine");
+      expect(ids(main().allPages)).toContain(added);
+    } finally {
+      popOut.unmount();
+    }
+  });
+
   it("does not put back the pages the prune removed", async () => {
     const popOut = await mountPopOut();
     try {
@@ -370,7 +403,7 @@ describe("a pop-out window opened before the repair", () => {
 });
 
 describe("the repair's version", () => {
-  it("is not recorded when the page-list save failed, and is once a save succeeds", async () => {
+  it("is not recorded when the page-list save failed, so the repair runs again", async () => {
     backend.perf = { prune_empty_auto_pages: false };
     failWritesTo(PAGES_STORAGE_KEY);
     const hook = await mount();
@@ -379,11 +412,26 @@ describe("the repair's version", () => {
     expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Terminal");
     expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBeNull();
 
-    // The store recovers; the next roster write saves the repaired roster.
+    // The store recovers; the next mount repairs and records.
     vi.mocked(Storage.prototype.setItem).mockRestore();
-    act(() => hook().reorderPage("operator-2", "operator-1"));
+    act(() => root.unmount());
+    root = createRoot(container);
+    await mount();
     expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+    expect(new Set(names(persisted())).size).toBe(40);
     expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBe("2");
+  });
+
+  it("ranks the repair's claims on a fresh occupancy read, not the reconcile's", async () => {
+    // By the repair's own read a restorable row has landed on the October
+    // "Page 20" too, so both holders are occupied and the older keeps the name.
+    // On the reconcile's read only the populated one was.
+    backend.perf = { prune_empty_auto_pages: false };
+    backend.sessionsLater = ["default", "oct-page-20"];
+    const hook = await mount();
+    const byId = (id: string) => hook().allPages.find((p) => p.id === id)?.name;
+    expect(byId("oct-page-20")).toBe("Page 20");
+    expect(byId("restored-2")).toBe("Page 41");
   });
 
   it("is not recorded, and nothing throws, when the version write itself fails", async () => {
@@ -559,23 +607,36 @@ describe("what the prune never does", () => {
     expect(hook().allPages.find((p) => p.id === "3e86a8ae")?.name).toBe("Terminal");
   });
 
-  it("a refused rename does not bring back a page the prune removed", async () => {
-    // While the prune is removing "oct-page-2" ("Page 2"), the operator adds a
-    // "tmux" page (named "tmux 2" when it renders) and renames "operator-1" to
-    // "tmux 2" before it has. The prune's removal is queued AFTER the rename,
-    // so the rename's updater runs on a roster that still holds "oct-page-2",
-    // and is refused. Writing that roster back into the ref brought
-    // "oct-page-2" back until the next passive effect: a rename made in that
-    // window (probed from a layout effect, which runs first) was refused for a
-    // name no page holds.
+  // Each writer below is dispatched while the prune is removing "oct-page-2"
+  // ("Page 2"), before that removal is queued, so the writer's updater runs on
+  // a roster that still holds "oct-page-2". A writer that copied that roster
+  // into the ref brought "oct-page-2" back until the next passive effect: a
+  // rename to "Page 2" made in that window (probed from a layout effect, which
+  // runs first) was refused for a name no page holds.
+  it.each<[string, (h: Hook) => void]>([
+    [
+      // "tmux 2" is free in the ref and taken by the time the rename renders.
+      "a refused rename",
+      (h) => {
+        h.addPage("tmux");
+        expect(h.renamePage("operator-1", "tmux 2")).toBe(true);
+      },
+    ],
+    ["a rename", (h) => expect(h.renamePage("operator-1", "keepers")).toBe(true)],
+    ["a reorder", (h) => h.reorderPage("operator-2", "operator-1")],
+    ["a page default cwd", (h) => h.setPageDefaultWorkingDir("operator-2", "/repo")],
+    [
+      "a project page",
+      (h) => void h.ensureProjectPage({ boundPageId: "proj-1", projectName: "proj" }),
+    ],
+  ])("%s mid-pass does not bring back a page the prune removed", async (_, write) => {
     let fired = false;
     let probeDue = false;
     let probe: boolean | null = null;
     backend.onRemovalList = () => {
       if (fired) return;
       fired = true;
-      latestHook!().addPage("tmux");
-      expect(latestHook!().renamePage("operator-1", "tmux 2")).toBe(true);
+      write(latestHook!());
       probeDue = true;
     };
     let latest: Hook | null = null;
@@ -593,11 +654,8 @@ describe("what the prune never does", () => {
     await settle();
 
     expect(probe).toBe(true);
-    const byId = (id: string) => latest!.allPages.find((p) => p.id === id);
-    expect(byId("operator-1")?.name).toBe("2");
-    expect(byId("operator-3")?.name).toBe("Page 2");
-    expect(byId("oct-page-2")).toBeUndefined();
-    expect(names(latest!.allPages)).toContain("tmux 2");
+    expect(latest!.allPages.find((p) => p.id === "operator-3")?.name).toBe("Page 2");
+    expect(ids(latest!.allPages)).not.toContain("oct-page-2");
   });
 
   it("writes no version after an incomplete read", async () => {
