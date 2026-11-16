@@ -708,9 +708,10 @@ three ways relative to a whole-plan vet:
    Exit 7 `CONFLICT` means origin no longer holds the blob you read — a peer
    edited the plan after your read: re-read it, re-splice, re-run with the new
    `--based-on`. Exit 5 `REFUSED` on `main` is a ruleset that requires a PR (push
-   a new branch with `--create` and open a PR) or a rate-limited ruleset probe
-   (retry once the GitHub budget resets, or publish this single plan file through
-   `scripts/land-plan-stamp.sh`, which rides a rate limit). The
+   a new branch with `--create` and open a PR) or a ruleset probe GitHub did not
+   answer — a rate limit or a transport failure (retry once the GitHub budget
+   resets or the network answers, or publish this single plan file through
+   `scripts/land-plan-stamp.sh`, which rides both). The
    scoped entry reads:
    ```
    Phase N: VETTED <date> (session <short-id>) — see § Phase N.
