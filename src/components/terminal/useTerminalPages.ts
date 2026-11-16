@@ -143,12 +143,11 @@ function persistActivePage(id: string) {
 
 /**
  * Record the one-time roster repair as done (plan 2026-11-05 Phase 6, D2), but
- * only when the PERSISTED roster, read back, needs no rename. A page-list
- * save the store refused is not an error anywhere, so a repair whose save
- * failed stays
- * unrecorded and runs again, instead of being marked done over a roster that
- * still has the duplicates. A version write that throws is left unrecorded the
- * same way. Returns whether the version was written.
+ * only when the PERSISTED roster, read back, needs no rename. A page-list save
+ * the store refused is reported, not thrown, so a repair whose save failed
+ * stays unrecorded and runs again, instead of being marked done over a roster
+ * that still has the duplicates. A version write that throws is left
+ * unrecorded the same way. Returns whether the version was written.
  */
 function recordRepairIfPersisted(): boolean {
   if (rosterNeedsRepair(loadPages())) return false;
@@ -690,7 +689,8 @@ export function useTerminalPages() {
   // clean: its removals and renames are saved by `setPages` updaters, which
   // run at the next render, so the read-back usually succeeds in this effect
   // after that commit. Never recorded inside an updater. A save the store
-  // refused keeps it unrecorded, and the repair runs again on the next mount.
+  // refused keeps it due: this window's next successful save (which builds on
+  // its own, repaired, copy) records it, and so does the next mount.
   const repairVersionDueRef = useRef(false);
   useEffect(() => {
     if (repairVersionDueRef.current && recordRepairIfPersisted()) {
