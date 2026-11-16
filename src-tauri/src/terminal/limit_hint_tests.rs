@@ -33,6 +33,7 @@ struct Calls {
     own_probes: u32,
     skips: Vec<SkipReason>,
     parks: Vec<(i64, ParkReason)>,
+    forgets: u32,
     continued: Vec<LimitStop>,
 }
 
@@ -74,8 +75,12 @@ impl Fake {
 }
 
 impl HintEnv for Fake {
-    fn switches(&self) -> (bool, bool) {
-        (self.auto_migrate, self.auto_continue)
+    fn switches(&self) -> HintSwitches {
+        HintSwitches {
+            auto_migrate: self.auto_migrate,
+            auto_continue: self.auto_continue,
+            continue_after_migration: true,
+        }
     }
     fn finished(&self) -> bool {
         self.finished
@@ -119,6 +124,9 @@ impl HintEnv for Fake {
     }
     fn park(&self, due_at_ms: i64, reason: ParkReason) {
         self.calls().parks.push((due_at_ms, reason));
+    }
+    fn forget_park(&self) {
+        self.calls().forgets += 1;
     }
     async fn continue_stop(&self, stop: LimitStop) {
         self.calls().continued.push(stop);
@@ -282,11 +290,29 @@ async fn an_answered_probe_restarts_the_backoff() {
 
 #[test]
 fn the_switches_are_read_from_their_own_settings() {
+    let sw = |m, c, n| HintSwitches {
+        auto_migrate: m,
+        auto_continue: c,
+        continue_after_migration: n,
+    };
     let mut cli = crate::settings::ClaudeCliSettings::default();
-    assert_eq!(hint_switches(&cli), (true, true));
+    assert_eq!(hint_switches(&cli), sw(true, true, true));
     cli.auto_migrate_on_token_exhaustion = false;
-    assert_eq!(hint_switches(&cli), (false, true));
+    assert_eq!(hint_switches(&cli), sw(false, true, true));
     cli.auto_migrate_on_token_exhaustion = true;
     cli.auto_continue_after_limit_reset = false;
-    assert_eq!(hint_switches(&cli), (true, false));
+    assert_eq!(hint_switches(&cli), sw(true, false, true));
+    cli.auto_continue_after_limit_reset = true;
+    cli.auto_continue_after_migration = false;
+    assert_eq!(hint_switches(&cli), sw(true, true, false));
+}
+
+#[tokio::test]
+async fn a_session_no_longer_stopped_drops_its_pending_park() {
+    let env = Fake::new(LimitStopRead::NotStopped);
+    run_hint(&env, SRC).await;
+    assert_eq!(env.calls().forgets, 1);
+    let stopped_env = Fake::new(reset_stop());
+    run_hint(&stopped_env, SRC).await;
+    assert_eq!(stopped_env.calls().forgets, 0);
 }

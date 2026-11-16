@@ -576,6 +576,10 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             from = %src,
             "no usable migration target (every other account exhausted/cooled/unauthenticated)"
         );
+        // No migration ran, so the cap slot goes back: the parked stop
+        // re-enters within the hour, and three re-entries must not fill the
+        // cap for a session that never moved.
+        refund_migration_cap(&record.claude_session_id, cap_stamp);
         report_migration_refused(
             &app,
             &record,
@@ -627,7 +631,7 @@ struct ProdHintEnv<'a> {
 }
 
 impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
-    fn switches(&self) -> (bool, bool) {
+    fn switches(&self) -> super::limit_hint::HintSwitches {
         super::limit_hint::hint_switches(&crate::settings::get_ai_settings().claude_cli)
     }
 
@@ -696,6 +700,10 @@ impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
         park_stop(self.app, self.record, self.src, due_at_ms, reason);
     }
 
+    fn forget_park(&self) {
+        super::limit_stop::with_parks(|p| p.forget(&self.record.terminal_id));
+    }
+
     async fn continue_stop(&self, stop: super::limit_stop::LimitStop) {
         continue_after_reset(self.app, self.record, self.src, stop).await;
     }
@@ -752,7 +760,7 @@ fn skip_message(why: super::limit_reset::SkipReason) -> &'static str {
             "usage-limit hint but both auto-migration and the reset-continue are disabled in settings"
         }
         SkipReason::MigratedSinceStop => {
-            "limit stop predates this session's latest migration, onto an account that is not exhausted — left to the migration (its continue nudge runs when auto_continue_after_migration is on)"
+            "limit stop predates this session's latest migration, onto an account that is not exhausted, and auto_continue_after_migration is off — not prompted"
         }
     }
 }
@@ -2938,6 +2946,19 @@ mod tests {
         }
         assert_eq!(after.matches("report_migration_refused(").count(), 2);
         assert!(!after.contains("emit_skipped(&app, &record, &src, \""));
+        // A no-target refusal gives its cap slot back.
+        let no_target = after
+            .split_once("pick_migration_target(")
+            .expect("the target pick")
+            .1;
+        let no_target = no_target
+            .split_once("NoUsableTarget")
+            .expect("the no-target refusal")
+            .0;
+        assert!(no_target.contains("refund_migration_cap("));
+        let env = source_between("for ProdHintEnv<'_> {", "\n}\n");
+        assert!(env.contains("self.record.finished_at.is_some()"));
+        assert!(env.contains("hint_switches(&crate::settings::get_ai_settings().claude_cli)"));
     }
 
     #[test]
