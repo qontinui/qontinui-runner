@@ -714,7 +714,14 @@ async fn materialize(
         .to_string();
 
     // 2. 🔒 The pin. Fails loud; never degrades to rotation.
-    let config_dir = resolve_target_config_dir(respawn.account.as_deref())?;
+    // Blocking (settings, cooldown and credential reads, and the no-pin pick):
+    // off the async worker.
+    let account = respawn.account.clone();
+    let config_dir = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        resolve_target_config_dir(account.as_deref())
+    })
+    .await
+    .map_err(|e| RespawnError::AccountPin(format!("account resolution did not complete: {e}")))??;
 
     // 3. The source bundle — cwd, intent, held claims.
     let state = super::handoff::fetch_state(http, coord_url, respawn.source_session_id).await?;

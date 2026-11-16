@@ -1966,8 +1966,10 @@ pub async fn resume_ai_sessions(
             let probe_id = task_run_id.clone();
             let decision = spawn_blocking_tracked(move || {
                 let cli = crate::settings::get_ai_settings().claude_cli;
+                // The dir a no-choice spawn would run under, never the shared
+                // resolved dir a sibling's pick may have just rewritten.
                 let (effective_config_dir, _config_dir_source) =
-                    crate::ai_provider::get_effective_config_dir(&cli);
+                    crate::ai_provider::get_effective_config_dir_for(&cli, None);
                 crate::terminal::transcript::resume_account_on_this_machine(
                     effective_config_dir.as_deref(),
                     &probe_dir,
