@@ -224,10 +224,7 @@ pub(crate) enum HintAction {
     /// Type [`LIMIT_RESET_NUDGE`] into the session, once for this stop.
     Continue(LimitStop),
     /// Wait until `due_at_ms`, then decide again.
-    Park {
-        due_at_ms: i64,
-        reason: ParkReason,
-    },
+    Park { due_at_ms: i64, reason: ParkReason },
     /// The existing migration. `park_due_at_ms` is set for a session that
     /// stopped at a limit: when the cap or the target refuses, it is parked
     /// until then instead of left with nothing scheduled.
@@ -289,7 +286,9 @@ fn decide_ignoring_switch(i: &HintInputs<'_>) -> HintAction {
     match i.transcript {
         LimitStopRead::Stopped(stop) => {
             let retry_due = i.now_ms + PARK_RETRY_MS;
-            let due = stop.resets_at_ms.map(|r| r.saturating_add(LIMIT_RESET_MARGIN_MS));
+            let due = stop
+                .resets_at_ms
+                .map(|r| r.saturating_add(LIMIT_RESET_MARGIN_MS));
             let reset_passed = due.is_some_and(|d| d <= i.now_ms);
             let wait_due = due.filter(|d| *d > i.now_ms);
             if i.probe == ProbeVerdict::Errored && reset_passed {
@@ -801,7 +800,13 @@ fn park_session<E: HintEnv>(env: &E, s: &HintSession, due_at_ms: i64, reason: Pa
     );
     env.emit(
         PARKED_EVENT,
-        parked_payload(&s.claude_session_id, &s.terminal_id, &s.config_dir, due_at_ms, reason),
+        parked_payload(
+            &s.claude_session_id,
+            &s.terminal_id,
+            &s.config_dir,
+            due_at_ms,
+            reason,
+        ),
     );
 }
 
@@ -868,7 +873,12 @@ async fn continue_session<E: HintEnv>(env: &E, s: &HintSession, stop: &LimitStop
                 "limit-reset-continue: not delivered — the attempt is spent"
             );
             if may_retry {
-                park_session(env, s, env.now_ms() + PARK_RETRY_MS, ParkReason::ContinueRetry);
+                park_session(
+                    env,
+                    s,
+                    env.now_ms() + PARK_RETRY_MS,
+                    ParkReason::ContinueRetry,
+                );
             }
         }
     }

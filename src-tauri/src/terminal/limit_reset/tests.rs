@@ -262,10 +262,7 @@ fn an_exhausted_stop_that_cannot_migrate_is_parked() {
 #[test]
 fn a_refused_migration_of_a_stop_parks() {
     let due = NOW + HOUR;
-    for reason in [
-        ParkReason::NoUsableTarget,
-        ParkReason::MigrationCapReached,
-    ] {
+    for reason in [ParkReason::NoUsableTarget, ParkReason::MigrationCapReached] {
         assert_eq!(
             on_refused_migration(Some(due), reason),
             RefusedMigration::Park {
@@ -341,7 +338,10 @@ fn one_stop_is_continued_once() {
     c.settle("s", "e", true, NOW);
     assert_eq!(c.try_claim("s", "e", NOW + 1), Claim::Delivered);
     // A new stop entry of the same session is a new claim.
-    assert_eq!(c.try_claim("s", "e2", NOW + 2), Claim::Granted { attempt: 1 });
+    assert_eq!(
+        c.try_claim("s", "e2", NOW + 2),
+        Claim::Granted { attempt: 1 }
+    );
 }
 
 /// Partner: claim only on submit. Two hints for one stop arrive before either
@@ -361,7 +361,11 @@ fn a_stop_is_retried_at_most_three_times() {
     for attempt in 1..=MAX_CONTINUE_ATTEMPTS {
         assert_eq!(c.try_claim("s", "e", NOW), Claim::Granted { attempt });
         let may_retry = c.settle("s", "e", false, NOW);
-        assert_eq!(may_retry, attempt < MAX_CONTINUE_ATTEMPTS, "attempt {attempt}");
+        assert_eq!(
+            may_retry,
+            attempt < MAX_CONTINUE_ATTEMPTS,
+            "attempt {attempt}"
+        );
     }
     assert_eq!(MAX_CONTINUE_ATTEMPTS, 3);
     assert_eq!(c.try_claim("s", "e", NOW), Claim::AttemptsSpent);
@@ -373,11 +377,7 @@ fn a_stop_is_retried_at_most_three_times() {
 fn with_the_continue_off_nothing_is_parked_for_a_continue() {
     let ahead = stop(Some(NOW + HOUR));
     let passed = stop(Some(NOW - HOUR));
-    fn off(
-        t: &LimitStopRead,
-        probe: ProbeVerdict,
-        block: Option<ParkReason>,
-    ) -> HintInputs<'_> {
+    fn off(t: &LimitStopRead, probe: ProbeVerdict, block: Option<ParkReason>) -> HintInputs<'_> {
         HintInputs {
             auto_continue: false,
             migration_block: block,
@@ -386,9 +386,18 @@ fn with_the_continue_off_nothing_is_parked_for_a_continue() {
     }
     let blocked = Some(ParkReason::MigrationDisabled);
     for (i, name) in [
-        (off(&ahead, ProbeVerdict::NotExhausted, None), "reset pending"),
-        (off(&ahead, ProbeVerdict::Exhausted, blocked), "exhausted, migration off"),
-        (off(&passed, ProbeVerdict::Errored, blocked), "probe unknown, migration off"),
+        (
+            off(&ahead, ProbeVerdict::NotExhausted, None),
+            "reset pending",
+        ),
+        (
+            off(&ahead, ProbeVerdict::Exhausted, blocked),
+            "exhausted, migration off",
+        ),
+        (
+            off(&passed, ProbeVerdict::Errored, blocked),
+            "probe unknown, migration off",
+        ),
     ] {
         assert_eq!(decide_hint(&i), HintAction::SkipContinueDisabled, "{name}");
     }
@@ -512,7 +521,13 @@ fn a_closed_terminal_leaves_the_park_list() {
 fn a_park_emits_session_limit_parked_not_the_skipped_error() {
     assert_eq!(PARKED_EVENT, "session-limit-parked");
     assert_ne!(PARKED_EVENT, "session-account-migration-skipped");
-    let p = parked_payload("sid", "tid", "/home/u/.claude-a", NOW, ParkReason::ResetPending);
+    let p = parked_payload(
+        "sid",
+        "tid",
+        "/home/u/.claude-a",
+        NOW,
+        ParkReason::ResetPending,
+    );
     assert_eq!(p["claudeSessionId"], "sid");
     assert_eq!(p["terminalId"], "tid");
     assert_eq!(p["configDir"], "/home/u/.claude-a");
@@ -594,7 +609,8 @@ fn a_wrapped_stop_option_still_reads() {
 /// Other menus with `Esc to cancel` are not this one.
 #[test]
 fn another_dialog_is_not_the_menu() {
-    let other = " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Enter to confirm · Esc to cancel";
+    let other =
+        " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Enter to confirm · Esc to cancel";
     assert!(!screen_shows_rate_limit_options_menu(&screen(other)));
 }
 

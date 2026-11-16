@@ -248,9 +248,9 @@ pub fn scan_grids_once() {
     // this bound only spreads the hints' probes across ticks.
     let live_ids: HashSet<&str> = sessions.iter().map(|(t, _)| t.as_str()).collect();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for park in super::limit_reset::take_due(now_ms, MAX_DUE_PARKS_PER_TICK, |tid| {
-        live_ids.contains(tid)
-    }) {
+    for park in
+        super::limit_reset::take_due(now_ms, MAX_DUE_PARKS_PER_TICK, |tid| live_ids.contains(tid))
+    {
         info!(
             terminal_id = %park.terminal_id,
             session = %park.claude_session_id,

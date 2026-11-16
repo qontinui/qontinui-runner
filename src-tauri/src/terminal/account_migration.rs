@@ -443,7 +443,10 @@ impl crate::terminal::limit_reset::HintEnv for AppHintEnv {
             .usage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = usage;
-        probe_verdict(fresh, crate::ai_provider::account_known_exhausted(&self.src))
+        probe_verdict(
+            fresh,
+            crate::ai_provider::account_known_exhausted(&self.src),
+        )
     }
 
     fn now_ms(&self) -> i64 {
@@ -495,7 +498,14 @@ impl crate::terminal::limit_reset::HintEnv for AppHintEnv {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        migrate_on_hint(&self.app, &self.record, &self.src, &usage, self.matched_pattern).await
+        migrate_on_hint(
+            &self.app,
+            &self.record,
+            &self.src,
+            &usage,
+            self.matched_pattern,
+        )
+        .await
     }
 }
 
@@ -521,7 +531,9 @@ async fn read_transcript_limit_stop(
         transcript_limit_stop(&path)
     })
     .await
-    .unwrap_or_else(|e| LimitStopRead::Unreadable(format!("transcript read task did not complete: {e}")))
+    .unwrap_or_else(|e| {
+        LimitStopRead::Unreadable(format!("transcript read task did not complete: {e}"))
+    })
 }
 
 /// One `Esc` when the CLI's `/rate-limit-options` menu holds the pane: the
@@ -539,8 +551,7 @@ fn close_rate_limit_options_menu(terminal_id: &str) {
     let Some(session) = tm.get(terminal_id) else {
         return;
     };
-    if !crate::terminal::limit_reset::screen_shows_rate_limit_options_menu(&session.grid_screen())
-    {
+    if !crate::terminal::limit_reset::screen_shows_rate_limit_options_menu(&session.grid_screen()) {
         return;
     }
     match session.write(
