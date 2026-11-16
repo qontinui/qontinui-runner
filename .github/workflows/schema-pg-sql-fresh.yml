@@ -274,16 +274,20 @@ jobs:
       # the client is the server's own binary: the same major AND minor by
       # construction. A host client is not one version pin away from that.
       # pg_dump refuses a server of a newer major, and even a minor skew
-      # changes the dump: measured 2026-11-16, Ubuntu 24.04's apt pg_dump
-      # 16.15 against this image's 16.16 server emitted 7202 extra
+      # changes the dump. 16.16 servers stamp a `pg_attver` attribute option
+      # on every column, which 16.16's pg_dump strips and 16.15's does not.
+      # Measured locally on 2026-11-16, by loading the checked-in dump into
+      # this image and dumping it both ways: Ubuntu 24.04's apt pg_dump 16.15
+      # emitted 7202 extra
       # `ALTER TABLE ONLY ... ALTER COLUMN ... SET (pg_attver=...)` lines that
       # the server's own 16.16 pg_dump omits, which the diff below would read
       # as drift.
       #
-      # This replaced a host `apt-get install -y postgresql-client-16`. When
-      # ubuntu-latest became Ubuntu 26.04, which ships only
-      # postgresql-client-18, that step failed with `E: Unable to locate
-      # package postgresql-client-16` on every run (coord finding 8a344609).
+      # This replaced a host `apt-get install -y postgresql-client-16`. On an
+      # Ubuntu 26.04 runner image, which ubuntu-latest has been moving to and
+      # which ships only postgresql-client-18, that step fails with `E: Unable
+      # to locate package postgresql-client-16` (coord finding
+      # 8a344609-11e9-467b-bb95-04923f20a7d3).
       # Running the server's own binary also removes the network-dependent apt
       # step from this REQUIRED check (ruleset 16044811), and with it the
       # mirror-hang exposure its 10-minute bound existed for.
