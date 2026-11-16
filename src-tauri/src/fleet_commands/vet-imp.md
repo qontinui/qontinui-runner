@@ -248,7 +248,7 @@ compare-and-swap").
 
 The helper is the one implementation of what this step used to spell out by
 hand: it fetches the default branch with an explicit refspec, builds the commit
-by plumbing on a separate index against a base resolved once (so the shared
+by plumbing (lib/plumbing-commit.sh) on a private index against a base resolved once (so the shared
 tree, index and worktree list are never touched), pushes without force with a
 non-fast-forward retry, and **reads the file back** — a content comparison of
 the file's hash against the default branch's blob at its path, with the
