@@ -3,11 +3,15 @@
  * The auto-prune of empty auto-created pages and the one-time roster repair,
  * through the mounted hook (plan 2026-11-05 Phase 6). The seam is the page
  * `reconcile` that runs on mount and on every `terminal-created` /
- * `terminal-exit`; the backend is the measured 2026-11-05 merytshost roster
- * (40 persisted pages, 22 occupied).
+ * `terminal-exit`. The backend serves the 2026-11-05 merytshost roster
+ * FIXTURE. Measured (coord finding `8c9e1419`): the totals (40 persisted
+ * pages, 22 occupied), the two "Terminal" pages, the duplicate names, the six
+ * operator names, and that "Page 19" onward is populated. Reconstructed: every
+ * other id, the October names below "Page 19", every `createdAt`, and the
+ * exact 22-page occupied set (see `fixtures/terminalPageRoster.ts`).
  */
 
-import { act, createElement } from "react";
+import { act, createElement, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -189,6 +193,22 @@ const populatedNames = (pages: TerminalPageConfig[]) =>
   names(pages.filter((p) => /^(restored|later)-/.test(p.id)));
 
 const persisted = () => instanceStorage.getJSON<TerminalPageConfig[]>(PAGES_STORAGE_KEY, []);
+
+/** Whether raw `localStorage` key `raw` is instance key `key` (bare, or `<key>:<port>`). */
+const isKey = (raw: string, key: string) => raw === key || raw.startsWith(`${key}:`);
+
+/** Make `localStorage.setItem` throw a full-storage error for instance key `key`. */
+function failWritesTo(key: string) {
+  const realSetItem = Storage.prototype.setItem;
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (
+    this: Storage,
+    raw: string,
+    value: string,
+  ) {
+    if (isKey(raw, key)) throw new DOMException("storage is full", "QuotaExceededError");
+    realSetItem.call(this, raw, value);
+  });
+}
 const ids = (pages: TerminalPageConfig[]) => pages.map((p) => p.id);
 const names = (pages: TerminalPageConfig[]) => pages.map((p) => p.name);
 
@@ -273,6 +293,107 @@ describe("Undo", () => {
 
     await terminalExit();
     expect(ids(hook().allPages)).toEqual(ids([...ROSTER_2026_11_05]));
+  });
+});
+
+describe("a pop-out window opened before the repair", () => {
+  /** Mount the hook as an unpinned pop-out (`term-2`), in its own root. */
+  async function mountPopOut(): Promise<{ hook: () => Hook; unmount: () => void }> {
+    const popContainer = document.createElement("div");
+    document.body.appendChild(popContainer);
+    const popRoot = createRoot(popContainer);
+    let latest: Hook | null = null;
+    function PopOut() {
+      latest = useTerminalPages();
+      return null;
+    }
+    windowLabel.current = "term-2";
+    try {
+      await act(async () => popRoot.render(createElement(PopOut)));
+      await settle();
+    } finally {
+      windowLabel.current = "main";
+    }
+    return {
+      hook: () => latest!,
+      unmount: () => {
+        act(() => popRoot.unmount());
+        popContainer.remove();
+      },
+    };
+  }
+
+  it("does not write the repaired duplicate names back", async () => {
+    backend.perf = { prune_empty_auto_pages: false };
+    // The pop-out loads the roster while it still has its duplicates.
+    const popOut = await mountPopOut();
+    try {
+      expect(popOut.hook().allPages.find((p) => p.id === "3e86a8ae")?.name).toBe("Terminal");
+      await mount();
+      expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBe("2");
+      expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+
+      // Any write from the pop-out, e.g. its "+".
+      act(() => void popOut.hook().addPage());
+
+      const roster = persisted();
+      expect(roster).toHaveLength(41);
+      expect(new Set(names(roster)).size).toBe(41);
+      expect(roster.find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+      expect(roster.filter((p) => p.name === "Terminal").map((p) => p.id)).toEqual(["default"]);
+      expect(roster.at(-1)?.name).toBe("Page 46");
+      // The pop-out now shows the repaired names too.
+      expect(popOut.hook().allPages.find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+    } finally {
+      popOut.unmount();
+    }
+  });
+
+  it("does not put back the pages the prune removed", async () => {
+    const popOut = await mountPopOut();
+    try {
+      expect(popOut.hook().allPages).toHaveLength(40);
+      await mount();
+      expect(persisted()).toHaveLength(28);
+
+      act(() => void popOut.hook().addPage());
+
+      const roster = persisted();
+      expect(roster).toHaveLength(29);
+      for (const id of EMPTY_AUTO_IDS) expect(ids(roster)).not.toContain(id);
+      expect(new Set(names(roster)).size).toBe(29);
+      expect(roster.at(-1)?.name).toBe("Page 40");
+    } finally {
+      popOut.unmount();
+    }
+  });
+});
+
+describe("the repair's version", () => {
+  it("is not recorded when the page-list save failed, and is once a save succeeds", async () => {
+    backend.perf = { prune_empty_auto_pages: false };
+    failWritesTo(PAGES_STORAGE_KEY);
+    const hook = await mount();
+    // Renamed in memory, but the store still holds the duplicates.
+    expect(hook().allPages.find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+    expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Terminal");
+    expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBeNull();
+
+    // The store recovers; the next roster write saves the repaired roster.
+    vi.mocked(Storage.prototype.setItem).mockRestore();
+    act(() => hook().reorderPage("operator-2", "operator-1"));
+    expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+    expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBe("2");
+  });
+
+  it("is not recorded, and nothing throws, when the version write itself fails", async () => {
+    backend.perf = { prune_empty_auto_pages: false };
+    failWritesTo(PAGES_VERSION_KEY);
+    const hook = await mount();
+    expect(hook().allPages.find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+    expect(persisted().find((p) => p.id === "3e86a8ae")?.name).toBe("Page 40");
+    expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBeNull();
+    expect(hook().pruneNotice?.renames.map((r) => r.id)).toContain("3e86a8ae");
   });
 });
 
@@ -380,6 +501,22 @@ describe("what the prune never does", () => {
     expect(ids(hook().allPages)).not.toContain("oct-page-23a");
   });
 
+  it("still prunes an auto page whose name editor was opened and closed unchanged", async () => {
+    // The tab bar commits a rename on blur. Keeping the name is not a rename,
+    // so the page stays `auto` and the prune still takes it.
+    backend.sweepSettled = false;
+    const hook = await mount();
+    expect(hook().renamePage("oct-page-2", "Page 2")).toBe(true);
+    expect(hook().renamePage("oct-page-3", " Page 3 ")).toBe(true);
+    expect(hook().allPages.find((p) => p.id === "oct-page-2")?.origin).toBe("auto");
+
+    backend.sweepSettled = true;
+    await terminalExit();
+    expect(ids(hook().allPages)).not.toContain("oct-page-2");
+    expect(ids(hook().allPages)).not.toContain("oct-page-3");
+    expect(hook().pruneNotice?.removed.map((r) => r.page.id)).toEqual(EMPTY_AUTO_IDS);
+  });
+
   it("re-checks the guards at removal time: a page popped out mid-pass is kept", async () => {
     let fired = false;
     backend.onRemovalList = () => {
@@ -420,6 +557,47 @@ describe("what the prune never does", () => {
     expect(hook().allPages).toHaveLength(40);
     expect(instanceStorage.getItem(PAGES_VERSION_KEY)).toBeNull();
     expect(hook().allPages.find((p) => p.id === "3e86a8ae")?.name).toBe("Terminal");
+  });
+
+  it("a refused rename does not bring back a page the prune removed", async () => {
+    // While the prune is removing "oct-page-2" ("Page 2"), the operator adds a
+    // "tmux" page (named "tmux 2" when it renders) and renames "operator-1" to
+    // "tmux 2" before it has. The prune's removal is queued AFTER the rename,
+    // so the rename's updater runs on a roster that still holds "oct-page-2",
+    // and is refused. Writing that roster back into the ref brought
+    // "oct-page-2" back until the next passive effect: a rename made in that
+    // window (probed from a layout effect, which runs first) was refused for a
+    // name no page holds.
+    let fired = false;
+    let probeDue = false;
+    let probe: boolean | null = null;
+    backend.onRemovalList = () => {
+      if (fired) return;
+      fired = true;
+      latestHook!().addPage("tmux");
+      expect(latestHook!().renamePage("operator-1", "tmux 2")).toBe(true);
+      probeDue = true;
+    };
+    let latest: Hook | null = null;
+    function Probe() {
+      latest = useTerminalPages();
+      useLayoutEffect(() => {
+        if (!probeDue) return;
+        probeDue = false;
+        probe = latest!.renamePage("operator-3", "Page 2");
+      });
+      return null;
+    }
+    latestHook = () => latest!;
+    await act(async () => root.render(createElement(Probe)));
+    await settle();
+
+    expect(probe).toBe(true);
+    const byId = (id: string) => latest!.allPages.find((p) => p.id === id);
+    expect(byId("operator-1")?.name).toBe("2");
+    expect(byId("operator-3")?.name).toBe("Page 2");
+    expect(byId("oct-page-2")).toBeUndefined();
+    expect(names(latest!.allPages)).toContain("tmux 2");
   });
 
   it("writes no version after an incomplete read", async () => {

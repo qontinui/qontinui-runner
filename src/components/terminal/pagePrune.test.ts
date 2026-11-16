@@ -14,6 +14,7 @@ import {
   pruneNoticeText,
   removeEach,
   restoreRemovedPages,
+  rosterNeedsRepair,
   withClassifiedOrigins,
   type RemovedPage,
 } from "./pagePrune";
@@ -101,6 +102,13 @@ describe("prunablePageIds (D3)", () => {
     const bound = { ...guards, boundPages: { bound: "terminal-popout-1" } };
     expect(prunablePageIds(pages, new Set(), bound)).toEqual(["2"]);
   });
+
+  it("counts an occupied default page, which the strip shows, for the keep-one rule", () => {
+    // The strip shows `default` while it hosts a session, so removing every
+    // empty auto page cannot leave it blank: nothing is held back.
+    const pages = [page("default", "Terminal"), auto("1"), auto("2")];
+    expect(prunablePageIds(pages, new Set(["default"]), guards)).toEqual(["1", "2"]);
+  });
 });
 
 describe("duplicateNameRepairs (D2 (b))", () => {
@@ -171,7 +179,32 @@ describe("restoreRemovedPages (Undo)", () => {
       [page("default", "Terminal"), page("y", "Page 3")],
       removed,
     );
-    expect(restored.map((p) => p.name)).toEqual(["Page 4", "Page 3 2", "Terminal", "Page 3"]);
+    // A runner name takes the next "Page N", as the repair renames it.
+    expect(restored.map((p) => p.name)).toEqual(["Page 5", "Page 4", "Terminal", "Page 3"]);
+  });
+
+  it("renames a collision exactly as the repair does", () => {
+    const survivors = [page("default", "Terminal"), page("p20", "Page 20"), page("t", "tmux")];
+    const gone = [page("oct20", "Page 20", { createdAt: 0 }), page("t2", "tmux", { createdAt: 0 })];
+    const undone = restoreRemovedPages(
+      survivors,
+      gone.map((p) => ({ page: p, index: 3, entries: [] })),
+    );
+    const repaired = duplicateNameRepairs([...survivors, ...gone], new Set(["p20", "t"]));
+    expect(undone.find((p) => p.id === "oct20")?.name).toBe("Page 21");
+    expect(undone.find((p) => p.id === "t2")?.name).toBe("tmux 2");
+    expect(repaired).toEqual([
+      { id: "oct20", from: "Page 20", to: "Page 21" },
+      { id: "t2", from: "tmux", to: "tmux 2" },
+    ]);
+  });
+});
+
+describe("rosterNeedsRepair", () => {
+  it("is true for a shared name or a second Terminal, false for a clean roster", () => {
+    expect(rosterNeedsRepair([page("a", "Page 1"), page("b", "Page 1")])).toBe(true);
+    expect(rosterNeedsRepair([page("default", "Terminal"), page("t", "Terminal")])).toBe(true);
+    expect(rosterNeedsRepair([page("default", "Terminal"), page("a", "Page 1")])).toBe(false);
   });
 });
 
@@ -184,7 +217,7 @@ describe("removeEach", () => {
       async () => reads.shift()!,
       async (id) => id,
     );
-    expect(pass).toEqual({ removed: ["a"], allReadsComplete: false, lastIds: new Set() });
+    expect(pass).toEqual({ removed: ["a"], allReadsComplete: false });
   });
   it("reports a whole pass as complete", async () => {
     const pass = await removeEach(
@@ -192,7 +225,7 @@ describe("removeEach", () => {
       async () => read("b"),
       async (id) => id,
     );
-    expect(pass).toEqual({ removed: ["a"], allReadsComplete: true, lastIds: new Set(["b"]) });
+    expect(pass).toEqual({ removed: ["a"], allReadsComplete: true });
   });
 });
 

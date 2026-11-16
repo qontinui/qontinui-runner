@@ -97,7 +97,7 @@ function emit(): void {
  * the field it is asked for returns an object missing that key, and a
  * `NaN`/negative cap would be worse than the default. Anything unusable
  * falls back to the stock value FIELD BY FIELD, so one bad key never
- * discards the other seven.
+ * discards the other eight.
  */
 export function normalizePerfCaps(raw: unknown): PerfCaps {
   const src = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;

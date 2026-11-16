@@ -75,9 +75,11 @@ export interface PruneGuards {
  * (no live terminal, no restorable record). The caller passes only a COMPLETE
  * occupancy read.
  *
- * At least one DOCKED page other than `default` always survives (pages bound
- * to a pop-out do not count: the strip cannot show them): if every one of them
- * is a candidate, the first is kept, so the strip never goes blank.
+ * At least one page the strip SHOWS always survives, so it never goes blank.
+ * Shown means docked (a page bound to a pop-out is in another window) and,
+ * for `default`, occupied: the strip hides an empty `default`
+ * (`computeVisiblePages`), and shows an occupied one, which is never a
+ * candidate. When every shown page is a candidate, the first is kept.
  */
 export function prunablePageIds(
   pages: readonly TerminalPageConfig[],
@@ -93,8 +95,10 @@ export function prunablePageIds(
       guards.now - p.createdAt >= PRUNE_MIN_AGE_MS &&
       !occupied.has(p.id),
   );
-  const docked = pages.filter((p) => p.id !== DEFAULT_PAGE_ID && !guards.boundPages[p.id]).length;
-  if (candidates.length > 0 && candidates.length === docked) candidates.shift();
+  const shown = pages.filter(
+    (p) => !guards.boundPages[p.id] && (p.id !== DEFAULT_PAGE_ID || occupied.has(DEFAULT_PAGE_ID)),
+  ).length;
+  if (candidates.length > 0 && candidates.length === shown) candidates.shift();
   return candidates.map((p) => p.id);
 }
 
@@ -115,12 +119,23 @@ export interface PageRename {
 }
 
 /**
+ * The name a page takes when the one it carries is already used (or is
+ * "Terminal", which only `default` may carry): a runner name (`Page N`) takes
+ * {@link nextAutoPageName}, so it never becomes a "Page 20 2"; any other name
+ * takes {@link uniquePageName}. The one collision rule the repair and Undo
+ * share.
+ */
+function collisionName(name: string, roster: ReadonlyArray<{ name: string }>): string {
+  return AUTO_NAMES[0].test(name) ? nextAutoPageName(roster) : uniquePageName(name, roster);
+}
+
+/**
  * Pure: re-insert `removed` (in the order they were removed) at their prior
  * indices, each as `origin: "operator"` so the next reconcile does not prune
  * it again. Walking the removals backwards against their captured indices
  * restores the original order exactly. A restored page whose name is now taken
- * (or is "Terminal") is given a unique one, so Undo cannot bring a duplicate
- * back. A page already present is left alone.
+ * (or is "Terminal") is renamed by the repair's rule ({@link collisionName}),
+ * so Undo cannot bring a duplicate back. A page already present is left alone.
  */
 export function restoreRemovedPages(
   pages: TerminalPageConfig[],
@@ -130,9 +145,10 @@ export function restoreRemovedPages(
   for (let i = removed.length - 1; i >= 0; i--) {
     const { page, index } = removed[i];
     if (out.some((p) => p.id === page.id)) continue;
+    const taken = page.name === DEFAULT_PAGE_NAME || out.some((p) => p.name === page.name);
     const restored: TerminalPageConfig = {
       ...page,
-      name: uniquePageName(page.name, out),
+      name: taken ? collisionName(page.name, out) : page.name,
       origin: "operator",
     };
     out.splice(Math.min(index, out.length), 0, restored);
@@ -145,9 +161,8 @@ export function restoreRemovedPages(
  * takes {@link nextAutoPageName}. Among pages sharing a name ONE keeps it, in
  * this order of claim: an OCCUPIED page (the name the operator has been
  * reading on a populated tab), then an operator page, then the oldest
- * (`createdAt`, then roster order). Every other holder is renamed: a runner
- * name (`Page N`) takes {@link nextAutoPageName}, any other name takes
- * {@link uniquePageName}. Ids never change. Returns the renames in the order
+ * (`createdAt`, then roster order). Every other holder is renamed by
+ * {@link collisionName}. Ids never change. Returns the renames in the order
  * they were made; an empty list means the roster was already clean.
  */
 export function duplicateNameRepairs(
@@ -163,7 +178,7 @@ export function duplicateNameRepairs(
 
   for (const p of roster) {
     if (p.id !== DEFAULT_PAGE_ID && p.name === DEFAULT_PAGE_NAME) {
-      rename(p, nextAutoPageName(roster));
+      rename(p, collisionName(p.name, roster));
     }
   }
 
@@ -179,13 +194,20 @@ export function duplicateNameRepairs(
       kept.add(p.name);
       continue;
     }
-    const to = AUTO_NAMES[0].test(p.name)
-      ? nextAutoPageName(roster)
-      : uniquePageName(p.name, roster);
+    const to = collisionName(p.name, roster);
     rename(p, to);
     kept.add(to);
   }
   return renames;
+}
+
+/**
+ * Pure: whether `pages` still carries a name the repair would change (a shared
+ * name, or a non-default "Terminal"). How many renames a roster needs does not
+ * depend on occupancy, which only decides WHICH holder keeps a name.
+ */
+export function rosterNeedsRepair(pages: readonly TerminalPageConfig[]): boolean {
+  return duplicateNameRepairs(pages, new Set()).length > 0;
 }
 
 /** Pure: apply `renames` to `pages` by id. Same reference when there are none. */
@@ -213,8 +235,6 @@ export interface OccupancyRead {
 export interface RemovalPass<T> {
   removed: T[];
   allReadsComplete: boolean;
-  /** The ids of the last complete re-read, or `null` when none was made. */
-  lastIds: Set<string> | null;
 }
 
 /**
@@ -231,16 +251,14 @@ export async function removeEach<T>(
 ): Promise<RemovalPass<T>> {
   const removed: T[] = [];
   let allReadsComplete = true;
-  let lastIds: Set<string> | null = null;
   for (const id of candidates) {
     const fresh = await read();
     if (!fresh.complete) allReadsComplete = false;
-    else lastIds = fresh.ids;
     if (!fresh.complete || fresh.ids.has(id)) continue;
     const r = await remove(id);
     if (r !== null) removed.push(r);
   }
-  return { removed, allReadsComplete, lastIds };
+  return { removed, allReadsComplete };
 }
 
 /** The strip's notice text for an auto-prune and/or repair. */
