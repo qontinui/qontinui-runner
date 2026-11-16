@@ -18,6 +18,7 @@
 //! use the HTTP API at port 9876 instead.
 
 use crate::execution_core::builtin_tools::{execute_builtin_tool, BuiltinToolRegistry};
+use qontinui_runner_lib::file_tail;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -187,11 +188,10 @@ impl EmbeddedMcp {
         }))
     }
 
-    /// Read runner logs from the dev-logs directory.
+    /// Read runner logs from the dev-logs directory: the newest `limit` entries
+    /// of each, from a bounded tail of the file (at most
+    /// [`file_tail::LOG_TAIL_CAP`] bytes), never the whole of it.
     async fn read_runner_logs(&self, args: Value) -> Result<Value, String> {
-        use std::fs::File;
-        use std::io::{BufRead, BufReader};
-
         let log_type = args
             .get("log_type")
             .and_then(|v| v.as_str())
@@ -220,14 +220,12 @@ impl EmbeddedMcp {
         for (key, filename) in log_files {
             let path = self.dev_logs_path.join(filename);
             if path.exists() {
-                let file = File::open(&path).map_err(|e| format!("Failed to open log: {}", e))?;
-                let reader = BufReader::new(file);
-
-                let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-                let entries: Vec<Value> = lines
+                let tail = file_tail::tail_lines(&path, limit, file_tail::LOG_TAIL_CAP)
+                    .map_err(|e| format!("Failed to read log: {}", e))?;
+                let entries: Vec<Value> = tail
+                    .lines
                     .iter()
                     .rev()
-                    .take(limit)
                     .filter_map(|line| serde_json::from_str(line).ok())
                     .collect();
 

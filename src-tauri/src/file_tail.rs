@@ -102,15 +102,20 @@ pub fn read_tail_lossy(path: &Path, max: u64) -> Option<String> {
 }
 
 /// [`read_tail_lossy`] over any seekable source `len` bytes long.
+///
+/// The window is the only buffer: a mid-file window's partial first line is
+/// drained off its front, and valid UTF-8 becomes the `String` in place. Only a
+/// window holding invalid UTF-8 is copied, to decode it — a transcript scan
+/// reads windows of megabytes on every turn end.
 fn read_tail_lossy_from<R: Read + Seek>(src: &mut R, len: u64, max: u64) -> io::Result<String> {
     let start = len.saturating_sub(max);
-    let window = read_range(src, start, len - start)?;
-    let text = if start == 0 {
-        &window[..]
-    } else {
-        after_first_newline(&window).unwrap_or_default()
-    };
-    Ok(String::from_utf8_lossy(text).into_owned())
+    let mut window = read_range(src, start, len - start)?;
+    if start > 0 {
+        let partial = window.len() - after_first_newline(&window).map_or(0, <[u8]>::len);
+        window.drain(..partial);
+    }
+    Ok(String::from_utf8(window)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// The last `n` lines of `path`, reading at most `cap` bytes of it. See
@@ -499,6 +504,26 @@ mod tests {
             Some("aaaa\nbbbb\ncc\u{FFFD}cc\n")
         );
         assert_eq!(read_tail_lossy(&dir.path().join("absent"), 8), None);
+    }
+
+    /// A valid-UTF-8 window becomes the string in place: the partial line is
+    /// drained off its front, so the string keeps the window's capacity. A
+    /// decode-and-copy would allocate exactly the body.
+    #[test]
+    fn read_tail_lossy_reuses_a_valid_window_instead_of_copying_it() {
+        let bytes = b"partial\nkept one\nkept two\n";
+        // The last 20 of 26 bytes: "l\n" is the partial line.
+        let lossy = read_tail_lossy_from(&mut Cursor::new(&bytes[..]), 26, 20).unwrap();
+        assert_eq!(lossy, "kept one\nkept two\n");
+        assert!(
+            lossy.capacity() > lossy.len(),
+            "capacity {} for {} bytes: the window was copied",
+            lossy.capacity(),
+            lossy.len()
+        );
+        // No `\n` in a mid-file window: no whole line, so nothing.
+        let none = read_tail_lossy_from(&mut Cursor::new(&b"abcdef"[..]), 6, 4).unwrap();
+        assert_eq!(none, "");
     }
 
     /// The length is fixed when the source is opened: bytes appended after
