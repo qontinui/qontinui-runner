@@ -23299,11 +23299,23 @@ mod spawn_account_tests {
         assert_eq!(own.source, ClaudeConfigDirSource::PickedForThisSpawn);
         assert_eq!(own.choice.as_ref().and_then(AccountChoice::pin), None);
 
+        // A flag, not a panic: a panicking pick surfaces as a JoinError that the
+        // resolver's fallback absorbs by resolving the pin alone, so a panic here
+        // could never fail the test.
+        let picked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let picked_in_pick = picked.clone();
         let pinned = super::resolve_account_for_spawn_with(
             Some(AccountChoice::Pinned(sibling.clone())),
-            || panic!("a pinned spawn must not take a pick"),
+            move || {
+                picked_in_pick.store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
         )
         .await;
+        assert!(
+            !picked.load(std::sync::atomic::Ordering::SeqCst),
+            "a pinned spawn must not take a pick"
+        );
         assert_eq!(pinned.dir.as_deref(), Some(sibling.as_str()));
         assert_eq!(pinned.source, ClaudeConfigDirSource::RequestOverride);
         assert_eq!(
