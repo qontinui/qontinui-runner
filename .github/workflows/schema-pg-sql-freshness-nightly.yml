@@ -286,27 +286,38 @@ jobs:
         timeout-minutes: 10
         run: bash atlas/scripts/apply_to.sh postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
 
-      # Bounded against a job-time apt hang, same 10-minute bound and same
-      # rationale as the identical step in schema-pg-sql-fresh.yml and
-      # ci.yml: a 9-second download sample cannot size a bound
-      # that must also cover `apt-get update` on a congested mirror.
-      - name: Install Postgres client (for pg_dump)
-        timeout-minutes: 10
+      # pg_dump runs INSIDE the postgres service container, the same way and
+      # for the same reasons as schema-pg-sql-fresh.yml's regenerate step: the
+      # client is the server's own binary, so its major and minor match by
+      # construction. That matters doubly here, because a skewed client's dump
+      # is not just a red night: this job would self-heal it into a refresh PR.
+      # The host `apt-get install -y postgresql-client-16` this replaced fails
+      # on Ubuntu 26.04, which ubuntu-latest now resolves to and which ships
+      # only postgresql-client-18; every night from 2026-11-12 went red at that
+      # step (coord finding 8a344609). This step refuses an empty container id
+      # up front, because fresh_check below would otherwise fall back to a host
+      # pg_dump of unknown version, and it logs which pg_dump the dump is taken
+      # with.
+      - name: Resolve pg_dump (the postgres service container's own)
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-16
+          if [ -z "$PG_CONTAINER" ]; then
+            echo "::error::job.services.postgres.id is empty; refusing to fall back to a host pg_dump of unknown version."
+            exit 1
+          fi
+          docker exec "$PG_CONTAINER" pg_dump --version
 
       - name: Check schema.pg.sql.generated is fresh
         id: fresh_check
         working-directory: qontinui-runner
         shell: bash
         env:
-          # Empty CLORINDE_PG_CONTAINER selects the regen script's NATIVE
-          # pg_dump path (the `-` default, not `:-`, honours the empty string).
-          CLORINDE_PG_CONTAINER: ""
-          CLORINDE_PG_HOST: localhost
-          CLORINDE_PG_PORT: "5433"
-          PGPASSWORD: qontinui_dev_password
+          # A non-empty CLORINDE_PG_CONTAINER selects the regen script's
+          # docker-exec path: pg_dump runs inside the service container over
+          # its local socket, so no host, port or password is passed. The
+          # step above has already refused an empty id.
+          CLORINDE_PG_CONTAINER: ${{ job.services.postgres.id }}
           # Atlas was applied by the step above; do not apply it twice.
           REGEN_SKIP_ATLAS: "1"
           # Single source of truth for the trigger predicate. Re-published as a
@@ -372,8 +383,9 @@ jobs:
 
           # Strip the pg_dump version banner before comparing: it records the OS
           # vendor string of whichever client produced the file, which differs
-          # between a contributor's Docker setup and CI's apt client. Pure
-          # environmental noise that would otherwise ratchet the artifact.
+          # between regen environments (a container's Debian build, a distro's
+          # apt client). Pure environmental noise that would otherwise ratchet
+          # the artifact.
           # Both inputs are known non-empty by the guards above, so the bare
           # `grep -v` cannot exit 1 here.
           strip() { grep -v '^-- Dumped by pg_dump version' "$1" > "$2"; }
