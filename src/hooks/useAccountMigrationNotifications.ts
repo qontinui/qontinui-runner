@@ -11,9 +11,11 @@
  *   surfaced as an error so the operator knows the session is stranded.
  * - `session-limit-parked` when a session that stopped at a usage limit was
  *   parked until its reset (backend `terminal::limit_reset`, plan 2026-11-05
- *   Phase 2). Not an error: nothing failed, and the session is continued at
- *   the reset. A restart can park ~100 sessions at once, so parks are
- *   coalesced into one info toast per burst.
+ *   Phase 2). Not an error: nothing failed. The scan loop hands the session
+ *   back to the usage-limit handler at its due time (plan Phase 3). A restart
+ *   can park ~100 sessions at once, so parks are coalesced into one info toast
+ *   per burst. A `continue-retry` park (a continue attempt that did not reach
+ *   the pane, retried shortly) raises no toast.
  * - `session-limit-reset-continued` when such a session was continued in
  *   place after its reset — coalesced the same way.
  * - `session-limit-reset-continue-gave-up` when the runner stopped trying to
@@ -254,10 +256,18 @@ export function gaveUpBurstToast(gaveUp: LimitGaveUpPayload[]): {
   message: string;
   type: ToastType;
 } {
+  const one = gaveUp.length === 1;
   return {
-    message: `${burstSubject(gaveUp)} stopped at a usage limit that has reset, but the runner could not continue it; it needs a prompt by hand`,
+    message: `${burstSubject(gaveUp)} stopped at a usage limit that has reset, but the runner could not continue ${
+      one ? "it; it needs" : "them; they need"
+    } a prompt by hand`,
     type: "error",
   };
+}
+
+/** Whether a park is worth a toast: not the runner's own short retry. */
+export function parkIsToasted(p: LimitParkedPayload): boolean {
+  return p.reason !== "continue-retry";
 }
 
 /**
@@ -323,7 +333,8 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
       },
     );
     const unlistenParked = listen<LimitParkedPayload>("session-limit-parked", (event) => {
-      parked.push(event.payload ?? {});
+      const payload = event.payload ?? {};
+      if (parkIsToasted(payload)) parked.push(payload);
     });
     const unlistenContinued = listen<LimitContinuedPayload>(
       "session-limit-reset-continued",
