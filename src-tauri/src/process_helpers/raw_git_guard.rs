@@ -15,9 +15,15 @@
 //! commit` run from inside a git hook inherits the hook's `GIT_DIR` /
 //! `GIT_INDEX_FILE` and acts on the hook's repository instead of the tempdir.
 //! So a second arm, [`no_git_spawn_anywhere_bypasses_the_chokepoint`], reads
-//! EVERY line of `src/` and `tests/` (no test-region skipping) and pins the
-//! total of marked exceptions, test sites included, at
+//! EVERY line of `src/`, `tests/` and `build.rs` (no test-region skipping) and
+//! pins the total of marked exceptions, test sites included, at
 //! [`EXPECTED_MARKED_ANYWHERE`].
+//!
+//! The build script is its own crate and cannot reach `no_window`, yet its git
+//! spawns stamp the sha `/health` serves, and a cargo build started from a git
+//! hook inherits that hook's `GIT_DIR`. So `build.rs` is read BY NAME (a read
+//! failure panics rather than being skipped) and must hold exactly one marked
+//! spawn: `build_script_git`, which scrubs the same `git_posture` list.
 
 use super::source_scan::{production_lines, rs_files};
 use std::path::PathBuf;
@@ -72,9 +78,10 @@ pub(super) fn raw_git_spawns(src: &str) -> (Vec<usize>, usize) {
     (unmarked, marked)
 }
 
-/// The marked raw git spawns allowed ANYWHERE under `src-tauri/src` and
-/// `src-tauri/tests`, test code included. Each is a reviewed exception; a new
-/// one is an edit to this number, not a free comment. The 8 sites:
+/// The marked raw git spawns allowed ANYWHERE under `src-tauri/src`,
+/// `src-tauri/tests` and `src-tauri/build.rs`, test code included. Each is a
+/// reviewed exception; a new one is an edit to this number, not a free comment.
+/// The 9 sites:
 ///
 /// 1. `src/bin/qontinui_cli.rs` `git_stdout` — the user's own shell repo.
 /// 2. `src/git_trunk.rs` — unscrubbed control in the re-exec child.
@@ -86,7 +93,10 @@ pub(super) fn raw_git_spawns(src: &str) -> (Vec<usize>, usize) {
 ///    `scrub_repo_local_git_env` on a raw builder.
 /// 8. `src/ci_node/sibling_git_env.rs` — never spawned; unit-tests
 ///    `isolate_std_git_command` on a raw builder.
-const EXPECTED_MARKED_ANYWHERE: usize = 8;
+/// 9. `build.rs` `build_script_git` — the build script's only git constructor;
+///    it cannot reach `no_window`, so it scrubs `git_posture`'s
+///    `REPO_LOCAL_GIT_ENV` itself.
+const EXPECTED_MARKED_ANYWHERE: usize = 9;
 
 /// Like [`raw_git_spawns`], but over EVERY line of `src` — no
 /// `production_lines`, no test-region parsing. Lines whose trimmed start is
@@ -223,13 +233,25 @@ fn the_detector_catches_a_raw_spawn_and_honours_the_marker() {
 /// Every git spawn under `src-tauri/src` AND `src-tauri/tests`, test code
 /// included, goes through the chokepoint: a test fixture run from inside a git
 /// hook otherwise inherits the hook's `GIT_DIR` / `GIT_INDEX_FILE` and writes
-/// the hook's repository. The marked exceptions are pinned at
-/// [`EXPECTED_MARKED_ANYWHERE`].
+/// the hook's repository. `src-tauri/build.rs` is scanned too, by name, and may
+/// spawn git only through its one marked `build_script_git`. The marked
+/// exceptions are pinned at [`EXPECTED_MARKED_ANYWHERE`].
 #[test]
 fn no_git_spawn_anywhere_bypasses_the_chokepoint() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut violations = Vec::new();
     let mut marked_sites = Vec::new();
+    // The build script by NAME: a directory walk skips an unreadable file, but
+    // a build.rs this guard could not read is a guard that scanned nothing.
+    let build_rs = manifest.join("build.rs");
+    let build_src = std::fs::read_to_string(&build_rs).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e} — the raw-git guard must scan the build script",
+            build_rs.display()
+        )
+    });
+    let (build_unmarked, build_marked) = raw_git_spawns_all_lines(&build_src);
+    violations.extend(build_unmarked.into_iter().map(|n| format!("build.rs:{n}")));
     for (sub, min_files) in [("src", 100), ("tests", 10)] {
         let root = manifest.join(sub);
         let mut files = Vec::new();
@@ -257,23 +279,32 @@ fn no_git_spawn_anywhere_bypasses_the_chokepoint() {
     }
     assert!(
         violations.is_empty(),
-        "{} raw git spawn(s) under src-tauri/src or src-tauri/tests (test code \
-         included) bypass process_helpers::no_window (the prompt posture AND the \
-         repository-local scrub):\n{}\n\nBuild them with \
-         `crate::process_helpers::no_window(\"git\")` under src/, or \
-         `qontinui_runner_lib::process_helpers::no_window(\"git\")` under tests/. A \
-         deliberate exception carries a `// git-env-ok: <reason>` comment within \
-         {MARKER_WINDOW} lines above it AND an update to EXPECTED_MARKED_ANYWHERE.",
+        "{} raw git spawn(s) under src-tauri/src, src-tauri/tests or src-tauri/build.rs \
+         (test code included) bypass process_helpers::no_window (the prompt posture \
+         AND the repository-local scrub):\n{}\n\nBuild them with \
+         `crate::process_helpers::no_window(\"git\")` under src/, \
+         `qontinui_runner_lib::process_helpers::no_window(\"git\")` under tests/, or \
+         `build_script_git()` in build.rs. A deliberate exception carries a \
+         `// git-env-ok: <reason>` comment within {MARKER_WINDOW} lines above it AND \
+         an update to EXPECTED_MARKED_ANYWHERE.",
         violations.len(),
         violations.join("\n")
     );
     assert_eq!(
+        build_marked.len(),
+        1,
+        "build.rs must carry exactly one marked raw git spawn (build_script_git), \
+         found {build_marked:?} — every build-script git goes through that one \
+         scrubbing constructor"
+    );
+    marked_sites.extend(build_marked.into_iter().map(|n| format!("build.rs:{n}")));
+    assert_eq!(
         marked_sites.len(),
         EXPECTED_MARKED_ANYWHERE,
         "expected exactly {EXPECTED_MARKED_ANYWHERE} `git-env-ok:` marked raw git \
-         spawns across src-tauri/src and src-tauri/tests, found {}:\n{}\n\nA new \
-         deliberate spawn is a reviewed edit to EXPECTED_MARKED_ANYWHERE and its site \
-         list; a removed one lowers it.",
+         spawns across src-tauri/src, src-tauri/tests and src-tauri/build.rs, found \
+         {}:\n{}\n\nA new deliberate spawn is a reviewed edit to \
+         EXPECTED_MARKED_ANYWHERE and its site list; a removed one lowers it.",
         marked_sites.len(),
         marked_sites.join("\n")
     );
