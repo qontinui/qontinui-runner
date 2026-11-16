@@ -51,9 +51,10 @@
 # runs produce byte-equal output regardless of pg_dump build origin
 # (apt-installed Ubuntu vs docker-exec'd Debian — these embed different
 # distro tags in the `-- Dumped by pg_dump version ...` header even at
-# the same Postgres patch level). Stripping the Dumped-version lines is
-# necessary for the CI gate, where the workflow uses Ubuntu's apt
-# postgresql-client-16 but `pg_dump`s a Debian-based pgvector container.
+# the same Postgres patch level). The CI gates now docker-exec the
+# service container's own pg_dump, as a local run does, but a native
+# client is still a supported mode, so the Dumped-version lines are
+# stripped regardless of which build produced the dump.
 #
 # Environment overrides:
 #   CLORINDE_PG_CONTAINER (default: qontinui-canonical-postgres)
@@ -73,8 +74,12 @@
 # Container vs native pg_dump:
 # By default the script uses `docker exec <container> pg_dump` so a host
 # without pg_dump installed can still run it. If CLORINDE_PG_CONTAINER
-# is set to the empty string, the script falls back to host `pg_dump`
-# (the CI workflow uses this path with a postgres-client install).
+# is set to the empty string, the script falls back to host `pg_dump`,
+# whose major version should equal the server's: pg_dump refuses a newer
+# server, and a newer pg_dump can word the same schema differently. The
+# CI workflows pass the postgres service container's id
+# (`job.services.postgres.id`) instead, so they dump with the server's
+# own binary.
 
 set -euo pipefail
 
