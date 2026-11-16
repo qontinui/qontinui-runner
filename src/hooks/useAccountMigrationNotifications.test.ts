@@ -10,6 +10,7 @@ import {
   LIMIT_BURST_MS,
   continuedBurstToast,
   createBurstCoalescer,
+  formatDue,
   gaveUpBurstToast,
   parkIsToasted,
   migratedToast,
@@ -165,6 +166,17 @@ describe("usage-limit park and continue toasts (plan 2026-11-05 Phase 2)", () =>
     expect(gaveUpBurstToast([{}, {}]).message).toBe(
       "2 sessions stopped at a usage limit that has reset, but the runner could not continue them; they need a prompt by hand",
     );
+  });
+
+  it("names the day when a park is due on another day", () => {
+    const now = new Date(2026, 10, 16, 9, 0).getTime();
+    const later = new Date(2026, 10, 16, 18, 30).getTime();
+    const days = new Date(2026, 10, 19, 18, 30).getTime();
+    expect(formatDue(later, now)).not.toContain(" ");
+    expect(formatDue(later, now)).toContain("18");
+    expect(formatDue(days, now)).toContain(" ");
+    expect(formatDue(days, now)).toContain("19");
+    expect(formatDue(days, now).endsWith(formatDue(later, now))).toBe(true);
   });
 
   it("raises no park toast for the runner's own continue retry", () => {

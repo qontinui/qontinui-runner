@@ -221,6 +221,18 @@ fn the_exhausted_window_reset_is_the_session_window_only_when_only_it_is_full() 
         exhausted_window_reset_ms(&AccountUsageInfo::default()),
         None
     );
+    // Exhausted by status alone (neither number at the threshold): the
+    // earlier reset, never the later.
+    let status_only = AccountUsageInfo {
+        utilization: 0.6,
+        session_utilization: Some(0.7),
+        status: Some("blocked".to_string()),
+        ..session_full.clone()
+    };
+    assert_eq!(
+        exhausted_window_reset_ms(&status_only),
+        Some(1_800_010_000_000)
+    );
 }
 
 #[test]
@@ -249,13 +261,22 @@ fn the_handler_probes_its_own_account_only_for_a_stop_it_could_continue() {
 #[test]
 fn a_stop_from_before_the_latest_migration_is_left_to_that_migration() {
     // The carried transcript ends at the stop the migration answered, with
-    // the OLD account's reset still ahead: never park it until then.
+    // the OLD account's reset still ahead: never park it until then. While
+    // the migration's own nudge can still be running, leave it to that nudge.
     let mut carried = inputs(stopped(Some(NOW + 86_400_000)), FINE);
-    carried.migrated_at_ms = Some(STOPPED_AT + 5_000);
+    carried.migrated_at_ms = Some(NOW - 60_000);
     assert_eq!(
         decide(&carried),
         LimitAction::Skip(SkipReason::MigratedSinceStop)
     );
+    // Past that window the stop was never answered: continue it, whatever
+    // the OLD account's reset says.
+    carried.migrated_at_ms = Some(NOW - 300_001);
+    assert_eq!(
+        decide(&carried),
+        LimitAction::Continue(stop(Some(NOW + 86_400_000)))
+    );
+    assert_eq!(MIGRATION_NUDGE_WINDOW_MS, 300_000);
     // A stop with no timestamp beside a recorded migration: the same.
     let mut untimed = inputs(
         LimitStopRead::Stopped(LimitStop {
@@ -264,14 +285,14 @@ fn a_stop_from_before_the_latest_migration_is_left_to_that_migration() {
         }),
         FINE,
     );
-    untimed.migrated_at_ms = Some(STOPPED_AT);
+    untimed.migrated_at_ms = Some(NOW - 60_000);
     assert_eq!(
         decide(&untimed),
         LimitAction::Skip(SkipReason::MigratedSinceStop)
     );
     // A destination that is itself dry still takes the next hop.
     let mut dry_target = inputs(stopped(Some(NOW + 86_400_000)), DRY);
-    dry_target.migrated_at_ms = Some(STOPPED_AT + 5_000);
+    dry_target.migrated_at_ms = Some(NOW - 60_000);
     assert_eq!(
         decide(&dry_target),
         LimitAction::Migrate {
@@ -311,6 +332,15 @@ fn the_probe_verdict_reads_a_missing_or_errored_row_as_unknown() {
     assert_eq!(
         ProbeVerdict::from_row(Some(&clean_with_reset), true).resets_at_ms,
         Some(1_800_500_000_000)
+    );
+    // An errored row carries no reset to park on.
+    let errored_with_reset = AccountUsageInfo {
+        error: Some("API error (429)".to_string()),
+        ..clean_with_reset.clone()
+    };
+    assert_eq!(
+        ProbeVerdict::from_row(Some(&errored_with_reset), true).resets_at_ms,
+        None
     );
     assert_eq!(
         ProbeVerdict::from_row(Some(&clean), true),
@@ -468,25 +498,25 @@ fn park_due_never_lands_inside_one_margin_and_falls_back_an_hour() {
 #[test]
 fn a_refused_migration_of_a_stop_parks_it_and_a_non_stop_reports_as_before() {
     assert_eq!(
-        migration_refused(Some(NOW + 9_000), ParkReason::NoUsableTarget),
+        migration_refused(Some(NOW + 9_000), ParkReason::NoUsableTarget, NOW),
         RefusalReport::Park {
             due_at_ms: NOW + 9_000,
             reason: ParkReason::NoUsableTarget,
         }
     );
     assert_eq!(
-        migration_refused(Some(NOW + 9_000), ParkReason::MigrationCapReached),
+        migration_refused(Some(NOW + 9_000), ParkReason::MigrationCapReached, NOW),
         RefusalReport::Park {
             due_at_ms: NOW + 9_000,
             reason: ParkReason::MigrationCapReached,
         }
     );
     assert_eq!(
-        migration_refused(None, ParkReason::NoUsableTarget),
+        migration_refused(None, ParkReason::NoUsableTarget, NOW),
         RefusalReport::Skipped("no-usable-target")
     );
     assert_eq!(
-        migration_refused(None, ParkReason::MigrationCapReached),
+        migration_refused(None, ParkReason::MigrationCapReached, NOW),
         RefusalReport::Skipped("migration-cap-reached")
     );
 }
@@ -501,16 +531,86 @@ fn report_park_parks_the_terminal_and_emits_session_limit_parked() {
         "/home/u/.claude-jan",
         NOW + 120_000,
         ParkReason::NoUsableTarget,
-        |t, s, due| parked = Some((t.to_string(), s.to_string(), due)),
+        |t, s, due, why| {
+            parked = Some((t.to_string(), s.to_string(), due, why));
+            true
+        },
         |name, payload| emitted.push((name, payload)),
     );
     assert_eq!(
         parked,
-        Some(("term-1".to_string(), "sid-1".to_string(), NOW + 120_000))
+        Some((
+            "term-1".to_string(),
+            "sid-1".to_string(),
+            NOW + 120_000,
+            "no-usable-target"
+        ))
     );
     assert_eq!(emitted.len(), 1);
     assert_eq!(emitted[0].0, "session-limit-parked");
     assert_eq!(emitted[0].1["reason"], "no-usable-target");
+    // A re-park the park list calls not worth reporting emits nothing.
+    let mut quiet = Vec::new();
+    report_park(
+        "term-1",
+        "sid-1",
+        "/home/u/.claude-jan",
+        NOW + 240_000,
+        ParkReason::NoUsableTarget,
+        |_, _, _, _| false,
+        |name, payload| quiet.push((name, payload)),
+    );
+    assert!(quiet.is_empty());
+}
+
+#[test]
+fn a_refused_migration_park_is_due_within_the_hour() {
+    // The source's weekly reset is days away; another account or a cap slot
+    // can free up long before.
+    assert_eq!(
+        migration_refused(Some(NOW + 4 * 86_400_000), ParkReason::NoUsableTarget, NOW),
+        RefusalReport::Park {
+            due_at_ms: NOW + 3_600_000,
+            reason: ParkReason::NoUsableTarget,
+        }
+    );
+}
+
+#[test]
+fn a_failing_probe_backs_off_up_to_the_hour() {
+    assert_eq!(unknown_park_backoff_ms(1), 120_000);
+    assert_eq!(unknown_park_backoff_ms(2), 240_000);
+    assert_eq!(unknown_park_backoff_ms(3), 480_000);
+    assert_eq!(unknown_park_backoff_ms(40), 3_600_000);
+    let mut l = ContinueLedger::default();
+    assert_eq!(l.note_unknown_park("s", "e"), 1);
+    assert_eq!(l.note_unknown_park("s", "e"), 2);
+    assert_eq!(l.note_unknown_park("s", "other"), 1);
+}
+
+#[test]
+fn only_a_stop_or_a_possible_migration_needs_the_roster_probe() {
+    assert!(roster_probe_needed(&stopped(None), false, 1));
+    assert!(roster_probe_needed(&LimitStopRead::NotStopped, true, 2));
+    assert!(!roster_probe_needed(&LimitStopRead::NotStopped, false, 2));
+    assert!(!roster_probe_needed(&LimitStopRead::NotStopped, true, 1));
+    assert!(!roster_probe_needed(
+        &LimitStopRead::Unreadable("x".to_string()),
+        false,
+        3
+    ));
+}
+
+#[tokio::test]
+async fn a_dropped_continue_run_does_not_leave_its_stop_in_flight() {
+    let ledger: Mutex<Option<ContinueLedger>> = Mutex::new(None);
+    let run = run_continue(&ledger, "s", "e", || {}, || std::future::pending());
+    // Poll it once (the claim is taken), then drop it mid-watch.
+    let mut run = Box::pin(run);
+    assert!(futures::poll!(run.as_mut()).is_pending());
+    assert_eq!(with_ledger(&ledger, |l| l.claim("s", "e")), Claim::InFlight);
+    drop(run);
+    assert_eq!(with_ledger(&ledger, |l| l.claim("s", "e")), Claim::Claimed);
 }
 
 #[test]
