@@ -45,6 +45,13 @@ pub(crate) const MAX_CONTINUE_ATTEMPTS: u32 = 3;
 /// carries no reset time.
 pub(crate) const PARK_WITHOUT_RESET_MS: i64 = 60 * 60 * 1000;
 
+/// How long after a migration its own continue nudge can still be in flight:
+/// the nudge waits up to `NUDGE_SYNC_WAIT` (45 s) for the delta sync, then up
+/// to 180 s for an idle prompt; one more minute of slack. Inside it, the
+/// carried stop is left to that nudge; after it, a stop the transcript still
+/// ends at was not answered, and is continued like any other.
+pub(crate) const MIGRATION_NUDGE_WINDOW_MS: i64 = 300_000;
+
 /// Typed into a session that stopped at its account's usage limit, once the
 /// limit has reset. Same shape as the migration's continue nudge; here the
 /// session stays on its own account, so its subagents' transcripts are where
@@ -95,27 +102,54 @@ impl ProbeVerdict {
         Self {
             unknown: row.is_none_or(|r| r.error.is_some()),
             known_exhausted,
-            resets_at_ms: row.and_then(exhausted_window_reset_ms),
+            resets_at_ms: row
+                .filter(|r| r.error.is_none())
+                .and_then(exhausted_window_reset_ms),
         }
     }
 }
 
-/// The reset of the window a probe row reads as exhausted: the five-hour
-/// session window when only it is at the exhaustion threshold, else the
-/// weekly window. Seconds in the row, milliseconds out.
+/// The reset of the window a probe row reads as exhausted: the weekly window
+/// when it is at the exhaustion threshold, the five-hour session window when
+/// only that one is, and the EARLIER of the two when neither number is (a
+/// row exhausted by its status alone): parking too early costs one re-probe,
+/// parking too late costs a whole window. Seconds in the row, milliseconds
+/// out.
 pub(crate) fn exhausted_window_reset_ms(
     row: &crate::commands::ai_settings::AccountUsageInfo,
 ) -> Option<i64> {
     let threshold = crate::commands::ai_settings::EXHAUSTION_UTILIZATION;
-    let session_only =
-        row.utilization < threshold && row.session_utilization.is_some_and(|u| u >= threshold);
-    let secs = if session_only {
-        row.session_resets_at
-    } else {
-        row.resets_at
+    let weekly_full = row.utilization >= threshold;
+    let session_full = row.session_utilization.is_some_and(|u| u >= threshold);
+    let secs = match (weekly_full, session_full) {
+        (true, _) => row.resets_at,
+        (false, true) => row.session_resets_at,
+        (false, false) => match (row.resets_at, row.session_resets_at) {
+            (Some(w), Some(s)) => Some(w.min(s)),
+            (w, s) => w.or(s),
+        },
     };
     secs.and_then(|s| i64::try_from(s).ok())
         .and_then(|s| s.checked_mul(1000))
+}
+
+/// Whether the hint needs the roster probe at all. A stop always does (the
+/// continue and the migration both read it); any other read only when a
+/// migration could follow, since every other outcome for it is a skip.
+pub(crate) fn roster_probe_needed(
+    read: &LimitStopRead,
+    auto_migrate: bool,
+    config_dir_count: usize,
+) -> bool {
+    matches!(read, LimitStopRead::Stopped(_)) || (auto_migrate && config_dir_count >= 2)
+}
+
+/// How long the `n`th consecutive probe-unknown park of one stop waits:
+/// one margin, doubling, at most [`PARK_WITHOUT_RESET_MS`]. A probe that keeps
+/// failing (a signed-out account) is re-tried less and less often.
+pub(crate) fn unknown_park_backoff_ms(n: u32) -> i64 {
+    let doublings = n.saturating_sub(1).min(16);
+    (LIMIT_RESET_MARGIN_MS << doublings).min(PARK_WITHOUT_RESET_MS)
 }
 
 /// Which probe the handler reads for the session's account.
@@ -234,9 +268,11 @@ pub(crate) enum SkipReason {
     MigrateDisabled,
     /// Not a stop, the account is exhausted, and there is no other account.
     NoOtherAccount,
-    /// The stop came before this session's latest migration: it was hit on
-    /// the old account, and the migration's own continue nudge owns it.
+    /// The stop came before this session's latest migration, within the
+    /// window that migration's own continue nudge can still be running.
     MigratedSinceStop,
+    /// Both the migration and the reset-continue are switched off.
+    Disabled,
 }
 
 /// What the hint does.
@@ -291,13 +327,19 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
     }
     match &i.read {
         LimitStopRead::Stopped(stop) => {
-            if migrated_since(stop, i.migrated_at_ms) {
+            if let Some(migrated_at) = migrated_since(stop, i.migrated_at_ms) {
                 // The stop was hit on the OLD account. A destination that is
-                // itself dry still takes the next hop, as it always has.
+                // itself dry still takes the next hop, as it always has. On a
+                // fine one the migration's nudge answers it; once that nudge
+                // can no longer be running, a transcript still ending at the
+                // stop says it never landed, and the old account's reset time
+                // is not this account's.
                 return if i.probe.known_exhausted {
                     migrate_or_park(i, None)
-                } else {
+                } else if i.now_ms - migrated_at <= MIGRATION_NUDGE_WINDOW_MS {
                     LimitAction::Skip(SkipReason::MigratedSinceStop)
+                } else {
+                    continue_or_skip(i, LimitAction::Continue(stop.clone()))
                 };
             }
             let reset_passed = stop.resets_at_ms.is_none_or(|r| r <= i.now_ms);
@@ -338,8 +380,9 @@ pub(crate) fn decide(i: &HintInputs) -> LimitAction {
 /// The stop was hit before this session's latest migration. A stop with no
 /// timestamp beside a recorded migration is read the same way: the migration
 /// path owns that session's continue, and a second prompt would race it.
-fn migrated_since(stop: &LimitStop, migrated_at_ms: Option<i64>) -> bool {
-    migrated_at_ms.is_some_and(|m| stop.stopped_at_ms.is_none_or(|s| s <= m))
+/// Returns the migration's time when it came after the stop.
+fn migrated_since(stop: &LimitStop, migrated_at_ms: Option<i64>) -> Option<i64> {
+    migrated_at_ms.filter(|m| stop.stopped_at_ms.is_none_or(|s| s <= *m))
 }
 
 /// `action` when it can end in a continue, which needs the reset-continue
@@ -387,10 +430,20 @@ pub(crate) enum RefusalReport {
 
 /// The report for a migration refused by the cap
 /// ([`ParkReason::MigrationCapReached`]) or by the target pick
-/// ([`ParkReason::NoUsableTarget`]), given the action's `park_fallback`.
-pub(crate) fn migration_refused(park_fallback: Option<i64>, reason: ParkReason) -> RefusalReport {
+/// ([`ParkReason::NoUsableTarget`]), given the action's `park_fallback`. The
+/// park is due no later than [`PARK_WITHOUT_RESET_MS`] from now: another
+/// account can free up, or a cap slot age out, well before the source
+/// account's own reset, and the re-entry then migrates.
+pub(crate) fn migration_refused(
+    park_fallback: Option<i64>,
+    reason: ParkReason,
+    now_ms: i64,
+) -> RefusalReport {
     match park_fallback {
-        Some(due_at_ms) => RefusalReport::Park { due_at_ms, reason },
+        Some(due_at_ms) => RefusalReport::Park {
+            due_at_ms: due_at_ms.min(now_ms + PARK_WITHOUT_RESET_MS),
+            reason,
+        },
         None => RefusalReport::Skipped(reason.as_str()),
     }
 }
@@ -414,20 +467,23 @@ pub(crate) fn parked_event(
 }
 
 /// Park a stopped session and report it: `park` records it on the park list
-/// and `emit` sends [`parked_event`]. Both are parameters so a test sees what
-/// a park reports, and that it is never `session-account-migration-skipped`.
+/// and answers whether it is worth reporting (a re-park for the same reason is
+/// not), and `emit` sends [`parked_event`]. Both are parameters so a test sees
+/// what a park reports, and that it is never
+/// `session-account-migration-skipped`.
 pub(crate) fn report_park(
     terminal_id: &str,
     claude_session_id: &str,
     config_dir: &str,
     due_at_ms: i64,
     reason: ParkReason,
-    park: impl FnOnce(&str, &str, i64),
+    park: impl FnOnce(&str, &str, i64, &'static str) -> bool,
     emit: impl FnOnce(&'static str, Value),
 ) {
-    park(terminal_id, claude_session_id, due_at_ms);
-    let (event, payload) = parked_event(claude_session_id, config_dir, due_at_ms, reason);
-    emit(event, payload);
+    if park(terminal_id, claude_session_id, due_at_ms, reason.as_str()) {
+        let (event, payload) = parked_event(claude_session_id, config_dir, due_at_ms, reason);
+        emit(event, payload);
+    }
 }
 
 /// The `session-limit-reset-continue-gave-up` event for a stop whose last
@@ -498,6 +554,8 @@ struct LedgerEntry {
     in_flight: bool,
     done: bool,
     attempts: u32,
+    /// Probe-unknown parks of this stop so far ([`unknown_park_backoff_ms`]).
+    unknown_parks: u32,
 }
 
 /// The in-flight and attempt record for reset-continues, keyed by
@@ -512,6 +570,16 @@ pub(crate) struct ContinueLedger {
 }
 
 impl ContinueLedger {
+    /// Count one more probe-unknown park of this stop; returns the count.
+    pub(crate) fn note_unknown_park(&mut self, claude_session_id: &str, entry_uuid: &str) -> u32 {
+        let e = self
+            .entries
+            .entry((claude_session_id.to_string(), entry_uuid.to_string()))
+            .or_default();
+        e.unknown_parks = e.unknown_parks.saturating_add(1);
+        e.unknown_parks
+    }
+
     pub(crate) fn claim(&mut self, claude_session_id: &str, entry_uuid: &str) -> Claim {
         let e = self
             .entries
@@ -561,7 +629,7 @@ impl ContinueLedger {
 /// The process's ledger.
 pub(crate) static LEDGER: Mutex<Option<ContinueLedger>> = Mutex::new(None);
 
-fn with_ledger<T>(
+pub(crate) fn with_ledger<T>(
     ledger: &Mutex<Option<ContinueLedger>>,
     f: impl FnOnce(&mut ContinueLedger) -> T,
 ) -> T {
@@ -599,12 +667,43 @@ where
         Claim::Claimed => {}
         other => return ContinueRun::NotClaimed(other),
     }
+    let mut claim = ClaimGuard {
+        ledger,
+        claude_session_id,
+        entry_uuid,
+        settled: false,
+    };
     prepare();
     let outcome = watch().await;
     let settled = with_ledger(ledger, |l| {
         l.settle(claude_session_id, entry_uuid, &outcome)
     });
+    claim.settled = true;
     ContinueRun::Ran { outcome, settled }
+}
+
+/// Settles a claim [`run_continue`] took when the run ends without settling
+/// it (its future dropped, its watcher panicked), as an attempt that did not
+/// reach the pane, so the stop is not left in flight for the process's life.
+struct ClaimGuard<'a> {
+    ledger: &'a Mutex<Option<ContinueLedger>>,
+    claude_session_id: &'a str,
+    entry_uuid: &'a str,
+    settled: bool,
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            with_ledger(self.ledger, |l| {
+                l.settle(
+                    self.claude_session_id,
+                    self.entry_uuid,
+                    &IdlePromptOutcome::TerminalGone,
+                )
+            });
+        }
+    }
 }
 
 // ── The /rate-limit-options menu ─────────────────────────────────────────────

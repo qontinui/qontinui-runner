@@ -346,13 +346,25 @@ pub(crate) struct Park {
 #[derive(Debug, Default)]
 pub(crate) struct ParkList {
     by_terminal: HashMap<String, Park>,
+    /// The reason last REPORTED for each terminal's park. Kept when a due park
+    /// is taken, so a pane re-parked for the same reason on every re-entry
+    /// (a probe that keeps failing) reports once, not each time.
+    reported: HashMap<String, &'static str>,
 }
 
 impl ParkList {
     /// Park `terminal_id` until `due_at_ms`. A second park of the same
     /// terminal replaces the first: the newest decision about a pane is the
     /// one that holds.
-    pub(crate) fn park(&mut self, terminal_id: &str, claude_session_id: &str, due_at_ms: i64) {
+    /// Returns whether the park is worth reporting: the terminal was last
+    /// reported under another reason, or never.
+    pub(crate) fn park(
+        &mut self,
+        terminal_id: &str,
+        claude_session_id: &str,
+        due_at_ms: i64,
+        reason: &'static str,
+    ) -> bool {
         self.by_terminal.insert(
             terminal_id.to_string(),
             Park {
@@ -361,6 +373,7 @@ impl ParkList {
                 due_at_ms,
             },
         );
+        self.reported.insert(terminal_id.to_string(), reason) != Some(reason)
     }
 
     /// Remove and return every park due at `now_ms`, oldest due first.
@@ -409,9 +422,15 @@ pub(crate) fn with_parks<T>(f: impl FnOnce(&mut ParkList) -> T) -> T {
     f(guard.get_or_insert_with(ParkList::default))
 }
 
-/// Park `terminal_id` until `due_at_ms` on the process's park list.
-pub(crate) fn park(terminal_id: &str, claude_session_id: &str, due_at_ms: i64) {
-    with_parks(|parks| parks.park(terminal_id, claude_session_id, due_at_ms));
+/// Park `terminal_id` until `due_at_ms` on the process's park list; whether
+/// to report it ([`ParkList::park`]).
+pub(crate) fn park(
+    terminal_id: &str,
+    claude_session_id: &str,
+    due_at_ms: i64,
+    reason: &'static str,
+) -> bool {
+    with_parks(|parks| parks.park(terminal_id, claude_session_id, due_at_ms, reason))
 }
 
 #[cfg(test)]
@@ -838,7 +857,7 @@ mod tests {
     #[test]
     fn a_park_is_due_at_its_time_and_not_before() {
         let mut parks = ParkList::default();
-        parks.park("t1", "s1", 1_000);
+        parks.park("t1", "s1", 1_000, "not-yet-reset");
         assert!(parks.take_due(999).is_empty());
         assert_eq!(
             parks.take_due(1_000),
@@ -854,10 +873,10 @@ mod tests {
     #[test]
     fn due_parks_come_out_oldest_first_and_a_repark_replaces() {
         let mut parks = ParkList::default();
-        parks.park("t2", "s2", 2_000);
-        parks.park("t1", "s1", 3_000);
-        parks.park("t1", "s1", 1_000);
-        parks.park("t3", "s3", 9_000);
+        parks.park("t2", "s2", 2_000, "not-yet-reset");
+        parks.park("t1", "s1", 3_000, "not-yet-reset");
+        parks.park("t1", "s1", 1_000, "not-yet-reset");
+        parks.park("t3", "s3", 9_000, "not-yet-reset");
         let due: Vec<(String, i64)> = parks
             .take_due(5_000)
             .into_iter()
@@ -868,5 +887,18 @@ mod tests {
             vec![("t1".to_string(), 1_000), ("t2".to_string(), 2_000)]
         );
         assert_eq!(parks.get("t3").map(|p| p.due_at_ms), Some(9_000));
+    }
+
+    #[test]
+    fn a_park_reports_once_per_reason_even_across_a_drain() {
+        let mut parks = ParkList::default();
+        assert!(parks.park("t1", "s1", 1_000, "probe-unknown"));
+        assert!(!parks.park("t1", "s1", 2_000, "probe-unknown"));
+        // Taken by the re-entry and parked again for the same reason: quiet.
+        assert_eq!(parks.take_due(5_000).len(), 1);
+        assert!(!parks.park("t1", "s1", 6_000, "probe-unknown"));
+        // A new reason is reported.
+        assert!(parks.park("t1", "s1", 7_000, "not-yet-reset"));
+        assert!(parks.park("t2", "s2", 7_000, "not-yet-reset"));
     }
 }

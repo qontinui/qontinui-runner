@@ -222,10 +222,21 @@ function clockTime(ms: number): string {
   });
 }
 
+/**
+ * When a park is due: `HH:MM` today, else prefixed with the short weekday and
+ * date, since a weekly limit can park a session for days.
+ */
+export function formatDue(ms: number, nowMs: number = Date.now()): string {
+  const due = new Date(ms);
+  if (due.toDateString() === new Date(nowMs).toDateString()) return clockTime(ms);
+  const day = due.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+  return `${day} ${clockTime(ms)}`;
+}
+
 /** The one toast for a burst of parks. */
 export function parkedBurstToast(
   parks: LimitParkedPayload[],
-  formatTime: (ms: number) => string = clockTime,
+  formatTime: (ms: number) => string = formatDue,
 ): { message: string; type: ToastType } {
   const dues = parks.map((p) => p.dueAtMs).filter((d): d is number => typeof d === "number");
   let until = "";

@@ -407,79 +407,22 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return;
     };
 
-    let ai_settings = crate::settings::get_ai_settings();
-    let auto_migrate = ai_settings.claude_cli.auto_migrate_on_token_exhaustion;
-    let auto_continue = ai_settings.claude_cli.auto_continue_after_limit_reset;
-    if !super::limit_reset::hint_wanted(auto_migrate, auto_continue) {
-        info!(
-            session = %record.claude_session_id,
-            "usage-limit hint but both auto-migration and the reset-continue are disabled in settings"
-        );
-        return;
-    }
-
-    // Did the session STOP at a limit? The transcript says (plan 2026-11-05
-    // Phase 2); the screen match that brought us here is only a hint.
-    let read = read_limit_stop(&record, &src).await;
-
-    // CONFIRM: a usage-limit *message* is only a hint (conversation text can
-    // quote one; a resume repaint can re-render a historical one). Re-probe
-    // before acting; `limit_reset::decide` combines the probe with the read.
-    let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    let roster_row = super::limit_reset::row_for(&usage, &src);
-    let probe = match super::limit_reset::probe_source(roster_row.is_some(), &read, auto_continue) {
-        super::limit_reset::ProbeSource::Roster => super::limit_reset::ProbeVerdict::from_row(
-            roster_row,
-            crate::ai_provider::account_known_exhausted(&src),
-        ),
-        // The roster probe returns no rows below two accounts. Only a stop
-        // the continue could resolve needs the verdict there, so only such a
-        // stop pays for probing the session's own account.
-        super::limit_reset::ProbeSource::OwnAccount => {
-            let row = crate::commands::ai_settings::probe_account_usage(src.clone()).await;
-            let exhausted = crate::commands::ai_settings::probe_result_exhausted(&row);
-            super::limit_reset::ProbeVerdict::from_row(Some(&row), exhausted)
-        }
-        super::limit_reset::ProbeSource::NoRow => super::limit_reset::ProbeVerdict::from_row(
-            None,
-            crate::ai_provider::account_known_exhausted(&src),
-        ),
+    // Transcript, probe, decision: skip, park or continue here; a migration
+    // comes back to run below (plan 2026-11-05 Phase 2).
+    let env = ProdHintEnv {
+        app: &app,
+        record: &record,
+        src: &src,
+        matched_pattern,
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let action = super::limit_reset::decide(&super::limit_reset::HintInputs {
-        finished: record.finished_at.is_some(),
-        read: read.clone(),
-        probe,
-        now_ms,
-        auto_migrate,
-        auto_continue,
-        config_dir_count: crate::settings::get_claude_config_dirs().len(),
-        migrated_at_ms: last_migrated_at(&record.claude_session_id),
-    });
-    let park_fallback = match action {
-        super::limit_reset::LimitAction::Migrate { park_fallback } => park_fallback,
-        super::limit_reset::LimitAction::Skip(why) => {
-            info!(
-                terminal_id,
-                session = %record.claude_session_id,
-                account = %src,
-                matched_pattern,
-                skip = ?why,
-                transcript = ?read,
-                "{}",
-                skip_message(why)
-            );
-            return;
-        }
-        super::limit_reset::LimitAction::Park { due_at_ms, reason } => {
-            park_stop(&app, &record, &src, due_at_ms, reason);
-            return;
-        }
-        super::limit_reset::LimitAction::Continue(stop) => {
-            continue_after_reset(&app, &record, &src, stop).await;
-            return;
-        }
-    };
+    let (park_fallback, usage) =
+        match super::limit_hint::run_hint(&env, record.finished_at.is_some(), &src).await {
+            super::limit_hint::HintFlow::Done => return,
+            super::limit_hint::HintFlow::Migrate {
+                park_fallback,
+                usage,
+            } => (park_fallback, usage),
+        };
 
     // Keep spawn-time selection off the dead account, and repoint the global
     // resolved dir so unrelated new sessions stop landing on it. When the
@@ -563,6 +506,84 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     );
 }
 
+/// [`super::limit_hint::HintEnv`] over the runner's real settings, probes,
+/// transcript, park list and idle watcher, for one session.
+struct ProdHintEnv<'a> {
+    app: &'a tauri::AppHandle,
+    record: &'a TerminalSessionRecord,
+    src: &'a str,
+    matched_pattern: &'static str,
+}
+
+impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
+    fn switches(&self) -> (bool, bool) {
+        let ai = crate::settings::get_ai_settings();
+        (
+            ai.claude_cli.auto_migrate_on_token_exhaustion,
+            ai.claude_cli.auto_continue_after_limit_reset,
+        )
+    }
+
+    fn config_dir_count(&self) -> usize {
+        crate::settings::get_claude_config_dirs().len()
+    }
+
+    async fn read_stop(&self) -> super::limit_stop::LimitStopRead {
+        read_limit_stop(self.record, self.src).await
+    }
+
+    async fn roster_probe(&self) -> Vec<crate::commands::ai_settings::AccountUsageInfo> {
+        crate::commands::ai_settings::refresh_account_usage_snapshot().await
+    }
+
+    async fn own_probe(&self) -> crate::commands::ai_settings::AccountUsageInfo {
+        crate::commands::ai_settings::probe_account_usage(self.src.to_string()).await
+    }
+
+    fn known_exhausted(&self) -> bool {
+        crate::ai_provider::account_known_exhausted(self.src)
+    }
+
+    fn row_exhausted(&self, row: &crate::commands::ai_settings::AccountUsageInfo) -> bool {
+        crate::commands::ai_settings::probe_result_exhausted(row)
+    }
+
+    fn migrated_at(&self) -> Option<i64> {
+        last_migrated_at(&self.record.claude_session_id)
+    }
+
+    fn note_unknown_park(&self, entry_uuid: &str) -> u32 {
+        super::limit_reset::with_ledger(&super::limit_reset::LEDGER, |l| {
+            l.note_unknown_park(&self.record.claude_session_id, entry_uuid)
+        })
+    }
+
+    fn now_ms(&self) -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    fn skip(&self, why: super::limit_reset::SkipReason, read: &super::limit_stop::LimitStopRead) {
+        info!(
+            terminal_id = %self.record.terminal_id,
+            session = %self.record.claude_session_id,
+            account = %self.src,
+            matched_pattern = self.matched_pattern,
+            skip = ?why,
+            transcript = ?read,
+            "{}",
+            skip_message(why)
+        );
+    }
+
+    fn park(&self, due_at_ms: i64, reason: super::limit_reset::ParkReason) {
+        park_stop(self.app, self.record, self.src, due_at_ms, reason);
+    }
+
+    async fn continue_stop(&self, stop: super::limit_stop::LimitStop) {
+        continue_after_reset(self.app, self.record, self.src, stop).await;
+    }
+}
+
 /// The session's transcript, classified ([`super::limit_stop`]), read off the
 /// async workers. A record with no working dir cannot be located: UNKNOWN.
 async fn read_limit_stop(
@@ -598,7 +619,7 @@ fn skip_message(why: super::limit_reset::SkipReason) -> &'static str {
             "usage-limit hint on a session marked finished — never continuing it"
         }
         SkipReason::Echoed => {
-            "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
+            "usage-limit message, but the transcript shows no limit stop and the account is not read as exhausted — skipping (likely echoed text)"
         }
         SkipReason::TranscriptUnreadable => {
             "limit stop UNKNOWN — transcript unreadable; account not exhausted, so nothing is typed"
@@ -610,6 +631,9 @@ fn skip_message(why: super::limit_reset::SkipReason) -> &'static str {
             "usage-limit confirmed-candidate but auto-migration is disabled in settings"
         }
         SkipReason::NoOtherAccount => "usage-limit hint but there is no other account to migrate to",
+        SkipReason::Disabled => {
+            "usage-limit hint but both auto-migration and the reset-continue are disabled in settings"
+        }
         SkipReason::MigratedSinceStop => {
             "limit stop predates this session's latest migration, onto an account that is not exhausted — left to the migration (its continue nudge runs when auto_continue_after_migration is on)"
         }
@@ -658,7 +682,11 @@ fn report_migration_refused(
     park_fallback: Option<i64>,
     reason: super::limit_reset::ParkReason,
 ) {
-    match super::limit_reset::migration_refused(park_fallback, reason) {
+    match super::limit_reset::migration_refused(
+        park_fallback,
+        reason,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
         super::limit_reset::RefusalReport::Park { due_at_ms, reason } => {
             park_stop(app, record, src, due_at_ms, reason)
         }
