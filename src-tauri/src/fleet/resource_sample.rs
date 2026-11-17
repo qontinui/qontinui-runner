@@ -2053,14 +2053,17 @@ pub(crate) async fn collect() -> Vec<ResourceSample> {
 /// deliberately reachable only from inside it. Re-checking would restate the
 /// rule in a second place; the whole lesson of the 2026-07-28 outage is that a
 /// rule keyed in one place is the one that survives the next mechanism.
-pub(crate) async fn publish_once() {
+///
+/// Returns what the attempt established ([`PublishOutcome`]); the sampler loop
+/// discards it, and the log lines are unchanged by it.
+pub(crate) async fn publish_once() -> PublishOutcome {
     let Some(device) = crate::fleet::load_device_file() else {
         debug!("fleet::resource_sample: no ~/.qontinui/machine.json — skipping");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoDevice);
     };
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         debug!("fleet::resource_sample: no coord base configured — skipping");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoCoordBase);
     };
 
     // Bearer BEFORE the probes: the door is device-keyed (coord binds the path
@@ -2071,13 +2074,13 @@ pub(crate) async fn publish_once() {
     // `wsl.exe` twice a minute forever for a POST that can never be sent.
     let Some(bearer) = crate::coord_mcp::read_usable_device_jwt().await else {
         debug!("fleet::resource_sample: no usable device JWT — skipping this tick");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoBearer);
     };
 
     let samples = collect().await;
     if samples.is_empty() {
         debug!("fleet::resource_sample: no lane produced a sample this tick");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoSamples);
     }
 
     let body = ResourceSampleReq {
@@ -2097,7 +2100,7 @@ pub(crate) async fn publish_once() {
         Ok(c) => c,
         Err(e) => {
             debug!("fleet::resource_sample: http client build failed: {e}");
-            return;
+            return PublishOutcome::Skipped(SkipReason::ClientBuild);
         }
     };
 
@@ -2115,20 +2118,50 @@ pub(crate) async fn publish_once() {
             // A 200 is not "stored": coord drops invalid items and unknown
             // fields INSIDE a 200 and says so only in the body.
             let text = resp.text().await.ok();
-            log_sample_ack(sample_ack(text.as_deref(), body.samples.len()));
+            let ack = sample_ack(text.as_deref(), body.samples.len());
+            log_sample_ack(ack.clone());
+            PublishOutcome::Acked(ack)
         }
         Ok(resp) => {
             let status = resp.status();
-            warn_once(
-                &http_failure_class(status.as_u16()),
-                format!("POST {url} -> HTTP {status}"),
-            );
+            let class = http_failure_class(status.as_u16());
+            warn_once(&class, format!("POST {url} -> HTTP {status}"));
+            PublishOutcome::HttpFailure(class)
         }
-        Err(e) => warn_once(
-            transport_failure_class(e.is_connect(), e.is_timeout()),
-            format!("POST {url} failed: {e}"),
-        ),
+        Err(e) => {
+            let class = transport_failure_class(e.is_connect(), e.is_timeout());
+            warn_once(class, format!("POST {url} failed: {e}"));
+            PublishOutcome::TransportFailure(class)
+        }
     }
+}
+
+/// Why [`publish_once`] sent nothing this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipReason {
+    /// No readable `machine.json` naming both a device id and a hostname.
+    NoDevice,
+    /// No connected coord base is configured.
+    NoCoordBase,
+    /// No usable (present, unexpired) device JWT.
+    NoBearer,
+    /// No lane produced a sample.
+    NoSamples,
+    /// The HTTP client could not be built.
+    ClientBuild,
+}
+
+/// What one [`publish_once`] attempt established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    /// Nothing was sent, for this reason.
+    Skipped(SkipReason),
+    /// coord answered 2xx; the body classified by [`sample_ack`].
+    Acked(SampleAck),
+    /// coord answered non-2xx: the [`http_failure_class`].
+    HttpFailure(String),
+    /// The request got no answer: the [`transport_failure_class`].
+    TransportFailure(&'static str),
 }
 
 /// The one line logged for a 2xx body that is not coord's documented outcome.
@@ -2420,6 +2453,10 @@ fn warn_once(class: &str, msg: String) {
         debug!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
     }
 }
+
+#[cfg(test)]
+#[path = "resource_sample_publish_tests.rs"]
+mod publish_tests;
 
 #[cfg(test)]
 mod tests {

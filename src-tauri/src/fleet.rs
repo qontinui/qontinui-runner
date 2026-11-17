@@ -1433,7 +1433,7 @@ pub fn spawn_budget_republisher(role: MachineRole) {
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
-                resource_sample::publish_once().await;
+                let _ = resource_sample::publish_once().await;
                 reporter.tick().await;
 
                 // The CI node sizes its concurrency from coord's capacity
