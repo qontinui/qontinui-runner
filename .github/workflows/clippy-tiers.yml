@@ -403,7 +403,7 @@ jobs:
         shell: bash
         run: |
           if [ "$O_CHECKOUT" = "failure" ]; then
-            echo "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::step 'Checkout' failed before clippy ran; no byte of this PR was read: re-run once"
+            echo "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::step 'Checkout' failed before clippy ran (a checkout failure caused by this PR's own tree is an accepted residual): re-run once"
             exit 0
           fi
           if [ ! -f .github/scripts/declare-setup-death.sh ]; then

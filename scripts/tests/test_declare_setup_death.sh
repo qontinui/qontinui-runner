@@ -243,6 +243,8 @@ elif not re.search(r'VERDICT_STEPS=.*"\$' + by_id["clippy"] + r'"', run):
 title = "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::"
 if not re.search(r'if \[ "\$O_CHECKOUT" = "failure" \]; then\n\s+echo "' + re.escape(title), run):
     errs.append("the inline Checkout declaration is missing or its title drifted")
+if run.count("(not a verdict on this PR)") != 1:
+    errs.append("the reserved phrase appears in the declare step outside the single Checkout branch")
 if env.get("DECLARE_JOB") != "Clippy diff-scoped (advisory)":
     errs.append("DECLARE_JOB drifted from the job's display name")
 if declare.get("timeout-minutes") is None:
