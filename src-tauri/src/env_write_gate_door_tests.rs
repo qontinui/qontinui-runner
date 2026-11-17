@@ -11,11 +11,26 @@
 //!
 //! The door tests observe the refusal only where a caller of the door can: the
 //! `Err` (or the per-entry error) the door returns and the file it did not
-//! write, beside a positive control on the guarded thread that shows the same
-//! door IS a writer. They never read the gate's own counters, so each one
-//! enters where the population enters and goes red with the gate removed. The
-//! counters are read only by the two tests that are about counting and
-//! line-once printing.
+//! write. Where a door's refusal leaves nothing a caller can see (the
+//! FreshInstall persist is skipped quietly), a positive control on the guarded
+//! thread shows the same door IS a writer, so an empty fixture cannot be
+//! vacuous. They never read the gate's own counters, so each one enters where
+//! the population enters and goes red with the gate removed. Only
+//! `a_repeated_refusal_writes_one_line`, which is about counting and line-once
+//! printing, reads them.
+//!
+//! What these tests do NOT pin: removing ONE internal gate while the others
+//! stay. With the `load_settings_full` persist gate alone removed, the persist
+//! reaches `save_settings`, whose `get_settings_path` gate still refuses it, so
+//! no file lands; the seed gate in `claude_accounts::load_with_migration` sits
+//! behind a process-wide `Once` that an earlier guarded loader may already have
+//! completed. Both are proven by forcing the whole gate open (plan Phase 1).
+//!
+//! The positive controls that run a settings LOAD (workspace-root, tokio) can
+//! complete the roster seed, which resolves the platform config dir, so on unix
+//! they point `XDG_CONFIG_HOME` into the fixture first and are `cfg(unix)` for
+//! the reason the roster test is: Windows resolves the known folders once per
+//! process and would seed the box's own roster.
 //!
 //! Why the assertions are deterministic: while this test holds the fixture it
 //! holds `env_lock`, so every other thread in the process holds none, and the
@@ -60,6 +75,16 @@ fn run_unguarded_counted<T: Send + 'static>(
     })
 }
 
+/// Point `XDG_CONFIG_HOME` inside `fixture` for the guard's life, so a guarded
+/// settings load that completes the roster seed writes the fixture's roster,
+/// never the box's.
+#[cfg(unix)]
+fn xdg_config_home_inside(fixture: &Path) -> crate::test_env::EnvVarRestore {
+    let restore = crate::test_env::EnvVarRestore::capture(&["XDG_CONFIG_HOME"]);
+    std::env::set_var("XDG_CONFIG_HOME", fixture.join("xdg-config"));
+    restore
+}
+
 /// Every entry in `dir` a settings door writes: `settings.json` and its
 /// atomic-write temps (`settings.json.tmp.…`).
 fn settings_traces(dir: &Path) -> Vec<String> {
@@ -82,6 +107,8 @@ fn settings_traces(dir: &Path) -> Vec<String> {
 #[test]
 fn an_unguarded_worker_reaching_workspace_root_persists_nothing_into_the_fixture() {
     let amb = crate::test_env::isolated_ambient();
+    #[cfg(unix)]
+    let _xdg = xdg_config_home_inside(amb.dir());
     let settings_json = amb.dir().join("settings.json");
     assert_eq!(settings_traces(amb.dir()), Vec::<String>::new());
 
@@ -97,11 +124,16 @@ fn an_unguarded_worker_reaching_workspace_root_persists_nothing_into_the_fixture
     // Positive control on the SAME fixture: the guarded thread's identical
     // call persists, so the empty fixture above is the gate's refusal and not
     // a door that never writes.
-    let _ = crate::workspace_paths::workspace_root();
-    assert!(
-        settings_json.is_file(),
-        "a guarded thread's FreshInstall load persists — the door must be a writer here"
-    );
+    #[cfg(unix)]
+    {
+        let _ = crate::workspace_paths::workspace_root();
+        assert!(
+            settings_json.is_file(),
+            "a guarded thread's FreshInstall load persists — the door must be a writer here"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = settings_json;
 }
 
 /// The `coord_sync` drain loop's door, entered the way the measured writes
@@ -113,6 +145,8 @@ fn an_unguarded_worker_reaching_workspace_root_persists_nothing_into_the_fixture
 #[test]
 fn an_unguarded_tokio_worker_reaching_get_cloud_sync_enabled_persists_nothing() {
     let amb = crate::test_env::isolated_ambient();
+    #[cfg(unix)]
+    let _xdg = xdg_config_home_inside(amb.dir());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .build()
@@ -143,15 +177,18 @@ fn an_unguarded_tokio_worker_reaching_get_cloud_sync_enabled_persists_nothing() 
 
     // Positive control on the SAME fixture: the same chain on this guarded
     // thread persists, so the worker's empty fixture is the gate's refusal.
-    let _tenant_switch = crate::egress::test_support::pin(
-        crate::egress::Flow::TranscriptSync,
-        crate::egress::Level::On,
-    );
-    let _ = crate::egress::transcript_sync_permitted();
-    assert!(
-        amb.dir().join("settings.json").is_file(),
-        "a guarded thread's load through the drain loop's chain persists — the door must be a writer here"
-    );
+    #[cfg(unix)]
+    {
+        let _tenant_switch = crate::egress::test_support::pin(
+            crate::egress::Flow::TranscriptSync,
+            crate::egress::Level::On,
+        );
+        let _ = crate::egress::transcript_sync_permitted();
+        assert!(
+            amb.dir().join("settings.json").is_file(),
+            "a guarded thread's load through the drain loop's chain persists — the door must be a writer here"
+        );
+    }
 }
 
 /// An explicit door returns the refusal — never a silent `Ok` that would tell
