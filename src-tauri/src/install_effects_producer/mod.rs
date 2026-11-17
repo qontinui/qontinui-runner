@@ -53,6 +53,8 @@ pub mod parsers;
 mod pm;
 mod registry_creds;
 pub mod registry_routes;
+#[cfg(test)]
+mod shim_beacon_route_tests;
 mod sibling_manifests;
 pub mod types;
 
