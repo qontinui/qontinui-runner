@@ -1422,8 +1422,9 @@ mod tests {
     // `2026-11-17-a-session-minted-plan-work-unit-carries-no-phase-declaration`,
     // Phase 1) -------------------------------------------------------------------
 
-    /// Every `# `-headed body containing `Phase` in `parser.rs`'s test module,
-    /// copied verbatim (the `format!` templates excluded). Bodies that declare
+    /// The `# `-headed bodies containing `Phase` in `parser.rs`'s test module as
+    /// of 2026-11-17, copied verbatim (the `format!` templates excluded);
+    /// nothing keeps this in sync, so a new parser case must be added here. Bodies that declare
     /// nothing stay in: they prove the `None` arm.
     const PARSER_TEST_PHASE_BODIES: &[&str] = &[
         "# T\n\n> **Status: in progress 2026-06-19.** Implementing Phase 1 only; gate Phases 2-4.\n\n**Phase 1 — parser.** body\n\n## Phase 2: push client\n\nProse mentioning Phase 1 again should not count.\n",
