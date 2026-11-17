@@ -66,9 +66,9 @@
 //! stderr), then a `panic!` under `test_support::strict_canary()`, else ONE
 //! line on stderr per distinct `(thread, door, first caller frame)` — written
 //! with `Write::write_all` on `std::io::stderr()`, which reached the suite log
-//! from passing tests in every measured run (plan Phase 1 by hand; 56–60 lines
-//! per whole-suite run in Phases 2 and 4), where an `eprintln!` from a passing
-//! test is discarded by libtest's capture — and an `Err` carrying
+//! from passing tests in every measured run (the plan's `## Census` and
+//! `## Phase 4 results` sections record the counts), where an `eprintln!` from
+//! a passing test is discarded by libtest's capture — and an `Err` carrying
 //! the same sentence. The caller frame is in the key because many runtime
 //! workers share one thread name (`tokio-rt-worker`); without it, the first
 //! worker's line would swallow every other worker's. Finding that frame costs a
