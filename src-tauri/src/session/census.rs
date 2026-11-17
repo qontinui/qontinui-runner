@@ -349,6 +349,12 @@ const RUNNER_COMM: &str = "qontinui-runner";
 /// The Claude Code CLI's process name in `/proc/<pid>/comm`.
 const CLAUDE_COMM: &str = "claude";
 
+/// The per-pane PTY holder (`qontinui-pty-holder`) as `/proc/<pid>/comm`
+/// reports it, truncated by the kernel to 15 bytes. A holder can leave its
+/// runner's process subtree (a handoff restart's adopted panes), so whether a
+/// runner is attached to it cannot be read from ancestry at all.
+const HOLDER_COMM: &str = "qontinui-pty-ho";
+
 /// `(comm, ppid)` out of one `/proc/<pid>/stat` line. `comm` may itself
 /// contain spaces and parentheses, so it is the text between the FIRST `(`
 /// and the LAST `)`; `ppid` is the second field after that.
@@ -387,7 +393,8 @@ pub fn read_proc_stat(_pid: u32) -> Option<(String, u32)> {
 /// `Some(true)` the nearest supervisor is a runner; `Some(false)` it is
 /// another `claude`, or the walk reached init (pid ≤ 1) with neither; `None`
 /// UNKNOWN — a link was unreadable (the process exited mid-walk, or the OS has
-/// no `/proc`), the tree cycled, or the depth bound was hit. A CLI that runs
+/// no `/proc`), a PTY holder sits on the path (whether a runner is attached to
+/// it is not an ancestry fact), the tree cycled, or the depth bound was hit. A CLI that runs
 /// under a different process name (e.g. `node`) is not recognised as a
 /// `claude` stop, so such a nested session still reads as hosted.
 pub fn runner_ancestor(pid: u32, read_stat: &dyn Fn(u32) -> Option<(String, u32)>) -> Option<bool> {
@@ -402,6 +409,11 @@ pub fn runner_ancestor(pid: u32, read_stat: &dyn Fn(u32) -> Option<(String, u32)
         }
         if comm == CLAUDE_COMM {
             return Some(false);
+        }
+        if comm.starts_with(HOLDER_COMM) {
+            // A runner may be attached to this holder or none may be:
+            // UNKNOWN, never "no pusher".
+            return None;
         }
         if ppid == cur {
             return None;
@@ -449,7 +461,12 @@ fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> Ce
         kind: non_empty(&s.kind),
         tmux_pane: (probes.tmux_pane_of)(s.pid)
             .or_else(|| s.tmux.as_deref().and_then(tmux_pane_from_locator)),
-        window_name: non_empty(&s.name),
+        // Never Claude Code's own `derived` auto-name, which may summarise the
+        // conversation — the same rule the identity reporter applies
+        // (`identity_stamp::registry_name`).
+        window_name: (s.name_source.as_deref() != Some("derived"))
+            .then(|| non_empty(&s.name))
+            .flatten(),
         window_name_source: s.name_source.clone(),
         registry_status: non_empty(&s.status),
         registry_status_updated_at: s.status_updated_at.and_then(ms_to_rfc3339),
@@ -463,6 +480,10 @@ fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> Ce
         runner_ancestor,
     }
 }
+
+/// How long [`build_snapshot`] waits before re-reading a home that had an
+/// unreadable record.
+const UNREADABLE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Build the census snapshot — a pure function of the account homes, the live
 /// pid set and the injected [`Probes`], so it is unit-tested against a temp dir
@@ -481,7 +502,15 @@ pub fn build_snapshot(
     for dir in config_dirs {
         // One home at a time so each row keeps the config dir it came from —
         // `read_live_sessions` reports the account label but not the path.
-        let read = read_live_sessions(std::slice::from_ref(dir), live_pids, probes.may_host_claude);
+        let mut read =
+            read_live_sessions(std::slice::from_ref(dir), live_pids, probes.may_host_claude);
+        // An unreadable record may be a rewrite caught mid-way; read the home
+        // once more before calling the whole snapshot indeterminate. (This
+        // runs on the blocking pool, so the short sleep blocks no async worker.)
+        if read.unlistable.is_empty() && !read.unreadable_records.is_empty() {
+            std::thread::sleep(UNREADABLE_RETRY_DELAY);
+            read = read_live_sessions(std::slice::from_ref(dir), live_pids, probes.may_host_claude);
+        }
         // coord REPLACES the device's whole snapshot, so a session missing
         // from an incomplete read (an unlistable `sessions/` dir, or a live
         // pid's record that did not read) would be posted as DEAD. Refuse the
@@ -638,12 +667,18 @@ async fn publisher_loop(app: tauri::AppHandle) {
         "session census publisher started (interval={}s)",
         CENSUS_INTERVAL.as_secs()
     );
+    // One client for the loop's life, reused every tick. A build failure
+    // leaves `None`, which each tick reports as `Transport`.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok();
     let mut last: Option<PostState> = None;
     let mut ticker = tokio::time::interval(CENSUS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        let state = tick(&app).await;
+        let state = tick(&app, client.as_ref()).await;
         if last.as_ref() != Some(&state) {
             log_transition(&state);
             last = Some(state);
@@ -652,31 +687,38 @@ async fn publisher_loop(app: tauri::AppHandle) {
 }
 
 fn log_transition(state: &PostState) {
-    match state {
-        PostState::Ok => info!("session census: posted to coord"),
+    let msg: std::borrow::Cow<'static, str> = match state {
+        PostState::Ok => "session census: posted to coord".into(),
         PostState::NoDeviceId => {
-            info!("session census: no local device id — not posting (state change)")
+            "session census: no local device id — not posting (state change)".into()
         }
         PostState::Unpaired => {
-            info!("session census: no device credential (unpaired) — not posting (state change)")
+            "session census: no device credential (unpaired) — not posting (state change)".into()
         }
-        PostState::Snapshot => warn!(
+        PostState::Snapshot => {
             "session census: process snapshot or census build indeterminate — skipped (an \
              empty census would read as every session dead)"
-        ),
-        PostState::Unavailable => info!(
+                .into()
+        }
+        PostState::Unavailable => {
             "session census: coord answered 503 (census store not deployed yet) — retrying each \
              tick quietly"
-        ),
-        PostState::RouteAbsent => info!(
-            "session census: coord answered 404 (census ingest route not deployed yet) —              retrying each tick quietly"
-        ),
+                .into()
+        }
+        PostState::RouteAbsent => {
+            "session census: coord answered 404 (census ingest route not deployed yet) — \
+             retrying each tick quietly"
+                .into()
+        }
         PostState::Http(code) => {
-            warn!("session census: coord answered HTTP {code} — will retry each tick")
+            format!("session census: coord answered HTTP {code} — will retry each tick").into()
         }
-        PostState::Transport => {
-            warn!("session census: coord unreachable — will retry each tick")
-        }
+        PostState::Transport => "session census: coord unreachable — will retry each tick".into(),
+    };
+    if is_quiet(state) {
+        info!("{msg}");
+    } else {
+        warn!("{msg}");
     }
 }
 
@@ -719,17 +761,10 @@ impl HostedSubstrate {
     }
 }
 
-async fn tick(app: &tauri::AppHandle) -> PostState {
-    let Some(device_id) = crate::agent_runtime::load_local_device_id() else {
-        return PostState::NoDeviceId;
-    };
-    // The PAIRED-DEVICE JWT, resolved ONCE and presented verbatim below.
-    // coord's ingest 403s an agent or bootstrap token, and a path device that
-    // differs from the token's. No credential ⇒ no post: never anonymous.
-    let Some(token) = crate::auth::device_bearer_scoped(crate::auth::TenantScope::Device) else {
-        return PostState::Unpaired;
-    };
-
+async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostState {
+    // The snapshot is built and REMEMBERED before any credential is looked at:
+    // the poller's local verdict (`no_pusher`) is a device-local fact and must
+    // not go Unknown because coord cannot be posted to.
     let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let live_pids = match super::claude_session_registry::live_pids_from_snapshot(&snap) {
         Ok(p) => p,
@@ -777,18 +812,35 @@ async fn tick(app: &tauri::AppHandle) -> PostState {
         "session census: snapshot built"
     );
 
+    // Device id and the PAIRED-DEVICE JWT, resolved ONCE (file and keyring IO,
+    // so on the blocking pool) and presented verbatim below. coord's ingest
+    // 403s an agent or bootstrap token, and a path device that differs from the
+    // token's. No credential ⇒ no post: never anonymous.
+    let ident = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(|| {
+        let device_id = crate::agent_runtime::load_local_device_id();
+        let token = match device_id {
+            Some(_) => crate::auth::device_bearer_scoped(crate::auth::TenantScope::Device),
+            None => None,
+        };
+        (device_id, token)
+    })
+    .await
+    .unwrap_or((None, None));
+    let Some(device_id) = ident.0 else {
+        return PostState::NoDeviceId;
+    };
+    let Some(token) = ident.1 else {
+        return PostState::Unpaired;
+    };
+    let Some(client) = client else {
+        return PostState::Transport;
+    };
+
     let (base, _src) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = format!(
         "{}/coord/session-census/{device_id}",
         base.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return PostState::Transport,
-    };
     // coord-auth-exempt(device-jwt-required): `token` is the paired-device JWT
     // resolved once above via `device_bearer_scoped(TenantScope::Device)`; the
     // tick returns `Unpaired` before reaching here when there is none, so this
@@ -801,14 +853,30 @@ async fn tick(app: &tauri::AppHandle) -> PostState {
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => PostState::Ok,
-        Ok(resp) if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-            PostState::Unavailable
-        }
-        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => PostState::RouteAbsent,
-        Ok(resp) => PostState::Http(resp.status().as_u16()),
+        Ok(resp) => post_state_for(resp.status()),
         Err(_) => PostState::Transport,
     }
+}
+
+/// The post outcome for coord's HTTP status. 404 (a coord without the ingest
+/// route) and 503 (a coord without the census store) are the QUIET retry
+/// states: the runner may ship ahead of coord.
+fn post_state_for(status: reqwest::StatusCode) -> PostState {
+    if status.is_success() {
+        PostState::Ok
+    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        PostState::Unavailable
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        PostState::RouteAbsent
+    } else {
+        PostState::Http(status.as_u16())
+    }
+}
+
+/// Is `state` logged at `info` rather than `warn`? Everything but a coord
+/// error that is not "behind this runner" and an unreachable coord.
+fn is_quiet(state: &PostState) -> bool {
+    !matches!(state, PostState::Http(_) | PostState::Transport)
 }
 
 #[cfg(test)]
@@ -1035,6 +1103,63 @@ mod tests {
         let live: HashSet<u32> = [100].into_iter().collect();
         let snap = build_snapshot(&[a], &live, Utc::now(), None, &no_probes()).unwrap();
         assert_eq!(snap.sessions[0].last_acted_at, ms_to_rfc3339(1790832214000));
+    }
+
+    #[test]
+    fn a_coord_without_the_route_or_the_store_is_a_quiet_retry() {
+        use reqwest::StatusCode;
+        assert_eq!(post_state_for(StatusCode::OK), PostState::Ok);
+        assert_eq!(post_state_for(StatusCode::NO_CONTENT), PostState::Ok);
+        assert_eq!(
+            post_state_for(StatusCode::NOT_FOUND),
+            PostState::RouteAbsent
+        );
+        assert_eq!(
+            post_state_for(StatusCode::SERVICE_UNAVAILABLE),
+            PostState::Unavailable
+        );
+        for code in [401u16, 403, 422, 500] {
+            let st = StatusCode::from_u16(code).unwrap();
+            assert_eq!(post_state_for(st), PostState::Http(code));
+        }
+        assert!(is_quiet(&PostState::RouteAbsent));
+        assert!(is_quiet(&PostState::Unavailable));
+        assert!(is_quiet(&PostState::Snapshot));
+        assert!(!is_quiet(&PostState::Http(500)));
+        assert!(!is_quiet(&PostState::Transport));
+    }
+
+    #[test]
+    fn a_pty_holder_on_the_path_makes_ancestry_unknown() {
+        // pid 100's parent is a holder (comm truncated by the kernel): a runner
+        // may or may not be attached, so neither hosted nor unhosted.
+        let stat = |pid: u32| match pid {
+            100 => Some(("claude".to_string(), 40)),
+            40 => Some(("qontinui-pty-ho".to_string(), 1)),
+            _ => None,
+        };
+        assert_eq!(runner_ancestor(100, &stat), None);
+    }
+
+    #[test]
+    fn a_derived_registry_name_is_never_posted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = home(tmp.path(), ".claude-x");
+        registry_row(
+            &a,
+            100,
+            SID_A,
+            r#","name":"summary of chat","nameSource":"derived""#,
+        );
+        registry_row(&a, 200, SID_B, r#","name":"steward","nameSource":"user""#);
+        let live: HashSet<u32> = [100, 200].into_iter().collect();
+        let snap = build_snapshot(&[a], &live, Utc::now(), None, &no_probes()).unwrap();
+        assert_eq!(snap.sessions[0].window_name, None);
+        assert_eq!(
+            snap.sessions[0].window_name_source.as_deref(),
+            Some("derived")
+        );
+        assert_eq!(snap.sessions[1].window_name.as_deref(), Some("steward"));
     }
 
     #[test]
