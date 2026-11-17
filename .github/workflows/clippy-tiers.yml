@@ -223,7 +223,7 @@ jobs:
       checks: write
 
     # Every step before the `clippy` (reviewdog) step needs an `id`, a matching
-    # `O_*` env entry and a `pick` line in the final "Declare a setup death"
+    # `O_*` env entry and a `row` line in the final "Declare a setup death"
     # step -- a setup step without them fails silently (no annotation).
     steps:
       - name: Checkout
@@ -362,56 +362,67 @@ jobs:
         shell: bash
 
       # A setup death is NOT a verdict on this PR (plan
-      # 2026-11-05-repair-classifier-reads-why-a-check-failed, Phase 3). When a
-      # step BEFORE clippy fails (an apt hang, a sibling clone, a pnpm build),
-      # the check goes red without clippy ever reading the diff. Name the first
-      # failed setup step in an annotation whose title carries the literal
-      # phrase "(not a verdict on this PR)" -- coord's repair classifier
-      # (author_feedback.rs is_no_verdict_annotation) matches it byte-exact and
-      # re-runs instead of blaming the PR's code. Emits nothing when the
-      # reviewdog step itself failed (that IS a verdict) or no setup step did.
-      # Outcomes arrive via env only; step names below are static literals.
+      # 2026-11-05-repair-classifier-reads-why-a-check-failed, Phase 3) -- but
+      # only when this PR cannot have caused it (plan
+      # 2026-11-17-runner-clippy-setup-death-guards-frontend-steps). When a
+      # step BEFORE clippy fails, .github/scripts/declare-setup-death.sh titles
+      # an annotation with the literal phrase "(not a verdict on this PR)" --
+      # coord's repair classifier (author_feedback.rs is_no_verdict_annotation)
+      # matches it and re-runs once instead of blaming the PR's code. It
+      # withholds that title (a notice instead) when the PR touches this job's
+      # harness, when a step that reads the PR's frontend tree died on a PR
+      # that changed a frontend input, when the sibling resolver died on a PR
+      # carrying coord dep labels, or when any of that is unreadable. Each row
+      # is `<name> <conclusion> <class>`; the class says what of the PR that
+      # step reads. Outcomes arrive via env only; names are static literals.
+      # A failed Checkout is declared inline: the script never arrived.
       - name: Declare a setup death (not a verdict on this PR)
         if: failure()
+        timeout-minutes: 3
         env:
-          O_CHECKOUT: ${{ steps.checkout.outcome }}
-          O_SIBLING_SCHEMAS: ${{ steps.sibling_schemas.outcome }}
-          O_SIBLING_REPOS: ${{ steps.sibling_repos.outcome }}
-          O_SETUP_PNPM: ${{ steps.setup_pnpm.outcome }}
-          O_SETUP_NODE: ${{ steps.setup_node.outcome }}
-          O_SETUP_RUST: ${{ steps.setup_rust.outcome }}
-          O_SETUP_REVIEWDOG: ${{ steps.setup_reviewdog.outcome }}
-          O_APT: ${{ steps.apt.outcome }}
-          O_FREE_DISK: ${{ steps.free_disk.outcome }}
-          O_SWAPFILE: ${{ steps.swapfile.outcome }}
-          O_RUST_CACHE: ${{ steps.rust_cache.outcome }}
-          O_PNPM_INSTALL: ${{ steps.pnpm_install.outcome }}
-          O_PNPM_BUILD: ${{ steps.pnpm_build.outcome }}
-          O_CLIPPY: ${{ steps.clippy.outcome }}
+          O_CHECKOUT: ${{ steps.checkout.conclusion }}
+          O_SIBLING_SCHEMAS: ${{ steps.sibling_schemas.conclusion }}
+          O_SIBLING_REPOS: ${{ steps.sibling_repos.conclusion }}
+          O_SETUP_PNPM: ${{ steps.setup_pnpm.conclusion }}
+          O_SETUP_NODE: ${{ steps.setup_node.conclusion }}
+          O_SETUP_RUST: ${{ steps.setup_rust.conclusion }}
+          O_SETUP_REVIEWDOG: ${{ steps.setup_reviewdog.conclusion }}
+          O_APT: ${{ steps.apt.conclusion }}
+          O_FREE_DISK: ${{ steps.free_disk.conclusion }}
+          O_SWAPFILE: ${{ steps.swapfile.conclusion }}
+          O_RUST_CACHE: ${{ steps.rust_cache.conclusion }}
+          O_PNPM_INSTALL: ${{ steps.pnpm_install.conclusion }}
+          O_PNPM_BUILD: ${{ steps.pnpm_build.conclusion }}
+          O_CLIPPY: ${{ steps.clippy.conclusion }}
+          DECLARE_JOB: Clippy diff-scoped (advisory)
+          # rust-toolchain.toml steers rustup in the workspace (Setup Rust).
+          HARNESS_PATHS_RE: '^(\.github/(workflows/clippy-tiers\.yml|actions/|sibling-pins\.conf)|rust-toolchain(\.toml)?$)'
         shell: bash
         run: |
-          if [ "$O_CLIPPY" = "failure" ]; then
+          if [ "$O_CHECKOUT" = "failure" ]; then
+            echo "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::step 'Checkout' failed before clippy ran; no byte of this PR was read: re-run once"
             exit 0
           fi
-          first=""
-          pick() {
-            if [ -z "$first" ] && [ "$2" = "failure" ]; then
-              first="$1"
-            fi
-          }
-          pick 'Checkout' "$O_CHECKOUT"
-          pick 'Check out sibling qontinui-schemas' "$O_SIBLING_SCHEMAS"
-          pick 'Checkout sibling repos' "$O_SIBLING_REPOS"
-          pick 'Setup pnpm' "$O_SETUP_PNPM"
-          pick 'Setup Node.js' "$O_SETUP_NODE"
-          pick 'Setup Rust' "$O_SETUP_RUST"
-          pick 'Setup reviewdog' "$O_SETUP_REVIEWDOG"
-          pick 'Install dependencies (Ubuntu)' "$O_APT"
-          pick 'Free disk space (Ubuntu)' "$O_FREE_DISK"
-          pick 'Add swapfile (Ubuntu — guard against link-time OOM)' "$O_SWAPFILE"
-          pick 'Cache Rust dependencies' "$O_RUST_CACHE"
-          pick 'Install frontend dependencies' "$O_PNPM_INSTALL"
-          pick 'Build frontend' "$O_PNPM_BUILD"
-          if [ -n "$first" ]; then
-            echo "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::step '${first}' failed before clippy ran"
+          if [ ! -f .github/scripts/declare-setup-death.sh ]; then
+            echo "::notice title=Clippy diff-scoped (advisory) setup death left as a verdict::.github/scripts/declare-setup-death.sh is absent from the checkout"
+            exit 0
           fi
+          row() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+          SETUP_STEPS="$(
+            row 'Checkout' "$O_CHECKOUT" tree-free
+            row 'Check out sibling qontinui-schemas' "$O_SIBLING_SCHEMAS" sibling-labels
+            row 'Checkout sibling repos' "$O_SIBLING_REPOS" tree-free
+            row 'Setup pnpm' "$O_SETUP_PNPM" frontend
+            row 'Setup Node.js' "$O_SETUP_NODE" frontend
+            row 'Setup Rust' "$O_SETUP_RUST" tree-free
+            row 'Setup reviewdog' "$O_SETUP_REVIEWDOG" tree-free
+            row 'Install dependencies (Ubuntu)' "$O_APT" tree-free
+            row 'Free disk space (Ubuntu)' "$O_FREE_DISK" tree-free
+            row 'Add swapfile (Ubuntu — guard against link-time OOM)' "$O_SWAPFILE" tree-free
+            row 'Cache Rust dependencies' "$O_RUST_CACHE" tree-free
+            row 'Install frontend dependencies' "$O_PNPM_INSTALL" frontend
+            row 'Build frontend' "$O_PNPM_BUILD" frontend
+          )"
+          VERDICT_STEPS="$(printf '%s\t%s\n' 'Clippy diff-scoped via reviewdog' "$O_CLIPPY")"
+          export SETUP_STEPS VERDICT_STEPS
+          bash .github/scripts/declare-setup-death.sh || echo "::notice::declare-setup-death.sh exited $? (a reporter never decides this check)"

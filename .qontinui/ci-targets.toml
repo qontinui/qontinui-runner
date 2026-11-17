@@ -425,6 +425,15 @@ observes = [
 ]
 
 [[targets]]
+name = "declare-setup-death-tests"
+observes = [
+  ".github/scripts/declare-setup-death.sh",
+  "scripts/tests/test_declare_setup_death.sh",
+  ".github/workflows/declare-setup-death-tests.yml",
+  ".github/workflows/clippy-tiers.yml",
+]
+
+[[targets]]
 name = "flake-escalation:unit-tests"
 observes = [
   "scripts/ci-flake-escalate.mjs",
