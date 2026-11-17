@@ -1464,37 +1464,19 @@
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
       "symbol": "provision_agent_definitions",
-      "excerpt": "\"agent_runtime: no qontinui-root resolved; skipping .claude/agents \\",
+      "excerpt": "{worktree_cwd} without the qontinui-claude-config overlay ({})\",",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3)."
+      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3). Re-reviewed when the no-root arm stopped skipping and started writing the embedded floor (and running the retirement pass) without the qontinui-claude-config overlay, its warning rendering the typed WorkspaceRootUnresolved (runner#2978)."
     },
     {
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions",
-      "excerpt": "\"no qontinui-root resolved ({why}), so \\",
+      "symbol": "provision_agent_definitions_layers",
+      "excerpt": "root.join(\"qontinui-claude-config\")",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3)."
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions",
-      "excerpt": "<root>/qontinui-claude-config/.claude/agents cannot be located — {state}\"",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3)."
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions_retiring",
-      "excerpt": ".join(\"qontinui-claude-config\")",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only after a root resolved. A missing dir makes read_dir fail and the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6)."
+      "note": "The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only when a root resolved (overlay_root is Ok). With no root, or a missing dir, the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6), and again when it moved from provision_agent_definitions_retiring to provision_agent_definitions_layers, which both the rooted and the no-root arm now share (runner#2978)."
     },
     {
       "class": "repo_layout",
@@ -1656,14 +1638,6 @@
       "class": "repo_layout",
       "file": "src/capability_manifest.rs",
       "symbol": "const CAPABILITY_SPECS",
-      "excerpt": "copy is a no-op that logs \\\"no qontinui-root resolved; skipping \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/capability_manifest.rs",
-      "symbol": "const CAPABILITY_SPECS",
       "excerpt": "description: \"Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` \\",
       "count": 1,
       "disposition": "unreviewed"
@@ -1770,7 +1744,7 @@
       "class": "repo_layout",
       "file": "src/coord_mcp.rs",
       "symbol": "probe_stdio_shim",
-      "excerpt": "\"no workspace root resolved, so <root>/qontinui-claude-config/scripts/\\",
+      "excerpt": "\"{unresolved} <root>/qontinui-claude-config/scripts/\\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1912,15 +1886,6 @@
       "file": "src/mcp/plan_library.rs",
       "symbol": "const WRITE_CONTRACT",
       "excerpt": "with (a runner scan uses `<repo>/<dir>`, e.g. `qontinui-dev-notes/prompts`). \\",
-      "count": 1,
-      "disposition": "unreviewed",
-      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/mcp/session_recap.rs",
-      "symbol": "analyze_handler",
-      "excerpt": "Json(api_error(format!(\"Cannot find qontinui-root: {}\", e))),",
       "count": 1,
       "disposition": "unreviewed",
       "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
