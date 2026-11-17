@@ -26,7 +26,7 @@
 #                      UNKNOWN (withhold)
 #   VERDICT_STEPS      `<name><TAB><conclusion>` rows of the job's verdict
 #                      step(s); any failure means the red IS a verdict
-#   HARNESS_PATHS_RE   ERE over changed paths: the job's own harness. A PR
+#   HARNESS_PATHS_RE   REQUIRED ERE over changed paths: the job's own harness. A PR
 #                      touching any of it may have caused ANY setup death.
 #                      This script's own path is always harness.
 #   FRONTEND_INERT_RE  optional ERE: paths no frontend step is known to read
@@ -41,7 +41,7 @@
 #                      inert diff would be declared; withhold frontend deaths
 #                      on a non-default sibling ref before adding that import.
 #   GITHUB_EVENT_NAME / GITHUB_SHA / GITHUB_WORKSPACE
-#   GIT_BOUND          optional seconds bound for each local git call (30);
+#   GIT_BOUND          optional positive-integer seconds bound for each local git call (30);
 #                      the one network fetch is bounded at twice that.
 #
 # DECISION (first failed setup step = F):
@@ -74,7 +74,6 @@ SELF_RE='^\.github/scripts/declare-setup-death\.sh$'
 DEFAULT_FRONTEND_INERT_RE='^(src-tauri/|crates/|docs/|\.github/|Cargo\.(toml|lock)$|[^/]+\.md$)'
 INERT_RE="${FRONTEND_INERT_RE:-$DEFAULT_FRONTEND_INERT_RE}"
 GIT_BOUND="${GIT_BOUND:-30}"
-FETCH_BOUND=$((GIT_BOUND * 2))
 
 # Workflow-command escaping (actions/toolkit command.ts).
 esc_data() {
@@ -106,9 +105,21 @@ if [ "$JOB_OK" = 0 ]; then
   exit 0
 fi
 
+# Required inputs and bounds. An unset harness pattern would leave the job's
+# own workflow unguarded; a non-numeric bound would abort silently.
+if [ -z "${HARNESS_PATHS_RE:-}" ]; then
+  withhold "HARNESS_PATHS_RE is unset, so this job's own harness is unread."
+  exit 0
+fi
+if ! [[ "$GIT_BOUND" =~ ^[1-9][0-9]*$ ]]; then
+  withhold "GIT_BOUND '${GIT_BOUND}' is not a positive integer, so no git call can be bounded."
+  exit 0
+fi
+FETCH_BOUND=$((GIT_BOUND * 2))
+
 # A regex that does not compile makes grep exit 2 with no output, which would
 # read as "no match". Probe every supplied pattern first.
-for re in "$SELF_RE" "$INERT_RE" ${HARNESS_PATHS_RE:+"$HARNESS_PATHS_RE"}; do
+for re in "$SELF_RE" "$INERT_RE" "$HARNESS_PATHS_RE"; do
   grep -E -q -e "$re" < /dev/null 2> /dev/null
   if [ $? -gt 1 ]; then
     withhold "the pattern '${re}' is not a valid ERE, so the guard cannot be read. A setup death (if any) is left to read as a verdict."
@@ -250,7 +261,7 @@ read_guard() {
     return
   fi
   local re
-  for re in "$SELF_RE" ${HARNESS_PATHS_RE:+"$HARNESS_PATHS_RE"}; do
+  for re in "$SELF_RE" "$HARNESS_PATHS_RE"; do
     if ! grep_hit 0 "$re"; then
       REASON="grep over this PR's diff failed, so the harness guard is unread"
       return

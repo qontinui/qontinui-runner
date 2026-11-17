@@ -144,6 +144,8 @@ run "invalid FRONTEND_INERT_RE -> withhold (UNKNOWN)" withhold "why=not a valid 
 run "garbled setup conclusion -> withhold (UNKNOWN)" withhold "why=rendered no usable conclusion" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Build frontend' | sed "s/^Setup Rust${T}success/Setup Rust${T}sucess/")"
 run "garbled verdict conclusion -> withhold (UNKNOWN)" withhold "why=rendered no usable conclusion" $(pr "$W_RUST" "$M_RUST") VERDICT_STEPS="Clippy diff-scoped via reviewdog${T}" SETUP_STEPS="$(steps 'Build frontend')"
 run "no setup rows -> withhold (UNKNOWN)" withhold "why=no rows" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS=
+run "HARNESS_PATHS_RE unset -> withhold" withhold "why=HARNESS_PATHS_RE is unset" $(pr "$W_WF" "$M_WF") HARNESS_PATHS_RE= SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+run "non-numeric GIT_BOUND -> withhold" withhold "why=not a positive integer" $(pr "$W_RUST" "$M_RUST") GIT_BOUND=abc SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
 run "step name with workflow-command metacharacters is escaped" declare "why=step 'a:b,c%25d' failed" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="Checkout${T}success${T}tree-free"$'\n'"a:b,c%d${T}failure${T}tree-free"
 }
 run "push event -> withhold (UNKNOWN)" withhold "why=not pull_request" GITHUB_EVENT_NAME=push GITHUB_WORKSPACE="$W_RUST" GITHUB_SHA="$M_RUST" SETUP_STEPS="$(steps 'Install frontend dependencies')"
@@ -206,6 +208,8 @@ if names != list(expected):
     errs.append(f"setup steps {names!r} differ from the tested table {list(expected)!r}")
 if "clippy" not in by_id:
     errs.append("the verdict step's conclusion is not passed")
+elif not re.search(r'VERDICT_STEPS=.*"\$' + by_id["clippy"] + r'"', run):
+    errs.append("VERDICT_STEPS is not built from the clippy step's conclusion")
 title = "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::"
 if not re.search(r'if \[ "\$O_CHECKOUT" = "failure" \]; then\n\s+echo "' + re.escape(title), run):
     errs.append("the inline Checkout declaration is missing or its title drifted")
