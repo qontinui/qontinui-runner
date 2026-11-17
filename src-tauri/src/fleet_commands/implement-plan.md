@@ -1330,7 +1330,8 @@ bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-
 ```
 
 **`--based-on` is required** (`_status-writers.md` → "Publishing a stamp — the compare-and-swap"): `<blob of the pre-stamp re-read>` is `git -C <plans checkout> rev-parse
-origin/main:plans/<stem>.md` from the same fetch as the pinned re-read above —
+refs/remotes/origin/main:plans/<stem>.md` (the full ref, which a local branch named
+`origin/main` cannot shadow) from the same fetch as the pinned re-read above —
 the version this step's guard judged. Edit THAT version: `cat-file -p` it into a
 private scratch file (`mktemp -d`), edit that copy and pass it as
 `<local plan file>` — never write it over a shared checkout's copy, which may
@@ -2324,6 +2325,16 @@ verdict you saw and what you re-acquired**. Silence here is the
 `silent-empty-is-unknown` failure: a dead loop looks exactly like a healthy
 one to anything that does not ask.
 
+**A `DEAD` loop may have been killed with its pane, and then the net may
+already have fired.** `status` prints a `launch: posture=…` line for the loop
+`start` last launched. Anything but `posture=scope` dies when its pane's systemd
+scope is torn down (an account migration, a closed tab), and `<ledger>.alert`
+`TERMINATED` records a trapped TERM from outside. In that case the plan reserve
+may already have expired, and Step 0.5's implement→ship net may already have
+dispatched a duplicate. So after re-acquiring, read
+`coord_gate_list {work_unit_id}` for that net. If it has cleared or dispatched,
+arm a fresh one exactly as Step 0.5 does, and say so in the report.
+
 #### `/loop` gap (documented limitation)
 
 `/loop` is built into Claude Code itself, NOT a user-editable slash
@@ -3110,9 +3121,10 @@ checkpoint at `RESUME_FROM` passed back verbatim rather than reconstructing
 its state. `UNKNOWN` (exit 4): nothing to act on; say so. A `failed`
 notification carrying a provider `429` with a stated reset is not retried
 blind: run `scripts/rate-limit-reset.sh schedule` **with `--hint`** (see
-`/vet-imp-sweep` Step 6 — without a brief the resumed agent's whole context is
-`run /<skill> <args>`) so the resume is a coord `time_elapsed` gate that
-survives this session, and quote its `gate_id`; a `529`/"Overloaded" is
+`/vet-imp-sweep` Step 6 — without a brief the resumed agent gets
+`run /<skill> <args>` and only what coord adds itself) so the resume is a
+coord `time_elapsed` gate that survives this session, and quote its `gate_id`;
+a `529`/"Overloaded" is
 `TRANSIENT` — retry once.
 
 **Claim release (per Step 0.6).** AFTER each phase Agent returns —
@@ -4891,7 +4903,7 @@ established — a clean `gh pr checks` read is not proof of the latter.
      fi
      # Suite dir: publish the flipped 00-index.md with ITS OWN compare -- one
      # blob per call. After the fetch above:
-     #   IDX_BASED_ON="$(git -C "$TOP" rev-parse -q --verify "origin/main:<suite dir>/00-index.md")"
+     #   IDX_BASED_ON="$(git -C "$TOP" rev-parse -q --verify "refs/remotes/origin/main:<suite dir>/00-index.md")"
      # copy that blob into "$WORK/00-index.md", flip the row there, and publish it
      # with --based-on "$IDX_BASED_ON" (no session-marker check: an index carries none).
    else
@@ -4902,7 +4914,8 @@ established — a clean `gh pr checks` read is not proof of the latter.
    What the helper does, so its verdict can be read rather than trusted blind:
    it fetches the plans repo's default branch with an explicit refspec, probes
    that branch's ruleset, and — when no rule requires a PR — builds the commit
-   by plumbing on a separate index against a base resolved ONCE, so it never
+   by plumbing (lib/plumbing-commit.sh) on a private index against a base
+   resolved ONCE, so it never
    commits onto, rebases, or pushes the branch this checkout is on (routinely a
    peer's [policy: shared-checkout-route-around]). It pushes that commit to the
    default branch without force, rebuilding on a non-fast-forward. Then it reads
@@ -5290,12 +5303,15 @@ time window, operator approval). (canonical spec: `_gate-registration` →
     blocked-exit path says. The OFF-by-default headline above governs the other
     half: a Step 6 "follow-up plan with open items" that this session is still
     carrying.
-  - **When it IS on, populate `hint` — it is the spawned agent's only context.**
-    coord flattens the continuation to `run /<skill> <args>` and appends
-    `\n\n<hint>` only if a hint is present; no other key in the frame carries a
-    plan body, a PR body, prior findings or the predicate, so a hintless
-    continuation spawns an agent that knows nothing but the command line. Six
-    labelled lines, **references before bodies**, **≤2000 characters**:
+  - **When it IS on, populate `hint` — it is the only field that can carry
+    *why*.** coord flattens the continuation to `run /<skill> <args>` and appends
+    `\n\n<hint>` only if a hint is present; coord's own dispatch-time `brief`
+    beside it holds only references coord can resolve (the work unit's slug, the
+    PR the predicate names, its block reason, finding ids) and a fixed
+    end-of-session step, never a plan body, a PR body or what this session
+    tried, so a hintless continuation spawns an agent that knows the command
+    line and those references, not why it was sent. Six labelled lines,
+    **references before bodies**, **≤2000 characters**:
     `Plan: <plan-stem>` / `Why: <≤2 sentences>` / `PR: <owner/repo#N>` /
     `Blocked: <block_reason_code>[ ×N since <ISO8601>]` /
     `Resource-keys: <keys a peer's coord_recent_findings would match>` /
@@ -5604,7 +5620,7 @@ instead of it.
     --repo <repo> --intent "<plan-stem>: <phase title>" --work-unit <plan-work-unit-uuid> [--build-required]
   ```
 
-  It POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — an ANONYMOUS route: no runner, no mint, no cached credential, no `$COORD_HTTP_URL` (unset is an absent override, not a missing door; never substitute `127.0.0.1:9876`, which has no allocate route). `device_id` is a claim it reads from `$QONTINUI_MACHINE_ID` first, then `~/.qontinui/machine.json`, then any device JWT's payload, expired or not. It materialises every `worktrees[]` row (declared siblings included) at the RELATIVE path under the workspace root on the reserved branch, and refuses a STALE allocation whose branch already exists on origin (exit 9 — re-run, **and hand the leaked row back with `--done --branch <the reserved branch> --abandon` first**, since every real call mints a `coord.agent_worktrees` row the caller cannot retire and a bare retry loop leaks one per attempt; file it against `dossier:coord-allocate-returns-a-stale-allocation`). It **never switches the primary checkout's branch, on any answer** — the narrow claim, not "never touches it": `git worktree add` necessarily writes a branch ref and `.git/worktrees/<name>/` metadata into the primary's git dir, it fetches there, and a linked `node_modules` (below) makes the primary the write target for anything the worktree later installs. Output is five line kinds, not one: `agent_id <uuid>`; `<repo> <abs path> <branch>` per worktree; `node_modules <link> -> <target>`, interleaved after a worktree that got one; then -- only when the config is actually written -- one `sibling_store <abs path>` per SHA-keyed store entry it uses (`agent-worktrees/.siblings/<repo>@<sha>/`); and a trailing `cargo_config <path>`. What it sends (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`):
+  It POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — an ANONYMOUS route: no runner, no mint, no cached credential, no `$COORD_HTTP_URL` (unset is an absent override, not a missing door; never substitute `127.0.0.1:9876`, which has no allocate route). `device_id` is a claim it reads from `$QONTINUI_MACHINE_ID` first, then `~/.qontinui/machine.json`, then any device JWT's payload, expired or not. It materialises every `worktrees[]` row (declared siblings included) at the RELATIVE path under the workspace root on the reserved branch, and refuses a STALE allocation whose branch already exists on origin (exit 9 — re-run, **and hand the leaked row back with `--done --branch <the reserved branch> --abandon` first**, since every real call mints a `coord.agent_worktrees` row the caller has to hand back and a bare retry loop leaks one per attempt; file it against `dossier:coord-allocate-returns-a-stale-allocation`). It **never switches the primary checkout's branch, on any answer** — the narrow claim, not "never touches it": `git worktree add` necessarily writes a branch ref and `.git/worktrees/<name>/` metadata into the primary's git dir, it fetches there, and a linked `node_modules` (below) makes the primary the write target for anything the worktree later installs. Output is five line kinds, not one: `agent_id <uuid>`; `<repo> <abs path> <branch>` per worktree; `node_modules <link> -> <target>`, interleaved after a worktree that got one; then -- only when the config is actually written -- one `sibling_store <abs path>` per SHA-keyed store entry it uses (`agent-worktrees/.siblings/<repo>@<sha>/`); and a trailing `cargo_config <path>`. What it sends (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`):
 
   ```
   POST https://coord.qontinui.io/agents/allocate         // no Authorization header

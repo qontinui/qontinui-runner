@@ -75,6 +75,13 @@ pub mod tauri_event_payloads;
 // operator never performed).
 pub mod fs_atomic;
 
+// Bounded reads of a file's END — the one tail reader (`read_tail_lossy` for
+// transcript scans, `tail_lines` for log views). In the lib so its core can be
+// tested against a synthetic source, and so every reader of a log's end shares
+// one bound instead of growing another whole-file read. Plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phase 2.
+pub mod file_tail;
+
 // Runner instance identity from the process env (`QONTINUI_INSTANCE_NAME`) —
 // the ONE primary/secondary predicate. In the lib for the same reason as
 // `fs_atomic`: the runner bin's tier-persist guard and the `qontinui_profile`
@@ -130,8 +137,10 @@ pub mod mcp_spill;
 // the `qontinui_profile env` CLI and the Tauri runner GUI share one code path.
 // Moved out of the binary crate at P4: the bundled cluster is now the runner's
 // ONLY database, so the lib-side consumers (env_agent's db_schema pool, the
-// `qontinui-specs` CLI) must be able to address it. It has no `crate::`
-// dependencies, so the move is mechanical.
+// `qontinui-specs` CLI) must be able to address it. It had no `crate::`
+// dependencies then, so the move was mechanical; it has gained three since:
+// `crate::instance_env` (its default data root) and, in its test harness,
+// `crate::process_helpers` and `crate::runner_breadcrumb`.
 pub mod embedded_pg;
 pub mod env_agent;
 

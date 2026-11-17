@@ -327,8 +327,10 @@ When a check fails on a PR this session authored, fix it here (do not spawn).
 **Classify from the failed job's STEPS before you read anything else** — the
 first bullet below is that test, and the log is the second one, not the first.
 Only once the classification says “real” do you read the failing run log
-(**coord first** — `coord_ci_job_log_tail {repo, job_id}`; `gh run view <id> --log-failed`
-is the labelled fallback, see "Coord doors for job and log reads" below), and then
+(**coord first** — `coord_ci_job_log_tail {repo, job_id}`;
+`gh api repos/<owner>/<repo>/actions/jobs/<job_id>/logs` is the labelled fallback,
+see "Coord doors for job and log reads" below — **never** `gh run view --log-failed`,
+which on some gh builds prints nothing, exit 0, for a job that failed), and then
 only for what it sends you to fix:
 
 - **Transient infra** (rate-limit fetching a tool version, runner eviction,
@@ -494,9 +496,13 @@ only for what it sends you to fix:
   costs a full download per job; the GitHub-hosted OOM emits the **identical**
   string; and it is **blind to one of the two death shapes outright** — when the
   runner vanishes before flushing, `GET /actions/jobs/<id>/logs` **404s** and the
-  frozen step is visible ONLY in the `steps` array. So `--log-failed` returning
-  nothing useful is not evidence of a real failure; it is the signature of the
-  shape you cannot see that way.
+  frozen step is visible ONLY in the `steps` array. So an empty log read
+  decides nothing in either direction. A 404 from the jobs endpoint is the
+  vanished-runner shape (infra), and on some gh builds `gh run view --log-failed`
+  prints nothing, exit 0, for every failed job it reads (gh 2.46.0, 2026-11-15:
+  empty for all 9 failed Frontend CI runs read, while the jobs endpoint above
+  served each failed Unit-test job's log it was asked for — finding `7f3d5ae8`). The `steps` array
+  decides; read the log through the jobs endpoint.
 
   **ANY failed step means a genuine failure of that step** — Tier 1 requires
   ZERO, so the count that separates the two causes is zero-vs-nonzero. **The

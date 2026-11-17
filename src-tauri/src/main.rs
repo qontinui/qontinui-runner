@@ -261,6 +261,7 @@ mod safe_lock;
 mod saved_api_requests;
 mod scenarios;
 mod scheduler;
+mod scheduler_limit_relaunch;
 mod scheduler_probe;
 mod scheduler_remote_agent;
 mod scheduler_script;
@@ -2991,6 +2992,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::clipboard::share_file_to_mobile,
             commands::clipboard::share_to_mobile,
             commands::clipboard::clipboard_write_text,
+            commands::clipboard::clipboard_read_text,
             commands::cloud_sync_settings::get_cloud_sync_settings,
             commands::cloud_sync_settings::save_cloud_sync_settings,
             commands::cloud_sync_settings::get_session_metadata_sync_settings,
@@ -3209,8 +3211,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::global_log_sources::find_log_sources_with_ai,
             commands::global_log_sources::get_global_log_sources,
             commands::global_log_sources::migrate_project_sources_to_global,
-            commands::global_log_sources::read_global_log_sources,
-            commands::global_log_sources::read_log_sources_by_profile,
             commands::global_log_sources::save_global_log_sources,
             commands::global_log_sources::select_log_sources_for_context,
             commands::global_log_sources::set_default_log_source_profile,
@@ -3787,7 +3787,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Capture the primary's boot instant ONCE, synchronously, before
             // anything can serve a request. It is the reference the PID-reuse
-            // guard keys on (`claude_present_in_inclusive_subtree`), and it is
+            // guard keys on (`PaneLook::claude_present`), and it is
             // now shared by BOTH `tracking_health` consumers: the 600 s
             // periodic task and the on-demand `GET /restart-readiness` pass
             // (plan 2026-08-29-no-single-answer-…, D5). Two passes keyed on
@@ -4785,7 +4785,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         WorkerPlane,
                     };
 
-                    // Reference instant for `claude_present_in_inclusive_subtree`'s
+                    // Reference instant for `PaneLook::claude_present`'s
                     // PID-reuse guard: this primary's own boot time (captured once,
                     // at task spawn — effectively boot time), NOT a per-record
                     // `opened_at`. A per-record timestamp misfires whenever a later
@@ -4793,7 +4793,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // `terminal_id` (e.g. a reconnect into an existing pane) — the
                     // tracked PID's real creation legitimately predates that later
                     // record's `opened_at` by design, not because of PID recycling.
-                    // See the doc comment on `claude_present_in_inclusive_subtree`
+                    // See the doc comment on `PaneLook::claude_present`
                     // for the full incident writeup (2026-07-03).
                     let primary_boot_unix_millis = chrono::Utc::now().timestamp_millis();
 
@@ -4925,21 +4925,27 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             consecutive_no_match.clear();
                         }
 
-                        // One system-wide process snapshot per tick, shared by
-                        // every open record below. The process table is
+                        // One system-wide look per tick, shared by every open
+                        // record below: a process snapshot plus Claude Code's
+                        // session registry read for every live terminal's
+                        // subtree (plan 2026-11-05-npm-installed-claude-is-
+                        // invisible-…), so an npm-installed `claude` (`node …
+                        // cli.js`) reads present. The process table is
                         // consistent within a tick, so taking it once per record
                         // was N redundant PowerShell/`/proc` scans; `pid_alive`
-                        // stays the only per-record syscall. The claude-present
-                        // signal needs image names and the PID-reuse guard needs
-                        // creation times — both carried on the snapshot.
+                        // stays the only per-record syscall. FRESH, never the
+                        // memo: this poll closes a record on an ABSENT `claude`.
                         let asked_at_ms = chrono::Utc::now().timestamp_millis();
-                        let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
-                        // The table may be up to the provider's memo TTL older
-                        // than this call, so stamp the epoch with when ITS read
-                        // began — a lower bound on every row's observation —
-                        // not with the time it was asked for. A table no read
-                        // produced (observed_at_ms 0) is UNKNOWN and records
-                        // nothing (`tick_snapshot_ok` below).
+                        let look_roots: Vec<u32> = std::iter::once(std::process::id())
+                            .chain(live.iter().filter_map(|i| i.pid).filter(|&p| p > 0))
+                            .collect();
+                        let look = crate::terminal::graceful_exit::PaneLook::take_fresh(&look_roots).await;
+                        let snap = look.snapshot();
+                        // Stamp the epoch with when the table's read began — a
+                        // lower bound on every row's observation — not with the
+                        // time it was asked for. A table no read produced
+                        // (observed_at_ms 0) is UNKNOWN and records nothing
+                        // (`tick_snapshot_ok` below).
                         let snap_captured_at_ms = if snap.observed_at_ms > 0 {
                             snap.observed_at_ms.min(asked_at_ms)
                         } else {
@@ -4971,7 +4977,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             if open.is_empty() {
                                 StdHashMap::new()
                             } else {
-                                match session::claude_session_registry::live_pids_from_snapshot(&snap) {
+                                match session::claude_session_registry::live_pids_from_snapshot(snap) {
                                     // A PARTIAL read is safe here, so the rows of
                                     // every listable dir are used and an unlistable
                                     // dir only costs its own: a session missing from
@@ -4981,7 +4987,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(live_pids) => session::claude_session_registry::read_live_sessions(
                                         &terminal::transcript::find_claude_config_dirs(),
                                         &live_pids,
-                                        &session::claude_session_registry::may_host_claude(&snap),
+                                        &session::claude_session_registry::may_host_claude(snap),
                                     )
                                     .sessions
                                     .into_iter()
@@ -5174,16 +5180,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // for both the operator (claude is a child
                                     // of the shell) and agent (tracked PID *is*
                                     // claude, idle with zero children) shapes.
-                                    let claude_present = crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
-                                        pid,
-                                        &snap,
-                                        crate::session::tracking_health::pid_reuse_reference(
+                                    // `None` is UNDECIDED (a `node`/`bun` the
+                                    // session registry could not settle may be
+                                    // the `claude`): this record's snapshot is
+                                    // then not ok, so classify Skips it and it
+                                    // is never closed on that tick.
+                                    let (claude_present, snapshot_ok) =
+                                        crate::session::tracking_health::poll_claude_presence(
+                                            &look,
                                             pid,
-                                            &holder_verified,
-                                            primary_boot_unix_millis,
-                                        ),
-                                    );
-                                    (Some(alive), claude_present, tick_snapshot_ok)
+                                            crate::session::tracking_health::pid_reuse_reference(
+                                                pid,
+                                                &holder_verified,
+                                                primary_boot_unix_millis,
+                                            ),
+                                            tick_snapshot_ok,
+                                        );
+                                    (Some(alive), claude_present, snapshot_ok)
                                 }
                             };
 
@@ -5440,12 +5453,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // row pre-empts the rung-2 argv id and re-keys the
                         // pane's coord row; anything else re-keys nothing.
                         let provider_rows =
-                            session::reconcile::compute_provider_rows(&live_ptys, &snap).await;
+                            session::reconcile::compute_provider_rows(&live_ptys, &look).await;
                         let actions = if needs_reconcile {
                             let actions = session::reconcile::run_reconcile_pass(
                                 &poll_lifecycle_store,
                                 &live_ptys,
-                                &snap,
+                                &look,
                                 "periodic",
                             )
                             .await;
@@ -5478,7 +5491,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         session::reconcile::refresh_titles_pass(
                             &poll_lifecycle_store,
                             &live_ptys,
-                            &snap,
+                            &look,
                         );
 
                         poll_lifecycle_store.prune(
@@ -5521,10 +5534,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // The boot pass reads the provider rows too, so a pane whose
                     // claude was resumed before this runner started is re-keyed
                     // from its own registry file, not its stale argv.
-                    let boot_snap =
-                        crate::process_capture::process_tree::snapshot_process_table_public().await;
+                    let boot_roots: Vec<u32> = live.iter().filter_map(|pty| pty.pid).collect();
+                    let boot_look =
+                        crate::terminal::graceful_exit::PaneLook::take(&boot_roots).await;
                     let provider_rows =
-                        session::reconcile::compute_provider_rows(&live, &boot_snap).await;
+                        session::reconcile::compute_provider_rows(&live, &boot_look).await;
                     let actions =
                         session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
                     emit_session_bound(&reconcile_app_handle, &actions);

@@ -930,6 +930,17 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         );
         return;
     };
+    // An incomplete census (a process the session registry could not settle
+    // may be a live `claude`) is not safe to act on: close nothing this tick.
+    // An undecided census was already logged once by `fresh_pass`
+    // (`CENSUS_UNDECIDED_LOG`, naming this arm's consequence too).
+    if !fresh.unknowns.is_empty() {
+        debug!(
+            unknowns = ?fresh.unknowns,
+            "wind_down_executor: census incomplete this tick — nothing closed"
+        );
+        return;
+    }
     let Some(manager) = app
         .try_state::<Arc<TerminalManager>>()
         .map(|s| s.inner().clone())
@@ -1205,8 +1216,11 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
 
     async fn census(&self) -> Option<LiveCensus> {
         let fresh = wind_down_observer::fresh_pass(self.app, self.grace).await;
-        if fresh.pass.is_none() {
+        // Incomplete — no table, or a process the session registry could not
+        // settle — is no census: the arm closes nothing on it.
+        if !fresh.unknowns.is_empty() {
             debug!(unknowns = ?fresh.unknowns, "wind_down_executor: finished_close census incomplete");
+            return None;
         }
         let observed = fresh.observed;
         let census = fresh.pass.map(|pass| LiveCensus { pass, observed });

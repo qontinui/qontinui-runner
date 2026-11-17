@@ -124,10 +124,14 @@ temp_dev/
 # node parses it).
 # .qontinui/ci-pool-variables.toml is repo content too: the lane variables
 # coord's pool-variable controller decides, read from its canonical mirror.
+# .qontinui/ci-targets.toml is repo content too: the per-job CI
+# target map coord's overlap counterfactual reads (plan
+# 2026-11-08-coord-lands-one-candidate-per-repo-...).
 .qontinui/*
 !.qontinui/ci.toml
 !.qontinui/ci-requirements.toml
 !.qontinui/ci-pool-variables.toml
+!.qontinui/ci-targets.toml
 
 # Ignore CLAUDE notes file
 CLAUDE.md

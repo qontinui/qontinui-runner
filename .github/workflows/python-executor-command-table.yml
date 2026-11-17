@@ -10,6 +10,10 @@ name: Python executor command table
 # dir or ~ (plan 2026-11-14-one-xlib-distribution-and-no-tmp-debug-logs-in-the-python-bridge),
 # and tests/test_event_path_no_temp_writes.py, which exercises the event path with
 # its heavy imports stubbed so it too needs only these packages.
+# And python-bridge/tests/test_single_xlib_owner.py (stdlib tomllib only): the
+# bridge lock names exactly one distribution that installs `Xlib/` (python-xlib),
+# and neither pyautogui nor mouseinfo, which would bring back the python3-xlib
+# fork (same plan, phase 3).
 #
 # Hermetic: no network, no credentials. NOT a merge gate (absent from the repo
 # ruleset's required contexts). It is inside ci-integrity.yml's scope

@@ -172,6 +172,9 @@ written at the end of a turn, so the git probes decide); no live claim
 sits in the step 0.5 ledger; and every owed item reads `landed` or `watched`.
 A primary checkout reads UNKNOWN, not not-closeable: peers' WIP in a shared tree
 is not this session's owed work.
+In a linked tree whose custody directory also holds another session's slot, a
+dirty path a peer could have written reads UNKNOWN for the same reason, and this
+session never commits or discards such a path.
 
 This step refuses a finish ONLY on a definite reason, because a definite reason
 means the work is not actually done. An UNKNOWN closeability does not block the
@@ -222,12 +225,13 @@ verdict). Read its exit code:
 | Exit | First line | Action |
 |---|---|---|
 | 0 | `CLOSEABLE ...` | proceed to step 1 |
+| 0, but the first line is not `CLOSEABLE ...` -- empty, say: under `bash -t`, `bash -n`, or a `SHELLOPTS` holding `onecmd` or `noexec`, the script runs no check and prints nothing | anything but `CLOSEABLE ...` | **the check did not run.** Never proceed past it: re-run this step from a shell without those options (`env -u SHELLOPTS -u BASHOPTS bash ...`). `overlord-finish-guard.py` reads this exit as closeable-unknown, not as closeable |
 | 1, first line `NOT_CLOSEABLE ...`, and SID did NOT come from `$CLAUDE_CODE_SESSION_ID` (it came from `$QONTINUI_AGENT_SESSION_ID` or the box-global file, which step 1a treats as possibly a peer's) | `NOT_CLOSEABLE ...` | hold the verdict until step 1a has run. **If step 1a confirms the id is yours, the reasons are yours: apply the next row (do not finish).** If step 1a does not confirm the id (a peer's id, or an unproven one), step 1a's own refusal governs: the session is not finished, and these reasons are reported as UNKNOWN because they may be a peer's, not as your own not-closeable. A held claim was already refused by step 0.5 either way |
 | 1, first line `NOT_CLOSEABLE ...` | `NOT_CLOSEABLE ...` | **do not finish.** A definite reason: a dirty or untracked tree, a commit on no remote, a live claim (a ledger row still held -- `stolen` / `lapsed` / `owner_gone` rows are not), or an owed item that is `not_watched`, `owed` or `dropped`. Quote every `NOT_CLOSEABLE <reason> <detail>` line, fix it (commit and push, release the claim, get the item landed or watched), then re-run this step |
 | 3 | `UNKNOWN ...` | **proceed with the finish** and put in the report: `closeable: UNKNOWN (<the UNKNOWN reason lines>) — finished` |
 | no `session-closeable exit` line at all: the shell printed `SID: no session id: step 0.6 did NOT run` or `CCFG: fill CCFG ...: step 0.6 did NOT run` | — | **the step did not run.** Never proceed past it: fill `CCFG` (or resolve the session id) and re-run this step |
 | 2 | usage | the call was malformed (an empty `--owed-items` / `--worktree` value, a non-uuid id): fix it and re-run; do not proceed on a usage error |
-| 127 / `No such file or directory`, an exit 1 whose first line is NOT `NOT_CLOSEABLE` (the script crashed), or any other exit | — | the same as 3: proceed, and report `closeable: UNKNOWN (<what failed>) — finished` |
+| 127 / `No such file or directory`, an exit 1 whose first line is NOT `NOT_CLOSEABLE` (the script crashed, or bash stopped it because POSIX mode would not come on: `UNKNOWN shell_environment` on stderr), or any other exit | — | the same as 3: proceed, and report `closeable: UNKNOWN (<what failed>) — finished` |
 
 Report the closeable axis in exactly those words and nothing else: no
 paraphrase, and no sentence of your own about whether the session can be

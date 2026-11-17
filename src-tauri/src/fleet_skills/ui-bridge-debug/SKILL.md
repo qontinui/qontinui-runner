@@ -89,7 +89,8 @@ accepts in its `actions` list (`GET $BASE/control/element/<id>`, or the
 element's entry in the snapshot) — use one of those rather than guessing.
 On the runner, when an enabled element advertises a list, a verb not on it is
 refused with a 400 naming that list (`hoverClick` also passes wherever `click`
-does; a malformed `type` request fails its own param check first):
+does, and `unhover` wherever `hover` does; a malformed `type` request fails its
+own param check first):
 `supportedActions` for an unknown verb (`INVALID_REQUEST`), `supported_actions`
 for a built-in verb this element does not advertise (`ACTION_NOT_SUPPORTED`).
 The context can add `didYouMean`, a near-miss the element accepts, and
@@ -97,10 +98,13 @@ The context can add `didYouMean`, a near-miss the element accepts, and
 on a text-entry element (one advertising `type`, or an ARIA textbox /
 contenteditable) and `click` on anything else, such as a button. Lists from
 `@qontinui/ui-bridge` 0.46 or later advertise `sendKeys` on every kind, so on
-those lists that outcome needs a runner carrying qontinui-runner#2858; an older
-runner suggests `sendKeys` on a button. Check that a hint names the verb and
-key you meant before copying it. An element advertising no list, or one the
-runner could not read, gets no such 400. A runner build older than qontinui-runner
+those lists that outcome needs a runner build containing qontinui-runner
+`2e72bfb37` (landed by #2872): `git merge-base --is-ancestor 2e72bfb37
+<gitSha>` with the runner's `/health` `gitSha`, where exit 128 is UNKNOWN, not
+older. An older runner suggests `sendKeys` on a button. Check that a hint names
+the verb and key you meant before copying it. An element advertising no list,
+or one the runner could not read, gets no such 400. A runner build older than
+qontinui-runner
 `6c88e5a37` instead answers an unknown verb with `Unknown action '<x>'.
 Supported actions: <list>`, where the list is the runner's GLOBAL verb list and
 there is no suggestion. Either way, the element's `actions` list is the answer.

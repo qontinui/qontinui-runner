@@ -697,11 +697,21 @@ three ways relative to a whole-plan vet:
    status block.** Do not touch other phases' sections, and do not run the
    single-stamp-invariant full-block replace §5 describes for a whole-plan
    vet. Instead, splice that scoped entry into the existing status
-   blockquote using the same separate-index, pinned-`$BASE` push recipe
-   `CLAUDE.md` already documents for a shared checkout (`git hash-object -w`
-   → `GIT_INDEX_FILE=<tmp> git read-tree "$BASE"` → `update-index` →
-   `write-tree` → `commit-tree -p "$BASE"` → push), so a concurrent phase
-   session's own scoped edit is never clobbered by a full-block rewrite. The
+   blockquote and publish it with
+   `bash <workspace-root>/qontinui-claude-config/scripts/plumbing-push.sh --root <plans checkout> --branch main --put plans/<stem>.md=<edited file> --based-on plans/<stem>.md=<blob> --message "<subject>"`,
+   where `<blob>` is the `git rev-parse refs/remotes/origin/main:plans/<stem>.md`
+   you read (right after a fetch; the full ref, which a local branch named
+   `origin/main` cannot shadow) before splicing (its header carries the why: a
+   private index, a base pinned once, no empty sha ever pushed, the blob you
+   read compared with origin on every attempt, read-back), so a concurrent
+   phase session's own scoped edit is never clobbered by a full-block rewrite.
+   Exit 7 `CONFLICT` means origin no longer holds the blob you read — a peer
+   edited the plan after your read: re-read it, re-splice, re-run with the new
+   `--based-on`. Exit 5 `REFUSED` on `main` is a ruleset that requires a PR (push
+   a new branch with `--create` and open a PR) or a ruleset probe GitHub did not
+   answer — a rate limit or a transport failure (retry once the GitHub budget
+   resets or the network answers, or publish this single plan file through
+   `scripts/land-plan-stamp.sh`, which rides both). The
    scoped entry reads:
    ```
    Phase N: VETTED <date> (session <short-id>) — see § Phase N.
@@ -749,8 +759,9 @@ written.
 plans directory is inside a git repo, fetch
 (`git -C <plans-repo-root> fetch -q origin +refs/heads/main:refs/remotes/origin/main`,
 exit status read unpiped — a failed fetch is a STOP), record
-`BASED_ON=$(git -C <plans-repo-root> rev-parse -q --verify origin/main:<repo-relative plan path>)`
-(empty: the plan is not on origin — publish it with `--based-on new` first, per
+`BASED_ON=$(git -C <plans-repo-root> rev-parse -q --verify refs/remotes/origin/main:<repo-relative plan path>)`
+(the full ref, which a local branch named `origin/main` cannot shadow; empty:
+the plan is not on origin — publish it with `--based-on new` first, per
 the precondition above), and write `git -C <plans-repo-root> cat-file -p "$BASED_ON"`
 into a private scratch file (`mktemp -d`). **That scratch file is "the plan on
 disk" for every later step of this run** — the capture below, Step 1's `Read`,
@@ -3068,9 +3079,10 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      `hint` field, so the brief goes into `initial_prompt` itself — coord would
      have produced the same text from a typed continuation's `hint`, plus a
      closing `/unattended` line it never adds to a legacy prompt. Without
-     it the spawned session's entire brief is `run /implement-plan <path>`: it
-     opens on a plan it has never read, with no idea why it was dispatched
-     instead of the vetting session finishing the work. Six labelled lines
+     it the spawned session gets `run /implement-plan <path>` and only what
+     coord's dispatch-time brief adds: it opens on a plan it has never read,
+     with no idea why it was dispatched instead of the vetting session finishing
+     the work. Six labelled lines
      (`Plan`/`Why`/`PR`/`Blocked`/`Resource-keys`/`Tried`), **references before
      bodies**, **≤2000 characters** — nothing enforces that cap and nothing
      truncates for you, so cut prose rather than references and end a cut brief

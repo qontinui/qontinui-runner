@@ -1065,6 +1065,7 @@ mod tests {
             holder_hosted: vec![],
             holder_panes: vec![],
             holder_census_error: None,
+            undecided: vec![],
         }
     }
 

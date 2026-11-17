@@ -80,6 +80,7 @@ use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
     ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
+use crate::terminal::graceful_exit::PaneLook;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// One live PTY the reconcile considers, projected from
@@ -931,8 +932,8 @@ pub trait ProviderSessionIndex {
 ///
 /// The provider instead maintains this small JSON file per live session —
 /// `{pid, sessionId, cwd, startedAt, name, status, …}` — whose `name` IS the
-/// in-TUI name and whose `pid` is the claude image the binder already anchors on
-/// ([`claude_anchor_in_subtree`](crate::process_capture::process_tree::claude_anchor_in_subtree)).
+/// in-TUI name and whose `pid` is the `claude` the binder already anchors on
+/// ([`PaneLook::claude_anchor`](crate::terminal::graceful_exit::PaneLook::claude_anchor)).
 /// It is read-only to us and best-effort: an absent/unparseable file, or a
 /// provider version that stops writing it, degrades to "no refresh this tick"
 /// and the title simply stays as it is.
@@ -1106,9 +1107,9 @@ pub fn refresh_titles<N: ProviderSessionIndex>(
 pub fn refresh_titles_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
-    snapshot: &ProcessSnapshot,
+    look: &PaneLook,
 ) -> Vec<TitleRefresh> {
-    let live = anchor_live_ptys(live, snapshot);
+    let live = anchor_live_ptys(live, look);
     refresh_titles(store, &live, &DiskProviderSessionIndex::discover())
 }
 
@@ -1188,16 +1189,17 @@ impl ProviderRows {
     }
 }
 
-/// Blocking: resolve anchors from `snapshot` and read every config dir's file
+/// Blocking: resolve anchors from `look` and read every config dir's file
 /// for each anchor pid. An unknown snapshot anchors nothing. `config_dirs` is
 /// only called when at least one anchor exists, so a tick with no claude pane
 /// does no directory discovery.
 pub fn compute_provider_rows_blocking(
     live: &[LivePty],
-    snapshot: &ProcessSnapshot,
+    look: &PaneLook,
     config_dirs: impl FnOnce() -> Vec<PathBuf>,
 ) -> ProviderRows {
-    let anchored = anchor_live_ptys(live, snapshot);
+    let snapshot = look.snapshot();
+    let anchored = anchor_live_ptys(live, look);
     let pids: Vec<(u32, Option<i64>)> = anchored
         .iter()
         .filter_map(|p| {
@@ -1224,12 +1226,12 @@ pub fn compute_provider_rows_blocking(
 /// [`compute_provider_rows_blocking`] on the blocking pool. A join failure
 /// reads as "no valid rows": rung 2 stays the fallback and nothing is re-keyed
 /// from the registry.
-pub async fn compute_provider_rows(live: &[LivePty], snapshot: &ProcessSnapshot) -> ProviderRows {
-    let (live, snapshot) = (live.to_vec(), snapshot.clone());
+pub async fn compute_provider_rows(live: &[LivePty], look: &PaneLook) -> ProviderRows {
+    let (live, look) = (live.to_vec(), look.clone());
     spawn_blocking_tracked(move || {
         compute_provider_rows_blocking(
             &live,
-            &snapshot,
+            &look,
             crate::terminal::transcript::find_claude_config_dirs,
         )
     })
@@ -1244,13 +1246,17 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-/// Resolve each live PTY's CLAUDE anchor — the claude-image descendant pid + its
-/// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The
+/// Resolve each live PTY's CLAUDE anchor — the oldest live `claude` in its
+/// subtree ([`PaneLook::claude_anchor`]: an image-proven `claude`, or a pid
+/// Claude Code's session registry names, so an npm-installed one anchors too)
+/// + its process start — from an ALREADY-TAKEN look (no extra sweep). The
 /// correlation must anchor on when CLAUDE started, not on when its shell did (a
 /// foreign same-cwd session started after the shell but before claude would
 /// otherwise qualify); the shell pid's start is only a fallback for a found
 /// claude whose own start is unknown. A PTY whose subtree hosts no claude image
-/// keeps `ai_pid: None`, and [`run_reconcile`] never binds it.
+/// keeps `ai_pid: None`, and [`run_reconcile`] never binds it. So does one
+/// whose anchor is UNDECIDED (a `node`/`bun` the registry could not settle may
+/// be the older `claude`): an unresolved anchor binds nothing.
 ///
 /// An UNKNOWN snapshot ([`ProcessSnapshot::is_unknown`]: a failed read, or the
 /// last good table served `stale`) anchors NOTHING: its processes may have
@@ -1258,9 +1264,9 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
 /// session it no longer hosts — whose `--resume` the next restore would type.
 /// Every unresolved `ai_pid` stays `None`, so no pane is bound this pass;
 /// pruning and the rest of the pass still run.
-fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty> {
+fn anchor_live_ptys(live: &[LivePty], look: &PaneLook) -> Vec<LivePty> {
     let mut out = live.to_vec();
-    if snapshot.is_unknown() {
+    if look.snapshot().is_unknown() {
         return out;
     }
     for pty in out.iter_mut() {
@@ -1268,9 +1274,7 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
             continue; // the caller already resolved it
         }
         let Some(root) = pty.pid else { continue };
-        if let Some((ai_pid, ai_start)) =
-            crate::process_capture::process_tree::claude_anchor_in_subtree(root, snapshot)
-        {
+        if let Ok(Some((ai_pid, ai_start))) = look.claude_anchor(root) {
             pty.ai_pid = Some(ai_pid);
             // An unknown (0) creation time is NOT an anchor — leave it None so
             // the shell-start fallback applies.
@@ -1307,10 +1311,11 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 pub async fn run_reconcile_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
-    snapshot: &ProcessSnapshot,
+    look: &PaneLook,
     context: &str,
 ) -> Vec<ReconcileAction> {
-    let live = anchor_live_ptys(live, snapshot);
+    let snapshot = look.snapshot();
+    let live = anchor_live_ptys(live, look);
 
     // Rung 2 — ONE targeted cmdline query, for exactly the anchor pids of the
     // terminals that still need binding. Never a table-wide fetch; an empty list
@@ -1437,8 +1442,9 @@ pub async fn run_at_boot(
     if live.is_empty() && store.open_records().is_empty() {
         return Vec::new(); // nothing to do
     }
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    run_reconcile_pass(store, &live, &snapshot, "boot").await
+    let roots: Vec<u32> = live.iter().filter_map(|pty| pty.pid).collect();
+    let look = PaneLook::take(&roots).await;
+    run_reconcile_pass(store, &live, &look, "boot").await
 }
 
 /// Wire payload for the `session-bound` Tauri event — the binder→frontend
@@ -1916,7 +1922,7 @@ mod tests {
         };
         let rows = compute_provider_rows_blocking(
             &[pty_anchored("term-1", 31524, created, "C:/repo")],
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             || vec![dir.path().to_path_buf()],
         );
         (dir, rows)
@@ -2730,7 +2736,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         let stale = table(true);
-        let anchored = anchor_live_ptys(&live, &stale);
+        let anchored = anchor_live_ptys(
+            &live,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&stale),
+        );
         assert_eq!(anchored[0].ai_pid, None, "a stale table anchors nothing");
         let actions = run_reconcile(&store, &anchored, &stale, &index(), &no_cmdlines());
         assert!(
@@ -2744,7 +2753,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         let fresh = table(false);
-        let anchored = anchor_live_ptys(&live, &fresh);
+        let anchored = anchor_live_ptys(
+            &live,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&fresh),
+        );
         assert_eq!(
             anchored[0].ai_pid,
             Some(5151),
@@ -2808,5 +2820,45 @@ mod tests {
                 .as_deref(),
             Some(ORIGIN_OBSERVED)
         );
+    }
+
+    /// Shell 5 → `node` 50 (an npm-installed `claude`, `node … cli.js`).
+    fn npm_pane_table() -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot {
+            stale: false,
+            ..Default::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name, started) in [(5, "bash", 1_000), (50, "node", 1_050)] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    fn npm_look(
+        witness: crate::terminal::graceful_exit::RegistryWitness,
+    ) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::over_whole_table(npm_pane_table(), witness)
+    }
+
+    /// The reconcile anchor: an npm `claude` the registry names anchors the
+    /// pane. Partner: drop the witness and nothing anchors (the pane is never
+    /// bound). Unsettled, the anchor is unresolved: no bind.
+    #[test]
+    fn an_npm_claude_anchors_the_pane_and_an_unsettled_one_binds_nothing() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        let live = vec![pty("npm-term", Some(5), "/repo")];
+        let anchor = |w| {
+            let p = &anchor_live_ptys(&live, &npm_look(w))[0];
+            (p.ai_pid, p.ai_start_unix)
+        };
+        assert_eq!(
+            anchor(RegistryWitness::naming(&[50])),
+            (Some(50), Some(1_050))
+        );
+        assert_eq!(anchor(RegistryWitness::naming(&[])), (None, None));
+        assert_eq!(anchor(RegistryWitness::unreadable("test")), (None, None));
     }
 }

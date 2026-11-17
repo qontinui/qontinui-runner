@@ -1312,6 +1312,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .layer(axum::middleware::from_fn(
             crate::condition_secrets::scrub_sdk_responses,
         ))
+        // `dispatch` sends its `params` verbatim to the app and never
+        // substitutes, so while a condition-check session holds a secret a
+        // `{{secret:<ref>}}` placeholder in its request is refused before the
+        // handler runs rather than typed into the app as literal text. It
+        // also checks `control/wait-for-app` (a `/ui-bridge/control/*`
+        // route); every other sibling passes through untouched.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 // ============================================================================

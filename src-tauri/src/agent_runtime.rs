@@ -1290,11 +1290,33 @@ fn resolve_waiting_with(
         return resolve();
     }
     let start = std::time::Instant::now();
+    let mut retried = false;
     loop {
         let found = resolve();
-        if found != bare || start.elapsed() >= wait {
+        if found != bare {
+            // Only a recovery after at least one retry is news: it is the
+            // direct evidence of a reinstall window the wait rode out.
+            if retried {
+                info!(
+                    "resolve_claude_bin: real `{bare}` reappeared on PATH after {:?} — \
+                     a reinstall window was ridden out (finding 00525a01)",
+                    start.elapsed()
+                );
+            }
             return found;
         }
+        if start.elapsed() >= wait {
+            if !wait.is_zero() {
+                warn!(
+                    "resolve_claude_bin: no real `{bare}` on PATH after waiting {:?} — \
+                     falling back to the bare name, which the PTY child resolves to the \
+                     identity shim; the respawned pane may exit 127 (finding 00525a01)",
+                    start.elapsed()
+                );
+            }
+            return found;
+        }
+        retried = true;
         std::thread::sleep(step);
     }
 }
