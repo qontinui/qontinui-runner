@@ -210,7 +210,8 @@ and prints its phase declaration — the `phases`, `phase_labels` and
 `metadata` — as one compact JSON object on stdout, so a session minting a plan
 work unit by hand can send exactly that. Exit 0 printed it; exit 3 the plan
 declares no phase (`NO_PHASES` on stderr, nothing on stdout); exit 2 a usage
-error or an unreadable (or non-UTF-8) file.";
+error or an unreadable (or non-UTF-8) file; exit 1 the JSON could not be
+written to stdout (e.g. a closed pipe).";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PrCreateArgs {
@@ -453,7 +454,8 @@ fn pr_create(args: &[String]) -> ExitCode {
 // exactly the keys `phases`, `phase_labels`, `phases_undeclared`; exit 3 with
 // `NO_PHASES` on stderr and nothing on stdout when the plan declares no phase;
 // exit 2 with a usage/error line on stderr for a missing or extra argument or
-// an unreadable / non-UTF-8 file. Offline: no runner, coord or backend.
+// an unreadable / non-UTF-8 file; exit 1 when the JSON could not be written to
+// stdout (a closed pipe). Offline: no runner, coord or backend.
 // ===========================================================================
 
 /// Exit code when the plan declares no phase (`NO_PHASES`).
@@ -487,7 +489,12 @@ fn plan_phase_declaration(
         Err(e) => {
             let _ = writeln!(
                 err,
-                "qontinui-pr: cannot read {path:?} as UTF-8: {e}\n{usage}"
+                "qontinui-pr: cannot read {path:?}{}: {e}\n{usage}",
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    " as UTF-8"
+                } else {
+                    ""
+                }
             );
             return 2;
         }
