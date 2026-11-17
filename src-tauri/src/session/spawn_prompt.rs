@@ -993,7 +993,10 @@ mod script_tests {
     /// thread's still-open write handle on the script IT is about to run,
     /// which then fails to start with ETXTBSY. Cheap: these are sub-second
     /// shell runs.
-    static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// It is the SAME lock as the bash-shim harness's
+    /// (`shim_test_support::EXE_LOCK`): these tests write and run identity-shim
+    /// scripts too, and two locks would not serialize against each other.
+    use crate::install_effects_producer::intercept::shim_test_support::EXE_LOCK;
 
     /// Take [`EXE_LOCK`], surviving a poisoned mutex so one failing test
     /// reports its own assertion instead of cascading into the rest.

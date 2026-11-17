@@ -133,10 +133,16 @@ fn first_stat_at(root: &Path) -> Option<SystemTime> {
 
 /// The real-clock guarantee, measured from the WRITE rather than from when the
 /// harness started the shim: the fake `claude` ran at least 2 s after its
-/// target last changed. The wait line is owed whenever the shim's first probe
-/// came under 2 s after that change (whole-second `now - ctime` is then at
-/// most 2, under the shim's 3); a probe that a loaded box delayed past that may
-/// legitimately find the target settled and print nothing.
+/// target last changed. That assertion is unconditional.
+///
+/// Whether the wait line was OWED depends on when the shim read its clock,
+/// which this test cannot see: the wrapper stamps `first_stat` BEFORE `stat`
+/// runs, and the shim reads `now` only after it returns. The shim waits while
+/// whole-second `now - floor(ctime)` is under 3, i.e. while its clock reads
+/// under `floor(changed) + 2` (in whole seconds, up to the next boundary). So
+/// the line is required only when the probe began at least 1 s before that
+/// point, `first_stat < floor(changed) + 1 s`, leaving a full second for `stat`
+/// and the clock read; a later probe downgrades to a NOTE.
 fn assert_launched_two_seconds_after_the_write(
     changed: Option<SystemTime>,
     launched: Option<SystemTime>,
@@ -151,16 +157,23 @@ fn assert_launched_two_seconds_after_the_write(
         "the claude launched {gap:?} after its target changed: {stderr}"
     );
     let first_stat = first_stat.expect("the shim called stat");
-    if first_stat < changed + Duration::from_secs(2) {
+    let changed_floor = SystemTime::UNIX_EPOCH
+        + Duration::from_secs(
+            changed
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("a change time after the epoch")
+                .as_secs(),
+        );
+    let probe_after_write = first_stat.duration_since(changed).unwrap_or_default();
+    if first_stat < changed_floor + Duration::from_secs(1) {
         assert!(
             stderr.contains(WAIT_LINE_TAIL),
-            "the first probe came {:?} after the write, so the wait line is owed: {stderr}",
-            first_stat.duration_since(changed).unwrap_or_default()
+            "the first probe came {probe_after_write:?} after the write, so the wait line is owed: {stderr}"
         );
     } else {
         eprintln!(
-            "NOTE: the shim's first stat came {:?} after the write; the wait line is not owed",
-            first_stat.duration_since(changed).unwrap_or_default()
+            "NOTE: the shim's first stat came {probe_after_write:?} after the write, too late to \
+             require the wait line"
         );
     }
 }
@@ -344,8 +357,18 @@ fn a_changing_claude_is_announced_once_and_launched_once_settled() {
         "one wait line: {}",
         run.stderr
     );
+    // The age is whole seconds, read on whichever side of a second boundary
+    // the first probe lands, so it may read 0 or 1.
+    let wait_line = run
+        .stderr
+        .lines()
+        .find(|l| l.contains(WAIT_LINE_TAIL))
+        .unwrap_or_default();
     assert!(
-        run.stderr.contains("/real/claude changed 0s ago (an install may still be writing it); waiting up to 10s for it to settle"),
+        wait_line.starts_with("qontinui shim: ")
+            && wait_line.contains("/real/claude changed ")
+            && (wait_line.contains(" changed 0s ago ") || wait_line.contains(" changed 1s ago "))
+            && wait_line.ends_with("waiting up to 10s for it to settle"),
         "the wait line names the path, the age and the bound: {}",
         run.stderr
     );
