@@ -8817,7 +8817,6 @@ mod tests {
         assert!(unobserved["lastFailure"].is_null());
         for key in [
             "heartbeatsSuperseded",
-            "heartbeatsMuted",
             "heartbeatsDroppedOnFailure",
             "heartbeatsDroppedOnFailureByKind",
         ] {
@@ -12580,8 +12579,11 @@ mod tests {
             }];
             let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
             let tick = |store: &SessionLifecycleStore| {
-                let rows =
-                    compute_provider_rows_blocking(&live, &snap, || vec![cfg.path().to_path_buf()]);
+                let rows = compute_provider_rows_blocking(
+                    &live,
+                    &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
+                    || vec![cfg.path().to_path_buf()],
+                );
                 let actions = run_reconcile(
                     store,
                     &live,

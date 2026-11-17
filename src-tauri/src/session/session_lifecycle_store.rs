@@ -2067,7 +2067,7 @@ impl SessionLifecycleStore {
     /// Credential hygiene (Task 5): when this close ends the LAST open session
     /// for its workdir, the workdir's coord-mcp proxy nonce is revoked and its
     /// app-data session-restore config is reaped
-    /// ([`crate::coord_mcp::release_workdir_on_session_close`]) — a closed
+    /// ([`crate::coord_mcp::release_workdir_proxy_nonces`]) — a closed
     /// session's credential must not stay live. Skipped for account-migration
     /// closes (the session continues under a new record with the same workdir)
     /// and when a sibling open session still shares the workdir.
@@ -2375,7 +2375,10 @@ impl SessionLifecycleStore {
         // the nonce the resumed pane still uses is never released under it.
         if let Some(wd) = closed_workdir {
             if !workdir_still_in_use {
-                crate::coord_mcp::release_workdir_on_session_close(&wd);
+                crate::coord_mcp::release_workdir_proxy_nonces(
+                    &wd,
+                    crate::coord_mcp::RELEASE_CAUSE_SESSION_CLOSE,
+                );
             }
         }
         outcome
@@ -2948,6 +2951,30 @@ impl SessionLifecycleStore {
         finished: bool,
         reason: Option<String>,
     ) -> Result<FinishOutcome, SetFinishedError> {
+        self.set_finished_inner(claude_session_id, finished, reason, false)
+    }
+
+    /// Mark `claude_session_id` finished with `reason` ONLY if it is not
+    /// finished already — decided under the same locks as the write, so a
+    /// session that finished itself concurrently keeps its own mark and reason
+    /// (a reason-carrying [`Self::set_finished`] would restamp it). An already
+    /// finished record is returned unchanged (`FinishChange::None`, nothing
+    /// forwarded).
+    pub fn set_finished_if_unfinished(
+        &self,
+        claude_session_id: &str,
+        reason: String,
+    ) -> Result<FinishOutcome, SetFinishedError> {
+        self.set_finished_inner(claude_session_id, true, Some(reason), true)
+    }
+
+    fn set_finished_inner(
+        &self,
+        claude_session_id: &str,
+        finished: bool,
+        reason: Option<String>,
+        only_if_unfinished: bool,
+    ) -> Result<FinishOutcome, SetFinishedError> {
         // Held to the end of this call: see `finish_forward`. It guards no
         // data, so a poisoned guard is simply taken over.
         let _forward = self
@@ -2965,6 +2992,13 @@ impl SessionLifecycleStore {
         let rec = m
             .get_mut(claude_session_id)
             .ok_or(SetFinishedError::UnknownSession)?;
+        if only_if_unfinished && rec.finished_at.is_some() {
+            return Ok(FinishOutcome {
+                record: rec.clone(),
+                changed: FinishChange::None,
+                coord: FinishSync::LocalOnly(LocalOnlyReason::NotRequeued),
+            });
+        }
 
         // A blank reason is no reason.
         let reason = non_empty(reason);
@@ -3023,6 +3057,10 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed.clone()),
             }],
         );
+        // Record the mark in the snapshot history too: past-sessions merges
+        // that history in once the registry row ages out (~24 h), and without
+        // this line a finished session would read as unfinished there.
+        self.snapshot_change(std::iter::once(changed.clone()));
         // Notify AFTER the durable local write and outside the map lock (the
         // guard was consumed by `persist`). Every write that reaches here owes
         // coord a write — a fresh mark, a restamp, or an unmark (reaching here

@@ -14,8 +14,9 @@
 //! `Get-CimInstance Win32_Process` via PowerShell kept only as its
 //! circuit-protected fallback), and on Unix `/proc/<pid>/stat` for the parent
 //! and start time and `/proc/<pid>/comm` for the image name. BFS runs in Rust.
-//! The image name powers [`claude_present_in_inclusive_subtree`], the
-//! session-liveness signal.
+//! The image name is one of the two witnesses of a live `claude`; the
+//! session-liveness reads that combine it with Claude Code's own session
+//! registry live in `crate::terminal::graceful_exit::PaneLook`.
 
 use std::collections::HashMap;
 
@@ -70,7 +71,7 @@ impl PidWithSpawnedAt {
 /// re-querying WMI; `names[pid] -> image_name` carries each process's image
 /// (e.g. `claude.exe` on Windows, `comm` on Unix) so the session liveness
 /// poll can ask "is a live Claude process present in this subtree?" — the
-/// signal [`claude_present_in_inclusive_subtree`] reads.
+/// image witness `crate::terminal::graceful_exit::PaneLook` reads.
 #[derive(Debug, Clone)]
 pub struct ProcessSnapshot {
     /// `true` when this is NOT a fresh read: the last good snapshot served
@@ -120,7 +121,7 @@ pub struct ProcessSnapshot {
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
-/// instant comparison in [`claude_present_in_inclusive_subtree`]. Creation
+/// instant comparison in `crate::terminal::graceful_exit::PaneLook::claude_present`. Creation
 /// times come from WMI at second granularity, so a beat of rounding slack is
 /// always allowed before treating a tracked PID as reused.
 pub(crate) const PID_REUSE_SKEW_MS: i64 = 5_000;
@@ -151,81 +152,8 @@ impl ProcessSnapshot {
     }
 }
 
-/// True iff a live Claude process is present in the **inclusive** subtree
-/// rooted at `root_pid` — i.e. `root_pid`'s own image is `claude*`, OR any
-/// descendant's image is `claude*`. This is the liveness signal the terminal-
-/// session poll uses: a session is alive iff there is a live Claude here, which
-/// is the correct question for **both** session shapes:
-/// - **Operator session:** tracked PID is the shell; `claude` is a child →
-///   present via a descendant.
-/// - **Agent / gate-continuation session:** tracked PID *is* `claude` (it is the
-///   portable-pty child) → present via the root, even when idle with zero
-///   children (the bug the old `descendant_count > 0` heuristic mis-closed).
-///
-/// `reference_unix_millis` guards PID reuse: if the tracked `root_pid`'s
-/// creation time predates the reference instant (beyond [`PID_REUSE_SKEW_MS`]),
-/// the PID cannot belong to anything this reference instant's process tree
-/// spawned — its image name must not be trusted, so the subtree is treated as
-/// claude-absent. The comparison normalizes units: `creation_times` is epoch
-/// **seconds**, `reference_unix_millis` is epoch **millis**.
-///
-/// **Pass the runner primary's own boot time here — NEVER a per-session-record
-/// timestamp like `opened_at`.** (Regression found live 2026-07-03, Phase 1
-/// verification of PR #630: a session record's `terminal_id` can legitimately
-/// be reused by a *later* record against an *already-running* terminal — e.g.
-/// a reconnect into an existing pane — since `record_open` dedups by
-/// `claude_session_id`, never by `terminal_id`. When that happens the tracked
-/// PID's real creation time predates the newer record's `opened_at` by design,
-/// not because of PID recycling, and the old `opened_at`-based guard falsely
-/// concluded "reused" — flipping a genuinely live, idle session to `poll-dead`
-/// after `LIVE_SHELL_DEAD_TICKS`. A PID cannot predate the primary's OWN boot
-/// time and still belong to a terminal this boot's `TerminalManager` spawned,
-/// so the boot start is the correct, restart-scoped reference instant: it
-/// still catches the genuine cross-restart PID-recycle case the guard exists
-/// for, without misfiring on ordinary same-boot terminal reuse.
-pub fn claude_present_in_inclusive_subtree(
-    root_pid: u32,
-    snapshot: &ProcessSnapshot,
-    reference_unix_millis: i64,
-) -> bool {
-    // PID-reuse guard on the tracked root (seconds → millis before comparing).
-    if let Some(&created_secs) = snapshot.creation_times.get(&root_pid) {
-        if created_secs > 0 && created_secs * 1000 + PID_REUSE_SKEW_MS < reference_unix_millis {
-            return false;
-        }
-    }
-    if is_countable_claude(root_pid, snapshot) {
-        return true;
-    }
-    bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
-        .iter()
-        .any(|d| is_countable_claude(d.pid, snapshot))
-}
-
-/// Every claude-image PID in the **inclusive** subtree rooted at `root_pid`
-/// (the root itself is included when its image is `claude*`). Same walk as
-/// [`claude_present_in_inclusive_subtree`] but returning the PIDs instead of
-/// a bool — the session-tracking health check
-/// ([`crate::session::tracking_health`]) uses it to cross-reference live
-/// Claude processes against the durable lifecycle records. No PID-reuse
-/// guard here: this is an enumeration, not a liveness verdict — callers that
-/// need the guard pair it with `claude_present_in_inclusive_subtree`.
-pub fn claude_pids_in_inclusive_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
-    let mut out = Vec::new();
-    if is_countable_claude(root_pid, snapshot) {
-        out.push(root_pid);
-    }
-    out.extend(
-        bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
-            .iter()
-            .filter(|d| is_countable_claude(d.pid, snapshot))
-            .map(|d| d.pid),
-    );
-    out
-}
-
-/// Every PID in the **inclusive** subtree rooted at `root_pid`, in the order
-/// [`claude_pids_in_inclusive_subtree`] reports: the root first — only when
+/// Every PID in the **inclusive** subtree rooted at `root_pid`: the root
+/// first — only when
 /// the table holds it, so a root that has already exited is not reported as a
 /// live process — then its descendants breadth-first. The walk the
 /// graceful-exit probe classifies pid by pid
@@ -243,30 +171,6 @@ pub fn inclusive_subtree_pids(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<
             .map(|d| d.pid),
     );
     out
-}
-
-/// The claude-image PID in the **inclusive** subtree rooted at `root_pid` with
-/// the EARLIEST KNOWN creation time, returned as `(pid, creation_secs)`.
-///
-/// "Anchor" because this pid's process-start is the correlation anchor the
-/// launch-agnostic session binder uses (its `--session-id` cmdline + its start
-/// time vs a transcript's first event). When several claude images live in the
-/// subtree (a resume relaunched claude under the same shell), the OLDEST is the
-/// session that has been running — the one whose transcript we want. Creation
-/// times are second-granular and may be unknown (`0`, e.g. a WMI/`/proc` miss);
-/// a KNOWN (`>0`) time always sorts before an unknown one, and unknowns sort
-/// last so a resolvable anchor is preferred. Returns `None` when the subtree
-/// hosts no claude image (built on [`claude_pids_in_inclusive_subtree`]).
-pub fn claude_anchor_in_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Option<(u32, i64)> {
-    claude_pids_in_inclusive_subtree(root_pid, snapshot)
-        .into_iter()
-        .map(|pid| (pid, snapshot.creation_times.get(&pid).copied().unwrap_or(0)))
-        .min_by(|(_, a), (_, b)| {
-            // Prefer the earliest KNOWN creation; unknown (`<= 0`) sorts last.
-            let ka = if *a > 0 { *a } else { i64::MAX };
-            let kb = if *b > 0 { *b } else { i64::MAX };
-            ka.cmp(&kb)
-        })
 }
 
 /// Extract the session id a process command line NAMES, returning it ONLY when
@@ -1884,24 +1788,42 @@ mod tests {
     // exercise the image-name logic, not reuse.
     const REFERENCE_FRESH: i64 = 1_000_000;
 
+    // The subtree liveness reads live on `graceful_exit::PaneLook` (plan
+    // 2026-11-05-npm-installed-claude-is-invisible-…). These tests pin their
+    // IMAGE arm: a complete registry read that names nothing, over a look
+    // covering every pid in the table, judges each pid by its image alone.
+    fn image_look(snap: &ProcessSnapshot) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::image_only(snap)
+    }
+
+    fn image_present(root: u32, snap: &ProcessSnapshot, reference: i64) -> bool {
+        image_look(snap)
+            .claude_present(root, reference)
+            .expect("an image-only reading is always decided")
+    }
+
+    fn image_pids(root: u32, snap: &ProcessSnapshot) -> Vec<u32> {
+        image_look(snap)
+            .claude_pids(root)
+            .expect("an image-only reading is always decided")
+    }
+
+    fn image_anchor(root: u32, snap: &ProcessSnapshot) -> Option<(u32, i64)> {
+        image_look(snap)
+            .claude_anchor(root)
+            .expect("an image-only reading is always decided")
+    }
+
     #[test]
     fn claude_present_root_is_claude() {
         // Agent / gate-continuation session: tracked PID *is* claude, zero
         // children — the exact idle shape the old descendant-count heuristic
         // mis-closed as poll-dead.
         let snap = snap_with(&[], &[(100, 1_000)], &[(100, "claude.exe")]);
-        assert!(claude_present_in_inclusive_subtree(
-            100,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(100, &snap, REFERENCE_FRESH));
         // Case-insensitive, no extension, path-qualified — all match.
         let snap2 = snap_with(&[], &[(100, 1_000)], &[(100, "C:/bin/Claude")]);
-        assert!(claude_present_in_inclusive_subtree(
-            100,
-            &snap2,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(100, &snap2, REFERENCE_FRESH));
     }
 
     #[test]
@@ -1912,11 +1834,7 @@ mod tests {
             &[(200, 1_000), (201, 1_001)],
             &[(200, "powershell.exe"), (201, "claude")],
         );
-        assert!(claude_present_in_inclusive_subtree(
-            200,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(200, &snap, REFERENCE_FRESH));
     }
 
     #[test]
@@ -1929,11 +1847,7 @@ mod tests {
             &[(300, 1_000), (301, 1_001)],
             &[(300, "pwsh.exe"), (301, "node.exe")],
         );
-        assert!(!claude_present_in_inclusive_subtree(
-            300,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(!image_present(300, &snap, REFERENCE_FRESH));
     }
 
     #[test]
@@ -1945,18 +1859,14 @@ mod tests {
         // happened 1000s after this PID was created: a genuine cross-boot
         // PID recycle.)
         let reused = snap_with(&[], &[(400, 1_000)], &[(400, "claude.exe")]);
-        assert!(!claude_present_in_inclusive_subtree(
-            400, &reused, 2_000_000
-        ));
+        assert!(!image_present(400, &reused, 2_000_000));
         // Within the skew window (3ms later) it is NOT reuse — a freshly
         // spawned claude whose creation rounds just past the reference.
         let fresh = snap_with(&[], &[(400, 1_000)], &[(400, "claude.exe")]);
-        assert!(claude_present_in_inclusive_subtree(400, &fresh, 1_000_003));
+        assert!(image_present(400, &fresh, 1_000_003));
         // Unresolved creation time (0) must never count as reuse.
         let unknown = snap_with(&[], &[(400, 0)], &[(400, "claude.exe")]);
-        assert!(claude_present_in_inclusive_subtree(
-            400, &unknown, 2_000_000
-        ));
+        assert!(image_present(400, &unknown, 2_000_000));
     }
 
     /// Regression test for the live 2026-07-03 false-poll-dead-close incident
@@ -1974,15 +1884,11 @@ mod tests {
         let snap = snap_with(&[], &[(500, 1_000)], &[(500, "claude.exe")]);
         // The bug: a per-record `opened_at` well after this PID's creation
         // falsely reads as PID reuse.
-        assert!(!claude_present_in_inclusive_subtree(500, &snap, 2_000_000));
+        assert!(!image_present(500, &snap, 2_000_000));
         // The fix: the primary's own boot time (at/before the PID's creation)
         // correctly reads the same live PID as present, regardless of how
         // much later a reused terminal's newest session record was opened.
-        assert!(claude_present_in_inclusive_subtree(
-            500,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(500, &snap, REFERENCE_FRESH));
     }
 
     /// The pure shim-dir predicate: per-terminal identity/install-intercept
@@ -2052,18 +1958,14 @@ mod tests {
             r"C:\Users\x\AppData\Local\Programs\claude\claude.exe".to_string(),
         );
 
-        let mut pids = claude_pids_in_inclusive_subtree(600, &snap);
+        let mut pids = image_pids(600, &snap);
         pids.sort();
         assert_eq!(
             pids,
             vec![602, 603],
             "shim 601 excluded; real + unknown-path kept"
         );
-        assert!(claude_present_in_inclusive_subtree(
-            600,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(600, &snap, REFERENCE_FRESH));
 
         // Subtree holding ONLY the shim (real claude gone): claude-absent.
         let mut shim_only = snap_with(
@@ -2074,12 +1976,8 @@ mod tests {
         shim_only
             .exe_paths
             .insert(701, "/tmp/qontinui-identity-t2/claude".to_string());
-        assert!(claude_pids_in_inclusive_subtree(700, &shim_only).is_empty());
-        assert!(!claude_present_in_inclusive_subtree(
-            700,
-            &shim_only,
-            REFERENCE_FRESH
-        ));
+        assert!(image_pids(700, &shim_only).is_empty());
+        assert!(!image_present(700, &shim_only, REFERENCE_FRESH));
     }
 
     #[test]
@@ -2091,11 +1989,11 @@ mod tests {
             &[(200, 900), (201, 1_100), (202, 1_050)],
             &[(200, "pwsh.exe"), (201, "claude.exe"), (202, "claude")],
         );
-        assert_eq!(claude_anchor_in_subtree(200, &snap), Some((202, 1_050)));
+        assert_eq!(image_anchor(200, &snap), Some((202, 1_050)));
 
         // Root itself is claude with a known creation → anchor is the root.
         let root = snap_with(&[], &[(300, 1_000)], &[(300, "claude")]);
-        assert_eq!(claude_anchor_in_subtree(300, &root), Some((300, 1_000)));
+        assert_eq!(image_anchor(300, &root), Some((300, 1_000)));
 
         // Unknown (0) creation sorts LAST: the one with a known time wins.
         let mixed = snap_with(
@@ -2103,11 +2001,11 @@ mod tests {
             &[(400, 900), (401, 0), (402, 2_000)],
             &[(400, "sh"), (401, "claude"), (402, "claude")],
         );
-        assert_eq!(claude_anchor_in_subtree(400, &mixed), Some((402, 2_000)));
+        assert_eq!(image_anchor(400, &mixed), Some((402, 2_000)));
 
         // No claude image anywhere → None.
         let none = snap_with(&[(500, &[501])], &[], &[(500, "sh"), (501, "node")]);
-        assert_eq!(claude_anchor_in_subtree(500, &none), None);
+        assert_eq!(image_anchor(500, &none), None);
     }
 
     #[test]
@@ -2428,10 +2326,6 @@ mod tests {
         // End-to-end: the inclusive-subtree helper sees claude under the shell.
         // reference == the shell's creation in millis so the reuse guard is a
         // no-op (creation does not predate the reference).
-        assert!(claude_present_in_inclusive_subtree(
-            10,
-            &snap,
-            1_715_911_000_000
-        ));
+        assert!(image_present(10, &snap, 1_715_911_000_000));
     }
 }

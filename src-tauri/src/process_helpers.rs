@@ -218,6 +218,41 @@ impl ChildTreeGuard {
         }
     }
 
+    /// Put the RUNNING process `pid` — one this process did not spawn itself,
+    /// such as a server a launcher started as a grandchild — and everything it
+    /// spawns from now on in a kill-on-close job, so it dies with this process
+    /// however this process ends (a normal exit, `ExitProcess`, a crash, a kill).
+    ///
+    /// What it does not cover: processes `pid` spawned BEFORE the assignment
+    /// stay outside the job. For a server whose workers exit when it does
+    /// (a PostgreSQL postmaster), killing it is enough.
+    ///
+    /// A process that cannot be opened (gone already, another user's) or
+    /// assigned attaches nothing — the same clean degrade as [`Self::attach`].
+    pub fn attach_pid(pid: u32) -> Self {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+        // SAFETY: `OpenProcess` has no preconditions; a null return (no such
+        // process, or access denied) is handled below.
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            return Self(None);
+        }
+        let guard = Self::attach_raw(process);
+        // SAFETY: `process` is the handle opened above and owned here; the job
+        // holds its own reference to the process, so closing ours is sound.
+        unsafe { CloseHandle(process) };
+        guard
+    }
+
+    /// Whether a kill-on-close job is attached. False after a failed attach,
+    /// which degraded to killing nothing.
+    pub fn is_attached(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// Post-spawn form for a command that went through [`Self::arm`]. On
     /// Windows that is exactly [`Self::attach`].
     pub fn attach_armed(child: &std::process::Child) -> Self {
@@ -316,6 +351,21 @@ impl ChildTreeGuard {
     /// caller compiles on every platform.
     pub fn attach_tokio(_child: &tokio::process::Child) -> Self {
         Self(None)
+    }
+
+    /// No-op: a process this one did not spawn cannot be moved into a process
+    /// group from outside (`setpgid` only works on the caller or its own
+    /// not-yet-exec'd children), so nothing is attached. A caller that needs
+    /// such a process gone at exit stops it itself; see the Windows form for
+    /// what this covers there.
+    pub fn attach_pid(_pid: u32) -> Self {
+        Self(None)
+    }
+
+    /// Whether a process group is attached — only for an [`Self::arm`]ed
+    /// command's child.
+    pub fn is_attached(&self) -> bool {
+        self.0.is_some()
     }
 
     /// Post-spawn form for an [`Self::arm`]ed command: the child *is* its
@@ -2902,7 +2952,7 @@ mod timeout_tests {
 /// The ONE code-only line lexer: comments removed, and string, raw-string and
 /// char literals emptied. Read by this file's source guards (through
 /// `source_scan`) and by the runner binary's own source-scan tests
-/// (`ci_node::executor`), which is why it is gated like
+/// (`ci_node::executor`, `commands::project_logs`), which is why it is gated like
 /// `ambient::test_support`: `cargo test` builds this rlib for the binary's
 /// tests WITH `debug_assertions` but without `cfg(test)`. A release build has
 /// neither and compiles none of this.
@@ -3161,8 +3211,8 @@ mod source_scan {
     /// lexer. Ending early reads some test code as production: a column-0
     /// line inside a multi-line string literal ends a skip. That happens in
     /// many files today; a reviewer's port counted 21, among them
-    /// `fleet.rs`, `check_executor/analyzers/*`, `env_write_lock_guard.rs`
-    /// and `orchestrator/planning.rs`, and the rules above newly made it
+    /// `fleet.rs`, `check_executor/analyzers/*` and
+    /// `env_write_lock_guard.rs`, and the rules above newly made it
     /// happen in `pair.rs` and `playwright/executor.rs`. Nothing in those
     /// spans trips a guard. Two shapes still end LATE and hide the
     /// production item after the test item:

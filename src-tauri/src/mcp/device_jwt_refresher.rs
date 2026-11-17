@@ -6351,6 +6351,9 @@ pub(crate) fn publish_default_binding_verdict(verdict: DefaultBindingVerdict) {
 async fn heal_vanished_binding_store() {
     let verdict = match spawn_blocking_tracked(|| {
         let heal = qontinui_runner_lib::pair::heal_vanished_paired_user();
+        if heal.wrote() {
+            crate::commands::web_integration::notify_tenant_bindings_changed();
+        }
         let census = matches!(heal, qontinui_runner_lib::pair::PairedUserHeal::Refused(_))
             .then(qontinui_runner_lib::pair::held_credential_census);
         classify_default_binding(&heal, census.as_ref())

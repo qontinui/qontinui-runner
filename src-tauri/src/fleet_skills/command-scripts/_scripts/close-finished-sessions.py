@@ -15,7 +15,11 @@ runner serves none), is reported and never closed. A finish is read by
 finish_state, the one rule nudge-stopped-sessions.py reads too: any turn after
 it reopens it (REVIVED), and a finish its own final message contradicts is
 CONTRADICTED. A finished session whose directory is not a linked worktree is
-CUSTODY (finished-criteria condition 3), never closed.
+CUSTODY (finished-criteria condition 3), never closed. So is one whose runner serves a `windDown.custody`
+or `windDown.obligations` view that is not clean / not watched: those are the two halves of `closeable`
+the runner's finished_close arm judges (plan 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-
+lives-only-in-it-and-coord-owns-whether-its-watchers-work, Phase 6), and this script reads them rather than
+re-deriving either. An absent view means the arm did not judge the session, which adds nothing.
 Read-only unless --close. Stdlib only. The command /close-finished-sessions
 documents every verdict and the evidence it rests on.
 
@@ -75,11 +79,21 @@ READ_ERRORS = (urllib.error.URLError, OSError, ValueError, EnvelopeUnknown)
 #
 # "Safe to close": /unattended Step 4.9 prints `SAFE TO CLOSE - <n> trees
 # checked, nothing only on disk; hand-off declared for <k>` (or `NOT SAFE TO
-# CLOSE - <k> trees`). Accepted: the phrase opening its line (after a bullet or
-# one allowlisted label), then nothing, or a separator and one of the report
-# clauses below, with no hedge anywhere in that sentence. Every other mention of
-# the phrase vetoes the whole message.
+# CLOSE - <k> trees`), under its `Closeout verdict` heading; a failed hand-off
+# declaration is its own `  hand-off not declared: <tree> (<reason>)` line under
+# the headline, never appended to it. Accepted: the phrase opening its line
+# (after a bullet or one allowlisted label), then nothing, or a separator and one
+# of the report clauses below, with no hedge anywhere in that sentence. A
+# negated, conditional, hedged or questioned mention vetoes the whole message,
+# as do work left only on disk in its sentence and a bare headline taken back by
+# the line after it (safe_to_close's docstring); any other mention is neither.
 SAFE_RE = re.compile(r"safe[ _-]to[ _-]close", re.I)
+# A dated plan stem names a document, not a verdict - e.g.
+# `2026-10-18-a-finished-session-is-safe-to-close-when-...`, cited by
+# /finish-session. safe_to_close masks every stem before reading, so neither
+# the phrase inside one nor its words ("when", "only") read as a mention or a
+# hedge: echoing the citation neither vetoes nor closes.
+PLAN_STEM = re.compile(r"(?<![\w-])\d{4}-\d{2}-\d{2}(?:-[a-z0-9]+)+(?![\w-])")
 SAFE_LINE_START = re.compile(
     r"(?:^|\n)[ \t>*-]*(?:(?:hand-off safety|step 4\.9(?: verdict)?|verdict|safe-to-close verdict)[ \t]*:[ \t]*)?$",
     re.I)
@@ -375,6 +389,7 @@ def safe_to_close(text):
     an unusual wording must not override a runner finished marker. Any NO vetoes
     the whole message."""
     yes = no = False
+    text = PLAN_STEM.sub(lambda s: "x" * len(s.group()), text)  # same length: offsets hold
     quoted = safe_quotes(text)
     for m in SAFE_RE.finditer(text):
         span = next(((a, b) for a, b in quoted if a <= m.start() < b), None)
@@ -633,23 +648,121 @@ PROMISE_WORDS = [
 ]
 # Read per SENTENCE (split after . ! ? ; : and newlines, which stay in the sentence). The end-or-continuation
 # anchor after "now" is what keeps "Running the suite now passes 284/284." and "it is now reverted" quiet.
-_SENT_PREFIX = r"^[ \t]*(?:(?:[#>*+-]+|\[[ xX]\]|\d+[.)])[ \t]*)*"
+_SENT_PREFIX = r"^[ \t]*(?:(?:[#>*+(-]+|\[[ xX]\]|\d+[.)]|(?:ok|okay|alright|sure)\b,?)[ \t]*)*"
 _DOING = (r"(?:doing|re-?running|running|starting|kicking off|kicked off|working on|deploying|handling"
-          r"|rebuilding|fixing|pushing|merging|on it)")
-_END = r"[ \t]*(?:[.!;:]|\.\.\.|\u2026)?[ \t]*$"
-# Three shapes. (1) verb + an OBJECT + now, then the sentence ends (any terminator, ; and : included, since
-# the split keeps them) or continues (`,` `(` a dash, `and`): "Running it now; results shortly.", "Doing it
-# now, then marking finished." (2) a BARE verb + now ending the sentence on . or ! only: "Running now." --
-# a bare "Running now:" / "Starting now, the hook ..." is a status label or an adverb, not a promise.
-# (3) "now <verb>". Plus "<subject> is running now." whose subject is not nothing/none/no ...
+          r"|rebuilding|building|fixing|pushing|merging|landing|rebasing|retrying|testing|checking|on it)")
+# A gerund used as the SUBJECT of a report is not a promise: "Testing is complete now.", "Checking showed ...".
+_NOT_AN_OBJECT = r"(?!(?:now|is|are|was|were|shows?|showed|passe[sd]|works?|worked|fixed)\b)"
+_END = r"[ \t]*(?:[.!;:]+|\u2026)?\)?[ \t]*$"
+_CONTINUES = r"[ \t]*[,(\u2014\u2013-]|[ \t]+and\b"
+_BUSY = r"(?:running|deploying|rebuilding|building|merging|pushing)"
+# A report verb in its finite use ("Landing #12 fixed it", "the gate shows it is closed") ends the object; the
+# same word as an adjective or in a relative clause does not ("Merging the fixed branch now.").
+_REPORTS = r"\b(?:shows?|showed|passe[sd]|fixed|works?)[ \t]+(?:it|that|this|everything|all|main|now)\b"
+# The object before "now": up to 40 characters with no finite report in it, or up to 80 with no finite verb at
+# all, because past 40 the words are more often a report ("Running the whole suite against main shows
+# everything is green now."). After a comma the object takes no copula at all, since there the gerund is as
+# often the subject of a report ("As of #12, building on Windows works now.").
+_OBJECT = (r"(?:(?:(?!" + _REPORTS + r")[^\n]){0,39}?"
+           r"|(?:(?!\b(?:is|are|was|were|shows?|showed|passe[sd]|fixed|reads?|looks?)\b)[^\n]){40,79}?)")
+_OBJECT_AFTER_COMMA = r"(?:(?!\b(?:is|are|was|were|works?)\b|" + _REPORTS + r")[^\n]){0,79}?"
+
+
+def _promise_arms(obj):
+    """The three promise shapes, with `obj` as the first one's object."""
+    return (r"(?:" + _DOING + r"[ \t]+" + _NOT_AN_OBJECT + r"\S" + obj + r"[ \t]+now\b"
+            r"(?:" + _END + r"|" + _CONTINUES + r")"
+            r"|" + _DOING + r"[ \t]+now[ \t]*(?:[.!;]+|\u2026)?\)?[ \t]*$"
+            r"|now " + _DOING + r"\b(?![ \t]+(?:is|are|was|were)\b))")
+
+
+# Three shapes, each opening the sentence or a clause after a comma ("Merged #12, rebuilding the index
+# now."). (1) verb + an OBJECT + now, then the sentence ends (any terminator, ; and : included, since the
+# split keeps them) or continues (`,` `(` a dash, `and`): "Running it now; results shortly.", "Doing it now,
+# then marking finished." (2) a BARE verb + now ending the sentence on . ! or ;: "Running now." -- a bare
+# "Running now:" / "Starting now, the hook ..." is a status label or an adverb, not a promise. (3) "now
+# <verb>", unless the verb is the subject of a copula ("now merging is unblocked").
 STARTS_NOW = re.compile(
-    _SENT_PREFIX + r"(?:" + _DOING + r"[ \t]+(?!now\b)\S[^\n]{0,39}?[ \t]+now\b"
-    r"(?:" + _END + r"|[ \t]*[,(\u2014\u2013-]|[ \t]+and\b)"
-    r"|" + _DOING + r"[ \t]+now[ \t]*(?:[.!]|\.\.\.|\u2026)?[ \t]*$"
-    r"|now " + _DOING + r"\b)", re.I)
-IS_RUNNING_NOW = re.compile(
-    r"^(?![^\n]*\b(?:nothing|none|no)\b)[^\n]*\b(?:is|are)[ \t]+(?:still[ \t]+)?"
-    r"(?:running|deploying|rebuilding|building|merging|pushing)[ \t]+now" + _END, re.I)
+    r"(?:" + _SENT_PREFIX + _promise_arms(_OBJECT) + r"|,[ \t]+" + _promise_arms(_OBJECT_AFTER_COMMA) + r")", re.I)
+# A sentence whose opening gerund is the subject of a copula is a report, not a promise ("Checking out main
+# is safe now.", "Fixing it is unnecessary now."), unless a relative or complement word comes first
+# ("Fixing the tests that are failing now.", "Checking whether main is green now."). Only the text up to the
+# promise's own "now" is read, and a progressive copula is the object's ("Fixing the bug main is hitting now.").
+GERUND_SUBJECT = re.compile(
+    _SENT_PREFIX + _DOING + r"\b(?:(?!\b(?:that|which|what|whether|who|where|when|if|while|until)\b)[^\n])*?"
+    r"\b(?:is|are|was|were)\b(?![ \t]+\w+ing\b)", re.I)
+
+
+def starts_now(sent):
+    """True when `sent` opens a promise (STARTS_NOW) that is not a gerund-subject report."""
+    for m in STARTS_NOW.finditer(sent):
+        if sent[m.start()] == "," or not GERUND_SUBJECT.match(sent[:m.end()]):
+            return True
+    return False
+
+
+# Two subject shapes, read by busy_now: "<subject> is (still) running (right) now." / "<subject> is now running
+# (in the background).", ending or continuing; and "<subject> running now." with no "is", ending on . or !
+# only, since "Jobs running now: 0" is a status label. The bare shape leaves "is"/"are" to the first.
+IS_BUSY_NOW = re.compile(
+    r"\b(?:is|are)[ \t]+(?:(?:still[ \t]+)?" + _BUSY + r"[ \t]+(?:right[ \t]+)?now|now[ \t]+" + _BUSY + r")"
+    r"(?:[ \t]+in[ \t]+the[ \t]+background)?(?:" + _END + r"|" + _CONTINUES + r")", re.I)
+BARE_BUSY_NOW = re.compile(
+    r"(?:^|[ \t])(?!(?:is|are)[ \t])\S+[ \t]+(" + _BUSY + r")[ \t]+(?:right[ \t]+)?now(?:[ \t]+in[ \t]+the[ \t]+background)?"
+    r"[ \t]*(?:[.!]+|\u2026)?\)?[ \t]*$", re.I)
+# The negation is read in the SUBJECT'S OWN CLAUSE only: the text before the verb, after the last comma,
+# parenthesis, dash, or so/and/but/then. A "no" elsewhere in the sentence negates something else ("The
+# rebuild is running now, no action needed.", "There was no fix, so the rebuild is now running."), and even
+# inside that clause a negating word counts only where it HEADS the subject ("There are 0 jobs", "- Zero
+# builds", "nothing else", "Not one job"), never as a modifier or inside a name ("With nothing blocking it
+# the deploy", "Phase 0", "v2.0", "zero-downtime"). A bare "what"/"which" opening the SENTENCE is a status
+# label when the sentence ends in ":" ("What is now running: nothing."); "Which is running now." is not, and
+# after a comma it is a relative pronoun ("..., which is running
+# now."). And not/never/n't negates only the bare shape's verb ("The build isn't running now.").
+_CLAUSE_CUT = re.compile(r"[,(\u2014\u2013]|[ \t]-[ \t]|\b(?:so|and|but|then)\b", re.I)
+_CLAUSE_LEAD = re.compile(r"^[ \t]*(?:(?:[#>*+-]+|\[[ xX]\])[ \t]*)*")
+_LABEL_HEAD = re.compile(r"^[ \t]*(?:what|which)(?:'s)?[ \t]*$", re.I)
+# The negating word must head the subject: at the clause's start, or after there's / are / currently ...
+_NEG_HEAD = re.compile(r"(?:^|\b(?:are|is|were|was|currently|there'?s|moment|today|now)[ \t]+)"
+                       r"(?:(?:no|0|zero)[ \t]+[a-z]|(?:nothing|none|nobody|neither|no[ \t]+one"
+                       r"|not[ \t]+(?:one|a[ \t]+single))\b)", re.I)
+# ... or end the head right before the verb ("Still nothing is running now."), unless a preposition makes it
+# an object ("The rebuild waiting on nothing else is running now.").
+_NEG_TAIL = re.compile(r"(?:^|\b(?:here|now|then)[ \t]+on[ \t]+"
+                       r"|\b(?!(?:on|by|for|from|with|of|about|at|to|toward|towards|into|onto|against)\b)\w+[ \t]+)"
+                       r"(?:nothing|none|nobody)(?:[ \t]+else)?[ \t]*$", re.I)
+# The head is what precedes a relative clause: "The fix that was zero risk is deploying now." heads on "The fix".
+_RELATIVE = re.compile(r"\b(?:that|which|who)\b", re.I)
+_NEG_VERB = re.compile(r"(?:\b(?:not|never)|n't)[ \t]*$", re.I)
+
+
+def _subject_clause(sent, verb_at):
+    """The clause the verb at `verb_at` belongs to, from its last clause boundary, leading bullets stripped."""
+    head = sent[:verb_at]
+    cuts = list(_CLAUSE_CUT.finditer(head))
+    return _CLAUSE_LEAD.sub("", head[cuts[-1].end():] if cuts else head)
+
+
+def _negated_head(clause):
+    """Whether the subject's head (the clause before any relative clause) is negated."""
+    head = _RELATIVE.split(clause, 1)[0]
+    return bool(_NEG_HEAD.search(head) or _NEG_TAIL.search(head))
+
+
+def busy_now(sent):
+    """True when `sent` says its subject is busy right now, and that subject's own clause does not negate it."""
+    for m in IS_BUSY_NOW.finditer(sent):
+        label = _LABEL_HEAD.match(sent[:m.start()]) and sent.rstrip().endswith(":")
+        if not (_negated_head(_subject_clause(sent, m.start())) or label):
+            return True
+    m = BARE_BUSY_NOW.search(sent)
+    if m:
+        clause = _subject_clause(sent, m.start(1))
+        if not (_negated_head(clause) or _NEG_VERB.search(clause)):
+            return True
+    return False
+
+
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?;:\u2026])[ \t]+|\n")
 # A fenced block only when BOTH fences open a line; an unpaired ``` hides nothing after it.
 CODE_SPANS = re.compile(r"^[ \t]*```[^\n]*\n.*?^[ \t]*```[ \t]*$|`[^`\n]*`", re.S | re.M)
@@ -665,7 +778,7 @@ def promise_hits(text):
     """The pronoun-free promise labels in `text` (already code-free and normalized); quoted spans skipped."""
     text = QUOTED_SPANS.sub(" ", text)
     hits = [label for label, p in PROMISE_WORDS if p.search(text)]
-    if any(STARTS_NOW.search(sent) or IS_RUNNING_NOW.search(sent) for sent in SENTENCE_SPLIT.split(text)):
+    if any(starts_now(sent) or busy_now(sent) for sent in SENTENCE_SPLIT.split(text)):
         hits.append("starts work now")
     return hits
 # A gate, finding or plan that NAMES something "as the next step" is a durable record of who owes it, not
@@ -943,6 +1056,28 @@ PHRASE_CASES = [
     ("SAFE TO CLOSE: no worktrees allocated or edited, nothing exists only on disk.", True),
     ("**Safe to close:** nothing exists only on disk, and no worktree hand-off was needed.", True),
     ("I left no worktrees and no stray processes; the one local ref I created was deleted. Safe to close.", False),
+    # The 2026-11-05 grammar (#2377): a failed hand-off declaration is its own line under the headline and
+    # must not read as a veto. The old appended form still vetoes, and so does an echo of the old Step 4.9
+    # heading, a question - why #2377 renamed it "Closeout verdict".
+    ("SAFE TO CLOSE \u2014 2 trees checked, nothing only on disk; hand-off declared for 1\n"
+     "  hand-off not declared: app-repo (exit 5 / coord unreachable)", True),
+    ("## Step 4.9 \u2014 Closeout verdict\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; "
+     "hand-off declared for 1", True),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0\n"
+     "  hand-off not declared: notes-repo (exit 6)\n\nPOLICY_COMPLIANCE: ok\n\n"
+     "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0", True),
+    ("## Step 4.9 \u2014 Safe to close?\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; "
+     "hand-off declared for 1\n\n- Landed: #12.\n\n- Gated: none.\n\nPOLICY_COMPLIANCE: ok", "veto"),
+    # A dated plan stem containing the phrase names a document (/finish-session cites one): echoing it,
+    # in its own paragraph or in the headline's sentence, neither vetoes the headline nor stands in for
+    # one. A phrase outside a stem still vetoes.
+    ("Per plan `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work` the runner closes it.\n\n"
+     "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1", True),
+    ("Plan 2026-10-18-x governs. It is not safe-to-close yet.", "veto"),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1 "
+     "(per 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work)", True),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0; NOT declared for "
+     "app-repo: exit 5", "veto"),
     ("**Safe to close: yes.** I checked two working trees.", True),
     ("**Hand-off safety:** safe to close \u2014 1 tree checked, nothing only on disk.", True),
     ("- **Session finished.** The runner marked it locally.", True),
@@ -1039,6 +1174,55 @@ _PROMISES_R2 = [
     "Kicked off the rebuild now.", "The rebuild is running now.",
 ]
 PHRASE_CASES += [(t, "veto") for t in _PROMISES_R2] + [("Session marked finished.\n" + t, "veto") for t in _PROMISES_R2]
+# The limits #2052 recorded: repeated punctuation, the word order "is now running", a subject with no "is",
+# a verb outside the first list, and an object past 40 characters.
+_PROMISES_R3 = [
+    "Running it now!!", "Doing it now...", "The rebuild is now running.", "The rebuild is still running now.",
+    "Rebuild running now.", "Tests running now!", "Building it now.", "Landing #12 now.", "Rebasing the branch now.",
+    "Retrying the job now.", "Testing the fix now.", "Checking the gate now.",
+    "Running the full suite on the rebased branch against main now.",
+    # Review of the first attempt: a copula in a short object, and a negation or number elsewhere in the sentence.
+    "Re-running the tests that were flaky now.", "Fixing the tests that are failing now.", "Fixing what is red now.",
+    "Fixing the stale reads now.", "Checking whether main is green now.",
+    "The fix did not hold, so the rebuild is running now.", "Phase 0 is running now.", "v2.0 is deploying now.",
+    "The zero-downtime deploy is running now.", "It never landed, so a merge running now.",
+    "CI isn't green, so a retry build running now.",
+    # A continuation after "now", and an opening word or parenthesis before the verb.
+    "The rebuild is running now, results shortly.", "The rebuild is now running, results shortly.",
+    "OK, running it now.", "(Running it now.)",
+    # Review of the clause-local negation: a "no" or a count outside the subject's own clause.
+    "The rebuild is running now, no action needed.", "The rebuild is now running, nothing else is pending.",
+    "There was no fix, so the rebuild is now running.", "No fix held, so the rebuild is now running.",
+    "The rebuild is running now - nothing else to do.", "No worries, the rebuild is running now.",
+    "No blocker, so the deploy is running now.", "The rebuild with no cache is running now.",
+    # A clause after a comma, a bare interjection, a closing parenthesis, and "right now" / "in the background".
+    "Got it, running it now.", "Thanks, doing it now.", "Sure thing, running it now.", "OK running it now.",
+    "Merged #12, rebuilding the index now.", "All four PRs landed, running the final check now.",
+    "No problem, rebuilding now.", "(Tests running now.)", "The rebuild is running right now.",
+    "The rebuild is now running in the background.", "Rebuild running now in the background.",
+    "Deploying now; back in 5.",
+    # Review round 2: a report word used as an adjective or inside a relative clause, and a what/which that
+    # is not the sentence's whole subject.
+    "Merging the fixed branch now.", "Pushing the fixed commit now.", "Deploying the fixed build now.",
+    "Landing the fixed PR now.", "Re-running the tests that passed locally now.",
+    "Fixing the tests that showed red now.", "Checking the fix that passed CI now.",
+    "Rebuilding the index CI showed stale now.", "Which is why the rebuild is running now.",
+    "Which means the deploy is running now.", "What I started is running now.",
+    "Which leaves the deploy, which is running now.", "With nothing blocking it the deploy is running now.",
+    # Review round 3: a copula after the promise's "now", inside its object, or in the subject's relative clause.
+    "Re-running CI now, main is red.", "Fixing the lint now, CI is red.", "Running Phase 5 now, it is the last one.",
+    "Running it now, results are due in 10 min.", "Merging #12 now and the rest is queued.",
+    "Pushing the branch now - the PR is #45.", "Fixing the lint now (the hook is strict).",
+    "Doing it now, the gate is still open.", "Rebuilding the index now -- it is stale.",
+    "Fixing the bug main is hitting now.", "Fixing the test CI is failing on now.",
+    "The fix that was zero risk is deploying now.", "The deploy that is no longer blocked is running now.",
+    # Review round 4: a what/which subject on a sentence that is not a ":" label, and a negating word that a
+    # preposition makes an object.
+    "Which is running now.", "What is running now.", "The rebuild. Which is running now.",
+    "The rebuild waiting on nothing else is running now.", "The deploy blocked by nobody is running now.",
+    "The deploy aimed at nobody is running now.", "The job pointing to nothing is running now.",
+]
+PHRASE_CASES += [(t, "veto") for t in _PROMISES_R3] + [("Session marked finished.\n" + t, "veto") for t in _PROMISES_R3]
 
 # Plan 2026-11-08-finished-sessions-held-open-by-idle-chrome-and-hedge-words, Phase 2: a negated hedge, a note
 # explaining a zero hand-off, an emphasised label and "no files of mine ... only on disk" read as the reports they
@@ -1301,6 +1485,15 @@ PHRASE_CASES += [
 # Real closeouts from finished sessions in wordings the grammar does not list.
 # They need not read as a yes, but they must NOT veto a runner finished marker.
 NO_VETO_CASES = [
+    # A bare plan stem containing the phrase is a citation, not a veto.
+    "Plan 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work governs the close.",
+    # ...and a stem in the headline's own sentence does not veto it (a headline that is not at its line's
+    # start is not a yes, by the grammar, but it must not read as a no).
+    "Closed per 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work. SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1",
+    # /finish-session step 0.6 (#2377): an UNKNOWN-closeable finish reports the axis and ends at "finished".
+    "closeable: UNKNOWN (custody slot missing for app-repo) \u2014 finished",
+    "UNKNOWN \u2014 1 trees could not be checked; hand-off declared for 0\n  app-repo: coord unreachable\n"
+    "  hand-off not declared: app-repo (exit 6)",
     "SAFE TO CLOSE \u2014 1 tree checked, nothing left only on disk; hand-off declared for 1. The worktree is "
     "clean, nothing is unpushed.",
     "SAFE TO CLOSE \u2014 0 trees allocated or edited by this session, nothing only on disk; hand-off declared for 0.",
@@ -1326,6 +1519,39 @@ NO_VETO_CASES = [
     "SAFE TO CLOSE. Running the suite now shows 284 green.",
     "Starting now, the hook blocks raw cargo.",
     "No jobs are running now.",
+    "0 jobs running now.",
+    "Zero builds running now.",
+    "The runner is not running now.",
+    "The build isn't running now.",
+    "Nothing running now.",
+    "Jobs running now: 0",
+    "Building now: nothing.",
+    "Running the whole suite against main shows everything is green now.",
+    "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk. Nothing is now running.",
+    # Review of the clause-local negation: a negated subject, wherever the sentence starts.
+    "There are no jobs running now.", "There are 0 jobs running now.", "Currently zero builds running now.",
+    "- 0 jobs running now.", "- No jobs running now.", "- Zero builds running now.",
+    "Final state:\n- 3 PRs landed.\n- 0 jobs running now.",
+    "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk, no jobs running now.",
+    "The deploy stopped, nothing else running now.", "All done, nothing's running now.",
+    "- Nothing's running now.", "Neither build is running now.", "Nobody is running now.",
+    "What is now running: nothing.",
+    # A gerund that is the subject of a report, not the verb of a promise.
+    "Testing is complete now.", "SAFE TO CLOSE. Testing is complete now.", "Building is fixed now.",
+    "Rebasing is unnecessary now.", "Merging is unblocked now.", "Checking showed main is green now.",
+    "Checking the gate shows it is closed now.", "Landing #12 fixed it, all green now.",
+    # Review round 2: a count after "there's" or an adverbial, a gerund with an object as the subject of a
+    # copula, and a gerund-subject report after an introductory comma.
+    "There's no build running now.", "There's 0 jobs running now.", "At the moment no jobs are running now.",
+    "Checking out main is safe now.", "Rebasing onto main is clean now.", "Fixing it is unnecessary now.",
+    "Running it is safe now.", "As of #12, building on Windows works now.",
+    "After #12, testing on Windows is green now.", "Since the fix, running the suite is clean now.",
+    "In short, testing everything is done now.", "#12 landed, now merging is unblocked for #13.",
+    "Testing on main passes now.", "Building on Windows works now.", "Not one job is running now.",
+    "Not a single build is running now.", "Currently nothing is running now.",
+    "Absolutely nothing is running now.", "Still nothing is running now.", "So far nothing is running now.",
+    "Nothing that I started is running now.", "From here on nothing is running now.",
+    "From now on nothing is running now.",
 ] + NO_VETO_CASES_PHASE2 + N3_LINES + [
     "- Safe to close? SAFE TO CLOSE — 2 trees reviewed, nothing only on disk."]
 
@@ -1359,6 +1585,9 @@ FT = "Review found nothing to follow up.\n\n**POLICY_COMPLIANCE**\n"
 # The custody probe's stand-in for the selftests (git_rev_parse_dirs, finished-criteria
 # condition 3): git's answer per directory. A directory no case set up fails loudly.
 LINKED_CWD = "/w/agent-worktrees/a1/repo"
+# A `windDown` block whose two closeable halves both pass, as the runner serves them (selftest stand-in).
+WD_PASS = {"eligibility": "eligible", "custody": {"verdict": "clean"},
+           "obligations": {"verdict": "watched", "itemsJudged": 2}}
 GIT_ANSWERS = {
     LINKED_CWD: (0, "/w/repo/.git/worktrees/a1\n/w/repo/.git\n", ""),  # a linked worktree
     "/w/repo": (0, ".git\n.git\n", ""),  # a primary checkout, at its top (git answers relative paths)
@@ -1445,6 +1674,24 @@ def limit_menu_full_width(cols):
             "   2. Wait here, then continue automatically at Nov 18, 9pm", "   3. Switch to usage credits", "",
             "   Enter to confirm \u00b7 Esc to cancel")
     return "".join(r.ljust(cols) for r in rows) + "\u2594" * cols
+
+
+# The bare-"Stop" variant of the menu (plan 2026-11-14-a-rate-limit-menu-whose-first-option-is-a-bare-stop-is-
+# never-read-as-a-usage-limit, Phase 2). EVERY fixture below is SYNTHETIC: the real layout of that variant has
+# not been measured, so options 2 and 3 are invented placeholders, and the match must not depend on their words.
+def limit_menu_stop_rows(question="   What do you want to do?", opt1="   \u276f 1. Stop",
+                         rest=("   2. Placeholder second option", "   3. Placeholder third option"), hint=True):
+    """The rows of a SYNTHETIC bare-Stop menu."""
+    return (question, "", opt1) + tuple(rest) + (("", "   Enter to confirm \u00b7 Esc to cancel") if hint else ())
+
+
+def limit_menu_stop_screen(width=None, **kw):
+    """A SYNTHETIC bare-Stop menu screen: rows joined by CR, or, with `width`, each row padded to that many
+    columns with no line break (a ConPTY pane), then the drawn border."""
+    rows = limit_menu_stop_rows(**kw)
+    if width:
+        return "".join(r.ljust(width) for r in rows) + "\u2594" * width
+    return "\r".join(rows) + "\r" + "\u2594" * 75
 
 
 FOOTER_CASES = [
@@ -2283,6 +2530,33 @@ def finish_time_cases(bad):
         ({}, at(after), dict(base, cwd="/w/slow"), "CUSTODY", "custody UNKNOWN: git did not answer"),
         ({}, at(after), dict(base, cwd="/w/broken"), "CUSTODY", "custody UNKNOWN: git rev-parse exited 128"),
         ({}, cf, dict(shut, cwd="/w/repo"), "CUSTODY", ("closeout phrase", "is a primary checkout")),
+        # Phase 6 of the closeable plan: the runner's two halves, read and never re-derived. A linked worktree
+        # the runner judged clean, with every obligation watched, still closes...
+        ({}, dict(at(after), windDown=WD_PASS), base, "FINISHED", "coord session_status=finished ("),
+        # ...no view at all (an older runner, or the arm has not judged it) adds nothing...
+        ({}, dict(at(after), windDown={"eligibility": "eligible"}), base, "FINISHED", "coord session_status=finished ("),
+        # ...and each half that is present and not passing withholds the close, alone or together.
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty", "reason": "uncommitted",
+                                                              "detail": "/w/a has uncommitted changes"})),
+         base, "CUSTODY", ("runner's custody verdict is dirty (uncommitted)", "/w/a has uncommitted changes")),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "unknown", "reason": "probe_failed"})),
+         base, "CUSTODY", "runner's custody verdict is unknown (probe_failed)"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations={"verdict": "unwatched", "reason": "not_watched",
+                                                                  "detail": "gates item g-1 reads `not_watched`"})),
+         base, "CUSTODY", ("runner's obligations verdict is unwatched (not_watched)", "g-1")),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations={"verdict": "unknown",
+                                                                  "reason": "obligations_unreadable"})),
+         base, "CUSTODY", "runner's obligations verdict is unknown (obligations_unreadable)"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations=None)), base, "CUSTODY",
+         "runner's obligations view is unreadable"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"reason": "x"})), base, "CUSTODY",
+         "runner's custody view is unreadable"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty"},
+                                           obligations={"verdict": "unknown"})),
+         base, "CUSTODY", ("runner's custody verdict is dirty", "runner's obligations verdict is unknown")),
+        # the script's own check still speaks beside the runner's
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty"})), dict(base, cwd="/w/repo"),
+         "CUSTODY", ("is a primary checkout", "runner's custody verdict is dirty")),
     ]
     # Served finished-criteria condition 1 (plan Phase 2): a live row coord does not read finished is never
     # closable, whatever finish signal it carries - a closeout phrase, a nothing-owed footer, a runner mark, or
@@ -2641,7 +2915,66 @@ def limit_menu_cases(bad):
     # A limit option above the screen's last key hint, with no hint of its own, about 658 collapsed characters
     # away: a fixed distance just past MENU_SPAN (600), so raising the bound reads it open.
     far = ("   \u276f 1. Stop and wait for limit to reset\r" + ("x" * 40 + "\r") * 16 + hint + border)
+    # SYNTHETIC bare-"Stop" fixtures (layout unmeasured; see limit_menu_stop_screen).
+    stop_hint = "   Enter to confirm \u00b7 Esc to cancel"
+    stop_only = limit_menu_stop_screen()
+    # A dropped character the question arm tolerates ("wan"), and damage past what it tolerates ("What d you").
+    stop_damaged_tol = limit_menu_stop_screen(question="   What do you wan to do?")
+    stop_damaged = limit_menu_stop_screen(question="   What d you want to do?")
+    stop_no_question = limit_menu_stop_screen(question="   Something else entirely")
+    stop_hook = limit_menu_stop_screen(opt1="   \u276f 1. Stop hook")
+    stop_hook_nq = limit_menu_stop_screen(question="   Something else entirely", opt1="   \u276f 1. Stop hook")
+    # Question intact, "Stop" the only option row: the hint follows it directly (question arm only).
+    stop_alone = limit_menu_stop_screen(rest=())
+    # Neither anchor: another question, "Stop" the only row.
+    stop_alone_nq = limit_menu_stop_screen(question="   Something else entirely", rest=())
+    # "Stop" and then a description row, then option 2: neither terminator follows "Stop" (a recorded miss).
+    stop_described = limit_menu_stop_screen(opt1="   \u276f 1. Stop\r      stops this session")
+    # A real menu of other options under the same question, and a "Stop" not at number 1.
+    other_opts = limit_menu_stop_screen(opt1="   \u276f 1. Yes", rest=("   2. No",))
+    stop_second = limit_menu_stop_screen(opt1="   \u276f 1. Yes", rest=("   2. Stop",))
+    stop_eleven = limit_menu_stop_screen(question="   Something else entirely", opt1="   \u276f 11. Stop")
+    stop_eleven_q = limit_menu_stop_screen(opt1="   \u276f 11. Stop")  # question intact
+    # ACCEPTED READ, recorded not endorsed: another dialog numbering "1. Stop" above "2." that ends on the
+    # same key hint is indistinguishable from the menu by its skeleton, so it reads open (costs one Esc/probe).
+    stop_other_dialog = limit_menu_stop_screen(question="   Stop what, exactly?", rest=("   2. Keep going",))
+    # A bare-Stop option above the screen's last key hint, past MENU_SPAN, with no hint of its own.
+    stop_far = ("   What do you want to do?\r   \u276f 1. Stop\r   2. Placeholder\r" + ("x" * 40 + "\r") * 16
+                + hint + border)
+    stop_later = (stop_only + "\r   Do you want to make this edit?\r   \u276f 1. Yes\r   2. No\r\r" + hint + border)
+    stop_spaceless = (stop_only.replace("Enter to confirm \u00b7 Esc to cancel", "Entertoconfirm\u00b7Esctocancel")
+                      .replace("1. Stop", "1.Stop"))
     cases = [  # (case, screen, windDown, transcript, tool shells, want verdict, fragments)
+        ("SYNTHETIC bare-Stop menu", stop_only, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu, question lightly damaged (the question arm)", stop_damaged_tol, None, base, [],
+         "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu, question damaged past tolerance (the 2. arm)", stop_damaged, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu, question absent (the 2. arm)", stop_no_question, None, base, [], "LIMITED",
+         (said,)),
+        ("SYNTHETIC bare-Stop alone before the hint, question intact (the question arm)", stop_alone, None, base, [],
+         "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu with its spaces dropped", stop_spaceless, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu over a live tool shell", stop_only, None, base, [12], "BUSY",
+         ("tool shell(s) running", "!" + said)),
+        ("SYNTHETIC 1. Stop hook under the question", stop_hook, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC 1. Stop hook, question absent", stop_hook_nq, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC bare Stop alone, no anchor", stop_alone_nq, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC bare Stop with a description row (recorded miss)", stop_described, None, base, [], "BUSY",
+         ("!" + said,)),
+        ("SYNTHETIC other options under the question", other_opts, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC Stop as option 2", stop_second, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC 11. Stop", stop_eleven, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC 11. Stop, question intact", stop_eleven_q, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC ACCEPTED READ: another dialog's 1. Stop then 2. on the same key hint reads open",
+         stop_other_dialog, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu left in scrollback", stop_only + "\r\u276f ", None, base, [], "BUSY",
+         ("!" + said,)),
+        ("SYNTHETIC bare-Stop menu followed by a reply", stop_only.replace("\u2594", "") + "\n\u25cf Resumed.", None,
+         base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC bare-Stop menu above a later dialog on the same key hint", stop_later, None, base, [], "BUSY",
+         ("!" + said,)),
+        ("SYNTHETIC bare-Stop option further than MENU_SPAN above the key hint", stop_far, None, base, [], "BUSY",
+         ("!" + said,)),
         ("the measured menu", LIMIT_MENU_SCREEN, None, base, [], "LIMITED",
          (said, "the final reply carries no limit message")),
         ("the menu with no border drawn", unbordered, None, base, [], "LIMITED", (said,)),
@@ -2685,6 +3018,12 @@ def limit_menu_cases(bad):
     cases += [(f"a {cols}-column pane, every row written full-width", limit_menu_full_width(cols), None, base, [],
                "LIMITED",
                (said,)) for cols in (300, 310, 400, 1000)]
+    cases += [(f"SYNTHETIC bare-Stop menu, a {cols}-column pane, every row written full-width",
+               limit_menu_stop_screen(width=cols), None, base, [], "LIMITED", (said,))
+              for cols in (80, 300, 310, 400, 1000)]
+    cases += [(f"SYNTHETIC bare-Stop menu with a question damaged past tolerance, a {cols}-column pane",
+               limit_menu_stop_screen(width=cols, question="   What d you want to do?"), None, base, [], "LIMITED",
+               (said,)) for cols in (300, 1000)]
     # Every veto word but the two whose definitions cover a modal still vetoes under the
     # menu. The table itself is walked, so a word added to it is tried too. The two are
     # named here, not read from MENU_VETOES, so a word added there reads red.
@@ -3815,6 +4154,19 @@ def running_turn(text):
 # with any whitespace, or none, between them. The option matched is the first,
 # which a narrow pane always draws.
 LIMIT_MENU = re.compile(r"Stop\s*and\s*wait\s*for\s*limit\s*to\s*reset")
+# The same menu's first option drawn as a bare "Stop": reported, not observed here, for usage-billed
+# accounts and for a credits_required rejection (plan
+# 2026-11-14-a-rate-limit-menu-whose-first-option-is-a-bare-stop-is-never-read-as-a-usage-limit, Phase 2).
+# That layout is UNMEASURED, so this reads only the menu's skeleton and never the words of options 2 or 3:
+# `1. Stop` as a WHOLE option (only whitespace, then a numbered row `2.` or the key hint, so "1. Stop hook"
+# is not it), anchored by EITHER the question before it (tolerant of dropped characters, "What do you wan
+# to do?") OR a directly following numbered second row. The row must not continue a number ("11. Stop"): the
+# question arm cannot skip a leading digit, so only the `2.` arm needs the lookbehind.
+# Known misses and accepted reads: an option drawn with a description row under "Stop" is not read; a
+# screen of some other dialog that numbers "1. Stop" above "2." and ends on the same key hint is read open.
+LIMIT_MENU_STOP = re.compile(
+    r"(?:Wh?a?t\s*do\s*you\s*wa?n?t?\s*to\s*do[\s?]*[\u276f>]?\s*1\.\s*Stop\s*(?=2\.|Enter\s*to\s*confirm)"
+    r"|(?<![\w.])1\.\s*Stop\s*(?=2\.))")
 MENU_HINT = re.compile(r"Enter\s*to\s*confirm\s*\u00b7\s*Esc\s*to\s*cancel")
 # A run of spaces or tabs. A Windows pane's ConPTY can pad each row with spaces to
 # the pane's full width, with no line break (the CONPTY_FIXTURE_COLS fixtures), so
@@ -3835,14 +4187,17 @@ MENU_WINDOW = 3000
 # drawn border (U+2594, inside the box-drawing and block range U+2500-U+259F) to the
 # end of the text. One left in scrollback is followed by other text, and an older
 # menu above a later dialog that ends on the same key hint has its own hint between.
-MENU_OPEN = re.compile(LIMIT_MENU.pattern + r"(?:(?!Enter\s*to\s*confirm).){0,%d}?" % MENU_SPAN
+MENU_OPEN = re.compile(r"(?:" + LIMIT_MENU.pattern + "|" + LIMIT_MENU_STOP.pattern + ")"
+                       + r"(?:(?!Enter\s*to\s*confirm).){0,%d}?" % MENU_SPAN
                        + MENU_HINT.pattern + r"[\s\u2500-\u259f]*$", re.S)
 
 # The reason line classify_row gives a LIMITED row whose screen ends on an open
 # usage-limit menu, whichever arm read the limit: the menu arm's first line, or a
 # line after the transcript's limit message. It is a contract: /nudge-stopped-sessions
 # keeps a row carrying it LIMITED whatever its reset says, so the menu reaches
-# triage's limit step, whose Esc dismisses it, and nothing types into it.
+# triage's limit step, which chooses its "Wait here, then continue automatically"
+# option by its text (or, with no such row, dismisses it with Esc), and nothing
+# types into it.
 MENU_OPEN_LINE = "an open usage-limit menu ends the screen"
 
 def limit_menu_open(text):
@@ -3851,8 +4206,8 @@ def limit_menu_open(text):
     last MENU_WINDOW characters once each run of spaces or tabs reads as one.
     Pass the whole stripped tail: a slice taken first can cut off the option of
     a menu drawn full-width. classify_row reads such a pane LIMITED, and
-    triage-sessions.py dismisses the menu with Esc, and refuses to type into
-    it, through this same helper."""
+    triage-sessions.py chooses the menu's wait option or dismisses it with Esc,
+    and refuses to type into it, through this same helper."""
     return bool(text) and bool(MENU_OPEN.search(HSPACE_RUN.sub(" ", text)[-MENU_WINDOW:]))
 
 
@@ -6231,6 +6586,41 @@ def custody_refusal(cwd):
     return None
 
 
+# The two halves of `closeable` the runner's finished_close arm judges and serves on a readiness row's
+# `windDown` block (qontinui-runner wind_down.rs CustodyView / ObligationsView): the LOCAL half (every worktree
+# the session touched is clean and pushed) and the REMOTE half (every item coord's coord_session_obligations
+# attributes to it is watched). Only the arm's own word counts here, and only as a veto: an absent view means
+# the arm has not judged this session (it reads obligations only for a custody-clean one, and an older runner
+# serves neither), which is no information; a present view that is not the clean word, whatever else it says,
+# is a refusal. A view that is not an object, or carries no string verdict, is unreadable and refuses.
+RUNNER_HALVES = (("custody", "clean", "the worktrees it touched are not all clean and pushed"),
+                 ("obligations", "watched", "not every obligation coord attributes to it is watched"))
+
+
+def runner_halves_refusal(rp):
+    """None when the runner serves no view or only passing ones; else why the close is withheld. Pure."""
+    wd = rp.get("windDown") if isinstance(rp, dict) else None
+    if not isinstance(wd, dict):
+        return None
+    why = []
+    for key, passing, meaning in RUNNER_HALVES:
+        if key not in wd:
+            continue
+        view = wd[key]
+        verdict = view.get("verdict") if isinstance(view, dict) else None
+        if verdict == passing:
+            continue
+        if not isinstance(verdict, str):
+            why.append(f"runner's {key} view is unreadable ({type(view).__name__} without a string verdict)")
+            continue
+        reason = view.get("reason")
+        detail = view.get("detail")
+        why.append(f"runner's {key} verdict is {verdict}"
+                   + (f" ({reason})" if isinstance(reason, str) else "")
+                   + f": {meaning}" + (f" - {detail[:160]}" if isinstance(detail, str) and detail else ""))
+    return "; ".join(why) or None
+
+
 def classify(term, row, table, idle_min, own_tid, ready, strays=None):
     """Return (verdict, reasons[]). The verdicts are VERDICTS; CLOSABLE are the
     ones --close acts on.
@@ -6332,7 +6722,7 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
 
     if LIMIT_RE.search(tx["final_text"][-300:]):
         # An open menu is named beside the message (MENU_OPEN_LINE), so a consumer
-        # routes the row to the step that dismisses the menu and never types into it.
+        # routes the row to the step that answers the menu and never types into it.
         return "LIMITED", (["stopped by an account usage limit mid-work: " + tx["final_text"].strip()[-80:]]
                            + ([MENU_OPEN_LINE] if menu else []))
     # Read after the transcript's limit, so a row that has one keeps the reason
@@ -6402,8 +6792,9 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
     else:
         finish = fs.why
     custody = custody_refusal(tx.get("cwd"))
-    if custody:
-        return "CUSTODY", finish + note + [custody] + binding
+    halves = runner_halves_refusal(rp)
+    if custody or halves:
+        return "CUSTODY", finish + note + [x for x in (custody, halves) if x] + binding
     return "FINISHED", finish + note + binding
 
 

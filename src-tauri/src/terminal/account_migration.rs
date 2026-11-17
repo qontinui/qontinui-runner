@@ -96,11 +96,10 @@ use crate::terminal::session_carry::{
 pub(crate) const MIGRATION_CAP: usize = 3;
 const MIGRATION_CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Cooldown stamped on the exhausted source account so spawn-time selection
-/// (`pick_best_account` / `rotate_account_on_rate_limit`) stays off it. One
-/// hour — matches `EXHAUSTION_STALE_TTL`'s trust window for the probe's
-/// `exhausted` flag; a weekly/5-hour cap doesn't clear in minutes.
-const EXHAUSTED_ACCOUNT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
+// Cooldown stamped on the exhausted source account so spawn-time selection
+// (`pick_best_account` / `rotate_account_on_rate_limit`) stays off it, when
+// the probe names no reset. The ONE shared floor, owned by `ai_provider`.
+use crate::ai_provider::limit_hit::EXHAUSTED_ACCOUNT_COOLDOWN;
 
 /// Per-session migration timestamps (unix millis), for the cap.
 static MIGRATION_HISTORY: Mutex<Option<HashMap<String, Vec<i64>>>> = Mutex::new(None);
@@ -926,6 +925,11 @@ pub(crate) struct ResumeSpawn<'a> {
     /// keeps the durable restore record consistent (the record stores the dir
     /// the session actually launched under).
     pub config_dir: &'a str,
+    /// How long [`spawn_resumed_pane`] may BLOCK waiting for a real `claude`
+    /// binary to reappear (npm auto-update reinstall window) before it falls
+    /// back to the bare name. Non-zero only for a caller on the blocking pool;
+    /// zero never sleeps.
+    pub claude_bin_wait: std::time::Duration,
     pub title: String,
     pub page_id: String,
     pub zone_index: i32,
@@ -994,7 +998,7 @@ pub(crate) fn spawn_resumed_pane(
     let command = resume_respawn_argv(
         // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
         // `claude_bin_path()` cannot be the PTY child's program on Windows.
-        &crate::agent_runtime::resolve_claude_bin(),
+        &crate::agent_runtime::resolve_claude_bin_waiting(spec.claude_bin_wait),
         spec.claude_session_id,
         model,
         &launch_cfg,
@@ -1013,7 +1017,8 @@ pub(crate) fn spawn_resumed_pane(
         // this respawn has no briefing, so it carries a BODY-ONLY composed
         // file when the tenant's cache exists, and nothing otherwise.
         resume_respawn_extra_required(
-            crate::session::claude_hook::direct_spawn_settings_args(),
+            // A migrated GATE continuation keeps its Stop-armed carrier.
+            crate::session::claude_hook::spawn_settings_args(spec.gate_identity.is_some()),
             prompt_carrier.as_ref(),
         ),
     );
@@ -1228,9 +1233,10 @@ where
     .map_err(MigrateError::from)
 }
 
-/// The `claude` anchor (oldest `claude` image, pid + start time) in the pane
-/// `terminal_id`, from one process-table snapshot. `None` when the pane is
-/// gone, remote (no local pid), hosts no `claude`, or the table is unreadable.
+/// The `claude` anchor (oldest live `claude`, pid + start time) in the pane
+/// `terminal_id`, from one look. `None` when the pane is gone, remote (no
+/// local pid), hosts no `claude`, the table is unreadable, or the anchor is
+/// undecided ([`pane_claude_anchor`]).
 async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<ProcIdentity> {
     use tauri::Manager;
     let manager = app
@@ -1238,12 +1244,24 @@ async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<Pr
         .inner()
         .clone();
     let root = manager.get(terminal_id)?.pane_root_pid()?;
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    if snapshot.is_unknown() {
+    let look = crate::terminal::graceful_exit::PaneLook::take(&[root]).await;
+    pane_claude_anchor(&look, root)
+}
+
+/// The oldest live `claude` under `root` in `look` — an image-proven one, or a
+/// pid Claude Code's session registry names whatever its image, so an
+/// npm-installed `claude` (`node … cli.js`) is the old writer too. `None` for
+/// an unreadable table, for no `claude`, and for an UNDECIDED anchor (a pid
+/// the registry could not settle may be the older `claude`): an unresolved
+/// anchor names no writer, so the post-exit top-up migrates nothing from it.
+fn pane_claude_anchor(
+    look: &crate::terminal::graceful_exit::PaneLook,
+    root: u32,
+) -> Option<ProcIdentity> {
+    if look.snapshot().is_unknown() {
         return None;
     }
-    let (pid, started_at) =
-        crate::process_capture::process_tree::claude_anchor_in_subtree(root, &snapshot)?;
+    let (pid, started_at) = look.claude_anchor(root).ok()??;
     Some(ProcIdentity { pid, started_at })
 }
 
@@ -1424,6 +1442,8 @@ fn migrate_session(
                 &record.claude_session_id,
             ),
             config_dir: dst_config_dir,
+            // Runs on the blocking pool (`migrate_session_off_runtime`).
+            claude_bin_wait: crate::agent_runtime::CLAUDE_BIN_RESOLVE_WAIT,
             title: title.clone(),
             page_id: record.page_id.clone(),
             zone_index: record.zone_index,
@@ -1671,6 +1691,7 @@ mod tests {
             lines: rows.iter().map(|r| r.to_string()).collect(),
             cursor_row,
             cursor_col,
+            cursor_row_dim: None,
         }
     }
 
@@ -1762,6 +1783,70 @@ mod tests {
             12,
         );
         assert!(matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)));
+    }
+
+    // ---- parked limit-stop screens (plan 2026-11-05, Phase 1) ----------------
+    //
+    // RECONSTRUCTED from the plan's description of the two shapes its vet read
+    // on merytshost through the non-mutating
+    // `GET /ui-bridge/sdk/terminal/sessions/{id}/text` (panes `ac77c109` /
+    // `a3982390`, and `131b4908`); not a byte capture. The banner and footer
+    // rows are the measured texts; the surrounding layout, the transcript row
+    // and the menu's `❯ 1.` spacing are assumed. The menu test therefore sweeps
+    // every cursor position rather than trusting one.
+
+    fn fixture_screen(
+        text: &str,
+        cursor_row: u16,
+        cursor_col: u16,
+    ) -> crate::terminal::graceful_exit::ScreenText {
+        crate::terminal::graceful_exit::ScreenText {
+            lines: text.lines().map(str::to_string).collect(),
+            cursor_row,
+            cursor_col,
+            cursor_row_dim: None,
+        }
+    }
+
+    const IDLE_UNDER_WEEKLY_BANNER: &str =
+        include_str!("fixtures/parked_screens/idle_prompt_under_weekly_banner.txt");
+    const RATE_LIMIT_OPTIONS_MENU: &str =
+        include_str!("fixtures/parked_screens/rate_limit_options_menu.txt");
+
+    /// An idle, empty `❯` under the weekly-limit banner, bypass footer: the
+    /// watcher may submit into it, so a reset-continue reaches these panes.
+    #[test]
+    fn a_parked_idle_prompt_under_the_weekly_banner_is_ready() {
+        let s = fixture_screen(IDLE_UNDER_WEEKLY_BANNER, 4, 2);
+        assert_eq!(s.lines[4], "❯\u{a0}");
+        assert!(s.lines[1].contains("You've hit your weekly limit"));
+        assert_eq!(probe_idle_prompt(&s), IdlePromptProbe::Ready);
+    }
+
+    /// The `/rate-limit-options` menu is never `Ready`, wherever the cursor
+    /// sits: the idle watcher gives up on it, which is why Phase 2 adopts
+    /// runner#2417's one-Esc limit-wait gate.
+    #[test]
+    fn the_rate_limit_options_menu_is_never_ready() {
+        let rows = RATE_LIMIT_OPTIONS_MENU.lines().count();
+        assert_eq!(rows, 7);
+        for row in 0..rows as u16 {
+            for col in 0..=6 {
+                let s = fixture_screen(RATE_LIMIT_OPTIONS_MENU, row, col);
+                assert!(
+                    matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)),
+                    "cursor ({row},{col}) read {:?}",
+                    probe_idle_prompt(&s)
+                );
+            }
+        }
+        // The pointer row itself is refused as a dialog, not as "no prompt".
+        let on_pointer = fixture_screen(RATE_LIMIT_OPTIONS_MENU, 4, 3);
+        assert!(
+            matches!(probe_idle_prompt(&on_pointer), IdlePromptProbe::NotYet(ref why) if why.contains("numbered choice")),
+            "{:?}",
+            probe_idle_prompt(&on_pointer)
+        );
     }
 
     #[test]
@@ -2594,5 +2679,50 @@ mod tests {
 
         let text = nudge_text(vec![agent("a1", None)], Ok(Vec::new())).await;
         assert_eq!(text, CONTINUE_NUDGE, "nothing resumable now: nothing named");
+    }
+
+    /// Shell 5 → `node` 50 (an npm-installed `claude`, `node … cli.js`).
+    fn npm_pane_table() -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot {
+            stale: false,
+            ..Default::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name, started) in [(5, "bash", 1_000), (50, "node", 1_050)] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    fn npm_look(
+        witness: crate::terminal::graceful_exit::RegistryWitness,
+    ) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::over_whole_table(npm_pane_table(), witness)
+    }
+
+    /// The migration anchor (the old writer the post-exit top-up waits on):
+    /// an npm `claude` the registry names is the writer. Partner: drop the
+    /// witness and there is no writer. Unsettled, the anchor is unresolved:
+    /// no writer, so the top-up migrates nothing from it.
+    #[test]
+    fn an_npm_claude_is_the_old_writer_and_an_unsettled_one_is_none() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        assert_eq!(
+            pane_claude_anchor(&npm_look(RegistryWitness::naming(&[50])), 5),
+            Some(ProcIdentity {
+                pid: 50,
+                started_at: 1_050
+            })
+        );
+        assert_eq!(
+            pane_claude_anchor(&npm_look(RegistryWitness::naming(&[])), 5),
+            None
+        );
+        assert_eq!(
+            pane_claude_anchor(&npm_look(RegistryWitness::unreadable("test")), 5),
+            None
+        );
     }
 }

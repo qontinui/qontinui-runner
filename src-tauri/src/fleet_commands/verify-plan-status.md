@@ -472,7 +472,7 @@ and the body. Before writing your stamp:
    `git -C "$TOP" fetch -q origin +refs/heads/main:refs/remotes/origin/main`
    (exit status read unpiped — a failed fetch is a STOP for this plan), then
    record `BASED_ON=$(git -C "$TOP" rev-parse -q --verify
-   "origin/main:<repo-relative path>")` for this path and read the block from
+   "refs/remotes/origin/main:<repo-relative path>")` for this path and read the block from
    `git -C "$TOP" cat-file -p "$BASED_ON"`. `$QONTINUI_PLANS_DIR` usually names
    a shared checkout that can be thousands of commits behind, and a guard run
    against its copy never sees a peer's newer `IN PROGRESS`. Make your edits on

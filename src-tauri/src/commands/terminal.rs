@@ -18,6 +18,8 @@ use crate::terminal::visibility::VisibilityTier;
 use crate::terminal::{strip_ansi, TerminalManager};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+pub(crate) mod coord_wiring;
+
 /// The `(share_output, redact_secrets)` a terminal session declares to coord,
 /// from `settings.performance` (many-sessions plan Phase 8).
 ///
@@ -270,9 +272,9 @@ pub async fn terminal_create(
         )
         .await;
 
-    let repo_detect_handle = app_handle.clone();
-    let repo_detect_dir = working_dir.clone();
-    let cred_helper_dir = working_dir.clone();
+    // `create` consumes `app_handle`; the post-create wiring's repo detection
+    // emits through this clone.
+    let post_create_handle = app_handle.clone();
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` +
     // the configured plan directories). Derived from the live isolated edit
     // context before it is parked on the session; each var is omitted when it
@@ -327,207 +329,44 @@ pub async fn terminal_create(
         ctx.remove_unspawned("terminal_create command", e.child_started, &e.message)
     })?;
 
-    // Park the isolated edit context on the terminal session so its
-    // heartbeat + claim live as long as the PTY. Cleared in `close()`.
-    if let Some(ctx) = isolated_ctx {
-        if let Some(session) = terminal_manager.get(&info.id) {
-            session.set_isolated_edit_ctx(ctx);
-        }
-    }
-
     // The D1 durable tenant stamp is written inside `create` (the chokepoint
     // every tenant-offering door shares); `Intent.tenant_id` below carries the
     // same tenant to coord.
-
-    // Unconditional coord registration — every terminal session is
-    // mirrored into the coordinator's session plane so the dashboard
-    // renders it from `coord.sessions`. This is NOT gated by dual-write;
-    // registration is always-on. Errors are logged and swallowed so a
-    // coord hiccup never blocks the operator's terminal.
-    let purpose = title
-        .filter(|t| t.trim().len() >= 3)
-        .unwrap_or_else(|| "Terminal shell session".to_string());
-    let (share_output, redact_secrets) = intent_sharing_from_settings();
-    let intent = Intent {
-        kind: SessionKind::TerminalShell,
-        purpose,
-        repo: effective_intent_repo,
-        branch: None,
-        work_unit_slug,
-        // Accept-only on `Intent`; the runner never emits the legacy key.
-        plan_slug: None,
-        correlation_topic,
-        // Deliberately None on the interactive create path — a PRESENT
-        // `page_id` is the coord-side "this is a gate continuation" marker.
-        page_id: None,
-        declared_paths: working_dir
-            .map(std::path::PathBuf::from)
-            .into_iter()
-            .collect(),
-        share_output,
-        redact_secrets,
-        // The tenant the spawn picker (F2) / `--tenant` flag (F3) chose for
-        // this tab. `None` → the registry stamps the device default
-        // (default-for-new-sessions), which is the pre-F2 behavior.
-        tenant_id: spawn_tenant_id,
-    };
-    // R2 — RESUME the pane's prior coord session if one is persisted,
-    // otherwise register fresh. Resuming PATCHes the EXISTING coord row
-    // (state=active + heartbeat) so a runner restart no longer orphans the
-    // old row + mints a duplicate. On a persisted-but-GC'd row the resume
-    // falls back to a fresh register (new id), which we persist over the
-    // stale one. Either way the pane ends with a live coord session id.
     //
-    // DELIBERATELY STILL ON THE CRITICAL PATH (Phase 6, §4 Q2 — do not "optimize"
-    // these into a `tokio::spawn` without re-reading that resolution):
-    //   * the coord CLAIM above (`acquire_for_terminal`) returns the value that
-    //     BECOMES `working_dir`, a spawn input — it can never move after spawn;
-    //   * `attach_output_pipe` below subscribes to a live broadcast of PTY
-    //     output, so deferring it drops the session's first bytes;
-    //   * `set_coord_session_id` + the `set_on_exit` close hook must move
-    //     together WITH registration or a PTY that exits first leaves a coord
-    //     ghost;
-    //   * `credential_helper::setup_credential_helper` hard-requires coord to
-    //     already know the session (it is already `tokio::spawn`ed below).
-    // What Phase 6 actually removed from this path is the network: the OAuth
-    // refresh is now a background refresher (`ai_provider::oauth_refresh`), and
-    // pinned-session verification was already off-path
-    // (`poll_and_verify_pinned_session`).
-    let registry = session_registry.inner().clone();
-    let persisted = pane_store.get(&pane_key);
-    // Key the row by the harness session id the identity seam pinned this PTY
-    // child to (inside `create` above — the seam runs before this block on
-    // every spawn path). Without it the registry falls back to the RUNNER's
-    // own ambient id, which no child ever runs under, so coord's scoped
-    // `coord_report_status` could never resolve the row
-    // (`session_not_owned_by_caller`) and sessions fell through to the
-    // unscoped call that writes a PEER's row. Both arms pass it: a fresh row is
-    // registered under it, and a RESUMED row is re-keyed to it (plan
-    // 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row,
-    // Phase 2) instead of keeping the first-ever pin it was registered under.
-    // `None` only when the terminal vanished between spawn and here.
-    let pinned_session_id = terminal_manager
-        .get(&info.id)
-        .map(|session| session.pinned_session_id().to_string());
-    // Phase 0 instrumentation: the coord-registration segment of spawn
-    // latency. `register_external` is synchronous and does no HTTP (it queues
-    // an outbox row, contending on the process-global outbox `write_lock` +
-    // fsync); `resume_external` additionally does a live `PATCH /sessions/:id`
-    // probe. The span separates the two in the log.
-    let registration: Result<uuid::Uuid, crate::session::SessionError> = match persisted {
-        Some(prior_id) => {
-            use tracing::Instrument;
-            registry
-                .resume_external(prior_id, intent, pinned_session_id)
-                .instrument(tracing::debug_span!(
-                    "terminal_spawn.coord_register",
-                    terminal_id = %info.id,
-                    resume = true
-                ))
-                .await
-        }
-        None => {
-            let _span = tracing::debug_span!(
-                "terminal_spawn.coord_register",
-                terminal_id = %info.id,
-                resume = false
-            )
-            .entered();
-            registry.register_external_with_lineage(intent, None, pinned_session_id)
-        }
-    };
-
-    let mut coord_session_id: Option<uuid::Uuid> = None;
-    match registration {
-        Ok(coord_id) => {
-            coord_session_id = Some(coord_id);
-            // Persist (or refresh) the pane → coord-id mapping so the NEXT
-            // restart resumes this same row. On the fallback path `coord_id`
-            // is a fresh id replacing the stale GC'd one.
-            pane_store.put(&pane_key, coord_id);
-
-            // Store the coord session id on the terminal so close can clean up.
-            if let Some(session) = terminal_manager.get(&info.id) {
-                terminal_manager.bind_coord_session(&session, coord_id);
-
-                // R1 — install the on-exit hook so the PTY waiter thread
-                // closes the coord session mirror the instant the process
-                // exits, instead of leaving a ghost until coord's own
-                // stale→closed watcher reaps it (the runner no longer
-                // self-closes abandoned sessions; see coord_sync plan A3).
-                // Shares the idempotent `close_by_id` path with the frontend
-                // `terminal_close` command, so a double-close (exit +
-                // explicit close) is a no-op.
-                let close_registry = registry.clone();
-                // Fixed at spawn (`TerminalSession::pinned_session_id` doc) —
-                // safe to capture as an owned String for the on-exit hook,
-                // which fires once the session's identity is long past
-                // changing.
-                let exit_pinned_session_id = session.pinned_session_id().to_string();
-                // A boot-restored gate continuation is re-registered in the
-                // continuation registry against THIS terminal (plan 2026-10-03
-                // D3), so its death must reach the same producer a backend
-                // spawn's does. A no-op for a terminal the registry does not
-                // hold — every ordinary operator tab.
-                let exited_terminal_id = info.id.clone();
-                // tauri's handle rather than `Handle::try_current()`: it is always
-                // available here, and the waiter thread that fires the hook has none.
-                let exit_rt_handle = tauri::async_runtime::handle().inner().clone();
-                session.set_on_exit(Box::new(move |coord_id, exit| {
-                    if let Err(e) = close_registry.close_by_id(coord_id) {
-                        warn!(
-                            coord_session = %coord_id,
-                            error = %e,
-                            "terminal exit hook: coord session close failed"
-                        );
-                    }
-                    crate::agent_runtime::notify_continuation_terminal_exit(
-                        &exited_terminal_id,
-                        Some(&exit_rt_handle),
-                        Some(exit),
-                    );
-                    // Trigger 4 (session_exit) — plan
-                    // 2026-08-27-operator-touch-observation-runner-emitter,
-                    // Phase B2 §2b/§2c.
-                    crate::session::operator_touch::emit_session_exit_if_nonzero(
-                        &close_registry,
-                        coord_id,
-                        Some(&exit_pinned_session_id),
-                        exit.agent_exit_code(),
-                    );
-                }));
-
-                // Attach the output pipe so PTY output streams to coord.
-                let rx = session.subscribe_output();
-                registry.attach_output_pipe(coord_id, rx, true);
-            }
-            info!(
-                terminal_id = %info.id,
-                coord_session = %coord_id,
-                resumed = persisted.is_some(),
-                "terminal_create: coord session ready"
-            );
-        }
-        Err(e) => {
-            warn!(
-                terminal_id = %info.id,
-                error = %e,
-                "terminal_create: coord session registration failed — terminal unaffected"
-            );
-        }
-    }
-
-    tokio::spawn(async move {
-        crate::repo_detection::check_and_emit_unregistered(repo_detect_handle, repo_detect_dir)
-            .await;
-    });
-
-    if let (Some(dir), Some(sid)) = (cred_helper_dir, coord_session_id) {
-        let session_id_str = sid.to_string();
-        tokio::spawn(async move {
-            crate::credential_helper::setup_credential_helper(&dir, &session_id_str).await;
-        });
-    }
+    // Unconditional coord registration — every terminal session is mirrored
+    // into the coordinator's session plane so the dashboard renders it from
+    // `coord.sessions`, and so a remote end can address it. Shared with every
+    // other create door (`coord_wiring`); this door alone owns a pane key, so it
+    // RESUMES the pane's prior coord row across a runner restart (R2).
+    //
+    // DELIBERATELY STILL ON THE CRITICAL PATH (Phase 6, §4 Q2): the coord CLAIM
+    // above (`acquire_for_terminal`) returns the value that BECOMES
+    // `working_dir`, a spawn input, and the wiring's own reasons are on
+    // `coord_wiring::wire_coord_session`.
+    let intent = coord_wiring::terminal_shell_intent(
+        title.as_deref(),
+        "Terminal shell session",
+        effective_intent_repo,
+        work_unit_slug,
+        correlation_topic,
+        working_dir.as_deref(),
+        spawn_tenant_id,
+    );
+    coord_wiring::finish_terminal_create(
+        terminal_manager.inner(),
+        Some(session_registry.inner()),
+        Some(&post_create_handle),
+        &info.id,
+        isolated_ctx,
+        intent,
+        coord_wiring::CoordRegistration::PaneKeyed {
+            pane_store: pane_store.inner().clone(),
+            pane_key,
+        },
+        working_dir,
+        "tauri_terminal_create",
+    )
+    .await;
 
     Ok(CommandResponse {
         success: true,
@@ -2623,6 +2462,35 @@ pub(crate) struct SessionCaptureHint {
 /// `JWT|KEY|TOKEN|SECRET` redaction filter matches none of them.
 pub(crate) const GATE_ID_ENV: &str = "QONTINUI_GATE_ID";
 
+/// The env a GATE continuation's PTY carries beyond the base child env: the
+/// gate it reports to ([`GATE_ID_ENV`] / [`GATE_DEVICE_ID_ENV`]) and the
+/// Stop-hook mode it runs under.
+///
+/// The mode is forwarded because `claude_stop_hook.sh` short-circuits on
+/// `QONTINUI_STOP_HOOK_CONTINUATION` before asking the runner, and the base
+/// child env sets that variable to the RUNNER's mode — `off` when unset. A gate
+/// continuation reads an unset flag as armed
+/// ([`crate::mcp::continuation_verdict::FlagReading::mode_for`]); without this
+/// override its Stop hook would be registered and then exit before ever
+/// reaching the verdict. Applied through `extra_env`, which runs after the base
+/// env, so it wins. Pure over its inputs (the unit-test surface).
+pub(crate) fn gate_identity_env(
+    gate: GateIdentity,
+    reading: crate::mcp::continuation_verdict::FlagReading,
+) -> Vec<(String, String)> {
+    vec![
+        (GATE_ID_ENV.to_string(), gate.gate_id.to_string()),
+        (
+            GATE_DEVICE_ID_ENV.to_string(),
+            gate.consuming_device_id.to_string(),
+        ),
+        (
+            crate::mcp::continuation_verdict::FLAG_ENV.to_string(),
+            reading.mode_for(true).as_str().to_string(),
+        ),
+    ]
+}
+
 /// Env var carrying the CONSUMING device id for [`GATE_ID_ENV`]'s gate.
 ///
 /// coord's outcome UPDATE carries `AND continuation_consumed_by = $3`, so a
@@ -2886,10 +2754,9 @@ pub(crate) fn create_terminal_session_backend(
     // to report to" — the correct signal, and the reason this is not a
     // sentinel value.
     if let Some(gate) = capture_hint.as_ref().and_then(|h| h.gate_identity) {
-        env_pairs.push((GATE_ID_ENV.to_string(), gate.gate_id.to_string()));
-        env_pairs.push((
-            GATE_DEVICE_ID_ENV.to_string(),
-            gate.consuming_device_id.to_string(),
+        env_pairs.extend(gate_identity_env(
+            gate,
+            crate::mcp::continuation_verdict::FlagReading::from_env(),
         ));
     }
     // The spawn-time policy delivery marker pair — set, or BLANKED, on every
@@ -3024,47 +2891,16 @@ pub(crate) fn create_terminal_session_backend(
     ) {
         Ok(coord_id) => {
             coord_session_id = Some(coord_id);
-            if let Some(session) = terminal_manager.get(&info.id) {
-                terminal_manager.bind_coord_session(&session, coord_id);
-                let close_registry = session_registry.clone();
-                // Capacity-freed re-poll: capture this terminal's id so the exit
-                // hook can tell `agent_runtime` a continuation slot just freed and
-                // a load-deferred continuation can be re-polled promptly. The
-                // notify is a no-op unless this terminal is a registered
-                // continuation session, so an ordinary operator tab never
-                // triggers a poll. The PTY waiter that fires this hook is a
-                // bare OS thread with no tokio runtime, so capture the current
-                // runtime handle HERE (this fn runs under tokio) for the poll to
-                // spawn on.
-                let exited_terminal_id = info.id.clone();
-                let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
-                let exit_pinned_session_id = session.pinned_session_id().to_string();
-                session.set_on_exit(Box::new(move |coord_id, exit| {
-                    if let Err(e) = close_registry.close_by_id(coord_id) {
-                        warn!(
-                            coord_session = %coord_id,
-                            error = %e,
-                            "gate-continuation terminal exit hook: coord session close failed"
-                        );
-                    }
-                    crate::agent_runtime::notify_continuation_terminal_exit(
-                        &exited_terminal_id,
-                        exit_rt_handle.as_ref(),
-                        Some(exit),
-                    );
-                    // Trigger 4 (session_exit) — plan
-                    // 2026-08-27-operator-touch-observation-runner-emitter,
-                    // Phase B2 §2b/§2c.
-                    crate::session::operator_touch::emit_session_exit_if_nonzero(
-                        &close_registry,
-                        coord_id,
-                        Some(&exit_pinned_session_id),
-                        exit.agent_exit_code(),
-                    );
-                }));
-                let rx = session.subscribe_output();
-                session_registry.attach_output_pipe(coord_id, rx, true);
-            }
+            // The bind + on-exit close hook + output pipe every create door
+            // shares (`coord_wiring`). This fn runs under tokio, so the exit
+            // hook's captured runtime handle is present.
+            coord_wiring::bind_registered_coord_session(
+                terminal_manager,
+                session_registry,
+                &info.id,
+                coord_id,
+                "create_terminal_session_backend",
+            );
             info!(
                 terminal_id = %info.id,
                 coord_session = %coord_id,
@@ -3686,6 +3522,32 @@ mod tests {
             2,
             "a spawned session hands over nothing"
         );
+    }
+
+    /// A gate continuation's PTY carries the gate pair AND an armed Stop-hook
+    /// mode when the flag is unset — the script short-circuits on that
+    /// variable, so without it the registered hook never reaches the verdict.
+    /// An explicit `off` is forwarded as `off`.
+    #[test]
+    fn gate_identity_env_arms_the_stop_hook_unless_the_flag_is_off() {
+        use crate::mcp::continuation_verdict::{FlagReading, Mode, FLAG_ENV};
+        let gate = GateIdentity {
+            gate_id: uuid::Uuid::new_v4(),
+            consuming_device_id: uuid::Uuid::new_v4(),
+        };
+        let get = |env: &[(String, String)], k: &str| {
+            env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        let env = gate_identity_env(gate, FlagReading::Unset);
+        assert_eq!(get(&env, GATE_ID_ENV), Some(gate.gate_id.to_string()));
+        assert_eq!(
+            get(&env, GATE_DEVICE_ID_ENV),
+            Some(gate.consuming_device_id.to_string())
+        );
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("on"));
+
+        let env = gate_identity_env(gate, FlagReading::Explicit(Mode::Off));
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("off"));
     }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never

@@ -1252,6 +1252,75 @@ pub(crate) fn resolve_claude_bin() -> String {
     bare
 }
 
+/// How long a migration respawn waits for a real `claude` to reappear on PATH
+/// before it settles for the bare-name fallback. Longer than the identity
+/// shim's own 10 s wait: the shim only covers the window once the PTY child is
+/// already running, and a reinstall window that outlives it kills the pane
+/// with exit 127 (finding 00525a01, 2026-11-14 21:27).
+pub(crate) const CLAUDE_BIN_RESOLVE_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// [`resolve_claude_bin`], re-tried for up to `wait` while it can only answer
+/// with the bare-name fallback. A bare name is what an npm auto-update
+/// reinstall leaves behind for a moment (the real binary is renamed aside), and
+/// it resolves in the PTY child to the identity shim, whose bounded wait can
+/// run out. BLOCKS (thread sleep) for up to `wait`: only pass a non-zero `wait`
+/// from the blocking pool; a zero `wait` never sleeps.
+pub(crate) fn resolve_claude_bin_waiting(wait: std::time::Duration) -> String {
+    resolve_waiting_with(
+        resolve_claude_bin,
+        &claude_bin_path(),
+        wait,
+        std::time::Duration::from_millis(500),
+    )
+}
+
+/// The retry loop of [`resolve_claude_bin_waiting`], with the resolver injected
+/// so the waiting is testable. Returns the first answer that is not `bare`, or
+/// the last answer once `wait` has elapsed.
+fn resolve_waiting_with(
+    mut resolve: impl FnMut() -> String,
+    bare: &str,
+    wait: std::time::Duration,
+    step: std::time::Duration,
+) -> String {
+    // An absolute `bare` (a `QONTINUI_CLAUDE_BIN` override) is launchable
+    // as-is and `resolve` answers it at once; it equals `bare` by design, so
+    // retrying would only stall.
+    if std::path::Path::new(bare).is_absolute() {
+        return resolve();
+    }
+    let start = std::time::Instant::now();
+    let mut retried = false;
+    loop {
+        let found = resolve();
+        if found != bare {
+            // Only a recovery after at least one retry is news: it is the
+            // direct evidence of a reinstall window the wait rode out.
+            if retried {
+                info!(
+                    "resolve_claude_bin: real `{bare}` reappeared on PATH after {:?} — \
+                     a reinstall window was ridden out (finding 00525a01)",
+                    start.elapsed()
+                );
+            }
+            return found;
+        }
+        if start.elapsed() >= wait {
+            if !wait.is_zero() {
+                warn!(
+                    "resolve_claude_bin: no real `{bare}` on PATH after waiting {:?} — \
+                     falling back to the bare name, which the PTY child resolves to the \
+                     identity shim; the respawned pane may exit 127 (finding 00525a01)",
+                    start.elapsed()
+                );
+            }
+            return found;
+        }
+        retried = true;
+        std::thread::sleep(step);
+    }
+}
+
 // =============================================================================
 // Public entrypoint
 // =============================================================================
@@ -3650,6 +3719,32 @@ fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     SESSIONS.get_or_init(|| std::sync::Mutex::new(ContinuationRegistry::default()))
 }
 
+/// The `coord.gates` row the LIVE continuation in `terminal_id` reports to, or
+/// `None` when the registry holds no entry for that terminal or holds one with
+/// no gate (a work-unit dispatch).
+///
+/// Read-only. It is how the Stop-hook verdict scopes its default-on arm to gate
+/// continuations ([`crate::mcp::continuation_verdict::mode_for_terminal`]) —
+/// by the runner's own record, never by a title or by the session's
+/// environment, which the runner cannot read.
+pub(crate) fn live_gate_continuation_gate_id(terminal_id: &str) -> Option<uuid::Uuid> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .get(terminal_id)
+        .and_then(|s| s.gate_id)
+}
+
+/// `(terminal_id, gate_id)` for every LIVE continuation that has a gate row —
+/// a snapshot taken under the registry lock and returned with it released.
+/// The finish relay ([`crate::session::continuation_finish_relay`]) walks it.
+pub(crate) fn live_gate_continuations() -> Vec<(String, uuid::Uuid)> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .iter()
+        .filter_map(|(tid, s)| s.gate_id.map(|g| (tid.clone(), g)))
+        .collect()
+}
+
 /// The `coord.gates` row this continuation may report a work outcome to, or
 /// `None` when there is no gate row to report to at all.
 ///
@@ -4955,7 +5050,7 @@ pub(crate) fn registered_continuation_gate(
 /// `work_completed` is always the bare marker (the fixed string is what lets
 /// coord's transition guard compare it exactly), while `work_abandoned` carries
 /// `": <first line, ≤200 chars>"` whenever a detail was sent.
-fn is_session_work_outcome(recorded: &str) -> bool {
+pub(crate) fn is_session_work_outcome(recorded: &str) -> bool {
     recorded == "work_completed" || marker_matches("work_abandoned", recorded)
 }
 
@@ -8092,8 +8187,11 @@ async fn run_continuation_terminal(
             prompt_carrier,
             // Direct exec — no identity shim in the chain to append `--settings`,
             // so the hook carrier has to be spelled out here or this session runs
-            // with no SessionStart/PreCompact/Stop hook at all.
-            crate::session::claude_hook::direct_spawn_settings_args(),
+            // with no SessionStart/PreCompact/Stop hook at all. A GATE
+            // continuation gets the Stop-armed carrier unless the flag is
+            // explicitly `off`: it is the unattended population whose turn end
+            // must be checked (plan 2026-10-28-finished-gate-continuations-…).
+            crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
         );
         // ...unless an operator template put a replacement prompt in the final
@@ -8309,15 +8407,20 @@ const CONTINUATION_DOOR: &str = "gate continuation";
 /// Phase 3). Awaited BEFORE the caller's own spawn-failed post, which is the
 /// allocation's one report — the context's `agent_id` is the continuation's —
 /// so this removes and never reports. `child_started == true` keeps every
-/// tree (logged). `None` (no worktree acquired) does nothing.
+/// tree (logged). `None` (no worktree acquired) does nothing and returns
+/// `None`; otherwise the removal's report is returned, which a door may
+/// ignore — the removal has already logged every tree's outcome.
 async fn remove_unspawned_continuation(
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     child_started: bool,
     reason: &str,
-) {
-    if let Some(ctx) = ctx {
-        ctx.remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
-            .await;
+) -> Option<crate::agent_worktree::remove_unspawned::RemovalReport> {
+    match ctx {
+        Some(ctx) => Some(
+            ctx.remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
+                .await,
+        ),
+        None => None,
     }
 }
 
@@ -9750,7 +9853,9 @@ async fn run_continuation_headless(
             // checks run before the spawn, and `spawn_tokio_with_retry` errs
             // only when no attempt produced a child (a spawned child is its
             // `Ok`). So the fresh tree is removed before the one report.
-            remove_unspawned_continuation(ctx, false, &reason).await;
+            let _removal = remove_unspawned_continuation(ctx, false, &reason).await;
+            #[cfg(test)]
+            headless_refusal_tests::observe_removal(_removal.as_ref());
             report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
             Err(e)
         }
@@ -17106,6 +17211,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resolve_waiting_returns_real_binary_that_appears_mid_wait() {
+        let mut calls = 0;
+        let got = resolve_waiting_with(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    "claude".to_string()
+                } else {
+                    "/real/claude".to_string()
+                }
+            },
+            "claude",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(got, "/real/claude");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn resolve_waiting_does_not_stall_on_an_absolute_override() {
+        let abs = if cfg!(windows) {
+            r"C:\x\claude.exe"
+        } else {
+            "/x/claude"
+        };
+        let start = std::time::Instant::now();
+        let got = resolve_waiting_with(
+            || abs.to_string(),
+            abs,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(5),
+        );
+        assert_eq!(got, abs);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resolve_waiting_gives_up_with_bare_name_after_the_wait() {
+        let got = resolve_waiting_with(
+            || "claude".to_string(),
+            "claude",
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(5),
+        );
+        assert_eq!(got, "claude");
+    }
+
     /// The spawn seam resolves `claude` to the absolute file a PATH walk finds
     /// (plan `2026-10-03-runner-claude-spawn-fails-enoent-during-cli-auto-update`).
     #[cfg(unix)]
@@ -19566,6 +19720,27 @@ mod tests {
     }
 
     const CAP_ENV_KEYS: &[&str] = &[RETIRED_CONTINUATION_SESSION_CAP_ENV];
+
+    /// The two read-only registry doors the Stop-hook verdict and the finish
+    /// relay use: only a LIVE entry carrying a gate is a gate continuation; a
+    /// gate-less entry (a work-unit dispatch) and an unknown terminal are not.
+    #[test]
+    fn live_gate_continuation_lookups_name_only_gated_live_entries() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::new_v4();
+        register_continuation_session("t-gate".to_string(), None, Some(gate));
+        register_continuation_session("t-unit".to_string(), Some("unit:x:p".to_string()), None);
+
+        assert_eq!(live_gate_continuation_gate_id("t-gate"), Some(gate));
+        assert_eq!(live_gate_continuation_gate_id("t-unit"), None);
+        assert_eq!(live_gate_continuation_gate_id("t-nope"), None);
+        assert_eq!(
+            live_gate_continuations(),
+            vec![("t-gate".to_string(), gate)]
+        );
+        clear_continuation_registry();
+    }
 
     /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
     /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
@@ -23043,6 +23218,11 @@ mod gateway_spawn_refusal_tests {
         }
     }
 }
+
+/// Plan `2026-11-13-spawn-refused-tree-followups` Phase 2: the headless
+/// continuation's gateway refusal, driven end to end through the remover.
+#[cfg(test)]
+mod headless_refusal_tests;
 
 /// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
 /// Phase 3: what the gate-continuation and coord-launch doors hand the remover.

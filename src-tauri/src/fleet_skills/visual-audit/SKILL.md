@@ -669,8 +669,18 @@ Hover targets are page-specific — take the id from the cell's own snapshot
 
 `--throttle` (`slow-3g`, `fast-3g`, or `latency=<ms>,down=<kbps>,up=<kbps>`)
 applies Chromium network emulation once the page is ready; `--no-cache` stops a
-warm cache from painting a "slow" load instantly. What Chromium accepted is
+warm HTTP cache from painting a "slow" load instantly. What Chromium accepted is
 stamped as `network` on every timeline result and matrix cell.
+
+Neither flag reaches the document's in-memory image cache. A URL this page has
+already decoded is answered from memory at once, with no throttle, even under
+`--no-cache` (observed on the Chromium that Playwright 1.65 ships;
+ui-bridge#351). So a timed swap must use a URL the page has not loaded yet. If
+you swap the same candidate into a second slot, or again after an earlier
+`--exec` in the same invocation, give it its own URL (`$CAND?2`). Otherwise (a)
+below records an instant arrival that the network never served. The cache
+belongs to one document: each `node "$INJECT"` run launches its own Chromium,
+and each matrix cell is a fresh context, so a new run starts with it empty.
 
 `captureTimeline` records frames on a timer. Two shapes answer two questions:
 
@@ -685,7 +695,10 @@ node "$INJECT" --url "$PAGE" --throttle slow-3g --no-cache --quiet \
   --exec 'mediaOverrideRestore {}' --exec 'mediaOverrideList {}'
 
 # (b) The slot's own loading-to-loaded timeline: reload under the throttle,
-#     frame 1 at the navigation commit, then read LCP/CLS from the media facts.
+#     frame 1 is the first frame after the navigation commit (its offsetMs says
+#     how long after); under the throttle it can still be the previous page's
+#     held frame, so do not read frame 1 as the slot loading. Then read
+#     LCP/CLS from the media facts.
 node "$INJECT" --url "$PAGE" --throttle slow-3g --no-cache --quiet \
   --exec "captureTimeline {\"dir\":\"$WORK/load\",\"frames\":40,\"intervalMs\":500,\"reload\":true}" \
   --exec 'find {"mediaOnly":true,"includeHidden":true}'
@@ -695,9 +708,13 @@ Size the timeline from the candidate's bytes: at 50 KB/s plus 2 s latency, the
 last frame must come after the arrival, or the frames record only the empty box
 and the "arrival" is unobserved. (a)'s `during.answeredAtMs` against the last
 frame's `offsetMs` says whether it did. The restore after a `--no-cache` run
-re-downloads the original under the same throttle; its wait is bounded by that
-`decodeTimeoutMs` too, so a short one there reads as `verified: false` — an
-UNKNOWN restore while the original is still in flight, not proof either way.
+puts back a URL the page decoded at load, so the in-memory cache above may
+answer it at once. If it does not, the original re-downloads under the same
+throttle, and that wait is bounded by the same `decodeTimeoutMs`: a short one
+reads as `verified: false`, an UNKNOWN restore while the original is still in
+flight, not proof either way. A restore that answers at once may have come from
+memory, so it says nothing about whether the throttle applied; read the
+`network` stamp for that.
 
 (a)'s `during.answeredAtMs` is when the candidate was confirmed on screen and
 its frames show what stood in the slot until then (an empty box, the old image,

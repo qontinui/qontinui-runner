@@ -264,6 +264,19 @@ def progress_since_nudge(tx):
     return False if tx.get("nudge_replied") else None
 
 
+def nudge_measured_at(tx, progress):
+    """Epoch ms of the /next-move that progress_since_nudge measured: the
+    transcript's last prompt. None when nothing was measured. coord credits a
+    measurement to a nudge only when this is at or after the nudge's row, so a
+    nudge typed that never landed is not credited with the one before it."""
+    if progress is None or not tx:
+        return None
+    at = tx.get("last_prompt")  # cfs.ms(): a float of epoch ms
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not 0 < at < float("inf"):
+        return None
+    return int(at)
+
+
 def progress_tx(row):
     """The transcript facts of a row judge() does not read: None when unreadable,
     which is a row with no measurement, never a failed pass."""
@@ -342,10 +355,10 @@ def judge(verdict, reasons, facts, tx, now_ms, cooldown_h, include_complete=Fals
         # A screen that ends on an open usage-limit menu (cfs.MENU_OPEN_LINE, from
         # either of the close screen's LIMITED arms) stays LIMITED whatever the
         # reset says: /next-move typed into it would choose an option, and
-        # triage's limit step is the one that dismisses it with Esc and waits for
-        # the runner's hand-off.
+        # triage's limit step is the one that answers it: Esc and the runner's
+        # hand-off, or the menu's wait option chosen by its text.
         if cfs.MENU_OPEN_LINE in reasons:
-            return "LIMITED", reasons + ["left to triage's limit step, which dismisses the menu, whatever the reset"]
+            return "LIMITED", reasons + ["left to triage's limit step, which answers the menu, whatever the reset"]
         if tx is None:
             return "LIMITED", reasons + ["transcript unreadable at re-check"]
         reset = limit_reset_ms(tx["final_text"], tx["last_asst"])
@@ -671,7 +684,9 @@ def screen(idle_min, only, cooldown_h, include_complete, use_coord=True, use_gh=
         # Measured on every row, not just the stopped ones judge() reads: a
         # session a nudge put to work reads BUSY, and a rate over only the
         # sessions that stopped again reads low. 260 transcripts took 6 s.
-        r["progress_since_nudge"] = progress_since_nudge(tx if tx is not None else progress_tx(row))
+        ptx = tx if tx is not None else progress_tx(row)
+        r["progress_since_nudge"] = progress_since_nudge(ptx)
+        r["nudge_measured_at"] = nudge_measured_at(ptx, r["progress_since_nudge"])
         r["verdict"], r["reasons"] = judge(r["verdict"], r["reasons"], facts, tx, now, cooldown_h,
                                            include_complete, ext)
     return res, warnings, ready_err
@@ -868,7 +883,7 @@ def selftest_prepare():
         server.shutdown()
         server.server_close()
     verdicts = [
-        ({"safe_to_restart": True}, "clear"),            # a build that predates the prepare
+        ({"safe_to_restart": True}, "clear"),            # no restart_prep field: every build from main until runner#2796
         ({"restart_prep": None}, "clear"),
         ({"restart_prep": {"state": "done"}}, "clear"),
         ({"restart_prep": {"state": "cancelled"}}, "clear"),
@@ -1997,6 +2012,11 @@ def selftest():
         got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
         if got.get("progress_since_nudge") is not True:
             bad.append(f"screen() dropped progress_since_nudge: {got.get('progress_since_nudge')!r}")
+        # ...and names the /next-move it measured, so coord can tell a nudge that
+        # never landed from the earlier one whose effect this row shows.
+        if got.get("nudge_measured_at") != int(real_now - 3600000):
+            bad.append(f"screen() nudge_measured_at = {got.get('nudge_measured_at')!r}, "
+                       f"want the measured prompt's time {int(real_now - 3600000)}")
         # A session the nudge put to work is measured too, whatever it reads now,
         # and an unreadable transcript there is no measurement, not a failed pass.
         for v in ("BUSY", "FINISHED", "EXITED-FINISHED"):
@@ -2011,6 +2031,8 @@ def selftest():
         got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
         if got.get("progress_since_nudge") is not None:
             bad.append(f"screen() on an unreadable transcript: {got.get('progress_since_nudge')!r}")
+        if got.get("nudge_measured_at") is not None:
+            bad.append(f"screen() measured no nudge but named one: {got.get('nudge_measured_at')!r}")
     finally:
         for k, v in saved.items():
             setattr(cfs, k, v)

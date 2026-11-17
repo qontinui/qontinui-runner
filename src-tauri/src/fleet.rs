@@ -623,6 +623,29 @@ static COORD_ONLY_BINDINGS_WARNED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeSet<uuid::Uuid>>,
 > = std::sync::OnceLock::new();
 
+/// Act on one heartbeat reconcile pass: log and `notify` when it changed local
+/// binding state, then flag each binding only coord holds. The reconcile drops
+/// bindings with no user action, so without the notify the tenant list and its
+/// credential notes keep showing a binding the device has lost until the app
+/// restarts. `notify` is a parameter so a test can count it; the heartbeat
+/// passes [`crate::commands::web_integration::notify_tenant_bindings_changed`].
+fn apply_binding_reconcile_report(
+    report: qontinui_runner_lib::pair::BindingReconcileReport,
+    notify: impl FnOnce(),
+) {
+    if report.changed() {
+        info!(
+            "fleet::heartbeat: reconciled bindings against coord \
+             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
+            report.dropped, report.dropped_slots, report.default_repointed
+        );
+        notify();
+    }
+    for (t, slot) in report.coord_only {
+        warn_coord_only_binding_once(t, slot);
+    }
+}
+
 fn warn_coord_only_binding_once(tenant: uuid::Uuid, slot: qontinui_runner_lib::auth::SlotState) {
     let set = COORD_ONLY_BINDINGS_WARNED
         .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
@@ -3629,18 +3652,10 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             .await
             .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
             match reconciled {
-                Ok(report) => {
-                    if report.changed() {
-                        info!(
-                            "fleet::heartbeat: reconciled bindings against coord \
-                             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
-                            report.dropped, report.dropped_slots, report.default_repointed
-                        );
-                    }
-                    for (t, slot) in report.coord_only {
-                        warn_coord_only_binding_once(t, slot);
-                    }
-                }
+                Ok(report) => apply_binding_reconcile_report(
+                    report,
+                    crate::commands::web_integration::notify_tenant_bindings_changed,
+                ),
                 Err(e) => {
                     tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
                 }
@@ -3655,8 +3670,12 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             })
             .await
             .unwrap_or_else(|e| Err(format!("backfill task failed: {e}")));
-            if let Err(e) = backfilled {
-                tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
+            match backfilled {
+                Ok(true) => crate::commands::web_integration::notify_tenant_bindings_changed(),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
+                }
             }
         }
         // D2: the same body carries this device's drain state. An absent or
@@ -7435,6 +7454,64 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reconcile runs on a heartbeat with no user action, so a changed
+    /// binding set has to reach the UI from here or it never does, and an
+    /// unchanged pass (every 30 s heartbeat) must not reach it at all.
+    #[test]
+    fn only_a_changed_binding_reconcile_tells_the_ui() {
+        use qontinui_runner_lib::pair::BindingReconcileReport;
+        let notified = |report: BindingReconcileReport| {
+            let mut count = 0;
+            apply_binding_reconcile_report(report, || count += 1);
+            count
+        };
+        let tenant = uuid::Uuid::from_u128(7);
+        assert_eq!(notified(BindingReconcileReport::default()), 0);
+        assert_eq!(
+            notified(BindingReconcileReport {
+                held: vec![(tenant, 1)],
+                ..Default::default()
+            }),
+            0,
+            "a held binding changed nothing"
+        );
+        for changed in [
+            BindingReconcileReport {
+                dropped: vec![tenant],
+                ..Default::default()
+            },
+            BindingReconcileReport {
+                dropped_slots: vec![tenant],
+                ..Default::default()
+            },
+            BindingReconcileReport {
+                default_repointed: Some(None),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(notified(changed.clone()), 1, "{changed:?}");
+        }
+    }
+
+    /// The heartbeat hands its report to the function the test above drives,
+    /// with the event that the tenant list listens for.
+    #[test]
+    fn the_heartbeat_reconcile_notifies_with_the_bindings_event() {
+        // Whitespace is collapsed on both sides, so a reformat cannot fail this.
+        // The needle cannot match its own spelling here: the `\` continuation
+        // stays in the squashed source between `report,` and `crate::`.
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let needle = "Ok(report) => apply_binding_reconcile_report( report, \
+                      crate::commands::web_integration::notify_tenant_bindings_changed,";
+        let source = squash(include_str!("fleet.rs"));
+        assert!(source.contains(&squash(needle)));
+        // The legacy backfill announces only when it reports a rewrite.
+        assert!(source.contains(&squash(
+            "Ok(true) => crate::commands::web_integration::notify_tenant_bindings_changed(), \
+             Ok(false) => {}"
+        )));
+    }
 
     /// Phase 3 (plan 2026-09-23-…-ungated): at a CRITICAL verdict the tree
     /// publisher's tick never calls `publish_tree_state` — so no `capture_tree`

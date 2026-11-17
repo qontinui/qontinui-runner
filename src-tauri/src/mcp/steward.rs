@@ -1284,6 +1284,8 @@ async fn start_steward(
         spec.skill, mode, interval
     );
 
+    // `create` consumes `app_handle`; the post-create coord wiring needs it.
+    let wiring_handle = app_handle.clone();
     match terminal_manager.create(
         Some(spec.skill.to_string()),
         None, // working_dir — default to workspace root
@@ -1384,6 +1386,39 @@ async fn start_steward(
                     ))),
                 ));
             }
+
+            // The post-create coord wiring every create door shares. A steward
+            // is NOT exempt from it, and never was on purpose: it is a
+            // terminal-hosted agent session like any other, and without a
+            // coord row it could not be ended from another device (plan
+            // 2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session,
+            // Phase 4; see `commands::terminal::coord_wiring`). Fresh, not
+            // pane-keyed: this door has no restore round-trip. Before the
+            // launch command is typed, so the output pipe sees its first bytes.
+            let intent = crate::commands::terminal::coord_wiring::terminal_shell_intent(
+                Some(spec.skill),
+                "Steward session",
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let registry = wiring_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+                .map(|r| r.inner().clone());
+            crate::commands::terminal::coord_wiring::finish_terminal_create(
+                &terminal_manager,
+                registry.as_ref(),
+                Some(&wiring_handle),
+                &info.id,
+                None,
+                intent,
+                crate::commands::terminal::coord_wiring::CoordRegistration::FreshPinned,
+                None,
+                "steward_start",
+            )
+            .await;
 
             // Type the launch command in after a short delay for shell
             // initialization — identical pattern to `create_terminal_handler`'s

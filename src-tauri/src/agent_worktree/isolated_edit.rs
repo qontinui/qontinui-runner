@@ -100,6 +100,44 @@ pub struct IsolatedEditContext {
     // Worktrees `remove_unspawned` took off disk. `Drop`'s fs-observer push
     // and edit-effect verify skip them: both would read a tree that is gone.
     removed_worktrees: Vec<PathBuf>,
+
+    // How long `Drop`'s credential cleanup waits for an install still in
+    // flight before aborting it (and cleaning up anyway). Always
+    // [`crate::credential_helper::CLEANUP_INSTALL_WAIT`] in production; a
+    // field so a test can drive the abort arm through `Drop` itself.
+    cred_cleanup_wait: std::time::Duration,
+}
+
+/// Test-only record of the worktrees each `Drop` handed to its fs-observer push
+/// and edit-effect verify (both producers iterate the SAME list), keyed by the
+/// context's agent id. Both producers are flag-gated off by default, so this is
+/// the observable seam for the removed-tree skip.
+#[cfg(test)]
+pub(crate) mod drop_observed_recorder {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    fn map() -> &'static Mutex<HashMap<String, Vec<PathBuf>>> {
+        static MAP: OnceLock<Mutex<HashMap<String, Vec<PathBuf>>>> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn record(agent_id: &str, observed: Vec<PathBuf>) {
+        map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent_id.to_string(), observed);
+    }
+
+    /// What the `Drop` of `agent_id`'s context handed to the producers, if it
+    /// has run. Removes the entry.
+    pub(crate) fn take(agent_id: &str) -> Option<Vec<PathBuf>> {
+        map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(agent_id)
+    }
 }
 
 impl Drop for IsolatedEditContext {
@@ -130,9 +168,16 @@ impl Drop for IsolatedEditContext {
                 .any(|r| super::canonical_paths::paths_equal(r, &w.worktree_path))
         };
 
+        let observed: Vec<&MaterializedWorktree> = self.worktrees.iter().filter(on_disk).collect();
+        #[cfg(test)]
+        drop_observed_recorder::record(
+            &self.agent_id,
+            observed.iter().map(|w| w.worktree_path.clone()).collect(),
+        );
+
         if super::fs_observer::fs_observer_enabled() {
             let correlation_id = Some(uuid::Uuid::new_v4());
-            for w in self.worktrees.iter().filter(on_disk) {
+            for w in &observed {
                 super::fs_observer::spawn_push_worktree_observations(
                     self.coord_http_base.clone(),
                     w.worktree_path.clone(),
@@ -153,7 +198,7 @@ impl Drop for IsolatedEditContext {
         // (default off, flips with `QONTINUI_FS_OBSERVER_ENABLED` once quiet)
         // and drop-safe: it spawns onto the current runtime, never blocking
         // `Drop` — same mechanism the fs_observations push uses.
-        for w in self.worktrees.iter().filter(on_disk) {
+        for w in &observed {
             super::edit_effect_loop::spawn_verify(
                 self.coord_http_base.clone(),
                 w.worktree_path.clone(),
@@ -186,7 +231,10 @@ impl Drop for IsolatedEditContext {
         // Detached-thread form: `Drop` must neither block a Tokio worker on
         // `git config` subprocesses nor risk a panic-during-unwind.
         for id in std::iter::once(&self.agent_id).chain(self.extra_cred_agent_ids.iter()) {
-            crate::credential_helper::spawn_cleanup_credential_helper(id.clone());
+            crate::credential_helper::spawn_cleanup_credential_helper_within(
+                id.clone(),
+                self.cred_cleanup_wait,
+            );
         }
 
         // Stop EVERY heartbeat first so no tick races with a release POST.
@@ -712,6 +760,7 @@ pub async fn acquire(
         edit_loop_declared_paths,
         provenance,
         removed_worktrees: Vec::new(),
+        cred_cleanup_wait: crate::credential_helper::CLEANUP_INSTALL_WAIT,
         extra_cred_agent_ids: Vec::new(),
         spawn_tenant: req.spawn_tenant,
     }))
@@ -1666,6 +1715,9 @@ fn read_device_id() -> Result<uuid::Uuid, String> {
 }
 
 #[cfg(test)]
+mod isolated_edit_drop_tests;
+
+#[cfg(test)]
 impl IsolatedEditContext {
     /// Test-only constructor that builds a context with synthetic claims and
     /// NO live heartbeats, bypassing the network acquire path. Used to
@@ -1705,6 +1757,7 @@ impl IsolatedEditContext {
             spawn_tenant: None,
             provenance: HashMap::new(),
             removed_worktrees: Vec::new(),
+            cred_cleanup_wait: crate::credential_helper::CLEANUP_INSTALL_WAIT,
         }
     }
 

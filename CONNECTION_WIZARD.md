@@ -74,14 +74,33 @@ the LAN.
 
 ## Step 4 — Verification
 
-Three live health checks:
+Three live checks, every one made by the runner. The wizard never calls the
+phone from the webview, because a phone on `@qontinui/ui-bridge-native` 0.11.0
+or later refuses any browser caller, and off a cable it admits only a runner that
+signs each request with the token the phone issued it.
 
-1. **Transport established** — USB: ADB forward allocated. LAN: proxy built.
-   Remote: rathole tunnel up.
-2. **Health check** — `GET /ui-bridge/health` returns 200 with an `uiBridge`
-   metadata block.
-3. **Elements readable** — `GET /ui-bridge/control/snapshot?visibleOnly=true`
-   returns non-empty elements.
+1. **Transport established** — USB: `POST /ui-bridge/apps/forward-device`
+   (iOS: `/ui-bridge/ios/forward`) allocates the forward and fetches the phone's
+   pairing token over the cable. A phone that admits the cable as on the phone
+   itself needs no code there. LAN: the device's row in `GET /ui-bridge/devices`,
+   which is the phone's own id for an mDNS pick and `lan-<ip>` for a typed
+   address. The address is registered only when it has no row yet, so a retry
+   reuses the row and its proxy. Remote: rathole tunnel up.
+2. **Runner connected** — `POST /ui-bridge/devices/{id}/connect` for a LAN row,
+   `POST /ui-bridge/sdk/connect` otherwise. Connecting makes the device the
+   runner's one active app, in place of whatever it was connected to. A phone
+   that requires pairing makes the wizard ask for the 6-digit code the app's
+   Settings shows after **Pair** is tapped. That includes an Android phone over
+   USB that did not admit the cable as local, once the runner's USB scanner has
+   listed it; an iPhone has no USB row to pair through, so pair it over Wi-Fi.
+   The wizard sends the code to `POST /ui-bridge/devices/{id}/pair` and runs the
+   check again. The runner keeps the token in its encrypted store and signs every
+   later request to that phone. If the runner already holds a different token for
+   the phone (`PAIRING_TOKEN_HELD`), the wizard offers to replace it, which is
+   right only when the pairing was revoked in the app's Settings. That pairing
+   spent the code, so replacing asks for a new one.
+3. **Elements readable** — `GET /ui-bridge/sdk/snapshot` on the runner returns
+   non-empty elements.
 
 On failure, the wizard shows the specific error + a retry button. Common
 fixes:

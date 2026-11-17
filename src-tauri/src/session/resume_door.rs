@@ -496,39 +496,67 @@ fn holder_from_command_lines(
 // I/O: the spawn site
 // ---------------------------------------------------------------------------
 
-/// Read the claude processes under `terminal_id`'s pane. `None` when the pane
-/// is gone or the process table is UNKNOWN (a failed or stale read): an empty
-/// list from it would read as "the resumed claude is not there". A read begun
-/// now (never the memo), since [`verify`] can disprove a resume from it.
+/// Why one verify poll could not read the pane — the poll is skipped, and
+/// when EVERY poll was skipped, the last one's reason is the verdict.
+const PROCESS_TABLE_UNREADABLE: &str = "process_table_unreadable";
+/// The pane holds a process Claude Code's session registry could not settle
+/// (it may be the resumed npm-installed `claude`), so the list is undecided.
+const REGISTRY_UNDECIDED: &str = "registry_undecided";
+
+/// Read the claude processes under `terminal_id`'s pane. `Err` names why the
+/// poll could not read it: the pane is gone or the table is UNKNOWN (a failed
+/// or stale read) — [`PROCESS_TABLE_UNREADABLE`] — or the pane's `claude` set
+/// is UNDECIDED — [`REGISTRY_UNDECIDED`] ([`claude_pids_under`]). An empty or
+/// partial list from any of them would read as "the resumed claude is not
+/// there". A read begun now (never the memo), since [`verify`] can disprove a
+/// resume from it.
 async fn read_claude_procs(
     tm: &Arc<TerminalManager>,
     terminal_id: &str,
-) -> Option<Vec<ClaudeProc>> {
+) -> Result<Vec<ClaudeProc>, &'static str> {
     use crate::process_capture::process_tree as pt;
-    let root = tm.get(terminal_id)?.child_pid()?;
-    let snap = pt::snapshot_process_table_fresh().await;
-    if snap.is_unknown() {
-        return None;
-    }
-    let pids = pt::claude_pids_in_inclusive_subtree(root, &snap);
-    // An UNKNOWN command-line read skips this poll (`None`), exactly as an
-    // UNKNOWN table does: a list built from it would drop every process (each
+    let root = tm
+        .get(terminal_id)
+        .and_then(|t| t.child_pid())
+        .ok_or(PROCESS_TABLE_UNREADABLE)?;
+    let look = crate::terminal::graceful_exit::PaneLook::take_fresh(&[root]).await;
+    let pids = claude_pids_under(&look, root)?;
+    // An UNKNOWN command-line read skips this poll, exactly as an UNKNOWN
+    // table does: a list built from it would drop every process (each
     // `ClaudeProc` needs its cmdline) and read as "the resumed claude is not
     // there". The caller polls again.
-    let cmdlines = pt::command_lines_for_pids(&pids).await?;
+    let cmdlines = pt::command_lines_for_pids(&pids)
+        .await
+        .ok_or(PROCESS_TABLE_UNREADABLE)?;
     let cwds = pt::working_directories_for_pids(&pids).await;
-    Some(
-        pids.into_iter()
-            .filter_map(|pid| {
-                Some(ClaudeProc {
-                    pid,
-                    cmdline: cmdlines.get(&pid)?.clone(),
-                    cwd: cwds.get(&pid).cloned(),
-                    config_dir: config_dir_of_pid(pid),
-                })
+    Ok(pids
+        .into_iter()
+        .filter_map(|pid| {
+            Some(ClaudeProc {
+                pid,
+                cmdline: cmdlines.get(&pid)?.clone(),
+                cwd: cwds.get(&pid).cloned(),
+                config_dir: config_dir_of_pid(pid),
             })
-            .collect(),
-    )
+        })
+        .collect())
+}
+
+/// Every live `claude` under `root` in `look` — an image-proven one, or a pid
+/// Claude Code's session registry names whatever its image, so a resumed
+/// npm-installed `claude` (`node … cli.js`) is seen. `None` (skip this poll)
+/// for an UNKNOWN table and for an UNDECIDED set: a pid the registry could not
+/// settle may be the resumed `claude`, and leaving it out would disprove a
+/// resume that happened. The `Err` says which ([`PROCESS_TABLE_UNREADABLE`]
+/// or [`REGISTRY_UNDECIDED`]).
+fn claude_pids_under(
+    look: &crate::terminal::graceful_exit::PaneLook,
+    root: u32,
+) -> Result<Vec<u32>, &'static str> {
+    if look.snapshot().is_unknown() {
+        return Err(PROCESS_TABLE_UNREADABLE);
+    }
+    look.claude_pids(root).map_err(|_| REGISTRY_UNDECIDED)
 }
 
 /// Poll the process table until the resumed claude is proven (or disproven).
@@ -549,11 +577,11 @@ async fn verify(
 }
 
 /// The poll loop behind [`verify`], over an injected pane check and process
-/// read (`None` = that poll's table was UNKNOWN). At the deadline it reports
-/// `no_claude_resume_process_observed` only when at least one poll actually
-/// READ the table; when every poll was UNKNOWN it reports
-/// `process_table_unreadable` — "could not look" is not "looked and found
-/// nothing".
+/// read (`Err(reason)` = that poll could not read the pane). At the deadline
+/// it reports `no_claude_resume_process_observed` only when at least one poll
+/// actually READ it; when every poll was skipped it reports the last skip's
+/// reason (`process_table_unreadable` or `registry_undecided`) — "could not
+/// look" is not "looked and found nothing".
 async fn verify_with<A, R, Fut>(
     cand: &Candidate,
     terminal_id: &str,
@@ -565,27 +593,31 @@ async fn verify_with<A, R, Fut>(
 where
     A: FnMut() -> bool,
     R: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<Vec<ClaudeProc>>>,
+    Fut: std::future::Future<Output = Result<Vec<ClaudeProc>, &'static str>>,
 {
     let deadline = tokio::time::Instant::now() + deadline;
     let mut any_poll_readable = false;
+    let mut last_skip = PROCESS_TABLE_UNREADABLE;
     loop {
         if !pane_alive() {
             return Err("pane_vanished_before_claude_appeared".to_string());
         }
-        if let Some(procs) = read().await {
-            any_poll_readable = true;
-            match judge(&procs, cand, terminal_id) {
-                Ok(ev) => return Ok(ev),
-                Err(Some(reason)) => return Err(reason),
-                Err(None) => {}
+        match read().await {
+            Ok(procs) => {
+                any_poll_readable = true;
+                match judge(&procs, cand, terminal_id) {
+                    Ok(ev) => return Ok(ev),
+                    Err(Some(reason)) => return Err(reason),
+                    Err(None) => {}
+                }
             }
+            Err(reason) => last_skip = reason,
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(if any_poll_readable {
                 "no_claude_resume_process_observed"
             } else {
-                "process_table_unreadable"
+                last_skip
             }
             .to_string());
         }
@@ -678,6 +710,7 @@ async fn resume_one(
                     working_dir: &cand.working_dir,
                     model_transcript,
                     config_dir: &cand.config_dir,
+                    claude_bin_wait: std::time::Duration::ZERO,
                     title: cand.title.clone(),
                     page_id: cand.page_id.clone(),
                     zone_index: cand.zone_index,
@@ -1163,8 +1196,15 @@ mod tests {
         let window = Duration::from_millis(40);
         let poll = Duration::from_millis(5);
 
-        let every_poll_unknown =
-            verify_with(&c, "t", window, poll, || true, || std::future::ready(None)).await;
+        let every_poll_unknown = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Err(PROCESS_TABLE_UNREADABLE)),
+        )
+        .await;
         assert_eq!(
             every_poll_unknown,
             Err("process_table_unreadable".to_string())
@@ -1176,7 +1216,7 @@ mod tests {
             window,
             poll,
             || true,
-            || std::future::ready(Some(Vec::new())),
+            || std::future::ready(Ok(Vec::new())),
         )
         .await;
         assert_eq!(
@@ -1193,7 +1233,11 @@ mod tests {
             || true,
             || {
                 polls += 1;
-                std::future::ready((polls == 2).then(Vec::new))
+                std::future::ready(if polls == 2 {
+                    Ok(Vec::new())
+                } else {
+                    Err(PROCESS_TABLE_UNREADABLE)
+                })
             },
         )
         .await;
@@ -1209,10 +1253,24 @@ mod tests {
             window,
             poll,
             || true,
-            || std::future::ready(Some(vec![proc(&good, None, None)])),
+            || std::future::ready(Ok(vec![proc(&good, None, None)])),
         )
         .await;
         assert_eq!(found.map(|ev| ev.pid), Ok(Some(42)));
+
+        // Every poll UNDECIDED (a `node` the session registry could not
+        // settle may be the resumed `claude`): reported as such, never as an
+        // unreadable table and never as "not observed".
+        let every_poll_undecided = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Err(REGISTRY_UNDECIDED)),
+        )
+        .await;
+        assert_eq!(every_poll_undecided, Err("registry_undecided".to_string()));
     }
 
     #[test]
@@ -1270,5 +1328,47 @@ mod tests {
         );
         assert_eq!((report.resumed, report.failed, report.skipped), (0, 1, 2));
         assert!(!report.generation_applied);
+    }
+
+    /// Shell 5 → `node` 50 (an npm-installed `claude`, `node … cli.js`).
+    fn npm_pane_table() -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot {
+            stale: false,
+            ..Default::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name, started) in [(5, "bash", 1_000), (50, "node", 1_050)] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    fn npm_look(
+        witness: crate::terminal::graceful_exit::RegistryWitness,
+    ) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::over_whole_table(npm_pane_table(), witness)
+    }
+
+    /// The resume verifier sees a resumed npm `claude` the registry names.
+    /// Partner: drop the witness and the pane reads claude-free (a resume
+    /// that happened would be disproven). Unsettled, the poll is skipped
+    /// (`None`), never an empty list.
+    #[test]
+    fn a_resumed_npm_claude_is_seen_and_an_unsettled_poll_is_skipped() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::naming(&[50])), 5),
+            Ok(vec![50])
+        );
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::naming(&[])), 5),
+            Ok(vec![])
+        );
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::unreadable("test")), 5),
+            Err(REGISTRY_UNDECIDED)
+        );
     }
 }

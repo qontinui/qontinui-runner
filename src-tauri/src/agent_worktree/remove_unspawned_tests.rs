@@ -620,10 +620,11 @@ async fn a_refused_remove_after_scaffolding_cleanup_says_it_was_deleted() {
     );
 }
 
-/// Review fix 5: with `status.showUntrackedFiles=no` the dirty probe's plain
-/// porcelain hides an operator's untracked file; the removal's own listing
-/// passes `--untracked-files=all`, so the scaffolding guard sees and refuses it
-/// (before `git worktree remove` would be the only thing left to).
+/// Review fix 5, tightened by edge 9171555e: with `status.showUntrackedFiles=no`
+/// an operator's untracked file must still keep the tree. The dirty probe now
+/// passes `--untracked-files=all` itself, so it is the FIRST guard that refuses
+/// (it used to be blind here, leaving the scaffolding listing — which also
+/// passes the flag — as the only guard before `git worktree remove`).
 #[tokio::test]
 async fn an_untracked_file_hidden_by_show_untracked_no_still_keeps_the_tree() {
     let fx = Fixture::new();
@@ -638,12 +639,11 @@ async fn an_untracked_file_hidden_by_show_untracked_no_still_keeps_the_tree() {
 
     let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
 
-    match only_outcome(&report) {
-        TreeOutcome::Kept(KeepReason::Scaffolding(why)) => {
-            assert!(why.contains("notes.txt"), "{why}")
-        }
-        other => panic!("expected the scaffolding listing to refuse, got {other:?}"),
-    }
+    assert_eq!(
+        only_outcome(&report),
+        &TreeOutcome::Kept(KeepReason::Dirty(DirtyVerdict::Dirty)),
+        "the dirty probe itself must see the hidden untracked file"
+    );
     assert!(tree.join("notes.txt").exists());
 }
 
@@ -896,4 +896,97 @@ async fn an_ignored_node_modules_dir_or_link_keeps_the_tree() {
             "the link target is untouched"
         );
     }
+}
+
+/// Edge 4253717f: removing a never-spawned tree revokes its coord-mcp proxy
+/// nonces TOTALLY — the live device key AND a superseded key still riding
+/// grace — so the proxy refuses both at once. The grace-preserving eviction
+/// this replaced left the live key graced, i.e. still accepted.
+#[tokio::test]
+async fn a_removed_trees_proxy_nonces_are_revoked_with_no_grace() {
+    let _amb = crate::test_env::isolated_ambient();
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    let wd = tree.to_string_lossy().to_string();
+    let superseded = crate::coord_mcp::register_device_proxy_nonce_for_test(&wd);
+    let live = crate::coord_mcp::register_device_proxy_nonce_for_test(&wd);
+    assert!(
+        crate::coord_mcp::proxy_nonce_is_valid(&superseded),
+        "fixture: the superseded key rides grace"
+    );
+    assert!(crate::coord_mcp::proxy_nonce_is_valid(&live));
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+    assert!(
+        !crate::coord_mcp::proxy_nonce_is_valid(&live),
+        "the removed tree's live key is refused immediately"
+    );
+    assert!(
+        !crate::coord_mcp::proxy_nonce_is_valid(&superseded),
+        "the removed tree's graced key is refused immediately"
+    );
+    for n in [&live, &superseded] {
+        crate::coord_mcp::forget_proxy_nonce_for_test(n);
+    }
+}
+
+/// The scaffolding listing passes `--untracked-files=all` itself: under
+/// `status.showUntrackedFiles=no`, a scaffolding-only tree's untracked
+/// scaffolding must still be listed — and so deleted. Without the flag the
+/// listing reads empty and the scaffolding survives.
+#[test]
+fn the_scaffolding_listing_sees_scaffolding_hidden_by_show_untracked_no() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    git(
+        &fx.canonical,
+        &["config", "status.showUntrackedFiles", "no"],
+    );
+    provision_scaffolding(&tree);
+    assert_eq!(
+        git(&tree, &["status", "--porcelain"]),
+        "",
+        "fixture: plain porcelain is blind to the scaffolding"
+    );
+
+    let claude_files = |dir: &Path| -> usize {
+        fn count(dir: &Path) -> usize {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| {
+                            let p = e.path();
+                            if p.is_dir() {
+                                count(&p)
+                            } else {
+                                1
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        count(dir)
+    };
+    assert!(
+        claude_files(&tree.join(".claude")) > 0,
+        "fixture: provisioning wrote .claude files"
+    );
+
+    assert_eq!(delete_scaffolding(&tree), Ok(()));
+
+    // `--untracked-files=all` lists FILES, so each listed file is deleted and
+    // empty `.claude/` directories may remain for `git worktree remove`.
+    for entry in [".mcp.json", ".coord-mcp-status"] {
+        assert!(!tree.join(entry).exists(), "{entry} was listed and deleted");
+    }
+    assert_eq!(
+        claude_files(&tree.join(".claude")),
+        0,
+        "every .claude file was listed and deleted"
+    );
 }

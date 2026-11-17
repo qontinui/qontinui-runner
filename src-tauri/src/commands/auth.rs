@@ -1338,6 +1338,7 @@ async fn finalize_signed_in(
             );
             AppError::Raw(format!("persist pairing: {e}"))
         })?;
+    crate::commands::web_integration::notify_tenant_bindings_changed();
 
     // 5a. A NEW credential is in `tenant_id`'s slot (and in the legacy slot when
     //     that tenant is the default), so every rejection coord recorded
