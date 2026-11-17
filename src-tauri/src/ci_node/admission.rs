@@ -3010,7 +3010,11 @@ mod tests {
         // next read restores 4. Measured from the tick alone there is no rise;
         // from the deferral there is, and the dispatch drains.
         assert_eq!(room_opened(4, 4, 3, 1), 0, "from the tick's cap: missed");
-        assert_eq!(room_opened(4u32.min(3), 4, 3, 1), 1, "from the deferral's cap");
+        assert_eq!(
+            room_opened(4u32.min(3), 4, 3, 1),
+            1,
+            "from the deferral's cap"
+        );
     }
 
     /// The sizing counts only the dispatches that had started by the sample's

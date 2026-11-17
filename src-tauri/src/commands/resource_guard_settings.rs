@@ -619,7 +619,10 @@ mod tests {
         let unset = &v["unset_resolves_to"];
         assert!(unset["count"].is_u64(), "{unset}");
         assert!(unset["source"].is_string(), "{unset}");
-        assert!(v.get("effective").is_none(), "the old, misleading key is gone");
+        assert!(
+            v.get("effective").is_none(),
+            "the old, misleading key is gone"
+        );
         let unknown = host_suggestion_json(crate::ci_node::host_sizing::HostCapacity {
             mem_bytes: None,
             cpus: 8,
