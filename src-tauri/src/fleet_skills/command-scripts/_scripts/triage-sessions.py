@@ -3559,7 +3559,11 @@ def pass_row(r, observed_at):
             since = int(fin)
     screen = r.get("screen")
     progress = r.get("progress_since_nudge")
-    return {
+    measured = r.get("nudge_measured_at")
+    measured = (rfc3339(dt.datetime.fromtimestamp(measured / 1000, dt.timezone.utc))
+                if isinstance(progress, bool) and isinstance(measured, (int, float))
+                and not isinstance(measured, bool) and 0 < measured < 4102444800000 else None)
+    row = {
         "terminal_id": r["terminalId"],
         "observed_at": observed_at,
         "claude_session_id": sid if isinstance(sid, str) and nss.UUID_RE.match(sid) else None,
@@ -3575,6 +3579,12 @@ def pass_row(r, observed_at):
         "action_outcome": None,
         "detail": {"reasons": [str(x)[:REASON_CHARS] for x in (r.get("reasons") or [])[:REASONS_MAX]]},
     }
+    # Sent only when known: absent and null mean the same UNKNOWN to coord, and
+    # a coord predating the field refuses the KEY, so an unmeasured row stays
+    # writable there.
+    if measured:
+        row["nudge_measured_at"] = measured
+    return row
 
 
 def apply_events(rows, events):
@@ -3674,6 +3684,37 @@ def runner_build():
     except Exception:  # noqa: BLE001 - READ_ERRORS leaves out a response cut mid-read
         return None
     return sha if isinstance(sha, str) and sha else None
+
+
+# Two reads of ONE runner process derive starts that differ: now - uptimeSeconds
+# carries whole-second truncation plus the /health read's own latency, which
+# reaches seconds under load. Starts closer than this are one process. coord's
+# flow engine compares across passes with the same bound
+# (RUNNER_START_TOLERANCE_SECS in qontinui-coord overlord_passes.rs).
+# uptimeSeconds runs on the runner's MONOTONIC clock, so a suspend or an NTP step
+# also moves the derived start; that fails closed (the absences read unproven).
+RUNNER_START_TOLERANCE_S = 30
+
+
+def runner_started():
+    """When the runner PROCESS started, as an aware UTC datetime: now minus
+    /health uptimeSeconds. None when it cannot be read. Never raises."""
+    try:
+        up = cfs.read("/health", "data.uptimeSeconds", timeout=20)
+    except Exception:  # noqa: BLE001 - READ_ERRORS leaves out a response cut mid-read
+        return None
+    if isinstance(up, bool) or not isinstance(up, (int, float)) or up < 0:
+        return None
+    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=up)
+
+
+def same_runner_start(before, after):
+    """The start to record for a screen read between two derived starts: the
+    earlier read when both are known and within the tolerance, else None (a
+    restart during the screen, or a failed read: UNKNOWN)."""
+    if before is None or after is None:
+        return None
+    return before if abs((after - before).total_seconds()) <= RUNNER_START_TOLERANCE_S else None
 
 
 def runner_port():
@@ -3846,6 +3887,21 @@ def direct_call(tool, args, opener=None):
     return body
 
 
+# coord's own slack past ended_at for a row's timestamps (OBSERVED_AT_SLACK_SECS).
+MEASURED_SLACK_S = 300
+
+
+def parse_rfc3339(value):
+    """A timezone-aware datetime for an RFC 3339 string, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else None
+
+
 def record_pass(doc, proxy=None, direct=None):
     """Write the pass, then read it back by pass_id over the door that wrote it.
     Returns the one line to print. `proxy` is the session's own door
@@ -3875,7 +3931,37 @@ def record_pass(doc, proxy=None, direct=None):
     if stored.get("row_count") != n:
         return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds row_count="
                 f"{stored.get('row_count')!r}, not {n}{via}")
+    sent = parse_rfc3339(doc.get("runner_started_at"))
+    if sent is not None and parse_rfc3339(stored.get("runner_started_at")) != sent:
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds runner_started_at="
+                f"{stored.get('runner_started_at')!r}, not {doc['runner_started_at']}{via}")
+    # The same for each row's measured prompt: a coord that accepts the key but
+    # does not store it would otherwise read back as recorded.
+    lost = measured_not_stored(doc["rows"], stored.get("rows"))
+    if lost and not isinstance(stored.get("rows"), list):
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back carries no rows list, "
+                f"so the nudge_measured_at of {len(lost)} row(s) is unconfirmed{via}")
+    if lost:
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds no matching "
+                f"nudge_measured_at for {len(lost)} row(s) that sent one (first: {lost[0]}){via}")
     return f"ledger: recorded pass {pid} ({n} rows, read back){via}"
+
+
+def measured_not_stored(sent_rows, stored_rows):
+    """The terminal ids whose sent nudge_measured_at the read-back does not
+    hold. An unreadable row list counts every sent value as not stored."""
+    def key(r):  # coord stores text fields trimmed
+        tid = r.get("terminal_id")
+        return tid.strip() if isinstance(tid, str) else tid
+    want = {key(r): parse_rfc3339(r.get("nudge_measured_at")) for r in sent_rows}
+    want = {tid: at for tid, at in want.items() if at is not None}
+    if not want:
+        return []
+    got = {}
+    if isinstance(stored_rows, list):
+        got = {key(r): parse_rfc3339(r.get("nudge_measured_at"))
+               for r in stored_rows if isinstance(r, dict)}
+    return [str(tid) for tid, at in want.items() if got.get(tid) != at]
 
 
 class PassRecorder:
@@ -3886,6 +3972,7 @@ class PassRecorder:
         self.doc = None
         self.res = None
         self.build_before = self.screened_build = None
+        self.start_before = self.screened_start = None
         self.events = []  # ("rows", step, [acted rows]) or ("file", step, path), in the order the steps ran
         self.steps = {}
         self.lock = None
@@ -3925,6 +4012,7 @@ class PassRecorder:
     def screening(self):
         """Call before the screen: see screened()."""
         self.build_before = runner_build()
+        self.start_before = runner_started()
 
     def screened(self, res):
         """The flow metrics compare a pass's build across passes to tell a close
@@ -3934,6 +4022,9 @@ class PassRecorder:
         self.res = res
         after = runner_build()
         self.screened_build = after if after == self.build_before else None
+        # The same rule for the runner PROCESS: a restart that keeps the build
+        # is still a restart, and only a start read on both sides tells.
+        self.screened_start = same_runner_start(self.start_before, runner_started())
 
     def step(self, name, **facts):
         self.steps.setdefault(name, {}).update(facts)
@@ -3971,9 +4062,9 @@ class PassRecorder:
             rows.append({"terminal_id": tid, "action": "name", "action_outcome": outcome})
         self.events.append(("rows", "name", rows))
 
-    def build(self, code, now=None, build=None, versions=None):
-        """The pass document for coord. `now`, `build` and `versions` are
-        injectable so the selftest builds without the clock, runner or git."""
+    def build(self, code, now=None, build=None, versions=None, started=None):
+        """The pass document for coord. `now`, `build`, `versions` and `started`
+        are injectable so the selftest builds without the clock, runner or git."""
         events, bad = [], 0
         for kind, _step, item in self.events:
             if kind == "file":
@@ -3992,8 +4083,20 @@ class PassRecorder:
         if dropped:
             counts["ledger"] = {"rows_dropped": dropped}
         build = self.screened_build if build is None else build
-        return dict(self.doc, runner_build=build,
-                    ended_at=rfc3339(now or dt.datetime.now(dt.timezone.utc)), exit_code=code,
+        started = self.screened_start if started is None else started
+        ended = now or dt.datetime.now(dt.timezone.utc)
+        # coord refuses the WHOLE pass when one row's nudge_measured_at is later
+        # than ended_at plus its 5-minute slack, so a future-dated transcript
+        # stamp (a clock step) drops only that row's value, never the pass.
+        limit = ended + dt.timedelta(seconds=MEASURED_SLACK_S)
+        for row in rows:
+            at = parse_rfc3339(row.get("nudge_measured_at"))
+            if at is not None and at > limit:
+                del row["nudge_measured_at"]
+        # Sent only when known, for the same reason as a row's nudge_measured_at.
+        known = {"runner_started_at": rfc3339(started)} if started else {}
+        return dict(self.doc, **known, runner_build=build,
+                    ended_at=rfc3339(ended), exit_code=code,
                     step_counts=counts, verdict_histogram=histogram,
                     overlord_versions=overlord_versions(build) if versions is None else versions, rows=rows)
 
@@ -4076,6 +4179,7 @@ def ledger_selftest():
     import contextlib
     import io
     globals()["runner_build"] = lambda: None  # the process exits after this selftest
+    globals()["runner_started"] = lambda: None
     bad = []
     sid = "0f2a1b3c-4d5e-4f60-8a7b-9c0d1e2f3a4b"
     res = [
@@ -4090,7 +4194,8 @@ def ledger_selftest():
     row = pass_row(res[0], "2026-10-24T00:00:00.000Z")
     want = {"terminal_id": "t-stop", "claude_session_id": sid, "session_name": "n" * TEXT_MAX, "tab": "infra",
             "account": "acct1", "screen_verdict": "ACTIVE", "verdict": "STOPPED", "reason_codes": [],
-            "state_since_ms": None, "progress_since_nudge": None, "action": "none", "action_outcome": None,
+            "state_since_ms": None, "progress_since_nudge": None,
+            "action": "none", "action_outcome": None,
             "detail": {"reasons": ["a", "b", "c"]}, "observed_at": "2026-10-24T00:00:00.000Z"}
     if row != want:
         bad.append(f"pass_row(STOPPED) = {row}")
@@ -4098,6 +4203,15 @@ def ledger_selftest():
         got = pass_row(dict(res[0], progress_since_nudge=given), "x")["progress_since_nudge"]
         if got is not want_progress:
             bad.append(f"pass_row(progress_since_nudge={given!r}) = {got!r}")
+    # The measured prompt rides only beside a measurement, as RFC 3339.
+    for given, at, want_at in [(True, 1761270000000, "2025-10-24T01:40:00.000Z"),
+                               (False, 1761270000000, "2025-10-24T01:40:00.000Z"),
+                               (None, 1761270000000, None), (True, None, None), (True, True, None),
+                               (True, 1761270000000.5, "2025-10-24T01:40:00.000Z"),
+                               (True, 0, None), (True, float("nan"), None), (True, "1761270000000", None)]:
+        got = pass_row(dict(res[0], progress_since_nudge=given, nudge_measured_at=at), "x").get("nudge_measured_at")
+        if got != want_at:
+            bad.append(f"pass_row(progress={given!r}, nudge_measured_at={at!r}) = {got!r}, want {want_at!r}")
     fin, held = pass_row(res[1], "x"), pass_row(res[2], "x")
     if (fin["claude_session_id"], fin["account"], fin["state_since_ms"]) != (None, None, 1761270000000):
         bad.append(f"pass_row(FINISHED) = {fin}")
@@ -4180,6 +4294,36 @@ def ledger_selftest():
                 checks.append((rec.build(1, now=when, versions={})["runner_build"], want_build))
         finally:
             globals()["runner_build"] = real_build
+        # The runner start follows the build's rule: read on both sides of the
+        # screen, kept within the tolerance, else unknown.
+        real_started = runner_started
+        t0 = dt.datetime(2026, 10, 24, 0, 0, 0, tzinfo=dt.timezone.utc)
+        near = t0 + dt.timedelta(seconds=RUNNER_START_TOLERANCE_S)
+        far = t0 + dt.timedelta(seconds=RUNNER_START_TOLERANCE_S + 1)
+        try:
+            for before, after, want in [(t0, t0, "2026-10-24T00:00:00.000Z"), (t0, near, "2026-10-24T00:00:00.000Z"),
+                                        (t0, far, None), (None, t0, None), (t0, None, None)]:
+                globals()["runner_started"] = lambda v=before: v
+                rec.screening()
+                globals()["runner_started"] = lambda v=after: v
+                rec.screened(res)
+                globals()["runner_started"] = lambda: far
+                checks.append((rec.build(1, now=when, versions={}).get("runner_started_at"), want))
+        finally:
+            globals()["runner_started"] = real_started
+        # A row's nudge_measured_at within ended_at + 5 min is sent; one past it
+        # is dropped from that row alone (coord would refuse the whole pass).
+        saved_res = rec.res
+        try:
+            end_ms = int(when.timestamp() * 1000)
+            rec.res = [dict(res[0], progress_since_nudge=True, nudge_measured_at=end_ms + 300_000),
+                       dict(res[0], terminalId="t-late", progress_since_nudge=True,
+                            nudge_measured_at=end_ms + 301_000)]
+            got = {r["terminal_id"]: r.get("nudge_measured_at")
+                   for r in rec.build(1, now=when, versions={})["rows"]}
+            checks.append((got, {res[0]["terminalId"]: "2026-10-24T01:07:03.000Z", "t-late": None}))
+        finally:
+            rec.res = saved_res
         for got, exp in checks:
             if got != exp:
                 bad.append(f"build(): {got!r}, want {exp!r}")
@@ -4329,6 +4473,41 @@ def ledger_selftest():
     line = record_pass(big, proxy=door("proxy", None, 1, log), direct=door("direct", None, 1, log))
     if log != [("direct", WRITE_TOOL), ("direct", READ_TOOL)] or "over coord's /mcp door" not in line:
         bad.append(f"record_pass(oversize) = {line!r} via {log}")
+
+    # The read-back observes runner_started_at, not only row_count.
+    start = "2026-11-14T10:00:00.000Z"
+    new_doc = {"pass_id": "p-3", "runner_started_at": start,
+               "rows": [{"terminal_id": "t-a", "nudge_measured_at": start}, {"terminal_id": "t-b"}]}
+    stored_ok = [{"terminal_id": "t-a", "nudge_measured_at": start}, {"terminal_id": "t-b", "nudge_measured_at": None}]
+
+    def new_coord(served, rows=stored_ok):
+        def call(tool, args):
+            if tool == WRITE_TOOL:
+                return {"ok": True, "pass_id": args["pass_id"]}
+            return {"ok": True, "pass": {"pass_id": "p-3", "row_count": 2, "runner_started_at": served,
+                                         "rows": rows}}
+        return call
+    for served, ok in ((start, True), ("2026-11-14T10:00:00+00:00", True), (None, False),
+                       ("2026-11-14T10:00:05Z", False)):
+        line = record_pass(dict(new_doc), proxy=new_coord(served))
+        if line.startswith("ledger: recorded") != ok:
+            bad.append(f"record_pass(read-back runner_started_at={served!r}) = {line!r}, want ok={ok}")
+    # ...and each row's nudge_measured_at: a row that sent one must hold it.
+    for rows, ok in ((stored_ok, True),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": "2026-11-14T10:00:00+00:00"}, {"terminal_id": "t-b"}], True),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": None}, {"terminal_id": "t-b"}], False),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": "2026-11-14T10:00:01Z"}], False),
+                     ([{"terminal_id": "t-b"}], False), (None, False),
+                     ([{"terminal_id": " t-a ", "nudge_measured_at": start}], True)):
+        line = record_pass(dict(new_doc), proxy=new_coord(start, rows))
+        if line.startswith("ledger: recorded") != ok:
+            bad.append(f"record_pass(read-back rows={rows!r}) = {line!r}, want ok={ok}")
+    # A pass that sent no measured prompt needs none back, whatever the rows read.
+    line = record_pass(dict(new_doc, rows=[{"terminal_id": "t-b"}, {"terminal_id": "t-c"}]),
+                       proxy=new_coord(start, None))
+    if not line.startswith("ledger: recorded"):
+        bad.append(f"record_pass(no measured prompt, no rows read back) = {line!r}")
+
     bad += door_wording_selftest()
 
     # The device JWT: an expired source is skipped, never sent.

@@ -70,6 +70,38 @@ use qontinui_runner_lib::wind_down::{
 /// with the restart-readiness tests so the two cannot drift.
 pub(crate) const TERMINAL_PLANE_TABLE_UNKNOWN: &str = "the terminal-session plane could not be determined: the process table is unreadable (the fresh process-table read failed or served only the stale last-good table, ProcessSnapshot::is_unknown), so live `claude` processes cannot be enumerated";
 
+/// The census's undecided population, logged by its one reader: every
+/// `/restart-readiness` request and every wind-down pass come through
+/// [`fresh_pass`], so this is the only place it is observed, and one line
+/// names both consequences (see [`undecided_unknown`]).
+static CENSUS_UNDECIDED_LOG: crate::session::tracking_health::UndecidedLog =
+    crate::session::tracking_health::UndecidedLog::new(
+        "live-claude census",
+        "a restart is refused (safe_to_restart: false) AND the wind-down executor closes \
+         nothing (neither its drain arm nor finished_close) while it lasts",
+    );
+
+/// The `unknowns` entry for a pass whose census holds processes Claude Code's
+/// session registry could not settle
+/// ([`crate::session::tracking_health::TrackingHealthReport::undecided`]): a
+/// possible npm-installed `claude` is never read as absent, so the pass is not
+/// safe to act on. `None` when every process was decided.
+pub(crate) fn undecided_unknown(
+    report: &crate::session::tracking_health::TrackingHealthReport,
+) -> Option<String> {
+    let n = report.undecided.len();
+    (n > 0).then(|| {
+        let pids: Vec<String> = report.undecided.iter().map(|u| u.pid.to_string()).collect();
+        format!(
+            "{n} process{} (pid {}) may be a live npm-installed `claude` that Claude Code's \
+             session registry could not settle ({}), so the live-`claude` census is UNDECIDED",
+            if n == 1 { "" } else { "es" },
+            pids.join(", "),
+            report.undecided[0].reason,
+        )
+    })
+}
+
 /// What one [`observe_and_apply`] pass looked at, kept so a caller that ACTS on
 /// a verdict (the Phase 4 wind-down executor) can log the inputs the verdict
 /// was reached on, and resolve a process's pane and kind. Readiness ignores it.
@@ -184,7 +216,10 @@ pub fn observe_and_apply(
 /// census" the plan forbids).
 pub struct FreshPass {
     /// `None` when the terminal plane could not be determined at all; the
-    /// reason is then in `unknowns`.
+    /// reason is then in `unknowns`. A pass that IS here can still be
+    /// incomplete — a census with undecided processes ([`undecided_unknown`]) —
+    /// and then `unknowns` names why: a caller that ACTS on the pass must act
+    /// on nothing while `unknowns` is non-empty.
     pub pass: Option<TrackingHealthPass>,
     pub status_fetch: StatusFetch,
     pub observed: ObservedInputs,
@@ -263,7 +298,14 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
         )
         .await
         {
-            Some(pass) => Some(pass),
+            Some(pass) => {
+                // UNDECIDED reads as not-safe: the pass is kept (its counts
+                // are reported), but it is incomplete, and a caller that acts
+                // on a pass acts on none with an `unknowns` entry.
+                let _ = CENSUS_UNDECIDED_LOG.observe(&pass.report.undecided);
+                unknowns.extend(undecided_unknown(&pass.report));
+                Some(pass)
+            }
             None => {
                 unknowns.push(TERMINAL_PLANE_TABLE_UNKNOWN.to_string());
                 None
@@ -319,7 +361,8 @@ pub async fn recheck(
     terminal_id: &str,
 ) -> Option<WindDownView> {
     let fresh = fresh_pass(app, grace).await;
-    if !fresh.observed.looping_registry_resolved {
+    // An incomplete pass (see [`FreshPass::pass`]) re-derives no verdict.
+    if !fresh.observed.looping_registry_resolved || !fresh.unknowns.is_empty() {
         return None;
     }
     // The pane must still host this session: a terminal id that has been

@@ -41,38 +41,38 @@ describe("readOccupiedPageIds (fail-closed occupancy)", () => {
 
   it("unions live terminals and restorable sessions", async () => {
     answer(okTerminals("a"), okSessions("b"));
-    expect(await readOccupiedPageIds()).toEqual(new Set(["a", "b"]));
+    expect(await readOccupiedPageIds()).toEqual({ ids: new Set(["a", "b"]), complete: true });
   });
 
-  it("returns null when terminal_list throws (occupancy UNKNOWN, not empty)", async () => {
+  it("is incomplete when terminal_list throws, and keeps what the other source read", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "terminal_list") throw new Error("boom");
       return okSessions("b");
     });
-    expect(await readOccupiedPageIds()).toBeNull();
+    expect(await readOccupiedPageIds()).toEqual({ ids: new Set(["b"]), complete: false });
   });
 
-  it("returns null when the session list is malformed", async () => {
+  it("is incomplete when the session list is malformed", async () => {
     answer(okTerminals("a"), { data: {} });
-    expect(await readOccupiedPageIds()).toBeNull();
+    expect(await readOccupiedPageIds()).toEqual({ ids: new Set(["a"]), complete: false });
   });
 
-  it("returns null when terminal_list reports success: false", async () => {
+  it("is incomplete when terminal_list reports success: false", async () => {
     answer({ success: false }, okSessions());
-    expect(await readOccupiedPageIds()).toBeNull();
+    expect((await readOccupiedPageIds()).complete).toBe(false);
   });
 
-  it("bestEffort keeps what was read from the surviving source", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "terminal_list") throw new Error("boom");
-      return okSessions("b");
+  it("is incomplete when a drain withholds the restorable set (empty is UNKNOWN)", async () => {
+    answer(okTerminals("a"), {
+      success: true,
+      data: { sessions: [], deferredByDrain: { state: "drained", reason: "coord drained" } },
     });
-    expect(await readOccupiedPageIds(true)).toEqual(new Set(["b"]));
+    expect(await readOccupiedPageIds()).toEqual({ ids: new Set(["a"]), complete: false });
   });
 
-  it("an empty but well-formed read is an empty set, not null", async () => {
+  it("an empty but well-formed read is a complete empty set", async () => {
     answer(okTerminals(), okSessions());
-    expect(await readOccupiedPageIds()).toEqual(new Set());
+    expect(await readOccupiedPageIds()).toEqual({ ids: new Set(), complete: true });
   });
 });
 
@@ -120,65 +120,73 @@ describe("TerminalPageTabBar close-empty button", () => {
 describe("closeEmptyPagesWith (the close loop)", () => {
   const pg = (id: string): TerminalPageConfig => ({ id, name: id, createdAt: 0 });
   const pages = [pg("a"), pg("b"), pg("c")];
-
-  it("closes only the pages that are empty on both reads", async () => {
+  const read = (...ids: string[]) => ({ ids: new Set(ids), complete: true });
+  const UNKNOWN = { ids: new Set<string>(), complete: false };
+  const recorder = () => {
     const removed: string[] = [];
-    const n = await closeEmptyPagesWith(
-      pages,
-      async () => new Set(["a"]),
-      async (id) => {
+    return {
+      removed,
+      remove: async (id: string) => {
         removed.push(id);
+        return id;
       },
-    );
-    expect(removed).toEqual(["b", "c"]);
+    };
+  };
+
+  it("removes only the pages that are empty on both reads", async () => {
+    const r = recorder();
+    const n = await closeEmptyPagesWith(pages, async () => read("a"), r.remove);
+    expect(r.removed).toEqual(["b", "c"]);
     expect(n).toBe(2);
   });
 
-  it("closes nothing when occupancy is unreadable", async () => {
-    const remove = vi.fn(async () => {});
-    expect(await closeEmptyPagesWith(pages, async () => null, remove)).toBe(0);
+  it("removes nothing when occupancy is unreadable", async () => {
+    const remove = vi.fn(async () => "x");
+    expect(await closeEmptyPagesWith(pages, async () => UNKNOWN, remove)).toBe(0);
     expect(remove).not.toHaveBeenCalled();
   });
 
+  it("removes nothing on a drain-deferred read, even though it lists no restorable rows", async () => {
+    invokeMock.mockReset();
+    answer(okTerminals("a"), {
+      success: true,
+      data: { sessions: [], deferredByDrain: { state: "drained", reason: "x" } },
+    });
+    const r = recorder();
+    expect(await closeEmptyPagesWith(pages, readOccupiedPageIds, r.remove)).toBe(0);
+    expect(r.removed).toEqual([]);
+  });
+
   it("skips a page that became occupied between the first read and its turn", async () => {
-    const removed: string[] = [];
+    const r = recorder();
     // read #1 picks candidates b and c; by the time b's per-page re-check runs,
     // a terminal has landed on b.
-    const reads = [new Set(["a"]), new Set(["a", "b"]), new Set(["a", "b"])];
-    const n = await closeEmptyPagesWith(
-      pages,
-      async () => reads.shift() ?? null,
-      async (id) => {
-        removed.push(id);
-      },
-    );
-    expect(removed).toEqual(["c"]);
+    const reads = [read("a"), read("a", "b"), read("a", "b")];
+    const n = await closeEmptyPagesWith(pages, async () => reads.shift() ?? UNKNOWN, r.remove);
+    expect(r.removed).toEqual(["c"]);
     expect(n).toBe(1);
   });
 
   it("skips a page whose re-check cannot be read", async () => {
-    const removed: string[] = [];
-    const reads: Array<Set<string> | null> = [new Set(["a"]), null, new Set(["a"])];
+    const r = recorder();
+    const reads = [read("a"), UNKNOWN, read("a")];
+    const n = await closeEmptyPagesWith(pages, async () => reads.shift() ?? UNKNOWN, r.remove);
+    expect(r.removed).toEqual(["c"]);
+    expect(n).toBe(1);
+  });
+
+  it("does not count a page the record-only removal kept", async () => {
     const n = await closeEmptyPagesWith(
       pages,
-      async () => reads.shift() ?? null,
-      async (id) => {
-        removed.push(id);
-      },
+      async () => read("a"),
+      async (id) => (id === "b" ? null : id),
     );
-    expect(removed).toEqual(["c"]);
     expect(n).toBe(1);
   });
 
   it("keeps one page when every visible page is empty", async () => {
-    const removed: string[] = [];
-    await closeEmptyPagesWith(
-      pages,
-      async () => new Set(),
-      async (id) => {
-        removed.push(id);
-      },
-    );
-    expect(removed).toEqual(["b", "c"]);
+    const r = recorder();
+    await closeEmptyPagesWith(pages, async () => read(), r.remove);
+    expect(r.removed).toEqual(["b", "c"]);
   });
 });

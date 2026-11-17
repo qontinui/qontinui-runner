@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 106 | 107 | 96 | 10 | 0 | 0 |
+| `os_bound_tooling` | 111 | 112 | 96 | 15 | 0 | 0 |
 
 ## `repo_layout` (70 rows)
 
@@ -249,7 +249,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (106 rows)
+## `os_bound_tooling` (111 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -280,6 +280,11 @@ _No hits._
 | `src/crash_observability.rs` | `read_exception` | `cfg(windows)-only fn 'read_exception' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/crash_observability.rs` | `run_bounded` | `cfg(windows)-only fn 'run_bounded' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/crash_observability.rs` | `top_level_filter` | `cfg(windows)-only fn 'top_level_filter' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::created` | `cfg(windows)-only fn 'created' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Reads the held process handle's creation time (GetProcessTimes) to tie the harness's identity proof to that handle. Windows arm of embedded_pg::test_harness::end_postmaster; Linux makes its sysinfo identity proof while holding a pidfd; other Unix falls back to pid signalling. |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::drop` | `cfg(windows)-only fn 'drop' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Closes the held process handle. Windows arm of the test harness's held-handle teardown; Linux closes its pidfd, other Unix holds nothing. |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::image` | `cfg(windows)-only fn 'image' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Reads the held handle's image path (QueryFullProcessImageNameW) as the second identity check. Windows arm of the test harness's end_postmaster; Linux makes its sysinfo identity proof while holding a pidfd. |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::terminate` | `cfg(windows)-only fn 'terminate' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — TerminateProcess + WaitForSingleObject on the same held handle. Windows arm of end_postmaster; Linux sends SIGQUIT then SIGKILL through a pidfd, other Unix through the pid. |
+| `src/embedded_pg/test_harness.rs` | `unix_seconds_of_filetime` | `cfg(windows)-only fn 'unix_seconds_of_filetime' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Converts a Windows FILETIME (100 ns ticks since 1601) to Unix seconds so the owner record's start time compares with sysinfo's. Linux reads /proc/<pid>/stat starttime instead. |
 | `src/env_agent/collectors.rs` | `collect_harness_under` | `"dev-start.ps1",` | 1 | unreviewed |
 | `src/env_agent/collectors.rs` | `collect_harness_under` | `config_repo.join("scripts").join("dev-start.ps1"),` | 1 | unreviewed |
 | `src/env_agent/collectors.rs` | `dev_start_plain_ok` | `rest.contains("qontinui-claude-config\\scripts\\dev-start.ps1")` | 1 | unreviewed |
