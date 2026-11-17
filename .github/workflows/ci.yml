@@ -2616,6 +2616,23 @@ jobs:
         # manifests/plists). These are the ONLY two quick-xml advisories in
         # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
         #
+        # --ignore RUSTSEC-2026-0545 + RUSTSEC-2026-0548: two more zip
+        # advisories (advisory dates 2026-10-22 and 2026-10-17; first seen
+        # red-ing `security` on main 2026-11-17). 0545: AES entries returned
+        # without checking their authentication code when the data ends early
+        # or is empty (fixed in 9.0.0). 0548: `ZipStreamReader` extracts entries
+        # under local-header names that can differ from the central directory
+        # (9.0.5 adds an OPT-IN `enforce_header_consistency`, off by default).
+        # The runner's OWN zip is bumped to 9.0.5 and runner code never uses
+        # `ZipStreamReader`, so both ignores cover ONLY the zip 4.6.1 copy
+        # described in the next paragraph. Neither is reachable there:
+        # zip 4.6.1 is built without `aes-crypto` (its lock entry has no aes
+        # or hmac dependency), so 0545's code is not compiled; the updater
+        # reads with `ZipArchive`, never `ZipStreamReader`, so 0548's API is
+        # not called; and either way it reads only after `verify_signature`
+        # has checked the archive against our updater public key. Drop both
+        # with the four below, on the tauri-plugin-updater >= 2.14.1 upgrade.
+        #
         # --ignore RUSTSEC-2026-0367 + RUSTSEC-2026-0368 + RUSTSEC-2026-0369
         # + RUSTSEC-2026-0429: four zip < 9.0.0 extraction advisories (SUID/SGID
         # bits preserved; symlink targets outside the destination; permissions
@@ -2706,7 +2723,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0387
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0545 --ignore RUSTSEC-2026-0548 --ignore RUSTSEC-2026-0387
 
       # A hosted image ships node; a nawa org runner is not known to, and pnpm
       # needs it, so without this the audit below could run nothing behind its
