@@ -42,8 +42,10 @@
 //! too: after a runner restart there is no launch-failure entry and no prior
 //! close, so the verdict keeps the proposed reason whatever a persisted stamp
 //! would say. A stamp that negates evidence is at or after that evidence, and
-//! both age out on the same [`ENTRY_TTL_MS`], so a stamp always outlives what it
-//! negates.
+//! both age out on the same [`ENTRY_TTL_MS`], so under the TTL a stamp outlives
+//! what it negates. The two live in separate [`MAX_ENTRIES`] LRUs, so a stamp
+//! can still be evicted first once more than that many sessions are noted
+//! alive inside one TTL; the residual is a wrong but restorable `launch-failed`.
 //!
 //! The re-close rule: `record_open` clears a row's close reason when it
 //! re-opens it, so this registry also remembers, per session, when this
@@ -918,17 +920,32 @@ mod tests {
     /// arm, `PollAction::NeedsConfirm =>`.
     #[test]
     fn the_keepalive_arm_is_the_one_liveness_writer() {
-        let main_rs = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join("main.rs"),
-        )
-        .unwrap();
-        let calls: Vec<usize> = main_rs
-            .match_indices(".note_alive(")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(calls.len(), 1, "exactly one note_alive call in main.rs");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Every production `.note_alive(` call outside this module, across src/.
+        let mut writers: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !path.ends_with("terminal/launch_failure.rs")
+                {
+                    let body = std::fs::read_to_string(&path).unwrap();
+                    for _ in body.match_indices(".note_alive(") {
+                        writers.push(path.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            writers,
+            vec![src.join("main.rs")],
+            "exactly one note_alive call outside launch_failure.rs, in main.rs"
+        );
+        let main_rs = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        let call = main_rs.find(".note_alive(").unwrap();
         let keep_alive = main_rs
             .find("PollAction::KeepAlive =>")
             .expect("the poll's KeepAlive arm");
@@ -938,7 +955,7 @@ mod tests {
                 .and_then(|rest| rest.find("PollAction::NeedsConfirm =>"))
                 .expect("the arm after KeepAlive");
         assert!(
-            keep_alive < calls[0] && calls[0] < needs_confirm,
+            keep_alive < call && call < needs_confirm,
             "note_alive sits in the KeepAlive arm"
         );
     }
