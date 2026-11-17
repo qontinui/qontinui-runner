@@ -13,14 +13,16 @@
 //! progress reads as [`Settle::Changing`]. [`settle_of`] follows links, so a
 //! re-link alone, which changes only the link, is not seen, and a binary installed long ago costs one `stat`.
 //!
-//! ONE predicate, two consumers, so they cannot disagree about "settled":
+//! ONE Rust predicate, so the Rust consumers cannot disagree about "settled":
 //! - the native identity shim (`qontinui-shim`'s `run_identity`, plan
 //!   `2026-11-10-shim-settle-wait-and-in-memory-launch-liveness` Phase 3);
-//! - the parent plan's Phase 4 migration hold (`terminal/cli_availability.rs`),
-//!   which must call [`settle_of`] rather than carry a second copy.
+//! - the parent plan's planned Phase 4 migration hold
+//!   (`terminal/cli_availability.rs`, not built yet), which must call
+//!   [`settle_of`] rather than carry a second copy.
 //!
 //! The bash identity shim (`identity_shim.bash`) carries its own copy, as it
-//! does for `is_npm_placeholder`, in whole seconds (`now - ctime >= 3`).
+//! does for `is_npm_placeholder`. It works in whole seconds
+//! (`now - ctime >= 3`), so it is stricter than this predicate by up to 1 s.
 //!
 //! A change time that cannot be read is [`Settle::Unknown`]. Callers that gate a
 //! LAUNCH treat it as settled: waiting on it would delay every launch by the
