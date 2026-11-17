@@ -4522,8 +4522,9 @@ mod tests {
     /// test binary, so no sibling can put a settings file here. The residual trade
     /// (plan Risks R2): a report write moved onto a WORKER thread would be refused
     /// by that gate, which prints its door, path and thread, rather than caught by
-    /// this test. Today `config_report_run` spawns nothing, so every write the
-    /// report makes runs on this test's guarded thread and is still caught. Plan
+    /// this test. `config_report_cmd.rs` itself spawns no thread or task, so
+    /// every write it makes runs on this test's guarded thread and is still
+    /// caught; a callee that spawns one is outside that check. Plan
     /// `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`.
     ///
     /// This fingerprints every file the readers could write, runs the full

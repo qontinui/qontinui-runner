@@ -283,16 +283,23 @@ fn migrate_seed(accounts_path: &Path, unscoped_settings: &Path) -> bool {
 /// (at most once per process — `load_settings` calls this on every load).
 /// The seed is an env-resolved roster write, so a test-binary thread holding no
 /// `env_lock` skips it ([`roster_path_for_write`]).
+///
+/// The gate is decided OUTSIDE the `Once`: a refused caller must neither use it
+/// up (the seed would then never run for the process, whoever asks next) nor
+/// panic inside it under `strict_canary()` (a poisoned `Once` panics every later
+/// `load_settings` in the binary).
 pub fn load_with_migration() -> Option<ClaudeAccountsFile> {
     static MIGRATE_ONCE: std::sync::Once = std::sync::Once::new();
-    MIGRATE_ONCE.call_once(|| {
+    if !MIGRATE_ONCE.is_completed() {
         if let (Ok(accounts), Some(settings)) = (
             roster_path_for_write("claude_accounts::load_with_migration"),
             unscoped_settings_path(),
         ) {
-            migrate_seed(&accounts, &settings);
+            MIGRATE_ONCE.call_once(|| {
+                migrate_seed(&accounts, &settings);
+            });
         }
-    });
+    }
     load()
 }
 
