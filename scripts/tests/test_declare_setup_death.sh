@@ -9,7 +9,6 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-SCRIPT="$ROOT/.github/scripts/declare-setup-death.sh"
 WORKFLOW="$ROOT/.github/workflows/clippy-tiers.yml"
 JOB='Clippy diff-scoped (advisory)'
 DECLARE="::error title=${JOB} SETUP FAILED (not a verdict on this PR)::"
@@ -79,6 +78,15 @@ steps() {
 }
 VERDICT_SKIPPED="Clippy diff-scoped via reviewdog${T}skipped"
 
+# reporter <env...> : the reporter under the GitHub runner's locale, with the
+# case's env assignments applied last (so they override the defaults).
+reporter() {
+  local -a extra=("$@")
+  env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    DECLARE_JOB="$JOB" HARNESS_PATHS_RE="$HARNESS" VERDICT_STEPS="$VERDICT_SKIPPED" \
+    GITHUB_EVENT_NAME=pull_request "${extra[@]}" bash "$ROOT/.github/scripts/declare-setup-death.sh" 2>&1
+}
+
 # run <label> <expect: declare|withhold|silent> [why=<substring>] <env...>
 # A withhold names the reason it must carry, so a withhold for the WRONG
 # reason (an unreadable diff where the harness guard should have fired) fails.
@@ -86,9 +94,7 @@ run() {
   local label="$1" expect="$2"; shift 2
   local why="" out rc got
   case "${1:-}" in why=*) why="${1#why=}"; shift ;; esac
-  out="$(env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-    DECLARE_JOB="$JOB" HARNESS_PATHS_RE="$HARNESS" VERDICT_STEPS="$VERDICT_SKIPPED" \
-    GITHUB_EVENT_NAME=pull_request "$@" bash "$SCRIPT" 2>&1)"
+  out="$(reporter "$@")"
   rc=$?
   if grep -qF "$DECLARE" <<< "$out"; then got=declare
   elif grep -qF '::notice title=' <<< "$out"; then got=withhold
@@ -167,6 +173,18 @@ EO="$TMP/empty-origin"; git init -q -b main "$EO"; echo a > "$EO/a"; git -C "$EO
 git -C "$EO" checkout -q -b pr; git -C "$EO" commit -q --allow-empty -m empty; git -C "$EO" checkout -q main
 git -C "$EO" merge -q --no-ff -m merge pr; EW="$TMP/empty-work"; git clone -q --depth 1 "file://$EO" "$EW" 2> /dev/null
 run "empty PR diff -> withhold (UNKNOWN)" withhold "why=diff against its base is empty" GITHUB_WORKSPACE="$EW" GITHUB_SHA="$(git -C "$EO" rev-parse HEAD)" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+# grep failing at run time (after the pattern probe, which reads /dev/null):
+# its empty output must not read as "no match".
+SHIM="$TMP/grep-shim"; mkdir -p "$SHIM"; REALGREP="$(command -v grep)"
+# shellcheck disable=SC2016 # the shim's expansions run in the shim, not here
+printf '#!/usr/bin/env bash\nin="$(cat)"\n[ -z "$in" ] && exec "%s" "$@" < /dev/null\nexit 2\n' "$REALGREP" > "$SHIM/grep"; chmod +x "$SHIM/grep"
+# shellcheck disable=SC2046
+run "grep errors over the diff -> withhold (UNKNOWN)" withhold "why=grep over this PR's diff failed" $(pr "$W_RUST" "$M_RUST") PATH="$SHIM:$PATH" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+# Title-property escaping: ':' and ',' in the job name must be escaped.
+# shellcheck disable=SC2046
+out="$(reporter $(pr "$W_RUST" "$M_RUST") DECLARE_JOB='a: b, c' SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')")"
+if grep -qF '::error title=a%3A b%2C c SETUP FAILED (not a verdict on this PR)::' <<< "$out"; then ok "title properties escape ':' and ','"
+else bad "title properties escape ':' and ','" "$out"; fi
 # A rename of a frontend input into an inert directory: --no-renames must
 # list the source path, or only the inert destination is seen.
 RO="$TMP/ren-origin"; git init -q -b main "$RO"; git -C "$RO" config uploadpack.allowAnySHA1InWant true

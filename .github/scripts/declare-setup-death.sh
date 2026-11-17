@@ -28,7 +28,9 @@
 #                      step(s); any failure means the red IS a verdict
 #   HARNESS_PATHS_RE   REQUIRED ERE over changed paths: the job's own harness. A PR
 #                      touching any of it may have caused ANY setup death.
-#                      This script's own path is always harness.
+#                      This script's own path is always harness
+#                      (enforced by the copy the PR ships: a guard against
+#                      accident, not intent -- the workflow is the PR's too).
 #   FRONTEND_INERT_RE  optional ERE: paths no frontend step is known to read
 #                      in a way that can FAIL it (an allow-list; default
 #                      below). The vite build's Tailwind scan reads the whole
