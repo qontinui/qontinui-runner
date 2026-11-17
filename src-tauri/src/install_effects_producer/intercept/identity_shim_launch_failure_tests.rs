@@ -18,9 +18,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::shim_test_support::{
-    identity_shim_cmd, write_exe, EXEC_FAILED_BODY, EXE_LOCK, INVOKED_BODY, INVOKED_NO_HOOK_BODY,
+    exe_guard, identity_shim_cmd, write_exe, EXEC_FAILED_BODY, INVOKED_BODY, INVOKED_NO_HOOK_BODY,
     RESOLVE_FAILED_BODY, RESOLVE_FAILED_NO_HOOK_BODY,
 };
+use crate::install_effects_producer::{note_shim_beacon, ShimBeaconRequest};
+use crate::terminal::launch_failure::{LaunchFailure, LaunchFailureRegistry};
 
 const BUDGET: Duration = Duration::from_secs(40);
 
@@ -219,7 +221,7 @@ fn run_shim(real: Real, nested: bool) -> ShimRun {
 /// [`run_shim`], with the SessionStart hook's settings file delivered
 /// (`QONTINUI_CLAUDE_HOOK_SETTINGS`) only when `hook` is set.
 fn run_shim_with(real: Real, nested: bool, hook: bool) -> ShimRun {
-    let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = exe_guard();
     let tmp = tempfile::tempdir().unwrap();
     let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
     std::fs::create_dir_all(&shim_dir).unwrap();

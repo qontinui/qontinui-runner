@@ -1283,14 +1283,22 @@ fn resolve_real_settled_waiting(
 /// One probe of [`resolve_real_settled_waiting`]: the resolved candidate, if
 /// any, judged by the shared predicate at `now`.
 ///
+/// A candidate whose change time could not be read AND that no longer exists
+/// is a MISS (`None`), not [`Settle::Unknown`]: npm's reify renames
+/// `bin/claude` aside between the scan and the read, which is the window this
+/// wait exists for, and an unknown would launch the vanished path at once.
+/// `Unknown` stays for a path that exists with no readable change time.
+///
 /// On Windows the candidate is npm's wrapper, not the image, and the time is a
 /// stand-in that can read a long write's start, so coverage there is
 /// incidental (`intercept_core::settled`, "Windows limits").
 fn settle_probe(found: Option<PathBuf>, now: SystemTime) -> Option<(PathBuf, Settle)> {
-    found.map(|path| {
-        let settle = settle_of(&path, now);
-        (path, settle)
-    })
+    let path = found?;
+    let settle = settle_of(&path, now);
+    if settle == Settle::Unknown && !path.exists() {
+        return None;
+    }
+    Some((path, settle))
 }
 
 /// The one stderr line each kind of wait announces, once.
@@ -2093,6 +2101,42 @@ mod tests {
             Some((file, Settle::Settled))
         );
         assert_eq!(settle_probe(None, changed), None, "a miss stays a miss");
+    }
+
+    /// A candidate the scan resolved that is gone by the time its change time
+    /// is read (npm's reify renamed it aside) is a miss, not an unknown.
+    #[test]
+    fn settle_probe_reads_a_candidate_that_vanished_as_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("claude");
+        assert_eq!(settle_probe(Some(gone), SystemTime::now()), None);
+    }
+
+    /// Scripted: a candidate that vanishes mid-wait (the probe now reads it as
+    /// a miss) and comes back settled is waited out within one bound, never
+    /// launched while gone.
+    #[test]
+    fn resolve_settled_with_wait_waits_out_a_candidate_that_vanishes() {
+        let (mut sleeps, mut notes) = (0, Vec::new());
+        let got = resolve_settled_with_wait(
+            scripted(vec![changing(0), None, Some(Settle::Settled)]),
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+            |n| notes.push(n),
+        );
+        assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")));
+        assert_eq!(sleeps, 2);
+        assert_eq!(
+            notes,
+            [
+                WaitNote::Changing {
+                    path: PathBuf::from("/real/claude"),
+                    age: Duration::ZERO,
+                },
+                WaitNote::Missing,
+            ]
+        );
     }
 
     #[test]
