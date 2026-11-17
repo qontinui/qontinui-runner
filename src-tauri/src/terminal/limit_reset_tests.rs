@@ -647,7 +647,7 @@ fn only_a_stop_or_a_possible_migration_needs_the_roster_probe() {
 #[tokio::test]
 async fn a_dropped_continue_run_does_not_leave_its_stop_in_flight() {
     let ledger: Mutex<Option<ContinueLedger>> = Mutex::new(None);
-    let run = run_continue(&ledger, "s", "e", || {}, || std::future::pending());
+    let run = run_continue(&ledger, "s", "e", || {}, std::future::pending);
     // Poll it once (the claim is taken), then drop it mid-watch.
     let mut run = Box::pin(run);
     assert!(futures::poll!(run.as_mut()).is_pending());
