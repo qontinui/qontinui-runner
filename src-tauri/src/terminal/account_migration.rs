@@ -598,23 +598,15 @@ impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
 }
 
 /// The session's transcript, classified ([`super::limit_stop`]), read off the
-/// async workers. A record with no working dir cannot be located: UNKNOWN.
+/// async workers ([`record_limit_stop`]).
 async fn read_limit_stop(
     record: &TerminalSessionRecord,
     src: &str,
 ) -> super::limit_stop::LimitStopRead {
-    let Some(working_dir) = record.working_dir.clone() else {
-        return super::limit_stop::LimitStopRead::Unreadable(
-            "session record has no working_dir — cannot locate transcript".to_string(),
-        );
-    };
-    let path = super::transcript::session_transcript_path(
-        Path::new(src),
-        &working_dir,
-        &record.claude_session_id,
-    );
+    let record = record.clone();
+    let src = src.to_string();
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-        super::limit_stop::transcript_limit_stop(&path)
+        record_limit_stop(&record, &src)
     })
     .await
     .unwrap_or_else(|e| {
@@ -622,6 +614,29 @@ async fn read_limit_stop(
             "transcript read task did not complete: {e}"
         ))
     })
+}
+
+/// Blocking: did the session on `record` (account `src`) stop at a usage
+/// limit? Its own transcript and its background subagents'
+/// ([`super::limit_stop::transcript_limit_stop`]). Every hint reads this, so a
+/// pane first sighted before its limit is re-checked when its hint fires; the
+/// first-sight check ([`super::limit_reentry`]) reads it too. A record with no
+/// working dir cannot be located: UNKNOWN.
+pub(crate) fn record_limit_stop(
+    record: &TerminalSessionRecord,
+    src: &str,
+) -> super::limit_stop::LimitStopRead {
+    let Some(working_dir) = record.working_dir.as_deref() else {
+        return super::limit_stop::LimitStopRead::Unreadable(
+            "session record has no working_dir — cannot locate transcript".to_string(),
+        );
+    };
+    let path = super::transcript::session_transcript_path(
+        Path::new(src),
+        working_dir,
+        &record.claude_session_id,
+    );
+    super::limit_stop::transcript_limit_stop(&path)
 }
 
 /// The log line for a hint that does nothing.
