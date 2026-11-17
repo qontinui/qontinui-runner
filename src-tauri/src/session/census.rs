@@ -117,26 +117,10 @@ pub struct CensusSnapshot {
     pub sessions: Vec<CensusRow>,
 }
 
-/// The contract's account label for a config dir: the basename minus a
-/// leading `.claude-` (`~/.claude-tiohorst` → `tiohorst`), `default` for a
-/// plain `.claude`, and the bare basename for anything else (a
-/// `CLAUDE_CONFIG_DIR` pinned somewhere unconventional).
-///
-/// Deliberately NOT [`crate::session::past_sessions::account_from_config_dir`]:
-/// that labels the default home `unknown` because the session-repository
-/// identity key depends on it; the census contract names it `default`.
-pub fn account_label(config_dir: &Path) -> Option<String> {
-    let base = config_dir.file_name()?.to_str()?;
-    if base == ".claude" {
-        return Some("default".to_string());
-    }
-    Some(
-        base.strip_prefix(".claude-")
-            .filter(|s| !s.is_empty())
-            .unwrap_or(base)
-            .to_string(),
-    )
-}
+/// The contract's account label for a config dir, and the session-id shape
+/// check that keeps a registry-supplied id out of a path join — ONE
+/// implementation, shared with the session-identity reporter.
+pub use super::identity_stamp::{account_label, is_uuid_shaped};
 
 /// Epoch milliseconds → RFC 3339, `None` for a non-positive or out-of-range
 /// value (a registry row that omitted the field parses as `0`).
@@ -147,13 +131,6 @@ fn ms_to_rfc3339(ms: i64) -> Option<String> {
     Utc.timestamp_millis_opt(ms)
         .single()
         .map(|t| t.to_rfc3339())
-}
-
-/// A hyphenated, 36-character UUID — the only shape of session id this module
-/// will splice into a file name. A registry row is written by another program,
-/// so an id like `../x` must never reach a path join.
-pub fn is_uuid_shaped(s: &str) -> bool {
-    s.len() == 36 && uuid::Uuid::try_parse(s).is_ok()
 }
 
 // ===========================================================================
@@ -462,10 +439,11 @@ fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> Ce
         tmux_pane: (probes.tmux_pane_of)(s.pid)
             .or_else(|| s.tmux.as_deref().and_then(tmux_pane_from_locator)),
         // Never Claude Code's own `derived` auto-name, which may summarise the
-        // conversation — the same rule the identity reporter applies
-        // (`identity_stamp::registry_name`).
-        window_name: (s.name_source.as_deref() != Some("derived"))
-            .then(|| non_empty(&s.name))
+        // conversation, and never a name past coord's bound (omitted, not
+        // truncated) — the identity reporter's rules
+        // (`identity_stamp::operator_named` / `bounded_name`).
+        window_name: super::identity_stamp::operator_named(s)
+            .then(|| super::identity_stamp::bounded_name(&s.name))
             .flatten(),
         window_name_source: s.name_source.clone(),
         registry_status: non_empty(&s.status),
@@ -635,7 +613,11 @@ enum PostState {
     Ok,
     NoDeviceId,
     Unpaired,
-    Snapshot,
+    /// The snapshot was not built, with a coarse reason (never a path list:
+    /// the state is compared tick to tick, so it must not churn).
+    Snapshot(&'static str),
+    /// The blocking task resolving the device id and credential failed.
+    IdentityTask,
     /// coord answered 503 `session_census_unavailable`: its census tables are
     /// not deployed yet. A quiet, retryable state — not a fault of this runner.
     Unavailable,
@@ -695,10 +677,13 @@ fn log_transition(state: &PostState) {
         PostState::Unpaired => {
             "session census: no device credential (unpaired) — not posting (state change)".into()
         }
-        PostState::Snapshot => {
-            "session census: process snapshot or census build indeterminate — skipped (an \
-             empty census would read as every session dead)"
-                .into()
+        PostState::Snapshot(why) => format!(
+            "session census: snapshot indeterminate ({why}) — not posting (a short census \
+             would read live sessions as dead)"
+        )
+        .into(),
+        PostState::IdentityTask => {
+            "session census: device-id/credential lookup task failed — not posting".into()
         }
         PostState::Unavailable => {
             "session census: coord answered 503 (census store not deployed yet) — retrying each \
@@ -770,7 +755,7 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
         Ok(p) => p,
         Err(e) => {
             debug!(error = %e, "session census: process snapshot indeterminate");
-            return PostState::Snapshot;
+            return PostState::Snapshot("process table");
         }
     };
     let taken = Instant::now();
@@ -797,12 +782,14 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
     let snapshot = match built {
         Ok(Ok(s)) => s,
         Ok(Err(why)) => {
-            debug!(why = %why, "session census: snapshot indeterminate — not posting");
-            return PostState::Snapshot;
+            // The paths, once per distinct reason, at info: a record that stays
+            // unreadable keeps the census dark, and this line names it.
+            log_incomplete_once(&why);
+            return PostState::Snapshot("registry read incomplete");
         }
         Err(e) => {
             debug!(error = %e, "session census: build task failed");
-            return PostState::Snapshot;
+            return PostState::Snapshot("build task failed");
         }
     };
     remember(&snapshot, taken);
@@ -816,27 +803,30 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
     // so on the blocking pool) and presented verbatim below. coord's ingest
     // 403s an agent or bootstrap token, and a path device that differs from the
     // token's. No credential ⇒ no post: never anonymous.
+    // The coord base (env + profile/settings files) is read in the same task.
     let ident = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(|| {
         let device_id = crate::agent_runtime::load_local_device_id();
         let token = match device_id {
             Some(_) => crate::auth::device_bearer_scoped(crate::auth::TenantScope::Device),
             None => None,
         };
-        (device_id, token)
+        let (base, _src) = qontinui_runner_lib::profiles::coord_base_with_source();
+        (device_id, token, base)
     })
-    .await
-    .unwrap_or((None, None));
-    let Some(device_id) = ident.0 else {
+    .await;
+    let Ok((device_id, token, base)) = ident else {
+        return PostState::IdentityTask;
+    };
+    let Some(device_id) = device_id else {
         return PostState::NoDeviceId;
     };
-    let Some(token) = ident.1 else {
+    let Some(token) = token else {
         return PostState::Unpaired;
     };
     let Some(client) = client else {
         return PostState::Transport;
     };
 
-    let (base, _src) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = format!(
         "{}/coord/session-census/{device_id}",
         base.trim_end_matches('/')
@@ -876,7 +866,23 @@ fn post_state_for(status: reqwest::StatusCode) -> PostState {
 /// Is `state` logged at `info` rather than `warn`? Everything but a coord
 /// error that is not "behind this runner" and an unreachable coord.
 fn is_quiet(state: &PostState) -> bool {
-    !matches!(state, PostState::Http(_) | PostState::Transport)
+    !matches!(
+        state,
+        PostState::Http(_) | PostState::Transport | PostState::IdentityTask
+    )
+}
+
+/// Log an incomplete registry read's detail at info, once per distinct detail
+/// — so a record that stays unreadable is named without a line every tick.
+fn log_incomplete_once(why: &str) {
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if last.as_deref() != Some(why) {
+        info!("session census: {why}");
+        *last = Some(why.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -1124,7 +1130,8 @@ mod tests {
         }
         assert!(is_quiet(&PostState::RouteAbsent));
         assert!(is_quiet(&PostState::Unavailable));
-        assert!(is_quiet(&PostState::Snapshot));
+        assert!(is_quiet(&PostState::Snapshot("registry read incomplete")));
+        assert!(!is_quiet(&PostState::IdentityTask));
         assert!(!is_quiet(&PostState::Http(500)));
         assert!(!is_quiet(&PostState::Transport));
     }
@@ -1160,6 +1167,19 @@ mod tests {
             Some("derived")
         );
         assert_eq!(snap.sessions[1].window_name.as_deref(), Some("steward"));
+
+        // A name past coord's bound is omitted, never truncated.
+        let long = "n".repeat(super::super::identity_stamp::MAX_NAME_CHARS + 1);
+        let b = home(tmp.path(), ".claude-y");
+        registry_row(
+            &b,
+            300,
+            SID_A,
+            &format!(r#","name":"{long}","nameSource":"user""#),
+        );
+        let live: HashSet<u32> = [300].into_iter().collect();
+        let snap = build_snapshot(&[b], &live, Utc::now(), None, &no_probes()).unwrap();
+        assert_eq!(snap.sessions[0].window_name, None);
     }
 
     #[test]

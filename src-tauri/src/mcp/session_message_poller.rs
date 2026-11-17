@@ -631,6 +631,11 @@ impl SurfacingTracker {
         self.entries.contains_key(&(message_id.to_string(), reason))
     }
 
+    /// Drop one `(message, reason)` entry.
+    fn forget(&mut self, message_id: &str, reason: BlockReason) {
+        self.entries.remove(&(message_id.to_string(), reason));
+    }
+
     /// A successful delivery clears every tracking entry for the message.
     fn clear_message(&mut self, message_id: &str) {
         self.entries.retain(|(mid, _), _| mid != message_id);
@@ -1154,6 +1159,23 @@ fn unhosted_reason(
     }
 }
 
+/// FRESH evidence (`NotLive`: the session exited; `LiveUnderARunner`: a
+/// runner now hosts it) ends a message's sticky `no_pusher`, so a later
+/// `Unknown` census cannot re-assert it with the old entry's clock.
+fn forget_stale_no_pusher(
+    tracker: &mut SurfacingTracker,
+    message_id: &str,
+    verdict: crate::session::census::LocalVerdict,
+) {
+    use crate::session::census::LocalVerdict;
+    if matches!(
+        verdict,
+        LocalVerdict::NotLive | LocalVerdict::LiveUnderARunner
+    ) {
+        tracker.forget(message_id, BlockReason::NoPusher);
+    }
+}
+
 /// The envelope's tag name, matched case-insensitively by
 /// [`reminder_close_tag_end`].
 const REMINDER_TAG_NAME: &[u8] = b"system-reminder";
@@ -1575,10 +1597,10 @@ async fn deliver_once(
             // counter, one info line per window, and past the threshold the
             // surfacing POST (fix 2; once per repeat window, fail-open). Which
             // reason is the census's call: see `unhosted_reason`.
-            let (reason, detail) = unhosted_reason(
-                crate::session::census::local_verdict(to_session, now),
-                tracker.has(&msg.message_id, BlockReason::NoPusher),
-            );
+            let verdict = crate::session::census::local_verdict(to_session, now);
+            let (reason, detail) =
+                unhosted_reason(verdict, tracker.has(&msg.message_id, BlockReason::NoPusher));
+            forget_stale_no_pusher(tracker, &msg.message_id, verdict);
             surface_blocked_delivery(&ctx, tracker, msg, to_session, reason, detail, now).await;
             continue;
         };
@@ -2336,6 +2358,29 @@ mod tests {
             unhosted_reason(LocalVerdict::LiveUnderARunner, true).0,
             BlockReason::TargetNotLive
         );
+    }
+
+    #[test]
+    fn fresh_evidence_ends_a_sticky_no_pusher_for_good() {
+        use crate::session::census::LocalVerdict;
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let (thresh, repeat) = (Duration::from_secs(60), Duration::from_secs(1800));
+        // LiveUnhosted -> no_pusher, noted.
+        let (r1, _) = unhosted_reason(
+            LocalVerdict::LiveUnhosted,
+            t.has("m", BlockReason::NoPusher),
+        );
+        assert_eq!(r1, BlockReason::NoPusher);
+        t.note_blocked("m", r1, t0, thresh, repeat, true);
+        // The session exits: a fresh NotLive wins and clears the sticky entry.
+        let v = LocalVerdict::NotLive;
+        let (r2, _) = unhosted_reason(v, t.has("m", BlockReason::NoPusher));
+        forget_stale_no_pusher(&mut t, "m", v);
+        assert_eq!(r2, BlockReason::TargetNotLive);
+        // A later stale census (Unknown) must NOT re-assert no_pusher.
+        let (r3, _) = unhosted_reason(LocalVerdict::Unknown, t.has("m", BlockReason::NoPusher));
+        assert_eq!(r3, BlockReason::TargetNotLive);
     }
 
     #[test]
