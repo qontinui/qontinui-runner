@@ -100,7 +100,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
 pub use qontinui_runner_lib::tenant_pin;
 pub mod finish_heal; // Heal finished marks stamped synced over a write coord never applied; the finish read-back's coord.observed (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 5)
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
-pub mod finished_close_guard; // The finished_close arm's close guard: every served close condition judged fresh per close, SHADOW in Phase 1 (plan 2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions) // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
+pub mod finished_close_guard; // The finished_close arm's close guard: every served close condition judged fresh per close, SHADOW in Phase 1 (plan 2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions)
 pub mod stray_wait; // Tells a wait loop that can never end from work, so a finished session it holds can close (plan 2026-10-23-finished-sessions-stay-busy-behind-background-wait-loops-that-can-never-exit, Phase 4)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)

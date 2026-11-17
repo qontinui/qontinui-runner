@@ -192,6 +192,19 @@ pub fn facts_from_tail(tail: &str, whole_file: bool) -> TranscriptFacts {
                             .iter()
                             .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
                     });
+                // An attachment the user sent with no text (an image-only
+                // paste, a document) is still the user speaking: it opens a
+                // turn and is a prompt, even though it carries no text block
+                // (review A3; the served script misses it too, so a revival
+                // made that way would otherwise read as no revival).
+                let has_attachment = content.and_then(Value::as_array).is_some_and(|blocks| {
+                    blocks.iter().any(|b| {
+                        !matches!(
+                            b.get("type").and_then(Value::as_str),
+                            Some("text") | Some("tool_result") | None
+                        )
+                    })
+                });
                 let text: String = match content {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Array(blocks)) => blocks
@@ -219,7 +232,8 @@ pub fn facts_from_tail(tail: &str, whole_file: bool) -> TranscriptFacts {
                 } else {
                     let not_a_turn = starts_with_any(t, &NOT_A_TURN)
                         && (meta || !t.starts_with("<system-reminder>"));
-                    if !(turn_in || t.is_empty() || compact || not_a_turn || has_tool_result) {
+                    let empty = t.is_empty() && !has_attachment;
+                    if !(turn_in || empty || compact || not_a_turn || has_tool_result) {
                         turn_before = Some((f.last_turn_open_ms, turn_text.clone()));
                         f.last_turn_open_ms = Some(at);
                         turn_text = unwrap_pasted(t).to_string();
@@ -237,7 +251,9 @@ pub fn facts_from_tail(tail: &str, whole_file: bool) -> TranscriptFacts {
                             prompt_text = text_before;
                         }
                     }
-                } else if !text.trim().is_empty() && !starts_with_any(t, &NON_PROMPT) {
+                } else if (!text.trim().is_empty() || has_attachment)
+                    && !starts_with_any(t, &NON_PROMPT)
+                {
                     prompt_before = Some((f.last_prompt_ms, prompt_text.clone()));
                     f.last_prompt_ms = Some(at);
                     prompt_text = text.trim().to_string();
@@ -275,7 +291,10 @@ pub fn read_facts(path: &Path, stamp: Option<FileStamp>, window: u64) -> Option<
     }
     let len = std::fs::metadata(path).ok()?.len();
     let tail = read_tail_lossy(path, window)?;
-    let facts = facts_from_tail(&tail, len <= window);
+    // Stat again AFTER the read: a file that grew past the window between the
+    // two calls was not read whole, whatever the first length said (review A5).
+    let len_after = std::fs::metadata(path).ok()?.len();
+    let facts = facts_from_tail(&tail, len.max(len_after) <= window);
     if let Some(stamp) = stamp {
         if let Ok(mut guard) = cache().lock() {
             if guard.len() >= CACHE_CAP {
@@ -436,6 +455,34 @@ mod tests {
 
     fn facts(lines: &[String]) -> TranscriptFacts {
         facts_from_tail(&lines.join("\n"), true)
+    }
+
+    /// Review A3: a user line carrying only an attachment (no text block) is
+    /// the user speaking, so it opens a turn and is the newest prompt.
+    #[test]
+    fn an_attachment_only_user_line_is_a_prompt_and_opens_a_turn() {
+        let f = facts(&[
+            user(0, serde_json::json!("fix the bug"), &[]),
+            said(5, "end_turn"),
+            user(
+                60,
+                serde_json::json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}]),
+                &[],
+            ),
+            said(65, "end_turn"),
+        ]);
+        assert_eq!(f.last_prompt_ms, Some(t(60)));
+        assert_eq!(f.last_turn_open_ms, Some(t(60)));
+
+        // A tool result is still not one.
+        let g = facts(&[
+            user(0, serde_json::json!("fix the bug"), &[]),
+            tool_call(5),
+            tool_result(6),
+            said(7, "end_turn"),
+        ]);
+        assert_eq!(g.last_prompt_ms, Some(t(0)));
+        assert_eq!(g.last_turn_open_ms, Some(t(0)));
     }
 
     const WAKE: &str = "<task-notification>scheduled wake-up</task-notification>";

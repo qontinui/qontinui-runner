@@ -11,9 +11,11 @@
 //!
 //! ## Two arms, one tick, one budget
 //!
-//! [`decide_tick`] picks exactly ONE action per tick, so the two arms never
-//! run in the same tick and together they never close more than
-//! [`MAX_CLOSES_PER_TICK`] sessions in one. They also share the
+//! [`decide_tick`] picks exactly ONE action per tick. A drained tick runs both
+//! close passes ([`tick_passes`]), the guarded `finished_close` pass first, and
+//! the drain arm gets only what that pass left of the ONE budget
+//! ([`drain_share_after`]), so together they never attempt more than
+//! [`MAX_CLOSES_PER_TICK`] closes in one tick. They also share the
 //! [`ClockJumpGuard`] quarantine and the one `graceful_exit` call below.
 //!
 //! * **The drain arm** ([`TickAction::WindDown`]) — while drained, described
@@ -244,7 +246,10 @@ pub struct TickPasses {
 /// arm itself still presents no close authority, and the guarded arm closes
 /// the qualifying finished terminal sessions. The `finished_close` pass runs
 /// FIRST on such a tick, so a qualifying session is judged by the guard before
-/// the drain arm reaches it. `Undrain` and `Nothing` (the `Unknown` drain
+/// the drain arm reaches it. The two passes share ONE per-tick budget: the
+/// drain arm closes at most what the guarded batch left of
+/// [`MAX_CLOSES_PER_TICK`], and never a session that batch already judged this
+/// tick ([`drain_share_after`]). `Undrain` and `Nothing` (the `Unknown` drain
 /// state) run neither close pass.
 pub fn tick_passes(action: TickAction) -> TickPasses {
     match action {
@@ -262,6 +267,37 @@ pub fn tick_passes(action: TickAction) -> TickPasses {
             ..TickPasses::default()
         },
         TickAction::Nothing => TickPasses::default(),
+    }
+}
+
+/// What the drain arm may still do on a tick whose guarded `finished_close`
+/// pass already ran: the rest of the ONE per-tick budget, and the sessions it
+/// must skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrainShare {
+    /// Close attempts left for the drain arm this tick.
+    pub budget: usize,
+    /// `claude` session ids the guarded batch already judged this tick. The
+    /// drain arm does not re-attempt them: the guard's verdict (held, unknown,
+    /// or a close it made) stands for the tick.
+    pub skip: BTreeSet<String>,
+}
+
+/// PURE: the drain arm's share of a tick after the guarded pass reported
+/// `guarded` (`None` when it did not run). Every candidate the guarded batch
+/// took, whatever its outcome, spent one slot of [`MAX_CLOSES_PER_TICK`].
+pub(crate) fn drain_share_after(guarded: Option<&FinishedCloseTick>) -> DrainShare {
+    match guarded {
+        Some(FinishedCloseTick::Ran {
+            batched, outcomes, ..
+        }) => DrainShare {
+            budget: MAX_CLOSES_PER_TICK.saturating_sub(outcomes.len()),
+            skip: batched.iter().cloned().collect(),
+        },
+        _ => DrainShare {
+            budget: MAX_CLOSES_PER_TICK,
+            skip: BTreeSet::new(),
+        },
     }
 }
 
@@ -639,9 +675,11 @@ async fn tick_once(state: &mut ExecutorState) {
         crate::coord_drain_state::current_dispatch_role(),
     );
     let passes = tick_passes(action);
-    if passes.finished_close {
-        finished_close_once(&app, grace, clock, &mut state.finished_close_last_census).await;
-    }
+    let guarded = if passes.finished_close {
+        Some(finished_close_once(&app, grace, clock, &mut state.finished_close_last_census).await)
+    } else {
+        None
+    };
     if passes.undrain {
         // `undrain` reports what it could not restart, so a kind the drain
         // re-armed under is still owed and is retried on a later undrain.
@@ -650,7 +688,9 @@ async fn tick_once(state: &mut ExecutorState) {
     if passes.drain {
         state.was_drained = true;
         match clock {
-            ClockVerdict::Trustworthy => wind_down_once(&app, grace).await,
+            ClockVerdict::Trustworthy => {
+                wind_down_once(&app, grace, drain_share_after(guarded.as_ref())).await
+            }
             // Hazard 1. Fail closed: no close is attempted on an idle
             // window measured across a clock step. Already logged at
             // detection, above.
@@ -963,8 +1003,15 @@ async fn save_stopped_by_drain(set: StoppedByDrain) {
 }
 
 /// One wind-down pass: observe, then close what is eligible.
-async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
+async fn wind_down_once(app: &tauri::AppHandle, grace: Duration, share: DrainShare) {
     use tauri::Manager;
+
+    if share.budget == 0 {
+        debug!(
+            "wind_down_executor: the guarded finished_close batch spent this tick's close budget, so the drain arm waits for the next tick"
+        );
+        return;
+    }
 
     let fresh = wind_down_observer::fresh_pass(app, grace).await;
     let Some(pass) = fresh.pass.as_ref() else {
@@ -995,14 +1042,16 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
 
-    let candidates = select_candidates(&pass.report.terminal_hosted, &fresh.observed);
+    let mut candidates = select_candidates(&pass.report.terminal_hosted, &fresh.observed);
+    candidates.retain(|(session_id, _)| !share.skip.contains(session_id));
+    candidates.truncate(share.budget);
 
     if candidates.is_empty() {
         return;
     }
     info!(
         eligible = candidates.len(),
-        budget = MAX_CLOSES_PER_TICK,
+        budget = share.budget,
         "wind_down_executor: the device is drained — closing eligible sessions"
     );
 
@@ -1197,9 +1246,11 @@ pub(crate) enum FinishedCloseTick {
     /// The census ran. `judged` is every custody verdict reached, in order;
     /// `obligations` is every obligations verdict reached, which is only for
     /// the candidates whose custody was clean; `outcomes` is the close batch
-    /// over the ones that were both.
+    /// over the ones that were both. `batched` is the session ids handed to
+    /// that batch, in order (the drain arm's skip set on a drained tick).
     Ran {
         judged: Vec<(String, CustodyVerdict)>,
+        batched: Vec<String>,
         obligations: Vec<(String, ObligationsVerdict)>,
         outcomes: Vec<CandidateOutcome>,
     },
@@ -1266,6 +1317,9 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     *last_census = Some(now);
     let Some(pass) = world.census().await else {
         debug!("wind_down_executor: finished_close has no census this tick — nothing closed");
+        // Nothing was judged this tick, so no earlier batch's guard verdicts
+        // may stay published as current (review A6).
+        world.publish_close_guards(&[]);
         return FinishedCloseTick::NoCensus;
     };
     let candidates = {
@@ -1278,6 +1332,7 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         world.publish_close_guards(&[]);
         return FinishedCloseTick::Ran {
             judged: Vec::new(),
+            batched: Vec::new(),
             obligations: Vec::new(),
             outcomes: Vec::new(),
         };
@@ -1366,6 +1421,7 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         world.publish_close_guards(&[]);
         return FinishedCloseTick::Ran {
             judged,
+            batched: Vec::new(),
             obligations: obligations_judged,
             outcomes: Vec::new(),
         };
@@ -1376,12 +1432,26 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         shadow,
         "wind_down_executor: finished_close — closing finished, custody-clean, obligations-watched sessions"
     );
-    let outcomes = world
+    let batched: Vec<String> = clean
+        .iter()
+        .take(MAX_CLOSES_PER_TICK)
+        .map(|(s, _)| s.clone())
+        .collect();
+    let outcomes = match world
         .close_clean(&pass, clean, workspace_root, &ownership, ownership_read_at)
         .await
-        .unwrap_or_default();
+    {
+        Some(outcomes) => outcomes,
+        None => {
+            // No batch ran (the pane manager is gone): nothing was judged, so
+            // no earlier batch's verdicts may stay published (review A6).
+            world.publish_close_guards(&[]);
+            Vec::new()
+        }
+    };
     FinishedCloseTick::Ran {
         judged,
+        batched,
         obligations: obligations_judged,
         outcomes,
     }
@@ -1524,13 +1594,13 @@ async fn finished_close_once(
     grace: Duration,
     clock: ClockVerdict,
     last_census: &mut Option<Instant>,
-) {
+) -> FinishedCloseTick {
     let world = LiveFinishedCloseWorld {
         app,
         grace,
         probe: GitCustodyProbe::default(),
     };
-    finished_close_tick(&world, clock, last_census, Instant::now(), grace).await;
+    finished_close_tick(&world, clock, last_census, Instant::now(), grace).await
 }
 
 /// Which arm a [`close_batch`] runs for.
@@ -1764,7 +1834,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     for (index, (session_id, terminal_id)) in
         candidates.into_iter().take(MAX_CLOSES_PER_TICK).enumerate()
     {
-        let admission = effects.arm_still_admitted(arm);
+        let mut admission = effects.arm_still_admitted(arm);
         if admission == Admission::Withdrawn {
             info!(
                 arm = arm.word(),
@@ -1815,6 +1885,23 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
             }
             None
         };
+        if arm == CloseArm::FinishedClose {
+            // The guard's reads can take most of a minute (coord obligations,
+            // pending messages, custody probes, the transcript tail). Read the
+            // arm's admission AGAIN so a switch turned off, or a clock that
+            // left the window, during those reads still withdraws this close
+            // rather than acting on the admission read before them.
+            admission = effects.arm_still_admitted(arm);
+            if admission == Admission::Withdrawn {
+                info!(
+                    arm = arm.word(),
+                    "wind_down_executor: the arm no longer applies after the guard's reads — stopping this pass"
+                );
+                outcomes.push(CandidateOutcome::ArmWithdrawn);
+                effects.publish_close_guards(&guard_views);
+                return outcomes;
+            }
+        }
         if admission == Admission::Shadow {
             effects.would_close(&session_id, &terminal_id, custody.as_ref());
             outcomes.push(CandidateOutcome::Shadowed);
@@ -3132,8 +3219,8 @@ mod tests {
         }
     }
 
-    /// A transcript with nothing after [`FINISHED_AT_MS`]: prompted at 0 and
-    /// answered at 500, the whole file read.
+    /// A transcript with nothing after [`FINISHED_AT_MS`]: prompted and its
+    /// turn opened at -60 000, answered at 500, the whole file read.
     fn quiet_facts() -> TranscriptFacts {
         TranscriptFacts {
             last_prompt_ms: Some(-60_000),
@@ -4583,8 +4670,10 @@ mod tests {
             Admission::Close
         );
 
+        // `finished_close` reads the admission twice per candidate: before the
+        // guard's reads and again after them.
         let effects = RecordingEffects::new()
-            .admissions(&[Admission::Close, Admission::Withdrawn])
+            .admissions(&[Admission::Close, Admission::Close, Admission::Withdrawn])
             .eligible("t1")
             .eligible("t2");
         let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
@@ -4595,11 +4684,27 @@ mod tests {
         assert!(!effects.calls().contains(&"exit:t2".to_string()));
     }
 
+    /// Review A1: the guard's reads can take most of a minute, so an arm
+    /// switched off DURING them withdraws the close that was admitted before
+    /// them — the admission is re-read after the guard, not carried across it.
+    #[tokio::test]
+    async fn an_arm_withdrawn_during_the_guards_reads_withdraws_that_close() {
+        let effects = RecordingEffects::new()
+            .admissions(&[Admission::Close, Admission::Withdrawn])
+            .eligible("t1")
+            .eligible("t2");
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::ArmWithdrawn]);
+        assert!(!effects.calls().contains(&"exit:t1".to_string()));
+        assert!(!effects.calls().iter().any(|c| c.ends_with(":t2")));
+    }
+
     /// Each arm's batch is capped at `MAX_CLOSES_PER_TICK`; a tick takes one
     /// action, and only a drained one runs both close passes (Phase 3 of plan
-    /// `2026-11-16-…`), the guarded one first.
+    /// `2026-11-16-…`), the guarded one first. The shared budget itself is
+    /// pinned by `a_drained_tick_spends_one_budget_and_skips_what_the_guard_judged`.
     #[tokio::test]
-    async fn the_budget_is_shared_between_the_two_arms() {
+    async fn each_batch_is_capped_and_a_drain_never_runs_without_the_guard() {
         let now = Utc::now();
         for state in [drained(), CoordDrainState::Clear, unknown()] {
             for owes in [false, true] {
@@ -4628,6 +4733,45 @@ mod tests {
                 "{arm:?}"
             );
         }
+    }
+
+    /// Review A2: on a drained tick the two passes spend ONE budget. The drain
+    /// arm gets what the guarded batch left, and skips every session that
+    /// batch judged; with no guarded batch it gets the whole budget.
+    #[test]
+    fn a_drained_tick_spends_one_budget_and_skips_what_the_guard_judged() {
+        let none = drain_share_after(None);
+        assert_eq!(none.budget, MAX_CLOSES_PER_TICK);
+        assert!(none.skip.is_empty());
+        assert_eq!(
+            drain_share_after(Some(&FinishedCloseTick::NoCensus)).budget,
+            MAX_CLOSES_PER_TICK
+        );
+
+        let ran = FinishedCloseTick::Ran {
+            judged: Vec::new(),
+            batched: vec!["s1".to_string(), "s2".to_string(), "s3".to_string()],
+            obligations: Vec::new(),
+            outcomes: vec![
+                CandidateOutcome::GuardHeld,
+                CandidateOutcome::Shadowed,
+                CandidateOutcome::Attempted,
+            ],
+        };
+        let share = drain_share_after(Some(&ran));
+        assert_eq!(share.budget, MAX_CLOSES_PER_TICK - 3);
+        assert_eq!(
+            share.skip,
+            ["s1", "s2", "s3"].iter().map(|s| s.to_string()).collect()
+        );
+
+        let full = FinishedCloseTick::Ran {
+            judged: Vec::new(),
+            batched: Vec::new(),
+            obligations: Vec::new(),
+            outcomes: vec![CandidateOutcome::GuardHeld; MAX_CLOSES_PER_TICK + 1],
+        };
+        assert_eq!(drain_share_after(Some(&full)).budget, 0);
     }
 
     /// A steward a `finished_close` batch somehow reached is NOT recorded as
@@ -5117,6 +5261,7 @@ mod tests {
             judged,
             obligations,
             outcomes,
+            ..
         } = tick(&world).await
         else {
             panic!("the census should have run");
@@ -5140,6 +5285,7 @@ mod tests {
             judged,
             obligations,
             outcomes,
+            ..
         } = tick(&world).await
         else {
             panic!("the census should have run");
