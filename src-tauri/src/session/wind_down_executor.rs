@@ -223,6 +223,48 @@ pub enum TickAction {
     Nothing,
 }
 
+/// Which passes one tick runs, from its [`TickAction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TickPasses {
+    /// The guarded `finished_close` pass ([`finished_close_once`]), still
+    /// subject to its own switch and cadence ([`finished_close::plan_pass`]).
+    pub finished_close: bool,
+    /// The drain arm ([`wind_down_once`]).
+    pub drain: bool,
+    /// Restart what a drain stopped ([`undrain`]).
+    pub undrain: bool,
+}
+
+/// PURE: the passes a tick runs.
+///
+/// A DRAINED tick runs the guarded `finished_close` pass as well as the drain
+/// arm (plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+/// Phase 3), so a drain is relieved through the same close guard: the drain
+/// arm itself still presents no close authority, and the guarded arm closes
+/// the qualifying finished terminal sessions. The `finished_close` pass runs
+/// FIRST on such a tick, so a qualifying session is judged by the guard before
+/// the drain arm reaches it. `Undrain` and `Nothing` (the `Unknown` drain
+/// state) run neither close pass.
+pub fn tick_passes(action: TickAction) -> TickPasses {
+    match action {
+        TickAction::WindDown => TickPasses {
+            finished_close: true,
+            drain: true,
+            undrain: false,
+        },
+        TickAction::FinishedClose => TickPasses {
+            finished_close: true,
+            ..TickPasses::default()
+        },
+        TickAction::Undrain => TickPasses {
+            undrain: true,
+            ..TickPasses::default()
+        },
+        TickAction::Nothing => TickPasses::default(),
+    }
+}
+
 /// PURE: decide one tick from the drain state and whether this runner still
 /// OWES an undrain — a drain it has seen (or, across a restart, one whose
 /// stopped-by-drain set it inherited) that has not yet been undone.
@@ -596,28 +638,26 @@ async fn tick_once(state: &mut ExecutorState) {
         decide_tick(&drain, state.was_drained, Utc::now()),
         crate::coord_drain_state::current_dispatch_role(),
     );
-    match action {
-        TickAction::Nothing => {}
-        TickAction::FinishedClose => {
-            finished_close_once(&app, grace, clock, &mut state.finished_close_last_census).await;
-        }
-        TickAction::Undrain => {
-            // `undrain` reports what it could not restart, so a kind the drain
-            // re-armed under is still owed and is retried on a later undrain.
-            state.was_drained = undrain(&app).await;
-        }
-        TickAction::WindDown => {
-            state.was_drained = true;
-            match clock {
-                ClockVerdict::Trustworthy => wind_down_once(&app, grace).await,
-                // Hazard 1. Fail closed: no close is attempted on an idle
-                // window measured across a clock step. Already logged at
-                // detection, above.
-                ClockVerdict::Jumped { .. } => {}
-                ClockVerdict::Quarantined => debug!(
-                    "wind_down_executor: still within the post-clock-jump quarantine — no closes"
-                ),
-            }
+    let passes = tick_passes(action);
+    if passes.finished_close {
+        finished_close_once(&app, grace, clock, &mut state.finished_close_last_census).await;
+    }
+    if passes.undrain {
+        // `undrain` reports what it could not restart, so a kind the drain
+        // re-armed under is still owed and is retried on a later undrain.
+        state.was_drained = undrain(&app).await;
+    }
+    if passes.drain {
+        state.was_drained = true;
+        match clock {
+            ClockVerdict::Trustworthy => wind_down_once(&app, grace).await,
+            // Hazard 1. Fail closed: no close is attempted on an idle
+            // window measured across a clock step. Already logged at
+            // detection, above.
+            ClockVerdict::Jumped { .. } => {}
+            ClockVerdict::Quarantined => debug!(
+                "wind_down_executor: still within the post-clock-jump quarantine — no closes"
+            ),
         }
     }
 }
@@ -1180,7 +1220,8 @@ pub(crate) enum FinishedCloseTick {
 ///    candidate, in order, and probing STOPS once [`MAX_CLOSES_PER_TICK`]
 ///    candidates are in hand that are both custody-clean and obligations-watched
 ///    — no batch can close more.
-/// 3b. A candidate whose custody is clean is then judged on its OBLIGATIONS:
+///
+///    A candidate whose custody is clean is then judged on its OBLIGATIONS:
 ///    every item coord's `coord_session_obligations` attributes to it must be
 ///    watched, and a read that fails is UNKNOWN. That is the remote half of
 ///    `closeable`; the two halves are one conjunction and neither stands in for
@@ -1968,6 +2009,7 @@ pub const WIND_DOWN_PRESENTS_CLOSE_AUTHORITY: bool = false;
 /// past the missing authority above; the primitive checks that first.
 pub(crate) async fn wind_down_exit(
     manager: &Arc<TerminalManager>,
+    arm: CloseArm,
     session_id: &str,
     terminal_id: &str,
     kind: SessionKind,
@@ -1978,12 +2020,13 @@ pub(crate) async fn wind_down_exit(
         .await?;
     match &outcome {
         GracefulExitOutcome::Exited { .. } => {
-            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
+            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, arm = arm.word(), "wind_down_executor: closed");
         }
         GracefulExitOutcome::NoCloseAuthority { claude_pids } => warn!(
             session_id = %session_id,
             terminal_id = %terminal_id,
             ?kind,
+            arm = arm.word(),
             pids = ?claude_pids,
             outcome = WIND_DOWN_NO_CLOSE_AUTHORITY,
             "wind_down_executor: refused no_close_authority — a live claude is in the pane and \
@@ -1991,7 +2034,7 @@ pub(crate) async fn wind_down_exit(
              typed, nothing closed, the session is still running"
         ),
         other => {
-            warn!(session_id = %session_id, terminal_id = %terminal_id, ?kind, outcome = ?other, "wind_down_executor: not closed");
+            warn!(session_id = %session_id, terminal_id = %terminal_id, ?kind, arm = arm.word(), outcome = ?other, "wind_down_executor: not closed");
         }
     }
     Ok(outcome)
@@ -2211,6 +2254,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
             |recorded: &Vec<crate::session::stray_wait::RecordedStray>| {
                 wind_down_exit(
                     manager,
+                    arm,
                     session_id,
                     terminal_id,
                     kind,
@@ -3714,6 +3758,7 @@ mod tests {
         ) -> Result<GracefulExitOutcome, String> {
             wind_down_exit(
                 &self.manager,
+                arm,
                 session_id,
                 terminal_id,
                 SessionKind::Terminal,
@@ -4550,20 +4595,19 @@ mod tests {
         assert!(!effects.calls().contains(&"exit:t2".to_string()));
     }
 
-    /// The two arms share ONE budget: a tick takes exactly one action, so it
-    /// runs at most one arm, and whichever arm it runs is capped at
-    /// `MAX_CLOSES_PER_TICK`.
+    /// Each arm's batch is capped at `MAX_CLOSES_PER_TICK`; a tick takes one
+    /// action, and only a drained one runs both close passes (Phase 3 of plan
+    /// `2026-11-16-…`), the guarded one first.
     #[tokio::test]
     async fn the_budget_is_shared_between_the_two_arms() {
         let now = Utc::now();
         for state in [drained(), CoordDrainState::Clear, unknown()] {
             for owes in [false, true] {
-                let action = decide_tick(&state, owes, now);
-                let arms = [TickAction::WindDown, TickAction::FinishedClose]
-                    .iter()
-                    .filter(|a| **a == action)
-                    .count();
-                assert!(arms <= 1, "{state:?}/{owes}: one tick, at most one arm");
+                let passes = tick_passes(decide_tick(&state, owes, now));
+                assert!(
+                    !passes.drain || passes.finished_close,
+                    "{state:?}/{owes}: a drain pass never runs without the guarded pass"
+                );
             }
         }
         let ids: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
@@ -4615,6 +4659,58 @@ mod tests {
                 TickAction::Nothing
             );
         }
+    }
+
+    /// Phase 3: a DRAINED tick runs both the drain arm and the guarded
+    /// `finished_close` pass; an `Unknown` drain state runs neither; a clear
+    /// tick runs only the guarded pass; an owed undrain runs no close pass.
+    #[test]
+    fn a_drained_tick_runs_both_passes_and_an_unknown_one_runs_neither() {
+        let now = Utc::now();
+        let drained_tick = tick_passes(decide_tick(&drained(), false, now));
+        assert_eq!(
+            drained_tick,
+            TickPasses {
+                finished_close: true,
+                drain: true,
+                undrain: false
+            }
+        );
+        for owes in [false, true] {
+            assert_eq!(
+                tick_passes(decide_tick(&unknown(), owes, now)),
+                TickPasses::default(),
+                "an unreadable drain state is evidence for no pass"
+            );
+        }
+        assert_eq!(
+            tick_passes(decide_tick(&CoordDrainState::Clear, false, now)),
+            TickPasses {
+                finished_close: true,
+                ..TickPasses::default()
+            }
+        );
+        assert_eq!(
+            tick_passes(decide_tick(&CoordDrainState::Clear, true, now)),
+            TickPasses {
+                undrain: true,
+                ..TickPasses::default()
+            }
+        );
+        // `tick_once` dispatches through `tick_passes`, and runs the guarded
+        // pass before the drain arm.
+        let executor = executable_lines(include_str!("wind_down_executor.rs"));
+        let dispatch = executor
+            .find("let passes = tick_passes(action);")
+            .expect("tick_once dispatches through tick_passes");
+        let after_dispatch = executor.get(dispatch..).expect("a char boundary");
+        let guarded = after_dispatch
+            .find("if passes.finished_close {")
+            .expect("the guarded pass");
+        let drain = after_dispatch
+            .find("if passes.drain {")
+            .expect("the drain pass");
+        assert!(guarded < drain, "the guarded pass runs first");
     }
 
     /// Review item 2: index 0 is re-checked too for `finished_close` — both

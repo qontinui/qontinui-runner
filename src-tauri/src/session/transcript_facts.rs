@@ -127,8 +127,8 @@ fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
 /// Strip one leading `<pasted_content …>` wrapper (`PASTED_RE` in the script).
 fn unwrap_pasted(text: &str) -> &str {
     if let Some(rest) = text.strip_prefix("<pasted_content") {
-        if let Some(end) = rest.find('>') {
-            return rest[end + 1..].trim_start();
+        if let Some((_, after)) = rest.split_once('>') {
+            return after.trim_start();
         }
     }
     text

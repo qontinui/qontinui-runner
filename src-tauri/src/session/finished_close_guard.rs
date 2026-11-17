@@ -499,15 +499,15 @@ fn decide(inputs: &GuardInputs<'_>, arms: &[(&'static str, ArmVerdict)]) -> Guar
             ArmVerdict::Ok => {}
             ArmVerdict::Held { reason, detail } => {
                 return GuardVerdict::Held(GuardReason {
-                    arm: *arm,
-                    reason: *reason,
+                    arm,
+                    reason,
                     detail: detail.clone(),
                 })
             }
             ArmVerdict::Unknown { reason, detail } => {
                 return GuardVerdict::Unknown(GuardReason {
-                    arm: *arm,
-                    reason: *reason,
+                    arm,
+                    reason,
                     detail: detail.clone(),
                 })
             }
@@ -545,7 +545,7 @@ pub fn view(
         arms: arms
             .iter()
             .map(|(arm, v)| CloseGuardArmView {
-                arm: *arm,
+                arm,
                 verdict: v.word(),
                 reason: v.reason(),
                 detail: v.detail().map(|d| d.chars().take(300).collect()),
