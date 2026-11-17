@@ -1839,6 +1839,7 @@ async fn spawn_looping_agent_terminal(
         // with no SessionStart/PreCompact/Stop hook at all.
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
+        None,
     );
     // Withheld when an operator template adds a replacement prompt.
     let policy_delivery =
