@@ -283,6 +283,11 @@ pub(crate) struct DrainShare {
     pub skip: BTreeSet<String>,
 }
 
+/// A `Shadowed` outcome is charged too: under `shadow` the guarded batch
+/// still judged that session this tick, and the drain arm presents no close
+/// authority (plan D3), so leaving it to the drain would change nothing but
+/// the lifecycle record's `wind_down_arm`.
+///
 /// PURE: the drain arm's share of a tick after the guarded pass reported
 /// `guarded` (`None` when it did not run). Every candidate the guarded batch
 /// took, whatever its outcome, spent one slot of [`MAX_CLOSES_PER_TICK`].
@@ -4855,6 +4860,17 @@ mod tests {
             .find("if passes.drain {")
             .expect("the drain pass");
         assert!(guarded < drain, "the guarded pass runs first");
+        // Review A2, round 2: the drain arm is handed the guarded pass's
+        // result, and it applies both halves of its share.
+        assert!(
+            after_dispatch.contains("wind_down_once(&app, grace, drain_share_after(guarded.as_ref()))"),
+            "tick_once hands the drain arm its share of the one budget"
+        );
+        assert!(
+            executor.contains("candidates.retain(|(session_id, _)| !share.skip.contains(session_id));")
+                && executor.contains("candidates.truncate(share.budget);"),
+            "wind_down_once applies the skip set and the remaining budget"
+        );
     }
 
     /// Review item 2: index 0 is re-checked too for `finished_close` — both
@@ -5414,10 +5430,17 @@ mod tests {
         assert!(at("messages:t1") < at("recheck:t1"), "{calls:?}");
         assert!(at("recheck:t1") < at("custody:t1"), "{calls:?}");
         assert!(at("custody:t1") < at("transcript:t1"), "{calls:?}");
+        // Only the arm's local admission re-read (review A1) sits between the
+        // last guard input and the exit.
         assert_eq!(
             at("exit:t1"),
-            at("transcript:t1") + 1,
+            at("transcript:t1") + 2,
             "only local reads sit between the custody re-check and the exit: {calls:?}"
+        );
+        assert_eq!(
+            calls[at("transcript:t1") + 1],
+            "admitted?:finished_close",
+            "{calls:?}"
         );
 
         // Unknown at the re-check is no better.
