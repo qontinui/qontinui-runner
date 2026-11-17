@@ -11,7 +11,7 @@
 
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::shim_test_support::{identity_shim_cmd, write_exe, EXE_LOCK};
 
@@ -88,6 +88,81 @@ struct Run {
     beacons: String,
     /// One line per call of the fake `date`.
     date_calls: String,
+    /// The real `claude`'s change time (its target's, through a link) after
+    /// the run, and when the fake `claude` ran (its marker's mtime).
+    claude_changed: Option<SystemTime>,
+    launched_at: Option<SystemTime>,
+    /// When the shim first called `stat`, under [`Stat::Real`] only.
+    first_stat_at: Option<SystemTime>,
+}
+
+/// A file's change time, following links (what the shim's `stat -L` reads).
+fn ctime_of(path: &Path) -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(
+        SystemTime::UNIX_EPOCH
+            + Duration::new(
+                u64::try_from(meta.ctime()).ok()?,
+                u32::try_from(meta.ctime_nsec()).ok()?,
+            ),
+    )
+}
+
+/// The system `stat` behind a wrapper that first logs the call's wall-clock
+/// time in nanoseconds to `<root>/stat.times`, so a test can tell whether the
+/// shim's first probe came early enough that a wait line was owed.
+fn timed_real_stat(bin: &Path, root: &Path) {
+    let stat = system_tool("stat").expect("a system `stat`");
+    let date = system_tool("date").expect("a system `date`");
+    write_exe(
+        &bin.join("stat"),
+        &format!(
+            "#!/bin/sh\n'{date}' +%s%N >> '{times}'\nexec '{stat}' \"$@\"\n",
+            date = date.display(),
+            times = root.join("stat.times").display(),
+            stat = stat.display(),
+        ),
+    );
+}
+
+fn first_stat_at(root: &Path) -> Option<SystemTime> {
+    let ns: u64 = read(&root.join("stat.times")).lines().next()?.trim().parse().ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(ns))
+}
+
+/// The real-clock guarantee, measured from the WRITE rather than from when the
+/// harness started the shim: the fake `claude` ran at least 2 s after its
+/// target last changed. The wait line is owed whenever the shim's first probe
+/// came under 2 s after that change (whole-second `now - ctime` is then at
+/// most 2, under the shim's 3); a probe that a loaded box delayed past that may
+/// legitimately find the target settled and print nothing.
+fn assert_launched_two_seconds_after_the_write(
+    changed: Option<SystemTime>,
+    launched: Option<SystemTime>,
+    first_stat: Option<SystemTime>,
+    stderr: &str,
+) {
+    let changed = changed.expect("the real claude's change time");
+    let launched = launched.expect("the fake claude ran and left its marker");
+    let gap = launched.duration_since(changed).unwrap_or_default();
+    assert!(
+        gap >= Duration::from_secs(2),
+        "the claude launched {gap:?} after its target changed: {stderr}"
+    );
+    let first_stat = first_stat.expect("the shim called stat");
+    if first_stat < changed + Duration::from_secs(2) {
+        assert!(
+            stderr.contains(WAIT_LINE_TAIL),
+            "the first probe came {:?} after the write, so the wait line is owed: {stderr}",
+            first_stat.duration_since(changed).unwrap_or_default()
+        );
+    } else {
+        eprintln!(
+            "NOTE: the shim's first stat came {:?} after the write; the wait line is not owed",
+            first_stat.duration_since(changed).unwrap_or_default()
+        );
+    }
 }
 
 fn read(path: &Path) -> String {
@@ -167,11 +242,7 @@ fn run(scenario: &Scenario) -> Run {
         Stat::Absent => {}
         Stat::Gnu => fake_stat(&bin, root, false, scenario.answers),
         Stat::Bsd => fake_stat(&bin, root, true, scenario.answers),
-        Stat::Real => symlink(
-            system_tool("stat").expect("a system `stat`"),
-            bin.join("stat"),
-        )
-        .unwrap(),
+        Stat::Real => timed_real_stat(&bin, root),
     }
     let real = real_dir.join("claude");
     match scenario.claude {
@@ -225,6 +296,9 @@ fn run(scenario: &Scenario) -> Run {
         stat_calls: read(&root.join("stat.log")),
         beacons: read(&beacons),
         date_calls: read(&date_log),
+        claude_changed: ctime_of(&real),
+        launched_at: std::fs::metadata(&marker).and_then(|m| m.modified()).ok(),
+        first_stat_at: first_stat_at(root),
     }
 }
 
@@ -424,7 +498,9 @@ fn without_epochseconds_the_clock_falls_back_to_date() {
 }
 
 /// The real clock and the real `stat`: a fake real `claude` written just before
-/// the run starts only once at least 2 s have passed since that write.
+/// the run starts only once at least 2 s have passed since that write,
+/// measured on the filesystem's own clock (its ctime against the marker the
+/// fake writes when it runs).
 #[test]
 fn with_the_real_stat_a_freshly_written_claude_waits_at_least_two_seconds() {
     if system_tool("stat").is_none() {
@@ -436,11 +512,11 @@ fn with_the_real_stat_a_freshly_written_claude_waits_at_least_two_seconds() {
         ..Scenario::default()
     });
     assert!(run.ok && run.ran, "{}", run.stderr);
-    assert!(run.stderr.contains(WAIT_LINE_TAIL), "{}", run.stderr);
-    assert!(
-        run.elapsed >= Duration::from_secs(2),
-        "launched after {:?}",
-        run.elapsed
+    assert_launched_two_seconds_after_the_write(
+        run.claude_changed,
+        run.launched_at,
+        run.first_stat_at,
+        &run.stderr,
     );
 }
 
@@ -449,7 +525,7 @@ fn with_the_real_stat_a_freshly_written_claude_waits_at_least_two_seconds() {
 /// is not.
 #[test]
 fn with_the_real_stat_an_old_symlink_to_a_fresh_target_waits() {
-    let (Some(stat), Some(real_sleep)) = (system_tool("stat"), system_tool("sleep")) else {
+    let (Some(_), Some(real_sleep)) = (system_tool("stat"), system_tool("sleep")) else {
         eprintln!("SKIP: no system stat or sleep");
         return;
     };
@@ -464,7 +540,7 @@ fn with_the_real_stat_an_old_symlink_to_a_fresh_target_waits() {
     let target = root.join("claude-image");
     write_exe(&target, &fake_claude_body(&marker));
     symlink(&target, real_dir.join("claude")).unwrap();
-    symlink(&stat, bin.join("stat")).unwrap();
+    timed_real_stat(&bin, root);
     symlink(&real_sleep, bin.join("sleep")).unwrap();
     // Age the LINK past the shim's 3 whole seconds, then rewrite the target.
     std::thread::sleep(Duration::from_millis(3_300));
@@ -475,7 +551,6 @@ fn with_the_real_stat_an_old_symlink_to_a_fresh_target_waits() {
         bin.display(),
         real_dir.display()
     );
-    let begun = Instant::now();
     let out = crate::process_helpers::output_with_timeout(
         identity_shim_cmd(&shim_dir, &["--version"], &path, "10"),
         BUDGET,
@@ -483,9 +558,12 @@ fn with_the_real_stat_an_old_symlink_to_a_fresh_target_waits() {
     .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success() && marker.exists(), "{stderr}");
-    assert!(
-        stderr.contains(WAIT_LINE_TAIL),
-        "the target changed just now, so the launch waits: {stderr}"
+    // Read through the LINK: what the shim's `stat -L` saw is the target's
+    // fresh change time, not the link's 3 s-old one.
+    assert_launched_two_seconds_after_the_write(
+        ctime_of(&real_dir.join("claude")),
+        std::fs::metadata(&marker).and_then(|m| m.modified()).ok(),
+        first_stat_at(root),
+        &stderr,
     );
-    assert!(begun.elapsed() >= Duration::from_secs(2), "{:?}", begun.elapsed());
 }

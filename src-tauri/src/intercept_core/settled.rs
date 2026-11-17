@@ -1,11 +1,12 @@
 //! Is a resolved tool SETTLED, or is an installer still writing it?
 //!
 //! `npm install --global @anthropic-ai/claude-code` re-links `bin/claude` and
-//! then writes the 340 MB native image behind it. On 2026-11-10 a 100 ms sampler
-//! saw `bin/claude` resolve to an executable, non-stub ELF that was still being
-//! written, as small as 14.9 MB of 341.9 MB, for 1.2-1.5 s (coord finding
-//! `25770a72-5dac-414e-a839-c6e2d9d622fe`). A resolver that launches the first
-//! hit can start a truncated image there. The quiescence predicate is the
+//! then writes the 340 MB native image behind it. A 100 ms sampler on
+//! 2026-11-10 saw `bin/claude` resolve to an executable, non-stub ELF that was
+//! still being written: as small as 11.8 MB of 341.9 MB, with partial-ELF
+//! windows of p50 1.0 s and max 1.7 s, and a settle time of p95 3.1 s and
+//! max 3.8 s (coord finding `18ee5471-7b84-469b-927f-6128bfcb7263`). A
+//! resolver that launches the first hit can start a truncated image there. The quiescence predicate is the
 //! parent plan's D1 (`2026-11-10-migration-holds-for-missing-claude-cli`): the
 //! target's change time is at least [`SETTLE_MIN_AGE`] old. Writes and re-links
 //! both move a change time, so an install still in progress reads as
@@ -24,6 +25,18 @@
 //! LAUNCH treat it as settled: waiting on it would delay every launch by the
 //! full bound on a box that has no readable change time, and launching at once
 //! is the behaviour that predates this check.
+//!
+//! ## Windows limits
+//! - **The probe sees npm's wrapper, not the image.** On Windows `PATH`
+//!   resolves npm's cmd-shim wrapper (`claude.cmd`, or the bare `sh` wrapper
+//!   under MSYS), so the check reads the wrapper's times, not those of the
+//!   `claude.exe` behind it. Coverage there is incidental: it holds only when
+//!   the install also rewrites the wrapper.
+//! - **`max(created, modified)` can read the write START.** Windows has no
+//!   stable change time on the pinned toolchain, and an in-place write, or an
+//!   extractor that resets mtime, leaves a time near when the write began. So a
+//!   write that runs longer than [`SETTLE_MIN_AGE`] can read as
+//!   [`Settle::Settled`] while it is still in progress.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -82,8 +95,7 @@ fn changed_at(path: &Path) -> Option<SystemTime> {
 /// Windows has no stable change time on the pinned toolchain
 /// (`MetadataExt::change_time` is the unstable `windows_change_time`,
 /// rust-lang/rust#121478), so the later of creation and last write stands in.
-/// A rename-into-place keeps the source's creation time, but an install writes
-/// the file it renames, which moves the last-write time.
+/// See the module docs' "Windows limits" for what that misses.
 #[cfg(windows)]
 fn changed_at(path: &Path) -> Option<SystemTime> {
     let meta = std::fs::metadata(path).ok()?;
@@ -143,7 +155,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("claude");
         std::fs::write(&file, b"image").unwrap();
-        let now = SystemTime::now();
+        // Judged against the file's OWN change time, not the wall clock, so a
+        // saturated box cannot age it past the minimum before the first probe.
+        let now = changed_at(&file).expect("a readable change time") + Duration::from_millis(500);
         assert!(
             matches!(settle_of(&file, now), Settle::Changing { .. }),
             "a file written just now: {:?}",
