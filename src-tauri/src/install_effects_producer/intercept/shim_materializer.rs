@@ -2448,7 +2448,7 @@ const REAL_DIR_NAME: &str = "the-real-qontinui-identity-qontinui-shim-tool";
 mod resolve_wait_tests {
     use super::*;
     use crate::install_effects_producer::intercept::shim_test_support::{
-        bash, identity_cmd, install_settled_stat, write_exe, EXE_LOCK,
+        bash, exe_guard, identity_cmd, install_settled_stat, write_exe,
     };
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -2473,7 +2473,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2525,7 +2525,7 @@ mod resolve_wait_tests {
             eprintln!("SKIP: no /bin/sleep or /usr/bin/sleep for the fake sleep to exec");
             return;
         };
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2569,7 +2569,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2599,7 +2599,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2632,7 +2632,7 @@ mod resolve_wait_tests {
     /// The argv the real tool receives when the shim is launched with `args`
     /// and the pin set, and with the settings and mcp-config env when `hook_env`.
     fn identity_argv_seen_by_real_tool(args: &[&str], hook_env: bool) -> Vec<String> {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2751,7 +2751,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2780,7 +2780,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2806,7 +2806,7 @@ mod resolve_wait_tests {
     /// fall-through, with the diagnostic, and propagates `not found` (127).
     #[test]
     fn install_shim_unresolved_tool_reports_and_exits_127() {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, empty_dir) = (tmp.path().join("shim"), tmp.path().join("empty"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2872,7 +2872,7 @@ mod resolve_wait_tests {
         tool: &str,
         render_into: impl Fn(&Path) -> String,
     ) {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir_a = tmp.path().join(format!("{family_prefix}a"));
         let dir_b = tmp.path().join(format!("{family_prefix}b"));

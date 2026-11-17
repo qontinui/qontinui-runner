@@ -157,7 +157,7 @@ resolve_real() { scan_path real; }
 # line announces the wait so a genuinely absent tool is not a silent 10 s stall.
 # ---------------------------------------------------------------------------
 # The bound is counted in whole-second SECONDS, so it can end up to ~1 s
-# early, and a bound of 3 s or less cannot see a fresh write settle (settled
+# early, and a bound of 3 s or less may not see a fresh write settle (settled
 # needs `now - ctime >= 3`): such a launch goes out with the launch-anyway line.
 resolve_wait_secs() {
   local w="${QONTINUI_SHIM_RESOLVE_WAIT_SECS:-10}"
@@ -192,7 +192,7 @@ file_changed_at() {
 }
 
 # now_epoch: the current time in epoch seconds. $EPOCHSECONDS is a builtin
-# from bash 5; macOS ships bash 3.2, which falls back to `date +%s`.
+# from bash 5; a bash before 5 (e.g. 3.2) falls back to `date +%s`.
 now_epoch() {
   local n="${EPOCHSECONDS:-}"
   [ -n "$n" ] || n="$(date +%s 2>/dev/null)" || n=''
@@ -223,7 +223,10 @@ is_settled() {
 # launchable DID resolve, so this is no resolve-failed -- FAIL-OPEN, and an
 # exec that then fails still reports exec-failed), or returns 1 so that
 # report_unresolved runs as before. A zero wait disables both: the first hit is
-# printed as found, with no stat.
+# printed as found, with no stat. A candidate whose change time could not be
+# read AND that no longer exists is a MISS, not an unknown: npm's reify renames
+# bin/claude aside between the scan and the stat, which is the very window this
+# wait is for, and launching the vanished path would fail.
 resolve_real_waiting() {
   local found='' last='' rc=0 said_missing=0 said_changing=0
   local wait_secs; wait_secs="$(resolve_wait_secs)"
@@ -233,8 +236,14 @@ resolve_real_waiting() {
   fi
   local deadline=$((SECONDS + wait_secs))
   while :; do
+    rc=0
     if found="$(resolve_real)"; then
-      rc=0; is_settled "$found" || rc=$?
+      is_settled "$found" || rc=$?
+      if [ "$rc" -eq 2 ] && [ ! -e "$found" ]; then found=''; fi
+    else
+      found=''
+    fi
+    if [ -n "$found" ]; then
       if [ "$rc" -ne 1 ]; then printf '%s' "$found"; return 0; fi
       last="$found"
       if [ "$said_changing" -eq 0 ]; then

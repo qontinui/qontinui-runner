@@ -13,7 +13,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::shim_test_support::{identity_shim_cmd, write_exe, EXE_LOCK};
+use super::shim_test_support::{exe_guard, identity_shim_cmd, write_exe};
 
 const BUDGET: Duration = Duration::from_secs(40);
 
@@ -50,18 +50,31 @@ enum Claude {
     Present,
     /// Nothing, until the shim's first wait-loop `sleep` renames it in.
     AppearsOnFirstSleep,
+    /// Present, but a `vanish` answer from the fake `stat` renames it aside
+    /// (as npm's reify does) and the shim's next wait-loop `sleep` renames it
+    /// back.
+    VanishesOnStat,
 }
+
+/// The fixed "now", in epoch seconds, of every run whose `stat` is a fake: the
+/// shim's clock is the fake `date` (`EPOCHSECONDS` unset), and the fake
+/// `stat`'s `now` answers print this same second, so every age is a literal
+/// with no real-clock dependence.
+const FIXED_NOW: u64 = 1_000_000;
 
 struct Scenario<'a> {
     stat: Stat,
     /// One answer per answering `stat` call; the last repeats. `old` is epoch
-    /// second 1, `now` the current second, `future` 100 s ahead, anything else
-    /// is printed verbatim (a literal epoch, or garbage).
+    /// second 1, `now` the fixed clock's second ([`FIXED_NOW`], or
+    /// `date_fallback`), `future` 100 s ahead of it, `vanish` renames the
+    /// candidate aside and fails, `fail` fails with no output, and anything
+    /// else is printed verbatim (a literal epoch, or garbage).
     answers: &'a [&'a str],
     wait: &'a str,
     claude: Claude,
     /// Unset `EPOCHSECONDS` (via `BASH_ENV`) and put a `date` on PATH that
-    /// prints this epoch, so the shim takes its bash-3.2 `date +%s` fallback.
+    /// prints this epoch, so the shim takes its pre-bash-5 `date +%s`
+    /// fallback. A fake `stat` gets this clock at [`FIXED_NOW`] when unset.
     date_fallback: Option<u64>,
 }
 
@@ -182,8 +195,14 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-fn fake_stat(bin: &Path, root: &Path, bsd: bool, answers: &[&str]) {
-    let date = system_tool("date").expect("a system `date` for the fake stat's clock");
+/// Where the candidate goes when a `vanish` answer renames it aside.
+struct Vanish<'a> {
+    mv: &'a Path,
+    real: &'a Path,
+    staged: &'a Path,
+}
+
+fn fake_stat(bin: &Path, root: &Path, bsd: bool, answers: &[&str], now: u64, vanish: &Vanish) {
     let (ctl, count, log) = (
         root.join("stat.ctl"),
         root.join("stat.count"),
@@ -215,11 +234,12 @@ while IFS= read -r line; do
   v="$line"
   [ "$i" -ge "$n" ] && break
 done < '{ctl}'
-now=$('{date}' +%s)
 case "$v" in
   old) echo 1 ;;
-  now) echo "$now" ;;
-  future) echo $((now + 100)) ;;
+  now) echo {now} ;;
+  future) echo $(({now} + 100)) ;;
+  vanish) '{mv}' -f '{real}' '{staged}'; exit 1 ;;
+  fail) exit 1 ;;
   *) echo "$v" ;;
 esac
 "#,
@@ -227,7 +247,9 @@ esac
             bsd = u8::from(bsd),
             count = count.display(),
             ctl = ctl.display(),
-            date = date.display(),
+            mv = vanish.mv.display(),
+            real = vanish.real.display(),
+            staged = vanish.staged.display(),
         ),
     );
 }
@@ -239,7 +261,7 @@ fn fake_claude_body(marker: &Path) -> String {
 /// Run `claude --version` through the identity shim under `scenario`.
 fn run(scenario: &Scenario) -> Run {
     let real_sleep = system_tool("sleep").expect("a system `sleep`");
-    let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = exe_guard();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (shim_dir, bin, real_dir) = (root.join("shim"), root.join("bin"), root.join("real"));
@@ -251,22 +273,36 @@ fn run(scenario: &Scenario) -> Run {
         &bin.join("curl"),
         &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", beacons.display()),
     );
+    let real = real_dir.join("claude");
+    let staged = root.join("claude.staged");
+    let mv = system_tool("mv").expect("a system `mv`");
+    let vanish = Vanish {
+        mv: &mv,
+        real: &real,
+        staged: &staged,
+    };
+    // Every fake `stat` runs against the fixed clock, so its ages are literals.
+    let clock = match scenario.stat {
+        Stat::Gnu | Stat::Bsd => Some(scenario.date_fallback.unwrap_or(FIXED_NOW)),
+        Stat::Absent | Stat::Real => scenario.date_fallback,
+    };
     match scenario.stat {
         Stat::Absent => {}
-        Stat::Gnu => fake_stat(&bin, root, false, scenario.answers),
-        Stat::Bsd => fake_stat(&bin, root, true, scenario.answers),
+        Stat::Gnu => fake_stat(&bin, root, false, scenario.answers, clock.unwrap_or(FIXED_NOW), &vanish),
+        Stat::Bsd => fake_stat(&bin, root, true, scenario.answers, clock.unwrap_or(FIXED_NOW), &vanish),
         Stat::Real => timed_real_stat(&bin, root),
     }
-    let real = real_dir.join("claude");
     match scenario.claude {
         Claude::Present => {
             symlink(&real_sleep, bin.join("sleep")).unwrap();
             write_exe(&real, &fake_claude_body(&marker));
         }
-        Claude::AppearsOnFirstSleep => {
-            let mv = system_tool("mv").expect("a system `mv`");
-            let staged = root.join("claude.staged");
-            write_exe(&staged, &fake_claude_body(&marker));
+        Claude::AppearsOnFirstSleep | Claude::VanishesOnStat => {
+            if matches!(scenario.claude, Claude::AppearsOnFirstSleep) {
+                write_exe(&staged, &fake_claude_body(&marker));
+            } else {
+                write_exe(&real, &fake_claude_body(&marker));
+            }
             write_exe(
                 &bin.join("sleep"),
                 &format!(
@@ -287,7 +323,7 @@ fn run(scenario: &Scenario) -> Run {
     );
     let mut cmd = identity_shim_cmd(&shim_dir, &["--version"], &path, scenario.wait);
     cmd.env("QONTINUI_INSTALL_INTERCEPT_PORT", "1");
-    if let Some(epoch) = scenario.date_fallback {
+    if let Some(epoch) = clock {
         let bash_env = root.join("bash_env");
         std::fs::write(&bash_env, "unset EPOCHSECONDS\n").unwrap();
         cmd.env("BASH_ENV", &bash_env);
@@ -357,19 +393,11 @@ fn a_changing_claude_is_announced_once_and_launched_once_settled() {
         "one wait line: {}",
         run.stderr
     );
-    // The age is whole seconds, read on whichever side of a second boundary
-    // the first probe lands, so it may read 0 or 1.
-    let wait_line = run
-        .stderr
-        .lines()
-        .find(|l| l.contains(WAIT_LINE_TAIL))
-        .unwrap_or_default();
     assert!(
-        wait_line.starts_with("qontinui shim: ")
-            && wait_line.contains("/real/claude changed ")
-            && (wait_line.contains(" changed 0s ago ") || wait_line.contains(" changed 1s ago "))
-            && wait_line.ends_with("waiting up to 10s for it to settle"),
-        "the wait line names the path, the age and the bound: {}",
+        run.stderr.contains(
+            "/real/claude changed 0s ago (an install may still be writing it); waiting up to 10s for it to settle"
+        ),
+        "the wait line names the path, the age (a literal: the clock is fixed) and the bound: {}",
         run.stderr
     );
     assert!(!run.stderr.contains(LAUNCH_ANYWAY_TAIL), "{}", run.stderr);
@@ -496,6 +524,30 @@ fn absent_then_changing_then_settled_share_one_bound() {
     assert_invoked_only(&run, "absent, changing, settled");
 }
 
+/// npm's reify renames `bin/claude` aside: a candidate the probe resolved and
+/// that is GONE by the time `stat` reads it is a MISS to wait out, never an
+/// unknown change time that launches at once (the path no longer exists, so
+/// the exec would fail).
+#[test]
+fn a_candidate_that_vanishes_under_stat_is_a_miss_not_an_unknown() {
+    let run = run(&Scenario {
+        answers: &["vanish", "fail", "old"],
+        claude: Claude::VanishesOnStat,
+        ..Scenario::default()
+    });
+    assert!(run.ok && run.ran, "{}", run.stderr);
+    let lines: Vec<&str> = run.stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "one miss line and nothing else: {}", run.stderr);
+    assert!(lines[0].contains("claude not found on PATH"), "{}", run.stderr);
+    assert_eq!(
+        run.stat_calls.lines().count(),
+        3,
+        "both probes failed on the vanished path, then one settled read: {}",
+        run.stat_calls
+    );
+    assert_invoked_only(&run, "vanished under stat");
+}
+
 /// bash older than 5 (macOS's 3.2) has no `EPOCHSECONDS`; the shim's clock is
 /// then `date +%s`. `BASH_ENV` unsets the builtin before the shim runs, and a
 /// fake `date` prints a fixed epoch, so the ages below come from it alone.
@@ -524,6 +576,8 @@ fn without_epochseconds_the_clock_falls_back_to_date() {
 /// the run starts only once at least 2 s have passed since that write,
 /// measured on the filesystem's own clock (its ctime against the marker the
 /// fake writes when it runs).
+/// Linux only: the timing wrapper stamps with GNU `date +%s%N`.
+#[cfg(target_os = "linux")]
 #[test]
 fn with_the_real_stat_a_freshly_written_claude_waits_at_least_two_seconds() {
     if system_tool("stat").is_none() {
@@ -546,13 +600,15 @@ fn with_the_real_stat_a_freshly_written_claude_waits_at_least_two_seconds() {
 /// `-L`: a `bin/claude` symlink made long ago, pointing at a target rewritten
 /// just now, must wait — the LINK's own change time is settled, the target's
 /// is not.
+/// Linux only, as above.
+#[cfg(target_os = "linux")]
 #[test]
 fn with_the_real_stat_an_old_symlink_to_a_fresh_target_waits() {
     let (Some(_), Some(real_sleep)) = (system_tool("stat"), system_tool("sleep")) else {
         eprintln!("SKIP: no system stat or sleep");
         return;
     };
-    let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = exe_guard();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (shim_dir, bin, real_dir) = (root.join("shim"), root.join("bin"), root.join("real"));
