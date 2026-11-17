@@ -4044,7 +4044,10 @@ impl SessionLifecycleStore {
     /// rather than lose data). NOTE: no shipped adapter triggers this today (the
     /// audit refuted Claude id-rotation); it exists so a future adapter that does
     /// report a corrected id has a correct primitive and never leaves a
-    /// permanently-stale row.
+    /// permanently-stale row. Launch-failure liveness is NOT carried: it lives in
+    /// `terminal::launch_failure::registry()`, keyed by the old id, until the
+    /// poll's next KeepAlive notes the new one — a caller that wires this up
+    /// should re-note it there.
     pub fn rekey_session(&self, old_id: &str, new_id: &str) {
         if old_id == new_id {
             return;
