@@ -1235,7 +1235,7 @@ fn resolve_real_waiting(
 ///
 /// npm writes the 340 MB native `claude` behind a `bin/claude` it has already
 /// re-linked, so the first hit can be an executable, non-stub image that is
-/// still being written (finding `25770a72`). A candidate whose target changed
+/// still being written (finding `18ee5471`). A candidate whose target changed
 /// under [`SETTLE_MIN_AGE`] ago is re-probed inside the SAME bound as a miss;
 /// at the bound it is launched anyway, after one stderr line, because something
 /// launchable did resolve (FAIL-OPEN) — an exec that then fails is still
@@ -1250,6 +1250,9 @@ fn resolve_real_settled_waiting(
     let wait = resolve_wait_from(env::var(RESOLVE_WAIT_ENV).ok().as_deref(), default_wait);
     let resolved = resolve_settled_with_wait(
         || resolve_real(name, own_dirs).map(|p| {
+            // On Windows `p` is npm's wrapper, not the image, and the time is a
+            // stand-in that can read a long write's start: coverage there is
+            // incidental (intercept_core::settled, "Windows limits").
             let settle = settle_of(&p, SystemTime::now());
             (p, settle)
         }),

@@ -167,8 +167,8 @@ resolve_wait_secs() {
 # SETTLE check (plan 2026-11-10-shim-settle-wait-and-in-memory-launch-liveness,
 # Phase 3, D3). npm re-links `bin/claude` and THEN writes the 340 MB native
 # image behind it, so a resolved, executable, non-stub `claude` can still be
-# mid-write: a sampler saw one as small as 14.9 MB for up to 1.5 s (coord
-# finding 25770a72). A candidate is SETTLED when its target's change time is
+# mid-write: a sampler saw one as small as 11.8 MB of 341.9 MB, in partial-ELF
+# windows of up to 1.7 s, settling at p95 3.1 s (coord finding 18ee5471). A candidate is SETTLED when its target's change time is
 # old enough -- the runner's intercept_core::settled predicate, carried here as
 # a copy the way is_npm_placeholder is. Both clocks are whole seconds here, so
 # settled means `now - ctime >= 3`, which guarantees more than 2 s.
