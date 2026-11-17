@@ -24,7 +24,7 @@ describe("saveConstraintConfig", () => {
           success: false,
           error: "the workspace root did not resolve",
           code: "workspace_root_unresolved",
-          hint: { code: "workspace_root_unresolved", next_action: "set QONTINUI_ROOT" },
+          hint: { code: "workspace_root_unresolved", next_action: "set the Workspace root" },
         }),
         { status: 422, headers: { "Content-Type": "application/json" } },
       ),
