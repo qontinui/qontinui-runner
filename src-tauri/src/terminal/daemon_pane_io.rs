@@ -3341,8 +3341,8 @@ mod tests {
         /// Two checks, so both exit paths are pinned:
         /// * after the child EXITS and before `release`, each pane must fall
         ///   back to the struct's own reference alone. That is the pump's own
-        ///   exit handling (it returns on `Exit` and closes the control
-        ///   queue, which ends the control thread). `release` and `Drop` also
+        ///   exit handling: it closes the control queue on `Exit` (or on a
+        ///   final end of stream), which ends the control thread. `release` and `Drop` also
         ///   close the queue, so only this pre-release check sees that path
         ///   regress;
         /// * after `release` and drop, no pane-thread reference may remain.
