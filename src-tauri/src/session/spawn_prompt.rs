@@ -961,22 +961,15 @@ mod script_tests {
     /// whole process tree and returns an error.
     const SCRIPT_BUDGET: Duration = Duration::from_secs(30);
 
-    /// Serialises "write an executable, then spawn". `Command` forks, and a
-    /// forked child inherits every fd open at that moment — including another
-    /// thread's still-open write handle on the script IT is about to run,
-    /// which then fails to start with ETXTBSY. Cheap: these are sub-second
-    /// shell runs.
-    /// It is the SAME lock as the bash-shim harness's
-    /// (`shim_test_support::EXE_LOCK`): these tests write and run identity-shim
-    /// scripts too, and two locks would not serialize against each other.
-    use crate::install_effects_producer::intercept::shim_test_support::EXE_LOCK;
-
-    /// Take [`EXE_LOCK`], surviving a poisoned mutex so one failing test
-    /// reports its own assertion instead of cascading into the rest.
-    // test-lock: standalone — module-private; its holders take no other test lock and never take `env_lock` or any other test lock
-    fn exe_guard() -> std::sync::MutexGuard<'static, ()> {
-        EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // Serialises "write an executable, then spawn". `Command` forks, and a
+    // forked child inherits every fd open at that moment — including another
+    // thread's still-open write handle on the script IT is about to run,
+    // which then fails to start with ETXTBSY. Cheap: these are sub-second
+    // shell runs. It is the bash-shim harness's one lock
+    // (`shim_test_support::exe_guard`): these tests write and run
+    // identity-shim scripts too, and two locks would not serialize against
+    // each other.
+    use crate::install_effects_producer::intercept::shim_test_support::exe_guard;
 
     const BASH_INTEGRATION: &str = include_str!("../../resources/shell-integration.bash");
     const ZSH_INTEGRATION: &str = include_str!("../../resources/shell-integration.zsh");
