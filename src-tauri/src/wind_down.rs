@@ -361,6 +361,49 @@ pub struct WindDownView {
     /// "watched".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obligations: Option<ObligationsView>,
+    /// The `finished_close` arm's close guard for this session, from the arm's
+    /// most recent close batch (plan
+    /// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+    /// Phase 1). Present ONLY when the guard judged the session; absent is
+    /// "not judged", never "would close".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_guard: Option<CloseGuardView>,
+    /// coord's finish time for the session (unix ms) as the pass that built
+    /// this view read it — the stamp the close guard's revival arm judges
+    /// against. Not served: `sessionStatusSince` already carries it.
+    #[serde(skip)]
+    pub finished_at_ms: Option<i64>,
+}
+
+/// One input of the close guard, as `windDown.closeGuard.arms[]` serves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseGuardArmView {
+    /// `eligibility` | `custody` | `obligations` | `first_verdict` | `revival`
+    /// | `undelivered_messages`.
+    pub arm: &'static str,
+    /// `ok` | `held` | `unknown`.
+    pub verdict: &'static str,
+    /// The reason code, for `held` and `unknown`.
+    pub reason: Option<&'static str>,
+    /// What was found.
+    pub detail: Option<String>,
+}
+
+/// The close guard's verdict for one session — `windDown.closeGuard`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseGuardView {
+    /// `would_mint` | `held` | `unknown`.
+    pub verdict: &'static str,
+    /// The input that decided a `held` or `unknown` verdict.
+    pub decided_by: Option<&'static str>,
+    /// Its reason code.
+    pub reason: Option<&'static str>,
+    /// Every input, in the order the guard evaluates them.
+    pub arms: Vec<CloseGuardArmView>,
+    /// When the guard judged it (unix millis).
+    pub judged_at: i64,
 }
 
 impl WindDownView {
@@ -379,6 +422,8 @@ impl WindDownView {
             kind,
             custody: None,
             obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         }
     }
 

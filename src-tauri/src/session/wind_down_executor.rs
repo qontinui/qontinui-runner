@@ -165,6 +165,8 @@ use crate::session::tracking_health::{LiveClaudeProcess, TrackingHealthPass};
 use crate::session::wind_down_observer::{
     self, CustodyProbe, GitCustodyProbe, OwnershipRead, SessionCustodyContext,
 };
+use crate::session::finished_close_guard::{self, GuardInputs, GuardVerdict};
+use crate::session::transcript_facts::TranscriptFacts;
 use crate::settings::FinishedSessionClose;
 use crate::terminal::graceful_exit::{ChildExemptions, GracefulExitOutcome};
 use crate::terminal::TerminalManager;
@@ -1119,6 +1121,10 @@ pub(crate) trait FinishedCloseWorld: Sync {
     fn probe(&self) -> &dyn CustodyProbe;
     /// Publish this pass's custody verdicts for `/restart-readiness`.
     fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]);
+    /// Publish the close guard's verdicts for `/restart-readiness` — called
+    /// with an empty set on every pass that runs no close batch, so a verdict
+    /// never outlives the pass that reached it.
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]);
     /// The REMOTE half of `closeable` for one candidate: coord's obligations
     /// read, as read (judged by [`judge_obligations`]). Asked only for a
     /// candidate whose custody was clean, and at most
@@ -1205,6 +1211,7 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         PassPlan::Skip(SkipReason::Off) => {
             world.publish_custody(&[]);
             world.publish_obligations(&[]);
+            world.publish_close_guards(&[]);
             return FinishedCloseTick::Skipped(SkipReason::Off);
         }
         PassPlan::Skip(reason) => {
@@ -1227,6 +1234,7 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     if candidates.is_empty() {
         world.publish_custody(&[]);
         world.publish_obligations(&[]);
+        world.publish_close_guards(&[]);
         return FinishedCloseTick::Ran {
             judged: Vec::new(),
             obligations: Vec::new(),
@@ -1314,6 +1322,7 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     world.publish_obligations(&obligations_judged);
 
     if clean.is_empty() {
+        world.publish_close_guards(&[]);
         return FinishedCloseTick::Ran {
             judged,
             obligations: obligations_judged,
@@ -1431,6 +1440,10 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
         finished_close::publish_obligations(verdicts, Utc::now().timestamp_millis());
     }
 
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+        finished_close::publish_close_guards(views);
+    }
+
     async fn close_clean(
         &self,
         pass: &LiveCensus,
@@ -1545,6 +1558,11 @@ pub(crate) enum CandidateOutcome {
     /// `Watched` — an item is unwatched, or coord could not say. Nothing was
     /// typed at it.
     ObligationsNotWatched,
+    /// `finished_close` only: the close guard held the close on an input
+    /// beyond eligibility, custody and obligations — a PR head with no first
+    /// CI verdict, a revival after the finish, or an undelivered message — or
+    /// could not determine one. Nothing was typed at it.
+    GuardHeld,
     /// `finished_close` in `shadow`: every check passed and the close was
     /// logged, not made. Nothing was typed at it.
     Shadowed,
@@ -1579,6 +1597,22 @@ pub(crate) trait CloseEffects {
     /// because it is the slow one (up to 45 s), so the local re-checks sit
     /// next to the close; [`close_batch`] judges it with [`judge_obligations`].
     async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead;
+    /// (e) `finished_close` only: coord's undelivered messages for this
+    /// device, each attributed to the session it is for where the runner can
+    /// tell — the close guard's condition-2 "no undelivered message" input.
+    async fn undelivered_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<finished_close_guard::PendingMessage>, String>;
+    /// (f) `finished_close` only: the newest transcript copy's facts, read
+    /// deep enough to reach `finished_at_ms` — the guard's revival input.
+    async fn transcript_facts(
+        &self,
+        session_id: &str,
+        finished_at_ms: Option<i64>,
+    ) -> Result<TranscriptFacts, String>;
+    /// `finished_close` only: publish the batch's close-guard verdicts.
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]);
     /// `finished_close` in `shadow`: log that this candidate WOULD be closed,
     /// with the inputs it was judged on — `custody` is the verdict the
     /// re-check just reached, not the pass's.
@@ -1656,11 +1690,24 @@ pub(crate) trait CloseEffects {
 ///   consults it.
 ///
 /// **The order, for `finished_close`** (#2981 review concern 2): the coord
-/// obligations read FIRST — it can take up to 45 s — then the eligibility and
-/// custody re-checks, then the judgement of that read against what custody
-/// covered, then the close. So the freshest LOCAL reads (is the session still
-/// idle and finished, are its trees still clean) are the ones nearest the
-/// `/exit`, and no eligibility answer is 45 s stale by the time it is acted on.
+/// obligations read FIRST — it can take up to 45 s — and coord's undelivered
+/// messages, then the eligibility and custody re-checks and the transcript
+/// read, then the judgement of that read against what custody covered, then
+/// the close. So the freshest LOCAL reads (is the session still idle and
+/// finished, are its trees still clean, has it been revived) are the ones
+/// nearest the `/exit`, and no eligibility answer is 45 s stale by the time it
+/// is acted on.
+///
+/// **The close guard, for `finished_close`** (plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+/// Phase 1): every input above is handed to
+/// [`finished_close_guard::judge`], which also judges the first-verdict hold,
+/// revival and undelivered messages. Its verdict is logged at INFO
+/// (`close guard: would mint | held <reason> | unknown <reason>`, with every
+/// input) and published as `windDown.closeGuard`, BEFORE the shadow branch, so
+/// a shadow-mode arm logs it too. Anything but `Close` makes no close attempt.
+/// A `Close` proceeds to today's [`CloseEffects::wind_down_one`], which still
+/// presents no close authority (Phase 2 mints).
 ///
 /// In `shadow`, every one of those checks still runs, and the close is logged
 /// instead of made. `graceful_exit`'s own refusals (a child process, a nested
@@ -1672,6 +1719,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     effects: &E,
 ) -> Vec<CandidateOutcome> {
     let mut outcomes = Vec::new();
+    let mut guard_views: Vec<(String, wind_down::CloseGuardView)> = Vec::new();
     for (index, (session_id, terminal_id)) in
         candidates.into_iter().take(MAX_CLOSES_PER_TICK).enumerate()
     {
@@ -1682,63 +1730,48 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
                 "wind_down_executor: the arm no longer applies mid-batch — stopping this pass"
             );
             outcomes.push(CandidateOutcome::ArmWithdrawn);
+            if arm == CloseArm::FinishedClose {
+                effects.publish_close_guards(&guard_views);
+            }
             return outcomes;
         }
-        // `finished_close` reads coord's obligations FIRST (see the order
-        // above); the drain arm never reads them.
-        let obligations_read = if arm == CloseArm::FinishedClose {
-            Some(effects.recheck_obligations(&session_id).await)
+        let custody = if arm == CloseArm::FinishedClose {
+            // Every input read for THIS close, in the order above, then the
+            // guard. Nothing past this point can be closed without it.
+            let (verdict, arms, custody) =
+                guard_one_close(effects, index, &session_id, &terminal_id).await;
+            let judged_at_ms = Utc::now().timestamp_millis();
+            log_guard(&session_id, &terminal_id, &verdict, &arms);
+            guard_views.push((
+                session_id.clone(),
+                finished_close_guard::view(&verdict, &arms, judged_at_ms),
+            ));
+            match verdict {
+                // Phase 1 is shadow: the token is judged and dropped, and the
+                // close below still presents no close authority.
+                GuardVerdict::Close(_) => custody,
+                GuardVerdict::Held(r) | GuardVerdict::Unknown(r) => {
+                    outcomes.push(outcome_for_guard_arm(r.arm));
+                    continue;
+                }
+            }
         } else {
-            None
-        };
-        let rechecked = if recheck_is_owed(arm, index) {
-            effects.recheck(&session_id, &terminal_id).await
-        } else {
-            None
-        };
-        if !recheck_admits(arm, index, rechecked.as_ref()) {
-            info!(
-                session_id = %session_id,
-                terminal_id = %terminal_id,
-                verdict = rechecked.as_ref().map_or("gone", |v| v.eligibility),
-                reason = rechecked.as_ref().and_then(|v| v.reason).unwrap_or("-"),
-                "wind_down_executor: no longer eligible when its turn came — not closed"
-            );
-            outcomes.push(CandidateOutcome::NoLongerEligible);
-            continue;
-        }
-        // `finished_close` re-judges custody immediately before EVERY close
-        // (see `recheck_is_owed`); the drain arm never consults it.
-        let custody = if let Some(obligations_read) = &obligations_read {
-            let CustodyJudged {
-                verdict: custody,
-                covered,
-            } = effects.recheck_custody(&session_id, &terminal_id).await;
-            if !custody.is_clean() {
+            let rechecked = if recheck_is_owed(arm, index) {
+                effects.recheck(&session_id, &terminal_id).await
+            } else {
+                None
+            };
+            if !recheck_admits(arm, index, rechecked.as_ref()) {
                 info!(
                     session_id = %session_id,
                     terminal_id = %terminal_id,
-                    custody = %finished_close::describe(&custody),
-                    "wind_down_executor: custody no longer clean when its turn came — not closed"
+                    verdict = rechecked.as_ref().map_or("gone", |v| v.eligibility),
+                    reason = rechecked.as_ref().and_then(|v| v.reason).unwrap_or("-"),
+                    "wind_down_executor: no longer eligible when its turn came — not closed"
                 );
-                outcomes.push(CandidateOutcome::CustodyNotClean);
+                outcomes.push(CandidateOutcome::NoLongerEligible);
                 continue;
             }
-            // The remote half, read first and judged now against the trees
-            // custody just covered.
-            let obligations = judge_obligations(obligations_read, &covered);
-            if !obligations.is_watched() {
-                info!(
-                    session_id = %session_id,
-                    terminal_id = %terminal_id,
-                    obligations = %finished_close::describe_obligations(&obligations),
-                    "wind_down_executor: obligations no longer all watched when its turn came — not closed"
-                );
-                outcomes.push(CandidateOutcome::ObligationsNotWatched);
-                continue;
-            }
-            Some(custody)
-        } else {
             None
         };
         if admission == Admission::Shadow {
@@ -1788,7 +1821,108 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         }
         outcomes.push(CandidateOutcome::Attempted);
     }
+    if arm == CloseArm::FinishedClose {
+        effects.publish_close_guards(&guard_views);
+    }
     outcomes
+}
+
+/// Read every close-guard input for ONE `finished_close` candidate, in the
+/// order [`close_batch`] documents, and judge it. Returns the verdict, every
+/// arm's answer, and the re-checked custody verdict (for the shadow log).
+///
+/// The custody probe and the transcript read are skipped once the fresh
+/// eligibility re-check does not admit the session: the guard's eligibility
+/// arm already decides then, and the custody probes are the expensive part.
+async fn guard_one_close<E: CloseEffects + Sync>(
+    effects: &E,
+    index: usize,
+    session_id: &str,
+    terminal_id: &str,
+) -> (
+    GuardVerdict,
+    Vec<(&'static str, finished_close_guard::ArmVerdict)>,
+    Option<CustodyVerdict>,
+) {
+    let obligations_read = effects.recheck_obligations(session_id).await;
+    let messages = effects.undelivered_messages(session_id).await;
+    let rechecked = effects.recheck(session_id, terminal_id).await;
+    let admitted = recheck_admits(CloseArm::FinishedClose, index, rechecked.as_ref());
+    let custody = if admitted {
+        Some(effects.recheck_custody(session_id, terminal_id).await)
+    } else {
+        None
+    };
+    let covered = custody.as_ref().map_or(&[][..], |c| c.covered.as_slice());
+    let obligations = judge_obligations(&obligations_read, covered);
+    let transcript = if admitted {
+        let stamp = rechecked.as_ref().and_then(|v| v.finished_at_ms);
+        Some(effects.transcript_facts(session_id, stamp).await)
+    } else {
+        None
+    };
+    let custody = custody.map(|c| c.verdict);
+    let inputs = GuardInputs {
+        session_id,
+        terminal_id,
+        eligibility: rechecked.as_ref(),
+        custody: custody.as_ref(),
+        obligations: &obligations,
+        obligations_body: obligations_read.as_ref().ok(),
+        transcript: transcript.as_ref(),
+        messages: &messages,
+        now_ms: Utc::now().timestamp_millis(),
+    };
+    let (verdict, arms) = finished_close_guard::judge_with_arms(&inputs);
+    (verdict, arms, custody)
+}
+
+/// The outcome a non-`Close` guard verdict is recorded as, by the arm that
+/// decided it — so the three pre-guard outcomes keep their meaning.
+fn outcome_for_guard_arm(arm: &str) -> CandidateOutcome {
+    match arm {
+        "eligibility" => CandidateOutcome::NoLongerEligible,
+        "custody" => CandidateOutcome::CustodyNotClean,
+        "obligations" => CandidateOutcome::ObligationsNotWatched,
+        _ => CandidateOutcome::GuardHeld,
+    }
+}
+
+/// The ONE INFO line per `finished_close` close attempt: the guard's verdict
+/// with every input's verdict beside it.
+fn log_guard(
+    session_id: &str,
+    terminal_id: &str,
+    verdict: &GuardVerdict,
+    arms: &[(&'static str, finished_close_guard::ArmVerdict)],
+) {
+    let inputs = finished_close_guard::describe_arms(arms);
+    match verdict {
+        GuardVerdict::Close(token) => info!(
+            session_id = %token.session_id(),
+            terminal_id = %token.terminal_id(),
+            inputs = %inputs,
+            "close guard: would mint"
+        ),
+        GuardVerdict::Held(r) => info!(
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            arm = r.arm,
+            detail = %r.detail,
+            inputs = %inputs,
+            "close guard: held {}",
+            r.reason
+        ),
+        GuardVerdict::Unknown(r) => info!(
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            arm = r.arm,
+            detail = %r.detail,
+            inputs = %inputs,
+            "close guard: unknown {}",
+            r.reason
+        ),
+    }
 }
 
 /// Does [`wind_down_exit`] present a close authority to the graceful exit?
@@ -1955,6 +2089,61 @@ impl CloseEffects for LiveCloseEffects<'_> {
 
     async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead {
         wind_down_observer::fetch_obligations(session_id).await
+    }
+
+    async fn undelivered_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
+        use tauri::Manager;
+        let rows = wind_down_observer::fetch_pending_messages(session_id).await?;
+        let registrar = self
+            .app
+            .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            .map(|r| r.inner().clone());
+        Ok(rows
+            .into_iter()
+            .map(|(message_id, to_session)| {
+                // The same resolution the delivery poller routes on: a
+                // lifecycle record keyed by the id, else coord's session UUID
+                // through the registrar's forward index.
+                let owner = self
+                    .store
+                    .as_ref()
+                    .and_then(|store| store.get(&to_session))
+                    .map(|r| r.claude_session_id)
+                    .or_else(|| {
+                        let uuid = to_session.parse::<uuid::Uuid>().ok()?;
+                        registrar.as_ref()?.task_run_id_for(&uuid)
+                    });
+                finished_close_guard::PendingMessage {
+                    message_id,
+                    to_session,
+                    owner,
+                }
+            })
+            .collect())
+    }
+
+    async fn transcript_facts(
+        &self,
+        session_id: &str,
+        finished_at_ms: Option<i64>,
+    ) -> Result<TranscriptFacts, String> {
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::session::transcript_facts::facts_for_session(
+                &session_id,
+                finished_at_ms,
+                finished_close_guard::BAND_MS,
+            )
+        })
+        .await
+        .map_err(|e| format!("the transcript read did not complete: {e}"))?
+    }
+
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+        finished_close::publish_close_guards(views);
     }
 
     fn would_close(&self, session_id: &str, terminal_id: &str, custody: Option<&CustodyVerdict>) {
@@ -2630,6 +2819,8 @@ mod tests {
                 kind: SessionKind::Terminal,
                 custody: None,
                 obligations: None,
+                close_guard: None,
+                finished_at_ms: None,
             }),
             stray_wait_shells: 0,
         }
@@ -2682,6 +2873,8 @@ mod tests {
             kind: SessionKind::Terminal,
             custody: None,
             obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         };
         let not_yet = wind_down::WindDownView {
             eligibility: "not_yet",
@@ -2691,6 +2884,8 @@ mod tests {
             kind: SessionKind::Terminal,
             custody: None,
             obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         };
 
         // Drain arm: index 0 owes nothing — its verdict is the pass that just ran.
@@ -2770,6 +2965,13 @@ mod tests {
         outcomes: HashMap<String, Result<GracefulExitOutcome, String>>,
         /// Which terminals hold a steward, and of which kind.
         stewards: HashMap<String, String>,
+        /// What `undelivered_messages` answers, by terminal id. Absent = none.
+        messages: HashMap<String, Result<Vec<finished_close_guard::PendingMessage>, String>>,
+        /// What `transcript_facts` answers, by terminal id. Absent =
+        /// [`quiet_facts`], nothing after the finish.
+        transcripts: HashMap<String, Result<TranscriptFacts, String>>,
+        /// Every set of close-guard verdicts published, in order.
+        guards: std::sync::Mutex<Vec<Vec<(String, wind_down::CloseGuardView)>>>,
         calls: std::sync::Mutex<Vec<String>>,
         admission_calls: std::sync::atomic::AtomicUsize,
     }
@@ -2783,9 +2985,34 @@ mod tests {
                 obligations: HashMap::new(),
                 outcomes: HashMap::new(),
                 stewards: HashMap::new(),
+                messages: HashMap::new(),
+                transcripts: HashMap::new(),
+                guards: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
                 admission_calls: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+        fn messages(
+            mut self,
+            terminal_id: &str,
+            read: Result<Vec<finished_close_guard::PendingMessage>, String>,
+        ) -> Self {
+            self.messages.insert(terminal_id.to_string(), read);
+            self
+        }
+        fn transcript(mut self, terminal_id: &str, read: Result<TranscriptFacts, String>) -> Self {
+            self.transcripts.insert(terminal_id.to_string(), read);
+            self
+        }
+        /// The verdict words of every published guard set, flattened.
+        fn guard_words(&self) -> Vec<(String, &'static str, Option<&'static str>)> {
+            self.guards
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|(s, v)| (s.clone(), v.verdict, v.reason))
+                .collect()
         }
         fn eligible(mut self, terminal_id: &str) -> Self {
             self.verdicts
@@ -2844,6 +3071,9 @@ mod tests {
         }
     }
 
+    /// coord's finish stamp in every double's re-check view.
+    const FINISHED_AT_MS: i64 = 1_000;
+
     fn view(eligibility: &'static str) -> wind_down::WindDownView {
         wind_down::WindDownView {
             eligibility,
@@ -2853,6 +3083,20 @@ mod tests {
             kind: SessionKind::Terminal,
             custody: None,
             obligations: None,
+            close_guard: None,
+            finished_at_ms: Some(FINISHED_AT_MS),
+        }
+    }
+
+    /// A transcript with nothing after [`FINISHED_AT_MS`]: prompted at 0 and
+    /// answered at 500, the whole file read.
+    fn quiet_facts() -> TranscriptFacts {
+        TranscriptFacts {
+            last_prompt_ms: Some(-60_000),
+            last_turn_open_ms: Some(-60_000),
+            last_asst_ms: Some(500),
+            window_floor_ms: Some(-60_000),
+            whole_file: true,
         }
     }
 
@@ -3072,6 +3316,37 @@ mod tests {
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or_else(watched_read)
+        }
+        async fn undelivered_messages(
+            &self,
+            session_id: &str,
+        ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
+            let terminal_id = session_id.strip_prefix("s-").unwrap_or(session_id);
+            self.log(format!("messages:{terminal_id}"));
+            self.messages
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+        async fn transcript_facts(
+            &self,
+            session_id: &str,
+            finished_at_ms: Option<i64>,
+        ) -> Result<TranscriptFacts, String> {
+            let terminal_id = session_id.strip_prefix("s-").unwrap_or(session_id);
+            assert_eq!(
+                finished_at_ms,
+                Some(FINISHED_AT_MS),
+                "the stamp is the per-close re-check's"
+            );
+            self.log(format!("transcript:{terminal_id}"));
+            self.transcripts
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_else(|| Ok(quiet_facts()))
+        }
+        fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+            self.guards.lock().unwrap().push(views.to_vec());
         }
         fn would_close(
             &self,
@@ -3414,6 +3689,20 @@ mod tests {
         async fn recheck_obligations(&self, _session_id: &str) -> ObligationsRead {
             watched_read()
         }
+        async fn undelivered_messages(
+            &self,
+            _session_id: &str,
+        ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
+            Ok(Vec::new())
+        }
+        async fn transcript_facts(
+            &self,
+            _session_id: &str,
+            _finished_at_ms: Option<i64>,
+        ) -> Result<TranscriptFacts, String> {
+            Ok(quiet_facts())
+        }
+        fn publish_close_guards(&self, _views: &[(String, wind_down::CloseGuardView)]) {}
         fn would_close(&self, _session_id: &str, terminal_id: &str, _: Option<&CustodyVerdict>) {
             panic!("admission is Close, never Shadow: would_close({terminal_id})");
         }
@@ -3969,6 +4258,8 @@ mod tests {
             kind: SessionKind::Looping,
             custody: None,
             obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         };
         for index in 0..4 {
             assert!(!recheck_admits(
@@ -4552,6 +4843,9 @@ mod tests {
                 .unwrap()
                 .push(verdicts.to_vec());
         }
+        fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+            self.effects.publish_close_guards(views);
+        }
         async fn close_clean(
             &self,
             _pass: &Self::Pass,
@@ -4874,13 +5168,14 @@ mod tests {
         // #2981 review concern 2: the slow coord read comes FIRST, and the
         // local re-checks — eligibility, then custody — sit next to the close.
         let at = |needle: &str| calls.iter().position(|c| c == needle).unwrap();
-        assert!(at("obligations:t1") < at("recheck:t1"), "{calls:?}");
+        assert!(at("obligations:t1") < at("messages:t1"), "{calls:?}");
+        assert!(at("messages:t1") < at("recheck:t1"), "{calls:?}");
         assert!(at("recheck:t1") < at("custody:t1"), "{calls:?}");
-        assert!(at("custody:t1") < at("exit:t1"), "{calls:?}");
+        assert!(at("custody:t1") < at("transcript:t1"), "{calls:?}");
         assert_eq!(
             at("exit:t1"),
-            at("custody:t1") + 1,
-            "nothing runs between the custody re-check and the exit: {calls:?}"
+            at("transcript:t1") + 1,
+            "only local reads sit between the custody re-check and the exit: {calls:?}"
         );
 
         // Unknown at the re-check is no better.
@@ -4912,8 +5207,14 @@ mod tests {
             .collect();
         assert_eq!(
             calls,
-            vec!["obligations:t1", "recheck:t1", "custody:t1"],
-            "the obligations read precedes both local re-checks"
+            vec![
+                "obligations:t1",
+                "messages:t1",
+                "recheck:t1",
+                "custody:t1",
+                "transcript:t1"
+            ],
+            "the coord reads precede the local re-checks"
         );
 
         let drain = RecordingEffects::new()
@@ -5122,6 +5423,134 @@ mod tests {
             judge_obligations(&Ok(unproven), &[]).reason(),
             Some("session_not_proven")
         );
+    }
+
+    // ── The close guard at its call site (plan 2026-11-16-…, Phase 1) ────
+
+    fn pr_waiting_on_ci() -> ObligationsRead {
+        Ok(obligations_body(
+            serde_json::json!([{
+                "item": {"repo": "o/r", "pr_number": 7}, "verdict": "watched",
+                "attribution": "proven",
+                "facts": {"pr_state": "open", "head_sha": "abc", "confidence": "fresh",
+                          "checks": [{"name": "ci", "status": "in_progress",
+                                      "conclusion": null, "coord_gate": false}]},
+            }]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        ))
+    }
+
+    /// Every non-`Close` guard verdict — a pending first verdict, a revival,
+    /// an undelivered message, an unreadable transcript — stops the close
+    /// BEFORE `wind_down_one`, and each verdict is published; a `Close`
+    /// verdict reaches it.
+    #[tokio::test]
+    async fn a_non_close_guard_verdict_never_reaches_wind_down_one() {
+        let effects = RecordingEffects::new()
+            .eligible("t1")
+            .eligible("t2")
+            .eligible("t3")
+            .eligible("t4")
+            .obligations("t1", pr_waiting_on_ci())
+            .transcript(
+                "t2",
+                Ok(TranscriptFacts {
+                    last_prompt_ms: Some(FINISHED_AT_MS + 60_000),
+                    ..quiet_facts()
+                }),
+            )
+            .messages(
+                "t3",
+                Ok(vec![finished_close_guard::PendingMessage {
+                    message_id: "m1".to_string(),
+                    to_session: "s-t3".to_string(),
+                    owner: Some("s-t3".to_string()),
+                }]),
+            )
+            .transcript("t4", Err("no transcript".to_string()));
+        let outcomes = close_batch(
+            CloseArm::FinishedClose,
+            batch(&["t1", "t2", "t3", "t4"]),
+            &effects,
+        )
+        .await;
+        assert_eq!(outcomes, vec![CandidateOutcome::GuardHeld; 4]);
+        assert!(
+            !effects.calls().iter().any(|c| c.starts_with("exit:")),
+            "{:?}",
+            effects.calls()
+        );
+        assert_eq!(
+            effects.guard_words(),
+            vec![
+                ("s-t1".to_string(), "held", Some("first_verdict_pending")),
+                ("s-t2".to_string(), "held", Some("revived")),
+                ("s-t3".to_string(), "held", Some("undelivered_message")),
+                ("s-t4".to_string(), "unknown", Some("transcript_unreadable")),
+            ]
+        );
+
+        // Every input ok: the guard answers Close and the attempt proceeds.
+        let ok = RecordingEffects::new().eligible("t1");
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1"]), &ok).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
+        assert!(ok.calls().contains(&"exit:t1".to_string()));
+        assert_eq!(
+            ok.guard_words(),
+            vec![("s-t1".to_string(), "would_mint", None)]
+        );
+    }
+
+    /// The guard runs BEFORE the shadow branch: a shadow arm logs and
+    /// publishes its verdict, and a held one is never "would close".
+    #[tokio::test]
+    async fn a_shadow_arm_still_judges_and_publishes_the_guard() {
+        let effects = RecordingEffects::new()
+            .admissions(&[Admission::Shadow])
+            .eligible("t1")
+            .eligible("t2")
+            .obligations("t2", pr_waiting_on_ci());
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(
+            outcomes,
+            vec![CandidateOutcome::Shadowed, CandidateOutcome::GuardHeld]
+        );
+        assert!(!effects
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("would_close:t2")));
+        assert_eq!(
+            effects.guard_words(),
+            vec![
+                ("s-t1".to_string(), "would_mint", None),
+                ("s-t2".to_string(), "held", Some("first_verdict_pending")),
+            ]
+        );
+    }
+
+    /// The drain arm never consults the guard, and publishes nothing.
+    #[tokio::test]
+    async fn the_drain_arm_never_runs_the_guard() {
+        let effects = RecordingEffects::new()
+            .eligible("t2")
+            .transcript("t1", Err("never read".to_string()));
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted; 2]);
+        assert!(!effects.calls().iter().any(|c| c.starts_with("transcript:")
+            || c.starts_with("messages:")));
+        assert!(effects.guards.lock().unwrap().is_empty());
+    }
+
+    /// Each deciding arm keeps the outcome it had before the guard existed.
+    #[test]
+    fn a_guard_verdict_is_recorded_as_the_outcome_of_its_deciding_arm() {
+        assert_eq!(outcome_for_guard_arm("eligibility"), CandidateOutcome::NoLongerEligible);
+        assert_eq!(outcome_for_guard_arm("custody"), CandidateOutcome::CustodyNotClean);
+        assert_eq!(outcome_for_guard_arm("obligations"), CandidateOutcome::ObligationsNotWatched);
+        for arm in ["first_verdict", "revival", "undelivered_messages"] {
+            assert_eq!(outcome_for_guard_arm(arm), CandidateOutcome::GuardHeld, "{arm}");
+        }
     }
 
     /// Round-2 suggestion 6: the pass's ownership read serves the re-checks

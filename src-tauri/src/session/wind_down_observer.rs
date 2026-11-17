@@ -482,6 +482,8 @@ pub fn wind_down_for_process(
         .copied()
         .unwrap_or(TerminalObservation::UNOBSERVABLE);
     let work_status = work_status_for(process);
+    // coord's finish stamp — carried on the view so the close guard's revival
+    // arm judges against the stamp of the SAME fresh pass as its eligibility.
     let finished_at_ms = match work_status {
         WorkStatus::Finished => process
             .session_id
@@ -504,10 +506,9 @@ pub fn wind_down_for_process(
         finished_at_ms,
         grace,
     };
-    Some(WindDownView::from_verdict(
-        &wind_down::eligibility(&inputs, now_ms),
-        kind,
-    ))
+    let mut view = WindDownView::from_verdict(&wind_down::eligibility(&inputs, now_ms), kind);
+    view.finished_at_ms = finished_at_ms;
+    Some(view)
 }
 
 /// Attach [`wind_down_for_process`] to every process in `processes`.
@@ -706,6 +707,70 @@ pub fn first_uncovered_coord_worktree(
             _ => Some("<absent>".to_string()),
         }
     })
+}
+
+/// Per-request deadline for coord's pending-message read (the close guard's
+/// "no undelivered message" input) — the delivery poller's own bound.
+pub const PENDING_MESSAGES_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// coord's undelivered, unacked, unexpired messages for this device — `GET
+/// /coord/session-messages/pending`, the door the delivery poller pulls — as
+/// `(message_id, to_session)` pairs. `?live=` names the session when its id is
+/// a UUID, which ranks its oldest row onto the page (coord's round-robin puts
+/// a `live` recipient's first row ahead of every other recipient's). `Err`
+/// when there is no coord base, no shared client, no device credential (coord
+/// refuses an anonymous read), the read fails, or the body is not the shape
+/// coord serves: the close guard reads every `Err` as UNKNOWN.
+pub async fn fetch_pending_messages(
+    claude_session_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        return Err("no coord base is configured, so pending messages cannot be read".to_string());
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Err("the shared coord HTTP client could not be built".to_string());
+    };
+    if !crate::coord_http::have_device_token() {
+        return Err(
+            "no device credential: coord's pending-message read refuses an anonymous caller"
+                .to_string(),
+        );
+    }
+    let mut url = format!(
+        "{}/coord/session-messages/pending",
+        base.trim_end_matches('/')
+    );
+    if let Ok(uuid) = claude_session_id.trim().parse::<uuid::Uuid>() {
+        url.push_str(&format!("?live={uuid}"));
+    }
+    let body = read_obligations(
+        crate::coord_http::coord_get(client, &url),
+        &url,
+        PENDING_MESSAGES_TIMEOUT,
+    )
+    .await?;
+    pending_message_rows(&body)
+}
+
+/// The `(message_id, to_session)` rows of a pending-message body. A body with
+/// no `messages` list, or a row missing either id, is `Err`: a row that cannot
+/// be attributed must not vanish.
+pub fn pending_message_rows(body: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let rows = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "the pending-message body carries no `messages` list".to_string())?;
+    rows.iter()
+        .map(|row| {
+            let field = |key: &str| {
+                row.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("a pending message has no `{key}`: {row}"))
+            };
+            Ok((field("message_id")?, field("to_session")?))
+        })
+        .collect()
 }
 
 /// What the runner knows about one candidate before any probe runs.
@@ -1937,6 +2002,32 @@ mod tests {
         // And outside any repository there is no root at all.
         let outside = tempfile::tempdir().unwrap();
         assert_eq!(probe.worktree_root(outside.path()).await.unwrap(), None);
+    }
+
+    #[test]
+    fn pending_message_rows_keep_every_row_and_refuse_a_malformed_one() {
+        let body = serde_json::json!({"messages": [
+            {"message_id": "m1", "to_session": "s1", "kind": "ci_rework", "priority": "blocking"},
+            {"message_id": "m2", "to_session": "0192aaaa-0000-7000-8000-000000000001"},
+        ]});
+        assert_eq!(
+            pending_message_rows(&body).unwrap(),
+            vec![
+                ("m1".to_string(), "s1".to_string()),
+                (
+                    "m2".to_string(),
+                    "0192aaaa-0000-7000-8000-000000000001".to_string()
+                ),
+            ]
+        );
+        assert!(pending_message_rows(&serde_json::json!({"messages": []}))
+            .unwrap()
+            .is_empty());
+        assert!(pending_message_rows(&serde_json::json!({"error": "x"})).is_err());
+        assert!(
+            pending_message_rows(&serde_json::json!({"messages": [{"message_id": "m"}]})).is_err(),
+            "a row with no recipient cannot be ruled out as this session's"
+        );
     }
 
     // ── Obligations read (finished_close, remote half of `closeable`) ────
