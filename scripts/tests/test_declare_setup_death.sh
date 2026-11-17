@@ -86,7 +86,7 @@ run() {
   local label="$1" expect="$2"; shift 2
   local why="" out rc got
   case "${1:-}" in why=*) why="${1#why=}"; shift ;; esac
-  out="$(env -i PATH="$PATH" HOME="$HOME" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  out="$(env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     DECLARE_JOB="$JOB" HARNESS_PATHS_RE="$HARNESS" VERDICT_STEPS="$VERDICT_SKIPPED" \
     GITHUB_EVENT_NAME=pull_request "$@" bash "$SCRIPT" 2>&1)"
   rc=$?
@@ -110,6 +110,7 @@ read -r W_SELF M_SELF <<< "$(make_pr self .github/scripts/declare-setup-death.sh
 read -r W_TC M_TC <<< "$(make_pr tc rust-toolchain.toml)"
 read -r W_VENDOR M_VENDOR <<< "$(make_pr vendor vendor/pkg/index.js src-tauri/a.rs)"
 read -r W_NL M_NL <<< "$(make_pr nl "a.md"$'\n'"src-tauri/x.html")"
+read -r W_LAT M_LAT <<< "$(make_pr lat "src/caf"$'\xe9'".ts")"
 
 pr() { echo GITHUB_WORKSPACE="$1" GITHUB_SHA="$2"; }
 
@@ -124,6 +125,7 @@ run "lockfile PR, Setup Node.js died -> withhold" withhold "why=changes 'pnpm-lo
 run "TS PR, frontend build died -> withhold" withhold "why=changes 'src/x.ts'" $(pr "$W_TS" "$M_TS") SETUP_STEPS="$(steps 'Build frontend')"
 run "unclassified path (vendor/) PR, build died -> withhold" withhold "why=changes 'vendor/pkg/index.js'" $(pr "$W_VENDOR" "$M_VENDOR") SETUP_STEPS="$(steps 'Build frontend')"
 run "path containing a newline, build died -> withhold" withhold "why=containing a newline" $(pr "$W_NL" "$M_NL") SETUP_STEPS="$(steps 'Build frontend')"
+run "non-UTF-8 frontend path under a UTF-8 locale, build died -> withhold" withhold "why=reads this PR's frontend tree" $(pr "$W_LAT" "$M_LAT") SETUP_STEPS="$(steps 'Build frontend')"
 run "TS PR, apt died -> declare (apt reads nothing of the PR)" declare $(pr "$W_TS" "$M_TS") SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
 run "rust-only PR, apt died -> declare" declare $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
 run "workflow PR, apt died -> withhold (harness)" withhold "why=own harness" $(pr "$W_WF" "$M_WF") SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"

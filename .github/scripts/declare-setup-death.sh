@@ -69,6 +69,10 @@ set -uo pipefail
 trap 'exit 0' EXIT
 
 export GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1
+# Byte semantics for every grep/tr: under a UTF-8 locale GNU grep suppresses
+# a matching line holding invalid UTF-8 (a non-UTF-8 filename) and still
+# exits 0, which would read as "no match" and declare.
+export LC_ALL=C
 
 SELF_RE='^\.github/scripts/declare-setup-death\.sh$'
 DEFAULT_FRONTEND_INERT_RE='^(src-tauri/|crates/|docs/|\.github/|Cargo\.(toml|lock)$|[^/]+\.md$)'
