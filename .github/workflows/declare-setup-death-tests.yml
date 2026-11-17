@@ -17,7 +17,7 @@ on:
       - ".github/workflows/declare-setup-death-tests.yml"
       - ".github/workflows/clippy-tiers.yml"
   pull_request:
-    branches: [main]
+    branches: [main, develop, 'session-restore-**']
     paths:
       - ".github/scripts/declare-setup-death.sh"
       - "scripts/tests/test_declare_setup_death.sh"

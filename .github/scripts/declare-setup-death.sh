@@ -250,10 +250,17 @@ read_guard() {
     fi
   fi
   # With pipefail, the substitution's status is git's when git fails.
-  CHANGED="$(timeout -k 5 "$GIT_BOUND" git -C "$ws" diff -z --no-renames --name-only "$base" "$merge" 2> /dev/null | tr '\0' '\n')"
+  # NUL-delimited paths become lines; a newline INSIDE a path is first
+  # mapped to \001 so it cannot split one path into several inert ones.
+  CHANGED="$(timeout -k 5 "$GIT_BOUND" git -C "$ws" diff -z --no-renames --name-only "$base" "$merge" 2> /dev/null | tr '\n\0' '\001\n')"
   rc=$?
   if [ "$rc" -ne 0 ]; then
     REASON="git diff ${base} ${merge} exited ${rc}, so this PR's diff is unread"
+    return
+  fi
+  if [[ "$CHANGED" == *$'\001'* ]]; then
+    GUARD="true"
+    REASON="this PR changes a path containing a newline, which the path guards cannot classify"
     return
   fi
   if [ -z "$CHANGED" ]; then
