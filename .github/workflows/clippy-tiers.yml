@@ -422,6 +422,8 @@ jobs:
             row 'Install dependencies (Ubuntu)' "$O_APT" tree-free
             row 'Free disk space (Ubuntu)' "$O_FREE_DISK" tree-free
             row 'Add swapfile (Ubuntu — guard against link-time OOM)' "$O_SWAPFILE" tree-free
+            # rust-cache reads the PR's Cargo manifests via cargo metadata but
+            # reports its own errors without failing the step, hence tree-free.
             row 'Cache Rust dependencies' "$O_RUST_CACHE" tree-free
             row 'Install frontend dependencies' "$O_PNPM_INSTALL" frontend
             row 'Build frontend' "$O_PNPM_BUILD" frontend

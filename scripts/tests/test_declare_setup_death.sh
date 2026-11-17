@@ -167,6 +167,14 @@ EO="$TMP/empty-origin"; git init -q -b main "$EO"; echo a > "$EO/a"; git -C "$EO
 git -C "$EO" checkout -q -b pr; git -C "$EO" commit -q --allow-empty -m empty; git -C "$EO" checkout -q main
 git -C "$EO" merge -q --no-ff -m merge pr; EW="$TMP/empty-work"; git clone -q --depth 1 "file://$EO" "$EW" 2> /dev/null
 run "empty PR diff -> withhold (UNKNOWN)" withhold "why=diff against its base is empty" GITHUB_WORKSPACE="$EW" GITHUB_SHA="$(git -C "$EO" rev-parse HEAD)" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+# A rename of a frontend input into an inert directory: --no-renames must
+# list the source path, or only the inert destination is seen.
+RO="$TMP/ren-origin"; git init -q -b main "$RO"; git -C "$RO" config uploadpack.allowAnySHA1InWant true
+mkdir -p "$RO/src" && printf 'export const x = 1;\n%.0s' $(seq 40) > "$RO/src/x.ts"; git -C "$RO" add -A; git -C "$RO" commit -q -m base
+git -C "$RO" checkout -q -b pr; mkdir -p "$RO/docs"; git -C "$RO" mv src/x.ts docs/x.ts; git -C "$RO" commit -q -m mv; git -C "$RO" checkout -q main
+echo r > "$RO/README.md"; git -C "$RO" add -A; git -C "$RO" commit -q -m main2
+git -C "$RO" merge -q --no-ff -m merge pr; RW="$TMP/ren-work"; git clone -q --depth 1 "file://$RO" "$RW" 2> /dev/null
+run "frontend file renamed into docs/, build died -> withhold" withhold "why=changes 'src/x.ts'" GITHUB_WORKSPACE="$RW" GITHUB_SHA="$(git -C "$RO" rev-parse HEAD)" SETUP_STEPS="$(steps 'Build frontend')"
 
 # --- wiring: clippy-tiers.yml's declare step must match its setup steps -----
 if wiring="$(python3 - "$WORKFLOW" "$STEP_TABLE" << 'PY'
