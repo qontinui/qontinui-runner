@@ -1121,8 +1121,8 @@ mod glibc {
             // `ld.so --list-tunables`: arena_max stays at the alias's 0x8), so
             // MALLOC_ARENA_MAX still stands, as it does inside glibc.
             for value in [
-                "0", "00", "08", "09", "0x", "0X", "-0", "+0", "+08", "-08", "-+1",
-                "0x+1", "-0x+1", "+0x+1",
+                "0", "00", "08", "09", "0x", "0X", "-0", "+0", "+08", "-08", "-+1", "0x+1",
+                "-0x+1", "+0x+1",
             ] {
                 let tunables = format!("glibc.malloc.arena_max={value}");
                 let decision = decide_arena_cap(&env(Some("8"), Some(&tunables)));
