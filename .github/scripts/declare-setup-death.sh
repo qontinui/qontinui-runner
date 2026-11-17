@@ -22,18 +22,24 @@
 #                        frontend        reads the PR's frontend tree
 #                        sibling-labels  resolves siblings from coord dep
 #                                        labels (ALWAYS withheld, see below)
-#                      a missing or unknown class is treated as `frontend`
-#                      (the strictest diff rule -- fails closed)
+#                      a missing or unknown class makes the step list
+#                      UNKNOWN (withhold)
 #   VERDICT_STEPS      `<name><TAB><conclusion>` rows of the job's verdict
 #                      step(s); any failure means the red IS a verdict
 #   HARNESS_PATHS_RE   ERE over changed paths: the job's own harness. A PR
 #                      touching any of it may have caused ANY setup death.
 #                      This script's own path is always harness.
-#   FRONTEND_INERT_RE  optional ERE: paths no frontend step reads in a way
-#                      that can FAIL it (an allow-list; default below). The
-#                      vite build's Tailwind scan does read the whole tree,
-#                      but only to extract class candidates, which cannot
-#                      fail the build (.qontinui/ci-targets.toml header).
+#   FRONTEND_INERT_RE  optional ERE: paths no frontend step is known to read
+#                      in a way that can FAIL it (an allow-list; default
+#                      below). The vite build's Tailwind scan reads the whole
+#                      tree for class candidates; malformed candidates were
+#                      probed (tailwindcss 4.2.4, 2026-11-17) and did not fail
+#                      the build -- observed, not proven.
+#                      ASSUMPTION: vite.config.ts aliases @qontinui/schemas to
+#                      the label-resolved sibling, and no src/ file imports it
+#                      today. Once one does, a sibling-driven build death on an
+#                      inert diff would be declared; withhold frontend deaths
+#                      on a non-default sibling ref before adding that import.
 #   GITHUB_EVENT_NAME / GITHUB_SHA / GITHUB_WORKSPACE
 #   GIT_BOUND          optional seconds bound for each local git call (30);
 #                      the one network fetch is bounded at twice that.
@@ -42,9 +48,9 @@
 #   DECLARE_JOB unset or carries a reserved      -> withhold (generic title)
 #   phrase
 #   a supplied regex does not compile            -> withhold (UNKNOWN)
-#   no setup rows; a row with no name or a       -> withhold (UNKNOWN)
-#   conclusion outside success|failure|
-#   cancelled|skipped
+#   no setup or no verdict rows; a row with no   -> withhold (UNKNOWN)
+#   name, a conclusion outside success|failure|
+#   cancelled|skipped, or (setup) no known class
 #   any verdict step failed, or no F             -> emit nothing
 #   F is `sibling-labels`                        -> withhold: the resolver
 #     reads this PR's LIVE labels and reverse-searches open sibling PRs for
@@ -128,9 +134,10 @@ valid_concl() {
 }
 
 # --- verdict steps ----------------------------------------------------------
-unreadable=""
+unreadable="" vrows=0
 while IFS= read -r line || [ -n "${line:-}" ]; do
   [ -z "$line" ] && continue
+  vrows=$((vrows + 1))
   split_row "$line"; name="$F1" concl="$F2"
   if [ "$concl" = "failure" ]; then
     exit 0
@@ -146,34 +153,35 @@ while IFS= read -r line || [ -n "${line:-}" ]; do
   [ -z "$line" ] && continue
   rows=$((rows + 1))
   split_row "$line"; name="$F1" concl="$F2" class="$F3"
-  if [ -z "$name" ] || ! valid_concl "$concl"; then
+  case "$class" in tree-free | frontend | sibling-labels) ;; *) class="" ;; esac
+  if [ -z "$name" ] || ! valid_concl "$concl" || [ -z "$class" ]; then
     unreadable="${unreadable:-${name:-<unnamed>}}"
     continue
   fi
   if [ -z "$first" ] && [ "$concl" = "failure" ]; then
     first="$name"
-    first_class="${class:-frontend}"
+    first_class="$class"
   fi
 done <<< "${SETUP_STEPS:-}"
 
+if [ "$vrows" -eq 0 ]; then
+  withhold "VERDICT_STEPS carries no rows, so whether the verdict step failed is UNKNOWN."
+  exit 0
+fi
 if [ "$rows" -eq 0 ]; then
   withhold "SETUP_STEPS carries no rows, so whether a setup step failed is UNKNOWN."
   exit 0
 fi
 if [ -z "$first" ]; then
   if [ -n "$unreadable" ]; then
-    withhold "step '${unreadable}' rendered no usable conclusion (a renamed step id renders empty), so whether a setup step failed is UNKNOWN."
+    withhold "step '${unreadable}' rendered no usable conclusion or class (a renamed step id renders empty), so whether a setup step failed is UNKNOWN."
   fi
   exit 0
 fi
 if [ -n "$unreadable" ]; then
-  withhold "setup step '${first}' failed, but step '${unreadable}' rendered no usable conclusion, so the step list is UNKNOWN. This red is left to read as a verdict on this change."
+  withhold "setup step '${first}' failed, but step '${unreadable}' rendered no usable conclusion or class, so the step list is UNKNOWN. This red is left to read as a verdict on this change."
   exit 0
 fi
-case "$first_class" in
-  tree-free | frontend | sibling-labels) ;;
-  *) first_class="frontend" ;;
-esac
 
 # --- the guard: may THIS PR have caused it? -----------------------------------
 GUARD="UNKNOWN"

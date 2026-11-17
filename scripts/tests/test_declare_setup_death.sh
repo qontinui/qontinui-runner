@@ -129,7 +129,10 @@ run "reporter-script PR, apt died -> withhold (always harness)" withhold "why=ow
 run "rust-toolchain.toml PR, Setup Rust died -> withhold" withhold "why=own harness" $(pr "$W_TC" "$M_TC") SETUP_STEPS="$(steps 'Setup Rust')"
 run "sibling resolver died on a rust-only PR -> withhold (live labels unreadable)" withhold "why=live labels" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
 run "sibling resolver died on a push -> withhold" withhold "why=live labels" GITHUB_EVENT_NAME=push SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
-run "unknown class -> treated as frontend" withhold "why=changes 'src/x.ts'" $(pr "$W_TS" "$M_TS") SETUP_STEPS="Checkout${T}success${T}tree-free"$'\n'"Mystery${T}failure${T}weird"
+run "unknown class on an inert diff -> withhold (UNKNOWN)" withhold "why=no usable conclusion or class" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="Checkout${T}success${T}tree-free"$'\n'"Mystery${T}failure${T}sibling-label"
+run "row with no class -> withhold (UNKNOWN)" withhold "why=no usable conclusion or class" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="Checkout${T}success${T}tree-free"$'\n'"Mystery${T}failure"
+run "VERDICT_STEPS empty -> withhold (UNKNOWN)" withhold "why=VERDICT_STEPS carries no rows" $(pr "$W_RUST" "$M_RUST") VERDICT_STEPS= SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+run "nothing failed but a row is unreadable -> notice" withhold "why=whether a setup step failed is UNKNOWN" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps - | sed "s/^Setup Rust${T}success/Setup Rust${T}/")"
 run "clippy step failed -> silent" silent $(pr "$W_RUST" "$M_RUST") VERDICT_STEPS="Clippy diff-scoped via reviewdog${T}failure" SETUP_STEPS="$(steps 'Build frontend')"
 run "no setup step failed -> silent" silent $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps -)"
 run "empty conclusion row -> withhold (UNKNOWN)" withhold "why=rendered no usable conclusion" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Build frontend' | sed "s/^Setup Rust${T}success/Setup Rust${T}/")"
@@ -153,6 +156,11 @@ run "unreadable GITHUB_SHA -> withhold (UNKNOWN)" withhold "why=not readable" GI
 read -r W_GONE M_GONE <<< "$(make_pr gone src-tauri/y.rs)"
 git -C "$W_GONE" remote set-url origin "file://$TMP/does-not-exist"
 run "base unfetchable -> withhold (UNKNOWN)" withhold "why=could not be fetched" GITHUB_WORKSPACE="$W_GONE" GITHUB_SHA="$M_GONE" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+# An empty PR diff: the merge commit's tree equals its first parent's.
+EO="$TMP/empty-origin"; git init -q -b main "$EO"; echo a > "$EO/a"; git -C "$EO" add -A; git -C "$EO" commit -q -m base
+git -C "$EO" checkout -q -b pr; git -C "$EO" commit -q --allow-empty -m empty; git -C "$EO" checkout -q main
+git -C "$EO" merge -q --no-ff -m merge pr; EW="$TMP/empty-work"; git clone -q --depth 1 "file://$EO" "$EW" 2> /dev/null
+run "empty PR diff -> withhold (UNKNOWN)" withhold "why=diff against its base is empty" GITHUB_WORKSPACE="$EW" GITHUB_SHA="$(git -C "$EO" rev-parse HEAD)" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
 
 # --- wiring: clippy-tiers.yml's declare step must match its setup steps -----
 if wiring="$(python3 - "$WORKFLOW" "$STEP_TABLE" << 'PY'
