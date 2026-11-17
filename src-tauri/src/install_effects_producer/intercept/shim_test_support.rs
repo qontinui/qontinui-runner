@@ -45,11 +45,13 @@ fn rendered_identity_shim(shim_dir: &Path) -> String {
 /// through [`exe_guard`].
 static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take [`EXE_LOCK`], surviving a poisoned mutex so one failing test reports
-/// its own assertion instead of cascading into the rest.
-// test-lock: standalone — the crate's one exec-script lock; every holder (listed in the module doc) takes no other test lock and never takes `env_lock`
-pub(crate) fn exe_guard() -> std::sync::MutexGuard<'static, ()> {
-    EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// Take [`EXE_LOCK`] as a CHILD of the test-lock hierarchy: `env_lock` first,
+/// then this lock, both held until the guard drops (poison-recovering, so one
+/// failing test reports its own assertion instead of cascading). Its holders
+/// live in four other files, which a standalone lock's audit would not reach;
+/// as a child, `env_test_lock_hierarchy_guard` covers every one of them.
+pub(crate) fn exe_guard() -> crate::test_env::TestLockGuard {
+    crate::test_env::hierarchy_lock(&EXE_LOCK)
 }
 
 /// Write `body` as an executable at `path`, atomically (temp + rename) so a
