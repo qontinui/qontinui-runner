@@ -143,6 +143,13 @@ ISOLATION_LIB="$REPO_ROOT/scripts/lib/coord-revive-test-isolation.sh"
 # -I, so a caller's PYTHON* variables and its cwd never join sys.path.
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: no python3/python for the stub"; exit 1; }
+# The stubs run under fixture_launch so they die with this suite however the
+# suite dies (plan 2026-11-10-guard-suite-fixtures-die-with-a-cancelled-ci-job).
+# A copy of this skill dir outside the repo has no scripts/lib: fail, never
+# fall back to a raw `&` launch.
+[ -r "$REPO_ROOT/scripts/lib/fixture-port.sh" ] || { echo "FATAL: no scripts/lib/fixture-port.sh under $REPO_ROOT (this suite runs from the qontinui-claude-config checkout only)"; exit 1; }
+# shellcheck source=../../../scripts/lib/fixture-port.sh
+. "$REPO_ROOT/scripts/lib/fixture-port.sh"
 
 ok()  { PASS=$((PASS + 1)); echo "ok    $1"; }
 bad() { FAIL=$((FAIL + 1)); FAILED_CASES+=("$1"); echo "FAIL  $1"; }
@@ -452,8 +459,9 @@ print(srv.server_address[1], flush=True)
 srv.serve_forever()
 PYEOF
 REQLOG="$SANDBOX/requests.log"; : > "$REQLOG"
-"$PY" -I "$SANDBOX/stub.py" "$MODE_DIR" "$REQLOG" > "$SANDBOX/port" 2>"$SANDBOX/stub.err" &
-STUB_PID=$!
+fixture_launch $$ -- "$PY" -I "$SANDBOX/stub.py" "$MODE_DIR" "$REQLOG" > "$SANDBOX/port" 2>"$SANDBOX/stub.err" \
+  || { echo "FATAL: fixture_launch did not start the stub"; cat "$SANDBOX/stub.err"; exit 1; }
+STUB_PID=$FIXTURE_PID
 PORT=""
 for _ in $(seq 1 25); do
   PORT="$(tr -d '[:space:]' < "$SANDBOX/port" 2>/dev/null)"
@@ -788,8 +796,9 @@ done
 hdr "(c1) spawning runner A names tenant B; a sibling runner B ignores it -> never LIVE"
 MODE_DIR_B="$SANDBOX/mode-b"; mkdir -p "$MODE_DIR_B"
 REQLOG_B="$SANDBOX/requests-b.log"; : > "$REQLOG_B"
-"$PY" -I "$SANDBOX/stub.py" "$MODE_DIR_B" "$REQLOG_B" > "$SANDBOX/port-b" 2>"$SANDBOX/stub-b.err" &
-STUB_B_PID=$!
+fixture_launch $$ -- "$PY" -I "$SANDBOX/stub.py" "$MODE_DIR_B" "$REQLOG_B" > "$SANDBOX/port-b" 2>"$SANDBOX/stub-b.err" \
+  || { echo "FATAL: fixture_launch did not start the sibling stub"; cat "$SANDBOX/stub-b.err"; exit 1; }
+STUB_B_PID=$FIXTURE_PID
 PORT_B=""
 for _ in $(seq 1 25); do
   PORT_B="$(tr -d '[:space:]' < "$SANDBOX/port-b" 2>/dev/null)"

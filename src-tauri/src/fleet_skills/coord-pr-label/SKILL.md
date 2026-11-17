@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/blast-radius-override/migrate-repair flags; coord:priority, coord:clears-red and coord:destructive-attested are GitHub-applied only and refused here with the working gh route) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5), and is then READ BACK through coord's GET /coord/agent-pr-labels — ok only when the row is listed; a 200 without it is a contradiction (exit 4), a read that could not be made is written-but-UNKNOWN (exit 6), never ok.
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/blast-radius-override/migrate-repair flags; coord:priority, coord:clears-red and coord:destructive-attested are GitHub-applied only and refused here with the working gh route) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand; no success line rests on gh's exit code -- the label is READ back from GitHub, and a dep label whose upstream already landed is NOT-SENT (pre-flight) or STRIPPED-STALE (removed after the add), exit 7); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5), and is then READ BACK through coord's GET /coord/agent-pr-labels — ok only when the row is listed; a 200 without it is a contradiction (exit 4), a read that could not be made is written-but-UNKNOWN (exit 6), never ok.
 user-invocable: true
 ---
 
@@ -411,9 +411,46 @@ versions are in `.claude/commands/publish-runner.md` and
 On success, prints:
 
 ```
-ok: gh added label "<label>" to <repo>#<pr>
-ok: coord recorded label "<label>" in pr_labels (tenant_id=<uuid>, written=1) (read back: present, source=coord_skill)
+ok: gh added label "<label>" to <repo>#<pr> (read back on GitHub: present)
+   -- or, when the label was already there before the POST --
+ok: "<label>" was already on <repo>#<pr> (read back on GitHub: present before the POST and after it)
+   -- or, when the labels could not be read before the POST --
+ok: "<label>" is on <repo>#<pr> (read back on GitHub: present; whether this run's add changed it is UNKNOWN ...)
+ok: coord recorded label "<label>" in pr_labels (tenant_id=<uuid>, written=1) (read back: present, source=coord_skill; on GitHub: present)
 ```
+
+Neither line rests on an exit code. gh's exit 0 says GitHub ACCEPTED the add;
+the first line is printed only after the PR's labels are READ back from GitHub
+and list the label (one retry absorbs GitHub's read lag),
+and the second only after GitHub is read AGAIN, because
+coord can strip a label seconds after it lands (measured 2026-11-17 on
+qontinui-coord#4227: added 09:50:21, removed by `qontinui-merge-orchestrator`
+09:50:23, while the old script reported success and then a CONTRADICTION).
+
+A dependency label (`downstream-of` / `stacked-on`, or `upstream-of` naming
+this PR as the upstream) whose upstream PR has **already landed** declares an
+edge that is already satisfied (exit 7). When the pre-flight reads the upstream
+as landed (merged, or closed with `coord:landed` -- coord's rebase-ff land), the
+verdict is `NOT-SENT` and nothing is sent. When the label is added and then
+removed (coord strips a stale `downstream-of` within seconds), the verdict is
+`STRIPPED-STALE`, and the PR's `unlabeled` events name who
+removed it and when (only a removal that follows the single `labeled` event
+newer than the pre-POST mark is counted; a label already on the PR before the
+POST, or two new adds, credit nothing -- exit 3. Older removals are not
+counted: only the removal of THIS run's add is, identified by event id). Label names match
+case-insensitively, as GitHub's do. A bare `<repo>#<n>` value is NOT checked
+this way: coord resolves its owner under the owning tenant's org, so the script
+will not guess one from `--repo`; the GitHub read-back still decides.
+
+A label that is gone for any OTHER reason -- removed (by anyone) while the
+upstream does not read as landed (open, closed unlanded, unreadable, or not
+named), or gone with no removal of this run's add recorded --
+is an error (exit 3), never ok. A recorded removal of this run's add on a
+LANDED upstream is STRIPPED-STALE whoever removed it, and the line names them. Two windows cannot be closed: a peer whose add lands
+between the pre-POST mark and this run's POST makes this run's POST a no-op,
+and the peer's `labeled` event is then taken for this run's; and events can lag
+the mark itself, so a peer's add and strip finished just before it can surface
+afterwards as the one new add.
 
 A bare-repo dep label (`coord:downstream-of=qontinui-web#9`) is stored by coord
 in its canonical owner-qualified form, so the read-back accepts that spelling
@@ -424,12 +461,14 @@ too and names it: `(read back: present, source=coord_skill, stored as
 
 | Exit | Means | What to do |
 |------|-------|------------|
-| 0 | GitHub label applied, coord row written **and read back present** | nothing |
+| 0 | GitHub label **read back present** (after the add and again at the end), coord row written **and read back present** | nothing |
 | 2 | usage error or invalid label — nothing sent | fix the label |
-| 3 | the GitHub-side label add failed | read gh's relayed error |
+| 3 | the GitHub-side label add failed, or GitHub accepted it and the label is not on the PR for a reason other than a stale strip (after the coord write, the message says when coord holds a row) | read gh's relayed error, or the removal the script names |
 | 4 | coord refused or failed the write — **or contradicted it**: the read door answered 200 without the label coord said it wrote | report it; both bodies are printed |
 | 5 | coord row **withheld** — the write tenant was not proven to own the repo | see below |
 | 6 | **written but read-back UNKNOWN** — the read door could not be asked | re-ask later; never treat as ok |
+| 7 | the edge is **already satisfied** (upstream landed): `NOT-SENT` from the pre-flight (nothing sent), or `STRIPPED-STALE` (a recorded removal of this add; after the coord write the line says whether coord still holds a row) | nothing: the dependency is satisfied |
+| 8 | GitHub accepted the add but the PR's labels could not be **read back** — UNKNOWN (right after the add, nothing went to coord; at the final re-read, coord may already carry its row) | read the labels with `gh api repos/<o>/<r>/issues/<n>/labels`; never treat as ok |
 
 4 and 6 are deliberately distinct: "coord contradicted itself" is a coord defect
 to report, while "coord could not be asked" is a question to ask again — the
