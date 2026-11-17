@@ -3334,17 +3334,40 @@ mod tests {
         ///
         /// Field evidence this pins (plan
         /// `2026-11-17-runner-thread-growth-is-open-pane-accumulation-not-a-leak`):
-        /// runner threads on four fleet boxes were a flat base plus 4 per
-        /// OPEN holder pane, and fell when a pane closed. If an exit path
-        /// stopped closing the control queue, or the pump stopped returning
-        /// on `Exit`, every closed pane would leak its threads and this
-        /// test is what goes red.
+        /// runner threads on the Linux fleet boxes were a flat base plus 4
+        /// per OPEN holder pane (2 per in-process pane on Windows), and fell
+        /// when a pane closed.
+        ///
+        /// Two checks, so both exit paths are pinned:
+        /// * after the child EXITS and before `release`, each pane must fall
+        ///   back to the struct's own reference alone. That is the pump's own
+        ///   exit handling (it returns on `Exit` and closes the control
+        ///   queue, which ends the control thread). `release` and `Drop` also
+        ///   close the queue, so only this pre-release check sees that path
+        ///   regress;
+        /// * after `release` and drop, no pane-thread reference may remain.
         #[test]
         fn pty_holder_n_lifecycles_release_their_pane_threads() {
             use std::sync::Weak;
             const LIFECYCLES: usize = 12;
             let mut handles: Vec<(Weak<ControlQueue>, Weak<dyn HolderLink>)> = Vec::new();
             let mut dirs = Vec::new();
+            // The child has exited: both pane threads must end on their own,
+            // BEFORE `release`, leaving only the struct's reference (1, 1).
+            let threads_end_on_exit =
+                |ctl: &Weak<ControlQueue>, link: &Weak<dyn HolderLink>, pane: &str| {
+                    let refs = || (Weak::strong_count(ctl), Weak::strong_count(link));
+                    let end = Instant::now() + Duration::from_secs(10);
+                    while refs() != (1, 1) && Instant::now() < end {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert_eq!(
+                        refs(),
+                        (1, 1),
+                        "pane {pane}: (control, link) strong counts after the child \
+                         exited, before release: a pane thread did not end on exit"
+                    );
+                };
 
             // Guard pane, first: its child blocks on `read`, so both pane
             // threads are provably alive when the counts are read. 3 = the
@@ -3384,6 +3407,7 @@ mod tests {
                 }
                 assert_eq!(wait_within(&pane, Duration::from_secs(10)), Ok(0));
                 t.join().expect("the reader reached EOF");
+                threads_end_on_exit(&ctl, &link, "thr-guard");
                 pane.release(Duration::from_secs(1)).unwrap();
                 drop(pane);
                 handles.push((ctl, link));
@@ -3405,9 +3429,11 @@ mod tests {
                     .expect("spawn + attach"),
                 );
                 let (_collected, t) = drain(&pane);
+                let (ctl, link) = (Arc::downgrade(&pane.control), Arc::downgrade(&pane.link));
                 assert_eq!(wait_within(&pane, Duration::from_secs(10)), Ok(0));
                 t.join().expect("the reader reached EOF");
-                handles.push((Arc::downgrade(&pane.control), Arc::downgrade(&pane.link)));
+                threads_end_on_exit(&ctl, &link, tag.as_str());
+                handles.push((ctl, link));
                 pane.release(Duration::from_secs(1)).unwrap();
                 drop(pane);
                 dirs.push(dir);
@@ -3417,22 +3443,22 @@ mod tests {
             // thread can hold a strong reference now. (`wait_within`'s
             // helper thread may hold a pane `Arc` for an instant after it
             // sends; the poll absorbs that.)
-            let alive = || -> usize {
+            let live_refs = || -> usize {
                 handles
                     .iter()
                     .map(|(c, l)| Weak::strong_count(c) + Weak::strong_count(l))
                     .sum()
             };
             let end = Instant::now() + Duration::from_secs(10);
-            while alive() > 0 && Instant::now() < end {
+            while live_refs() > 0 && Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(20));
             }
             assert_eq!(
-                alive(),
+                live_refs(),
                 0,
                 "{} pane-thread references still alive across {} pane lifecycles \
                  — a pty-holder-ctl or pty-holder-pump thread outlived its pane",
-                alive(),
+                live_refs(),
                 LIFECYCLES + 1
             );
             for dir in dirs {
