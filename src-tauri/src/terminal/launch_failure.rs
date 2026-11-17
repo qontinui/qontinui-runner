@@ -1008,6 +1008,29 @@ mod tests {
         );
     }
 
+    /// The bash identity shim's literal `resolve-failed` body, through the
+    /// route's body ([`note_shim_beacon`]): recorded against its terminal with
+    /// exactly the flags the decider reads.
+    #[cfg(unix)]
+    #[test]
+    fn the_shims_resolve_failed_body_is_recorded_with_the_deciders_flags() {
+        use crate::install_effects_producer::intercept::shim_test_support::RESOLVE_FAILED_BODY;
+        use crate::install_effects_producer::{note_shim_beacon, ShimBeaconRequest};
+
+        let req: ShimBeaconRequest = serde_json::from_str(RESOLVE_FAILED_BODY).unwrap();
+        let registry = LaunchFailureRegistry::new();
+        let noted = note_shim_beacon(&registry, &req, 1_000);
+        let expected = LaunchFailure {
+            event: "resolve-failed".to_string(),
+            detail: "waited=1 stub=false settings=true user_session_id=true".to_string(),
+            settings: true,
+            user_chose_session: true,
+            at_ms: 1_000,
+        };
+        assert_eq!(noted.as_ref(), Some(&expected));
+        assert_eq!(registry.get("term-launch", 1_000), Some(expected));
+    }
+
     /// A live terminal in the poll's index, as `TerminalManager::list` reports it.
     fn live_terminal(
         id: &str,
