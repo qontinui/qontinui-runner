@@ -10891,9 +10891,12 @@ pub(crate) fn write_degraded_breadcrumb(
 /// temp file, then rename it over the breadcrumb. `std::fs::write` truncates
 /// before it writes, so a reader racing a rewrite (the probe re-stamping it,
 /// `/gate`, `/coord-revive`) could read an EMPTY file, which no reader can
-/// tell from a breadcrumb with no cause. Rust opens files with
-/// `FILE_SHARE_DELETE` on Windows, so a reader holding the old file open does
-/// not block the rename there.
+/// tell from a breadcrumb with no cause. On Windows a reader holding the old
+/// file open blocks the rename only if it opened WITHOUT `FILE_SHARE_DELETE`
+/// (Rust's own readers share delete; a .NET or CRT reader may not); the write
+/// then fails and is logged, leaving the previous breadcrumb in place. A temp
+/// file a crash leaves behind is excluded by the runner's managed excludes
+/// (`fleet::MANAGED_REPO_EXCLUDES`).
 fn replace_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
     let tmp = path.with_file_name(format!(
         "{COORD_MCP_STATUS_FILE}.tmp-{}-{}",
