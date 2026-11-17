@@ -82,6 +82,11 @@ fn main() -> ExitCode {
         Some("plan-library-backfill") => plan_library_backfill(&args[1..]),
         Some("plan-workunit-backfill") => plan_workunit_backfill(&args[1..]),
         Some("session-archive-backfill") => session_archive_backfill(&args[1..]),
+        Some("plan-phase-declaration") => ExitCode::from(plan_phase_declaration(
+            &args[1..],
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        )),
         Some("--help") | Some("-h") | Some("help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -101,6 +106,7 @@ USAGE:
   qontinui-pr plan-library-backfill [options]
   qontinui-pr plan-workunit-backfill [options]
   qontinui-pr session-archive-backfill [options]
+  qontinui-pr plan-phase-declaration <plan.md>
 
 OPTIONS (create):
   --repo <owner/name>   Target repo (default: inferred from `git remote get-url origin`)
@@ -196,7 +202,15 @@ upserts a head row plus the BYTE-VERBATIM transcript into qontinui-web's session
 repository with the runner's own device JWT. Bodies are never modified: a
 detector records `secret_finding_count`/`secret_finding_kinds` as an audit
 signal instead. Idempotent on (claude_session_id, account_label) +
-content_sha256. Every run prints the `tenant_source` histogram.";
+content_sha256. Every run prints the `tenant_source` histogram.
+
+`plan-phase-declaration` parses ONE plan file with the runner's own plan parser
+and prints its phase declaration — the `phases`, `phase_labels` and
+`phases_undeclared` keys the reconcile loop writes into the plan's work-unit
+`metadata` — as one compact JSON object on stdout, so a session minting a plan
+work unit by hand can send exactly that. Exit 0 printed it; exit 3 the plan
+declares no phase (`NO_PHASES` on stderr, nothing on stdout); exit 2 a usage
+error or an unreadable (or non-UTF-8) file.";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PrCreateArgs {
@@ -423,6 +437,81 @@ fn pr_create(args: &[String]) -> ExitCode {
         // Coord's (or the runner proxy's) error body, verbatim, to stderr.
         eprintln!("qontinui-pr: create failed ({status}): {}", text.trim());
         ExitCode::from(1)
+    }
+}
+
+// ===========================================================================
+// `qontinui-pr plan-phase-declaration <plan.md>`
+//
+// Plan `2026-11-17-a-session-minted-plan-work-unit-carries-no-phase-declaration`
+// Phase 1: print the runner's OWN phase declaration for one plan file
+// (`metadata::phase_declaration`, the object `build_metadata` writes), so a
+// session that mints a plan work unit itself sends the same three keys the
+// reconcile loop would rather than a hand re-derivation of the parser.
+//
+// Contract: exit 0 with exactly one line on stdout, a compact JSON object with
+// exactly the keys `phases`, `phase_labels`, `phases_undeclared`; exit 3 with
+// `NO_PHASES` on stderr and nothing on stdout when the plan declares no phase;
+// exit 2 with a usage/error line on stderr for a missing or extra argument or
+// an unreadable / non-UTF-8 file. Offline: no runner, coord or backend.
+// ===========================================================================
+
+/// Exit code when the plan declares no phase (`NO_PHASES`).
+const NO_PHASES_EXIT: u8 = 3;
+
+fn plan_phase_declaration(
+    args: &[String],
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> u8 {
+    use qontinui_runner_lib::plan_workunit_adapter::{
+        metadata::phase_declaration, parse_work_unit, slug_from_filename, PlanConvention,
+    };
+    let usage = "usage: qontinui-pr plan-phase-declaration <plan.md>";
+    let path = match args {
+        [one] if !one.starts_with('-') => one,
+        [] => {
+            let _ = writeln!(err, "qontinui-pr: missing <plan.md>\n{usage}");
+            return 2;
+        }
+        _ => {
+            let _ = writeln!(
+                err,
+                "qontinui-pr: expected exactly one <plan.md>, got {args:?}\n{usage}"
+            );
+            return 2;
+        }
+    };
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "qontinui-pr: cannot read {path:?} as UTF-8: {e}\n{usage}"
+            );
+            return 2;
+        }
+    };
+    // Slug as the adapter derives it (the file stem); the source path does not
+    // reach the declaration.
+    let parsed = parse_work_unit(
+        &slug_from_filename(path),
+        path,
+        &body,
+        &PlanConvention::operator_default(),
+    );
+    match phase_declaration(&parsed) {
+        Some(decl) => {
+            if writeln!(out, "{decl}").and_then(|()| out.flush()).is_err() {
+                let _ = writeln!(err, "qontinui-pr: could not write to stdout");
+                return 1;
+            }
+            0
+        }
+        None => {
+            let _ = writeln!(err, "NO_PHASES");
+            NO_PHASES_EXIT
+        }
     }
 }
 
