@@ -354,6 +354,56 @@ pub struct WindDownView {
     /// is "the arm did not judge this session", never "clean".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody: Option<CustodyView>,
+    /// The `finished_close` arm's obligations verdict (the REMOTE half of
+    /// `closeable`) for this session, from the arm's most recent pass. Present
+    /// ONLY when that arm read coord for it — which it does only for a session
+    /// whose custody was already clean. Absent is "not judged", never
+    /// "watched".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obligations: Option<ObligationsView>,
+    /// The `finished_close` arm's close guard for this session, from the arm's
+    /// most recent close batch (plan
+    /// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+    /// Phase 1). Present ONLY when the guard judged the session; absent is
+    /// "not judged", never "would close".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_guard: Option<CloseGuardView>,
+    /// coord's finish time for the session (unix ms) as the pass that built
+    /// this view read it — the stamp the close guard's revival arm judges
+    /// against. Not served: `sessionStatusSince` already carries it.
+    #[serde(skip)]
+    pub finished_at_ms: Option<i64>,
+}
+
+/// One input of the close guard, as `windDown.closeGuard.arms[]` serves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseGuardArmView {
+    /// `eligibility` | `custody` | `obligations` | `first_verdict` | `revival`
+    /// | `undelivered_messages`.
+    pub arm: &'static str,
+    /// `ok` | `held` | `unknown`.
+    pub verdict: &'static str,
+    /// The reason code, for `held` and `unknown`.
+    pub reason: Option<&'static str>,
+    /// What was found.
+    pub detail: Option<String>,
+}
+
+/// The close guard's verdict for one session — `windDown.closeGuard`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseGuardView {
+    /// `would_mint` | `held` | `unknown`.
+    pub verdict: &'static str,
+    /// The input that decided a `held` or `unknown` verdict.
+    pub decided_by: Option<&'static str>,
+    /// Its reason code.
+    pub reason: Option<&'static str>,
+    /// Every input, in the order the guard evaluates them.
+    pub arms: Vec<CloseGuardArmView>,
+    /// When the guard judged it (unix millis).
+    pub judged_at: i64,
 }
 
 impl WindDownView {
@@ -371,6 +421,9 @@ impl WindDownView {
             reason,
             kind,
             custody: None,
+            obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         }
     }
 
@@ -445,6 +498,14 @@ pub struct CustodyInputs {
     /// root), its coord-attributed worktrees, and its isolated-edit context's
     /// materialized worktrees.
     pub members: Vec<CustodyMember>,
+    /// Every worktree path the gather COVERED: each attributed path it was
+    /// handed (a reaped one included, since the gather positively saw it
+    /// gone), each isolated-edit worktree, and each member root it probed. The
+    /// obligations cross-check reads it: a worktree coord's obligations read
+    /// attributes to the session that is not covered here was never probed,
+    /// so its state is UNKNOWN (see `ObligationsUnknown::WorktreeNotProbed`).
+    /// Empty when the gather stopped before probing anything.
+    pub covered: Vec<String>,
 }
 
 /// Why custody rules a session out.
@@ -656,6 +717,396 @@ impl CustodyView {
             verdict: verdict.as_str(),
             reason: verdict.reason(),
             detail: verdict.detail(),
+            judged_at: judged_at_ms,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The obligations gate — the REMOTE half of `closeable` (plan
+// `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+// D1/D2 and Phase 6)
+// ---------------------------------------------------------------------------
+
+/// The verdict words of coord's `coord_session_obligations` read that let a
+/// session close. `landed` and `watched` are the two the plan names; `retired`
+/// is coord's word for a gate that reached a terminal state "leaving nothing
+/// owed on it" (a cleared gate whose continuation reported `work_completed`, a
+/// withdrawn gate whose object is still held) — nothing is owed, so nothing
+/// lives only in the session. Leaving it out would make every session that ever
+/// had a gate clear read Unknown, and the arm would close nothing.
+/// `scripts/session-closeable.sh` predates `retired` and reads it as Unknown;
+/// the two answer differently on that one word until it is taught it.
+pub const WATCHED_OBLIGATION_VERDICTS: [&str; 3] = ["landed", "watched", "retired"];
+
+/// The source blocks of coord's obligations read whose items ALL carry a
+/// verdict. Each must be present, read, and free of a verdict-less item: a body
+/// that omits one has not said the session owes nothing there.
+pub const VERDICT_SOURCES: [&str; 2] = ["prs", "gates"];
+
+/// A tracked obligation coord says nothing watches (`not_watched`) — work the
+/// session owes that would be lost if it closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObligationsUnwatched {
+    /// The coord source block the item came from (`prs`, `gates`, …).
+    pub source: String,
+    /// The item, as coord served it, compactly rendered.
+    pub item: String,
+    /// The reasons coord gave, joined; empty when it gave none.
+    pub reasons: String,
+}
+
+/// Which obligations input could not be determined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObligationsUnknown {
+    /// The read itself failed — no coord base, transport error, timeout,
+    /// non-2xx, or an undecodable body.
+    Unreadable { detail: String },
+    /// The answer is not the shape coord's read serves.
+    Malformed { detail: String },
+    /// `all_tracked_sources_read` was not `true`: a source was degraded or
+    /// truncated, and its list is "NOT evidence of absence" (coord's own
+    /// words).
+    SourcesNotRead { reported: String },
+    /// `session_proven_in_tenant` was not `true`: no tenant-scoped source puts
+    /// this session in the tenant the read ran as, so an empty answer is the
+    /// absence of a session, not of obligations. This is what a read made with
+    /// the wrong tenant's credential looks like.
+    SessionNotProven { reported: String },
+    /// A source block with `items` whose `coverage` is not `read`.
+    SourceNotRead { source: String, coverage: String },
+    /// An item whose verdict is `unknown`, a word this gate does not know, or
+    /// a `not_watched` whose attribution to this session is `uncertain`.
+    ItemUnknown {
+        source: String,
+        item: String,
+        verdict: String,
+        uncertain: bool,
+    },
+    /// A worktree coord attributes to the session (its `worktrees` block)
+    /// that the custody gate did not cover: no probe looked at it, so whether
+    /// it holds unpushed or uncommitted work is UNKNOWN. A `worktree_path`
+    /// coord served as null is the same, spelled `<absent>`.
+    WorktreeNotProbed { worktree: String },
+    /// Not read on this pass: the pass's obligations-read budget was spent
+    /// (`OBLIGATIONS_READS_PER_PASS` in the executor). UNKNOWN, never watched.
+    Deferred { detail: String },
+}
+
+/// The obligations verdict. Only [`ObligationsVerdict::Watched`] lets the
+/// `finished_close` arm close a session; `Unwatched` and `Unknown` never do —
+/// served policy `verification-and-evidence` `unknown-must-not-render-as-a-default`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObligationsVerdict {
+    /// Every tracked item that carries a verdict reads [`WATCHED_OBLIGATION_VERDICTS`]
+    /// and every tracked source was read. `judged` counts the items judged.
+    Watched {
+        judged: usize,
+    },
+    Unwatched(ObligationsUnwatched),
+    Unknown(ObligationsUnknown),
+}
+
+impl ObligationsUnknown {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unreadable { .. } => "obligations_unreadable",
+            Self::Malformed { .. } => "malformed",
+            Self::SourcesNotRead { .. } => "sources_not_read",
+            Self::SessionNotProven { .. } => "session_not_proven",
+            Self::SourceNotRead { .. } => "source_not_read",
+            Self::ItemUnknown { .. } => "item_unknown",
+            Self::WorktreeNotProbed { .. } => "worktree_not_probed",
+            Self::Deferred { .. } => "obligations_deferred",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Unreadable { detail } => {
+                format!("coord's obligations read could not be completed: {detail}")
+            }
+            Self::Malformed { detail } => {
+                format!("coord's obligations answer is not the expected shape: {detail}")
+            }
+            Self::SourcesNotRead { reported } => format!(
+                "all_tracked_sources_read is {reported}: a degraded or truncated source is not \
+                 evidence of absence"
+            ),
+            Self::SessionNotProven { reported } => format!(
+                "session_proven_in_tenant is {reported}: coord cannot place this session in the \
+                 tenant the read ran as, so an empty answer proves nothing"
+            ),
+            Self::SourceNotRead { source, coverage } => {
+                format!("source `{source}` has coverage `{coverage}`, not `read`")
+            }
+            Self::ItemUnknown {
+                source,
+                item,
+                verdict,
+                uncertain,
+            } => {
+                let uncertain = if *uncertain {
+                    " (attribution uncertain: coord cannot say it is this session's)"
+                } else {
+                    ""
+                };
+                format!("{source} item {item} reads `{verdict}`, which is not a watched verdict{uncertain}")
+            }
+            Self::WorktreeNotProbed { worktree } => format!(
+                "coord attributes worktree {worktree} to the session, but the custody gate never probed it, so its state is unknown"
+            ),
+            Self::Deferred { detail } => format!("not read this pass: {detail}"),
+        }
+    }
+}
+
+impl ObligationsVerdict {
+    pub fn is_watched(&self) -> bool {
+        matches!(self, Self::Watched { .. })
+    }
+
+    /// The wire word: `watched` | `unwatched` | `unknown`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Watched { .. } => "watched",
+            Self::Unwatched(_) => "unwatched",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The reason code, for `unwatched` and `unknown`.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Watched { .. } => None,
+            Self::Unwatched(_) => Some("not_watched"),
+            Self::Unknown(u) => Some(u.as_str()),
+        }
+    }
+
+    /// The human-readable detail, for `unwatched` and `unknown`.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::Watched { .. } => None,
+            Self::Unwatched(u) => Some(if u.reasons.is_empty() {
+                format!("{} item {} reads `not_watched`", u.source, u.item)
+            } else {
+                format!(
+                    "{} item {} reads `not_watched`: {}",
+                    u.source, u.item, u.reasons
+                )
+            }),
+            Self::Unknown(u) => Some(u.detail()),
+        }
+    }
+
+    /// An `Unknown` for a read that failed — the single spelling every
+    /// transport failure takes, so none can be mistaken for an answer.
+    pub fn unreadable(detail: impl Into<String>) -> Self {
+        Self::Unknown(ObligationsUnknown::Unreadable {
+            detail: detail.into(),
+        })
+    }
+}
+
+/// Decide whether every obligation coord attributes to a session is watched.
+/// Pure over the decoded body of `coord_session_obligations` (or its HTTP twin
+/// `GET /coord/overlord/session-obligations/:id`), which is the SAME rule
+/// `scripts/session-closeable.sh`'s coord judge applies, so the two halves of
+/// `closeable` cannot drift on what "watched" means (with the one `retired`
+/// difference documented at [`WATCHED_OBLIGATION_VERDICTS`]).
+///
+/// Evaluated in this order:
+///
+/// 1. **A failed read → `Unknown`.** Never a default: a timeout is not "no
+///    obligations".
+/// 2. **A body that is not an object → `Unknown`.**
+/// 3. **`all_tracked_sources_read` anything but `true` → `Unknown`.**
+/// 4. **`session_proven_in_tenant` anything but `true` → `Unknown`.** The
+///    runner reads as its default tenant's credential; a session of another
+///    tenant answers with every list empty, which must not read as "owes
+///    nothing".
+/// 5. **Every source block that carries an `items` list** (`prs`, `gates`,
+///    `worktrees`, `work_units`, `findings`, …): its `coverage` must be `read`,
+///    except that an EMPTY block coord declares `not_tracked`
+///    (`spawned_followup` — coord holds no store for it, and it is outside
+///    `all_tracked_sources_read`) says nothing and is skipped. Anything else is
+///    `Unknown`. Items with no `verdict` (worktrees, work units, findings carry
+///    none) are not judged here; the worktree half is the custody gate's.
+/// 6. **An item whose verdict is `not_watched` → `Unwatched`**, unless coord
+///    marks its attribution `uncertain` (then `Unknown`: it may be a peer's).
+///    Any other non-watched word, including `unknown`, is `Unknown`.
+///    `Unwatched` outranks `Unknown`, as `Dirty` outranks `Unknown` in
+///    [`custody_gate`]; neither closes.
+/// 7. **`prs` and `gates` must each be present with `coverage: read`**, and an
+///    item in either with no verdict is `Unknown`; a body that omits them is
+///    `Unknown` however clean the rest looks.
+/// 8. **No source block read at all → `Unknown`**: an answer with nothing in it
+///    is not evidence of an empty session.
+pub fn obligations_gate(read: &Result<serde_json::Value, String>) -> ObligationsVerdict {
+    use serde_json::Value;
+    let doc = match read {
+        Ok(doc) => doc,
+        Err(detail) => return ObligationsVerdict::unreadable(detail.clone()),
+    };
+    let Some(root) = doc.as_object() else {
+        return ObligationsVerdict::Unknown(ObligationsUnknown::Malformed {
+            detail: "the body is not a JSON object".to_string(),
+        });
+    };
+    if root.get("all_tracked_sources_read") != Some(&Value::Bool(true)) {
+        let reported = root
+            .get("all_tracked_sources_read")
+            .map_or_else(|| "absent".to_string(), Value::to_string);
+        return ObligationsVerdict::Unknown(ObligationsUnknown::SourcesNotRead { reported });
+    }
+    if root.get("session_proven_in_tenant") != Some(&Value::Bool(true)) {
+        let reported = root
+            .get("session_proven_in_tenant")
+            .map_or_else(|| "absent".to_string(), Value::to_string);
+        return ObligationsVerdict::Unknown(ObligationsUnknown::SessionNotProven { reported });
+    }
+    let mut judged = 0usize;
+    let mut blocks_read = 0usize;
+    let mut verdict_sources_read = 0usize;
+    let mut unwatched: Option<ObligationsUnwatched> = None;
+    let mut unknown: Option<ObligationsUnknown> = None;
+    for (source, block) in root {
+        let Some(block) = block.as_object() else {
+            continue;
+        };
+        let coverage = block.get("coverage").and_then(Value::as_str);
+        let Some(items) = block.get("items").and_then(Value::as_array) else {
+            if block.contains_key("coverage") {
+                unknown.get_or_insert(ObligationsUnknown::SourceNotRead {
+                    source: source.clone(),
+                    coverage: coverage.unwrap_or("?").to_string(),
+                });
+            }
+            continue;
+        };
+        match coverage {
+            Some("read") => blocks_read += 1,
+            Some("not_tracked") if items.is_empty() => continue,
+            other => {
+                unknown.get_or_insert(ObligationsUnknown::SourceNotRead {
+                    source: source.clone(),
+                    coverage: other.unwrap_or("?").to_string(),
+                });
+                continue;
+            }
+        }
+        if VERDICT_SOURCES.contains(&source.as_str()) {
+            verdict_sources_read += 1;
+        }
+        for entry in items {
+            let Some(verdict) = entry.get("verdict") else {
+                // `prs` and `gates` items always carry one; elsewhere
+                // (worktrees, work units, findings) none is expected.
+                if VERDICT_SOURCES.contains(&source.as_str()) {
+                    unknown.get_or_insert(ObligationsUnknown::ItemUnknown {
+                        source: source.clone(),
+                        item: entry.to_string().chars().take(200).collect(),
+                        verdict: "<absent>".to_string(),
+                        uncertain: false,
+                    });
+                }
+                continue;
+            };
+            judged += 1;
+            let word = verdict.as_str();
+            if word.is_some_and(|w| WATCHED_OBLIGATION_VERDICTS.contains(&w)) {
+                continue;
+            }
+            let item = entry
+                .get("item")
+                .map_or_else(|| "-".to_string(), Value::to_string);
+            let uncertain = entry.get("attribution").and_then(Value::as_str) == Some("uncertain");
+            if word == Some("not_watched") && !uncertain {
+                let reasons = match entry.get("reasons") {
+                    Some(Value::Array(rs)) => rs
+                        .iter()
+                        .map(|r| r.as_str().map_or_else(|| r.to_string(), str::to_string))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    Some(Value::String(r)) => r.clone(),
+                    _ => String::new(),
+                };
+                unwatched.get_or_insert(ObligationsUnwatched {
+                    source: source.clone(),
+                    item,
+                    reasons: reasons.chars().take(300).collect(),
+                });
+            } else {
+                unknown.get_or_insert(ObligationsUnknown::ItemUnknown {
+                    source: source.clone(),
+                    item,
+                    verdict: word.map_or_else(|| verdict.to_string(), str::to_string),
+                    uncertain,
+                });
+            }
+        }
+    }
+    if let Some(u) = unwatched {
+        return ObligationsVerdict::Unwatched(u);
+    }
+    if let Some(u) = unknown {
+        return ObligationsVerdict::Unknown(u);
+    }
+    if blocks_read == 0 {
+        return ObligationsVerdict::Unknown(ObligationsUnknown::Malformed {
+            detail: "all_tracked_sources_read is true but no source block with items was read"
+                .to_string(),
+        });
+    }
+    if verdict_sources_read != VERDICT_SOURCES.len() {
+        let missing: Vec<&str> = VERDICT_SOURCES
+            .iter()
+            .copied()
+            .filter(|name| {
+                root.get(*name)
+                    .and_then(|b| b.get("coverage"))
+                    .and_then(Value::as_str)
+                    != Some("read")
+            })
+            .collect();
+        return ObligationsVerdict::Unknown(ObligationsUnknown::Malformed {
+            detail: format!(
+                "the source block(s) {} are absent or not read, so the answer says nothing about them",
+                missing.join(", ")
+            ),
+        });
+    }
+    ObligationsVerdict::Watched { judged }
+}
+
+/// The `windDown.obligations` block `GET /restart-readiness` attaches when the
+/// `finished_close` arm read a session's obligations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObligationsView {
+    /// `watched` | `unwatched` | `unknown`.
+    pub verdict: &'static str,
+    /// The reason code, for `unwatched` and `unknown`.
+    pub reason: Option<&'static str>,
+    /// What was found, naming the item.
+    pub detail: Option<String>,
+    /// How many verdict-carrying items a `watched` verdict rests on.
+    pub items_judged: Option<usize>,
+    /// When the arm judged it (unix millis).
+    pub judged_at: i64,
+}
+
+impl ObligationsView {
+    pub fn from_verdict(verdict: &ObligationsVerdict, judged_at_ms: i64) -> Self {
+        Self {
+            verdict: verdict.as_str(),
+            reason: verdict.reason(),
+            detail: verdict.detail(),
+            items_judged: match verdict {
+                ObligationsVerdict::Watched { judged } => Some(*judged),
+                _ => None,
+            },
             judged_at: judged_at_ms,
         }
     }
@@ -1166,6 +1617,7 @@ mod tests {
             session_dir: Some("/ws/agent-worktrees/a/repo".to_string()),
             ownership: Ok(()),
             members,
+            covered: Vec::new(),
         }
     }
 
@@ -1478,5 +1930,223 @@ mod tests {
             i.finished_at_ms = Some(900_000);
             assert!(eligibility(&i, 1_000 + GRACE_MS).is_eligible(), "{kind:?}");
         }
+    }
+
+    // ── The obligations gate ─────────────────────────────────────────────
+
+    /// A coord answer shaped like `session_obligations_core`'s: tracked
+    /// sources `read`, `spawned_followup` always `not_tracked`.
+    fn obligations(prs: serde_json::Value, gates: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "claude_code_session_id": "11111111-1111-1111-1111-111111111111",
+            "all_tracked_sources_read": true,
+            "session_proven_in_tenant": true,
+            "prs": {"coverage": "read", "items": prs, "count": 0, "truncated": false},
+            "gates": {"coverage": "read", "items": gates, "count": 0, "truncated": false},
+            "worktrees": {"coverage": "read", "items": [], "truncated": false},
+            "work_units": {"coverage": "read", "items": [{"id": "wu-1"}], "truncated": false},
+            "findings": {"coverage": "read", "items": [], "truncated": false},
+            "spawned_followup": {"coverage": "not_tracked", "note": "n", "items": []},
+            "note": "n",
+        })
+    }
+
+    fn gate_item(verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "item": {"gate_id": "g-1"}, "verdict": verdict,
+            "reasons": ["why"], "attribution": "proven",
+        })
+    }
+
+    fn judge(doc: serde_json::Value) -> ObligationsVerdict {
+        obligations_gate(&Ok(doc))
+    }
+
+    #[test]
+    fn every_item_landed_watched_or_retired_is_watched() {
+        let doc = obligations(
+            serde_json::json!([gate_item("landed")]),
+            serde_json::json!([gate_item("watched"), gate_item("retired")]),
+        );
+        assert_eq!(judge(doc), ObligationsVerdict::Watched { judged: 3 });
+    }
+
+    /// A session that owes nothing is closeable: tracked sources read, empty.
+    #[test]
+    fn a_session_with_no_obligations_at_all_is_watched() {
+        let doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        assert_eq!(judge(doc), ObligationsVerdict::Watched { judged: 0 });
+    }
+
+    #[test]
+    fn a_not_watched_item_is_unwatched_and_names_the_item() {
+        let doc = obligations(
+            serde_json::json!([]),
+            serde_json::json!([gate_item("watched"), gate_item("not_watched")]),
+        );
+        let ObligationsVerdict::Unwatched(u) = judge(doc) else {
+            panic!("a not_watched item must not read watched");
+        };
+        assert_eq!(u.source, "gates");
+        assert!(u.item.contains("g-1"), "{u:?}");
+        assert_eq!(u.reasons, "why");
+    }
+
+    /// Unwatched outranks an Unknown elsewhere — the more useful thing to
+    /// report, and neither closes.
+    #[test]
+    fn unwatched_outranks_unknown() {
+        let doc = obligations(
+            serde_json::json!([gate_item("unknown")]),
+            serde_json::json!([gate_item("not_watched")]),
+        );
+        assert_eq!(judge(doc).as_str(), "unwatched");
+    }
+
+    #[test]
+    fn an_unknown_or_unrecognised_item_verdict_is_unknown_never_watched() {
+        for word in ["unknown", "recorded", "owed", "WATCHED", ""] {
+            let doc = obligations(serde_json::json!([gate_item(word)]), serde_json::json!([]));
+            let v = judge(doc);
+            assert_eq!(v.as_str(), "unknown", "{word:?}");
+            assert_eq!(v.reason(), Some("item_unknown"), "{word:?}");
+        }
+        // A verdict that is not a string at all.
+        let doc = obligations(
+            serde_json::json!([{"item": {}, "verdict": null}]),
+            serde_json::json!([]),
+        );
+        assert_eq!(judge(doc).as_str(), "unknown");
+    }
+
+    /// An uncertain attribution may be a peer's gate: even `not_watched` is
+    /// then Unknown, never a definite owed word.
+    #[test]
+    fn an_uncertain_not_watched_item_is_unknown() {
+        let mut item = gate_item("not_watched");
+        item["attribution"] = serde_json::json!("uncertain");
+        let v = judge(obligations(
+            serde_json::json!([]),
+            serde_json::json!([item]),
+        ));
+        assert_eq!(v.reason(), Some("item_unknown"));
+        assert!(v.detail().unwrap().contains("attribution uncertain"));
+    }
+
+    /// (c) An unreadable read is UNKNOWN — a timeout, a 503, a decode failure
+    /// all arrive here as `Err` and none is ever "nothing owed".
+    #[test]
+    fn an_unreadable_read_is_unknown_not_watched() {
+        let v = obligations_gate(&Err("GET …: operation timed out".to_string()));
+        assert_eq!(v.as_str(), "unknown");
+        assert_eq!(v.reason(), Some("obligations_unreadable"));
+        assert!(!v.is_watched());
+        assert!(v.detail().unwrap().contains("timed out"));
+    }
+
+    #[test]
+    fn a_degraded_or_truncated_answer_is_unknown_even_with_clean_items() {
+        for reported in [
+            serde_json::json!(false),
+            serde_json::json!("true"),
+            serde_json::Value::Null,
+        ] {
+            let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+            doc["all_tracked_sources_read"] = reported;
+            assert_eq!(judge(doc).reason(), Some("sources_not_read"));
+        }
+        // The key absent altogether (a coord predating it) is not "true".
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc.as_object_mut()
+            .unwrap()
+            .remove("all_tracked_sources_read");
+        assert_eq!(judge(doc).reason(), Some("sources_not_read"));
+    }
+
+    /// A read made as the wrong tenant answers with empty lists and
+    /// `session_proven_in_tenant: false`; that is not "owes nothing".
+    #[test]
+    fn a_session_coord_cannot_place_in_the_tenant_is_unknown() {
+        for reported in [serde_json::json!(false), serde_json::Value::Null] {
+            let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+            doc["session_proven_in_tenant"] = reported;
+            assert_eq!(judge(doc).reason(), Some("session_not_proven"));
+        }
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc.as_object_mut()
+            .unwrap()
+            .remove("session_proven_in_tenant");
+        assert_eq!(judge(doc).reason(), Some("session_not_proven"));
+    }
+
+    /// A body with both flags true and only a non-verdict block read says
+    /// nothing about PRs or gates; neither does a verdict-less PR or gate item.
+    #[test]
+    fn missing_prs_or_gates_and_verdictless_items_there_are_unknown() {
+        for drop in ["prs", "gates"] {
+            let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+            doc.as_object_mut().unwrap().remove(drop);
+            let v = judge(doc);
+            assert_eq!(v.reason(), Some("malformed"), "{drop}");
+            assert!(v.detail().unwrap().contains(drop), "{drop}");
+        }
+        let doc = serde_json::json!({
+            "all_tracked_sources_read": true, "session_proven_in_tenant": true,
+            "findings": {"coverage": "read", "items": []},
+        });
+        assert_eq!(judge(doc).reason(), Some("malformed"));
+        for bare in [
+            serde_json::json!({"item": {"gate_id": "g"}}),
+            serde_json::json!("g"),
+        ] {
+            let v = judge(obligations(
+                serde_json::json!([]),
+                serde_json::json!([bare]),
+            ));
+            assert_eq!(v.reason(), Some("item_unknown"));
+        }
+    }
+
+    #[test]
+    fn a_source_with_items_that_is_not_read_is_unknown() {
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc["gates"]["coverage"] = serde_json::json!("degraded");
+        assert_eq!(judge(doc).reason(), Some("source_not_read"));
+        // `not_tracked` with items in it is not the declared-empty shape.
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc["spawned_followup"]["items"] = serde_json::json!([gate_item("watched")]);
+        assert_eq!(judge(doc).reason(), Some("source_not_read"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_the_shape_is_unknown() {
+        for doc in [
+            serde_json::json!([]),
+            serde_json::json!("ok"),
+            serde_json::json!({"all_tracked_sources_read": true}),
+            serde_json::json!({"all_tracked_sources_read": true, "session_proven_in_tenant": true, "note": "no blocks"}),
+        ] {
+            let v = judge(doc.clone());
+            assert!(!v.is_watched(), "{doc}");
+        }
+        assert_eq!(
+            judge(serde_json::json!({"all_tracked_sources_read": true, "session_proven_in_tenant": true}))
+                .reason(),
+            Some("malformed")
+        );
+    }
+
+    #[test]
+    fn the_obligations_view_serialises_the_verdict_and_its_basis() {
+        let watched = ObligationsView::from_verdict(&ObligationsVerdict::Watched { judged: 2 }, 9);
+        let json = serde_json::to_value(&watched).unwrap();
+        assert_eq!(json["verdict"], "watched");
+        assert_eq!(json["itemsJudged"], 2);
+        assert_eq!(json["judgedAt"], 9);
+        let unknown = ObligationsView::from_verdict(&ObligationsVerdict::unreadable("boom"), 9);
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(json["verdict"], "unknown");
+        assert_eq!(json["reason"], "obligations_unreadable");
+        assert!(json["itemsJudged"].is_null());
     }
 }
