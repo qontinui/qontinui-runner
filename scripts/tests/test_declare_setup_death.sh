@@ -47,21 +47,11 @@ make_pr() {
   echo "$w $(git -C "$o" rev-parse HEAD)"
 }
 
-# Event payloads for the sibling-labels class.
-EV_NONE="$TMP/ev-none.json"; echo '{"pull_request":{"labels":[]}}' > "$EV_NONE"
-EV_OTHER="$TMP/ev-other.json"; echo '{"pull_request":{"labels":[{"name":"bug"}]}}' > "$EV_OTHER"
-EV_DEP="$TMP/ev-dep.json"; echo '{"pull_request":{"labels":[{"name":"coord:downstream-of=qontinui-schemas#12"}]}}' > "$EV_DEP"
-EV_BAD="$TMP/ev-bad.json"; echo 'not json' > "$EV_BAD"
-
 T=$'\t'
-# steps <failed step name|-> : the clippy-diff job's setup rows, one failed.
-steps() {
-  local f="$1" seen=0 out="" name class
-  while IFS='|' read -r name class; do
-    if [ "$name" = "$f" ]; then out+="$name${T}failure${T}$class"$'\n'; seen=1
-    elif [ "$seen" = 1 ]; then out+="$name${T}skipped${T}$class"$'\n'
-    else out+="$name${T}success${T}$class"$'\n'; fi
-  done << 'ROWS'
+# The clippy-diff job's setup steps and the class each MUST carry. The wiring
+# check below asserts clippy-tiers.yml carries exactly these classes, so the
+# decision cases exercise the shipped classification, not a copy of it.
+STEP_TABLE="$(cat << 'ROWS'
 Checkout|tree-free
 Check out sibling qontinui-schemas|sibling-labels
 Checkout sibling repos|tree-free
@@ -76,6 +66,15 @@ Cache Rust dependencies|tree-free
 Install frontend dependencies|frontend
 Build frontend|frontend
 ROWS
+)"
+# steps <failed step name|-> : the setup rows, that one failed.
+steps() {
+  local f="$1" seen=0 out="" name class
+  while IFS='|' read -r name class; do
+    if [ "$name" = "$f" ]; then out+="$name${T}failure${T}$class"$'\n'; seen=1
+    elif [ "$seen" = 1 ]; then out+="$name${T}skipped${T}$class"$'\n'
+    else out+="$name${T}success${T}$class"$'\n'; fi
+  done <<< "$STEP_TABLE"
   printf '%s' "$out"
 }
 VERDICT_SKIPPED="Clippy diff-scoped via reviewdog${T}skipped"
@@ -89,7 +88,7 @@ run() {
   case "${1:-}" in why=*) why="${1#why=}"; shift ;; esac
   out="$(env -i PATH="$PATH" HOME="$HOME" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     DECLARE_JOB="$JOB" HARNESS_PATHS_RE="$HARNESS" VERDICT_STEPS="$VERDICT_SKIPPED" \
-    GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$EV_NONE" "$@" bash "$SCRIPT" 2>&1)"
+    GITHUB_EVENT_NAME=pull_request "$@" bash "$SCRIPT" 2>&1)"
   rc=$?
   if grep -qF "$DECLARE" <<< "$out"; then got=declare
   elif grep -qF '::notice title=' <<< "$out"; then got=withhold
@@ -128,16 +127,21 @@ run "rust-only PR, apt died -> declare" declare $(pr "$W_RUST" "$M_RUST") SETUP_
 run "workflow PR, apt died -> withhold (harness)" withhold "why=own harness" $(pr "$W_WF" "$M_WF") SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
 run "reporter-script PR, apt died -> withhold (always harness)" withhold "why=own harness" $(pr "$W_SELF" "$M_SELF") SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
 run "rust-toolchain.toml PR, Setup Rust died -> withhold" withhold "why=own harness" $(pr "$W_TC" "$M_TC") SETUP_STEPS="$(steps 'Setup Rust')"
-run "sibling step died, no labels -> declare" declare $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
-run "sibling step died, unrelated label -> declare" declare $(pr "$W_RUST" "$M_RUST") GITHUB_EVENT_PATH="$EV_OTHER" SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
-run "sibling step died, coord dep label -> withhold" withhold "why=carries 'coord:downstream-of" $(pr "$W_RUST" "$M_RUST") GITHUB_EVENT_PATH="$EV_DEP" SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
-run "sibling step died, payload unparseable -> withhold (UNKNOWN)" withhold "why=could not be parsed" $(pr "$W_RUST" "$M_RUST") GITHUB_EVENT_PATH="$EV_BAD" SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
-run "sibling step died, payload missing -> withhold (UNKNOWN)" withhold "why=payload is unreadable" $(pr "$W_RUST" "$M_RUST") GITHUB_EVENT_PATH="$TMP/nope.json" SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
+run "sibling resolver died on a rust-only PR -> withhold (live labels unreadable)" withhold "why=live labels" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
+run "sibling resolver died on a push -> withhold" withhold "why=live labels" GITHUB_EVENT_NAME=push SETUP_STEPS="$(steps 'Check out sibling qontinui-schemas')"
 run "unknown class -> treated as frontend" withhold "why=changes 'src/x.ts'" $(pr "$W_TS" "$M_TS") SETUP_STEPS="Checkout${T}success${T}tree-free"$'\n'"Mystery${T}failure${T}weird"
 run "clippy step failed -> silent" silent $(pr "$W_RUST" "$M_RUST") VERDICT_STEPS="Clippy diff-scoped via reviewdog${T}failure" SETUP_STEPS="$(steps 'Build frontend')"
 run "no setup step failed -> silent" silent $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps -)"
-run "empty conclusion row -> withhold (UNKNOWN)" withhold "why=rendered no conclusion" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Build frontend' | sed "s/^Setup Rust${T}success/Setup Rust${T}/")"
+run "empty conclusion row -> withhold (UNKNOWN)" withhold "why=rendered no usable conclusion" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Build frontend' | sed "s/^Setup Rust${T}success/Setup Rust${T}/")"
 run "DECLARE_JOB with a reserved phrase -> withhold" withhold "why=reserves" $(pr "$W_RUST" "$M_RUST") DECLARE_JOB="x TIMED OUT" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+run "DECLARE_JOB carrying the excuse phrase, nothing failed -> withhold without leaking it" withhold "why=reserves" $(pr "$W_RUST" "$M_RUST") DECLARE_JOB="x (not a verdict on this PR)" SETUP_STEPS="$(steps -)"
+run "DECLARE_JOB unset -> withhold" withhold "why=unset" $(pr "$W_RUST" "$M_RUST") DECLARE_JOB= SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
+run "invalid HARNESS_PATHS_RE -> withhold (UNKNOWN)" withhold "why=not a valid ERE" $(pr "$W_TS" "$M_TS") HARNESS_PATHS_RE='^(oops' SETUP_STEPS="$(steps 'Build frontend')"
+run "invalid FRONTEND_INERT_RE -> withhold (UNKNOWN)" withhold "why=not a valid ERE" $(pr "$W_TS" "$M_TS") FRONTEND_INERT_RE='[unclosed' SETUP_STEPS="$(steps 'Build frontend')"
+run "garbled setup conclusion -> withhold (UNKNOWN)" withhold "why=rendered no usable conclusion" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="$(steps 'Build frontend' | sed "s/^Setup Rust${T}success/Setup Rust${T}sucess/")"
+run "garbled verdict conclusion -> withhold (UNKNOWN)" withhold "why=rendered no usable conclusion" $(pr "$W_RUST" "$M_RUST") VERDICT_STEPS="Clippy diff-scoped via reviewdog${T}" SETUP_STEPS="$(steps 'Build frontend')"
+run "no setup rows -> withhold (UNKNOWN)" withhold "why=no rows" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS=
+run "step name with workflow-command metacharacters is escaped" declare "why=step 'a:b,c%25d' failed" $(pr "$W_RUST" "$M_RUST") SETUP_STEPS="Checkout${T}success${T}tree-free"$'\n'"a:b,c%d${T}failure${T}tree-free"
 }
 run "push event -> withhold (UNKNOWN)" withhold "why=not pull_request" GITHUB_EVENT_NAME=push GITHUB_WORKSPACE="$W_RUST" GITHUB_SHA="$M_RUST" SETUP_STEPS="$(steps 'Install frontend dependencies')"
 run "schedule event -> withhold (UNKNOWN)" withhold "why=not pull_request" GITHUB_EVENT_NAME=schedule GITHUB_WORKSPACE="$W_RUST" GITHUB_SHA="$M_RUST" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
@@ -151,13 +155,14 @@ git -C "$W_GONE" remote set-url origin "file://$TMP/does-not-exist"
 run "base unfetchable -> withhold (UNKNOWN)" withhold "why=could not be fetched" GITHUB_WORKSPACE="$W_GONE" GITHUB_SHA="$M_GONE" SETUP_STEPS="$(steps 'Install dependencies (Ubuntu)')"
 
 # --- wiring: clippy-tiers.yml's declare step must match its setup steps -----
-if wiring="$(python3 - "$WORKFLOW" << 'PY'
+if wiring="$(python3 - "$WORKFLOW" "$STEP_TABLE" << 'PY'
 import re, sys
 try:
     import yaml
 except ImportError:
     print("PyYAML missing: the wiring check could not run"); sys.exit(1)
 wf = yaml.safe_load(open(sys.argv[1]))
+expected = dict(l.split("|", 1) for l in sys.argv[2].splitlines() if l)
 steps = wf["jobs"]["clippy-diff"]["steps"]
 errs = []
 idx = next((i for i, s in enumerate(steps) if s.get("id") == "clippy"), None)
@@ -186,6 +191,11 @@ for s in steps[:idx]:
     row = re.search(r"row '" + re.escape(name) + r"' \"\$" + var + r"\" (tree-free|frontend|sibling-labels)\n", run)
     if not row:
         errs.append(f"setup step {name!r} has no `row` line carrying ${var} and a class")
+    elif expected.get(name) != row.group(1):
+        errs.append(f"setup step {name!r} is classed {row.group(1)!r}, the tested table says {expected.get(name)!r}")
+names = [s.get("name") for s in steps[:idx]]
+if names != list(expected):
+    errs.append(f"setup steps {names!r} differ from the tested table {list(expected)!r}")
 if "clippy" not in by_id:
     errs.append("the verdict step's conclusion is not passed")
 title = "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::"
@@ -198,7 +208,7 @@ if declare.get("timeout-minutes") is None:
 print("\n".join(errs))
 sys.exit(1 if errs else 0)
 PY
-)"; then ok "clippy-tiers.yml wiring: every pre-clippy step has an id, a conclusion env entry and a classed row"
+)"; then ok "clippy-tiers.yml wiring: every pre-clippy step has an id, a conclusion env entry and the tested class"
 else bad "clippy-tiers.yml wiring" "$wiring"; fi
 
 # The workflow's harness RE must be the one these cases exercised.

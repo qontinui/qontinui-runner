@@ -20,7 +20,8 @@
 #                      `<name><TAB><conclusion><TAB><class>`; class is
 #                        tree-free       reads nothing the PR controls
 #                        frontend        reads the PR's frontend tree
-#                        sibling-labels  reads the PR's coord dep labels
+#                        sibling-labels  resolves siblings from coord dep
+#                                        labels (ALWAYS withheld, see below)
 #                      a missing or unknown class is treated as `frontend`
 #                      (the strictest diff rule -- fails closed)
 #   VERDICT_STEPS      `<name><TAB><conclusion>` rows of the job's verdict
@@ -28,27 +29,33 @@
 #   HARNESS_PATHS_RE   ERE over changed paths: the job's own harness. A PR
 #                      touching any of it may have caused ANY setup death.
 #                      This script's own path is always harness.
-#   FRONTEND_INERT_RE  optional ERE: paths the frontend steps provably never
-#                      read (an allow-list; default below)
-#   SIBLING_LABEL_RE   optional ERE over PR label names that steer the
-#                      sibling resolver (default below)
-#   GITHUB_EVENT_NAME / GITHUB_SHA / GITHUB_WORKSPACE / GITHUB_EVENT_PATH
+#   FRONTEND_INERT_RE  optional ERE: paths no frontend step reads in a way
+#                      that can FAIL it (an allow-list; default below). The
+#                      vite build's Tailwind scan does read the whole tree,
+#                      but only to extract class candidates, which cannot
+#                      fail the build (.qontinui/ci-targets.toml header).
+#   GITHUB_EVENT_NAME / GITHUB_SHA / GITHUB_WORKSPACE
 #   GIT_BOUND          optional seconds bound for each local git call (30);
 #                      the one network fetch is bounded at twice that.
 #
 # DECISION (first failed setup step = F):
-#   any verdict step failed, or no F            -> emit nothing
-#   a setup or verdict row has no conclusion    -> withhold (UNKNOWN)
-#   DECLARE_JOB missing or carries a reserved   -> withhold
+#   DECLARE_JOB unset or carries a reserved      -> withhold (generic title)
 #   phrase
-#   PR diff unreadable / empty / not a PR merge -> withhold (UNKNOWN)
-#   diff touches HARNESS_PATHS_RE               -> withhold
-#   F is `frontend` and a changed path is not   -> withhold
+#   a supplied regex does not compile            -> withhold (UNKNOWN)
+#   no setup rows; a row with no name or a       -> withhold (UNKNOWN)
+#   conclusion outside success|failure|
+#   cancelled|skipped
+#   any verdict step failed, or no F             -> emit nothing
+#   F is `sibling-labels`                        -> withhold: the resolver
+#     reads this PR's LIVE labels and reverse-searches open sibling PRs for
+#     labels naming this PR (an ambiguous pairing hard-fails it); none of
+#     that is in the event payload, so the PR may always be the cause
+#   PR diff unreadable / empty / not a PR merge  -> withhold (UNKNOWN)
+#   a grep over the diff errors                  -> withhold (UNKNOWN)
+#   diff touches HARNESS_PATHS_RE                -> withhold
+#   F is `frontend` and a changed path is not    -> withhold
 #   in FRONTEND_INERT_RE
-#   F is `sibling-labels` and the event payload -> withhold
-#   is unreadable or names a SIBLING_LABEL_RE
-#   label
-#   else                                        -> declare (re-run once)
+#   else                                         -> declare (re-run once)
 #
 # A withhold is a ::notice:: that never carries the phrase coord matches.
 # EXIT: always 0. A reporter never decides a check.
@@ -59,7 +66,7 @@ export GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1
 
 SELF_RE='^\.github/scripts/declare-setup-death\.sh$'
 DEFAULT_FRONTEND_INERT_RE='^(src-tauri/|crates/|docs/|\.github/|Cargo\.(toml|lock)$|[^/]+\.md$)'
-DEFAULT_SIBLING_LABEL_RE='^coord:(downstream|upstream)-of'
+INERT_RE="${FRONTEND_INERT_RE:-$DEFAULT_FRONTEND_INERT_RE}"
 GIT_BOUND="${GIT_BOUND:-30}"
 FETCH_BOUND=$((GIT_BOUND * 2))
 
@@ -76,10 +83,32 @@ esc_prop() {
   printf '%s' "$s"
 }
 
+# The reserved-phrase check runs before ANY output, so no withhold title can
+# carry a phrase coord's classifier matches.
 JOB="${DECLARE_JOB:-}"
+JOB_OK=1
+case "$JOB" in
+  "" | *"(not a verdict"* | *"OUT OF MEMORY"* | *"killed IN THE BUILD"* | *"TIMED OUT"*) JOB_OK=0 ;;
+esac
 withhold() {
-  echo "::notice title=$(esc_prop "${JOB:-setup death} setup death left as a verdict")::$(esc_data "$1")"
+  local t="setup death"
+  [ "$JOB_OK" = 1 ] && t="$JOB setup death"
+  echo "::notice title=$(esc_prop "$t left as a verdict")::$(esc_data "$1")"
 }
+if [ "$JOB_OK" = 0 ]; then
+  withhold "DECLARE_JOB is unset or carries a phrase coord's classifier reserves, so no title can be declared."
+  exit 0
+fi
+
+# A regex that does not compile makes grep exit 2 with no output, which would
+# read as "no match". Probe every supplied pattern first.
+for re in "$SELF_RE" "$INERT_RE" ${HARNESS_PATHS_RE:+"$HARNESS_PATHS_RE"}; do
+  grep -E -q -e "$re" < /dev/null 2> /dev/null
+  if [ $? -gt 1 ]; then
+    withhold "the pattern '${re}' is not a valid ERE, so the guard cannot be read. A setup death (if any) is left to read as a verdict."
+    exit 0
+  fi
+done
 
 # Split a TAB row into fields WITHOUT `IFS=$'\t' read`: tab is IFS
 # whitespace, so read merges adjacent tabs and an EMPTY middle field (a step
@@ -94,25 +123,31 @@ split_row() {
   [ "$F2" = "$rest" ] && return
   F3="${rest#*$'\t'}"
 }
+valid_concl() {
+  case "$1" in success | failure | cancelled | skipped) return 0 ;; *) return 1 ;; esac
+}
 
 # --- verdict steps ----------------------------------------------------------
 unreadable=""
 while IFS= read -r line || [ -n "${line:-}" ]; do
+  [ -z "$line" ] && continue
   split_row "$line"; name="$F1" concl="$F2"
-  [ -z "$name" ] && continue
-  if [ "${concl:-}" = "failure" ]; then
+  if [ "$concl" = "failure" ]; then
     exit 0
   fi
-  [ -z "${concl:-}" ] && unreadable="${unreadable:-$name}"
+  if [ -z "$name" ] || ! valid_concl "$concl"; then
+    unreadable="${unreadable:-${name:-<unnamed>}}"
+  fi
 done <<< "${VERDICT_STEPS:-}"
 
 # --- setup steps ------------------------------------------------------------
-first="" first_class=""
+first="" first_class="" rows=0
 while IFS= read -r line || [ -n "${line:-}" ]; do
+  [ -z "$line" ] && continue
+  rows=$((rows + 1))
   split_row "$line"; name="$F1" concl="$F2" class="$F3"
-  [ -z "$name" ] && continue
-  if [ -z "${concl:-}" ]; then
-    unreadable="${unreadable:-$name}"
+  if [ -z "$name" ] || ! valid_concl "$concl"; then
+    unreadable="${unreadable:-${name:-<unnamed>}}"
     continue
   fi
   if [ -z "$first" ] && [ "$concl" = "failure" ]; then
@@ -121,14 +156,18 @@ while IFS= read -r line || [ -n "${line:-}" ]; do
   fi
 done <<< "${SETUP_STEPS:-}"
 
+if [ "$rows" -eq 0 ]; then
+  withhold "SETUP_STEPS carries no rows, so whether a setup step failed is UNKNOWN."
+  exit 0
+fi
 if [ -z "$first" ]; then
   if [ -n "$unreadable" ]; then
-    withhold "step '${unreadable}' rendered no conclusion (a renamed step id renders empty), so whether a setup step failed is UNKNOWN."
+    withhold "step '${unreadable}' rendered no usable conclusion (a renamed step id renders empty), so whether a setup step failed is UNKNOWN."
   fi
   exit 0
 fi
 if [ -n "$unreadable" ]; then
-  withhold "setup step '${first}' failed, but step '${unreadable}' rendered no conclusion, so the step list is UNKNOWN. This red is left to read as a verdict on this change."
+  withhold "setup step '${first}' failed, but step '${unreadable}' rendered no usable conclusion, so the step list is UNKNOWN. This red is left to read as a verdict on this change."
   exit 0
 fi
 case "$first_class" in
@@ -136,21 +175,29 @@ case "$first_class" in
   *) first_class="frontend" ;;
 esac
 
-if [ -z "$JOB" ]; then
-  withhold "setup step '${first}' failed, but DECLARE_JOB is unset, so no title can be declared."
-  exit 0
-fi
-case "$JOB" in
-  *"(not a verdict"* | *"OUT OF MEMORY"* | *"killed IN THE BUILD"* | *"TIMED OUT"*)
-    withhold "setup step '${first}' failed, but DECLARE_JOB carries a phrase coord's classifier reserves, so no title is declared."
-    exit 0
-    ;;
-esac
-
 # --- the guard: may THIS PR have caused it? -----------------------------------
 GUARD="UNKNOWN"
 REASON=""
+# grep_hit <invert:0|1> <re> : first (non-)matching changed path in HIT;
+# returns 2 when grep itself failed.
+HIT=""
+grep_hit() {
+  local rc
+  if [ "$1" = 1 ]; then
+    HIT="$(grep -E -v -m1 -e "$2" <<< "$CHANGED")"; rc=$?
+  else
+    HIT="$(grep -E -m1 -e "$2" <<< "$CHANGED")"; rc=$?
+  fi
+  [ "$rc" -gt 1 ] && return 2
+  return 0
+}
+CHANGED=""
 read_guard() {
+  if [ "$first_class" = "sibling-labels" ]; then
+    GUARD="true"
+    REASON="'${first}' resolves siblings from this PR's live labels and from open sibling PRs' labels that name this PR, none of which this reporter can read, so the failure can be this PR's own pairing"
+    return
+  fi
   if [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ]; then
     REASON="the event is '${GITHUB_EVENT_NAME:-unset}', not pull_request, so there is no PR diff to read"
     return
@@ -183,54 +230,40 @@ read_guard() {
       return
     fi
   fi
-  local changed
-  changed="$(timeout -k 5 "$GIT_BOUND" git -C "$ws" diff -z --no-renames --name-only "$base" "$merge" 2> /dev/null | tr '\0' '\n')"
-  rc=${PIPESTATUS[0]}
+  # With pipefail, the substitution's status is git's when git fails.
+  CHANGED="$(timeout -k 5 "$GIT_BOUND" git -C "$ws" diff -z --no-renames --name-only "$base" "$merge" 2> /dev/null | tr '\0' '\n')"
+  rc=$?
   if [ "$rc" -ne 0 ]; then
     REASON="git diff ${base} ${merge} exited ${rc}, so this PR's diff is unread"
     return
   fi
-  if [ -z "$changed" ]; then
+  if [ -z "$CHANGED" ]; then
     REASON="this PR's diff against its base is empty"
     return
   fi
-  local hit
-  hit="$(grep -E -m1 -e "$SELF_RE" ${HARNESS_PATHS_RE:+-e "$HARNESS_PATHS_RE"} <<< "$changed")"
-  if [ -n "$hit" ]; then
-    GUARD="true"
-    REASON="this PR changes '${hit}', part of this job's own harness, so it can have caused the setup death"
-    return
+  local re
+  for re in "$SELF_RE" ${HARNESS_PATHS_RE:+"$HARNESS_PATHS_RE"}; do
+    if ! grep_hit 0 "$re"; then
+      REASON="grep over this PR's diff failed, so the harness guard is unread"
+      return
+    fi
+    if [ -n "$HIT" ]; then
+      GUARD="true"
+      REASON="this PR changes '${HIT}', part of this job's own harness, so it can have caused the setup death"
+      return
+    fi
+  done
+  if [ "$first_class" = "frontend" ]; then
+    if ! grep_hit 1 "$INERT_RE"; then
+      REASON="grep over this PR's diff failed, so the frontend guard is unread"
+      return
+    fi
+    if [ -n "$HIT" ]; then
+      GUARD="true"
+      REASON="'${first}' reads this PR's frontend tree and the PR changes '${HIT}', so the failure can be this PR's own"
+      return
+    fi
   fi
-  case "$first_class" in
-    frontend)
-      hit="$(grep -E -v -m1 -e "${FRONTEND_INERT_RE:-$DEFAULT_FRONTEND_INERT_RE}" <<< "$changed")"
-      if [ -n "$hit" ]; then
-        GUARD="true"
-        REASON="'${first}' reads this PR's frontend tree and the PR changes '${hit}', so the failure can be this PR's own"
-        return
-      fi
-      ;;
-    sibling-labels)
-      local ev="${GITHUB_EVENT_PATH:-}" labels
-      if [ -z "$ev" ] || [ ! -r "$ev" ] || ! command -v jq > /dev/null 2>&1; then
-        REASON="'${first}' reads this PR's labels and the event payload is unreadable"
-        return
-      fi
-      labels="$(jq -er '.pull_request.labels // empty | map(.name) | .[]?' "$ev" 2> /dev/null)"
-      rc=$?
-      # jq -e exits 4 on an empty label list, which is a readable answer.
-      if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ]; then
-        REASON="'${first}' reads this PR's labels and the event payload's labels could not be parsed (jq exited ${rc})"
-        return
-      fi
-      hit="$(grep -E -m1 -e "${SIBLING_LABEL_RE:-$DEFAULT_SIBLING_LABEL_RE}" <<< "$labels")"
-      if [ -n "$hit" ]; then
-        GUARD="true"
-        REASON="'${first}' resolves siblings from this PR's labels and the PR carries '${hit}', so the failure can be this PR's own"
-        return
-      fi
-      ;;
-  esac
   GUARD="false"
 }
 read_guard

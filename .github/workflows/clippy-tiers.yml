@@ -371,11 +371,14 @@ jobs:
       # matches it and re-runs once instead of blaming the PR's code. It
       # withholds that title (a notice instead) when the PR touches this job's
       # harness, when a step that reads the PR's frontend tree died on a PR
-      # that changed a frontend input, when the sibling resolver died on a PR
-      # carrying coord dep labels, or when any of that is unreadable. Each row
-      # is `<name> <conclusion> <class>`; the class says what of the PR that
-      # step reads. Outcomes arrive via env only; names are static literals.
+      # that changed a frontend input, whenever the sibling resolver died (it
+      # reads live labels on this PR and on sibling PRs that name it, which no
+      # step here can see), or when any of that is unreadable. Each row is
+      # `<name> <conclusion> <class>`; the class says what of the PR that step
+      # reads. Outcomes arrive via env only; names are static literals.
       # A failed Checkout is declared inline: the script never arrived.
+      # Accepted residual: a PR can itself fail checkout (a path too long for
+      # the runner's filesystem) and would still be declared here.
       - name: Declare a setup death (not a verdict on this PR)
         if: failure()
         timeout-minutes: 3
