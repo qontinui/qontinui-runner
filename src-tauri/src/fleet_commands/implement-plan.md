@@ -1422,6 +1422,19 @@ file push. (A repo that is NOT coord sole-authority lands its PRs via normal Git
 > stale copy, that is the expected outcome: **report the residual and carry on.**
 > **Do NOT loop re-transitioning — the next scan wins again.**
 
+**Then declare the plan's phases on the unit, best-effort:**
+`bash <workspace-root>/qontinui-claude-config/scripts/declare-plan-phases.sh <plan-stem> <plan file>`.
+A unit a session minted carries no `phases` (on a multi-bound device no scanner
+writes them), and `coord_work_unit_attest_phase` refuses every phase of such a
+unit ("no established phase declaration"). The script skips a plan-backed unit,
+patches only on a difference, refuses any declaration that drops a phase coord
+has established (a narrowing is patched by hand), and bounds its own run time;
+its header is the contract. Quote its one verdict line in the report and
+continue whatever it says: it never blocks the implementation. Until the runner
+ships `qontinui-pr plan-phase-declaration` (that plan's Phase 1), the verdict is
+`UNKNOWN` on every box: expected, not a fault. `/vet-plan` §5.4
+step 1 runs the same script.
+
 #### Retire the vet→implement safety net — withdraw it (do this AT the stamp)
 
 The IN PROGRESS stamp is the moment this session provably took the work over, so
