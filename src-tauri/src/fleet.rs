@@ -4014,6 +4014,9 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    // The breadcrumb's atomic-replace temp file (`coord_mcp::replace_breadcrumb`),
+    // which a crash between its write and its rename would leave behind.
+    ".coord-mcp-status.tmp-*",
     ".claude/worktrees/",
 ];
 
@@ -8156,8 +8159,11 @@ mod tests {",
         // file. A future entry spelled `/target-agent` or `target-agent/**`
         // would land in the exclude file and exclude nothing; only a fixture
         // derived from the roster catches that.
+        // A glob entry is materialized as one concrete name it matches (`*`
+        // is not a legal filename character on Windows).
+        let concrete = |pat: &str| pat.trim_end_matches('/').replace('*', "x");
         for pat in MANAGED_REPO_EXCLUDES {
-            let p = dir.join(pat.trim_end_matches('/'));
+            let p = dir.join(concrete(*pat));
             if pat.ends_with('/') {
                 std::fs::create_dir_all(&p).unwrap();
                 std::fs::write(p.join("x"), "x").unwrap();
@@ -8177,7 +8183,7 @@ mod tests {",
         // an entry that stopped being reported ride on a sibling's line and the
         // assert would silently stop asserting.
         for pat in MANAGED_REPO_EXCLUDES {
-            let want = pat.trim_end_matches('/');
+            let want = concrete(*pat);
             assert!(
                 before.lines().any(|l| {
                     l.split_whitespace()
