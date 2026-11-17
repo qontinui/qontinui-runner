@@ -286,11 +286,34 @@ pub fn save_session_guard_settings(
 /// of them binds — so a value above it can be warned about by name.
 fn host_suggestion_json(cap: crate::ci_node::host_sizing::HostCapacity) -> serde_json::Value {
     let (suggested, limiting_term) = crate::ci_node::host_sizing::suggestion_with_limit(cap);
+    // What an unset value resolves to NOW (plan 2026-11-05 Phase 7): the
+    // capacity model's Lane B total when it answers, else the static
+    // suggestion above — labelled, with why the model did not answer.
+    let (effective, source) = crate::ci_node::host_sizing::suggested_concurrent_builds_now(cap);
+    let effective = match &source {
+        crate::ci_node::host_sizing::ConcurrencySource::Model {
+            running_at_sample,
+            slots_c1,
+            static_partition,
+        } => serde_json::json!({
+            "count": effective,
+            "source": source.label(),
+            "running_at_sample": running_at_sample,
+            "slots_c1": slots_c1,
+            "static_partition": static_partition,
+        }),
+        crate::ci_node::host_sizing::ConcurrencySource::Static { reason } => serde_json::json!({
+            "count": effective,
+            "source": source.label(),
+            "unknown_reason": reason,
+        }),
+    };
     serde_json::json!({
         "suggested": suggested,
         "cpus": cap.cpus,
         "mem_gib": cap.mem_bytes.map(|b| b / (1024 * 1024 * 1024)),
         "limiting_term": limiting_term,
+        "effective": effective,
     })
 }
 
