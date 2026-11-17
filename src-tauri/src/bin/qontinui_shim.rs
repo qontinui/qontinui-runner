@@ -1249,13 +1249,7 @@ fn resolve_real_settled_waiting(
 ) -> Option<PathBuf> {
     let wait = resolve_wait_from(env::var(RESOLVE_WAIT_ENV).ok().as_deref(), default_wait);
     let resolved = resolve_settled_with_wait(
-        || resolve_real(name, own_dirs).map(|p| {
-            // On Windows `p` is npm's wrapper, not the image, and the time is a
-            // stand-in that can read a long write's start: coverage there is
-            // incidental (intercept_core::settled, "Windows limits").
-            let settle = settle_of(&p, SystemTime::now());
-            (p, settle)
-        }),
+        || settle_probe(resolve_real(name, own_dirs), SystemTime::now()),
         wait,
         RESOLVE_POLL,
         std::thread::sleep,
@@ -1284,6 +1278,19 @@ fn resolve_real_settled_waiting(
             None
         }
     }
+}
+
+/// One probe of [`resolve_real_settled_waiting`]: the resolved candidate, if
+/// any, judged by the shared predicate at `now`.
+///
+/// On Windows the candidate is npm's wrapper, not the image, and the time is a
+/// stand-in that can read a long write's start, so coverage there is
+/// incidental (`intercept_core::settled`, "Windows limits").
+fn settle_probe(found: Option<PathBuf>, now: SystemTime) -> Option<(PathBuf, Settle)> {
+    found.map(|path| {
+        let settle = settle_of(&path, now);
+        (path, settle)
+    })
 }
 
 /// The one stderr line each kind of wait announces, once.
@@ -2036,6 +2043,56 @@ mod tests {
             };
             assert_eq!(got, want, "{first:?}");
         }
+    }
+
+    /// The file's own change time, as `intercept_core::settled` reads it, so
+    /// the probe is judged against the file rather than a wall clock a
+    /// saturated box could run ahead of.
+    fn own_change_time(path: &Path) -> SystemTime {
+        let meta = std::fs::metadata(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            SystemTime::UNIX_EPOCH
+                + Duration::new(
+                    u64::try_from(meta.ctime()).unwrap(),
+                    u32::try_from(meta.ctime_nsec()).unwrap(),
+                )
+        }
+        #[cfg(not(unix))]
+        {
+            match (meta.created().ok(), meta.modified().ok()) {
+                (Some(c), Some(m)) => c.max(m),
+                (one, other) => one.or(other).unwrap(),
+            }
+        }
+    }
+
+    /// The probe the identity path runs judges the candidate with the shared
+    /// predicate: a file written just now is changing, and settled once its
+    /// own change time is 3 s old. A probe that stopped calling `settle_of`
+    /// would read every candidate as unknown, and launch it at once.
+    #[test]
+    fn settle_probe_judges_the_resolved_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("claude");
+        std::fs::write(&file, b"image").unwrap();
+        let changed = own_change_time(&file);
+
+        let (path, settle) =
+            settle_probe(Some(file.clone()), changed + Duration::from_millis(500)).unwrap();
+        assert_eq!(path, file);
+        assert_eq!(
+            settle,
+            Settle::Changing {
+                age: Duration::from_millis(500)
+            }
+        );
+        assert_eq!(
+            settle_probe(Some(file.clone()), changed + Duration::from_secs(3)),
+            Some((file, Settle::Settled))
+        );
+        assert_eq!(settle_probe(None, changed), None, "a miss stays a miss");
     }
 
     #[test]

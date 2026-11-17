@@ -8,9 +8,10 @@
 //! max 3.8 s (coord finding `18ee5471-7b84-469b-927f-6128bfcb7263`). A
 //! resolver that launches the first hit can start a truncated image there. The quiescence predicate is the
 //! parent plan's D1 (`2026-11-10-migration-holds-for-missing-claude-cli`): the
-//! target's change time is at least [`SETTLE_MIN_AGE`] old. Writes and re-links
-//! both move a change time, so an install still in progress reads as
-//! [`Settle::Changing`], and a binary installed long ago costs one `stat`.
+//! target's change time is at least [`SETTLE_MIN_AGE`] old. A write, or a
+//! rename into place, moves the target's change time, so an install still in
+//! progress reads as [`Settle::Changing`]. [`settle_of`] follows links, so a
+//! re-link alone, which changes only the link, is not seen, and a binary installed long ago costs one `stat`.
 //!
 //! ONE predicate, two consumers, so they cannot disagree about "settled":
 //! - the native identity shim (`qontinui-shim`'s `run_identity`, plan

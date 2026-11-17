@@ -26,8 +26,9 @@
 #   * DON'T DOUBLE-PIN: if the user already passed --session-id/--resume (or the
 #     resume subcommand), do NOT append our id — their explicit choice wins.
 #   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT, or is
-#     npm's placeholder stub (mid-reinstall), or resolved but CHANGED under 2 s
-#     ago (an install still writing it), is re-scanned for at most
+#     npm's placeholder stub (mid-reinstall), or resolved but changed under
+#     ~3 s ago (whole seconds; see the SETTLE check -- an install still
+#     writing it), is re-scanned for at most
 #     QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables both waits)
 #     before the fail-open fall-through. One deadline covers both waits; a
 #     candidate still changing at it is launched anyway. A SETTLED tool never
@@ -155,6 +156,9 @@ resolve_real() { scan_path real; }
 # otherwise have failed, or launched a tool still being written. One stderr
 # line announces the wait so a genuinely absent tool is not a silent 10 s stall.
 # ---------------------------------------------------------------------------
+# The bound is counted in whole-second SECONDS, so it can end up to ~1 s
+# early, and a bound of 3 s or less cannot see a fresh write settle (settled
+# needs `now - ctime >= 3`): such a launch goes out with the launch-anyway line.
 resolve_wait_secs() {
   local w="${QONTINUI_SHIM_RESOLVE_WAIT_SECS:-10}"
   case "$w" in ''|*[!0-9]*) w=10 ;; esac
