@@ -8,7 +8,14 @@
 //! a measured run caught writing whole default `settings.json` documents into
 //! other tests' fixtures (plan
 //! `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`).
-//! The worker's refusal count comes back through the join.
+//!
+//! The door tests observe the refusal only where a caller of the door can: the
+//! `Err` (or the per-entry error) the door returns and the file it did not
+//! write, beside a positive control on the guarded thread that shows the same
+//! door IS a writer. They never read the gate's own counters, so each one
+//! enters where the population enters and goes red with the gate removed. The
+//! counters are read only by the two tests that are about counting and
+//! line-once printing.
 //!
 //! Why the assertions are deterministic: while this test holds the fixture it
 //! holds `env_lock`, so every other thread in the process holds none, and the
@@ -24,11 +31,8 @@ use qontinui_runner_lib::env_write_gate::{refusals_on_this_thread, reported_line
 use std::path::Path;
 
 /// Run `f` on a fresh named thread (which holds no `env_lock`) and return its
-/// result with the number of refusals that thread made.
-fn run_unguarded<T: Send + 'static>(
-    name: &str,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> (T, u64) {
+/// result.
+fn on_unguarded_thread<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
@@ -37,12 +41,23 @@ fn run_unguarded<T: Send + 'static>(
                 0,
                 "the worker must hold no env_lock, or it proves nothing"
             );
-            let out = f();
-            (out, refusals_on_this_thread())
+            f()
         })
         .expect("spawn the unguarded worker")
         .join()
         .expect("the unguarded worker must not panic")
+}
+
+/// [`on_unguarded_thread`], also returning the number of refusals that thread
+/// made. Only the counting tests use it.
+fn run_unguarded_counted<T: Send + 'static>(
+    name: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (T, u64) {
+    on_unguarded_thread(name, move || {
+        let out = f();
+        (out, refusals_on_this_thread())
+    })
 }
 
 /// Every entry in `dir` a settings door writes: `settings.json` and its
@@ -70,30 +85,22 @@ fn an_unguarded_worker_reaching_workspace_root_persists_nothing_into_the_fixture
     let settings_json = amb.dir().join("settings.json");
     assert_eq!(settings_traces(amb.dir()), Vec::<String>::new());
 
-    let ((), refused) = run_unguarded("env-write-gate-door-workspace-root", || {
+    on_unguarded_thread("env-write-gate-door-workspace-root", || {
         let _ = crate::workspace_paths::workspace_root();
     });
-    assert!(
-        refused >= 1,
-        "the worker's FreshInstall persist must be refused, got {refused} refusals"
-    );
     assert_eq!(
         settings_traces(amb.dir()),
         Vec::<String>::new(),
         "an unguarded worker wrote a settings document into the live fixture"
     );
 
-    // Positive control on the SAME fixture.
-    let before = refusals_on_this_thread();
+    // Positive control on the SAME fixture: the guarded thread's identical
+    // call persists, so the empty fixture above is the gate's refusal and not
+    // a door that never writes.
     let _ = crate::workspace_paths::workspace_root();
     assert!(
         settings_json.is_file(),
         "a guarded thread's FreshInstall load persists — the door must be a writer here"
-    );
-    assert_eq!(
-        refusals_on_this_thread(),
-        before,
-        "a guarded thread is never refused"
     );
 }
 
@@ -110,18 +117,14 @@ fn an_unguarded_tokio_worker_reaching_get_cloud_sync_enabled_persists_nothing() 
         .worker_threads(1)
         .build()
         .expect("build a multi-thread runtime");
-    let (thread, refused) = rt.block_on(async {
+    let thread = rt.block_on(async {
         tokio::spawn(async {
             let _tenant_switch = crate::egress::test_support::pin(
                 crate::egress::Flow::TranscriptSync,
                 crate::egress::Level::On,
             );
-            let before = refusals_on_this_thread();
             let _ = crate::egress::transcript_sync_permitted();
-            (
-                std::thread::current().name().map(str::to_string),
-                refusals_on_this_thread() - before,
-            )
+            std::thread::current().name().map(str::to_string)
         })
         .await
         .expect("the worker task must not panic")
@@ -132,11 +135,23 @@ fn an_unguarded_tokio_worker_reaching_get_cloud_sync_enabled_persists_nothing() 
         Some("tokio-rt-worker"),
         "the door must run on a runtime worker, the shape the census measured"
     );
-    assert!(
-        refused >= 1,
-        "the worker's persist must be refused, got {refused}"
+    assert_eq!(
+        settings_traces(amb.dir()),
+        Vec::<String>::new(),
+        "an unguarded runtime worker wrote a settings document into the live fixture"
     );
-    assert_eq!(settings_traces(amb.dir()), Vec::<String>::new());
+
+    // Positive control on the SAME fixture: the same chain on this guarded
+    // thread persists, so the worker's empty fixture is the gate's refusal.
+    let _tenant_switch = crate::egress::test_support::pin(
+        crate::egress::Flow::TranscriptSync,
+        crate::egress::Level::On,
+    );
+    let _ = crate::egress::transcript_sync_permitted();
+    assert!(
+        amb.dir().join("settings.json").is_file(),
+        "a guarded thread's load through the drain loop's chain persists — the door must be a writer here"
+    );
 }
 
 /// An explicit door returns the refusal — never a silent `Ok` that would tell
@@ -145,15 +160,19 @@ fn an_unguarded_tokio_worker_reaching_get_cloud_sync_enabled_persists_nothing() 
 fn an_unguarded_update_settings_returns_the_refusal_and_writes_nothing() {
     let amb = crate::test_env::isolated_ambient();
     let name = "env-write-gate-door-update-settings";
-    let (verdict, refused) = run_unguarded(name, || {
+    let verdict = on_unguarded_thread(name, || {
         crate::settings::update_settings(|s| s.setup_completed = true)
     });
     let err = verdict.expect_err("an unguarded update must be refused");
     assert!(err.contains("holds no env_lock"), "{err}");
     assert!(err.contains(&format!("thread `{name}`")), "{err}");
     assert!(err.contains("`settings::update_settings`"), "{err}");
-    assert_eq!(refused, 1);
     assert_eq!(settings_traces(amb.dir()), Vec::<String>::new());
+
+    // Positive control: the guarded thread's update writes.
+    crate::settings::update_settings(|s| s.setup_completed = true)
+        .expect("a guarded update is never refused");
+    assert!(amb.dir().join("settings.json").is_file());
 }
 
 /// The tier writer in the lib, through the bin door every in-process caller
@@ -161,13 +180,12 @@ fn an_unguarded_update_settings_returns_the_refusal_and_writes_nothing() {
 #[test]
 fn an_unguarded_promote_tier_to_account_returns_the_refusal_and_writes_nothing() {
     let amb = crate::test_env::isolated_ambient();
-    let (verdict, refused) = run_unguarded("env-write-gate-door-promote-tier", || {
+    let verdict = on_unguarded_thread("env-write-gate-door-promote-tier", || {
         crate::settings::promote_tier_to_account().map_err(|e| e.to_string())
     });
     let err = verdict.expect_err("an unguarded tier promotion must be refused");
     assert!(err.contains("holds no env_lock"), "{err}");
     assert!(err.contains("`profiles::promote_tier_to_account`"), "{err}");
-    assert_eq!(refused, 1);
     assert_eq!(settings_traces(amb.dir()), Vec::<String>::new());
 }
 
@@ -189,15 +207,15 @@ fn an_unguarded_claude_accounts_save_returns_the_refusal_and_writes_nothing() {
     );
     let roster_dir = roster.parent().expect("a roster dir").to_path_buf();
 
-    let (verdict, refused) = run_unguarded("env-write-gate-door-roster-save", || {
+    let verdict = on_unguarded_thread("env-write-gate-door-roster-save", || {
         crate::claude_accounts::save(&crate::claude_accounts::ClaudeAccountsFile {
             claude_config_dirs: vec!["/accounts/of/the/worker".to_string()],
             ..Default::default()
         })
     });
     let err = verdict.expect_err("an unguarded roster save must be refused");
+    assert!(err.contains("holds no env_lock"), "{err}");
     assert!(err.contains("`claude_accounts::save`"), "{err}");
-    assert_eq!(refused, 1);
     assert!(
         !roster.exists(),
         "the refused roster write landed: {}",
@@ -207,6 +225,11 @@ fn an_unguarded_claude_accounts_save_returns_the_refusal_and_writes_nothing() {
         !roster_dir.exists(),
         "a refused write creates nothing, not even the roster's directory"
     );
+
+    // Positive control: the guarded thread's save writes the roster.
+    crate::claude_accounts::save(&crate::claude_accounts::ClaudeAccountsFile::default())
+        .expect("a guarded roster save is never refused");
+    assert!(roster.is_file(), "the door must be a writer here");
 }
 
 /// Under `strict_canary()` the refusal is a panic carrying the sentence.
@@ -241,7 +264,7 @@ fn a_strict_unguarded_worker_panics_with_the_refusal() {
 fn a_repeated_refusal_writes_one_line() {
     let _amb = crate::test_env::isolated_ambient();
     let name = "env-write-gate-door-print-once";
-    let ((), refused) = run_unguarded(name, || {
+    let ((), refused) = run_unguarded_counted(name, || {
         for _ in 0..3 {
             let _ = crate::settings::update_settings(|s| s.setup_completed = true);
         }
@@ -255,14 +278,18 @@ fn a_repeated_refusal_writes_one_line() {
 #[test]
 fn an_unguarded_save_settings_returns_the_refusal_and_writes_nothing() {
     let amb = crate::test_env::isolated_ambient();
-    let (verdict, refused) = run_unguarded("env-write-gate-door-save-settings", || {
+    let verdict = on_unguarded_thread("env-write-gate-door-save-settings", || {
         crate::settings::save_settings(&crate::settings::Settings::default())
     });
     let err = verdict.expect_err("an unguarded whole-document save must be refused");
     assert!(err.contains("holds no env_lock"), "{err}");
     assert!(err.contains("`settings::get_settings_path`"), "{err}");
-    assert_eq!(refused, 1);
     assert_eq!(settings_traces(amb.dir()), Vec::<String>::new());
+
+    // Positive control: the guarded thread's save writes.
+    crate::settings::save_settings(&crate::settings::Settings::default())
+        .expect("a guarded save is never refused");
+    assert!(amb.dir().join("settings.json").is_file());
 }
 
 /// `backup::restore_backup` resolves every destination from the env and writes
@@ -295,8 +322,9 @@ fn an_unguarded_restore_backup_restores_nothing() {
     );
     std::fs::remove_file(&settings_json).expect("clear the restore target");
 
-    let (restored, refused) = run_unguarded("env-write-gate-door-restore-backup", move || {
-        crate::backup::restore_backup(&archive)
+    let restored = on_unguarded_thread("env-write-gate-door-restore-backup", {
+        let archive = archive.clone();
+        move || crate::backup::restore_backup(&archive)
     });
     let restored = restored.expect("the archive opens");
     assert!(
@@ -304,18 +332,31 @@ fn an_unguarded_restore_backup_restores_nothing() {
         "nothing may be restored: {:?}",
         restored.files_restored
     );
-    assert!(
-        restored
-            .errors
-            .iter()
-            .any(|e| e.contains("holds no env_lock") && e.contains("`backup::restore_backup`")),
-        "the refusal is the entry's error: {:?}",
+    let refusals = restored
+        .errors
+        .iter()
+        .filter(|e| e.contains("holds no env_lock") && e.contains("`backup::restore_backup`"))
+        .count();
+    assert_eq!(
+        refusals,
+        made.files_backed_up.len(),
+        "every backed-up entry's error must be the refusal: {:?}",
         restored.errors
     );
-    assert_eq!(refused as usize, made.files_backed_up.len());
     assert!(
         !settings_json.exists(),
         "the refused restore wrote {}",
         settings_json.display()
     );
+
+    // Positive control: the guarded thread's restore of the same archive writes.
+    let guarded = crate::backup::restore_backup(&archive).expect("the archive opens");
+    assert!(
+        guarded
+            .files_restored
+            .contains(&"settings.json".to_string()),
+        "a guarded restore must restore settings.json: {:?}",
+        guarded
+    );
+    assert!(settings_json.is_file());
 }

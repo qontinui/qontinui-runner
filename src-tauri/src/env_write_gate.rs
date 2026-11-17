@@ -43,11 +43,16 @@
 //! gated at runtime on `ambient::test_support::canary_armed()`, because the
 //! runner BIN's test binary links this lib compiled without `cfg(test)`. A
 //! shipped build compiles the `Ok(())` twin; a dev runner is not in a `deps/`
-//! directory and is never armed. So production behaviour is unchanged.
+//! directory and is never armed. So no shipped or dev runner's write is ever
+//! refused; the one residue in a shipped build is that each door still
+//! evaluates the `target` argument it hands the `Ok(())` twin.
 //!
 //! # The doors
 //!
-//! Callers are the writers that resolve their target from the environment:
+//! Callers are the env-resolved SETTINGS writers — `settings.json`, the
+//! `claude-accounts.json` roster and a backup restore — not every writer that
+//! resolves a path from the environment (`profiles.json`, the instance and
+//! prompt stores are outside this gate; plan Risks R3):
 //! `settings::get_settings_path` (every whole-document save),
 //! `settings::load_settings_full`'s migration persist,
 //! `settings::update_settings`, `profiles::promote_tier_to_account`, the
@@ -60,12 +65,17 @@
 //! Counted (process-wide and per thread, so tests assert on state rather than
 //! stderr), then a `panic!` under `test_support::strict_canary()`, else ONE
 //! line on stderr per distinct `(thread, door, first caller frame)` — written
-//! with `Write::write_all` on `std::io::stderr()`, which libtest's per-test
-//! capture does not intercept (it intercepts the `print!` family only), so the
-//! line reaches the suite log even from a passing test — and an `Err` carrying
+//! with `Write::write_all` on `std::io::stderr()`, which reached the suite log
+//! from passing tests in every measured run (plan Phase 1 by hand; 56–60 lines
+//! per whole-suite run in Phases 2 and 4), where an `eprintln!` from a passing
+//! test is discarded by libtest's capture — and an `Err` carrying
 //! the same sentence. The caller frame is in the key because many runtime
 //! workers share one thread name (`tokio-rt-worker`); without it, the first
-//! worker's line would swallow every other worker's.
+//! worker's line would swallow every other worker's. Finding that frame costs a
+//! symbolized backtrace, so only the first [`CAPTURES_PER_DOOR`] refusals per
+//! `(thread, door)` capture one; later ones are counted and named
+//! `<not captured>`. A refused FreshInstall persist leaves the file absent, so an
+//! unguarded loader in a loop is refused on every iteration.
 
 use std::path::Path;
 
@@ -76,6 +86,10 @@ pub const PLAN: &str =
 /// The prefix of the stderr line a refusal writes — what a suite log is
 /// grepped for to inventory the refusals of one run.
 pub const LINE_PREFIX: &str = "[env-write-gate]";
+
+/// How many refusals per `(thread, door)` symbolize a backtrace to name their
+/// caller. Bounds the cost of a loader refused in a loop.
+pub const CAPTURES_PER_DOOR: u64 = 8;
 
 /// May THIS thread write `target`, a settings file `door` resolved from the
 /// process environment?
@@ -122,6 +136,9 @@ mod armed {
         /// Refusals on THIS thread — what a test reads, immune to every other
         /// test running in parallel.
         static REFUSALS_HERE: Cell<u64> = const { Cell::new(0) };
+        /// Refusals on THIS thread per door — bounds the backtrace captures.
+        static REFUSALS_HERE_AT: std::cell::RefCell<std::collections::HashMap<&'static str, u64>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
 
     /// The `(thread, door, caller frame)` keys a line has been written for.
@@ -173,8 +190,21 @@ mod armed {
         REFUSALS.fetch_add(1, Ordering::SeqCst);
         let _ = REFUSALS_HERE.try_with(|c| c.set(c.get() + 1));
 
+        let at_this_door = REFUSALS_HERE_AT
+            .try_with(|m| {
+                let mut m = m.borrow_mut();
+                let n = m.entry(door).or_insert(0);
+                *n += 1;
+                *n
+            })
+            .unwrap_or(1);
+
         let thread = thread_label();
-        let caller = first_caller_frame();
+        let caller = if at_this_door <= super::CAPTURES_PER_DOOR {
+            first_caller_frame()
+        } else {
+            "<not captured>".to_string()
+        };
         let refusal = sentence(door, target, &thread, &caller);
         if crate::ambient::test_support::thread_is_strict() {
             panic!("{refusal}");
@@ -213,8 +243,9 @@ mod armed {
     }
 
     /// Write the refusal line unless this `(thread, door, caller)` already has
-    /// one. Direct `write_all`, NOT `eprintln!`: libtest captures the `print!`
-    /// family per test, and a captured line from a passing test is discarded.
+    /// one. Direct `write_all`, NOT `eprintln!`: an `eprintln!` from a passing
+    /// test is captured and discarded, while this line reached the suite log in
+    /// every measured run (module docs).
     fn report_once(thread: &str, door: &'static str, caller: &str, sentence: &str) {
         let first = REPORTED.lock().unwrap_or_else(|p| p.into_inner()).insert((
             thread.to_string(),
@@ -373,6 +404,34 @@ mod tests {
             .join()
             .expect("the probe thread must not panic");
         assert_eq!(reported_lines(name, DOOR), 1);
+    }
+
+    /// Past `CAPTURES_PER_DOOR` refusals at one door, a thread stops paying for
+    /// a backtrace: every refusal is still counted, and the uncaptured ones
+    /// share one `<not captured>` line.
+    #[test]
+    fn refusals_past_the_capture_bound_are_counted_but_not_symbolized() {
+        let name = "env-write-gate-capture-bound-probe-lib";
+        let extra = 3;
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                for _ in 0..CAPTURES_PER_DOOR + extra {
+                    let refusal = check(DOOR, Some(&target())).expect_err("refused");
+                    assert!(refusal.contains("holds no env_lock"), "{refusal}");
+                }
+                assert_eq!(refusals_on_this_thread(), CAPTURES_PER_DOOR + extra);
+                let last = check(DOOR, Some(&target())).expect_err("refused");
+                assert!(last.contains("`<not captured>`"), "{last}");
+            })
+            .expect("spawn the probe thread")
+            .join()
+            .expect("the probe thread must not panic");
+        assert_eq!(
+            reported_lines(name, DOOR),
+            2,
+            "one line for the captured caller, one for the uncaptured refusals"
+        );
     }
 
     /// The caller frame skips the runtime and the door modules, keeps a test
