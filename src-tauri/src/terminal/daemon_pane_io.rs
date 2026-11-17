@@ -1618,7 +1618,6 @@ impl PumpCtx {
             Event::Exit(exit) => {
                 info!(pane = %self.key, holder_pid = self.holder_pid(), child_pid = self.child_pid, ?exit, "pty holder: pane process exited");
                 self.out.settle(exit_result(exit));
-                self.control.close();
                 self.conn.close();
                 return true;
             }
