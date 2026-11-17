@@ -226,14 +226,14 @@ fn ms_to_rfc3339(ms: i64) -> Option<String> {
 
 /// A name coord will accept, or `None`. Over-long names are omitted, never cut:
 /// a truncated name would be a different, wrong name.
-fn bounded_name(raw: &str) -> Option<String> {
+pub(crate) fn bounded_name(raw: &str) -> Option<String> {
     let t = raw.trim();
     (!t.is_empty() && t.chars().count() <= MAX_NAME_CHARS).then(|| t.to_string())
 }
 
 /// A registry name the operator chose (a `/rename` or a launch-time name), as
 /// opposed to Claude Code's own `nameSource: "derived"` auto-name.
-fn operator_named(s: &LiveClaudeSession) -> bool {
+pub(crate) fn operator_named(s: &LiveClaudeSession) -> bool {
     !s.name.trim().is_empty() && s.name_source.as_deref() != Some("derived")
 }
 
