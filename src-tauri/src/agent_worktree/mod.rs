@@ -81,8 +81,6 @@ pub(crate) mod remove_unspawned;
 pub(crate) mod retire_abandoned;
 pub mod session_env;
 pub(crate) mod sibling_store;
-#[cfg(test)]
-mod test_coord;
 
 /// Env var that controls the worktree-per-session spawn path. **Default ON**
 /// (Phase 2b); set to a falsy value (`0`/`false`/`no`) to opt a machine out.
