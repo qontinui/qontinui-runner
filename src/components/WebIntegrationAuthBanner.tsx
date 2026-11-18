@@ -40,6 +40,7 @@ import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useTenant } from "@/contexts/TenantContext";
+import { PendingSignInNotice } from "@/components/PendingSignInNotice";
 
 import {
   applyCredentialDarkSignal,
@@ -539,6 +540,9 @@ export function WebIntegrationAuthBanner() {
                 <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{ctaError}</span>
               </>
             ) : null}
+            <PendingSignInNotice
+              active={presentation.ctaAction === "cognito_sign_in" && authorizing}
+            />
           </div>
           {presentation.showSwitchTenant && tenantSwitcherOpen ? (
             <div
@@ -755,6 +759,7 @@ export function WebIntegrationAuthBanner() {
               <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
             </>
           ) : null}
+          <PendingSignInNotice active={authorizing} />
         </div>
       </div>
       <button

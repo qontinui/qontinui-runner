@@ -1184,6 +1184,27 @@ pub async fn cognito_sign_in(
         .map_err(String::from)
 }
 
+/// The Hosted-UI sign-in currently waiting for its browser callback, if any:
+/// its authorize URL and, when the system browser could not be opened, why.
+///
+/// The UI polls this while a [`cognito_sign_in`] is in flight so a box with no
+/// browser launcher can show the URL with a copy control instead of waiting
+/// five silent minutes (plan
+/// `2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human`
+/// P1.1).
+#[tauri::command]
+pub fn cognito_pending_sign_in() -> Option<qontinui_runner_lib::cognito::PendingSignIn> {
+    qontinui_runner_lib::cognito::pending_sign_in()
+}
+
+/// Cancel the pending Hosted-UI sign-in, releasing the callback port. Returns
+/// whether there was one. The cancelled [`cognito_sign_in`] call returns
+/// [`qontinui_runner_lib::cognito::SIGN_IN_CANCELLED`].
+#[tauri::command]
+pub fn cognito_cancel_sign_in() -> bool {
+    qontinui_runner_lib::cognito::cancel_pending_sign_in()
+}
+
 async fn cognito_sign_in_impl(
     backend_url: String,
     identity_provider: Option<String>,
@@ -2222,6 +2243,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             set_runner_tier,
             cognito_sign_in,
             cognito_sign_in_password,
+            cognito_pending_sign_in,
+            cognito_cancel_sign_in,
             qontinui_sign_out,
             sign_out_full,
             reset_credential_store,

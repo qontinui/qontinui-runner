@@ -15,6 +15,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogIn, AlertCircle, Loader2, RotateCcw } from "lucide-react";
 import { createLogger } from "@/lib/logger";
+import { PendingSignInNotice } from "@/components/PendingSignInNotice";
 
 const log = createLogger("LoginScreen");
 
@@ -216,6 +217,9 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
               <p className="text-sm text-destructive">{error}</p>
             </div>
           )}
+
+          {/* The authorize URL, when the runner could not open a browser. */}
+          <PendingSignInNotice active={pending !== null} />
 
           {/* Federated social sign-in (Cognito Hosted UI per IdP). Labels,
               ordering, and provider names match the web auth UI verbatim. */}

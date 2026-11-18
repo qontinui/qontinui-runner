@@ -61,6 +61,7 @@ import {
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useAuth } from "@/components/AuthProvider";
+import { PendingSignInNotice } from "@/components/PendingSignInNotice";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
@@ -472,6 +473,8 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
           </div>
         )}
       </div>
+
+      <PendingSignInNotice active={cognitoState === "signing-in"} />
 
       {flowError && (
         <div className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-200">
