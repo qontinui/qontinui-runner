@@ -203,7 +203,9 @@ pub(crate) struct CapacityRead {
     pub(crate) fetched_at: String,
     /// Seconds since the runner asked coord.
     pub(crate) cache_age_secs: f64,
-    /// How long this read is kept before coord is asked again.
+    /// How long this read is kept before coord is asked again; `0` when this
+    /// read is not kept at all (the read's task failed, so nothing was
+    /// stored and the next caller asks again). A kept read's TTL is never 0.
     pub(crate) cache_ttl_secs: u64,
 }
 
@@ -316,7 +318,17 @@ impl Entry {
         now.saturating_duration_since(self.done) < self.fetched.ttl()
     }
 
+    /// This entry as a kept read: its TTL is the one it is kept for.
     fn read_at(&self, now: Instant) -> CapacityRead {
+        self.read_kept_for(now, self.fetched.ttl().as_secs())
+    }
+
+    /// This entry as a read that is never kept: `cache_ttl_secs` is 0.
+    fn unkept_read_at(&self, now: Instant) -> CapacityRead {
+        self.read_kept_for(now, 0)
+    }
+
+    fn read_kept_for(&self, now: Instant, ttl_secs: u64) -> CapacityRead {
         let (state, device_id, row, coord, reason) = match &self.fetched {
             Fetched::Known {
                 device_id,
@@ -352,7 +364,7 @@ impl Entry {
             reason,
             fetched_at: self.fetched_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             cache_age_secs: now.saturating_duration_since(self.at).as_secs_f64(),
-            cache_ttl_secs: self.fetched.ttl().as_secs(),
+            cache_ttl_secs: ttl_secs,
         }
     }
 }
@@ -482,7 +494,9 @@ pub(crate) async fn current() -> CapacityRead {
 }
 
 /// `cache.get(prepare)` on a task of its own, so dropping the caller does not
-/// drop a fetch in flight. A task that panicked is an `unknown` read.
+/// drop a fetch in flight. A task that panicked is an `unknown` read that is
+/// not kept (`cache_ttl_secs: 0`): nothing was stored, so the next caller asks
+/// again.
 async fn get_detached<P, Fut>(cache: &'static CapacityCache, prepare: P) -> CapacityRead
 where
     P: FnOnce() -> Prepared<Fut> + Send + 'static,
@@ -496,7 +510,7 @@ where
             fetched_at: Utc::now(),
             fetched: Fetched::unknown(None, format!("the capacity read's task failed: {e}")),
         }
-        .read_at(Instant::now()),
+        .unkept_read_at(Instant::now()),
     }
 }
 
@@ -988,6 +1002,23 @@ mod tests {
         };
         assert_eq!(calls.load(Ordering::SeqCst), 1, "coord was asked once");
         assert_eq!(again.state, "known");
+    }
+
+    /// A read whose task failed (here, a preparation that panics) is UNKNOWN
+    /// naming the failure, and says it is not kept: its TTL is 0 and the
+    /// cache holds nothing after it.
+    #[tokio::test]
+    async fn a_failed_task_is_an_unkept_unknown_read() {
+        let cache: &'static CapacityCache = Box::leak(Box::new(CapacityCache::new()));
+        let read = get_detached(cache, || -> Prepared<std::future::Ready<Fetched>> {
+            panic!("the preparation failed")
+        })
+        .await;
+        assert_eq!(read.state, "unknown");
+        let reason = read.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("task failed"), "{reason}");
+        assert_eq!(read.cache_ttl_secs, 0, "a read that is not kept says 0");
+        assert!(cache.last(Instant::now()).is_none(), "nothing was kept");
     }
 
     /// Once the read is a minute old coord is asked again, and the new
