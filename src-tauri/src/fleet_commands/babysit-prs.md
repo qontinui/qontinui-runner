@@ -1812,7 +1812,8 @@ an admin-merge happened — produces a plan so the defect class dies:
      journal, an earlier cycle or an earlier report:
 
      ```bash
-     out=$(curl -sS -m 10 -w '\n%{http_code}' -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}')
+     # envelope-ok: reads only the HTTP status and a fixed-token match on coord's unknown-route 404; no envelope key is read
+     out=$(curl -sS -m 10 -w '\n%{http_code}' -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}') || true
      code=${out##*$'\n'}
      case "$out" in *'"error":"no_such_route"'*) err=no_such_route ;; *) err=other ;; esac
      echo "code=$code error=$err at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1828,7 +1829,7 @@ an admin-merge happened — produces a plan so the defect class dies:
        exists, so admission IS deployed and the tool must work. Call it through
        `coord-revive.sh call coord_child_slot '{"action":"acquire"}'` (the
        coord-revive skill's resolver). If that fails too, it is a refusal.
-     - `000` or a timeout — UNKNOWN, which is a refusal.
+     - `000`, an empty code, or a timeout — UNKNOWN, which is a refusal.
   3. **Transport down** — the call is unreachable, times out, or answers
      "Command failed with no output" — is a refusal for this cycle: start no
      child. A reviewer waits and retries (the bounded backoff below); it never
