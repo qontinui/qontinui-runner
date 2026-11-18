@@ -10,8 +10,12 @@
 //! Log loudness (`warn_once`'s budget, `log_sample_ack`'s once-flag) is
 //! process-global and deliberately not asserted, so test order cannot matter.
 
-use super::{publish_once, PublishOutcome, SampleAck, SkipReason};
-use crate::test_coord::{a_port_nothing_listens_on, coord_fixture, CoordFixture, ScriptedCoord};
+#[cfg(any(target_os = "linux", windows))]
+use super::SampleAck;
+use super::{publish_once, PublishOutcome, SkipReason};
+#[cfg(any(target_os = "linux", windows))]
+use crate::test_coord::a_port_nothing_listens_on;
+use crate::test_coord::{coord_fixture, CoordFixture, ScriptedCoord};
 
 /// The prefix of the resource-sample route on the double.
 const ROUTE: &str = "/coord/devices/";

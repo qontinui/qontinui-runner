@@ -56,8 +56,8 @@ struct Request {
 
 /// The ambient fixture every test against this double holds: the env lock, a
 /// temp `QONTINUI_HOME`, the keychain off (so no operator credential is read or
-/// sent to the double), and worktree mode on whatever the box's environment
-/// says. Both keys are on the fixture's capture list and are restored on drop.
+/// sent to the double), and worktree mode forced on. Both keys are on the
+/// fixture's capture list and are restored on drop.
 pub(crate) fn isolate() -> crate::test_env::IsolatedAmbient {
     let amb = crate::test_env::isolated_ambient();
     std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");

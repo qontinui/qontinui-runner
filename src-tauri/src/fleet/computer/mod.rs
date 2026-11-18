@@ -913,7 +913,14 @@ impl Reporter {
                         && s.computers.get(id).and_then(|c| c.kind.as_deref()) == Some("wsl_guest")
                 })
             });
-            if full || guest_pending {
+            // A test feeding host rows through `scan_override` is not asking
+            // about this box's WSL guests; probing them would make it
+            // host-dependent.
+            #[cfg(test)]
+            let probe_guests = self.scan_override.is_none();
+            #[cfg(not(test))]
+            let probe_guests = true;
+            if probe_guests && (full || guest_pending) {
                 for g in wsl_guest::probe::collect().await {
                     observed.push(guest_observed(&g, &host_id));
                 }
