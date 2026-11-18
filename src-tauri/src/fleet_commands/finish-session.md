@@ -175,7 +175,15 @@ A primary checkout reads UNKNOWN, not not-closeable: peers' WIP in a shared tree
 is not this session's owed work.
 In a linked tree whose custody directory also holds another session's slot, a
 dirty path a peer could have written reads UNKNOWN for the same reason, and this
-session never commits or discards such a path.
+session never commits or discards such a path. "This session's slot" is one under
+ANY id it is known by: the `SID` below, its environment's session ids and its
+current id in Claude Code's session registry, which a `/clear` or `/resume`
+moves while `$CLAUDE_CODE_SESSION_ID` stays the spawn id -- so the session's own
+dirt after a `/clear` refuses here like any other. `--no-worktrees` is checked
+the same way: a tree holding one of those slots is judged anyway. That includes
+a primary checkout the session ran in, which the custody recorder slots for the
+cwd every turn: it reads `UNKNOWN shared_checkout`, an ordinary UNKNOWN that
+lets the finish proceed (it once read CLOSEABLE).
 
 This step refuses a finish on a definite reason, because a definite reason
 means the work is not actually done. It also refuses when the script ran and
