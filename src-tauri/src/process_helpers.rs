@@ -3533,6 +3533,27 @@ mod console_window_guard {
     const CREATE_NO_WINDOW: &str = "CREATE_NO_WINDOW";
     const CREATE_NO_WINDOW_BIT: u64 = 0x0800_0000;
 
+    /// `DETACHED_PROCESS`: the child has no console at all.
+    const DETACHED_PROCESS: &str = "DETACHED_PROCESS";
+    const DETACHED_PROCESS_BIT: u64 = 0x0000_0008;
+
+    /// The process-creation flag names scan 3 can judge without resolving a
+    /// binding. The no-console ones are here too, so a mixed argument is plain.
+    const PLAIN_FLAG_NAMES: &[&str] = &[
+        "CREATE_NO_WINDOW",
+        "DETACHED_PROCESS",
+        "CREATE_NEW_CONSOLE",
+        "CREATE_NEW_PROCESS_GROUP",
+        "CREATE_SUSPENDED",
+        "CREATE_UNICODE_ENVIRONMENT",
+        "CREATE_BREAKAWAY_FROM_JOB",
+        "CREATE_DEFAULT_ERROR_MODE",
+        "BELOW_NORMAL_PRIORITY_CLASS",
+        "ABOVE_NORMAL_PRIORITY_CLASS",
+        "HIGH_PRIORITY_CLASS",
+        "IDLE_PRIORITY_CLASS",
+    ];
+
     /// Files scan 1 (`Command::new(`) does not apply to.
     ///
     /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
@@ -3695,6 +3716,36 @@ mod console_window_guard {
             .collect()
     }
 
+    /// Scan 3: the indices of unmarked `creation_flags(..)` lines whose
+    /// argument carries neither `CREATE_NO_WINDOW` nor `DETACHED_PROCESS`
+    /// (by name, by a file-local alias, or as a literal with the bit set).
+    /// `creation_flags` REPLACES the command's flags, so a command built
+    /// through `no_window(..)` and then handed `CREATE_NEW_PROCESS_GROUP`
+    /// alone opens a window without ever naming `CREATE_NEW_CONSOLE`.
+    ///
+    /// Only an argument made wholly of integer literals and the process-creation
+    /// flag names in [`PLAIN_FLAG_NAMES`] is judged. One naming anything else
+    /// (a `flags` variable, a parameter, a call) is opaque to a line scan, so
+    /// it is left alone rather than reported on a guess.
+    fn flags_dropping_no_window(lines: &[(usize, &str)], codes: &[String]) -> Vec<usize> {
+        let no_window = flag_names(codes, Some(CREATE_NO_WINDOW), CREATE_NO_WINDOW_BIT);
+        let detached = flag_names(codes, Some(DETACHED_PROCESS), DETACHED_PROCESS_BIT);
+        let plain = |arg: &str| {
+            let mut toks = tokens(arg).peekable();
+            toks.peek().is_some()
+                && toks.all(|t| integer_literal(t).is_some() || PLAIN_FLAG_NAMES.contains(&t))
+        };
+        (0..codes.len())
+            .filter(|&i| {
+                creation_flags_args(codes, i).iter().any(|arg| {
+                    plain(arg)
+                        && !carries(arg, &no_window, CREATE_NO_WINDOW_BIT)
+                        && !carries(arg, &detached, DETACHED_PROCESS_BIT)
+                }) && !marked(lines, i)
+            })
+            .collect()
+    }
+
     /// Scan 2: the indices of unmarked production lines that hand a command
     /// `CREATE_NEW_CONSOLE`, whatever built it:
     /// - any line whose code NAMES `CREATE_NEW_CONSOLE` (a call, a multi-line
@@ -3726,6 +3777,7 @@ mod console_window_guard {
         let lines = production_lines(src);
         let codes: Vec<String> = lines.iter().map(|(_, l)| code_only(l)).collect();
         let mut hits = new_console_sites(&lines, &codes);
+        hits.extend(flags_dropping_no_window(&lines, &codes));
         if !exempt_from_command_new_scan(rel) {
             hits.extend(unsuppressed_command_new(&lines, &codes));
         }
@@ -3878,19 +3930,19 @@ mod console_window_guard {
             (
                 "0x100",
                 "a.rs",
-                "fn f(c: &mut C) { c.creation_flags(0x100); }\n",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0100); }\n",
                 none,
             ),
             (
                 "0x1000",
                 "a.rs",
-                "fn f(c: &mut C) { c.creation_flags(0x1000); }\n",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_1000); }\n",
                 none,
             ),
             (
                 "decimal 512",
                 "a.rs",
-                "fn f(c: &mut C) { c.creation_flags(512); }\n",
+                "fn f(c: &mut C) { c.creation_flags(512 | CREATE_NO_WINDOW); }\n",
                 none,
             ),
             (
@@ -3908,7 +3960,7 @@ mod console_window_guard {
             (
                 "longer identifier",
                 "a.rs",
-                "fn f(c: &mut C) { c.creation_flags(NOT_CREATE_NEW_CONSOLE_X); }\n",
+                "fn f(c: &mut C) { c.creation_flags(NOT_CREATE_NEW_CONSOLE_X | CREATE_NO_WINDOW); }\n",
                 none,
             ),
             (
@@ -4016,7 +4068,10 @@ mod console_window_guard {
                 "process group only",
                 "a.rs",
                 group_only.as_str(),
-                &["a.rs:2: let mut c = std::process::Command::new(\"python\");"][..],
+                &[
+                    "a.rs:2: let mut c = std::process::Command::new(\"python\");",
+                    "a.rs:3: c.creation_flags(0x0000_0200);",
+                ][..],
             ),
             ("CREATE_NO_WINDOW by name", "a.rs", by_name.as_str(), none),
             (
@@ -4120,6 +4175,37 @@ mod console_window_guard {
             "only the two production spawns are sites; the test helper and the \
              all(test, unix) module are not"
         );
+    }
+
+    /// A `creation_flags(..)` that replaces `CREATE_NO_WINDOW` without naming
+    /// `CREATE_NEW_CONSOLE` is a site (scan 3); one keeping either no-console
+    /// bit, by name, alias or literal, is not. The fixtures are built with
+    /// `format!` so this module's own text holds no literal call to scan.
+    #[test]
+    fn a_creation_flags_that_drops_no_window_is_a_site() {
+        let call = |arg: &str| format!("c.{}({arg});", "creation_flags");
+        let bad = format!(
+            "fn f(c: &mut C) {{\n    {}\n}}\n",
+            call("CREATE_NEW_PROCESS_GROUP")
+        );
+        assert_eq!(
+            file_violations("a.rs", &bad),
+            vec![format!("a.rs:2: {}", call("CREATE_NEW_PROCESS_GROUP"))]
+        );
+        for arg in [
+            "CREATE_NO_WINDOW",
+            "CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW",
+            "0x0800_0000",
+            "DETACHED_PROCESS",
+        ] {
+            let ok = format!("fn f(c: &mut C) {{ {} }}\n", call(arg));
+            assert!(file_violations("a.rs", &ok).is_empty(), "{arg}");
+        }
+        let marked = format!(
+            "fn f(c: &mut C) {{\n    // console-ok: fixture\n    {}\n}}\n",
+            call("CREATE_NEW_PROCESS_GROUP")
+        );
+        assert!(file_violations("a.rs", &marked).is_empty());
     }
 
     /// Every `Command::new(` in production code must either be suppressed
