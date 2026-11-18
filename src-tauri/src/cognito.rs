@@ -209,6 +209,151 @@ fn bind_loopback_reuseaddr(port: u16) -> std::io::Result<std::net::TcpListener> 
     Ok(socket.into())
 }
 
+// ============================================================================
+// The pending Hosted-UI sign-in — what the UI shows while one waits.
+// ============================================================================
+
+/// What the UI needs while a Hosted-UI sign-in waits for its browser callback.
+///
+/// The authorize URL is always here, so a box whose browser could not be
+/// launched (no `xdg-open` on a headless Linux box, measured 2026-11-15) can
+/// copy it and finish the sign-in in a browser elsewhere — over an SSH forward
+/// of the callback port when that browser is on another machine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSignIn {
+    /// The Hosted-UI authorize URL this attempt is waiting on.
+    pub authorize_url: String,
+    /// Why the system browser could not be opened, or `None` when the launch
+    /// did not fail. `Some` is the case the UI must surface the URL for.
+    pub browser_launch_error: Option<String>,
+    /// The loopback port the callback must reach.
+    pub callback_port: u16,
+    /// When the attempt started (unix seconds).
+    pub started_at_unix: i64,
+}
+
+const CANCEL_NONE: u8 = 0;
+const CANCEL_BY_USER: u8 = 1;
+const CANCEL_SUPERSEDED: u8 = 2;
+
+/// The error a cancelled sign-in returns.
+pub const SIGN_IN_CANCELLED: &str = "sign-in cancelled";
+/// The error a sign-in returns when a newer attempt replaced it.
+pub const SIGN_IN_SUPERSEDED: &str = "sign-in superseded by a newer sign-in attempt";
+
+struct PendingSlot {
+    id: u64,
+    info: PendingSignIn,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+static PENDING_SIGN_IN: std::sync::Mutex<Option<PendingSlot>> = std::sync::Mutex::new(None);
+static NEXT_ATTEMPT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn pending_slot() -> std::sync::MutexGuard<'static, Option<PendingSlot>> {
+    PENDING_SIGN_IN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The Hosted-UI sign-in currently waiting for its callback, if any.
+pub fn pending_sign_in() -> Option<PendingSignIn> {
+    pending_slot().as_ref().map(|slot| slot.info.clone())
+}
+
+/// Cancel the pending Hosted-UI sign-in. Returns whether there was one. The
+/// cancelled attempt releases the callback port and returns
+/// [`SIGN_IN_CANCELLED`].
+pub fn cancel_pending_sign_in() -> bool {
+    match pending_slot().as_ref() {
+        Some(slot) => {
+            slot.cancel
+                .store(CANCEL_BY_USER, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Tell a pending attempt it has been superseded, then wait (bounded) for it
+/// to release the callback port. A wait that runs out is not an error here:
+/// the bind that follows reports a still-held port in its own words.
+fn supersede_pending_sign_in() {
+    use std::time::{Duration, Instant};
+    let Some(prev_id) = pending_slot().as_ref().map(|slot| {
+        slot.cancel
+            .store(CANCEL_SUPERSEDED, std::sync::atomic::Ordering::SeqCst);
+        slot.id
+    }) else {
+        return;
+    };
+    tracing::info!("cognito sign-in: superseding pending attempt {prev_id}");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if pending_slot().as_ref().map(|slot| slot.id) != Some(prev_id) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    tracing::warn!("cognito sign-in: pending attempt {prev_id} did not release in time");
+}
+
+/// One attempt's registration as THE pending sign-in. Dropping it clears the
+/// slot, but only if the slot is still this attempt's.
+struct PendingAttempt {
+    id: u64,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl PendingAttempt {
+    fn register(authorize_url: &str, callback_port: u16) -> Self {
+        let id = NEXT_ATTEMPT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CANCEL_NONE));
+        let mut slot = pending_slot();
+        if let Some(prev) = slot.as_ref() {
+            // A racing attempt registered first: it is superseded too.
+            prev.cancel
+                .store(CANCEL_SUPERSEDED, std::sync::atomic::Ordering::SeqCst);
+        }
+        *slot = Some(PendingSlot {
+            id,
+            info: PendingSignIn {
+                authorize_url: authorize_url.to_string(),
+                browser_launch_error: None,
+                callback_port,
+                started_at_unix: chrono::Utc::now().timestamp(),
+            },
+            cancel: cancel.clone(),
+        });
+        Self { id, cancel }
+    }
+}
+
+/// Record why the browser could not be opened for attempt `id`, if that
+/// attempt is still the pending one.
+fn record_browser_launch_error(id: u64, error: String) {
+    if let Some(slot) = pending_slot().as_mut().filter(|slot| slot.id == id) {
+        slot.info.browser_launch_error = Some(error);
+    }
+}
+
+/// What opens the authorize URL. `Send + Sync` because it runs on its own
+/// thread; production passes `open::that`, tests a stub.
+pub(crate) type BrowserOpener = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// Held across supersede, bind and register (see [`await_authorization_code`]).
+static SIGN_IN_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl Drop for PendingAttempt {
+    fn drop(&mut self) {
+        let mut slot = pending_slot();
+        if slot.as_ref().is_some_and(|s| s.id == self.id) {
+            *slot = None;
+        }
+    }
+}
+
 /// Run the full RFC-8252 PKCE login: open the system browser, capture the
 /// loopback redirect, validate `state`, and exchange the code at the token
 /// endpoint. Blocking (mirrors `pair::pair_via_browser`); call via
@@ -218,12 +363,60 @@ fn bind_loopback_reuseaddr(port: u16) -> std::io::Result<std::net::TcpListener> 
 /// the Cognito provider names — `Google`, `MicrosoftEntra`, `GitHub`); `None`
 /// preserves the existing native email/chooser screen.
 pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult, String> {
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
     let code_verifier = generate_code_verifier();
     let code_challenge = code_challenge_s256(&code_verifier);
     let state = generate_state();
+    let authorize_url = build_authorize_url(&state, &code_challenge, identity_provider);
+
+    let code = await_authorization_code(
+        COGNITO_CALLBACK_PORT,
+        &authorize_url,
+        &state,
+        std::sync::Arc::new(|url: &str| open::that(url).map_err(|e| e.to_string())),
+        std::time::Duration::from_secs(SIGN_IN_WAIT_SECS),
+    )?;
+    // Breadcrumb: the loopback callback fired and yielded an auth code. Logs
+    // length only, never the code itself — this is the "callback received on
+    // 127.0.0.1:53682" link the 2026-07-21 sign-in debug had to infer.
+    tracing::info!(
+        "Cognito callback received on 127.0.0.1:{COGNITO_CALLBACK_PORT} (authorization code len={})",
+        code.len()
+    );
+    exchange_and_identify(&code, &code_verifier)
+}
+
+/// How long a Hosted-UI sign-in waits for its browser callback.
+const SIGN_IN_WAIT_SECS: u64 = 300;
+
+/// Bind `port`, open `authorize_url` with `open_browser`, and wait up to `wait`
+/// for the loopback redirect. Returns the authorization code, or why there is
+/// none: a Cognito error, a state mismatch, the timeout, a cancel, or a newer
+/// sign-in superseding this one.
+///
+/// While it waits, this attempt is the ONE pending sign-in
+/// ([`pending_sign_in`]): the UI reads the authorize URL from there, and a
+/// failed browser launch is recorded there instead of only in the log. A
+/// second call while one is pending SUPERSEDES the first: it cancels it and
+/// waits for its listener to release the port, so a retry never fails at
+/// `bind` with `Address already in use` (plan
+/// `2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human`
+/// P1.2). The port is released before this function returns, on every path.
+fn await_authorization_code(
+    port: u16,
+    authorize_url: &str,
+    state: &str,
+    open_browser: BrowserOpener,
+    wait: std::time::Duration,
+) -> Result<String, String> {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    // Supersede, bind and register as ONE step: two retries that both waited
+    // out the same pending attempt must not then race each other to `bind`.
+    let start_guard = SIGN_IN_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    supersede_pending_sign_in();
 
     // Bind the FIXED loopback port. Cognito exact-matches redirect_uri, so we
     // cannot use an OS-assigned port here. If the port is busy, surface a
@@ -233,20 +426,26 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
     // just-completed sign-in (the previous flow's loopback server tears down on
     // success, but the OS may hold the 4-tuple in TIME_WAIT briefly) never
     // blocks a fresh rebind with `os error 10048`.
-    let std_listener = bind_loopback_reuseaddr(COGNITO_CALLBACK_PORT).map_err(|e| {
+    let std_listener = bind_loopback_reuseaddr(port).map_err(|e| {
         format!(
-            "could not bind loopback callback on 127.0.0.1:{COGNITO_CALLBACK_PORT} ({e}). \
+            "could not bind loopback callback on 127.0.0.1:{port} ({e}). \
              Another sign-in may be in progress, or another app is holding the port. \
              Close it and try again."
         )
     })?;
+    // This attempt is now THE pending sign-in. The guard clears the slot when
+    // it drops, which is after the listener is torn down below.
+    let attempt = PendingAttempt::register(authorize_url, port);
+    drop(start_guard);
+    let cancel = attempt.cancel.clone();
+    let cancel_for_server = cancel.clone();
     std_listener
         .set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking failed: {e}"))?;
 
     let received: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
     let received_clone = received.clone();
-    let state_expected = state.clone();
+    let state_expected = state.to_string();
 
     // Graceful-shutdown signal: the route handler fires this the instant it has
     // written a result (code OR error) to `received`, so `axum::serve` returns
@@ -353,9 +552,16 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
             // page is fully delivered to the browser) and THEN drops the
             // listener, releasing port 53682.
             let serve = axum::serve(tokio_listener, app).with_graceful_shutdown(async move {
+                let cancelled = async move {
+                    while cancel_for_server.load(std::sync::atomic::Ordering::SeqCst) == CANCEL_NONE
+                    {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                };
                 tokio::select! {
                     _ = shutdown_rx => {}
-                    _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                    _ = cancelled => {}
+                    _ = tokio::time::sleep(wait) => {}
                 }
             });
             serve.await.map_err(|e| format!("axum serve failed: {e}"))?;
@@ -366,12 +572,23 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
         })
     });
 
-    let authorize_url = build_authorize_url(&state, &code_challenge, identity_provider);
     tracing::info!("opening browser for Cognito sign-in (callback {COGNITO_REDIRECT_URI})");
-    if let Err(e) = open::that(&authorize_url) {
-        tracing::warn!(
-            "failed to open browser ({e}); user must open this URL manually: {authorize_url}"
-        );
+    // On its own thread: `open::that` waits for the launcher to exit, and a
+    // launcher that hangs must not keep this attempt from being cancelled or
+    // superseded. A failure is recorded on the pending sign-in, where the UI
+    // shows the URL with a copy control (P1.1), so a box whose launcher fails
+    // can still finish the sign-in elsewhere.
+    {
+        let url = authorize_url.to_string();
+        let attempt_id = attempt.id;
+        std::thread::spawn(move || {
+            if let Err(e) = open_browser(&url) {
+                tracing::warn!(
+                    "failed to open browser ({e}); user must open this URL manually: {url}"
+                );
+                record_browser_launch_error(attempt_id, e);
+            }
+        });
     }
 
     // Poll the slot up to 5 minutes. On capture we DON'T return immediately —
@@ -379,10 +596,15 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
     // sends on `server_done_rx` only AFTER the listener is dropped) so port
     // 53682 is provably free before `pkce_login` returns. This holds on BOTH
     // the success and the error path, so an immediate retry can always rebind.
-    let deadline = Instant::now() + Duration::from_secs(300);
+    let deadline = Instant::now() + wait;
     let captured: Result<String, String> = loop {
         if let Some(result) = received.lock().expect("mutex").take() {
             break result;
+        }
+        match cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            CANCEL_BY_USER => break Err(SIGN_IN_CANCELLED.to_string()),
+            CANCEL_SUPERSEDED => break Err(SIGN_IN_SUPERSEDED.to_string()),
+            _ => {}
         }
         if server_done_rx.try_recv().is_ok() {
             // Server stopped without a captured result — only happens on the
@@ -410,20 +632,18 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
     while server_done_rx.try_recv().is_err() && Instant::now() < teardown_deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Only now, with the port released, does this attempt stop being pending,
+    // so a superseding attempt waiting on the slot can bind straight away.
+    drop(attempt);
+    captured
+}
 
-    let code = captured?;
-    // Breadcrumb: the loopback callback fired and yielded an auth code. Logs
-    // length only, never the code itself — this is the "callback received on
-    // 127.0.0.1:53682" link the 2026-07-21 sign-in debug had to infer.
-    tracing::info!(
-        "Cognito callback received on 127.0.0.1:{COGNITO_CALLBACK_PORT} (authorization code len={})",
-        code.len()
-    );
-
+/// Exchange an authorization code for tokens and identify the user.
+fn exchange_and_identify(code: &str, code_verifier: &str) -> Result<CognitoLoginResult, String> {
     // Exchange the authorization code for tokens. Breadcrumb both outcomes —
     // token presence/expiry on success, the classified error on failure — so a
     // failed sign-in localizes to this exact step. Never logs token values.
-    let token_resp = match exchange_code(&code, &code_verifier) {
+    let token_resp = match exchange_code(code, code_verifier) {
         Ok(resp) => {
             tracing::info!(
                 "Cognito code-for-token exchange OK (id_token len={}, access_token len={}, refresh_token={}, expires_in={}s)",
@@ -754,6 +974,110 @@ fn post_token_form(form: &[(&str, &str)]) -> Result<CognitoTokenResponse, Cognit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // The pending sign-in (plan
+    // 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+    // P1.1 + P1.2). These drive `await_authorization_code` on a free port,
+    // never the fixed 53682 a live runner on the box may be holding.
+    // ------------------------------------------------------------------
+
+    /// Serializes the tests that touch the process-global pending slot.
+    static PENDING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind :0")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
+    /// Start one attempt on a thread whose browser launch always fails.
+    fn start_attempt(
+        port: u16,
+        url: &'static str,
+    ) -> std::thread::JoinHandle<Result<String, String>> {
+        std::thread::spawn(move || {
+            await_authorization_code(
+                port,
+                url,
+                "state",
+                std::sync::Arc::new(|_: &str| Err("no browser launcher".to_string())),
+                std::time::Duration::from_secs(60),
+            )
+        })
+    }
+
+    /// Wait (bounded) until the pending slot holds `url` with its launch error.
+    fn wait_for_pending(url: &str) -> PendingSignIn {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(p) = pending_sign_in() {
+                if p.authorize_url == url && p.browser_launch_error.is_some() {
+                    return p;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no pending sign-in for {url}; slot holds {:?}",
+                pending_sign_in()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_failed_browser_launch_surfaces_the_authorize_url_and_cancel_frees_the_port() {
+        let _guard = PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let port = free_port();
+        let attempt = start_attempt(port, "https://auth.example/authorize?attempt=one");
+
+        let pending = wait_for_pending("https://auth.example/authorize?attempt=one");
+        assert_eq!(pending.callback_port, port);
+        assert_eq!(
+            pending.browser_launch_error.as_deref(),
+            Some("no browser launcher")
+        );
+
+        assert!(
+            cancel_pending_sign_in(),
+            "there was a pending sign-in to cancel"
+        );
+        let result = attempt.join().expect("attempt thread");
+        assert_eq!(result, Err(SIGN_IN_CANCELLED.to_string()));
+        assert_eq!(pending_sign_in(), None, "the slot is cleared on exit");
+        assert!(!cancel_pending_sign_in(), "nothing is left to cancel");
+        bind_loopback_reuseaddr(port).expect("the callback port is released");
+    }
+
+    #[test]
+    fn a_second_sign_in_supersedes_the_first_instead_of_failing_at_bind() {
+        let _guard = PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let port = free_port();
+        let first = start_attempt(port, "https://auth.example/authorize?attempt=first");
+        wait_for_pending("https://auth.example/authorize?attempt=first");
+
+        // The 2026-11-15 shape: a retry inside the first attempt's window.
+        // Before P1.2 it failed with `Address already in use`.
+        let second = start_attempt(port, "https://auth.example/authorize?attempt=second");
+        assert_eq!(
+            first.join().expect("first thread"),
+            Err(SIGN_IN_SUPERSEDED.to_string())
+        );
+        wait_for_pending("https://auth.example/authorize?attempt=second");
+
+        assert!(cancel_pending_sign_in());
+        assert_eq!(
+            second.join().expect("second thread"),
+            Err(SIGN_IN_CANCELLED.to_string())
+        );
+        assert_eq!(pending_sign_in(), None);
+    }
 
     #[test]
     fn code_verifier_is_unreserved_and_right_length() {

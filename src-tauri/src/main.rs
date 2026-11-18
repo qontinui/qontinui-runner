@@ -2944,6 +2944,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::promote_runner_tier_to_account,
             commands::auth::cognito_sign_in,
             commands::auth::cognito_sign_in_password,
+            commands::auth::cognito_pending_sign_in,
+            commands::auth::cognito_cancel_sign_in,
             commands::autostart::get_autostart_enabled,
             commands::autostart::set_autostart_enabled,
             commands::backup::export_all_data,
