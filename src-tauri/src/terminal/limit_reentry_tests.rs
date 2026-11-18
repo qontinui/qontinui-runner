@@ -33,8 +33,26 @@ fn a_park_fires_at_its_due_time_and_not_before() {
             due_at_ms: 10_000,
         }]
     );
-    // Taken once: the handler decides what happens next.
+    // Taken once: the handler decides what happens next. A retry park an
+    // hour out stands in until it does.
     assert!(take_reentries(&mut parks, &mut pacer, &live(&["t1"]), 20_000).is_empty());
+    assert_eq!(parks.get("t1").map(|p| p.due_at_ms), Some(10_000 + 3_600_000));
+}
+
+#[test]
+fn a_handler_that_answers_nothing_does_not_drop_the_stop() {
+    let mut parks = ParkList::default();
+    let mut pacer = Pacer::default();
+    parks.park("t1", "s1", 1_000, "not-yet-reset");
+    assert_eq!(take_reentries(&mut parks, &mut pacer, &live(&["t1"]), 1_000).len(), 1);
+    // The handler returned early: nothing replaced or removed the retry park.
+    let again = take_reentries(&mut parks, &mut pacer, &live(&["t1"]), 1_000 + 3_600_000);
+    assert_eq!(again.iter().map(|p| p.terminal_id.as_str()).collect::<Vec<_>>(), vec!["t1"]);
+    // A handler that parks replaces the retry; one that answers removes it.
+    parks.park("t1", "s1", 5_000_000, "not-yet-reset");
+    assert_eq!(parks.get("t1").map(|p| p.due_at_ms), Some(5_000_000));
+    parks.forget("t1");
+    assert!(parks.get("t1").is_none());
 }
 
 #[test]
@@ -151,16 +169,28 @@ fn a_terminal_whose_transcript_reads_stopped_at_first_sight_is_handled_with_no_s
     assert_eq!(
         pass,
         FirstSightPass {
-            read: vec!["parked".into(), "working".into(), "gone".into()],
+            read: vec!["parked".into(), "working".into()],
             stopped: vec![("parked".into(), "s-parked".into())],
-            unreadable: 1,
+            unreadable: vec!["gone".into()],
         }
     );
 
     let mut seen = FirstSight::default();
     let mut parks = ParkList::default();
     assert_eq!(apply_first_sight(&mut seen, &mut parks, &pass, 50_000), 1);
-    // Read once per process; a terminal with no open record yet stays unread.
+    // Read once per process; a terminal with no open record yet stays unread,
+    // and so does an UNKNOWN read until its third try.
+    assert_eq!(
+        seen.unread(&candidates),
+        vec!["gone".to_string(), "shell".to_string()]
+    );
+    let gone_again = FirstSightPass {
+        unreadable: vec!["gone".into()],
+        ..FirstSightPass::default()
+    };
+    apply_first_sight(&mut seen, &mut parks, &gone_again, 50_000);
+    assert_eq!(seen.unread(&candidates).len(), 2);
+    apply_first_sight(&mut seen, &mut parks, &gone_again, 50_000);
     assert_eq!(seen.unread(&candidates), vec!["shell".to_string()]);
     // Enrolled as due now: the next tick hands it to the handler.
     let mut pacer = Pacer::default();
@@ -238,7 +268,8 @@ fn a_fresh_registry_re_derives_the_park() {
 
 #[test]
 fn three_hundred_first_sight_reads_finish_within_a_bound() {
-    // About the boot population (430 terminals on merytshost): each
+    // About the boot population (plan §Why: 339 terminals on merytshost on
+    // 2026-11-05; the plan sizes the boot read at about 430): each
     // transcript is 300 KiB, so the read needs its first tail window and then
     // widens past filler, and every other session has a subagent dir with one
     // file written since its last turn.

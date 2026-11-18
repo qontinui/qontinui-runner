@@ -216,9 +216,10 @@ fn subagents_dir(transcript: &Path) -> std::path::PathBuf {
 /// A limit hit by a background subagent is a conversation turn only in that
 /// subagent's `<sid>/subagents/agent-*.jsonl`. The session's own transcript
 /// records it only as a `queue-operation` line until its `/rate-limit-options`
-/// menu is dismissed (measured on merytshost 2026-11-12, session `fbb6a935`;
-/// on nilan, session `82ef8b01`: its last main-thread turn 04:48:19Z, a
-/// subagent's stop 05:02:38Z). A subagent stop decides here only when it is
+/// menu is dismissed (coord finding `1776d1cf`, merytshost 2026-11-12,
+/// session `fbb6a935`; the same shape read on nilan for this change on
+/// 2026-11-17, session `82ef8b01` under `~/.claude-ben`: its last main-thread
+/// turn 04:48:19Z, a subagent's stop 05:02:38Z, recorded in the fixtures). A subagent stop decides here only when it is
 /// LATER than the session's last main-thread turn: a stop the session has
 /// already answered, or that came before its latest turn, is history.
 ///
@@ -303,6 +304,14 @@ fn decide(bytes: &[u8], thread: Thread) -> Decision {
     // does.
     // A final newline ends the last line; it does not start an empty one, so
     // line numbers in the reasons below count real lines from the end.
+    // A subagent's transcript is often still being appended: a final line
+    // with no newline yet is a write in progress, not a corrupt record, so it
+    // is left out and the entry above it decides.
+    let bytes = match (thread, bytes.iter().rposition(|&b| b == b'\n')) {
+        (Thread::Subagent, Some(last_nl)) if !bytes.ends_with(b"\n") => &bytes[..=last_nl],
+        (Thread::Subagent, None) if !bytes.is_empty() => &bytes[..0],
+        _ => bytes,
+    };
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     // Set once a local command's output has been passed over, so the
     // `<command-name>` entry that ran it is passed over too (see
@@ -567,7 +576,7 @@ impl ParkList {
     /// The park on `terminal_id`, if any.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "read by plan 2026-11-05 Phase 3 and by tests")
+        expect(dead_code, reason = "read by tests")
     )]
     pub(crate) fn get(&self, terminal_id: &str) -> Option<&Park> {
         self.by_terminal.get(terminal_id)
@@ -1134,11 +1143,23 @@ mod tests {
     fn an_unreadable_subagent_file_written_since_the_last_turn_is_unknown() {
         let (_dir, main) = session(
             SUBAGENT_PARENT,
-            &[("agent-a0c1d2e3f4a5b6c7d.jsonl", "{\"type\":\"assistant\",\"isSide")],
+            &[("agent-a0c1d2e3f4a5b6c7d.jsonl", "{\"type\":\"assistant\",\"isSide\n")],
         );
         assert!(matches!(
             transcript_limit_stop(&main),
             LimitStopRead::Unreadable(ref why) if why.contains("subagent transcript")
+        ));
+    }
+
+    #[test]
+    fn a_subagent_line_still_being_written_is_left_out() {
+        // The stop, then the start of a line the CLI has not finished: the
+        // partial line is a write in progress, and the stop above decides.
+        let body = format!("{SUBAGENT_STOP}{{\"type\":\"api-request\",\"sessi");
+        let (_dir, main) = session(SUBAGENT_PARENT, &[("agent-a0c1d2e3f4a5b6c7d.jsonl", &body)]);
+        assert!(matches!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Stopped(ref s) if s.entry_uuid == SUBAGENT_STOP_UUID
         ));
     }
 
