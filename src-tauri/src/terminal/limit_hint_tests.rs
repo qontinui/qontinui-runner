@@ -193,7 +193,9 @@ async fn a_finished_session_is_never_continued() {
 
 #[tokio::test]
 async fn an_unreadable_transcript_keeps_the_pending_park() {
-    let env = Fake::new(LimitStopRead::Unreadable("cannot open transcript".to_string()));
+    let env = Fake::new(LimitStopRead::Unreadable(
+        "cannot open transcript".to_string(),
+    ));
     run_hint(&env, SRC).await;
     let calls = env.calls();
     assert_eq!(calls.skips, vec![SkipReason::TranscriptUnreadable]);
@@ -202,7 +204,9 @@ async fn an_unreadable_transcript_keeps_the_pending_park() {
 
 #[tokio::test]
 async fn an_unreadable_transcript_on_an_exhausted_account_keeps_the_pending_park() {
-    let mut env = Fake::new(LimitStopRead::Unreadable("cannot open transcript".to_string()));
+    let mut env = Fake::new(LimitStopRead::Unreadable(
+        "cannot open transcript".to_string(),
+    ));
     env.auto_migrate = false;
     env.known_exhausted = true;
     env.roster = vec![AccountUsageInfo {

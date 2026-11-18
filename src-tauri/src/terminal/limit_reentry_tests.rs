@@ -36,7 +36,10 @@ fn a_park_fires_at_its_due_time_and_not_before() {
     // Taken once: the handler decides what happens next. A retry park an
     // hour out stands in until it does.
     assert!(take_reentries(&mut parks, &mut pacer, &live(&["t1"]), 20_000).is_empty());
-    assert_eq!(parks.get("t1").map(|p| p.due_at_ms), Some(10_000 + 3_600_000));
+    assert_eq!(
+        parks.get("t1").map(|p| p.due_at_ms),
+        Some(10_000 + 3_600_000)
+    );
 }
 
 #[test]
@@ -44,10 +47,19 @@ fn a_handler_that_answers_nothing_does_not_drop_the_stop() {
     let mut parks = ParkList::default();
     let mut pacer = Pacer::default();
     parks.park("t1", "s1", 1_000, "not-yet-reset");
-    assert_eq!(take_reentries(&mut parks, &mut pacer, &live(&["t1"]), 1_000).len(), 1);
+    assert_eq!(
+        take_reentries(&mut parks, &mut pacer, &live(&["t1"]), 1_000).len(),
+        1
+    );
     // The handler returned early: nothing replaced or removed the retry park.
     let again = take_reentries(&mut parks, &mut pacer, &live(&["t1"]), 1_000 + 3_600_000);
-    assert_eq!(again.iter().map(|p| p.terminal_id.as_str()).collect::<Vec<_>>(), vec!["t1"]);
+    assert_eq!(
+        again
+            .iter()
+            .map(|p| p.terminal_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["t1"]
+    );
     // A handler that parks replaces the retry; one that answers removes it.
     parks.park("t1", "s1", 5_000_000, "not-yet-reset");
     assert_eq!(parks.get("t1").map(|p| p.due_at_ms), Some(5_000_000));
@@ -94,7 +106,9 @@ fn a_closed_terminal_leaves_the_list() {
     parks.park("t2", "s2", 1_000, "not-yet-reset");
     let due = take_reentries(&mut parks, &mut pacer, &live(&["t2"]), 5_000);
     assert_eq!(
-        due.iter().map(|p| p.terminal_id.as_str()).collect::<Vec<_>>(),
+        due.iter()
+            .map(|p| p.terminal_id.as_str())
+            .collect::<Vec<_>>(),
         vec!["t2"]
     );
     assert!(parks.get("t1").is_none());
@@ -149,11 +163,17 @@ fn a_terminal_whose_transcript_reads_stopped_at_first_sight_is_handled_with_no_s
     let store = Store(HashMap::from([
         (
             "parked".to_string(),
-            ("s-parked".to_string(), transcript(&dir, "s-parked", SEVEN_DAY_STOP)),
+            (
+                "s-parked".to_string(),
+                transcript(&dir, "s-parked", SEVEN_DAY_STOP),
+            ),
         ),
         (
             "working".to_string(),
-            ("s-working".to_string(), transcript(&dir, "s-working", &not_stopped_body())),
+            (
+                "s-working".to_string(),
+                transcript(&dir, "s-working", &not_stopped_body()),
+            ),
         ),
         (
             "gone".to_string(),
@@ -239,7 +259,10 @@ fn a_background_subagent_stop_is_enrolled_at_first_sight() {
         (sid.to_string(), main),
     )]));
     let pass = store.pass(&["db0a8eb9".to_string()]);
-    assert_eq!(pass.stopped, vec![("db0a8eb9".to_string(), sid.to_string())]);
+    assert_eq!(
+        pass.stopped,
+        vec![("db0a8eb9".to_string(), sid.to_string())]
+    );
 }
 
 #[test]
