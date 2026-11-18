@@ -1063,7 +1063,9 @@ async fn supervise_one(
                     }
                 }
             }
-            let prompt = spawn_prompt(&rec.def, reason != SpawnReason::FirstSpawn).await;
+            let assignment = slot_assignment(&rec.def.id, effective.slots);
+            let prompt =
+                spawn_prompt(&rec.def, reason != SpawnReason::FirstSpawn, assignment).await;
             let focus = reason == SpawnReason::FirstSpawn;
             do_spawn(app, registry, &rec.def, prompt, focus, false).await;
         }
@@ -1113,7 +1115,8 @@ async fn supervise_one(
                     );
                 }
             }
-            let prompt = spawn_prompt(&rec.def, true).await;
+            let assignment = slot_assignment(&rec.def.id, effective.slots);
+            let prompt = spawn_prompt(&rec.def, true, assignment).await;
             do_spawn(app, registry, &rec.def, prompt, false, true).await;
         }
     }
@@ -1156,7 +1159,11 @@ fn drain_rewrite(action: Action, drain: &crate::coord_drain_state::DrainGate) ->
 /// The fetch happens per spawn rather than per tick: spawns are rare (first
 /// enable, relaunch, death-respawn) and each one is the exact moment the
 /// freshest instructions matter, so there is nothing to cache.
-async fn spawn_prompt(def: &LoopingAgentDef, is_relaunch: bool) -> String {
+async fn spawn_prompt(
+    def: &LoopingAgentDef,
+    is_relaunch: bool,
+    assignment: Option<playbook::SlotAssignment>,
+) -> String {
     let coord_body = crate::looping_agent_coord::fetch_playbook(&def.playbook_ref).await;
     if coord_body.is_none() {
         debug!(
@@ -1167,10 +1174,21 @@ async fn spawn_prompt(def: &LoopingAgentDef, is_relaunch: bool) -> String {
     }
     let pb = playbook::resolve_playbook(coord_body.as_deref(), &def.playbook_ref);
     if is_relaunch {
-        playbook::relaunch_prompt(pb, &def.journal_path, &def.repos)
+        playbook::relaunch_prompt(pb, &def.journal_path, &def.repos, assignment)
     } else {
-        playbook::initial_prompt(pb, &def.journal_path, &def.repos)
+        playbook::initial_prompt(pb, &def.journal_path, &def.repos, assignment)
     }
+}
+
+/// The Shepherd slot this agent's tab is spawned under: the lease it holds and
+/// the resolved slot count. `None` when no lease is held, which the spawn gate
+/// (`gate_action`) normally makes unreachable; the prompt then tells the agent
+/// every repo is its own rather than inventing a partition.
+fn slot_assignment(agent_id: &str, slots: u32) -> Option<playbook::SlotAssignment> {
+    held_slot_for(agent_id).map(|held| playbook::SlotAssignment {
+        slot: held.slot,
+        count: slots,
+    })
 }
 
 /// Reconcile this agent's slot lease for one tick and report whether we hold
