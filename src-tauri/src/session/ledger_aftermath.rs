@@ -497,7 +497,7 @@ impl LedgerAftermath {
     /// this boot's landed restore stamps, and the close and finish of every
     /// prior-roster row the registry holds. A row the registry no longer holds
     /// keeps what was recorded — the record outlives the prune. Returns whether
-    /// a write landed.
+    /// THIS call's write landed (false when the same bytes are already in flight).
     pub fn observe_registry(&self, records: &[TerminalSessionRecord]) -> bool {
         if self.roster.is_empty() {
             return false;
@@ -734,7 +734,9 @@ impl LedgerAftermath {
     }
 
     /// Write `bytes` unless a newer generation already landed. Takes no state
-    /// lock.
+    /// lock. When a newer generation's write FAILED, an older one may still
+    /// land behind it; the failure re-marks the record dirty, so the next feed
+    /// rewrites the newest state.
     fn flush(&self, write_gen: u64, bytes: &[u8]) -> Flushed {
         let mut landed = self.disk_gen.lock().unwrap_or_else(|e| e.into_inner());
         if write_gen < *landed {
