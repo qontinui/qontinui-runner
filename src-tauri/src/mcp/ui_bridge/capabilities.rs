@@ -2346,10 +2346,22 @@ mod structured_assert_result_tests {
     #[test]
     fn a_missing_required_field_is_refused_not_defaulted() {
         for (name, body) in [
-            ("hasText no expected", json!({ "query": ".x", "assertion": "hasText" })),
-            ("hasClass no expected", json!({ "query": ".x", "assertion": "hasClass" })),
-            ("count non-integer", json!({ "query": ".x", "assertion": "count", "expected": "2" })),
-            ("hasAttribute no attribute", json!({ "query": ".x", "assertion": "hasAttribute" })),
+            (
+                "hasText no expected",
+                json!({ "query": ".x", "assertion": "hasText" }),
+            ),
+            (
+                "hasClass no expected",
+                json!({ "query": ".x", "assertion": "hasClass" }),
+            ),
+            (
+                "count non-integer",
+                json!({ "query": ".x", "assertion": "count", "expected": "2" }),
+            ),
+            (
+                "hasAttribute no attribute",
+                json!({ "query": ".x", "assertion": "hasAttribute" }),
+            ),
         ] {
             let request: StructuredAssertRequest =
                 serde_json::from_value(body).expect("deserializes");
