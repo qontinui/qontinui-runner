@@ -964,9 +964,11 @@ async fn supervise_one(
     // hands the slot over. Applied after everything else, so nothing turns it
     // back into a cycle; the Retire arm never respawns.
     //
-    // A tab holding NO slot on that lane (its lease was lost, or never taken)
-    // can never get one here, and the drain stops its every cycle, so it too
-    // is retired at its first idle tick — with nothing to release.
+    // A tab holding NO slot on that lane is retired at its first idle tick —
+    // with nothing to release — but only on coord's authoritative "not ours"
+    // answer (`lease_tick.unslotted`: every slot held by a peer, or the lease
+    // lost at hand-over). A Live tab may still walk on a closed lane to renew
+    // its own slot, so an unanswered walk never retires anything.
     let retire_unslotted = retire_unslotted_tab(effective.running, &lease_tick, &lease_obs);
     let action = lease::handover_action(action, lease_tick.hand_over || retire_unslotted);
 
@@ -1453,9 +1455,11 @@ async fn reconcile_slot_lease(
                 if lease::still_held_after_heartbeat(&outcome) {
                     return lease::LeaseTick::HAND_OVER;
                 }
-                // Already lost: there is nothing left to hand over, and on a
-                // closed lane nothing may take a slot either — no walk. The
-                // now-unslotted tab is retired at idle by the action stage.
+                // Already lost: there is nothing left to hand over. This path
+                // deliberately does not walk — the peer that took the slot runs
+                // the shepherd, and re-adopting would only hand it back a tick
+                // later. The now-unslotted tab is retired at idle by the action
+                // stage (`LeaseTick::LOST` carries `unslotted`).
                 warn!(
                     agent = %agent_id,
                     resource_key = %slot.resource_key,
