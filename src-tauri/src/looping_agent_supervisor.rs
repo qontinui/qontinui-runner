@@ -758,41 +758,19 @@ async fn supervise_one(
     let drain =
         crate::coord_drain_state::drain_gate(crate::coord_drain_state::SpawnOrigin::LoopingAgent);
 
-    // Observed BEFORE the lease reconcile (plan
-    // `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`,
-    // D5): a lane-closed holder hands its slot over at its first idle tick, so
-    // the hold decision needs this tick's idle verdict. One probe per tick,
-    // threaded through, as with liveness above.
-    //
-    // Observe idle/context-low on the live grid, through the ONE quiescence
-    // debounce (`TerminalSession::idle_quiescence_probe`) — never nudge into a
-    // frame that is still streaming. `None` means the first read was not idle,
-    // in which case neither signal is computed, exactly as before: this used to
-    // be a byte-for-byte copy of that debounce, the last one left after the
-    // predicate itself was consolidated into `looping_agent::idle`.
-    //
-    // The settled screen must also show no DIALOG ([`nudge_safe_idle`]): every
-    // action this `idle` unlocks types into the tab or closes it, and Enter on
-    // a dialog answers it (coord finding `9089767f`).
-    // `quiescent` is the raw turn-complete verdict, BEFORE the dialog veto: it
-    // gates only a displacement retire, which closes the tab rather than typing
-    // into it, so a tab stuck on a dialog can still be retired.
-    let (mut idle, mut context_low, mut quiescent) = (false, false, false);
-    if let Some((tid, session)) = &live {
-        if let Some(probe) = session
-            .idle_quiescence_probe(IDLE_QUIESCENCE_DEBOUNCE)
-            .await
-        {
-            quiescent = probe.idle;
-            let (safe, dialog) = nudge_safe_idle(probe.idle, &probe.lines);
-            log_dialog_transition(&rec.def.id, tid, dialog);
-            idle = safe;
-            context_low = snapshot_context_low(
-                &probe.lines,
-                rec.def.lifecycle_policy.context_low_threshold_pct,
-            );
-        }
-    }
+    // D5 (plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`):
+    // on a KNOWN-closed lane the hold decision needs this tick's idle verdict
+    // (a lane-closed holder hands its slot over at its first idle tick), so
+    // the probe runs BEFORE the lease reconcile there. On every other lane it
+    // keeps its old place after the reconcile: the 1.5 s debounce must not
+    // delay the heartbeat/acquire, nor age the verdict a `Nudge` acts on. One
+    // probe per tick either way.
+    let lane = lane_obs(&drain);
+    let early_probe = if lane == lease::LaneObs::Closed {
+        Some(probe_tab(&rec.def, &live).await)
+    } else {
+        None
+    };
 
     // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
     //
@@ -807,8 +785,11 @@ async fn supervise_one(
         spawn_grace_secs: rec.def.lifecycle_policy.spawn_grace_secs,
         source: effective.source,
         slots: effective.slots,
-        lane: lane_obs(&drain),
-        idle_past_grace: idle && spawn_grace_elapsed,
+        lane,
+        // The RAW turn-complete verdict, not the dialog-vetoed `idle`: a
+        // hand-over closes the tab and types nothing, like the displacement
+        // retire below, so a tab parked on a dialog still hands over.
+        idle_past_grace: early_probe.is_some_and(|p| p.quiescent) && spawn_grace_elapsed,
     };
     let lease_tick = reconcile_slot_lease(app, rec, &effective, &lease_obs).await;
     // D3: an authoritative all-`held` walk over our live tab means a live peer
@@ -816,6 +797,17 @@ async fn supervise_one(
     // (`renewed`) its own slot first and is never displaced by itself.
     let displaced =
         update_displacement(&rec.def.id, lease_tick.walk, &lease_obs, effective.running);
+
+    // Observe idle/context-low on the live grid (on a closed lane this tick's
+    // probe was already taken above). See [`probe_tab`].
+    let TabProbe {
+        idle,
+        context_low,
+        quiescent,
+    } = match early_probe {
+        Some(p) => p,
+        None => probe_tab(&rec.def, &live).await,
+    };
 
     // SHADOW MODE (plan 2026-08-11-agent-bailout-detector-for-finish-to-zero,
     // Phase 2): a confirmed-idle tick is the moment a turn just ENDED, so it is
@@ -974,7 +966,12 @@ async fn supervise_one(
     // a known-closed lane + a held slot + an idle tab retires the tab and then
     // hands the slot over. Applied after everything else, so nothing turns it
     // back into a cycle; the Retire arm never respawns.
-    let action = lease::handover_action(action, lease_tick.hand_over);
+    //
+    // A tab holding NO slot on that lane (its lease was lost, or never taken)
+    // can never get one here, and the drain stops its every cycle, so it too
+    // is retired at its first idle tick — with nothing to release.
+    let retire_unslotted = lease::retire_unslotted_on_closed_lane(&lease_obs, lease_tick.holds);
+    let action = lease::handover_action(action, lease_tick.hand_over || retire_unslotted);
 
     match action {
         Action::None => {}
@@ -988,6 +985,14 @@ async fn supervise_one(
                     "looping_agent_supervisor: handing the shepherd slot over — this device's \
                      agent lane is closed (drained or role-closed) and the tab is idle; retiring \
                      the tab, then releasing the slot, with no respawn"
+                );
+            } else if retire_unslotted {
+                warn!(
+                    agent = %rec.def.id,
+                    terminal = %tid,
+                    lane = ?lease_obs.lane,
+                    "looping_agent_supervisor: retiring an unslotted shepherd tab — this device's \
+                     agent lane is closed and the tab is idle; it holds no slot to release"
                 );
             } else {
                 warn!(
@@ -1174,6 +1179,52 @@ fn drain_rewrite(action: Action, drain: &crate::coord_drain_state::DrainGate) ->
     }
 }
 
+/// One tick's reading of the live grid.
+#[derive(Debug, Clone, Copy, Default)]
+struct TabProbe {
+    /// Turn complete AND no dialog on screen ([`nudge_safe_idle`]): every
+    /// action this unlocks types into the tab, and Enter on a dialog answers
+    /// it (coord finding `9089767f`).
+    idle: bool,
+    context_low: bool,
+    /// The raw turn-complete verdict, BEFORE the dialog veto. It gates only
+    /// the actions that CLOSE the tab rather than type into it (the
+    /// displacement retire, the D5 hand-over), so a tab stuck on a dialog can
+    /// still be retired.
+    quiescent: bool,
+}
+
+/// Observe idle/context-low on the live grid, through the ONE quiescence
+/// debounce (`TerminalSession::idle_quiescence_probe`) — never nudge into a
+/// frame that is still streaming. A `None` probe (the first read was not idle)
+/// computes neither signal: this used to be a byte-for-byte copy of that
+/// debounce, the last one left after the predicate itself was consolidated
+/// into `looping_agent::idle`. All `false` when there is no live tab.
+async fn probe_tab(
+    def: &LoopingAgentDef,
+    live: &Option<(String, Arc<crate::terminal::session::TerminalSession>)>,
+) -> TabProbe {
+    let Some((tid, session)) = live else {
+        return TabProbe::default();
+    };
+    let Some(probe) = session
+        .idle_quiescence_probe(IDLE_QUIESCENCE_DEBOUNCE)
+        .await
+    else {
+        return TabProbe::default();
+    };
+    let (safe, dialog) = nudge_safe_idle(probe.idle, &probe.lines);
+    log_dialog_transition(&def.id, tid, dialog);
+    TabProbe {
+        idle: safe,
+        context_low: snapshot_context_low(
+            &probe.lines,
+            def.lifecycle_policy.context_low_threshold_pct,
+        ),
+        quiescent: probe.idle,
+    }
+}
+
 /// PURE: fold the tick's drain read into the lease layer's lane observation
 /// (plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`,
 /// D5). `Drained` and `RoleClosed` are coord's KNOWN answers that the agent
@@ -1196,9 +1247,10 @@ fn lane_obs(drain: &crate::coord_drain_state::DrainGate) -> lease::LaneObs {
 
 /// D5's second step: release the slot whose tab the Retire arm just closed.
 /// The memo is cleared first so no later path in this process heartbeats a
-/// slot we have given up. No orphan cooldown is set — the lane being closed is
-/// what keeps this runner from re-taking it, and that clears the moment the
-/// lane reopens.
+/// slot we have given up. No orphan cooldown is set: what keeps this runner
+/// from re-taking the slot — even while the closed tab still reads
+/// `PendingRestore` — is [`lease::acquire_permitted`] refusing every walk on a
+/// known-closed lane, and that refusal lifts the moment the lane reopens.
 async fn release_handed_over_slot(app: &tauri::AppHandle, agent_id: &str) {
     let Some(slot) = clear_held_slot(agent_id) else {
         return;
@@ -1379,7 +1431,9 @@ async fn reconcile_slot_lease(
                 if lease::still_held_after_heartbeat(&outcome) {
                     return lease::LeaseTick::HAND_OVER;
                 }
-                // Already lost: there is nothing left to hand over.
+                // Already lost: there is nothing left to hand over, and on a
+                // closed lane nothing may take a slot either — no walk. The
+                // now-unslotted tab is retired at idle by the action stage.
                 warn!(
                     agent = %agent_id,
                     resource_key = %slot.resource_key,
@@ -1387,6 +1441,7 @@ async fn reconcile_slot_lease(
                      lane-closed hand-over"
                 );
                 clear_held_slot(agent_id);
+                return NOT_HELD;
             }
             lease::HoldDecision::Keep => {
                 let outcome = crate::looping_agent_coord::heartbeat_slot(
@@ -2458,6 +2513,60 @@ mod drain_rewrite_tests {
             super::lane_obs(&defer(DeferClass::Unknown)),
             LaneObs::Unknown
         );
+    }
+
+    /// D5 for the dispatch-role arm specifically: the fold is driven from a
+    /// `RoleClosed` deferral (not a hand-built `Closed`), so dropping
+    /// `RoleClosed` from [`lane_obs`] fails here even while drains still work.
+    #[test]
+    fn a_role_closed_holder_releases_at_idle() {
+        use crate::coord_drain_state::DeferClass;
+        use qontinui_runner_lib::looping_agent::desired_state::DesiredSource;
+        use qontinui_runner_lib::looping_agent::lease::{
+            acquire_permitted, hold_decision, HoldDecision, LeaseTickObs, ReleaseReason,
+        };
+        use qontinui_runner_lib::looping_agent::policy::Liveness;
+        let role_closed = DrainGate::Defer {
+            reason: "role ci_node closes the agent lane".into(),
+            class: DeferClass::RoleClosed,
+        };
+        let obs = |liveness, idle_past_grace| LeaseTickObs {
+            now_ms: 1_000_000,
+            liveness,
+            proven_alive: false,
+            spawn_able: true,
+            spawn_grace_secs: 90,
+            source: DesiredSource::Coord,
+            slots: 1,
+            lane: super::lane_obs(&role_closed),
+            idle_past_grace,
+        };
+        assert_eq!(
+            hold_decision(0, 0, &obs(Liveness::Live, true)),
+            HoldDecision::HandOver
+        );
+        assert_eq!(
+            hold_decision(0, 0, &obs(Liveness::Live, false)),
+            HoldDecision::Keep,
+            "busy: never mid-run"
+        );
+        assert_eq!(
+            hold_decision(0, 0, &obs(Liveness::Dead, false)),
+            HoldDecision::Release(ReleaseReason::LaneClosed)
+        );
+        assert!(!acquire_permitted(
+            &obs(Liveness::PendingRestore, false),
+            None
+        ));
+        // The unknown arm stays apart: an unread role keeps the slot.
+        let unknown = LeaseTickObs {
+            lane: super::lane_obs(&DrainGate::Defer {
+                reason: "unread".into(),
+                class: DeferClass::Unknown,
+            }),
+            ..obs(Liveness::Live, true)
+        };
+        assert_eq!(hold_decision(0, 0, &unknown), HoldDecision::Keep);
     }
 
     #[test]
