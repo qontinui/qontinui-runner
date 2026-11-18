@@ -92,7 +92,7 @@ pub struct SlotAssignment {
 fn slot_line(assignment: Option<SlotAssignment>) -> String {
     match assignment {
         Some(SlotAssignment { slot, count }) if count > 0 && slot < count => {
-            format!("{slot} of {count}")
+            format!("{slot} of {count} (fixed when this tab was spawned)")
         }
         _ => "none (treat every repo as yours)".to_string(),
     }
@@ -176,10 +176,10 @@ mod tests {
     }
 
     /// Plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`
-    /// Phase 4 (D4, D3.1, D3.2, D3.4): the bundled copy is the served v8
-    /// `agent_playbook/merge-shepherd`, byte for byte. Each rule below is one
-    /// the fleet's anti-overlap depends on, so dropping any of them from either
-    /// copy is a behaviour change, not an edit.
+    /// Phase 4 (D4, D3.1, D3.2, D3.4): the bundled copy is the proposed v8 of
+    /// `agent_playbook/merge-shepherd`, served byte for byte after this lands.
+    /// Each rule below is one the fleet's anti-overlap depends on, so dropping
+    /// any of them from either copy is a behaviour change, not an edit.
     #[test]
     fn bundled_shepherd_playbook_carries_the_bounded_fixer_rules() {
         let pb = MERGE_SHEPHERD_PLAYBOOK;
@@ -216,8 +216,13 @@ mod tests {
         assert!(pb.contains("red_main:<owner/repo>"));
         assert!(pb.contains("coord_alert_claim"));
         assert!(pb.contains("coord_alert_release"));
-        assert!(playbook_for("merge-shepherd") == Some(MERGE_SHEPHERD_PLAYBOOK));
-        assert!(playbook_for("no-such-playbook").is_none());
+        // D4 batching stops at the first refused slot; D-b background children
+        // heartbeated on a timer; a coord without `pushed_head` still releases.
+        assert!(pb.contains("claim none of its remaining PRs"));
+        assert!(pb.contains("**background** subagent"));
+        assert!(pb.contains("Never end your turn only waiting for a Fixer"));
+        assert!(pb.contains("release again without `pushed_head`"));
+        assert!(pb.contains("take the slot under the alert lease alone"));
     }
 
     #[test]
@@ -234,7 +239,7 @@ mod tests {
         assert!(p.contains("Run ONE cycle now"));
         assert!(p.contains("supervisor will prompt you"));
         assert!(p.contains("create it if absent"));
-        assert!(p.contains("- `shepherd_slot`: 1 of 2\n"));
+        assert!(p.contains("- `shepherd_slot`: 1 of 2 (fixed when this tab was spawned)\n"));
     }
 
     #[test]

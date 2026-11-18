@@ -1988,6 +1988,41 @@ pub(crate) fn status_snapshot(
     }
 }
 
+/// Plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`
+/// D3.4: the spawn prompt's `shepherd_slot` comes from the lease this
+/// supervisor holds for the agent, beside the resolved slot count.
+#[cfg(test)]
+mod slot_assignment_tests {
+    use super::*;
+
+    #[test]
+    fn slot_assignment_reads_the_held_lease_and_the_count() {
+        let agent = "slot-assignment-test-agent".to_string();
+        assert_eq!(
+            slot_assignment(&agent, 3),
+            None,
+            "no lease held: no assignment"
+        );
+        set_held_slot(
+            &agent,
+            HeldSlot {
+                slot: 2,
+                resource_key: "role:t:merge-shepherd:2".to_string(),
+                acquired_at_ms: 0,
+                last_proven_alive_ms: None,
+            },
+        );
+        let held = slot_assignment(&agent, 3);
+        clear_held_slot(&agent);
+        assert_eq!(held, Some(playbook::SlotAssignment { slot: 2, count: 3 }));
+        assert_eq!(
+            slot_assignment(&agent, 3),
+            None,
+            "a released lease clears it"
+        );
+    }
+}
+
 /// Coord finding `9089767f`: the supervisor's nudge-safe idle read and its
 /// early-exit classification.
 #[cfg(test)]
