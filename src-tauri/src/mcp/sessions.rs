@@ -1565,6 +1565,14 @@ async fn policy_context(
     // reads as fact. An unparseable id is simply no id.
     let attribution =
         crate::mcp::policy_context::parse_attribution_session(q.claude_session_id.as_deref());
+    // The continuation START PROOF (plan `2026-11-10-coord-counts-a-gate-
+    // continuation-consumed-only-once-its-session-proves-it-started`, D1). Here,
+    // BEFORE the injection-mode branch inside `policy_context`, because every
+    // `SessionStart` reaches this route whatever `QONTINUI_POLICY_INJECTION`
+    // says. Keyed by the raw path `id` — the TERMINAL id the continuation
+    // registry is keyed by — never by `key`, which may be the coord session id.
+    // Never blocks or fails the response: the post runs on a spawned task.
+    crate::continuation_start_proof::on_session_start(&id, attribution);
     // The session's spawn-time delivered-SHA marker (`QONTINUI_POLICY_DELIVERED_SHA`),
     // forwarded by the hook script in a HEADER so it never reaches the trace
     // log's request URI. Parsed strictly; anything but a 64-hex SHA-256 is no
