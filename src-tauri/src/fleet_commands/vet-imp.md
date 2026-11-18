@@ -1699,7 +1699,7 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   CONTRADICTION also
   means the PR body's `Coord-Reviewed-Head:` line is stale — coord's
   `require_review` gate reads that line, not the artifact — so the re-review
-  must edit the body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`,
+  must edit the body (`pr-body-publish.sh <owner>/<repo> <n> <file>`,
   `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
