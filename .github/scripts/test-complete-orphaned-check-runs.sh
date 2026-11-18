@@ -13,7 +13,7 @@ W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
 fail=0
 REPO=o/r
-SHA=abc123
+SHA=abc1234
 NAME='clippy-diff (advisory)'
 ENC='clippy-diff%20%28advisory%29'
 WARN='::warning title=complete-orphaned-check-runs::'
@@ -780,6 +780,7 @@ case "$code" in
   curlexit35) echo "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to api.example:443" >&2; exit 35 ;;
   curlexit52) echo "curl: (52) Empty reply from server" >&2; exit 52 ;;
   curlexit16) echo "curl: (16) Error in the HTTP2 framing layer" >&2; exit 16 ;;
+  curlexit60) echo "curl: (60) SSL certificate problem: unable to get local issuer certificate" >&2; exit 60 ;;
 esac
 tail -n +2 "$resp" >"$out"
 printf '%s' "$code"
@@ -873,7 +874,26 @@ for cx in 35 52 16; do
   if [ "$RC" -eq 0 ] && patched 481 && [ "$(sleeps)" = "2" ] && ! warned; then
     ok "curl path: curl exit ${cx} is retried"
   else bad "curl exit ${cx}" "rc=$RC sleeps='$(sleeps)'"; fi
+  # The marker itself: when every attempt fails the same way, the warning must
+  # carry the exact "curl transport failure (curl exit N)" line curl_api wrote,
+  # with the exit code of THIS failure and a no-status ("HTTP none") reading.
+  fresh "curl-exit$cx-marker"
+  respond GET "$(list_path 1)" default "curlexit$cx" ''
+  run PATH="$NOGH_PATH" GITHUB_API_URL=https://api.example GH_TOKEN=tok-458
+  if [ "$RC" -eq 0 ] \
+    && warned "listing check runs '${NAME}' on ${SHA} failed at page 1 (HTTP none: curl: (${cx}) " \
+    && printf '%s\n' "$OUT" | grep -qF "curl transport failure (curl exit ${cx}))."; then
+    ok "curl path: exit ${cx} surfaces the marker 'curl transport failure (curl exit ${cx})' with no HTTP status"
+  else bad "curl exit ${cx} marker" "rc=$RC"; fi
 done
+# A curl exit outside the connection class (60, a certificate problem) writes
+# no marker and is not retried.
+fresh curl-exit60
+respond GET "$(list_path 1)" default curlexit60 ''
+run PATH="$NOGH_PATH" GITHUB_API_URL=https://api.example GH_TOKEN=tok-458
+if [ "$RC" -eq 0 ] && [ -z "$(sleeps)" ] && warned && ! printf '%s\n' "$OUT" | grep -qF 'curl transport failure'; then
+  ok "curl path: exit 60 carries no transport marker and is not retried"
+else bad "curl exit 60" "rc=$RC sleeps='$(sleeps)'"; fi
 
 # 59. a GH_TOKEN holding a double quote, a backslash or a newline is not
 #     written into curl's config: a warning, and no call.
@@ -886,6 +906,88 @@ for tok in 'tok"x' 'tok\x' $'tok\nx'; do
   else bad "bad token $(printf '%q' "$tok")" "rc=$RC"; fi
   rm -rf "$STUB_DIR"
 done
+
+# 60. the allowlist: a repo, head_sha or check_name outside it is a wiring
+#     error (exit 2) before any API call, and nothing is echoed raw.
+fresh allowlist
+respond GET "$(list_path 1)" default 200 "$(page_body 1 501,in_progress)"
+orphan 501
+allow_bad() { # <label> <repo> <sha> <name>
+  OUT="$(env PATH="$W/stub:$PATH" STUB_DIR="$STUB_DIR" STEP_RC=unknown \
+    bash "$SCRIPT" "$2" "$3" "$4" why 2>&1)"
+  RC=$?
+  if [ "$RC" -eq 2 ] && [ ! -s "$STUB_DIR/calls.log" ] && printf '%s\n' "$OUT" | grep -q "^refusing $1 "; then
+    ok "the allowlist refuses a bad $1 (exit 2, no call)"
+  else bad "allowlist $1" "rc=$RC"; fi
+}
+allow_bad repo 'o/r/../x' "$SHA" "$NAME"
+allow_bad repo 'o r' "$SHA" "$NAME"
+allow_bad repo 'justname' "$SHA" "$NAME"
+allow_bad head_sha "$REPO" 'abc12' "$NAME"
+allow_bad head_sha "$REPO" 'main?x=1' "$NAME"
+allow_bad head_sha "$REPO" 'abcdefg' "$NAME"
+allow_bad check_name "$REPO" "$SHA" $'clippy\n::error::x'
+allow_bad check_name "$REPO" "$SHA" 'a"b'
+allow_bad check_name "$REPO" "$SHA" "$(printf 'x%.0s' $(seq 1 101))"
+fresh allowlist-ok
+respond GET "$(list_path 1)" default 200 "$(page_body 1 511,in_progress)"
+orphan 511
+run
+if [ "$RC" -eq 0 ] && patched 511 && ! warned; then
+  ok "a conforming repo, sha and check name are accepted"
+else bad "allowlist accepts" "rc=$RC"; fi
+
+# 61. SIGINT (a job cancel) removes the work dir. The script is launched through
+#     a python exec that resets SIGINT to SIG_DFL: a background job started by a
+#     non-interactive shell inherits SIGINT as IGNORED, which makes `kill -INT`
+#     a no-op and the case vacuous, so the precondition is asserted (SigIgn in
+#     /proc, where it exists; elsewhere the case is skipped LOUDLY).
+fresh sigint
+mkdir -p "$STUB_DIR/rt"
+mkdir -p "$W/stub-hang"
+cat >"$W/stub-hang/gh" <<'STUB'
+#!/usr/bin/env bash
+echo called >>"$STUB_DIR/hang-called"
+sleep 3
+STUB
+chmod +x "$W/stub-hang/gh"
+if [ ! -r /proc/self/status ]; then
+  echo "SKIP - 61 (SIGINT cleanup): no /proc to verify SIGINT is not ignored; NOT TESTED on this platform"
+else
+  python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+os.execvp("env", ["env"] + sys.argv[1:])' \
+    PATH="$W/stub-hang:$PATH" STUB_DIR="$STUB_DIR" RUNNER_TEMP="$STUB_DIR/rt" STEP_RC=unknown \
+    REVIEWDOG_STARTED_AT="$RD_START" REVIEWDOG_ENDED_AT="$ENDED" REVIEWDOG_CLOCK=github \
+    bash "$SCRIPT" "$REPO" "$SHA" "$NAME" why >"$STUB_DIR/sigint.out" 2>&1 &
+  sigpid=$!
+  for _ in $(seq 1 50); do
+    [ -s "$STUB_DIR/hang-called" ] && break
+    sleep 0.1
+  done
+  sigign="$(awk '/^SigIgn:/ {print $2}' "/proc/${sigpid}/status" 2>/dev/null)"
+  # SIGINT is signal 2: bit 0x2 of the SigIgn mask.
+  if [ -z "$sigign" ] || [ $((16#$sigign & 2)) -ne 0 ]; then
+    kill "$sigpid" 2>/dev/null
+    wait "$sigpid" 2>/dev/null
+    bad "SIGINT precondition" "SIGINT is still ignored in the child (SigIgn='${sigign}') or it was not readable; the case would be vacuous"
+  elif [ ! -s "$STUB_DIR/hang-called" ]; then
+    kill "$sigpid" 2>/dev/null
+    wait "$sigpid" 2>/dev/null
+    bad "SIGINT precondition" "the script never reached its first API call"
+  else
+    leftover_before="$(find "$STUB_DIR/rt" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+    kill -INT "$sigpid"
+    wait "$sigpid"
+    RC=$?
+    leftover_after="$(find "$STUB_DIR/rt" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+    OUT="$(cat "$STUB_DIR/sigint.out")"
+    if [ "$leftover_before" -eq 1 ] && [ "$leftover_after" -eq 0 ] && [ "$RC" -eq 130 ]; then
+      ok "SIGINT mid-call exits 130 and removes the work dir (it existed before the signal)"
+    else bad "SIGINT cleanup" "rc=$RC dirs before=$leftover_before after=$leftover_after"; fi
+  fi
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "complete-orphaned-check-runs tests: FAILED"
