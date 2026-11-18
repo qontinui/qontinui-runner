@@ -369,8 +369,8 @@ fn is_duration_token(w: &str) -> bool {
 /// update notice); the input box's top edge, which carries the session's
 /// name (`──── my-session ─`); and, on some panes, a `※ recap: …`
 /// paragraph between the turn line and the hint, usually closed by a
-/// `(… /config)` hint (one census pane's was not). With this rule 40 of the
-/// 44 read idle; the other 4 fail on the completed-turn line's own wording. Inside an open recap its
+/// `(… /config)` hint (not always). With this rule 40 of the census's
+/// 44 finished panes read idle (plan Phase 0). Inside an open recap its
 /// prose rows are admitted, but never a row that starts a transcript item;
 /// after a closed recap, only blank, hint and edge rows. Any other row means
 /// the turn line is not the one that just ended, and the glyph stays busy.
@@ -445,7 +445,7 @@ fn closes_recap(trimmed: &str) -> bool {
 
 /// The context hint row. Recognised by its START — `new task?` and a
 /// `/clear` — not by the full `/clear to save` text: on a narrow pane the row
-/// is cut short with `…` (12 of the census's 44 finished panes), so the full phrase is
+/// is cut short with `…`, so the full phrase is
 /// not there to match.
 fn is_context_hint_row(trimmed: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
@@ -1302,7 +1302,7 @@ mod tests {
         wrapped[4] = "  (disable recaps in".to_string();
         wrapped.insert(5, "  /config)".to_string());
         assert_eq!(verdict(&wrapped, 8), None);
-        // A recap with no closing hint (one census pane) is still admitted
+        // A recap with no closing hint is still admitted
         // while its rows are prose...
         let mut unclosed = measured.clone();
         unclosed[4] = "  and more prose with no closing hint".to_string();

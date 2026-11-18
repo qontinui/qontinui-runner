@@ -251,11 +251,16 @@ pub struct FreshPass {
 /// the verdict, [`claude_activity::RecordDepth::ActivityAndWindDown`] for one
 /// that will also report activity from the same read. `lane` picks the
 /// one-at-a-time flag the record read takes — see [`RecordReadLane`].
+/// `only_session` narrows the record read to that one Claude session's
+/// process: every other process in the pass then reads `record_unknown`
+/// (never closable), so only a caller that uses one verdict and discards the
+/// rest — [`recheck`] — may pass it.
 pub async fn fresh_pass(
     app: &tauri::AppHandle,
     grace: Duration,
     depth: claude_activity::RecordDepth,
     lane: RecordReadLane,
+    only_session: Option<&str>,
 ) -> FreshPass {
     use tauri::Manager;
 
@@ -343,7 +348,8 @@ pub async fn fresh_pass(
     let mut records = HashMap::new();
     let observed = match pass.as_mut() {
         Some(p) => {
-            records = read_wind_down_records(wind_down_pids(&p.report), depth, lane).await;
+            records =
+                read_wind_down_records(wind_down_pids(&p.report, only_session), depth, lane).await;
             let now_ms = chrono::Utc::now().timestamp_millis();
             observe_and_apply(
                 app,
@@ -404,6 +410,10 @@ pub async fn recheck(
         grace,
         claude_activity::RecordDepth::WindDown,
         RecordReadLane::Executor,
+        // Only this session's verdict is used, so only its record (and its
+        // transcript tail) is read: a full read per candidate would put every
+        // idle session's tail inside one `RECORD_READ_TIMEOUT` again.
+        Some(claude_session_id),
     )
     .await;
     // An incomplete pass (see [`FreshPass::pass`]) re-derives no verdict.
@@ -467,12 +477,16 @@ static REPORT_RECORD_READ_IN_FLIGHT: std::sync::atomic::AtomicBool =
 
 /// The top-level terminal-hosted processes of `report` — the ones a verdict
 /// is computed for — with the census's process start for the record's
-/// identity check.
-fn wind_down_pids(report: &TrackingHealthReport) -> Vec<claude_activity::LivePid> {
+/// identity check. With `only_session`, just that session's process.
+fn wind_down_pids(
+    report: &TrackingHealthReport,
+    only_session: Option<&str>,
+) -> Vec<claude_activity::LivePid> {
     report
         .terminal_hosted
         .iter()
         .filter(|p| !p.nested_under_claude)
+        .filter(|p| only_session.is_none_or(|sid| p.session_id.as_deref() == Some(sid)))
         .map(|p| claude_activity::LivePid {
             pid: p.pid,
             process_started_ms: p.age_s.map(|age_s| report.checked_at_ms - age_s * 1000),
@@ -1393,6 +1407,7 @@ mod tests {
             lines: rows.into_iter().map(str::to_string).collect(),
             cursor_row,
             cursor_col,
+            cursor_row_dim: None,
         };
         let draft = screen(
             vec![

@@ -297,7 +297,7 @@ pub fn input_prompt_ready(screen: &ScreenText) -> Result<(), String> {
 /// for a close, erring toward refusing is right. It types nothing, so it is
 /// not an arm of the busy/idle typing pair below.
 pub fn exit_input_area_clear(screen: &ScreenText) -> Result<(), String> {
-    prompt_ready_with(screen, DIALOG_MARKERS, false)
+    prompt_ready_with(screen, DIALOG_MARKERS, false, GhostText::Empty)
 }
 
 /// May a message be typed into the input box of a BUSY turn? (plan

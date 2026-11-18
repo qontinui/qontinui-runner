@@ -1393,6 +1393,7 @@ pub async fn restart_readiness_handler(
         wind_down::grace_from_env(),
         claude_activity::RecordDepth::ActivityAndWindDown,
         wind_down_observer::RecordReadLane::Report,
+        None,
     )
     .await;
     let wind_down_observer::FreshPass {
