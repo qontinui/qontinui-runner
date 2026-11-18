@@ -66,12 +66,16 @@
 //! include coord's own cache: coord may answer from a read up to 15 s old,
 //! and says how old in `coord.cache_age_secs`.
 //!
-//! A fetch has one deadline, [`FETCH_DEADLINE`], over its asynchronous part
-//! (the credential read, which runs on the blocking pool, and the HTTP round
-//! trip), so a stalled credential store cannot hold every caller behind the
-//! single-flight lock: past it the read is `unknown`, kept for
-//! [`UNKNOWN_TTL`]. The coord base and the device file are small synchronous
-//! file reads inside it, which a timeout cannot interrupt.
+//! A fetch has two stages ([`Prepared`]). The synchronous one resolves the
+//! coord base and the device from small file reads, and either settles the
+//! read there (no base, no usable device) or hands over the device and the
+//! asynchronous rest. That rest (the credential read, which runs on the
+//! blocking pool, and the HTTP round trip) runs under one deadline,
+//! [`FETCH_DEADLINE`], so a stalled credential store cannot hold every caller
+//! behind the single-flight lock: past it the read is `unknown`, kept for
+//! [`UNKNOWN_TTL`], and still names the device it was asking about. The
+//! synchronous reads sit outside the deadline, which could not interrupt
+//! them anyway.
 //!
 //! [`current`] runs the read on its own task ([`get_detached`]), so a caller
 //! that is dropped while a fetch is in flight (a loopback client that gave up
@@ -168,6 +172,17 @@ impl Fetched {
             Fetched::Known { .. } | Fetched::NoPlanYet { .. } => CACHE_TTL,
         }
     }
+}
+
+/// The synchronous stage of a fetch: either the read is already settled
+/// (no coord base, no usable device), or the device is known and `fut` is the
+/// asynchronous rest. Only `fut` runs under the fetch's deadline, so the
+/// deadline's `unknown` still names `device_id`.
+pub(crate) enum Prepared<Fut> {
+    /// Settled without awaiting anything.
+    Done(Fetched),
+    /// The device is resolved; `fut` reads the credential and asks coord.
+    Fetch { device_id: Uuid, fut: Fut },
 }
 
 /// One read of this device's capacity: served as-is on the loopback, and
@@ -371,22 +386,25 @@ impl CapacityCache {
             .map(|e| e.read_at(now))
     }
 
-    /// The kept read when it is fresh; otherwise `fetch`'s, kept and returned.
+    /// The kept read when it is fresh; otherwise a new one, kept and
+    /// returned: `prepare` runs once, and a [`Prepared::Done`] is the read
+    /// while a [`Prepared::Fetch`]'s future is awaited for it.
     /// `clock` tells the instant and wall time whenever it is asked: a read
     /// this call fetches is stamped with the moment its fetch began, and every
     /// read it returns, kept or fetched, is aged at the moment it is returned
     /// — so the fetch's own time, and any wait for a fetch in flight, are in
-    /// the age, which never reads younger than the runner's ask. A fetch that
-    /// has not answered within [`FETCH_DEADLINE`] is `unknown`.
+    /// the age, which never reads younger than the runner's ask. A fetch whose
+    /// future has not answered within [`FETCH_DEADLINE`] is `unknown`, naming
+    /// the device it was preparing to ask about.
     pub(crate) async fn get<Fut>(
         &self,
         clock: impl Fn() -> (Instant, DateTime<Utc>),
-        fetch: impl FnOnce() -> Fut,
+        prepare: impl FnOnce() -> Prepared<Fut>,
     ) -> CapacityRead
     where
         Fut: Future<Output = Fetched>,
     {
-        self.get_within(FETCH_DEADLINE, clock, fetch).await
+        self.get_within(FETCH_DEADLINE, clock, prepare).await
     }
 
     /// [`CapacityCache::get`] with the fetch's deadline given.
@@ -394,7 +412,7 @@ impl CapacityCache {
         &self,
         deadline: Duration,
         clock: impl Fn() -> (Instant, DateTime<Utc>),
-        fetch: impl FnOnce() -> Fut,
+        prepare: impl FnOnce() -> Prepared<Fut>,
     ) -> CapacityRead
     where
         Fut: Future<Output = Fetched>,
@@ -409,18 +427,21 @@ impl CapacityCache {
             return read;
         }
         let (at, fetched_at) = clock();
-        let fetched = tokio::time::timeout(deadline, fetch())
-            .await
-            .unwrap_or_else(|_| {
-                Fetched::unknown(
-                    None,
-                    format!(
-                        "the capacity fetch did not finish within {} s (the device file, the \
-                         credential read or coord stalled)",
-                        deadline.as_secs_f64()
-                    ),
-                )
-            });
+        let fetched = match prepare() {
+            Prepared::Done(fetched) => fetched,
+            Prepared::Fetch { device_id, fut } => tokio::time::timeout(deadline, fut)
+                .await
+                .unwrap_or_else(|_| {
+                    Fetched::unknown(
+                        Some(device_id),
+                        format!(
+                            "the capacity fetch did not finish within {} s (the credential \
+                             read or coord stalled)",
+                            deadline.as_secs_f64()
+                        ),
+                    )
+                }),
+        };
         let done = clock().0;
         let entry = Entry {
             at,
@@ -457,17 +478,17 @@ fn cache() -> &'static CapacityCache {
 /// This device's capacity: the kept read while it is fresh, otherwise a new
 /// read of coord's capacity door.
 pub(crate) async fn current() -> CapacityRead {
-    get_detached(cache(), fetch_live).await
+    get_detached(cache(), prepare_live).await
 }
 
-/// `cache.get(fetch)` on a task of its own, so dropping the caller does not
+/// `cache.get(prepare)` on a task of its own, so dropping the caller does not
 /// drop a fetch in flight. A task that panicked is an `unknown` read.
-async fn get_detached<F, Fut>(cache: &'static CapacityCache, fetch: F) -> CapacityRead
+async fn get_detached<P, Fut>(cache: &'static CapacityCache, prepare: P) -> CapacityRead
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    P: FnOnce() -> Prepared<Fut> + Send + 'static,
     Fut: Future<Output = Fetched> + Send + 'static,
 {
-    match tokio::spawn(cache.get(|| (Instant::now(), Utc::now()), fetch)).await {
+    match tokio::spawn(cache.get(|| (Instant::now(), Utc::now()), prepare)).await {
         Ok(read) => read,
         Err(e) => Entry {
             at: Instant::now(),
@@ -486,31 +507,45 @@ pub(crate) fn cached() -> Option<CapacityRead> {
     cache().last(Instant::now())
 }
 
-/// One live read of coord's capacity door for this device.
+/// The synchronous stage of one live read of coord's capacity door for this
+/// device: the coord base and the device file, then the asynchronous rest
+/// ([`fetch_live`]) to run under the deadline.
 ///
 /// The coord base is resolved first. A test that holds no isolated ambient is
 /// deflected to "not connected" there (`ambient::canary`); one that holds
 /// `isolated_ambient` resolves against its own empty fixture, which configures
 /// no coord base. Either way a test read never reaches the operator's device
 /// file or credential store.
-async fn fetch_live() -> Fetched {
+fn prepare_live() -> Prepared<impl Future<Output = Fetched> + Send + 'static> {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
-        return Fetched::unknown(
+        return Prepared::Done(Fetched::unknown(
             None,
             "no coord base is configured: this runner is not connected to coord",
-        );
+        ));
     };
     // The file the sample publisher reads: a device with no samples has no row.
     let Some(device) = crate::fleet::load_device_file() else {
-        return Fetched::unknown(
+        return Prepared::Done(Fetched::unknown(
             None,
             "~/.qontinui/machine.json names no device_id and hostname, so this runner has no \
              device to ask about",
-        );
+        ));
     };
     let Ok(device_id) = Uuid::parse_str(device.device_id.trim()) else {
-        return Fetched::unknown(None, "~/.qontinui/machine.json's device_id is not a UUID");
+        return Prepared::Done(Fetched::unknown(
+            None,
+            "~/.qontinui/machine.json's device_id is not a UUID",
+        ));
     };
+    Prepared::Fetch {
+        device_id,
+        fut: fetch_live(base, device_id),
+    }
+}
+
+/// The asynchronous stage of a live read, once [`prepare_live`] resolved the
+/// base and the device: the credential read, then [`fetch_from`].
+async fn fetch_live(base: String, device_id: Uuid) -> Fetched {
     let Some(bearer) = crate::coord_mcp::read_usable_device_jwt().await else {
         return Fetched::unknown(
             Some(device_id),
@@ -767,6 +802,14 @@ mod tests {
         assert!(reason.contains("unrecognised state"), "{reason}");
     }
 
+    /// A preparation that resolved [`device`] and hands over `fut`.
+    fn prepared<Fut>(fut: Fut) -> Prepared<Fut> {
+        Prepared::Fetch {
+            device_id: device(),
+            fut,
+        }
+    }
+
     /// A fetch that counts its calls and answers `answer`.
     fn counting(calls: &AtomicUsize, answer: Fetched) -> impl Future<Output = Fetched> + '_ {
         calls.fetch_add(1, Ordering::SeqCst);
@@ -780,13 +823,15 @@ mod tests {
         let cache = CapacityCache::new();
         let calls = AtomicUsize::new(0);
         let t0 = Instant::now();
-        let first = cache.get(at(t0), || counting(&calls, known())).await;
+        let first = cache
+            .get(at(t0), || prepared(counting(&calls, known())))
+            .await;
         assert_eq!(first.state, "known");
         assert_eq!(first.cache_age_secs, 0.0);
         let later = t0 + Duration::from_secs(59);
         let second = cache
             .get(at(later), || {
-                counting(&calls, Fetched::unknown(None, "must not run"))
+                prepared(counting(&calls, Fetched::unknown(None, "must not run")))
             })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "coord was asked once");
@@ -797,25 +842,66 @@ mod tests {
         assert_eq!(second.cache_ttl_secs, 60);
     }
 
-    /// A fetch that never answers (a stalled credential store) is cut off at
-    /// the deadline: the read is UNKNOWN naming it, with no row, and kept for
-    /// the short TTL, so the callers behind the single-flight lock are freed.
+    /// A fetch whose future never answers (a stalled credential store) is cut
+    /// off at the deadline: the read is UNKNOWN naming it, with no row, kept
+    /// for the short TTL so the callers behind the single-flight lock are
+    /// freed — and it still names the device the preparation resolved, since
+    /// that was known before the deadline began.
     #[tokio::test(start_paused = true)]
     async fn a_fetch_past_its_deadline_is_unknown() {
         let cache = CapacityCache::new();
         let t0 = Instant::now();
         let read = cache
-            .get_within(
-                Duration::from_secs(15),
-                at(t0),
-                std::future::pending::<Fetched>,
-            )
+            .get_within(Duration::from_secs(15), at(t0), || Prepared::Fetch {
+                device_id: Uuid::parse_str("0bcf4751-acd2-4000-8000-000000000001").unwrap(),
+                fut: std::future::pending::<Fetched>(),
+            })
             .await;
         assert_eq!(read.state, "unknown");
         assert!(read.row.is_none());
+        assert_eq!(
+            read.device_id.as_deref(),
+            Some("0bcf4751-acd2-4000-8000-000000000001"),
+            "the timed-out read keeps the device it was asking about"
+        );
         let reason = read.reason.as_deref().unwrap_or_default();
         assert!(reason.contains("did not finish within 15 s"), "{reason}");
+        assert!(!reason.contains("device file"), "{reason}");
         assert_eq!(read.cache_ttl_secs, UNKNOWN_TTL.as_secs());
+    }
+
+    /// A future that counts how often it is polled, and never answers.
+    struct CountingPending(Arc<AtomicUsize>);
+
+    impl Future for CountingPending {
+        type Output = Fetched;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Fetched> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A settled preparation is the read: no future is polled and no deadline
+    /// runs, even a zero one, so its reason is its own and not the timeout's.
+    #[tokio::test(start_paused = true)]
+    async fn a_done_preparation_never_polls_a_future() {
+        let cache = CapacityCache::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let never = CountingPending(polls.clone());
+        let read = cache
+            .get_within(Duration::ZERO, at(Instant::now()), move || {
+                // The future exists, but a `Done` drops it unpolled.
+                drop(never);
+                Prepared::<CountingPending>::Done(Fetched::unknown(None, "no coord base"))
+            })
+            .await;
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "no future was polled");
+        assert_eq!(read.state, "unknown");
+        assert_eq!(read.reason.as_deref(), Some("no coord base"));
+        assert_eq!(read.device_id, None);
     }
 
     /// A slow failure is kept its full TTL from when it FINISHED: a fetch that
@@ -836,7 +922,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 // The fetch took 15 s, past the 10 s TTL of what it returns.
                 *now.lock().unwrap() += Duration::from_secs(15);
-                std::future::ready(Fetched::unknown(None, "timed out"))
+                prepared(std::future::ready(Fetched::unknown(None, "timed out")))
             })
             .await;
         assert_eq!(slow.state, "unknown");
@@ -844,7 +930,7 @@ mod tests {
         *now.lock().unwrap() += Duration::from_secs(9);
         let next = cache
             .get(clock.clone(), || {
-                counting(&calls, Fetched::unknown(None, "must not run"))
+                prepared(counting(&calls, Fetched::unknown(None, "must not run")))
             })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "kept, not refetched");
@@ -852,7 +938,9 @@ mod tests {
         assert_eq!(next.cache_age_secs, 24.0);
         *now.lock().unwrap() += Duration::from_secs(1);
         cache
-            .get(clock, || counting(&calls, Fetched::unknown(None, "again")))
+            .get(clock, || {
+                prepared(counting(&calls, Fetched::unknown(None, "again")))
+            })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "10 s after it finished");
     }
@@ -868,11 +956,13 @@ mod tests {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let first = {
             let calls = calls.clone();
-            tokio::spawn(get_detached(cache, move || async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                let _ = gate.await;
-                let _ = done_tx.send(());
-                known()
+            tokio::spawn(get_detached(cache, move || {
+                prepared(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = gate.await;
+                    let _ = done_tx.send(());
+                    known()
+                })
             }))
         };
         while calls.load(Ordering::SeqCst) == 0 {
@@ -888,9 +978,11 @@ mod tests {
         }
         let again = {
             let calls = calls.clone();
-            get_detached(cache, move || async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Fetched::unknown(None, "must not run")
+            get_detached(cache, move || {
+                prepared(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Fetched::unknown(None, "must not run")
+                })
             })
             .await
         };
@@ -905,13 +997,15 @@ mod tests {
         let cache = CapacityCache::new();
         let calls = AtomicUsize::new(0);
         let t0 = Instant::now();
-        cache.get(at(t0), || counting(&calls, known())).await;
+        cache
+            .get(at(t0), || prepared(counting(&calls, known())))
+            .await;
         let refetched = cache
             .get(at(t0 + CACHE_TTL), || {
-                counting(
+                prepared(counting(
                     &calls,
                     Fetched::unknown(Some(device()), "coord unreachable: timed out"),
-                )
+                ))
             })
             .await;
         assert_eq!(
@@ -938,7 +1032,9 @@ mod tests {
             Some(device()),
             "coord unreachable: error sending request: connection refused",
         );
-        let read = cache.get(at(t0), || counting(&calls, down.clone())).await;
+        let read = cache
+            .get(at(t0), || prepared(counting(&calls, down.clone())))
+            .await;
         assert_eq!(read.state, "unknown");
         assert_eq!(read.row, None);
         assert_eq!(read.coord, None);
@@ -954,7 +1050,7 @@ mod tests {
 
         let held = cache
             .get(at(t0 + Duration::from_secs(9)), || {
-                counting(&calls, known())
+                prepared(counting(&calls, known()))
             })
             .await;
         assert_eq!(
@@ -965,7 +1061,7 @@ mod tests {
         assert_eq!(held.state, "unknown");
 
         let retried = cache
-            .get(at(t0 + UNKNOWN_TTL), || counting(&calls, known()))
+            .get(at(t0 + UNKNOWN_TTL), || prepared(counting(&calls, known())))
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(retried.state, "known");
@@ -983,10 +1079,12 @@ mod tests {
             let (cache, calls) = (cache.clone(), calls.clone());
             tokio::spawn(async move {
                 cache
-                    .get(at(t0), || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        let _ = gate.await;
-                        known()
+                    .get(at(t0), || {
+                        prepared(async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let _ = gate.await;
+                            known()
+                        })
                     })
                     .await
             })
@@ -999,9 +1097,11 @@ mod tests {
             let (cache, calls) = (cache.clone(), calls.clone());
             tokio::spawn(async move {
                 cache
-                    .get(at(t0), || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Fetched::unknown(None, "must not run")
+                    .get(at(t0), || {
+                        prepared(async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Fetched::unknown(None, "must not run")
+                        })
                     })
                     .await
             })
@@ -1037,12 +1137,14 @@ mod tests {
                 (cache.clone(), clock.clone(), now.clone(), started.clone());
             tokio::spawn(async move {
                 cache
-                    .get(clock, || async move {
-                        started.fetch_add(1, Ordering::SeqCst);
-                        let _ = gate.await;
-                        // The fetch took 4 s.
-                        *now.lock().unwrap() += Duration::from_secs(4);
-                        known()
+                    .get(clock, || {
+                        prepared(async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            let _ = gate.await;
+                            // The fetch took 4 s.
+                            *now.lock().unwrap() += Duration::from_secs(4);
+                            known()
+                        })
                     })
                     .await
             })
@@ -1054,7 +1156,9 @@ mod tests {
             let (cache, clock) = (cache.clone(), clock.clone());
             tokio::spawn(async move {
                 cache
-                    .get(clock, || async { Fetched::unknown(None, "must not run") })
+                    .get(clock, || {
+                        prepared(async { Fetched::unknown(None, "must not run") })
+                    })
                     .await
             })
         };
@@ -1082,7 +1186,9 @@ mod tests {
             "no read yet is no read, not an empty one"
         );
         let calls = AtomicUsize::new(0);
-        cache.get(at(t0), || counting(&calls, known())).await;
+        cache
+            .get(at(t0), || prepared(counting(&calls, known())))
+            .await;
         let stale = cache
             .last(t0 + Duration::from_secs(90))
             .expect("the last read");
