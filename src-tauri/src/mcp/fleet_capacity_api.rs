@@ -52,8 +52,6 @@
 //! tripwire read literal paths only
 //! (`relay_path_policy::tests::registered_routes`); a test pins the two equal.
 
-use std::sync::Arc;
-
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
@@ -61,7 +59,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::fleet_capacity::CapacityRead;
-use crate::mcp::types::{ApiResponse, ApiState};
+use crate::mcp::types::ApiResponse;
 
 /// The one path this family serves.
 pub const ROUTE_PATH: &str = "/fleet/capacity";
@@ -121,8 +119,10 @@ pub(crate) async fn get_fleet_capacity() -> Json<ApiResponse<FleetCapacityAnswer
     Json(ApiResponse::success(answer(read, dial)))
 }
 
-/// Routes contributed to the runner's main router from `mcp_api.rs`.
-pub fn routes() -> Router<Arc<ApiState>> {
+/// Routes contributed to the runner's main router from `mcp_api.rs`. The
+/// handler takes no state, so the router is generic over it: `mcp_api`
+/// merges it into its `Arc<ApiState>` router, and a test mounts it bare.
+pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new().route("/fleet/capacity", get(get_fleet_capacity))
 }
 
@@ -220,8 +220,11 @@ mod tests {
         assert!(wire["coord_base"].is_null(), "{wire}");
     }
 
-    /// The literal `routes()` registers is [`ROUTE_PATH`], read by the same
-    /// census the origin guard's door tripwire reads.
+    /// The route census — the crate-wide scan of literal `.route(` paths that
+    /// the origin guard's door tripwire reads — carries `GET` [`ROUTE_PATH`].
+    /// This pins the census literal, NOT `routes()`: any file mentioning the
+    /// path keeps it green. `routes_serves_the_handler_at_route_path` pins
+    /// what `routes()` actually serves.
     #[test]
     fn routes_registers_the_documented_path() {
         let registered = crate::mcp::relay_path_policy::tests::registered_routes();
@@ -231,15 +234,21 @@ mod tests {
         );
     }
 
-    /// The handler answers with the envelope and the read. On an isolated,
-    /// empty machine no coord is configured, so the read is `unknown` with its
-    /// reason, carries no row, and never touches the network. The handler
-    /// takes no state, so it is mounted on a bare router.
+    /// The JSON body of `response`.
+    async fn body_of(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `routes()` itself serves the handler at [`ROUTE_PATH`]: a request
+    /// through it gets the envelope. Fails when `routes()` drops the
+    /// registration, which the census test above cannot see.
     #[tokio::test]
-    async fn the_handler_serves_the_read_in_the_envelope() {
+    async fn routes_serves_the_handler_at_route_path() {
         let _amb = crate::test_env::isolated_ambient();
-        let response = Router::new()
-            .route(ROUTE_PATH, get(get_fleet_capacity))
+        let response = routes::<()>()
             .oneshot(
                 Request::builder()
                     .uri(ROUTE_PATH)
@@ -249,24 +258,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let body = body_of(response).await;
+        assert_eq!(body["success"], true, "{body}");
+    }
+
+    /// The handler on an isolated, empty machine: no coord is configured, so
+    /// the read is `unknown`, carries no row and no coord base, and so cannot
+    /// share a coord with anything. Only those machine-determined fields are
+    /// asserted — the dial is process-global poller state, which other tests
+    /// in this binary may have written.
+    #[tokio::test]
+    async fn the_handler_on_an_isolated_machine_serves_an_unconnected_read() {
+        let _amb = crate::test_env::isolated_ambient();
+        let Json(envelope) = get_fleet_capacity().await;
+        let body = serde_json::to_value(&envelope).unwrap();
         assert_eq!(body["success"], true, "an unknown is an answer: {body}");
         let data = &body["data"];
         assert_eq!(data["state"], "unknown", "{data}");
         assert!(data["row"].is_null(), "an unknown carries no row: {data}");
-        assert!(data["reason"].is_string(), "an unknown names why: {data}");
-        assert!(data["cache_ttl_secs"].is_u64(), "{data}");
-        // The dial is its own field beside the read, in one of its two states
-        // (which one depends on whether this process's poller ever read one),
-        // and a known one carries its age.
-        let dial = &data["capacity_model"];
-        match dial["state"].as_str() {
-            Some("known") => assert!(dial["age_secs"].is_number(), "{data}"),
-            Some("unknown") => assert!(dial["reason"].is_string(), "{data}"),
-            _ => panic!("the dial is known or unknown: {data}"),
-        }
+        assert!(data["coord_base"].is_null(), "not connected: {data}");
+        assert!(data["same_coord"].is_null(), "nothing to compare: {data}");
+    }
+
+    /// A known read from a test-owned cache beside a known dial: the row is
+    /// flattened into the answer as the read served it, the dial is its own
+    /// field, and the two name one coord.
+    #[tokio::test]
+    async fn answer_serves_a_known_read_beside_a_known_dial() {
+        let device = uuid::Uuid::from_u128(0x0bcf_4751_acd2_4000_8000_0000_0000_0001);
+        let row = serde_json::json!({"device_id": device.to_string(),
+                                     "slots": {"C3": {"state": "known", "value": 10}}});
+        let read = CapacityCache::new()
+            .get(
+                || (Instant::now(), Utc::now()),
+                || Prepared::Fetch {
+                    coord_base: "https://coord.qontinui.io".to_string(),
+                    device_id: device,
+                    fut: std::future::ready(Fetched::Known {
+                        device_id: device,
+                        row: row.clone(),
+                        coord: serde_json::json!({"model_version": 3}),
+                    }),
+                },
+            )
+            .await;
+        let wire =
+            serde_json::to_value(answer(read, known_dial("https://coord.qontinui.io"))).unwrap();
+        assert_eq!(wire["state"], "known", "{wire}");
+        assert_eq!(wire["row"], row, "{wire}");
+        assert_eq!(wire["coord"]["model_version"], 3, "{wire}");
+        assert_eq!(wire["capacity_model"]["state"], "known", "{wire}");
+        assert_eq!(
+            wire["capacity_model"]["value"]["permitted_consumers"][0], "local_builds",
+            "{wire}"
+        );
+        assert_eq!(wire["same_coord"], true, "{wire}");
+    }
+
+    /// An unknown read beside an unknown dial: the read's reason and the
+    /// dial's are both served, and there is no row.
+    #[tokio::test]
+    async fn answer_serves_an_unknown_read_beside_an_unknown_dial() {
+        let read = read_from(Some("https://coord.qontinui.io")).await;
+        let wire = serde_json::to_value(answer(read, dial_view(None, Utc::now()))).unwrap();
+        assert_eq!(wire["state"], "unknown", "{wire}");
+        assert!(wire["row"].is_null(), "{wire}");
+        assert_eq!(wire["reason"], "no machine.json", "{wire}");
+        assert_eq!(wire["capacity_model"]["state"], "unknown", "{wire}");
+        assert!(
+            wire["capacity_model"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("legacy reader"),
+            "{wire}"
+        );
     }
 }
