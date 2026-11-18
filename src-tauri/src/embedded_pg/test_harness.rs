@@ -46,8 +46,10 @@
 //!   [`HARNESS_VERSION`]. Built under an exclusive lock
 //!   on `.lock`, and entered by its builder before that lock is released
 //!   ([`enter_or_build`]); entered by every other process under a shared one,
-//!   which keeps a collection from removing it mid-copy. Every entry marks it
-//!   used. Worktrees on branches whose schemas differ share one target
+//!   which keeps a collection from removing it mid-copy. Whoever takes the
+//!   lock names itself in `.lock.holder` ([`LockHolder`]), so a process
+//!   waiting for it says who holds it ([`take_cache_lock`]). Every entry marks
+//!   it used. Worktrees on branches whose schemas differ share one target
 //!   directory, so caches of several keys coexist: a build collects another
 //!   key's cache only once no live root was copied from it and it has gone
 //!   unused for [`TEMPLATE_IDLE_LIMIT`].
@@ -153,20 +155,25 @@ use super::{
 /// directory that another user owns or that anyone else can reach
 /// ([`require_private`]), and on one with an ancestor another user could swap
 /// the tree through ([`require_safe_ancestors`]). The harness changes the mode
-/// only of a directory it made itself, never of one it found: name a directory
-/// that does not exist yet, such as `/dev/shm/<you>/qontinui-test-pg`, and the
-/// harness creates it, with any parent it lacks, private. Windows is not
-/// checked. It is also the boot-failure self-test's hook: pointed at a regular
-/// file, the harness cannot boot and must fail every test that asks it for a
-/// database.
+/// only of a directory it marked as its own ([`MADE_MARKER`]): one it made, or
+/// an existing one it found already private to this user. One it found open is
+/// never chmodded but refused: name a directory that does not exist yet, such
+/// as `/dev/shm/<you>/qontinui-test-pg`, and the harness creates it, with any
+/// parent it lacks, private. Windows is not checked. It is also the
+/// boot-failure self-test's hook: pointed at a regular file, the harness cannot
+/// boot and must fail every test that asks it for a database.
 pub const HARNESS_DIR_ENV: &str = "QONTINUI_TEST_PG_DIR";
 
 /// Runs every harness database on this EXTERNAL server instead of the bundled
 /// cluster: a `postgres://` or `postgresql://` URL whose role may create
 /// databases, on PostgreSQL 13 or newer (`DROP DATABASE … WITH (FORCE)`),
-/// reachable without TLS. A name nothing else exports, on purpose: no
-/// harness-backed test reads `DATABASE_URL`, which is set on a developer box and
-/// in DB-gated CI.
+/// reachable without TLS. The role must also be able to create the extensions
+/// the canonical schema creates for itself — `pgcrypto`, and `vector` where the
+/// server offers it: the harness's template is a copy of `template0`, so an
+/// extension an administrator pre-installed in `template1` is not there, and
+/// the schema's `CREATE EXTENSION` runs for real. A name nothing else exports,
+/// on purpose: no harness-backed test reads `DATABASE_URL`, which is set on a
+/// developer box and in DB-gated CI.
 pub const EXTERNAL_URL_ENV: &str = "QONTINUI_TEST_PG_URL";
 
 /// `max_connections` of every harness cluster. Set explicitly rather than left
@@ -278,19 +285,29 @@ const LOG_TAIL_BYTES: usize = 2048;
 /// Windows, by postgres processes that are exiting).
 const REMOVE_RETRY_WINDOW: Duration = Duration::from_secs(10);
 /// The file the harness writes into each directory it creates and may later
-/// make private again: the harness directory and every template cache. The
-/// harness changes the mode of no directory that lacks it ([`require_private`]).
+/// make private again: the harness directory and every template cache, and an
+/// existing harness directory it finds already private to this user
+/// ([`prepare_harness_dir`]). The harness changes the mode of no directory that
+/// lacks it, and counts as the mark only a regular file this user owns
+/// ([`require_private`]).
 const MADE_MARKER: &str = ".made-by-qontinui-test-pg";
+/// The file beside the cache lock naming the process that took the lock last
+/// ([`LockHolder`]), so a process waiting for the lock can say who holds it.
+const LOCK_HOLDER_FILE: &str = ".lock.holder";
 /// How long a process waits for the template cache lock, and how it says so.
 /// A builder holds the lock exclusively for a whole build, whose `initdb` has
-/// no bound at all ([`COMMAND_TIMEOUT`]), so a wedged build would otherwise
-/// stall every process sharing the directory, silently and for ever.
-/// A line on the stderr handle after 30 s and every 60 s after, and a boot
-/// error after 10 min: twice [`COMMAND_TIMEOUT`], the bound meant for one
-/// `initdb` or `pg_ctl`, so a slow build that is not wedged is waited out; and
-/// inside CI's 20-minute `Run Rust tests` step timeout, so a wedged lock there
-/// fails the boot with this error instead of leaving only the step's expiry to
-/// read.
+/// no bound at all ([`COMMAND_TIMEOUT`]), so a build that never ends would
+/// otherwise stall every process sharing the directory, silently and for ever.
+/// A line on the stderr handle after 30 s and every 60 s after, each naming
+/// the holder; and a boot error once ONE holder has held the lock for 10 min
+/// while this process watched — the clock restarts whenever the holder
+/// changes, so a queue of healthy builds of other keys is waited out however
+/// long it is ([`take_cache_lock`]). 10 min is twice [`COMMAND_TIMEOUT`], the
+/// bound meant for one `initdb` or `pg_ctl`, so a slow build is waited out;
+/// and it is inside CI's 20-minute `Run Rust tests` step timeout, so a process
+/// waiting behind a lock held that long fails its boot with this error. The
+/// holder itself is not bounded by it: a process whose own build never ends
+/// still ends only with the step.
 const LOCK_PATIENCE: LockPatience = LockPatience {
     first_report: Duration::from_secs(30),
     report_every: Duration::from_secs(60),
@@ -977,6 +994,8 @@ where
     let outcome = async move {
         // Another process may have built it while this one waited.
         let built = if template_dir.join(READY_FILE).is_file() {
+            let (dir, key) = lock_site(template_dir);
+            write_lock_holder(&dir, &key, "entering");
             None
         } else {
             Some(build().await?)
@@ -995,18 +1014,28 @@ struct LockPatience {
     first_report: Duration,
     /// Then one comes every this long.
     report_every: Duration,
-    /// The wait fails the boot after this long.
+    /// The wait fails the boot once one holder has held the lock this long.
     give_up: Duration,
     /// How often the lock is tried again.
     poll: Duration,
 }
 
 /// Take the template cache lock — shared, or exclusive when `exclusive` — to
-/// enter or build the cache in `template_dir`. While the lock is held elsewhere
-/// it says so through `report`, first after `patience.first_report` and then
-/// every `patience.report_every`, and past `patience.give_up` it gives up with
-/// an error naming the cache: a holder that never lets go fails the boot,
-/// rather than stalling every test in this process without a word.
+/// enter or build the cache in `template_dir`, then name this process as its
+/// holder ([`write_lock_holder`]: `entering` for a shared lock, `building` for
+/// an exclusive one).
+///
+/// While the lock is held elsewhere it says so through `report`, first after
+/// `patience.first_report` and then every `patience.report_every`, each line
+/// naming the holder [`LOCK_HOLDER_FILE`] names. Past `patience.give_up` it
+/// gives up with an error naming the cache and that holder — but only once ONE
+/// holder has held the lock that long while this process watched: the clock
+/// restarts whenever the named holder changes, so a queue of healthy holders,
+/// each well inside the bound, is waited out however long it is. A holder the
+/// file does not name — no file, an unreadable one, or one naming a process
+/// that is no longer live ([`LockHolder::is_live`]), such as a holder from
+/// before the file existed — is timed as one unnamed holder. Timed with
+/// `tokio::time`, so a test can run the wait on paused time.
 async fn take_cache_lock(
     lock: &std::fs::File,
     exclusive: bool,
@@ -1015,8 +1044,13 @@ async fn take_cache_lock(
     mut report: impl FnMut(String),
 ) -> Result<(), String> {
     let kind = if exclusive { "exclusive" } else { "shared" };
-    let started = Instant::now();
+    let (dir, key) = lock_site(template_dir);
+    let started = tokio::time::Instant::now();
     let mut next_report = patience.first_report;
+    let mut watched: Option<LockHolder> = None;
+    let mut watched_since = started;
+    let mut last_read: Option<LockHolder> = None;
+    let mut last_live = false;
     loop {
         let attempt = if exclusive {
             lock.try_lock()
@@ -1024,7 +1058,10 @@ async fn take_cache_lock(
             lock.try_lock_shared()
         };
         match attempt {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                write_lock_holder(&dir, &key, if exclusive { "building" } else { "entering" });
+                return Ok(());
+            }
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(format!(
@@ -1033,28 +1070,188 @@ async fn take_cache_lock(
                 ));
             }
         }
-        let waited = started.elapsed();
-        if waited >= patience.give_up {
+        let now = tokio::time::Instant::now();
+        // Liveness is judged when a name first appears, not on every poll: a
+        // named holder that dies lets go of the lock with its life, and whoever
+        // takes it next writes a new name.
+        let read = read_lock_holder(&dir);
+        if read != last_read {
+            last_live = read.as_ref().is_some_and(LockHolder::is_live);
+            last_read = read;
+        }
+        let holder = last_read.clone().filter(|_| last_live);
+        let same = match (&holder, &watched) {
+            (Some(holder), Some(watched)) => holder.is_same_process(watched),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            watched_since = now;
+        }
+        watched = holder;
+        let held = now - watched_since;
+        let named = watched.as_ref().map_or_else(
+            || "a process that has not named itself".to_string(),
+            LockHolder::describe,
+        );
+        if held >= patience.give_up {
             return Err(format!(
-                "gave up after {} s waiting for the {kind} cache lock for {}: the process \
-                 holding it is building or collecting a template cache and has not let go. A \
-                 wedged build there has to be ended; this boot fails rather than wait for ever",
-                waited.as_secs(),
-                template_dir.display()
+                "gave up waiting for the {kind} cache lock for {}: it has been held by {named} \
+                 for {} s (this process waited {} s in all), and this boot fails rather than \
+                 wait without a bound",
+                template_dir.display(),
+                held.as_secs(),
+                (now - started).as_secs()
             ));
         }
+        let waited = now - started;
         if waited >= next_report {
             report(format!(
-                "still waiting, after {} s, for the {kind} cache lock for {}: another process \
-                 is building or collecting a template cache; this boot gives up after {} s",
+                "still waiting, after {} s, for the {kind} cache lock for {}: held by {named} \
+                 for {} s; this boot gives up once one holder has held it for {} s",
                 waited.as_secs(),
                 template_dir.display(),
+                held.as_secs(),
                 patience.give_up.as_secs()
             ));
             next_report += patience.report_every;
         }
-        tokio::time::sleep(patience.poll.min(patience.give_up.saturating_sub(waited))).await;
+        tokio::time::sleep(patience.poll.min(patience.give_up.saturating_sub(held))).await;
     }
+}
+
+/// The directory holding the cache lock for the template cache in
+/// `template_dir`, and that cache's key: what [`write_lock_holder`] records.
+fn lock_site(template_dir: &Path) -> (PathBuf, String) {
+    let dir = template_dir
+        .parent()
+        .map_or_else(PathBuf::new, Path::to_path_buf);
+    let name = template_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let key = name
+        .strip_prefix(TEMPLATE_PREFIX)
+        .map_or_else(|| name.clone(), str::to_owned);
+    (dir, key)
+}
+
+/// The process that took the template cache lock last, as it recorded itself
+/// in [`LOCK_HOLDER_FILE`] once it had the lock: what a waiting process names.
+///
+/// One lock serves every cache key, and a SHARED lock has many holders at once,
+/// of whom the file names only the last to take it; one that has let go may
+/// be named while an earlier one still holds it, and a process that has just
+/// taken the lock is named only once it has written the file. An EXCLUSIVE
+/// holder is named for as long as it holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LockHolder {
+    pid: u32,
+    /// [`own_pid_namespace`] of the holder; `None` off Linux.
+    pid_ns: Option<String>,
+    /// [`process_start`] of the holder, which tells it from a later process
+    /// given the same pid; `None` where none is read.
+    started: Option<u64>,
+    /// The cache key it is working on.
+    key: String,
+    /// `entering`, `building` or `collecting`.
+    action: String,
+}
+
+impl LockHolder {
+    fn this_process(key: &str, action: &str) -> Self {
+        let pid = std::process::id();
+        Self {
+            pid,
+            pid_ns: own_pid_namespace().map(str::to_owned),
+            started: process_start(pid),
+            key: key.to_string(),
+            action: action.to_string(),
+        }
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "pid={}\npid_ns={}\nstarted={}\nkey={}\naction={}\n",
+            self.pid,
+            self.pid_ns.as_deref().unwrap_or_default(),
+            self.started.map(|at| at.to_string()).unwrap_or_default(),
+            self.key,
+            self.action
+        )
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut fields: HashMap<&str, &str> = HashMap::new();
+        for line in text.lines() {
+            if let Some((name, value)) = line.split_once('=') {
+                fields.insert(name.trim(), value.trim());
+            }
+        }
+        Some(Self {
+            pid: fields.get("pid")?.parse().ok()?,
+            pid_ns: fields
+                .get("pid_ns")
+                .filter(|ns| !ns.is_empty())
+                .map(|ns| (*ns).to_string()),
+            started: fields.get("started").and_then(|at| at.parse().ok()),
+            key: (*fields.get("key")?).to_string(),
+            action: (*fields.get("action")?).to_string(),
+        })
+    }
+
+    /// Whether the recorded process may still be running, judged as
+    /// [`owner_may_be_live`] judges a root's owner: a holder in another PID
+    /// namespace cannot be checked from here and counts as live; otherwise its
+    /// pid must be live and, where both starts are read, have started when the
+    /// holder did.
+    fn is_live(&self) -> bool {
+        if self.pid_ns.as_deref() != own_pid_namespace() {
+            return true;
+        }
+        crate::runner_breadcrumb::pid_is_live(self.pid)
+            && match (self.started, process_start(self.pid)) {
+                (Some(recorded), Some(now)) => recorded == now,
+                _ => true,
+            }
+    }
+
+    /// Whether `other` records the same process, whatever it was doing.
+    fn is_same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.pid_ns == other.pid_ns && self.started == other.started
+    }
+
+    /// `pid N (building KEY)`.
+    fn describe(&self) -> String {
+        format!("pid {} ({} {})", self.pid, self.action, self.key)
+    }
+}
+
+/// Record this process as the cache lock's holder in `dir`, working on the
+/// cache `key` (`action`: `entering`, `building` or `collecting`). Written to
+/// a file of this process's own and renamed into place, so a waiter never
+/// reads half of one. Best effort: a holder that cannot name itself still
+/// holds the lock, and a waiter then names it as unnamed.
+fn write_lock_holder(dir: &Path, key: &str, action: &str) {
+    let path = dir.join(LOCK_HOLDER_FILE);
+    let partial = dir.join(format!(
+        "{LOCK_HOLDER_FILE}.{}-{}",
+        std::process::id(),
+        process_nonce()
+    ));
+    let written = std::fs::write(&partial, LockHolder::this_process(key, action).render())
+        .and_then(|()| std::fs::rename(&partial, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&partial);
+        say(format!(
+            "could not name this process as the cache lock's holder ({}): {e}",
+            path.display()
+        ));
+    }
+}
+
+fn read_lock_holder(dir: &Path) -> Option<LockHolder> {
+    LockHolder::parse(&std::fs::read_to_string(dir.join(LOCK_HOLDER_FILE)).ok()?)
 }
 
 /// Enter the template cache in `template_dir` with `enter` once it is proven
@@ -1149,9 +1346,11 @@ async fn build_template(
             )
         })?;
     }
+    write_lock_holder(dir, key, "collecting");
     for line in collect_stale_templates(dir, key) {
         say(line);
     }
+    write_lock_holder(dir, key, "building");
     // Private: it holds the cluster's superuser password (`pg-pass`). Marked as
     // the harness's, so entering it may make it private again ([`MADE_MARKER`]).
     create_private_dir(template_dir).map_err(|e| {
@@ -1441,7 +1640,8 @@ async fn boot_external(raw: String) -> Result<Server, String> {
         &canonical_schema_sql(vectors),
         "the external test server",
     )
-    .await?;
+    .await
+    .map_err(external_schema_error)?;
     seal_template(&maintenance, &template, false).await?;
     spawn_peak_sampler(
         raw,
@@ -1471,6 +1671,23 @@ async fn boot_external(raw: String) -> Result<Server, String> {
         _postmaster: None,
         _exit_guard: None,
     })
+}
+
+/// `error`, from applying the canonical schema to an external server, with the
+/// remedy added when it is about an extension: the schema creates `pgcrypto`,
+/// and `vector` where the server offers it, for itself, and the template is a
+/// copy of `template0`, so a role that may not create them fails here even on
+/// a server whose `template1` carries them ([`EXTERNAL_URL_ENV`]).
+fn external_schema_error(error: String) -> String {
+    if !error.to_ascii_lowercase().contains("extension") {
+        return error;
+    }
+    format!(
+        "{error}. The canonical schema creates pgcrypto, and vector where the server offers \
+         it, for itself, and the harness's template is a copy of template0, so an extension \
+         pre-installed in template1 does not reach it: the role {EXTERNAL_URL_ENV} names must \
+         be able to create both extensions"
+    )
 }
 
 /// How many leftover database names [`describe_foreign_databases`] spells out.
@@ -2833,11 +3050,22 @@ fn private_dir_builder() -> std::fs::DirBuilder {
 }
 
 /// Enter the harness directory, refusing one this process cannot safely run
-/// PostgreSQL from and keep a cluster's superuser password in. A directory
-/// [`HARNESS_DIR_ENV`] names (`named`) must have safe ancestors first
-/// ([`require_safe_ancestors`]). A missing directory is created private, with
-/// any parent it lacks, and marked as the harness's ([`MADE_MARKER`]); either
-/// way it must then be private ([`require_private`]).
+/// PostgreSQL from and keep a cluster's superuser password in.
+///
+/// - A directory [`HARNESS_DIR_ENV`] names (`named`) must have safe ancestors
+///   ([`require_safe_ancestors`]), judged before anything is created and again
+///   after: an ancestor that came into being in between — another user
+///   squatting `/tmp/<you>` in the sticky `/tmp` — was not there to judge the
+///   first time, and the creation accepts an existing directory whoever owns
+///   it.
+/// - A missing directory is created private, with any parent it lacks, and
+///   marked as the harness's ([`MADE_MARKER`]).
+/// - An existing one that is already private to this user and carries no mark
+///   is marked now ([`found_private`]): the default location a harness from
+///   before the mark made has none, and opened later it would otherwise only
+///   be refused, although the harness made it.
+///
+/// Either way it must then be private ([`require_private`]).
 fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
     if named {
         require_safe_ancestors(dir)?;
@@ -2849,14 +3077,17 @@ fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
             dir.display()
         )
     })?;
-    if made {
+    if named {
+        require_safe_ancestors(dir)?;
+    }
+    if made || found_private(dir) {
         mark_made(dir)?;
     }
     require_private(dir)
 }
 
-/// Mark `dir`, which the harness has just created, as the harness's own
-/// ([`MADE_MARKER`]).
+/// Mark `dir`, which the harness has just created, or found private to this
+/// user ([`found_private`]), as the harness's own ([`MADE_MARKER`]).
 fn mark_made(dir: &Path) -> Result<(), String> {
     let marker = dir.join(MADE_MARKER);
     std::fs::write(
@@ -2867,20 +3098,66 @@ fn mark_made(dir: &Path) -> Result<(), String> {
     .map_err(|e| format!("could not mark {} as the harness's: {e}", dir.display()))
 }
 
+/// Whether `dir`, which the harness found rather than made, is private to this
+/// process's effective user — owned by it, with no access for its group or
+/// others — and carries no mark that counts (`is_marked`). Never on Windows,
+/// where nothing is checked.
+fn found_private(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        std::fs::metadata(dir).is_ok_and(|meta| {
+            meta.is_dir() && privacy_problem(meta.uid(), meta.mode(), me).is_none()
+        }) && !is_marked(dir, me)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+/// Whether `dir` holds a [`MADE_MARKER`] that counts ([`marker_counts`]).
+#[cfg(unix)]
+fn is_marked(dir: &Path, me: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir.join(MADE_MARKER))
+        .is_ok_and(|meta| marker_counts(meta.file_type().is_file(), meta.uid(), me))
+}
+
+/// Whether a [`MADE_MARKER`] that is a regular file (`is_file`, read without
+/// following a symlink) owned by uid `owner` is the harness's mark for uid
+/// `me`: only a regular file `me` owns is. Anyone who can write into a
+/// directory can plant a file there, or a symlink to one, but only `me` — or
+/// root — can make one `me` owns.
+#[cfg(any(unix, test))]
+fn marker_counts(is_file: bool, owner: u32, me: u32) -> bool {
+    is_file && owner == me
+}
+
 /// Refuse `dir` unless it is private to this user, making it private again
-/// first only when the harness made it.
+/// first only when it holds the harness's mark and nobody else could have
+/// written into it.
 ///
 /// The harness runs PostgreSQL out of the template caches in its directory and
 /// keeps each cluster's superuser password there (`tpl-*/pg-pass`), so a
 /// directory another user owns, or one others can reach, could hand this process
 /// their binaries to run or hand them the password. On Unix:
 ///
-/// - a directory holding [`MADE_MARKER`] — the harness directory or a template
-///   cache, which the harness created private — that this process's effective
-///   user owns and that is open to its group or others is set to 0700 again;
-/// - any other directory, such as one [`HARNESS_DIR_ENV`] names, is never
-///   chmodded: the harness does not change the mode of a directory it did not
-///   make;
+/// - a directory holding the harness's mark (`is_marked`) — the harness
+///   directory or a template cache — that this process's effective user owns
+///   and that is open to its group or others only to read or search is set to
+///   0700 again;
+/// - one such directory that its group or others can WRITE is refused, not
+///   chmodded: what they wrote into it while it was open would survive the
+///   chmod. The error says to remove it, after which the harness makes it
+///   again;
+/// - a directory with no mark that counts — one the harness found open rather
+///   than made, such as an existing directory [`HARNESS_DIR_ENV`] names that
+///   others can reach — is never chmodded: the harness does not change the
+///   mode of a directory it did not make;
 /// - then the directory must be owned by that user and open to no one else
 ///   ([`privacy_problem`]), or the boot fails with an error naming it and the
 ///   remedy.
@@ -2904,7 +3181,17 @@ fn require_private(dir: &Path) -> Result<(), String> {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
         let (owner, mode) = owner_and_mode(dir)?;
-        let made = dir.join(MADE_MARKER).is_file();
+        let made = is_marked(dir, me);
+        if made && owner == me && mode & 0o022 != 0 {
+            return Err(format!(
+                "{} carries the harness's mark but is writable by its group or others (mode \
+                 {:o}), and whatever was written into it while it was open would survive \
+                 making it private again, so the harness does not use it: remove it, and the \
+                 harness makes it again",
+                dir.display(),
+                mode & 0o7777
+            ));
+        }
         let unchanged = if made && owner == me && mode & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).err()
         } else {
@@ -2960,8 +3247,9 @@ fn privacy_problem(owner: u32, mode: u32, me: u32) -> Option<String> {
 /// the start of the `pg_ctl` in it. Every ancestor that exists, as the path
 /// names it and as it resolves through symlinks (whoever can write the
 /// directory holding a symlink can swap the symlink), must be owned by this
-/// process's effective user or by root, and writable by neither its group nor
-/// others unless it is sticky ([`ancestor_problem`]). Where a symlink's target
+/// process's effective user or by root, and not writable by others unless it
+/// is sticky ([`ancestor_problem`], which says why its group's write is not
+/// judged). Where a symlink's target
 /// itself passes through another symlink, the directory holding that second
 /// one is in neither chain and is not judged. The nearest ancestor is judged
 /// first, and the first that fails fails the boot; ancestors that do not exist
@@ -2994,8 +3282,8 @@ fn require_safe_ancestors(dir: &Path) -> Result<(), String> {
                 return Err(format!(
                     "{} cannot be the harness directory: its ancestor {} is {problem}, so \
                      another user could swap the tree under it. Point {HARNESS_DIR_ENV} at a \
-                     directory whose every ancestor is this user's or root's and writable by no \
-                     one else, unless sticky, such as /dev/shm/<you>/qontinui-test-pg",
+                     directory whose every ancestor is this user's or root's and not writable \
+                     by others, unless sticky, such as /dev/shm/<you>/qontinui-test-pg",
                     dir.display(),
                     ancestor.display()
                 ));
@@ -3009,17 +3297,24 @@ fn require_safe_ancestors(dir: &Path) -> Result<(), String> {
 
 /// Why an ancestor of the harness directory, owned by uid `owner` with
 /// permission bits `mode`, would let a user other than uid `me` swap the tree
-/// under it: a user other than `me` and root owns it, or its group or others
-/// can write to it and it is not sticky. `None` when it is safe.
+/// under it: a user other than `me` and root owns it, or others can write to it
+/// and it is not sticky. `None` when it is safe.
+///
+/// Group write is not judged. On a system with a private group per user and
+/// umask 0002 — the common default — every directory a tester makes is
+/// writable by a group whose only member is the tester, so refusing group
+/// write would refuse every named directory below one, while sharing a group
+/// with other users is the tester's own choice. The harness directory itself
+/// is judged more strictly ([`require_private`]).
 #[cfg(any(unix, test))]
 fn ancestor_problem(owner: u32, mode: u32, me: u32) -> Option<String> {
     if owner != me && owner != 0 {
         Some(format!(
             "owned by uid {owner}, neither this user (uid {me}) nor root"
         ))
-    } else if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+    } else if mode & 0o002 != 0 && mode & 0o1000 == 0 {
         Some(format!(
-            "writable by its group or others and not sticky (mode {:o})",
+            "writable by others and not sticky (mode {:o})",
             mode & 0o7777
         ))
     } else {
@@ -3505,7 +3800,14 @@ mod tests {
 
     const CHILD_MODE_ENV: &str = "QONTINUI_TEST_PG_CHILD";
     const CHILD_REPORT_ENV: &str = "QONTINUI_TEST_PG_CHILD_REPORT";
-    const CHILD_TIMEOUT: Duration = Duration::from_secs(600);
+    /// How long a child may run. Comfortably above [`LOCK_PATIENCE`]'s bound,
+    /// so a child waiting behind a held cache lock gives up by itself, and says
+    /// why, before it is killed.
+    const CHILD_TIMEOUT: Duration = Duration::from_secs(900);
+    const _: () = assert!(
+        CHILD_TIMEOUT.as_secs() >= LOCK_PATIENCE.give_up.as_secs() + 240,
+        "a child must outlive its own wait for the cache lock"
+    );
     /// How long a postmaster may take to disappear after its process ended (on
     /// Windows the job's kill lands asynchronously).
     const DEATH_WAIT: Duration = Duration::from_secs(30);
@@ -3540,10 +3842,11 @@ mod tests {
         })
     }
 
-    /// Run only as a child process: it is `#[ignore]`d, so a run of the whole
-    /// binary never counts it, and it FAILS unless `QONTINUI_TEST_PG_CHILD`
+    /// Run only as a child process: it is `#[ignore]`d, so a default run of
+    /// the whole binary skips it, and it FAILS unless `QONTINUI_TEST_PG_CHILD`
     /// selects a mode, so no run of it can count as a pass that exercised
-    /// nothing. The child-process self-tests below re-run this binary with
+    /// nothing — a run that includes ignored tests (`--include-ignored`,
+    /// nextest's `--run-ignored all`) sees it fail. The child-process self-tests below re-run this binary with
     /// exactly this test selected (`--ignored --exact`, [`child_command`]):
     ///
     /// - `pass`: boot, report where the cluster is, and pass.
@@ -3626,25 +3929,70 @@ mod tests {
     }
 
     fn run_child(mode: &str, report: &Path, harness_dir: Option<&Path>) -> ChildRun {
+        run_child_within(mode, report, harness_dir, CHILD_TIMEOUT)
+    }
+
+    /// Run [`child_helper`] in `mode`, its report at `report`, for at most
+    /// `limit`. Its stdout and stderr go to files beside the report, so a
+    /// child that overruns still shows what it said — a lock wait's lines and
+    /// its give-up among them. One that overruns has its process group killed
+    /// and FAILS the test, with that output; its cluster, which `pg_ctl` started
+    /// in a session of its own and so outside that group, is ended first
+    /// ([`ReapChildCluster`]).
+    fn run_child_within(
+        mode: &str,
+        report: &Path,
+        harness_dir: Option<&Path>,
+        limit: Duration,
+    ) -> ChildRun {
+        let stdout_path = report.with_extension("stdout");
+        let stderr_path = report.with_extension("stderr");
+        let file = |path: &Path| {
+            std::fs::File::create(path)
+                .unwrap_or_else(|e| panic!("the {mode} child's {}: {e}", path.display()))
+        };
         let mut command = child_command(Some(mode));
-        command.env(CHILD_REPORT_ENV, report);
+        command
+            .env(CHILD_REPORT_ENV, report)
+            .stdout(file(&stdout_path))
+            .stderr(file(&stderr_path));
         if let Some(dir) = harness_dir {
             command.env(HARNESS_DIR_ENV, dir);
         }
-        match crate::process_helpers::run_with_timeout(command, CHILD_TIMEOUT) {
-            Ok(crate::process_helpers::TimedOutput::Completed(output)) => ChildRun {
-                status: output.status,
-                output: format!(
-                    "--- child stdout ---\n{}\n--- child stderr ---\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            },
-            Ok(crate::process_helpers::TimedOutput::TimedOut { pid, .. }) => panic!(
-                "the {mode} child (pid {pid}) did not finish within {} s",
-                CHILD_TIMEOUT.as_secs()
-            ),
-            Err(e) => panic!("could not run the {mode} child: {e}"),
+        let output = || {
+            let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+            format!(
+                "--- child stdout ---\n{}\n--- child stderr ---\n{}",
+                read(&stdout_path),
+                read(&stderr_path)
+            )
+        };
+        crate::process_helpers::ChildTreeGuard::arm(&mut command);
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("could not run the {mode} child: {e}"));
+        let tree = crate::process_helpers::ChildTreeGuard::attach_armed(&child);
+        wait_for(|| !matches!(child.try_wait(), Ok(None)), limit);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tree.disarm();
+                ChildRun {
+                    status,
+                    output: output(),
+                }
+            }
+            outcome => {
+                let pid = child.id();
+                drop(tree);
+                let _ = child.kill();
+                let _ = child.wait();
+                let _reap = ReapChildCluster::reported(report);
+                panic!(
+                    "the {mode} child (pid {pid}) did not finish within {} s ({outcome:?}):\n{}",
+                    limit.as_secs(),
+                    output()
+                )
+            }
         }
     }
 
@@ -3799,6 +4147,57 @@ mod tests {
             "the failed child's root {} survived the sweep ({swept:?}):\n{}",
             facts.root.display(),
             run.output
+        );
+    }
+
+    /// A child that overruns its limit FAILS its test with what it said, and
+    /// leaves no cluster behind: killing its process group does not reach the
+    /// postmaster, which `pg_ctl` starts in a session of its own, so
+    /// [`run_child_within`] ends that cluster before it fails. The parent boots
+    /// the shared harness first, so the child enters a READY cache and boots
+    /// well inside the limit. Unix only: on Windows the child's kill-on-close
+    /// job takes the cluster with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_overruns_fails_with_its_output_and_leaves_no_cluster() {
+        const OVERRUN_LIMIT: Duration = Duration::from_secs(60);
+        let _warm = fresh_database_blocking();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let report = scratch.path().join("child-report");
+        let overran = std::panic::catch_unwind(|| {
+            run_child_within("hang", &report, None, OVERRUN_LIMIT);
+        });
+        // Ends what a broken run_child_within left, after the asserts below.
+        let _reap = ReapChildCluster::reported(&report);
+        let failure = panic_message(
+            overran
+                .expect_err("a hang child must overrun its limit")
+                .as_ref(),
+        );
+        let text = std::fs::read_to_string(&report).unwrap_or_else(|e| {
+            panic!(
+                "the hang child never booted within {} s, so nothing here is proven ({e}):\n\
+                 {failure}",
+                OVERRUN_LIMIT.as_secs()
+            )
+        });
+        let facts = parse_facts(&text).expect("the hang child's report");
+        assert!(
+            failure.contains("did not finish within")
+                && failure.contains("--- child stderr ---")
+                && failure.contains("bundled PostgreSQL"),
+            "the failure carries what the child said, its boot line among it: {failure}"
+        );
+        assert!(
+            wait_for(|| !postmaster_alive(&facts), DEATH_WAIT),
+            "postmaster {} of the child that overran (data dir {}) is still running",
+            facts.postmaster_pid,
+            facts.data_dir.display()
+        );
+        assert!(
+            !facts.root.exists(),
+            "the root {} of the child that overran survived it",
+            facts.root.display()
         );
     }
 
@@ -4044,8 +4443,8 @@ mod tests {
 
     /// A harness that cannot boot FAILS the test that asked it for a database,
     /// with the boot error — it never passes and is never ignored. Which boot
-    /// error depends on where the scratch directory is: under an ancestor its
-    /// group or others can write, the ancestor refusal comes first
+    /// error depends on where the scratch directory is: under an ancestor
+    /// others can write, the ancestor refusal comes first
     /// ([`require_safe_ancestors`]); otherwise the harness cannot create its
     /// directory where the regular file is. Either names the path, and that is
     /// all this asserts of the error.
@@ -4267,10 +4666,12 @@ mod tests {
 
     /// A harness directory and template caches the harness made — they hold its
     /// mark ([`MADE_MARKER`]) — that something has since opened to group or
-    /// others are made private again as the harness enters them, a READY cache
-    /// and a just-built one alike: creating a directory that exists leaves its
-    /// mode as it is, and every cache holds its cluster's superuser password
-    /// (`pg-pass`).
+    /// others for reading are made private again as the harness enters them, a
+    /// READY cache and a just-built one alike: creating a directory that exists
+    /// leaves its mode as it is, and every cache holds its cluster's superuser
+    /// password (`pg-pass`). One its group or others could WRITE is refused
+    /// with the remedy and keeps its mode, and so is one whose mark is a
+    /// symlink rather than a regular file: either could have been planted.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_directory_the_harness_made_is_made_private_again_on_entry() {
@@ -4282,10 +4683,10 @@ mod tests {
                 .mode()
                 & 0o777
         };
-        let widen = |path: &Path| {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))
+        let widen = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 .unwrap_or_else(|e| panic!("widen {}: {e}", path.display()));
-            assert_eq!(mode_of(path), 0o775, "{} was not widened", path.display());
+            assert_eq!(mode_of(path), mode, "{} was not widened", path.display());
         };
         let scratch = tempfile::tempdir().expect("scratch directory");
         let dir = scratch.path().join("qontinui-test-pg");
@@ -4294,7 +4695,7 @@ mod tests {
         std::fs::write(ready.join(READY_FILE), "built by the harness\n").expect("mark it READY");
         for made in [&dir, &ready] {
             mark_made(made).expect("mark it as the harness's");
-            widen(made);
+            widen(made, 0o755);
         }
 
         prepare_harness_dir(&dir, false).expect("enter the harness directory");
@@ -4328,7 +4729,7 @@ mod tests {
             move || async move {
                 std::fs::create_dir(building).map_err(|e| e.to_string())?;
                 mark_made(building)?;
-                std::fs::set_permissions(building, std::fs::Permissions::from_mode(0o775))
+                std::fs::set_permissions(building, std::fs::Permissions::from_mode(0o755))
                     .map_err(|e| e.to_string())?;
                 std::fs::write(building.join(READY_FILE), "built by the test\n")
                     .map_err(|e| e.to_string())?;
@@ -4348,6 +4749,113 @@ mod tests {
             require_private(&dir.join("not-there")).is_err(),
             "a directory whose mode cannot be read must be refused, not passed over"
         );
+
+        // Marked, but writable by others: what they wrote survives a chmod.
+        for writable in [0o775, 0o757] {
+            widen(&dir, writable);
+            let refused = prepare_harness_dir(&dir, false)
+                .expect_err("a marked directory others could write must be refused");
+            assert!(
+                refused.contains(&dir.display().to_string())
+                    && refused.contains("writable by its group or others")
+                    && refused.contains("remove it"),
+                "the error names the directory and the remedy: {refused}"
+            );
+            assert_eq!(
+                mode_of(&dir),
+                writable,
+                "the harness chmodded a marked directory others could write"
+            );
+        }
+
+        // A mark that is a symlink to a regular file does not count.
+        let planted = scratch.path().join("planted");
+        std::fs::create_dir(&planted).expect("plant the directory");
+        let target = scratch.path().join("a-mark-elsewhere");
+        std::fs::write(&target, "planted\n").expect("plant the symlink's target");
+        std::os::unix::fs::symlink(&target, planted.join(MADE_MARKER))
+            .expect("plant the mark as a symlink");
+        widen(&planted, 0o755);
+        let refused = require_private(&planted)
+            .expect_err("a directory whose mark is a symlink is not the harness's");
+        assert!(
+            refused.contains("chmod 700"),
+            "it is refused as a directory the harness did not make: {refused}"
+        );
+        assert_eq!(
+            mode_of(&planted),
+            0o755,
+            "the harness chmodded a directory whose mark is a symlink"
+        );
+    }
+
+    /// An existing harness directory that is already private to this user but
+    /// carries no mark — the default location a harness from before the mark
+    /// made — is marked on entry, so a later entry that finds it opened makes
+    /// it private again rather than refusing it. One found open is not marked
+    /// (`a_directory_the_harness_did_not_make_is_refused_and_left_as_it_is`).
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_private_harness_directory_is_marked_on_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path().join("qontinui-test-pg");
+        create_private_dir(&dir).expect("plant a harness directory from before the mark");
+        assert!(!dir.join(MADE_MARKER).exists(), "the fixture has no mark");
+
+        prepare_harness_dir(&dir, false).expect("enter the existing private directory");
+        assert!(
+            dir.join(MADE_MARKER).is_file(),
+            "an existing private harness directory was not marked on entry"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("open it to be read by others");
+        prepare_harness_dir(&dir, false)
+            .expect("a marked directory opened for reading is made private again");
+        let mode = std::fs::metadata(&dir)
+            .expect("the harness directory")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "it was not made private again");
+    }
+
+    /// Only a regular file this user owns is the harness's mark: not a symlink
+    /// or anything else, and not a file another user owns, who could plant
+    /// one in a directory open to them.
+    #[test]
+    fn a_mark_counts_only_as_a_regular_file_this_user_owns() {
+        let me = 1000;
+        assert!(marker_counts(true, me, me));
+        assert!(
+            !marker_counts(false, me, me),
+            "a symlink or a directory is no mark"
+        );
+        for other in [0, 1001] {
+            assert!(
+                !marker_counts(true, other, me),
+                "a file uid {other} owns is no mark for uid {me}"
+            );
+        }
+    }
+
+    /// A failure to apply the canonical schema to an external server says what
+    /// the role must be able to do when it is about an extension, and passes
+    /// any other failure on as it is.
+    #[test]
+    fn an_external_extension_failure_names_what_the_role_must_create() {
+        let denied = "applying canonical schema to the external test server failed: \
+                      permission denied to create extension \"vector\" (SQLSTATE 42501)";
+        let explained = external_schema_error(denied.to_string());
+        assert!(
+            explained.starts_with(denied)
+                && explained.contains("template0")
+                && explained.contains("pgcrypto")
+                && explained.contains(EXTERNAL_URL_ENV),
+            "the error names the extensions, why, and the role: {explained}"
+        );
+        let other = "applying canonical schema to the external test server failed: syntax error";
+        assert_eq!(external_schema_error(other.to_string()), other);
     }
 
     /// A directory the harness did not make is never chmodded: one open to its
@@ -4433,12 +4941,14 @@ mod tests {
 
     /// A harness directory that HARNESS_DIR_ENV names is refused, before
     /// anything is created, when an ancestor would let another user swap the
-    /// tree under it — here one this user owns that its group can write — and
-    /// the error names that ancestor. That holds for an ancestor the path names
-    /// on its way through a symlink as well as for one it resolves to. The
-    /// default location is not ancestor-checked ([`HarnessDir`]): it is
-    /// created, private and marked. (An ancestor another user owns, or root's,
-    /// cannot be made by a test; the predicate's own test covers those arms.)
+    /// tree under it — here one this user owns that others can write (0757) —
+    /// and the error names that ancestor. That holds for an ancestor the path
+    /// names on its way through a symlink, and for one only the symlink's
+    /// target reaches: a private directory holding a symlink to a directory
+    /// under an open one. The default location is not ancestor-checked
+    /// ([`HarnessDir`]): it is created, private and marked. (An ancestor
+    /// another user owns, or root's, cannot be made by a test; the predicate's
+    /// own test covers those arms.)
     #[cfg(unix)]
     #[test]
     fn a_named_harness_directory_under_an_open_ancestor_is_refused() {
@@ -4446,13 +4956,13 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let open = scratch.path().join("open");
         std::fs::create_dir(&open).expect("plant the ancestor");
-        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775))
-            .expect("open it to its group");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o757))
+            .expect("open it to others");
         let open = std::fs::canonicalize(&open).expect("resolve the ancestor");
         let named = open.join("qontinui-test-pg");
 
         let refused = prepare_harness_dir(&named, true)
-            .expect_err("a named directory under a group-writable ancestor must fail the boot");
+            .expect_err("a named directory under an ancestor others can write must fail");
         assert!(
             refused.contains(&format!("its ancestor {} is", open.display()))
                 && refused.contains("not sticky"),
@@ -4480,6 +4990,32 @@ mod tests {
         );
         assert!(
             !private.join("qontinui-test-pg").exists(),
+            "a refused harness directory must not have been created"
+        );
+
+        // Through a symlink in a PRIVATE directory to one under the open
+        // directory: every ancestor the path names is safe, and only the
+        // chain the symlink resolves to passes through `open`.
+        let target = open.join("target");
+        std::fs::create_dir(&target).expect("plant the symlink's target under the open one");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("make the target private");
+        let holder = scratch.path().join("holder");
+        std::fs::create_dir(&holder).expect("plant the private directory");
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o700))
+            .expect("make it private");
+        let link = holder.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("plant the symlink");
+        let resolved_only = link.join("qontinui-test-pg");
+        let refused = prepare_harness_dir(&resolved_only, true).expect_err(
+            "a named directory whose symlink resolves under an open directory must fail",
+        );
+        assert!(
+            refused.contains(&format!("its ancestor {} is", open.display())),
+            "the error names the open directory the symlink resolves under: {refused}"
+        );
+        assert!(
+            !target.join("qontinui-test-pg").exists(),
             "a refused harness directory must not have been created"
         );
 
@@ -4521,16 +5057,20 @@ mod tests {
     }
 
     /// An ancestor of a named harness directory is safe only when no user but
-    /// this one can swap the tree under it: this user or root owns it, and its
-    /// group and others cannot write to it unless it is sticky (`/tmp`,
-    /// `/dev/shm`).
+    /// this one can swap the tree under it: this user or root owns it, and
+    /// others cannot write to it unless it is sticky (`/tmp`, `/dev/shm`). Its
+    /// group's write is not judged ([`ancestor_problem`]): a directory made
+    /// under umask 0002 (0775) is safe.
     #[test]
     fn an_ancestor_is_safe_only_when_no_other_user_can_swap_the_tree_under_it() {
         let me = 1000;
         for (owner, mode) in [
             (me, 0o755),
             (me, 0o700),
+            (me, 0o775),
+            (me, 0o770),
             (0, 0o755),
+            (0, 0o775),
             (0, 0o711),
             (0, 0o1777),
             (me, 0o1777),
@@ -4541,7 +5081,13 @@ mod tests {
                 "an ancestor uid {owner} owns with mode {mode:o} is safe"
             );
         }
-        for (owner, mode) in [(me, 0o775), (me, 0o757), (0, 0o777), (0, 0o775)] {
+        for (owner, mode) in [
+            (me, 0o757),
+            (me, 0o777),
+            (me, 0o702),
+            (0, 0o777),
+            (0, 0o757),
+        ] {
             let problem = ancestor_problem(owner, mode, me).unwrap_or_else(|| {
                 panic!("an ancestor uid {owner} owns with mode {mode:o} can be swapped by others")
             });
@@ -4560,66 +5106,138 @@ mod tests {
         }
     }
 
-    /// A process waiting for the cache lock says so — after a delay, then at
-    /// intervals — and past its bound gives up with an error naming the cache,
-    /// rather than wait silently for ever behind a holder that never lets go; a
-    /// lock let go in time is taken.
-    #[tokio::test]
-    async fn a_cache_lock_wait_says_so_and_gives_up() {
+    /// A process waiting for the cache lock says so — first after
+    /// `first_report`, then every `report_every` — naming the holder the
+    /// holder file names ([`LOCK_HOLDER_FILE`]). When that holder changes it
+    /// restarts its clock, and it gives up only once ONE holder has held the
+    /// lock past `give_up`, with an error naming that holder and neither
+    /// calling it wedged nor inviting anyone to end it. Run on paused time
+    /// with the real [`LOCK_PATIENCE`], so every instant is exact however
+    /// loaded the box is.
+    #[tokio::test(start_paused = true)]
+    async fn a_cache_lock_wait_names_its_holder_and_times_each_holder_alone() {
         let scratch = tempfile::tempdir().expect("scratch directory");
-        let template_dir = scratch.path().join(format!("{TEMPLATE_PREFIX}wedged"));
+        let template_dir = scratch.path().join(format!("{TEMPLATE_PREFIX}waiting"));
         let named = template_dir.display().to_string();
+        let holder_file = scratch.path().join(LOCK_HOLDER_FILE);
         let waiter = open_lock(scratch.path()).expect("the cache lock");
         let holder = open_lock(scratch.path()).expect("another descriptor on the cache lock");
-        holder
-            .lock()
-            .expect("hold the lock, as a wedged build would");
-        let patience = LockPatience {
-            first_report: Duration::from_millis(50),
-            report_every: Duration::from_millis(100),
-            give_up: Duration::from_millis(500),
-            poll: Duration::from_millis(10),
+        holder.lock().expect("hold the lock, as a long build would");
+
+        let first = LockHolder::this_process("first-key", "building");
+        std::fs::write(&holder_file, first.render()).expect("name the first holder");
+        let second_pid = a_live_pid_not_ours();
+        let second = LockHolder {
+            pid: second_pid,
+            pid_ns: own_pid_namespace().map(str::to_owned),
+            started: process_start(second_pid),
+            key: "second-key".to_string(),
+            action: "collecting".to_string(),
         };
-        let mut lines = Vec::new();
-        let waited = tokio::time::timeout(
-            Duration::from_secs(10),
-            take_cache_lock(&waiter, false, &template_dir, patience, |line| {
+        assert!(
+            second.is_live(),
+            "the second holder must be live to be timed"
+        );
+
+        let begun = tokio::time::Instant::now();
+        let mut lines: Vec<String> = Vec::new();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(7200),
+            take_cache_lock(&waiter, false, &template_dir, LOCK_PATIENCE, |line| {
+                // The lock changes hands as the third line (150 s) is said.
+                if lines.len() == 2 {
+                    std::fs::write(&holder_file, second.render()).expect("name the second holder");
+                }
                 lines.push(line);
             }),
         )
         .await
-        .expect("the wait must give up by itself, not hang");
-        let refused = waited.expect_err("a lock held past the bound must fail the boot");
+        .expect("the wait must give up by itself, not hang")
+        .expect_err("a lock one holder keeps past the bound must fail the boot");
+        let waited = begun.elapsed();
+
+        let first_named = format!("held by pid {} (building first-key)", std::process::id());
+        let second_named = format!("held by pid {second_pid} (collecting second-key)");
         assert!(
-            refused.contains("gave up") && refused.contains(&named),
-            "the error says it gave up, and on which cache: {refused}"
+            lines
+                .first()
+                .is_some_and(|line| line.contains("after 30 s")),
+            "the first line comes after first_report, not before: {lines:?}"
         );
         assert!(
-            lines.len() >= 3 && lines.iter().all(|line| line.contains(&named)),
-            "the wait must say so, and keep saying so: {lines:?}"
+            lines.iter().take(3).all(|line| line.contains(&first_named))
+                && lines
+                    .iter()
+                    .skip(3)
+                    .all(|line| line.contains(&second_named))
+                && lines.len() > 3
+                && lines.iter().all(|line| line.contains(&named)),
+            "every line names the cache and the holder at that moment: {lines:?}"
+        );
+        assert!(
+            waited >= Duration::from_secs(750) && waited < Duration::from_secs(760),
+            "the clock restarts when the holder changes (150 s in), so the wait gives up 600 s \
+             after that, not 600 s after it began: it gave up after {waited:?}"
+        );
+        assert!(
+            refused.contains("gave up")
+                && refused.contains(&named)
+                && refused.contains(&format!("{second_named} for 600 s")),
+            "the error names the cache, the holder and how long that holder held it: {refused}"
+        );
+        for said in lines.iter().chain([&refused]) {
+            assert!(
+                !said.contains("wedged") && !said.contains("ended") && !said.contains("kill"),
+                "the wait judges no holder and invites no one to end it: {said}"
+            );
+        }
+
+        // A holder the file does not name — none, or a process that is gone
+        // — is timed as one unnamed holder.
+        let mut gone =
+            std::process::Command::new(std::env::current_exe().expect("this test binary's path"))
+                .args(["--list", "--exact", "no-such-test"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a process that exits at once");
+        gone.wait().expect("reap it");
+        let gone_pid = gone.id();
+        std::fs::write(
+            &holder_file,
+            LockHolder {
+                pid: gone_pid,
+                ..LockHolder::this_process("gone-key", "building")
+            }
+            .render(),
+        )
+        .expect("name a holder that is gone");
+        let short = LockPatience {
+            give_up: Duration::from_secs(60),
+            ..LOCK_PATIENCE
+        };
+        let refused = take_cache_lock(&waiter, false, &template_dir, short, drop)
+            .await
+            .expect_err("an unnamed holder past the bound fails the boot");
+        assert!(
+            refused.contains("held by a process that has not named itself for 60 s")
+                && !refused.contains(&format!("pid {gone_pid}")),
+            "a holder that is gone is not named: {refused}"
         );
 
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            drop(holder);
-        });
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            take_cache_lock(
-                &waiter,
-                true,
-                &template_dir,
-                LockPatience {
-                    give_up: Duration::from_secs(5),
-                    ..patience
-                },
-                drop,
-            ),
-        )
+        // A lock let go in time is taken, and its taker names itself.
+        let mut holding = Some(holder);
+        take_cache_lock(&waiter, true, &template_dir, LOCK_PATIENCE, |_| {
+            holding.take();
+        })
         .await
-        .expect("the wait must end by itself")
         .expect("a lock let go in time is taken");
-        release.join().expect("the thread that let the lock go");
+        let taker = read_lock_holder(scratch.path()).expect("the taker named itself");
+        assert!(
+            taker.is_same_process(&LockHolder::this_process("waiting", "building"))
+                && taker.key == "waiting"
+                && taker.action == "building",
+            "the taker of an exclusive lock names itself, building its key: {taker:?}"
+        );
         let _ = waiter.unlock();
     }
 
