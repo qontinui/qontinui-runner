@@ -496,12 +496,16 @@ impl CapacityCache {
         };
         let read = entry.read_at(done);
         let mut last = self.last_guard();
-        let changed = last.as_ref().map(|e| e.fetched.outcome()) != Some(entry.fetched.outcome());
+        let changed = last
+            .as_ref()
+            .map(|e| (e.fetched.outcome(), e.coord_base.as_deref()))
+            != Some((entry.fetched.outcome(), entry.coord_base.as_deref()));
         if changed {
             // The bearer never reaches a reason, so a reason is safe to log.
             tracing::info!(
                 state = read.state,
                 reason = read.reason.as_deref().unwrap_or(""),
+                coord_base = read.coord_base.as_deref().unwrap_or(""),
                 "fleet capacity: this device's read changed"
             );
         }
@@ -712,6 +716,14 @@ async fn read_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>,
             Err(e) => return Err(format!("but its body could not be read: {e}")),
         }
     }
+}
+
+/// Whether two coord bases name the same coord, ignoring a trailing `/`;
+/// `None` when either is absent. A difference in spelling alone (host case,
+/// an explicit default port) reads as `false`, so a join is refused rather
+/// than wrongly allowed. PURE.
+pub(crate) fn same_coord_base(a: Option<&str>, b: Option<&str>) -> Option<bool> {
+    Some(a?.trim_end_matches('/') == b?.trim_end_matches('/'))
 }
 
 #[cfg(test)]

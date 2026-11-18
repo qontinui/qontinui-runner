@@ -245,13 +245,29 @@ pub(crate) fn lane_b_total(running_at_sample: u32, slots_c1: u32, static_partiti
 fn answer_from(
     read: Option<&CapacityRead>,
     dial: Option<&serde_json::Value>,
+    dial_coord_base: Option<&str>,
     running_started_by: impl FnOnce(DateTime<Utc>) -> usize,
     host: HostCapacity,
 ) -> (u32, ConcurrencySource) {
     let static_partition = suggested_concurrent_builds(host);
     let inputs = read
         .ok_or_else(|| "no capacity read in this process yet".to_string())
-        .and_then(|read| model_inputs(read, dial));
+        .and_then(|read| {
+            let inputs = model_inputs(read, dial)?;
+            // The row and the dial join only when they came from one coord:
+            // a dial kept from a coord this runner has left must not permit
+            // sizing from another coord's row.
+            let read_base = read.coord_base.as_deref();
+            match crate::fleet_capacity::same_coord_base(read_base, dial_coord_base) {
+                Some(true) => Ok(inputs),
+                _ => Err(format!(
+                    "the capacity row and the capacity_model dial are not from one coord \
+                     (row from {}, dial from {}), so they are not joined",
+                    read_base.unwrap_or("no coord"),
+                    dial_coord_base.unwrap_or("no coord")
+                )),
+            }
+        });
     match inputs {
         Ok(inputs) => {
             let seen_by = inputs.sample_at
@@ -329,6 +345,7 @@ pub(crate) fn suggested_concurrent_builds_now(host: HostCapacity) -> (u32, Concu
     let answer = answer_from(
         read.as_ref(),
         dial.as_ref().map(|d| &d.dial),
+        dial.as_ref().map(|d| d.coord_base.as_str()),
         super::admission::running_started_by,
         host,
     );
@@ -580,6 +597,7 @@ mod tests {
         let (n, source) = answer_from(
             Some(&r),
             Some(&on),
+            Some("https://coord.qontinui.io/"),
             |at| {
                 asked = Some(at);
                 2
@@ -606,10 +624,41 @@ mod tests {
             (None, Some(&on), "no capacity read"),
             (Some(&r), None, "has not been read"),
         ] {
-            let (n, source) = answer_from(no_read, no_dial, |_| panic!("not asked"), HOST);
+            let (n, source) = answer_from(
+                no_read,
+                no_dial,
+                Some("https://coord.qontinui.io"),
+                |_| panic!("not asked"),
+                HOST,
+            );
             assert_eq!(n, suggested_concurrent_builds(HOST));
             assert!(
                 matches!(&source, ConcurrencySource::Static { reason } if reason.contains(why)),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A dial kept from another coord (or one whose coord is unknown) does
+    /// not permit sizing from this coord's row: the static formula answers,
+    /// labelled with both coords, and the running count is never asked for.
+    #[test]
+    fn a_dial_from_another_coord_is_not_joined_with_the_row() {
+        let on = dial(&[CONSUMER]);
+        let r = read(row(json!({"state": "known", "value": 3})), FRESH);
+        for dial_base in [Some("https://coord.other.example"), None] {
+            let (n, source) = answer_from(
+                Some(&r),
+                Some(&on),
+                dial_base,
+                |_| panic!("not asked"),
+                HOST,
+            );
+            assert_eq!(n, suggested_concurrent_builds(HOST));
+            assert!(
+                matches!(&source, ConcurrencySource::Static { reason }
+                    if reason.contains("not from one coord")
+                        && reason.contains("https://coord.qontinui.io")),
                 "{source:?}"
             );
         }
