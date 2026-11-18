@@ -31,6 +31,12 @@
 //!   (`no_plan_yet`), or coord refused (`device_not_in_plan` for a device the
 //!   tenant's newest plan does not carry).
 //!
+//! Every read names `coord_base`, the coord it asked (or would have asked):
+//! the base [`qontinui_runner_lib::profiles::connected_coord_base`] resolved
+//! when the read was prepared, `null` only when none resolved (the runner is
+//! not connected). Whatever serves the read beside something another coord
+//! answered (the D9 dial) compares the two rather than implying they agree.
+//!
 //! Beside the row: `coord`, the rest of coord's answer (`model_version`,
 //! `plan`, `thresholds`, `cadence_secs`, `coverage`, `note`, coord's own
 //! `cache_age_secs`), whenever coord answered 2xx. The D9 dial is NOT part of
@@ -177,12 +183,22 @@ impl Fetched {
 /// The synchronous stage of a fetch: either the read is already settled
 /// (no coord base, no usable device), or the device is known and `fut` is the
 /// asynchronous rest. Only `fut` runs under the fetch's deadline, so the
-/// deadline's `unknown` still names `device_id`.
+/// deadline's `unknown` still names `device_id`. Both carry the coord base
+/// the preparation resolved, which the read serves as `coord_base`.
 pub(crate) enum Prepared<Fut> {
-    /// Settled without awaiting anything.
-    Done(Fetched),
-    /// The device is resolved; `fut` reads the credential and asks coord.
-    Fetch { device_id: Uuid, fut: Fut },
+    /// Settled without awaiting anything. `coord_base` is `None` only when no
+    /// connected base resolved.
+    Done {
+        coord_base: Option<String>,
+        fetched: Fetched,
+    },
+    /// The base and the device are resolved; `fut` reads the credential and
+    /// asks the coord at `coord_base`.
+    Fetch {
+        coord_base: String,
+        device_id: Uuid,
+        fut: Fut,
+    },
 }
 
 /// One read of this device's capacity: served as-is on the loopback, and
@@ -193,6 +209,9 @@ pub(crate) struct CapacityRead {
     pub(crate) state: &'static str,
     /// The device asked about, once it was resolved.
     pub(crate) device_id: Option<String>,
+    /// The coord this read asked (or would have asked), as
+    /// `connected_coord_base` resolved it; `None` only when none resolved.
+    pub(crate) coord_base: Option<String>,
     /// This device's row exactly as coord served it; only when `known`.
     pub(crate) row: Option<Value>,
     /// coord's answer without its `devices` list, whenever coord answered 2xx.
@@ -310,6 +329,8 @@ struct Entry {
     /// kept as long as a quick one.
     done: Instant,
     fetched_at: DateTime<Utc>,
+    /// The coord base the preparation resolved; `None` when none did.
+    coord_base: Option<String>,
     fetched: Fetched,
 }
 
@@ -359,6 +380,7 @@ impl Entry {
         CapacityRead {
             state,
             device_id: device_id.map(|d| d.to_string()),
+            coord_base: self.coord_base.clone(),
             row,
             coord,
             reason,
@@ -439,26 +461,37 @@ impl CapacityCache {
             return read;
         }
         let (at, fetched_at) = clock();
-        let fetched = match prepare() {
-            Prepared::Done(fetched) => fetched,
-            Prepared::Fetch { device_id, fut } => tokio::time::timeout(deadline, fut)
-                .await
-                .unwrap_or_else(|_| {
-                    Fetched::unknown(
-                        Some(device_id),
-                        format!(
-                            "the capacity fetch did not finish within {} s (the credential \
+        let (coord_base, fetched) = match prepare() {
+            Prepared::Done {
+                coord_base,
+                fetched,
+            } => (coord_base, fetched),
+            Prepared::Fetch {
+                coord_base,
+                device_id,
+                fut,
+            } => (
+                Some(coord_base),
+                tokio::time::timeout(deadline, fut)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Fetched::unknown(
+                            Some(device_id),
+                            format!(
+                                "the capacity fetch did not finish within {} s (the credential \
                              read or coord stalled)",
-                            deadline.as_secs_f64()
-                        ),
-                    )
-                }),
+                                deadline.as_secs_f64()
+                            ),
+                        )
+                    }),
+            ),
         };
         let done = clock().0;
         let entry = Entry {
             at,
             done,
             fetched_at,
+            coord_base,
             fetched,
         };
         let read = entry.read_at(done);
@@ -508,6 +541,8 @@ where
             at: Instant::now(),
             done: Instant::now(),
             fetched_at: Utc::now(),
+            // The task that would have said which coord it asked is gone.
+            coord_base: None,
             fetched: Fetched::unknown(None, format!("the capacity read's task failed: {e}")),
         }
         .unkept_read_at(Instant::now()),
@@ -532,17 +567,26 @@ pub(crate) fn cached() -> Option<CapacityRead> {
 /// file or credential store.
 fn prepare_live() -> Prepared<impl Future<Output = Fetched> + Send + 'static> {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
-        return Prepared::Done(Fetched::unknown(
-            None,
-            "no coord base is configured: this runner is not connected to coord",
-        ));
+        return Prepared::Done {
+            coord_base: None,
+            fetched: Fetched::unknown(
+                None,
+                "no coord base is configured: this runner is not connected to coord",
+            ),
+        };
     };
     // The file the sample publisher reads: a device with no samples has no row.
     let device_id = match device_from(qontinui_runner_lib::ambient::try_read_machine_json()) {
         Ok(device_id) => device_id,
-        Err(reason) => return Prepared::Done(Fetched::unknown(None, reason)),
+        Err(reason) => {
+            return Prepared::Done {
+                coord_base: Some(base),
+                fetched: Fetched::unknown(None, reason),
+            }
+        }
     };
     Prepared::Fetch {
+        coord_base: base.clone(),
         device_id,
         fut: fetch_live(base, device_id),
     }
@@ -677,6 +721,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// The coord base the test preparations resolve.
+    const COORD_BASE: &str = "https://coord.qontinui.io";
+
     fn device() -> Uuid {
         Uuid::from_u128(0x0bcf_4751_acd2_4000_8000_0000_0000_0001)
     }
@@ -740,6 +787,7 @@ mod tests {
             at,
             done: at,
             fetched_at: Utc::now(),
+            coord_base: Some(COORD_BASE.to_string()),
             fetched,
         }
     }
@@ -862,6 +910,7 @@ mod tests {
     /// A preparation that resolved [`device`] and hands over `fut`.
     fn prepared<Fut>(fut: Fut) -> Prepared<Fut> {
         Prepared::Fetch {
+            coord_base: COORD_BASE.to_string(),
             device_id: device(),
             fut,
         }
@@ -910,6 +959,7 @@ mod tests {
         let t0 = Instant::now();
         let read = cache
             .get_within(Duration::from_secs(15), at(t0), || Prepared::Fetch {
+                coord_base: COORD_BASE.to_string(),
                 device_id: Uuid::parse_str("0bcf4751-acd2-4000-8000-000000000001").unwrap(),
                 fut: std::future::pending::<Fetched>(),
             })
@@ -920,6 +970,11 @@ mod tests {
             read.device_id.as_deref(),
             Some("0bcf4751-acd2-4000-8000-000000000001"),
             "the timed-out read keeps the device it was asking about"
+        );
+        assert_eq!(
+            read.coord_base.as_deref(),
+            Some("https://coord.qontinui.io"),
+            "and the coord it was asking"
         );
         let reason = read.reason.as_deref().unwrap_or_default();
         assert!(reason.contains("did not finish within 15 s"), "{reason}");
@@ -952,13 +1007,17 @@ mod tests {
             .get_within(Duration::ZERO, at(Instant::now()), move || {
                 // The future exists, but a `Done` drops it unpolled.
                 drop(never);
-                Prepared::<CountingPending>::Done(Fetched::unknown(None, "no coord base"))
+                Prepared::<CountingPending>::Done {
+                    coord_base: None,
+                    fetched: Fetched::unknown(None, "no coord base"),
+                }
             })
             .await;
         assert_eq!(polls.load(Ordering::SeqCst), 0, "no future was polled");
         assert_eq!(read.state, "unknown");
         assert_eq!(read.reason.as_deref(), Some("no coord base"));
         assert_eq!(read.device_id, None);
+        assert_eq!(read.coord_base, None, "no base resolved, none served");
     }
 
     /// A slow failure is kept its full TTL from when it FINISHED: a fetch that
@@ -1542,6 +1601,7 @@ mod tests {
         for key in [
             "state",
             "device_id",
+            "coord_base",
             "row",
             "coord",
             "reason",
@@ -1556,6 +1616,7 @@ mod tests {
         }
         assert_eq!(wire["state"], "known");
         assert_eq!(wire["device_id"], device().to_string());
+        assert_eq!(wire["coord_base"], "https://coord.qontinui.io");
         assert_eq!(wire["row"]["slots"]["C3"]["value"], 10);
         assert_eq!(wire["row"]["c3_cpu_cores"]["value"], 40.0);
         assert!(

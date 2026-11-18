@@ -431,6 +431,7 @@ mod tests {
         CapacityRead {
             state: if known { "known" } else { "unknown" },
             device_id: Some("6f1d2c3b-0a9e-4d8c-b7a6-5f4e3d2c1b0a".into()),
+            coord_base: Some("https://coord.qontinui.io".into()),
             row,
             coord,
             reason: (!known).then(|| "no coord".to_string()),
