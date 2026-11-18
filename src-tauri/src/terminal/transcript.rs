@@ -236,12 +236,24 @@ pub fn find_claude_config_dirs() -> Vec<PathBuf> {
     // bin-side — so it is passed in as the `configured` argument. One rule, two
     // callers; a second copy would be the "kept in sync by shape, not by
     // import" failure mode this tree argues against everywhere else.
-    qontinui_runner_lib::session_archive::discovery::discover_account_homes_from_env(
+    claude_config_dirs_from(
+        &qontinui_runner_lib::session_archive::discovery::ambient_discovery(),
         &crate::settings::get_claude_config_dirs(),
     )
-    .into_iter()
-    .map(|home| home.config_dir)
-    .collect()
+}
+
+/// [`find_claude_config_dirs`] over explicit discovery inputs: `ambient` (what
+/// the machine itself supplies) and the settings roster `configured`. One
+/// composition for every caller, so a test can run it over a temp home.
+pub(crate) fn claude_config_dirs_from(
+    ambient: &qontinui_runner_lib::session_archive::discovery::AmbientDiscovery,
+    configured: &[String],
+) -> Vec<PathBuf> {
+    ambient
+        .discover(configured)
+        .into_iter()
+        .map(|home| home.config_dir)
+        .collect()
 }
 
 /// Claude Code's cap on a sanitized project-dir name. A longer name is cut to
