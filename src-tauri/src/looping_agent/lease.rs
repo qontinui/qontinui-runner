@@ -171,6 +171,25 @@ pub fn orphan_grace_ms(spawn_grace_secs: u64) -> i64 {
     i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)
 }
 
+/// What coord's device drain read says about this device's AGENT lane, this
+/// tick (plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`,
+/// D5). Folded by the supervisor from the same `DrainGate` the drain rewrite
+/// uses, so the lease and the action gate judge one read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneObs {
+    /// The lane is open: coord allows looping-agent work on this device.
+    Open,
+    /// Coord KNOWN-closed the lane: the device is `Drained`, or its dispatch
+    /// role closes the agent lane (`RoleClosed`). A slot held here can never
+    /// license a new cycle — the drain rewrite turns every `Nudge`/`Relaunch`
+    /// into `None` — so it is handed over at the first idle tick.
+    Closed,
+    /// The drain state could not be read. Changes nothing: an unread lane is
+    /// not evidence of a closed one (served `verification-and-evidence`
+    /// `unknown-must-not-render-as-a-default`).
+    Unknown,
+}
+
 /// The per-tick observation the supervisor hands the lease layer. Resolved
 /// ONCE per tick, before the lease reconcile, so the lease and the decision
 /// core judge the same tab (two reads per tick could disagree — the #1025
@@ -187,6 +206,13 @@ pub struct LeaseTickObs {
     pub spawn_grace_secs: u64,
     pub source: DesiredSource,
     pub slots: u32,
+    /// The device's agent lane as coord's drain read reports it (D5).
+    pub lane: LaneObs,
+    /// The tab sits at a dialog-free idle prompt (`looping_agent::idle`, the
+    /// supervisor's `nudge_safe_idle`) AND is past its spawn grace: the first
+    /// point at which closing it is not mid-run. `false` whenever there is no
+    /// live tab to probe.
+    pub idle_past_grace: bool,
 }
 
 /// Why a held slot is being given up.
@@ -196,6 +222,11 @@ pub enum ReleaseReason {
     TabNotAlive,
     /// Coord lowered the count below this slot's index.
     OutOfRange,
+    /// The device's agent lane is known-closed (drained or role-closed) and no
+    /// tab is alive to retire: nothing will ever run on this slot here, so a
+    /// runner on an open device should take it now rather than after the
+    /// orphan grace (D5).
+    LaneClosed,
 }
 
 /// What to do with a slot we hold, this tick.
@@ -203,6 +234,10 @@ pub enum ReleaseReason {
 pub enum HoldDecision {
     Keep,
     Release(ReleaseReason),
+    /// D5: the lane is known-closed and the live tab is idle — RETIRE the tab,
+    /// THEN release the slot, and do not respawn. The order matters: releasing
+    /// first would let a peer spawn a second shepherd while ours still runs.
+    HandOver,
 }
 
 /// **Should a slot we hold be kept this tick?** Pure; evaluated before the
@@ -212,15 +247,32 @@ pub enum HoldDecision {
 ///    (`OutOfRange`): the count was lowered. Only under `Coord` — the
 ///    local-registry fallback always reports one slot, so a failed
 ///    desired-state read must never release slot 1.
-/// 2. A tab that is alive (`Live` or `PendingRestore`) keeps its slot,
-///    unconditionally: never freed by an authz refusal, a drain, a backoff or
-///    anything else.
-/// 3. Otherwise (`Dead`/`Exited`) the slot is kept while
+/// 2. Under a KNOWN-closed lane ([`LaneObs::Closed`], plan
+///    `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap` D5)
+///    the slot is handed over at the first point that is not mid-run: a `Live`
+///    tab that is idle past its grace → [`HoldDecision::HandOver`]; no alive
+///    tab at all → released at once (`LaneClosed`, no orphan grace — no
+///    respawn can come while the lane is shut); a busy or pending-restore tab
+///    keeps it until its next idle tick. [`LaneObs::Unknown`] changes nothing.
+/// 3. A tab that is alive (`Live` or `PendingRestore`) keeps its slot: never
+///    freed by an authz refusal, an unknown drain, a backoff or anything else
+///    short of rule 2's known-closed lane.
+/// 4. Otherwise (`Dead`/`Exited`) the slot is kept while
 ///    `now - anchor < orphan_grace` and released (`TabNotAlive`) once the
 ///    grace has passed. A clock that runs backwards keeps.
 pub fn hold_decision(held_slot: u32, anchor_ms: i64, obs: &LeaseTickObs) -> HoldDecision {
     if obs.source == DesiredSource::Coord && held_slot >= obs.slots {
         return HoldDecision::Release(ReleaseReason::OutOfRange);
+    }
+    if obs.lane == LaneObs::Closed {
+        if !obs.liveness.tab_alive() {
+            return HoldDecision::Release(ReleaseReason::LaneClosed);
+        }
+        if obs.liveness == Liveness::Live && obs.idle_past_grace {
+            return HoldDecision::HandOver;
+        }
+        // Busy (or a restore in flight): never mid-run. Next idle tick.
+        return HoldDecision::Keep;
     }
     if obs.liveness.tab_alive() {
         return HoldDecision::Keep;
@@ -422,6 +474,18 @@ pub fn displacement_action(action: Action, displaced: Displaced, quiescent: bool
     }
 }
 
+/// D5's action rewrite, applied LAST: a tick on which the reconcile decided
+/// [`HoldDecision::HandOver`] retires the tab whatever the decision core
+/// wanted. Every other action is unchanged. The `Retire` arm never respawns,
+/// and the supervisor releases the slot only after the tab is closed.
+pub fn handover_action(action: Action, hand_over: bool) -> Action {
+    if hand_over {
+        Action::Retire
+    } else {
+        action
+    }
+}
+
 /// What the lease reconcile reports to the supervisor for one tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseTick {
@@ -430,6 +494,9 @@ pub struct LeaseTick {
     /// What this tick's acquire walk established (`NotWalked` when it did not
     /// run — including every tick on which we already held a slot).
     pub walk: WalkVerdict,
+    /// D5: we still hold the slot, but this tick must retire the idle tab and
+    /// then release it ([`HoldDecision::HandOver`]).
+    pub hand_over: bool,
 }
 
 impl LeaseTick {
@@ -437,11 +504,19 @@ impl LeaseTick {
     pub const NOT_HELD: LeaseTick = LeaseTick {
         holds: false,
         walk: WalkVerdict::NotWalked,
+        hand_over: false,
     };
     /// A tick on which we kept the slot we already held.
     pub const HELD: LeaseTick = LeaseTick {
         holds: true,
         walk: WalkVerdict::NotWalked,
+        hand_over: false,
+    };
+    /// A tick on which we hold the slot only until the idle tab is retired.
+    pub const HAND_OVER: LeaseTick = LeaseTick {
+        holds: true,
+        walk: WalkVerdict::NotWalked,
+        hand_over: true,
     };
 
     /// The report for a tick whose walk ran.
@@ -449,6 +524,7 @@ impl LeaseTick {
         LeaseTick {
             holds: matches!(walk, WalkVerdict::Acquired { .. }),
             walk,
+            hand_over: false,
         }
     }
 }
@@ -879,6 +955,8 @@ mod tests {
             spawn_grace_secs: GRACE_SECS,
             source: DesiredSource::Coord,
             slots: 1,
+            lane: LaneObs::Open,
+            idle_past_grace: false,
         }
     }
 
@@ -979,6 +1057,113 @@ mod tests {
         assert_eq!(
             hold_decision(0, 0, &obs(0, Liveness::Live)),
             HoldDecision::Keep
+        );
+    }
+
+    // -- D5: a lane-closed holder hands its slot over at its first idle tick --
+
+    /// A `Live` tab past its grace on a device whose lane reads `lane`.
+    fn lane_obs(lane: LaneObs, idle_past_grace: bool) -> LeaseTickObs {
+        LeaseTickObs {
+            lane,
+            idle_past_grace,
+            ..obs(1_000_000, Liveness::Live)
+        }
+    }
+
+    #[test]
+    fn a_drained_holder_with_an_idle_tab_retires_and_releases() {
+        // Mutation guard: a hold_decision that keeps the slot on a drain (the
+        // pre-D5 rule 2) fails here.
+        assert_eq!(
+            hold_decision(0, 0, &lane_obs(LaneObs::Closed, true)),
+            HoldDecision::HandOver
+        );
+        // The hand-over retires, whatever the decision core wanted...
+        for a in ALL_ACTIONS {
+            assert_eq!(handover_action(a, true), Action::Retire, "{a:?}");
+            assert_eq!(handover_action(a, false), a, "{a:?}");
+        }
+        // ...and with the tab gone the slot is released at once, never held
+        // through the orphan grace, and never re-walked into a respawn: a
+        // closed lane leaves the runner nothing it may spawn.
+        for l in [Liveness::Dead, Liveness::Exited] {
+            let gone = LeaseTickObs {
+                lane: LaneObs::Closed,
+                spawn_able: false,
+                ..obs(1, l)
+            };
+            assert_eq!(
+                hold_decision(0, 0, &gone),
+                HoldDecision::Release(ReleaseReason::LaneClosed),
+                "{l:?}"
+            );
+            assert!(!acquire_permitted(&gone, None), "{l:?}: no respawn");
+        }
+    }
+
+    #[test]
+    fn a_drained_holder_with_a_busy_tab_keeps_its_slot() {
+        assert_eq!(
+            hold_decision(0, 0, &lane_obs(LaneObs::Closed, false)),
+            HoldDecision::Keep,
+            "never mid-run: a busy tab keeps the slot until its next idle tick"
+        );
+        // A restore in flight is not idle either.
+        let pending = LeaseTickObs {
+            lane: LaneObs::Closed,
+            idle_past_grace: true,
+            ..obs(1_000_000, Liveness::PendingRestore)
+        };
+        assert_eq!(hold_decision(0, 0, &pending), HoldDecision::Keep);
+        // The tick the busy tab goes idle, it hands over.
+        assert_eq!(
+            hold_decision(0, 0, &lane_obs(LaneObs::Closed, true)),
+            HoldDecision::HandOver
+        );
+    }
+
+    #[test]
+    fn an_unknown_lane_releases_nothing() {
+        // An idle live tab keeps its slot at any age.
+        let ten_days = 10 * 24 * 3_600 * 1000;
+        let idle = LeaseTickObs {
+            now_ms: ten_days,
+            ..lane_obs(LaneObs::Unknown, true)
+        };
+        assert_eq!(hold_decision(0, 0, &idle), HoldDecision::Keep);
+        // A dead tab under an unknown lane still gets the full orphan grace —
+        // the unknown read never shortens it to the closed-lane release.
+        let g = orphan_grace_ms(GRACE_SECS);
+        let dead = LeaseTickObs {
+            lane: LaneObs::Unknown,
+            ..obs(g - 1, Liveness::Dead)
+        };
+        assert_eq!(hold_decision(0, 0, &dead), HoldDecision::Keep);
+        // And an open lane behaves exactly as before D5.
+        assert_eq!(
+            hold_decision(0, 0, &lane_obs(LaneObs::Open, true)),
+            HoldDecision::Keep
+        );
+    }
+
+    #[test]
+    fn a_role_closed_holder_releases_at_idle() {
+        // `RoleClosed` (bench / ci_node) folds to the same known-closed lane
+        // as a drain — the supervisor's `lane_obs` maps both — so it hands over
+        // at idle and keeps while busy, exactly like a drain.
+        assert_eq!(
+            hold_decision(0, 0, &lane_obs(LaneObs::Closed, true)),
+            HoldDecision::HandOver
+        );
+        assert_eq!(
+            hold_decision(0, 0, &lane_obs(LaneObs::Closed, false)),
+            HoldDecision::Keep
+        );
+        // An out-of-range slot is still released as OutOfRange first.
+        assert_eq!(
+            hold_decision(1, 0, &lane_obs(LaneObs::Closed, true)),
+            HoldDecision::Release(ReleaseReason::OutOfRange)
         );
     }
 
@@ -1212,6 +1397,8 @@ mod tests {
             spawn_grace_secs: GRACE_SECS,
             source,
             slots,
+            lane: LaneObs::Open,
+            idle_past_grace: false,
         };
 
         // -- Hold. --
@@ -1230,6 +1417,15 @@ mod tests {
                         r.last_orphan_release = Some(now);
                         may_walk = false; // never re-take the slot just given up
                     }
+                }
+                HoldDecision::HandOver => {
+                    // The simulation keeps every lane open; modelled anyway as
+                    // the supervisor runs it: retire the tab, then release.
+                    r.tab = Liveness::Dead;
+                    coord.release(&h.resource_key, r.name);
+                    r.releases.push((now, ReleaseReason::LaneClosed));
+                    r.held = None;
+                    may_walk = false;
                 }
                 HoldDecision::Keep => {
                     if still_held_after_heartbeat(&coord.heartbeat(&h.resource_key, r.name, now)) {
