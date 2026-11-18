@@ -5443,8 +5443,12 @@ fn derive_and_publish_legacy_posture(
     pins: PosturePinInputs,
     app: Option<&tauri::AppHandle>,
 ) {
-    record_recovery_inventory(RecoveryInventory::read(auth_manager));
-    let obs = legacy_slot_observation(auth_manager.probe_access_token());
+    let read = auth_manager.probe_access_token();
+    // A runner holding no credential at all (never paired, a guest tier) has
+    // nothing an outage can take away, so it is not warned about one.
+    let holds_credential = matches!(read, crate::secure_storage::StoredTokenRead::Present(_));
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), holds_credential);
+    let obs = legacy_slot_observation(read);
     if let Some(transition) =
         derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
     {
@@ -5651,7 +5655,8 @@ pub(crate) async fn refresh_tenant_slots(
     }
     // Before either posture publish below reads it, so the boot publish
     // already carries a missing-recovery warning (P2.3).
-    record_recovery_inventory(RecoveryInventory::read(auth_manager));
+    // Tenant slots exist, so this runner holds (or held) a credential.
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), true);
     let mut health: Vec<TenantSlotHealthRow> = Vec::with_capacity(tenants.len());
     // Phase 1 of the coord-credential-posture plan: what each slot HELD when
     // this pass looked at it — `(tenant, exp, present, unknown)`, pushed
@@ -6481,12 +6486,12 @@ pub(crate) fn recovery_inventory() -> RecoveryInventory {
 /// Record `inventory`, logging a warning when it first shows — or newly
 /// shows — that no automatic recovery is left (P2.3: a boot-time warning, not
 /// only an outage-time error).
-pub(crate) fn record_recovery_inventory(inventory: RecoveryInventory) {
+pub(crate) fn record_recovery_inventory(inventory: RecoveryInventory, holds_credential: bool) {
     let previous = replace_recovery_inventory(inventory);
     if previous == Some(inventory) {
         return;
     }
-    if inventory.needs_a_human_after_expiry() {
+    if holds_credential && inventory.needs_a_human_after_expiry() {
         warn!(
             "device_jwt_refresher: this runner holds neither a Cognito session nor a device \
              machine key ({}); the next outage longer than the device-JWT lifetime (~4 h) \

@@ -612,14 +612,19 @@ fn await_authorization_code(
             _ => {}
         }
         if server_done_rx.try_recv().is_ok() {
-            // Server stopped without a captured result — only happens on the
-            // internal 300s graceful-shutdown timeout (no browser callback).
+            // Server stopped without a captured result: the wait ran out, or a
+            // cancel/supersede landed after the check above. Re-read the cancel
+            // so a cancel is never reported as a timeout.
             break match received.lock().expect("mutex").take() {
                 Some(result) => result,
-                None => Err(
-                    "sign-in timed out after 5 minutes waiting for the browser callback"
-                        .to_string(),
-                ),
+                None => match cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    CANCEL_BY_USER => Err(SIGN_IN_CANCELLED.to_string()),
+                    CANCEL_SUPERSEDED => Err(SIGN_IN_SUPERSEDED.to_string()),
+                    _ => Err(
+                        "sign-in timed out after 5 minutes waiting for the browser callback"
+                            .to_string(),
+                    ),
+                },
             };
         }
         if Instant::now() >= deadline {
