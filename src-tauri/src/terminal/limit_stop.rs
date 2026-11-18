@@ -307,10 +307,18 @@ fn decide(bytes: &[u8], thread: Thread) -> Decision {
     // A subagent's transcript is often still being appended: a final line
     // with no newline yet is a write in progress, not a corrupt record, so it
     // is left out and the entry above it decides.
-    let bytes = match (thread, bytes.iter().rposition(|&b| b == b'\n')) {
-        (Thread::Subagent, Some(last_nl)) if !bytes.ends_with(b"\n") => &bytes[..=last_nl],
-        (Thread::Subagent, None) if !bytes.is_empty() => &bytes[..0],
-        _ => bytes,
+    // A final line that already parses is complete, newline or not.
+    let unterminated_start = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(last_nl) => last_nl + 1,
+        None => 0,
+    };
+    let partial_tail = thread == Thread::Subagent
+        && unterminated_start < bytes.len()
+        && serde_json::from_slice::<Value>(&bytes[unterminated_start..]).is_err();
+    let bytes = if partial_tail {
+        &bytes[..unterminated_start]
+    } else {
+        bytes
     };
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     // Set once a local command's output has been passed over, so the
@@ -1148,6 +1156,16 @@ mod tests {
         assert!(matches!(
             transcript_limit_stop(&main),
             LimitStopRead::Unreadable(ref why) if why.contains("subagent transcript")
+        ));
+    }
+
+    #[test]
+    fn a_complete_subagent_stop_whose_newline_has_not_landed_reads_stopped() {
+        let body = SUBAGENT_STOP.trim_end();
+        let (_dir, main) = session(SUBAGENT_PARENT, &[("agent-a0c1d2e3f4a5b6c7d.jsonl", body)]);
+        assert!(matches!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Stopped(ref s) if s.entry_uuid == SUBAGENT_STOP_UUID
         ));
     }
 

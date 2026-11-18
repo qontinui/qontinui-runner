@@ -104,7 +104,7 @@ fn a_closed_terminal_leaves_the_list() {
     seen.read.insert("t2".to_string());
     seen.retain_live(&live(&["t2"]));
     assert_eq!(
-        seen.unread(&["t1".to_string(), "t2".to_string()]),
+        seen.unread(&["t1".to_string(), "t2".to_string()], 0),
         vec!["t1".to_string()]
     );
 }
@@ -172,16 +172,18 @@ fn a_terminal_whose_transcript_reads_stopped_at_first_sight_is_handled_with_no_s
             read: vec!["parked".into(), "working".into()],
             stopped: vec![("parked".into(), "s-parked".into())],
             unreadable: vec!["gone".into()],
+            no_record: vec!["shell".into()],
         }
     );
 
     let mut seen = FirstSight::default();
     let mut parks = ParkList::default();
     assert_eq!(apply_first_sight(&mut seen, &mut parks, &pass, 50_000), 1);
-    // Read once per process; a terminal with no open record yet stays unread,
-    // and so does an UNKNOWN read until its third try.
+    // Read once per process. An UNKNOWN read stays unread until its third
+    // try; a terminal with no confirmed record is looked up again 5 min later.
+    assert_eq!(seen.unread(&candidates, 50_000), vec!["gone".to_string()]);
     assert_eq!(
-        seen.unread(&candidates),
+        seen.unread(&candidates, 350_000),
         vec!["gone".to_string(), "shell".to_string()]
     );
     let gone_again = FirstSightPass {
@@ -189,9 +191,10 @@ fn a_terminal_whose_transcript_reads_stopped_at_first_sight_is_handled_with_no_s
         ..FirstSightPass::default()
     };
     apply_first_sight(&mut seen, &mut parks, &gone_again, 50_000);
-    assert_eq!(seen.unread(&candidates).len(), 2);
+    assert_eq!(seen.unread(&candidates, 50_000), vec!["gone".to_string()]);
     apply_first_sight(&mut seen, &mut parks, &gone_again, 50_000);
-    assert_eq!(seen.unread(&candidates), vec!["shell".to_string()]);
+    assert!(seen.unread(&candidates, 50_000).is_empty());
+    assert_eq!(seen.unread(&candidates, 350_000), vec!["shell".to_string()]);
     // Enrolled as due now: the next tick hands it to the handler.
     let mut pacer = Pacer::default();
     let due = take_reentries(
@@ -260,8 +263,8 @@ fn a_fresh_registry_re_derives_the_park() {
     // first sight and enrols it again.
     let mut seen = FirstSight::default();
     let mut parks = ParkList::default();
-    assert_eq!(seen.unread(&candidates), candidates);
-    let pass = store.pass(&seen.unread(&candidates));
+    assert_eq!(seen.unread(&candidates, 0), candidates);
+    let pass = store.pass(&seen.unread(&candidates, 0));
     assert_eq!(apply_first_sight(&mut seen, &mut parks, &pass, 2_000), 1);
     assert_eq!(parks.get("t1").map(|p| p.due_at_ms), Some(2_000));
 }

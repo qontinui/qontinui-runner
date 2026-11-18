@@ -66,6 +66,10 @@ pub(crate) const REENTRY_RETRY_MS: i64 = super::limit_reset::PARK_WITHOUT_RESET_
 /// many reads in all, before the terminal counts as read.
 const FIRST_SIGHT_UNREADABLE_TRIES: u32 = 3;
 
+/// A live terminal with no confirmed open record (a plain shell, or a session
+/// not yet bound) is looked up again this long after a sweep found none.
+const NO_RECORD_RECHECK_MS: i64 = 5 * 60_000;
+
 /// How often a first-sight sweep may start. A sweep reads only terminals not
 /// yet read, so after boot most sweeps find nothing to do.
 const FIRST_SIGHT_INTERVAL: Duration = Duration::from_secs(15);
@@ -131,13 +135,18 @@ pub(crate) struct FirstSight {
     read: HashSet<String>,
     /// UNKNOWN reads so far of a terminal not yet counted as read.
     unreadable_tries: std::collections::HashMap<String, u32>,
+    /// Terminals a sweep found no confirmed record for, and when to look
+    /// again ([`NO_RECORD_RECHECK_MS`]).
+    no_record_until_ms: std::collections::HashMap<String, i64>,
 }
 
 impl FirstSight {
-    /// The live terminals not yet read, in `live`'s order.
-    pub(crate) fn unread(&self, live: &[String]) -> Vec<String> {
+    /// The live terminals not yet read and not waiting out a no-record
+    /// recheck at `now_ms`, in `live`'s order.
+    pub(crate) fn unread(&self, live: &[String], now_ms: i64) -> Vec<String> {
         live.iter()
             .filter(|t| !self.read.contains(*t))
+            .filter(|t| self.no_record_until_ms.get(*t).is_none_or(|&u| u <= now_ms))
             .cloned()
             .collect()
     }
@@ -146,6 +155,7 @@ impl FirstSight {
     pub(crate) fn retain_live(&mut self, live: &HashSet<&str>) {
         self.read.retain(|t| live.contains(t.as_str()));
         self.unreadable_tries.retain(|t, _| live.contains(t.as_str()));
+        self.no_record_until_ms.retain(|t, _| live.contains(t.as_str()));
     }
 }
 
@@ -163,6 +173,9 @@ pub(crate) struct FirstSightPass {
     /// read again on later sweeps ([`FIRST_SIGHT_UNREADABLE_TRIES`]); the
     /// hint path also reads such a pane when its screen matches.
     pub unreadable: Vec<String>,
+    /// Terminals with no confirmed open record yet: looked up again after
+    /// [`NO_RECORD_RECHECK_MS`].
+    pub no_record: Vec<String>,
 }
 
 /// One first-sight sweep over `candidates`. `open_record` finds a terminal's
@@ -178,6 +191,7 @@ pub(crate) fn first_sight_pass<R>(
     let mut pass = FirstSightPass::default();
     for terminal_id in candidates {
         let Some(record) = open_record(terminal_id) else {
+            pass.no_record.push(terminal_id.clone());
             continue;
         };
         match read_stop(&record) {
@@ -205,7 +219,12 @@ pub(crate) fn apply_first_sight(
     pass: &FirstSightPass,
     now_ms: i64,
 ) -> usize {
+    for terminal_id in &pass.no_record {
+        seen.no_record_until_ms
+            .insert(terminal_id.clone(), now_ms + NO_RECORD_RECHECK_MS);
+    }
     for terminal_id in &pass.read {
+        seen.no_record_until_ms.remove(terminal_id);
         seen.unreadable_tries.remove(terminal_id);
         seen.read.insert(terminal_id.clone());
     }
@@ -293,7 +312,7 @@ fn start_first_sight(live: &[String], live_set: &HashSet<&str>) {
         if last_started.is_some_and(|t| t.elapsed() < FIRST_SIGHT_INTERVAL) {
             return;
         }
-        let candidates = seen.unread(live);
+        let candidates = seen.unread(live, chrono::Utc::now().timestamp_millis());
         if candidates.is_empty() || FIRST_SIGHT_RUNNING.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -353,6 +372,9 @@ fn run_first_sight(candidates: &[String]) {
             unreadable = pass.unreadable.len(),
             "first-sight transcript check: some transcripts could not be read — left to the screen hint"
         );
+    }
+    if pass.read.is_empty() && pass.unreadable.is_empty() {
+        return;
     }
     info!(
         candidates = candidates.len(),

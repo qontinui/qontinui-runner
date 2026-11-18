@@ -187,6 +187,17 @@ async fn a_finished_session_is_never_continued() {
     let calls = env.calls();
     assert!(calls.continued.is_empty());
     assert_eq!(calls.skips, vec![SkipReason::Finished]);
+    // Final for this stop: a re-entry's retry park is dropped (plan Phase 3).
+    assert_eq!(calls.forgets, 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_transcript_keeps_the_pending_park() {
+    let env = Fake::new(LimitStopRead::Unreadable("cannot open transcript".to_string()));
+    run_hint(&env, SRC).await;
+    let calls = env.calls();
+    assert_eq!(calls.skips, vec![SkipReason::TranscriptUnreadable]);
+    assert_eq!(calls.forgets, 0);
 }
 
 #[tokio::test]
