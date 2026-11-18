@@ -295,6 +295,10 @@ const MADE_MARKER: &str = ".made-by-qontinui-test-pg";
 /// The file beside the cache lock naming the process that took the lock last
 /// ([`LockHolder`]), so a process waiting for the lock can say who holds it.
 const LOCK_HOLDER_FILE: &str = ".lock.holder";
+/// How old a partial holder file whose text is not a record must be before it
+/// is taken for a dead writer's ([`sweep_holder_partials`]): a write and a
+/// rename take milliseconds.
+const HOLDER_PARTIAL_GRACE: Duration = Duration::from_secs(60);
 /// How long a process waits for the template cache lock, and how it says so.
 /// A builder holds the lock exclusively for a whole build, whose `initdb` has
 /// no bound at all ([`COMMAND_TIMEOUT`]), so a build that never ends would
@@ -1273,11 +1277,18 @@ fn read_lock_holder(dir: &Path) -> Option<LockHolder> {
 /// Remove the partial holder files (`.lock.holder.<pid>-<nonce>`,
 /// [`write_lock_holder`]) in `dir` that a process no longer live left behind,
 /// by dying between the write and the rename. Run under the cache lock, which
-/// its caller has just taken. A file whose text records its process is judged
-/// as a waiter judges a named holder ([`LockHolder::is_live`]: pid and start);
-/// one whose text cannot be read as a record — cut short by the death — by the
-/// pid in its name alone. A live process's file is never removed: it may be
-/// mid-write. One line per removal or failure.
+/// its caller has just taken. One line per removal or failure.
+///
+/// - A file whose text reads as a record of the pid in its name is judged as a
+///   waiter judges a named holder ([`LockHolder::is_live`]): removed only when
+///   that process is gone — a record from another PID namespace counts as live
+///   and is kept.
+/// - A file whose text does not read as a record — empty, or cut short by a
+///   death or by a writer still writing — says nothing of its namespace, so
+///   its pid cannot be judged from here alone: it is removed only once it is
+///   older than [`HOLDER_PARTIAL_GRACE`], far longer than any write and
+///   rename take, AND its pid is not live in this namespace. A writer in
+///   another namespace mid-write is protected by the grace, not by its pid.
 fn sweep_holder_partials(dir: &Path) -> Vec<String> {
     let prefix = format!("{LOCK_HOLDER_FILE}.");
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1295,16 +1306,19 @@ fn sweep_holder_partials(dir: &Path) -> Vec<String> {
             continue;
         };
         let path = entry.path();
-        let live = match std::fs::read_to_string(&path)
+        let keep = match std::fs::read_to_string(&path)
             .ok()
             .as_deref()
             .and_then(LockHolder::parse)
             .filter(|holder| holder.pid == pid)
         {
             Some(holder) => holder.is_live(),
-            None => crate::runner_breadcrumb::pid_is_live(pid),
+            None => {
+                !modified_before(&path, HOLDER_PARTIAL_GRACE)
+                    || crate::runner_breadcrumb::pid_is_live(pid)
+            }
         };
-        if live {
+        if keep {
             continue;
         }
         lines.push(match std::fs::remove_file(&path) {
@@ -3275,7 +3289,7 @@ fn require_private(dir: &Path, named: bool) -> Result<(), String> {
             let remedy = if named {
                 fresh_dir.clone()
             } else {
-                "remove it, and the harness makes it again".to_string()
+                format!("remove it, and the harness makes it again, or {fresh_dir}")
             };
             return Err(format!(
                 "{} carries the harness's mark but is writable by its group or others (mode \
@@ -3296,7 +3310,9 @@ fn require_private(dir: &Path, named: bool) -> Result<(), String> {
                 .map(|e| format!(" (setting it to 0700 failed: {e})"))
                 .unwrap_or_default();
             let remedy = match (made, named) {
-                (true, false) => "remove it, and the harness makes it again".to_string(),
+                (true, false) => {
+                    format!("remove it, and the harness makes it again, or {fresh_dir}")
+                }
                 (false, false) => format!(
                     "make it private yourself (chmod 700; the harness changes the mode only \
                      of a directory it made), remove it if it is an old harness directory or \
@@ -3909,6 +3925,16 @@ mod tests {
         CHILD_TIMEOUT.as_secs() >= LOCK_PATIENCE.give_up.as_secs() + 240,
         "a child must outlive one holder's hold on the cache lock"
     );
+    /// How long the `slow-hang` child waits after booting before it reports:
+    /// longer than the overrun self-test's after-boot limit
+    /// ([`OVERRUN_LIMIT`]).
+    const SLOW_REPORT_DELAY: Duration = Duration::from_secs(12);
+    /// The overrun self-test's after-boot limit.
+    const OVERRUN_LIMIT: Duration = Duration::from_secs(10);
+    const _: () = assert!(
+        SLOW_REPORT_DELAY.as_secs() > OVERRUN_LIMIT.as_secs(),
+        "the slow child must report after a spawn-timed limit would have expired"
+    );
     /// How long a postmaster may take to disappear after its process ended (on
     /// Windows the job's kill lands asynchronously).
     const DEATH_WAIT: Duration = Duration::from_secs(30);
@@ -3956,6 +3982,9 @@ mod tests {
     /// - `hang`: boot, report, and wait to be killed — failing if it is not
     ///   within [`CHILD_TIMEOUT`]. Its report is renamed into place, so a parent
     ///   polling for it never reads half of one.
+    /// - `slow-hang`: as `hang`, but it waits [`SLOW_REPORT_DELAY`] after
+    ///   booting before it reports, so a limit timed from the spawn rather than
+    ///   from the report would expire before the boot signal arrives.
     /// - `boot-failure`: ask for a database from a harness that cannot boot.
     #[test]
     #[ignore = "child-process helper; run by its parent test"]
@@ -3980,9 +4009,12 @@ mod tests {
                     );
                 }
             }
-            "hang" => {
+            "hang" | "slow-hang" => {
                 let _database = fresh_database_blocking();
                 let facts = embedded_facts().expect("the child runs on the bundled cluster");
+                if mode == "slow-hang" {
+                    std::thread::sleep(SLOW_REPORT_DELAY);
+                }
                 let report = PathBuf::from(std::env::var(CHILD_REPORT_ENV).expect("report path"));
                 let partial = report.with_extension("partial");
                 std::fs::write(&partial, render_facts(&facts)).expect("write the child report");
@@ -4046,8 +4078,9 @@ mod tests {
     /// on Windows its kill-on-close job, which takes the postmaster with it.
     /// Either way its cluster is then ended, once proven its, and its root
     /// removed ([`ReapChildCluster::of_child`]): the one its report names, and
-    /// any root named for its pid in the harness directory, which covers a
-    /// child killed after its postmaster started but before its report.
+    /// any root in the harness directory whose owner record is the child's,
+    /// which covers a child killed after its postmaster started but before its
+    /// report.
     fn run_child_within(
         mode: &str,
         report: &Path,
@@ -4101,10 +4134,12 @@ mod tests {
             }
             outcome => {
                 let pid = child.id();
+                // Read while the child is unreaped, so the pid is still its.
+                let started = process_start(pid);
                 drop(tree);
                 let _ = child.kill();
                 let _ = child.wait();
-                let _reap = ReapChildCluster::of_child(report, pid, harness_dir);
+                let _reap = ReapChildCluster::of_child(report, pid, started, harness_dir);
                 panic!(
                     "the {mode} child (pid {pid}) did not finish within {} s {phase} \
                      ({outcome:?}):\n{}",
@@ -4150,14 +4185,28 @@ mod tests {
             )
         }
 
-        /// [`Self::reported`], and every root named for the child's `pid` in
-        /// its harness directory (`named_dir`, else the one this process
-        /// resolves, which the child shares): a child killed between its
+        /// [`Self::reported`], and every root in the child's harness directory
+        /// (`named_dir`, else the one this process resolves, which the child
+        /// shares) that the child itself created: a child killed between its
         /// postmaster's start and its report leaves a root and a cluster that
-        /// no report names. Only for a child that has been killed and reaped,
-        /// whose roots nothing else owns; each postmaster is still ended only
-        /// once proven a postmaster of that root's data directory.
-        fn of_child(report: &Path, pid: u32, named_dir: Option<&Path>) -> Self {
+        /// no report names.
+        ///
+        /// A root is taken only when its owner record ([`OWNER_FILE`]) names
+        /// the child's `pid`, this process's PID namespace (the child's), and
+        /// the child's `started` ([`process_start`], read while the child was
+        /// still unreaped, so its pid could not yet name another process). A
+        /// root with no record, or a record naming another namespace, another
+        /// start, or none, is left alone for the dead-owner sweep
+        /// ([`sweep_dead_roots`]): it may be a live peer's whose pid is the
+        /// same number. With no `started` — off Linux and Windows — nothing is
+        /// taken this way. Each postmaster is still ended only once proven a
+        /// postmaster of that root's data directory.
+        fn of_child(
+            report: &Path,
+            pid: u32,
+            started: Option<u64>,
+            named_dir: Option<&Path>,
+        ) -> Self {
             let mut reap = Self::reported(report);
             let dir = named_dir
                 .map(Path::to_path_buf)
@@ -4171,8 +4220,13 @@ mod tests {
                 .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
                 .map(|entry| entry.path())
                 .collect();
+            let own_ns = own_pid_namespace().map(str::to_owned);
             for root in named {
-                if !reap.0.iter().any(|(known, _)| same_dir(known, &root)) {
+                let created_by_the_child = started.is_some()
+                    && read_owner(&root).is_some_and(|owner| {
+                        owner.pid == pid && owner.pid_ns == own_ns && owner.started == started
+                    });
+                if created_by_the_child && !reap.0.iter().any(|(known, _)| same_dir(known, &root)) {
                     reap.0.push((root, None));
                 }
             }
@@ -4308,22 +4362,24 @@ mod tests {
     /// starts only once the child has booted (its report is its boot signal),
     /// so however long it takes to build or enter the bundled cache — it always
     /// runs on the bundled cluster, whatever server the parent uses — is
-    /// bounded by [`CHILD_TIMEOUT`] alone. Unix only: on Windows the child's
-    /// kill-on-close job takes the cluster with it.
+    /// bounded by [`CHILD_TIMEOUT`] alone. The child is `slow-hang`, which
+    /// reports [`SLOW_REPORT_DELAY`] after it booted: a limit timed from the
+    /// spawn would expire first, and the failure would be a boot timeout. Unix
+    /// only: on Windows the child's kill-on-close job takes the cluster with
+    /// it.
     #[cfg(unix)]
     #[test]
     fn a_child_that_overruns_fails_with_its_output_and_leaves_no_cluster() {
-        const OVERRUN_LIMIT: Duration = Duration::from_secs(10);
         let scratch = tempfile::tempdir().expect("scratch directory");
         let report = scratch.path().join("child-report");
         let overran = std::panic::catch_unwind(|| {
-            run_child_within("hang", &report, None, OVERRUN_LIMIT);
+            run_child_within("slow-hang", &report, None, OVERRUN_LIMIT);
         });
         // Ends what a broken run_child_within left, after the asserts below.
         let _reap = ReapChildCluster::reported(&report);
         let failure = panic_message(
             overran
-                .expect_err("a hang child must overrun its limit")
+                .expect_err("a slow-hang child must overrun its limit")
                 .as_ref(),
         );
         let text = std::fs::read_to_string(&report).unwrap_or_else(|e| {
@@ -4335,8 +4391,10 @@ mod tests {
         });
         let facts = parse_facts(&text).expect("the hang child's report");
         assert!(
-            failure.contains("did not finish within 10 s after booting")
-                && failure.contains("--- child stderr ---")
+            failure.contains(&format!(
+                "did not finish within {} s after booting",
+                OVERRUN_LIMIT.as_secs()
+            )) && failure.contains("--- child stderr ---")
                 && failure.contains("bundled PostgreSQL"),
             "the failure carries what the child said, its boot line among it: {failure}"
         );
@@ -4911,8 +4969,11 @@ mod tests {
             assert!(
                 refused.contains(&dir.display().to_string())
                     && refused.contains("writable by its group or others")
-                    && refused.contains("remove it"),
-                "the error names the directory and the remedy: {refused}"
+                    && refused.contains("remove it")
+                    && refused.contains(&format!("point {HARNESS_DIR_ENV} at a directory"))
+                    && refused.contains("does not exist yet"),
+                "the error names the directory and both remedies, removing it or naming a \
+                 fresh one (a filesystem that holds no modes makes removal loop): {refused}"
             );
             assert_eq!(
                 mode_of(&dir),
@@ -5588,9 +5649,12 @@ mod tests {
     }
 
     /// The process that takes the cache lock removes the partial holder files
-    /// processes no longer live left behind — judged by the record in the file
-    /// where it reads as one, else by the pid in its name — and never a live
-    /// process's, which may be mid-write.
+    /// processes no longer live left behind, and never a live process's, which
+    /// may be mid-write. A file that reads as a record is judged by that record
+    /// (pid and start); one that does not is removed only once it is older
+    /// than [`HOLDER_PARTIAL_GRACE`] and its pid is not live here. The
+    /// cut-short cases name `u32::MAX`, which no process has on any platform,
+    /// so they do not depend on a reaped pid staying free.
     #[tokio::test]
     async fn a_lock_taker_sweeps_only_dead_processes_partial_holder_files() {
         let gone = || {
@@ -5603,6 +5667,14 @@ mod tests {
             child.wait().expect("reap it");
             child.id()
         };
+        let age = |path: &Path| {
+            let aged = SystemTime::now() - HOLDER_PARTIAL_GRACE - Duration::from_secs(60);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.set_modified(aged))
+                .unwrap_or_else(|e| panic!("age {}: {e}", path.display()));
+        };
         let scratch = tempfile::tempdir().expect("scratch directory");
         let dir = scratch.path();
         let partial = |pid: u32, nonce: &str| dir.join(format!("{LOCK_HOLDER_FILE}.{pid}-{nonce}"));
@@ -5613,15 +5685,23 @@ mod tests {
             }
             .render()
         };
+        assert!(
+            !crate::runner_breadcrumb::pid_is_live(u32::MAX),
+            "u32::MAX must name no process"
+        );
 
         let dead_recorded = partial(gone(), "a");
-        let dead_cut_short = partial(gone(), "b");
+        let aged_cut_short = partial(u32::MAX, "b");
+        let fresh_cut_short = partial(u32::MAX, "e");
         let own = partial(std::process::id(), "c");
-        let live_cut_short = partial(a_live_pid_not_ours(), "d");
+        let live_aged_cut_short = partial(a_live_pid_not_ours(), "d");
         std::fs::write(&dead_recorded, record(gone_pid_of(&dead_recorded))).expect("plant");
-        std::fs::write(&dead_cut_short, "pid=").expect("plant");
+        std::fs::write(&aged_cut_short, "pid=").expect("plant");
+        std::fs::write(&fresh_cut_short, "").expect("plant");
         std::fs::write(&own, record(std::process::id())).expect("plant");
-        std::fs::write(&live_cut_short, "").expect("plant");
+        std::fs::write(&live_aged_cut_short, "").expect("plant");
+        age(&aged_cut_short);
+        age(&live_aged_cut_short);
         std::fs::write(dir.join(LOCK_HOLDER_FILE), record(std::process::id())).expect("plant");
 
         let lock = open_lock(dir).expect("the cache lock");
@@ -5637,7 +5717,7 @@ mod tests {
         .expect("an uncontested lock is taken");
         let _ = lock.unlock();
 
-        for removed in [&dead_recorded, &dead_cut_short] {
+        for removed in [&dead_recorded, &aged_cut_short] {
             assert!(
                 !removed.exists(),
                 "a dead process's partial holder file {} survived: {lines:?}",
@@ -5650,7 +5730,11 @@ mod tests {
                 "its removal was not said: {lines:?}"
             );
         }
-        for kept in [&own, &live_cut_short] {
+        assert!(
+            fresh_cut_short.exists(),
+            "a cut-short partial younger than the grace was removed: it may be mid-write"
+        );
+        for kept in [&own, &live_aged_cut_short] {
             assert!(
                 kept.exists(),
                 "a live process's partial holder file {} was removed",
@@ -5661,6 +5745,59 @@ mod tests {
             dir.join(LOCK_HOLDER_FILE).is_file(),
             "the holder file itself is not a partial"
         );
+    }
+
+    /// The root scan of [`ReapChildCluster::of_child`] takes only a root whose
+    /// owner record is the child's — its pid, this namespace, its start — and
+    /// leaves one under the same pid whose record names another start, or that
+    /// has no record: it may be a live peer's. Neither root has a postmaster.
+    #[test]
+    fn the_child_root_scan_takes_only_roots_the_child_created() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path();
+        let pid = std::process::id();
+        let started = process_start(pid);
+        let plant = |nonce: &str, owner: Option<Owner>| {
+            let root = dir.join(format!("{RUN_PREFIX}{pid}-{nonce}"));
+            std::fs::create_dir(&root).expect("plant a root");
+            if let Some(owner) = owner {
+                write_owner(&root, &owner).expect("write its owner record");
+            }
+            root
+        };
+        let childs = Owner::this_process("scan", None);
+        let other_start = Owner {
+            started: Some(childs.started.map_or(1, |at| at + 1)),
+            ..childs.clone()
+        };
+        let other_ns = Owner {
+            pid_ns: Some("pid:[another]".to_string()),
+            ..childs.clone()
+        };
+        let created = plant("created", Some(childs));
+        let peer_start = plant("peer-start", Some(other_start));
+        let peer_ns = plant("peer-ns", Some(other_ns));
+        let unrecorded = plant("unrecorded", None);
+
+        drop(ReapChildCluster::of_child(
+            &dir.join("no-report"),
+            pid,
+            started,
+            Some(dir),
+        ));
+
+        assert_eq!(
+            !created.exists(),
+            started.is_some(),
+            "a root whose record is the child's is taken wherever a start is read"
+        );
+        for left in [&peer_start, &peer_ns, &unrecorded] {
+            assert!(
+                left.exists(),
+                "{} is not the child's, and was taken",
+                left.display()
+            );
+        }
     }
 
     /// The pid in a partial holder file's name.
