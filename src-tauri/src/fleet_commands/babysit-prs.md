@@ -1,7 +1,7 @@
 ---
 description: "Shepherd this session's PRs to landed — watch CI, fix red in-session, diagnose green-but-stuck PRs via coord's pr-merge events, merge a diagnosed coord defect directly through the one notifying door (scripts/agent-direct-merge.sh; served policy git-operations direct-merge-with-notification, operator decision 2026-10-16), then write a remediation plan and run /vet-imp on it so coord itself gets fixed."
 argument-hint: "[repo#123 ...] [--threshold=45m] [--no-merge] [--no-remediate] [--once]"
-allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate
+allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate, Agent
 ---
 
 # Babysit PRs — shepherd session PRs to landed
@@ -554,6 +554,40 @@ only for what it sends you to fix:
   migration-bearing PRs check `alembic heads` against PR ∪ main; a conflict
   here is a REAL failure to fix now (re-parent onto the new chain tip),
   because coord's speculative CI will hit it even though the PR looks green.
+
+**Claim the PR before the first commit of every fix round** — the
+`Transient infra` re-run above changes no head and needs no claim; a `Real
+failure` fix and a stale-green re-parent do. Authorship does not keep coord's
+own fixers off a head: coord's `pr_fix` dispatch, a Merge
+Shepherd on another machine and a peer running this command all read one
+exclusion, the reserved claim `coord_adopt_pr` writes (plan
+`2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap` D3.3). So,
+once Step 3 has decided to change the PR and before you commit:
+
+```
+coord_adopt_pr {repo: "<owner/repo>", pr_number: <N>, head_sha: "<current head, full sha>", action: "claim"}
+```
+
+- **`claimed`** — you hold the head. Fix, commit, push, then release:
+  `{..., head_sha: "<the head you claimed>", action: "release", pushed_head: "<the FULL 40-character sha you pushed>"}`.
+  With `pushed_head`, coord holds your pushed head with an observe marker while
+  its CI runs, so no other worker picks up a head whose fix is already in CI. An
+  abbreviated sha is refused, so read it with `git rev-parse HEAD`. If the
+  release is refused because `pushed_head` is an unknown argument (a coord that
+  predates it), release again without it.
+- **`held_by`** — another worker holds this head (a coord fixer agent, or a
+  session at `session:<uuid>`, which `coord_send_message` reaches). Do not push
+  to the branch. Wait and claim again in a later round. `held_by` at tier 14 is
+  someone's pushed head whose CI is still running.
+- **`head_not_current`** — re-read the head and claim once more.
+- **`capped`** — the PR's shared attempt budget is spent. Stop fixing it and
+  report it as `blocked-legitimate` with the answer quoted.
+- **`not_visible`**, an error, or the tool unreachable over every door
+  (`coord-revive.sh call coord_adopt_pr '<json>'` is the fallback) — UNKNOWN.
+  Make no commit to the PR this round; say so in the exit report.
+
+Release every claim you still hold before you exit, whatever the outcome
+(`action: "release"`, no `pushed_head` when nothing was pushed).
 
 ## Step 4 — Green-or-no-CI past threshold → diagnose via coord
 
@@ -1581,6 +1615,15 @@ Then:
    adoption; `RENEWED` means your own session already holds it, which is
    yours only when your own earlier call for that key printed UNKNOWN. Exit 2
    is UNKNOWN: do not adopt on it.
+   **The `adopt-wip:` reservation says who adopts the work; it does not keep
+   coord's fixers off the original PR.** So before your first commit, ALSO take
+   the original PR's reserved claim, as in Step 3:
+   `coord_adopt_pr {repo, pr_number: <N>, head_sha: <its current head>, action: "claim"}`.
+   Adopt only on `claimed`. `held_by` means another worker holds that head, so
+   release your `adopt-wip:` reservation and do not adopt. Release the
+   `coord_adopt_pr` claim (no `pushed_head`, since you never push to the
+   original) once your new PR reads back, together with the `adopt-wip:` release
+   above. The two locks answer different questions, and an adoption holds both.
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
    branch off current `origin/main` (cherry-pick or re-apply in a worktree —
@@ -1748,6 +1791,37 @@ an admin-merge happened — produces a plan so the defect class dies:
   UNKNOWN is the expected failure here, so **say which check actually ran** in the
   exit report rather than recording the dedupe as passed.
 - **Don't race coord.** An in-flight queue proposal always wins; wait.
+- **Subagents are counted by coord, and fixers stay bounded.** Every subagent
+  this command starts (a fresh-context reviewer, or a fixer) first takes a child
+  slot: `coord_child_slot {action: "acquire"}`, and spawns only on `granted`.
+  Run every child as a BACKGROUND Agent call: a foreground child blocks you, and
+  a blocked parent cannot heartbeat. While children run, poll them on a bounded
+  timer (every few minutes, well inside the slot's 600 s lapse) and heartbeat
+  every slot you hold on each poll (`{action: "heartbeat", n}`). Never end a turn
+  only waiting on a child. Release each slot (`{action: "release", n}`) as soon
+  as its child returns. A refused acquire, an error, or a coord that does not
+  serve `coord_child_slot` at all reads as REFUSED:
+  - a **fixer** is not spawned; do that work yourself, serially;
+  - a **reviewer** whose review a gate requires (a pre-PR review, the
+    independence review an expedite or an adoption needs) is never replaced by
+    an inline self-review: inline review is legitimate only under a recorded
+    `degrade` disposition (served `verification-and-evidence`
+    `code-review-invocation-path`). Release any other child slot you hold and
+    retry the acquire with a bounded backoff, 3 tries over about 10 minutes.
+    Still refused: open no PR (and request no expedite) for that change, push
+    the branch, and report the PR as `blocked-legitimate` with
+    `pre-PR review owed; reviewer child slot refused (held_by=<key>)`.
+
+  Step 3 fixes in-session. A dedicated shepherding session that splits red PRs
+  across fixer subagents follows the served `agent_playbook/merge-shepherd` §4
+  rule: at most 3 fixers at once and only as many as coord granted; related PRs
+  in ONE repo whose changed files do not overlap (`coord_conflict_check`); each
+  PR claimed with `coord_adopt_pr` before its child starts and released with
+  `pushed_head` after the push; at the first refused slot, claim none of the
+  batch's remaining PRs. There are no nested subagents, no child started in the
+  background and killed later, and no fan-out against one shared cause.
+  Children pass no `effort`, so they inherit yours, and they never claim or take
+  slots themselves: this session is the single claimant.
 - **Report on exit**: per-PR final state (merged-by-coord / `expedited-landed (request <id>)` / `expedite-pending (request <id>)` / `expedite-refused (<code>[, request <id>])` / `expedite-unreached (<observed>)` / **handed-to-operator**
   / admin-merged [after request <id>] / fixed-and-waiting / blocked-legitimate / operator-escalated
   / `handed-to-train (gate <id>)` for a closeout exit (Step 2), with its check
