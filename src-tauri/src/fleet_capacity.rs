@@ -538,23 +538,66 @@ fn prepare_live() -> Prepared<impl Future<Output = Fetched> + Send + 'static> {
         ));
     };
     // The file the sample publisher reads: a device with no samples has no row.
-    let Some(device) = crate::fleet::load_device_file() else {
-        return Prepared::Done(Fetched::unknown(
-            None,
-            "~/.qontinui/machine.json names no device_id and hostname, so this runner has no \
-             device to ask about",
-        ));
-    };
-    let Ok(device_id) = Uuid::parse_str(device.device_id.trim()) else {
-        return Prepared::Done(Fetched::unknown(
-            None,
-            "~/.qontinui/machine.json's device_id is not a UUID",
-        ));
+    let device_id = match device_from(qontinui_runner_lib::ambient::try_read_machine_json()) {
+        Ok(device_id) => device_id,
+        Err(reason) => return Prepared::Done(Fetched::unknown(None, reason)),
     };
     Prepared::Fetch {
         device_id,
         fut: fetch_live(base, device_id),
     }
+}
+
+/// The device a read of `machine.json` names, or why it names none. PURE.
+///
+/// The requirements are the sample publisher's (`fleet::load_device_file`):
+/// a `device_id` AND a `hostname`, since a device the publisher skips has no
+/// samples and so no row in coord's model. Each way the file can fail them
+/// has its own reason, naming the path whenever one resolved.
+fn device_from(
+    read: Result<
+        qontinui_runner_lib::ambient::MachineJson,
+        qontinui_runner_lib::ambient::MachineJsonError,
+    >,
+) -> Result<Uuid, String> {
+    use qontinui_runner_lib::ambient::MachineJsonError;
+    const FILE: &str = "~/.qontinui/machine.json";
+    let machine = match read {
+        Ok(machine) => machine,
+        Err(e) => {
+            let path = e
+                .path()
+                .map_or_else(|| FILE.to_string(), |p| p.display().to_string());
+            return Err(match e {
+                MachineJsonError::NoHomeDir => format!(
+                    "no home directory resolved (no QONTINUI_HOME, no home), so there is no \
+                     {FILE} to name this runner's device"
+                ),
+                ref missing if missing.is_missing() => {
+                    format!("{path} does not exist, so this runner has no device to ask about")
+                }
+                MachineJsonError::Read { source, .. } => {
+                    format!("{path} could not be read ({source}), so this runner has no device")
+                }
+                MachineJsonError::Parse { source, .. } => format!(
+                    "{path} is not a valid machine.json ({source}), so this runner has no device"
+                ),
+            });
+        }
+    };
+    let Some(device_id) = machine.device_id.as_deref() else {
+        return Err(format!(
+            "{FILE} names no device_id, so this runner has no device to ask about"
+        ));
+    };
+    if machine.hostname.is_none() {
+        return Err(format!(
+            "{FILE} names no hostname: the sample publisher skips a device with no hostname, \
+             so coord holds no row for it"
+        ));
+    }
+    Uuid::parse_str(device_id.trim())
+        .map_err(|_| format!("{FILE}'s device_id {device_id:?} is not a UUID"))
 }
 
 /// The asynchronous stage of a live read, once [`prepare_live`] resolved the
@@ -1376,6 +1419,118 @@ mod tests {
             reason.contains("HTTP 404 device_not_in_plan: not a workstation"),
             "{reason}"
         );
+    }
+
+    /// A parsed `machine.json` from `doc`.
+    fn machine(
+        doc: Value,
+    ) -> Result<
+        qontinui_runner_lib::ambient::MachineJson,
+        qontinui_runner_lib::ambient::MachineJsonError,
+    > {
+        Ok(
+            qontinui_runner_lib::ambient::try_parse_machine_json(
+                &serde_json::to_vec(&doc).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn device_reason(
+        read: Result<
+            qontinui_runner_lib::ambient::MachineJson,
+            qontinui_runner_lib::ambient::MachineJsonError,
+        >,
+    ) -> String {
+        device_from(read).expect_err("names no device")
+    }
+
+    #[test]
+    fn device_from_a_complete_file_is_its_device() {
+        let read = machine(json!({"device_id": device().to_string(), "hostname": "nawa"}));
+        assert_eq!(device_from(read), Ok(device()));
+    }
+
+    #[test]
+    fn device_from_no_home_dir_says_so() {
+        let reason = device_reason(Err(
+            qontinui_runner_lib::ambient::MachineJsonError::NoHomeDir,
+        ));
+        assert!(reason.contains("no home directory resolved"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_missing_file_says_it_does_not_exist() {
+        let reason = device_reason(Err(qontinui_runner_lib::ambient::MachineJsonError::Read {
+            path: "/h/.qontinui/machine.json".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }));
+        assert!(
+            reason.contains("/h/.qontinui/machine.json does not exist"),
+            "{reason}"
+        );
+        assert!(!reason.contains("names no"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_an_unreadable_file_names_the_io_error() {
+        let reason = device_reason(Err(qontinui_runner_lib::ambient::MachineJsonError::Read {
+            path: "/h/.qontinui/machine.json".into(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied"),
+        }));
+        assert!(
+            reason.contains("/h/.qontinui/machine.json could not be read (access denied)"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn device_from_an_unparseable_file_names_the_parse_error() {
+        let source = serde_json::from_slice::<Value>(b"{not json").unwrap_err();
+        let detail = source.to_string();
+        let reason = device_reason(Err(qontinui_runner_lib::ambient::MachineJsonError::Parse {
+            path: "/h/.qontinui/machine.json".into(),
+            source,
+        }));
+        assert!(
+            reason.contains("/h/.qontinui/machine.json is not a valid machine.json"),
+            "{reason}"
+        );
+        assert!(reason.contains(&detail), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_file_without_device_id_says_only_that() {
+        let reason = device_reason(machine(json!({"hostname": "nawa"})));
+        assert!(reason.contains("names no device_id"), "{reason}");
+        assert!(!reason.contains("hostname"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_file_without_hostname_says_coord_holds_no_row() {
+        let reason = device_reason(machine(json!({"device_id": device().to_string()})));
+        assert!(reason.contains("names no hostname"), "{reason}");
+        assert!(
+            reason.contains("the sample publisher skips a device with no hostname"),
+            "{reason}"
+        );
+        assert!(reason.contains("coord holds no row for it"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_device_id_that_is_not_a_uuid_says_so() {
+        let reason = device_reason(machine(json!({"device_id": "nawa-1", "hostname": "nawa"})));
+        assert!(reason.contains("\"nawa-1\" is not a UUID"), "{reason}");
+    }
+
+    /// On an isolated machine the real reader finds no file, and the reason
+    /// says the file is missing (not that it names nothing).
+    #[test]
+    fn device_from_the_isolated_machine_says_the_file_is_missing() {
+        let _amb = crate::test_env::isolated_ambient();
+        let reason = device_reason(qontinui_runner_lib::ambient::try_read_machine_json());
+        assert!(reason.contains("does not exist"), "{reason}");
+        assert!(reason.contains("machine.json"), "{reason}");
     }
 
     /// The fields a local tool reads are a contract: each is present (null
