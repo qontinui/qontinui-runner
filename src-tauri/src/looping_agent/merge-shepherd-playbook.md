@@ -62,7 +62,7 @@ The Fixer's contract: work in an **isolated worktree**, make the minimal fix, pu
    - `granted`: journal `{repo, pr, head_sha, child_slot_n}` (the `n` it returned), then start that PR's Fixer.
    - `refused` (any `held_by`, such as `device_launch_full`, `launch_capacity_unknown`, `child_session_cap` or `child_tenant_cap`): start no more Fixers this cycle, and **stop walking the batch: claim none of its remaining PRs.** You still hold this PR's claim, so work it yourself, serially, once the running Fixers have reported, or release the claim if you will not reach it this cycle. There is no floor of one Fixer. A refusal is the answer; do not retry it this cycle.
    - a tool error from a coord that serves `coord_child_slot`: treat it as `refused`. A Fixer that a deployed admission did not grant must not run.
-   - **any other answer** — the tool is missing, unknown, unreachable or silent: apply "Resolving `coord_child_slot`" below. Only its positive `404` proof lets a Fixer start uncounted (still within the width of 3), and the cycle summary then says so.
+   - **any other answer** — the tool is missing, unknown, unreachable or silent: apply "Resolving `coord_child_slot`" below. Only its positive proof (`404` with `no_such_route`, probed this cycle) lets a Fixer start uncounted (still within the width of 3), and the cycle summary then says so.
 3. **While Fixers run**, keep their slots alive yourself. Start every Fixer as a **background** subagent: a foreground one blocks you, and a blocked parent cannot heartbeat. Then wait for them with the `Monitor` tool on a bounded until-loop with a timeout of a few minutes (well inside 600 s), never a foreground sleep, and on each wake heartbeat every granted slot (`coord_child_slot` `heartbeat` with its `n`) and check every Fixer. Never end your turn only waiting for a Fixer: if none has reported, poll again. A slot lapses 600 s after its last acquire or heartbeat. A heartbeat answering `not_held` or `stolen` means coord no longer counts that Fixer. Let it finish, but start no new Fixer until it has reported. Release each slot as soon as its Fixer returns.
 4. **When a Fixer reports**, verify what it says against GitHub (the push is on the PR branch; `gh pr checks`) and coord. Then release its PR claim (with `pushed_head` when it pushed; see "PR claims" step 3), release its child slot (`coord_child_slot` `release` with its `n`), retire its worktree, and journal all three. Before the cycle ends, every Fixer has reported `fixed`, `needs-human` or `gave-up`, and every claim and child slot it used is released.
 
@@ -78,15 +78,23 @@ from a stale runner-proxy allowlist):
    `ToolSearch` (`select:` its name). A tool that loads is used: call it.
 2. **Probe coord's own door** when it does not load, or its call is
    rejected as an unknown tool or method. This is unauthenticated and goes
-   around both the MCP client and the runner proxy:
+   around both the MCP client and the runner proxy. Run it afresh before
+   EVERY uncounted spawn, in this cycle; never reuse an answer from the
+   journal, an earlier cycle or an earlier report:
 
    ```bash
-   curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}'
+   out=$(curl -sS -m 10 -w '\n%{http_code}' -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}')
+   code=${out##*$'\n'}
+   case "$out" in *'"error":"no_such_route"'*) err=no_such_route ;; *) err=other ;; esac
+   echo "code=$code error=$err at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    ```
 
-   - exactly `404` — **child slots are not deployed**. Start the child
-     uncounted, as before child slots existed, within every other rule here.
-     There is no slot to heartbeat or release for it.
+   - `code=404` AND `error=no_such_route` (coord's own typed answer for a
+     path it does not register) — **child slots are not deployed**. Start
+     the child uncounted, as before child slots existed, within every other
+     rule here. There is no slot to heartbeat or release for it.
+   - `code=404` with any other body (a proxy, a load balancer, a captive
+     portal) — not coord's answer, so it proves nothing: a refusal.
    - any other HTTP code (`401`, `403`, `405`, `422`, ...) — the route
      exists, so admission IS deployed and the tool must work. Call it through
      `coord-revive.sh call coord_child_slot '{"action":"acquire"}'` (the
@@ -97,8 +105,9 @@ from a stale runner-proxy allowlist):
    Fixer, and work that PR yourself, serially.
 
 Whenever a child runs uncounted, record the proof in the journal (and the cycle summary): the
-probe's HTTP code and its UTC time. Whenever a transport failure refused a
-child, record the door and the exact error.
+probe's `code`, its `error` value and its UTC time, from THIS cycle's
+probe. Whenever a transport failure refused a child, record the door and
+the exact error.
 
 **Forbidden shapes:** no nested subagents (a Fixer starts nothing), no Fixer started in the background and killed later, no parallel watchers. **Never fan out against a systemic fault.** When the batch's PRs fail for one shared cause (Principle 4, the Systemic row), diagnose it once with no Fixers at all. Start every Fixer without an `effort` argument, so it inherits yours.
 
@@ -180,4 +189,4 @@ Coord's own fixers (the `pr_fix` dispatch and coord's in-coord Unlandable Shephe
 3. **One claim per change, released when the change is reported.** The Fixer pushes and then reports `{fixed | needs-human | gave-up}` (§4) — that report is the end of the change. Release the claim you took in step 1 (`action: "release"`, with `head_sha` set to the SAME head you claimed). **When the change pushed, also pass `pushed_head`: the FULL 40-character sha you pushed** (read it with `git rev-parse HEAD` after the push; an abbreviated sha is refused). If the release is refused because `pushed_head` is an unknown argument (a coord that predates it), release again without `pushed_head`, and journal that the pushed head is unheld while its CI runs. coord then holds that new head for you with an observe marker until its CI concludes, the PR closes, or the hold outlives the repo's stuck threshold. While it holds, no other Shepherd and no coord `pr_fix` dispatch can take a head whose fix is already in CI. The marker draws nothing from the PR's attempt budget. Journal the release and the `observing` block it answers with. Do **not** claim the new head yourself: claiming it only to release it again spends a second attempt from the PR's budget for nothing. A claim answered `held_by` at tier 14 is another worker's pushed head whose CI is still running: skip that PR and claim again in a later cycle. The same applies to an inline rebase: claim, rebase, push, release with `pushed_head`.
 4. **Never leave a claim behind.** If you stop working a PR for any reason (cooldown, error, relaunch mid-change), release what you hold. After a relaunch, release every claim your journal records without a matching release before taking any new one; a release refused because you are no longer the claimant is journaled and left to coord's takeover of dead holders. A release answering `released`, `not_held` or `held_by` closes that journal entry either way; only a tool error leaves it open for the next cycle. A claim held by a session that has ended is taken over by coord, but do not rely on that. Release every child slot (`coord_child_slot` `release`) and red-main lease (`coord_alert_release`) you hold on the same terms. A relaunched you is a new session and cannot release the previous session's slots or leases: its child slots lapse within 600 s and its alert leases at their deadline, so journal them as lapsing and do not retry.
 
-**If `coord_adopt_pr` cannot be reached** (coord-mcp down or a stale proxy nonce), you cannot claim, so **dispatch no Fixer and make no rebase** until it is reachable again. This overrides the coord-transport note's "just continue GitHub-only" for anything that CHANGES a PR: diagnosing, journaling and surfacing continue GitHub-only as before. The same rule covers `coord_child_slot` when its transport is down: start no Fixer, and work your claimed PRs yourself, one at a time. Only the positive `404` proof in §4 ("Resolving `coord_child_slot`") lets a Fixer start uncounted.
+**If `coord_adopt_pr` cannot be reached** (coord-mcp down or a stale proxy nonce), you cannot claim, so **dispatch no Fixer and make no rebase** until it is reachable again. This overrides the coord-transport note's "just continue GitHub-only" for anything that CHANGES a PR: diagnosing, journaling and surfacing continue GitHub-only as before. The same rule covers `coord_child_slot` when its transport is down: start no Fixer, and work your claimed PRs yourself, one at a time. Only the positive proof in §4 ("Resolving `coord_child_slot`": `404` with `no_such_route`, probed this cycle) lets a Fixer start uncounted.

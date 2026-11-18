@@ -202,7 +202,12 @@ mod tests {
         // are refusals; the proof is journaled.
         assert!(pb.contains("#### Resolving `coord_child_slot`"));
         assert!(pb.contains("https://coord.qontinui.io/coord/child-slots"));
-        assert!(pb.contains("exactly `404` — **child slots are not deployed**"));
+        assert!(pb.contains("`code=404` AND `error=no_such_route`"));
+        assert!(pb.contains("**child slots are not deployed**"));
+        assert!(pb.contains("*'\"error\":\"no_such_route\"'*) err=no_such_route"));
+        assert!(pb.contains("`code=404` with any other body"));
+        assert!(pb.contains("Run it afresh before\n   EVERY uncounted spawn"));
+        assert!(pb.contains("never reuse an answer from the\n   journal"));
         assert!(pb.contains("exists, so admission IS deployed"));
         assert!(pb.contains("`000` or a timeout — UNKNOWN, which is a refusal"));
         assert!(pb.contains("**Transport down**"));

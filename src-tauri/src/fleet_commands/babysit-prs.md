@@ -1807,15 +1807,23 @@ an admin-merge happened — produces a plan so the defect class dies:
      `ToolSearch` (`select:` its name). A tool that loads is used: call it.
   2. **Probe coord's own door** when it does not load, or its call is
      rejected as an unknown tool or method. This is unauthenticated and goes
-     around both the MCP client and the runner proxy:
+     around both the MCP client and the runner proxy. Run it afresh before
+     EVERY uncounted spawn, in this cycle; never reuse an answer from the
+     journal, an earlier cycle or an earlier report:
 
      ```bash
-     curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}'
+     out=$(curl -sS -m 10 -w '\n%{http_code}' -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}')
+     code=${out##*$'\n'}
+     case "$out" in *'"error":"no_such_route"'*) err=no_such_route ;; *) err=other ;; esac
+     echo "code=$code error=$err at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
      ```
 
-     - exactly `404` — **child slots are not deployed**. Start the child
-       uncounted, as before child slots existed, within every other rule here.
-       There is no slot to heartbeat or release for it.
+     - `code=404` AND `error=no_such_route` (coord's own typed answer for a
+       path it does not register) — **child slots are not deployed**. Start
+       the child uncounted, as before child slots existed, within every other
+       rule here. There is no slot to heartbeat or release for it.
+     - `code=404` with any other body (a proxy, a load balancer, a captive
+       portal) — not coord's answer, so it proves nothing: a refusal.
      - any other HTTP code (`401`, `403`, `405`, `422`, ...) — the route
        exists, so admission IS deployed and the tool must work. Call it through
        `coord-revive.sh call coord_child_slot '{"action":"acquire"}'` (the
@@ -1827,8 +1835,9 @@ an admin-merge happened — produces a plan so the defect class dies:
      reviews inline.
 
   Whenever a child runs uncounted, record the proof in the exit report: the
-  probe's HTTP code and its UTC time. Whenever a transport failure refused a
-  child, record the door and the exact error.
+  probe's `code`, its `error` value and its UTC time, from THIS cycle's
+  probe. Whenever a transport failure refused a child, record the door and
+  the exact error.
 
   Run every child as a
   BACKGROUND Agent call: a foreground child blocks you, and a blocked parent
