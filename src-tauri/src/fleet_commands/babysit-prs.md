@@ -1793,24 +1793,37 @@ an admin-merge happened — produces a plan so the defect class dies:
 - **Don't race coord.** An in-flight queue proposal always wins; wait.
 - **Subagents are counted by coord, and fixers stay bounded.** Every subagent
   this command starts (a fresh-context reviewer, or a fixer) first takes a child
-  slot: `coord_child_slot {action: "acquire"}`, and spawns only on `granted`.
-  Run every child as a BACKGROUND Agent call: a foreground child blocks you, and
-  a blocked parent cannot heartbeat. While children run, poll them on a bounded
-  timer (every few minutes, well inside the slot's 600 s lapse) and heartbeat
-  every slot you hold on each poll (`{action: "heartbeat", n}`). Never end a turn
-  only waiting on a child. Release each slot (`{action: "release", n}`) as soon
-  as its child returns. A refused acquire, an error, or a coord that does not
-  serve `coord_child_slot` at all reads as REFUSED:
+  slot: `coord_child_slot {action: "acquire"}`, and spawns on `granted`.
+  **Child slots not deployed** (the tool is not in your tool list, or the call
+  is rejected as an unknown tool or method) is NOT a refusal: spawn the child
+  uncounted, as before child slots existed, and say in the exit report that it
+  ran uncounted because child slots are not deployed. Run every child as a
+  BACKGROUND Agent call: a foreground child blocks you, and a blocked parent
+  cannot heartbeat. Wait for children with `Monitor` on a bounded until-loop
+  with a timeout of a few minutes (well inside the slot's 600 s lapse), never a
+  foreground sleep; on each wake heartbeat every slot you hold
+  (`{action: "heartbeat", n}`) and check every child. Never end a turn only
+  waiting on a child. Release each slot (`{action: "release", n}`) as soon as its
+  child returns. An explicit `refused`, or an error from a coord that serves the
+  tool, is a REFUSAL:
   - a **fixer** is not spawned; do that work yourself, serially;
   - a **reviewer** whose review a gate requires (a pre-PR review, the
     independence review an expedite or an adoption needs) is never replaced by
     an inline self-review: inline review is legitimate only under a recorded
     `degrade` disposition (served `verification-and-evidence`
-    `code-review-invocation-path`). Release any other child slot you hold and
-    retry the acquire with a bounded backoff, 3 tries over about 10 minutes.
-    Still refused: open no PR (and request no expedite) for that change, push
-    the branch, and report the PR as `blocked-legitimate` with
-    `pre-PR review owed; reviewer child slot refused (held_by=<key>)`.
+    `code-review-invocation-path`). Release the slot of every child that has
+    already returned (a child still running stays counted), and retry the
+    acquire with a bounded backoff, 3 tries over about 10 minutes. Still
+    refused: open no PR and request no expedite for that change, and report the
+    PR as `blocked-legitimate` with
+    `pre-PR review owed; reviewer child slot refused (held_by=<key>)`. For a
+    pre-PR review, record it through `review-arm-record.sh`: the registry read in `reads[]` as it
+    came back, with `"blocked": "pre-PR review owed; reviewer child slot refused
+    (held_by=<key>)"` added to that read row; NO `reviews[]` row, because no
+    review ran; and no arm of your own invention. When the change is an
+    adoption's NEW branch, push that branch so the work survives the worktree's
+    reclaim; never push to an open PR's head on this stop, because that push
+    would be the unreviewed change.
 
   Step 3 fixes in-session. A dedicated shepherding session that splits red PRs
   across fixer subagents follows the served `agent_playbook/merge-shepherd` §4

@@ -195,7 +195,12 @@ mod tests {
         assert!(pb.contains("claim, then child slot"));
         assert!(pb.contains("`granted`"));
         assert!(pb.contains("`heartbeat`"));
-        assert!(pb.contains("A Fixer that coord does not count must not run"));
+        assert!(pb.contains("A Fixer that a deployed admission did not grant must not run"));
+        // Undeployed admission is not a refusal: the Fixer runs uncounted.
+        assert!(pb.contains("**child slots not deployed**"));
+        assert!(pb.contains("Start the Fixer uncounted"));
+        // The wait door is Monitor on a bounded until-loop.
+        assert!(pb.contains("the `Monitor` tool on a bounded until-loop"));
         // D3.5: the parent is the single claimant.
         assert!(pb.contains("You are the single claimant"));
         // D4 grouping: one repo, file-disjoint.
