@@ -409,6 +409,13 @@ pub struct LedgerAftermath {
     /// Earlier boots' records, read once at open: their writers are gone.
     earlier: Arc<Vec<AftermathRecord>>,
     state: Mutex<State>,
+    /// The highest write generation whose bytes landed on disk. Held across
+    /// the file write (never together with `state`), so writes land in
+    /// generation order and a stale one never overwrites a newer one.
+    disk_gen: Mutex<u64>,
+    /// The file writer; a field so a test can watch what the lock is doing
+    /// while it runs.
+    write: fn(&Path, &[u8]) -> std::io::Result<()>,
 }
 
 #[derive(Debug, Default)]
@@ -416,9 +423,12 @@ struct State {
     sessions: BTreeMap<String, SessionAftermath>,
     /// Something changed since the last write landed.
     dirty: bool,
-    /// The bytes of the last write that landed: a write happens only when the
-    /// record would change.
-    written: Option<Vec<u8>>,
+    /// The bytes of the newest write handed out (landed or in flight): a write
+    /// happens only when the record would change. Cleared when that write
+    /// fails, so the retry is not mistaken for a no-op.
+    handed: Option<Vec<u8>>,
+    /// The generation of the newest write handed out.
+    write_gen: u64,
     newest_tick: Option<ProcessTick>,
 }
 
@@ -474,6 +484,8 @@ impl LedgerAftermath {
             roster,
             earlier: Arc::new(earlier),
             state: Mutex::new(State::default()),
+            disk_gen: Mutex::new(0),
+            write: write_record,
         }
     }
 
@@ -485,7 +497,7 @@ impl LedgerAftermath {
     /// this boot's landed restore stamps, and the close and finish of every
     /// prior-roster row the registry holds. A row the registry no longer holds
     /// keeps what was recorded — the record outlives the prune. Returns whether
-    /// a write landed.
+    /// THIS call's write landed (false when the same bytes are already in flight).
     pub fn observe_registry(&self, records: &[TerminalSessionRecord]) -> bool {
         if self.roster.is_empty() {
             return false;
@@ -531,7 +543,7 @@ impl LedgerAftermath {
             }
         }
         st.dirty |= changed;
-        self.persist_if_dirty(&mut st)
+        self.persist_if_dirty(st)
     }
 
     /// Feed (b), after the poll's classify loop: the ids it `KeepAlive`d this
@@ -583,7 +595,7 @@ impl LedgerAftermath {
         };
         st.newest_tick = Some(ProcessTick { at_ms, read });
         st.dirty |= changed;
-        self.persist_if_dirty(&mut st)
+        self.persist_if_dirty(st)
     }
 
     /// Does an idle tick still need a process read? Only while some
@@ -659,10 +671,44 @@ impl LedgerAftermath {
 
     /// Write the record when something changed and its bytes would differ.
     /// Fail-soft: a failure logs, leaves the record dirty (the next feed
-    /// retries) and returns `false`.
-    fn persist_if_dirty(&self, st: &mut State) -> bool {
-        if !st.dirty {
+    /// retries) and returns `false`. The record is serialized under the state
+    /// lock and written after it is released, so a slow disk never stalls the
+    /// feeds that share the lock.
+    fn persist_if_dirty(&self, st: MutexGuard<'_, State>) -> bool {
+        let Some((write_gen, bytes, sessions)) = self.reserve_write(st) else {
             return false;
+        };
+        match self.flush(write_gen, &bytes) {
+            Flushed::Landed => {
+                debug!(
+                    path = %self.path.display(),
+                    sessions,
+                    "ledger aftermath: persisted"
+                );
+                true
+            }
+            Flushed::Superseded => false,
+            Flushed::Failed(e) => {
+                warn!(
+                    error = %e,
+                    path = %self.path.display(),
+                    "ledger aftermath: write failed — kept in memory, retried on the next change"
+                );
+                let mut st = self.lock();
+                if st.write_gen == write_gen {
+                    st.dirty = true;
+                    st.handed = None;
+                }
+                false
+            }
+        }
+    }
+
+    /// Under the state lock: serialize the record and hand out the next write
+    /// generation, or `None` when nothing needs writing. Consumes the guard.
+    fn reserve_write(&self, mut st: MutexGuard<'_, State>) -> Option<(u64, Vec<u8>, usize)> {
+        if !st.dirty {
+            return None;
         }
         let record = AftermathRecordRef {
             aftermath_version: AFTERMATH_VERSION,
@@ -674,30 +720,44 @@ impl LedgerAftermath {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "ledger aftermath: serialize failed — not persisted");
-                return false;
+                return None;
             }
         };
-        if st.written.as_deref() == Some(bytes.as_slice()) {
+        if st.handed.as_deref() == Some(bytes.as_slice()) {
             st.dirty = false;
-            return false;
+            return None;
         }
-        if let Err(e) = write_record(&self.path, &bytes) {
-            warn!(
-                error = %e,
-                path = %self.path.display(),
-                "ledger aftermath: write failed — kept in memory, retried on the next change"
-            );
-            return false;
-        }
-        debug!(
-            path = %self.path.display(),
-            sessions = st.sessions.len(),
-            "ledger aftermath: persisted"
-        );
-        st.written = Some(bytes);
+        st.write_gen += 1;
+        st.handed = Some(bytes.clone());
         st.dirty = false;
-        true
+        Some((st.write_gen, bytes, st.sessions.len()))
     }
+
+    /// Write `bytes` unless a newer generation already landed. Takes no state
+    /// lock. When a newer generation's write FAILED, an older one may still
+    /// land behind it; the failure re-marks the record dirty, so the next feed
+    /// rewrites the newest state.
+    fn flush(&self, write_gen: u64, bytes: &[u8]) -> Flushed {
+        let mut landed = self.disk_gen.lock().unwrap_or_else(|e| e.into_inner());
+        if write_gen < *landed {
+            return Flushed::Superseded;
+        }
+        match (self.write)(&self.path, bytes) {
+            Ok(()) => {
+                *landed = write_gen;
+                Flushed::Landed
+            }
+            Err(e) => Flushed::Failed(e),
+        }
+    }
+}
+
+/// How one handed-out write ended.
+enum Flushed {
+    Landed,
+    /// A newer generation is already on disk; this one was dropped.
+    Superseded,
+    Failed(std::io::Error),
 }
 
 fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -756,12 +816,28 @@ fn retain_earlier(
     boot_ms: i64,
     retained_generation_files: &HashSet<String>,
 ) -> Vec<AftermathRecord> {
+    retain_earlier_with(dir, boot_ms, retained_generation_files, read_record_file)
+}
+
+fn retain_earlier_with(
+    dir: &Path,
+    boot_ms: i64,
+    retained_generation_files: &HashSet<String>,
+    read: impl Fn(&Path) -> RecordFile,
+) -> Vec<AftermathRecord> {
+    // A record names the generation its boot retained, rotated at or before
+    // that boot, so a record from a boot older than every retained generation
+    // can name none of them — however unreadable it is.
+    let oldest_generation = retained_generation_files
+        .iter()
+        .filter_map(|n| session_ledger::parse_generation_file_name(n))
+        .min();
     let mut kept: Vec<(PathBuf, AftermathRecord)> = Vec::new();
     for (stamp, path) in record_files_in(dir) {
         if stamp == boot_ms {
             continue;
         }
-        match read_record_file(&path) {
+        match read(&path) {
             RecordFile::Ok(rec)
                 if rec
                     .generation_file
@@ -772,7 +848,13 @@ fn retain_earlier(
             }
             RecordFile::Ok(_) => remove_record(&path, "names no retained generation"),
             RecordFile::Unreadable => remove_record(&path, "unreadable"),
-            RecordFile::Io => {}
+            // Possibly transient, so kept — unless its boot predates every
+            // retained generation, when no later read could make it count.
+            RecordFile::Io => {
+                if oldest_generation.is_some_and(|oldest| stamp < oldest) {
+                    remove_record(&path, "unreadable and older than every retained generation");
+                }
+            }
         }
     }
     kept.sort_by_key(|(_, rec)| std::cmp::Reverse(rec.boot_ms));

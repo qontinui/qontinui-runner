@@ -972,3 +972,101 @@ async fn measure_the_idle_tick_snapshot_and_read() {
     );
     assert!(snapshot + reading < Duration::from_secs(30));
 }
+
+/// Mutation: `retain_earlier_with`'s `RecordFile::Io` arm goes back to `{}`.
+/// A permanently unreadable record escaped the per-generation cap; one whose
+/// boot predates every retained generation names none of them and goes, one
+/// that could still name a retained generation stays (the read may be
+/// transient).
+#[test]
+fn an_unreadable_record_older_than_every_retained_generation_is_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    // GEN is `session-ledger.1000.json`: boots 10 and 999 predate it.
+    for boot in [10, 999, 1_500] {
+        std::fs::write(dir.path().join(aftermath_file_name(boot)), b"x").unwrap();
+    }
+    let retained: HashSet<String> = [GEN.to_string()].into_iter().collect();
+
+    let earlier = retain_earlier_with(dir.path(), 5_000, &retained, |_| RecordFile::Io);
+
+    assert!(earlier.is_empty());
+    let mut left: Vec<i64> = record_files_in(dir.path())
+        .into_iter()
+        .map(|(b, _)| b)
+        .collect();
+    left.sort_unstable();
+    assert_eq!(
+        left,
+        vec![1_500],
+        "only the one that could still count stays"
+    );
+
+    // With no retained generation to compare against, nothing is pruned on
+    // the strength of an unreadable file alone.
+    let none: HashSet<String> = HashSet::new();
+    retain_earlier_with(dir.path(), 5_000, &none, |_| RecordFile::Io);
+    assert_eq!(record_files_in(dir.path()).len(), 1);
+}
+
+thread_local! {
+    static LOCK_FREE_DURING_WRITE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static PROBED: std::cell::RefCell<Option<std::sync::Arc<LedgerAftermath>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn probing_writer(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let free = PROBED.with(|p| p.borrow().as_ref().map(|a| a.state.try_lock().is_ok()));
+    LOCK_FREE_DURING_WRITE.with(|c| c.set(free));
+    write_record(path, bytes)
+}
+
+/// Mutation: `persist_if_dirty` writes while holding the state guard (the
+/// guard passed through `flush` instead of dropped in `reserve_write`).
+#[test]
+fn the_file_is_written_without_holding_the_state_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = open_at(dir.path(), BOOT, &roster(&["s1"]));
+    a.write = probing_writer;
+    let a = std::sync::Arc::new(a);
+    PROBED.with(|p| *p.borrow_mut() = Some(std::sync::Arc::clone(&a)));
+
+    assert!(a.observe_tick(3_000, &[("s1".to_string(), Direct)], held(&[])));
+
+    assert_eq!(
+        LOCK_FREE_DURING_WRITE.with(|c| c.get()),
+        Some(true),
+        "the writer ran, and the state lock was free while it did"
+    );
+    PROBED.with(|p| *p.borrow_mut() = None);
+}
+
+/// Mutation: `flush` drops its `write_gen < *landed` check. Two writes are
+/// handed out; the newer lands first, then the older one arrives late.
+#[test]
+fn a_stale_write_never_overwrites_a_newer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open_at(dir.path(), BOOT, &roster(&["s1"]));
+    let reserve = |came_back: i64| {
+        {
+            let mut st = a.lock();
+            st.sessions
+                .entry("s1".to_string())
+                .or_default()
+                .came_back_at = Some(came_back);
+            st.dirty = true;
+        }
+        a.reserve_write(a.lock()).expect("a write is handed out")
+    };
+    let (older_gen, older_bytes, _) = reserve(1_000);
+    let (newer_gen, newer_bytes, _) = reserve(2_000);
+    assert!(newer_gen > older_gen);
+
+    assert!(matches!(a.flush(newer_gen, &newer_bytes), Flushed::Landed));
+    assert!(matches!(
+        a.flush(older_gen, &older_bytes),
+        Flushed::Superseded
+    ));
+
+    let on_disk = std::fs::read(dir.path().join(aftermath_file_name(BOOT))).unwrap();
+    assert_eq!(on_disk, newer_bytes, "the newer record is what is on disk");
+}
