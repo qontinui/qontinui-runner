@@ -61,6 +61,11 @@ import {
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useAuth } from "@/components/AuthProvider";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
@@ -227,8 +232,13 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       );
     } catch (err) {
       const msg = typeof err === "string" ? err : String(err);
-      setFlowError(msg);
-      onLog("error", `Qontinui sign-in failed: ${msg}`);
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (isSignInCancelled(err)) {
+        onLog("info", "Qontinui sign-in cancelled");
+      } else {
+        setFlowError(msg);
+        onLog("error", `Qontinui sign-in failed: ${msg}`);
+      }
     } finally {
       setCognitoState("idle");
     }
@@ -472,6 +482,11 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
           </div>
         )}
       </div>
+
+      <PendingSignInNotice
+        active={cognitoState === "signing-in"}
+        noBrowserHint={NO_BROWSER_HINT.settings}
+      />
 
       {flowError && (
         <div className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-200">

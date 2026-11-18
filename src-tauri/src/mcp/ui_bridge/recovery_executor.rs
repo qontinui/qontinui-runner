@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
 
-use super::ai_analyze::ATTEMPT_SUCCEEDED;
+use super::ai_analyze::{attempt_verdict, AttemptVerdict, ATTEMPT_SUCCEEDED};
 use super::diagnostics::{extract_error_code, CanonicalCode};
 use super::request::{action_outcome, ui_bridge_request_sync, ActionOutcome};
 
@@ -425,7 +425,8 @@ fn original_action_retry_outcome(retry: &Result<serde_json::Value, String>) -> R
 }
 
 /// Read the frontend's reply to the scoped recovery attempt
-/// (`ai_recovery_attempt`): `Ok` iff it says [`ATTEMPT_SUCCEEDED`] is `true`.
+/// (`ai_recovery_attempt`): `Ok` iff [`attempt_verdict`] reads it as
+/// [`AttemptVerdict::Acted`], i.e. [`ATTEMPT_SUCCEEDED`] is `true`.
 ///
 /// Deliberately NOT [`action_outcome`]. The scoped attempt's SUCCESS reply
 /// carries no `success` key: the frontend answers the envelope's
@@ -437,32 +438,44 @@ fn original_action_retry_outcome(retry: &Result<serde_json::Value, String>) -> R
 /// ([`super::request::extract_response_data`]). Read strictly, every
 /// successful attempt would be indeterminate, so `Err`, and the retry that
 /// only `Ok` reaches would never run. The verdict lives in the field the
-/// runner already names, [`ATTEMPT_SUCCEEDED`], which
-/// `ai_analyze::as_recovery_failure` reads too.
+/// runner already names, [`ATTEMPT_SUCCEEDED`].
 ///
-/// - an explicit `success: false` is `Err`, whatever else the body says (the
-///   dispatcher stamps the envelope's refusal — `RECOVERY_UNSCOPED`,
-///   `RECOVERY_TARGET_MISSING`, `RECOVERY_FAILED` — onto `data`);
-/// - an `attemptSucceeded` that is `false`, missing, or not a boolean is
-///   `Err`: an absent verdict is not a success here either;
-/// - only `attemptSucceeded: true` is `Ok`.
+/// That field has two readers, this one and `ai_analyze::as_recovery_failure`
+/// (the HTTP answer of `/ai/recovery/attempt`), and both read it strictly
+/// through [`attempt_verdict`]. Until plan
+/// `2026-11-10-the-recovery-attempt-route-never-reads-a-missing-verdict-as-success`
+/// they disagreed about a missing value: this reader refused it while the
+/// route passed it through as a 200. This function is now a thin adapter that
+/// turns the shared verdict into the `Result` the retry ladder consumes:
+///
+/// - [`AttemptVerdict::DidNotAct`] is `Err`. That covers an explicit
+///   `success: false`, whatever else the body says (the dispatcher stamps the
+///   envelope's refusal — `RECOVERY_UNSCOPED`, `RECOVERY_TARGET_MISSING`,
+///   `RECOVERY_FAILED` — onto `data`), and `attemptSucceeded: false`.
+/// - [`AttemptVerdict::Unstated`], an `attemptSucceeded` that is missing or
+///   not a boolean, is `Err` as well, with `INDETERMINATE:` text. Neither
+///   reader treats a missing verdict as success.
+/// - Only [`AttemptVerdict::Acted`] is `Ok`.
+///
+/// An `Err` carries the reply's own `error` text when it has one. Otherwise it
+/// says `LLM recovery failed` (did not act) or gives the `INDETERMINATE:` text
+/// (no verdict).
 ///
 /// `Ok` means only that the scoped executor ACTED on the addressed element.
 /// Whether the original action now succeeds is the retry's question
 /// ([`original_action_retry_outcome`]).
 fn scoped_attempt_verdict(reply: serde_json::Value) -> Result<serde_json::Value, String> {
-    let refused = reply.get("success").and_then(|v| v.as_bool()) == Some(false);
-    let attempt_succeeded = reply.get(ATTEMPT_SUCCEEDED).and_then(|v| v.as_bool());
-    if !refused && attempt_succeeded == Some(true) {
-        return Ok(reply);
-    }
-    if let Some(error) = reply.get("error").and_then(|v| v.as_str()) {
-        return Err(error.to_string());
-    }
-    Err(if !refused && attempt_succeeded.is_none() {
-        format!("INDETERMINATE: scoped recovery reply carried no boolean `{ATTEMPT_SUCCEEDED}`")
-    } else {
-        "LLM recovery failed".to_string()
+    let verdict = attempt_verdict(&reply);
+    let fallback = match verdict {
+        AttemptVerdict::Acted => return Ok(reply),
+        AttemptVerdict::DidNotAct => "LLM recovery failed".to_string(),
+        AttemptVerdict::Unstated => {
+            format!("INDETERMINATE: scoped recovery reply carried no boolean `{ATTEMPT_SUCCEEDED}`")
+        }
+    };
+    Err(match reply.get("error").and_then(|v| v.as_str()) {
+        Some(error) => error.to_string(),
+        None => fallback,
     })
 }
 
@@ -1067,6 +1080,40 @@ mod tests {
             let err = scoped_attempt_verdict(silent.clone())
                 .expect_err("a reply with no boolean `attemptSucceeded` is no verdict");
             assert!(err.starts_with("INDETERMINATE:"), "{silent}: {err}");
+        }
+    }
+
+    /// The two readers of `attemptSucceeded` give the same answer for every
+    /// reply shape: `scoped_attempt_verdict` here, and the route's
+    /// `ai_analyze::as_recovery_failure`. A reply is a success in one exactly
+    /// when it is a success in the other. Until plan
+    /// `2026-11-10-the-recovery-attempt-route-never-reads-a-missing-verdict-as-success`
+    /// they disagreed about a missing verdict: the route answered 200 and this
+    /// reader refused it.
+    #[test]
+    fn both_readers_of_the_scoped_verdict_agree_on_every_reply_shape() {
+        for reply in [
+            json!({ "attemptSucceeded": true }),
+            json!({ "attemptSucceeded": true, "elementId": "btn-1" }),
+            json!({ "attemptSucceeded": false }),
+            json!({ "success": false, "attemptSucceeded": true }),
+            json!({
+                "success": false,
+                "error": "RECOVERY_UNSCOPED: no elementId",
+                "attemptSucceeded": false,
+            }),
+            json!({}),
+            json!({ "something": "else" }),
+            json!({ "success": true }),
+            json!({ "attemptSucceeded": null }),
+            json!({ "attemptSucceeded": "true" }),
+        ] {
+            let route_ok = super::super::ai_analyze::as_recovery_failure(Ok(axum::Json(
+                crate::mcp::types::ApiResponse::success(reply.clone()),
+            )))
+            .is_ok();
+            let ladder_ok = scoped_attempt_verdict(reply.clone()).is_ok();
+            assert_eq!(route_ok, ladder_ok, "{reply}");
         }
     }
 

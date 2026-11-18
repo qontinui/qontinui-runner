@@ -2890,6 +2890,18 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    work_unit_id=<uuid> plan_slug=<plan stem>`. It merges rather than replaces,
    so it will not erase the `plan_slug` / `intent` `/preflight` Step 5 wrote, and
    it exits 0 on every path.
+   **Then declare the plan's phases on the unit, best-effort:**
+   `bash <workspace-root>/qontinui-claude-config/scripts/declare-plan-phases.sh <plan stem> <plan file>`.
+   This upsert carries no `metadata`, and on a multi-bound device no scanner
+   writes `phases` either, so without it `coord_work_unit_attest_phase` refuses
+   every phase ("no established phase declaration"). The script skips a
+   plan-backed unit, patches only on a difference, refuses any declaration that
+   drops a phase coord has established (a narrowing is patched by hand), and
+   bounds its own run time; its header is the contract. Quote its one verdict
+   line in the vet report and continue whatever it says: it never blocks the vet.
+   Until the runner ships `qontinui-pr plan-phase-declaration` (that plan's
+   Phase 1), the verdict is `UNKNOWN` on every box: expected, not a fault.
+   `/implement-plan` Step 0.5 runs the same script.
 2. **Always: resolve the operator's `device_id` DYNAMICALLY** (never hardcode a
    UUID): env `QONTINUI_MACHINE_ID` first, else read `~/.qontinui/machine.json`
    and parse `"device_id"` (fall back to `"machine_id"` if present).

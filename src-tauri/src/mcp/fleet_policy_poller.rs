@@ -477,11 +477,15 @@ fn set_floors(floors: SessionFloorsByLane) {
 // without its age: `capacity_model_view` serves it with `read_at` and
 // `age_secs`, and a consumer that wants a staleness rule reads them there.
 
-/// One recorded dial: the block as coord served it, and when it was read.
+/// One recorded dial: the block as coord served it, which coord served it,
+/// and when it was read.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CapacityModelReading {
     /// The `capacity_model` block, unchanged.
     pub(crate) dial: serde_json::Value,
+    /// The coord base the controls poll that carried it dialled
+    /// (`fetch_fleet_policy`'s `coord_base_with_source`).
+    pub(crate) coord_base: String,
     /// When the poll that carried it was answered.
     pub(crate) read_at: chrono::DateTime<chrono::Utc>,
 }
@@ -512,8 +516,8 @@ pub(crate) fn capacity_model_dial() -> Option<CapacityModelReading> {
 }
 
 /// The dial as it is served beside a capacity read, at `now`:
-/// `{"state":"known","value":<the block, unchanged>,"read_at":<RFC 3339>,
-/// "age_secs":<f64>}`, or `{"state":"unknown","reason":…}` before the first
+/// `{"state":"known","value":<the block, unchanged>,"coord_base":<the coord
+/// that served it>,"read_at":<RFC 3339>,"age_secs":<f64>}`, or `{"state":"unknown","reason":…}` before the first
 /// dial-carrying answer — which a consumer reads as "keep the legacy reader",
 /// never as a default dial. The age is there because the last good dial is
 /// kept however old it gets (D9), so a stale one is visible, not hidden.
@@ -522,13 +526,14 @@ pub(crate) fn capacity_model_view(now: chrono::DateTime<chrono::Utc>) -> serde_j
 }
 
 /// [`capacity_model_view`] of `reading`. PURE.
-fn dial_view(
+pub(crate) fn dial_view(
     reading: Option<CapacityModelReading>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
     match reading {
         Some(r) => serde_json::json!({
             "state": "known",
+            "coord_base": r.coord_base,
             "read_at": r.read_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "age_secs": r.age_secs(now),
             "value": r.dial,
@@ -550,17 +555,23 @@ fn capacity_model_from(body: &FleetPolicyResponse) -> Option<&serde_json::Value>
     body.capacity_model.as_ref().filter(|d| d.is_object())
 }
 
-/// Record `dial` as the last good one. Internal — only the controls poll
-/// calls this, and only with a dial a 2xx carried.
-fn record_capacity_model(dial: &serde_json::Value) {
-    record_dial_in(capacity_model_cache(), dial);
+/// Record `dial`, served by the coord at `coord_base`, as the last good one.
+/// Internal — only the controls poll calls this, and only with a dial a 2xx
+/// carried.
+fn record_capacity_model(dial: &serde_json::Value, coord_base: &str) {
+    record_dial_in(capacity_model_cache(), dial, coord_base);
 }
 
 /// [`record_capacity_model`] into `cache` (a test's own, so it never touches
 /// the process-global one other tests read).
-fn record_dial_in(cache: &RwLock<Option<CapacityModelReading>>, dial: &serde_json::Value) {
+fn record_dial_in(
+    cache: &RwLock<Option<CapacityModelReading>>,
+    dial: &serde_json::Value,
+    coord_base: &str,
+) {
     *cache.write().unwrap_or_else(|e| e.into_inner()) = Some(CapacityModelReading {
         dial: dial.clone(),
+        coord_base: coord_base.to_string(),
         read_at: chrono::Utc::now(),
     });
 }
@@ -1323,7 +1334,7 @@ async fn poll_permission_auto_accept_once() -> PermissionAutoAcceptPoll {
     };
     let tenant = crate::auth::jwt_tenant_claim(&device_jwt);
     match fetch_fleet_policy_with(PERMISSION_AUTO_ACCEPT_DOMAIN, &device_jwt).await {
-        Ok(body) => permission_auto_accept_poll_for_body(&body, tenant),
+        Ok((body, _base)) => permission_auto_accept_poll_for_body(&body, tenant),
         Err(e) => PermissionAutoAcceptPoll {
             outcome: permission_auto_accept_outcome_for_error(e),
             resolved_scope: None,
@@ -3317,7 +3328,10 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
 /// Parameterised by domain rather than duplicated per cache: the auth, the base
 /// resolution and the 401/404-versus-error classification are the parts a second
 /// copy would eventually get subtly wrong.
-async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchError> {
+///
+/// A 2xx answers the body beside the coord base it was asked of, so a cache
+/// that serves what it read can say which coord served it.
+async fn fetch_fleet_policy(domain: &str) -> Result<(FleetPolicyResponse, String), FetchError> {
     // Device JWT — same slot the relay reads as its Bearer (REPLACE-not-REVOKE
     // lifecycle owned by the refresher). Empty ⇒ unpaired ⇒ skip quietly.
     let device_jwt = match crate::auth::AuthManager::new().get_access_token() {
@@ -3332,7 +3346,7 @@ async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchEr
 async fn fetch_fleet_policy_with(
     domain: &str,
     device_jwt: &str,
-) -> Result<FleetPolicyResponse, FetchError> {
+) -> Result<(FleetPolicyResponse, String), FetchError> {
     // coord base — identical source-of-truth chain to the producer's
     // `coord_base()` (env COORD_HTTP_URL → profile coord_url → default).
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
@@ -3376,6 +3390,7 @@ async fn fetch_fleet_policy_with(
 
     resp.json()
         .await
+        .map(|body| (body, base))
         .map_err(|e| FetchError::Failed(format!("decode: {e}")))
 }
 
@@ -3411,7 +3426,7 @@ fn level_outcome_for_error(err: FetchError) -> PollOutcome {
 /// One poll of the [`DOMAIN`] (install-interception) cache.
 async fn poll_once() -> PollOutcome {
     match fetch_fleet_policy(DOMAIN).await {
-        Ok(body) => PollOutcome::Updated(normalize_level(body.effective_level.as_deref())),
+        Ok((body, _base)) => PollOutcome::Updated(normalize_level(body.effective_level.as_deref())),
         Err(e) => level_outcome_for_error(e),
     }
 }
@@ -3486,7 +3501,7 @@ fn plan_capture_outcome_for_error(err: FetchError) -> PollOutcome {
 /// NOT this domain's values and nothing here reads them.
 async fn poll_plan_capture_once() -> PlanCapturePoll {
     match fetch_fleet_policy(PLAN_CAPTURE_DOMAIN).await {
-        Ok(body) => PlanCapturePoll {
+        Ok((body, _base)) => PlanCapturePoll {
             outcome: plan_capture_outcome_for_body(&body),
             resolved_scope: body.resolved_scope.map(|s| s.trim().to_string()),
         },
@@ -3543,7 +3558,7 @@ fn account_selection_outcome_for_error(err: FetchError) -> PollOutcome {
 /// [`account_selection_outcome_for_error`] for why a 401 keeps.
 async fn poll_account_selection_once() -> PollOutcome {
     match fetch_fleet_policy(ACCOUNT_SELECTION_DOMAIN).await {
-        Ok(body) => account_selection_outcome_for_body(&body),
+        Ok((body, _base)) => account_selection_outcome_for_body(&body),
         Err(e) => account_selection_outcome_for_error(e),
     }
 }
@@ -3708,7 +3723,11 @@ async fn poll_egress_once(
         default_tenant,
         targets,
         enumeration_complete,
-        |domain, bearer| async move { fetch_fleet_policy_with(domain, &bearer).await },
+        |domain, bearer| async move {
+            fetch_fleet_policy_with(domain, &bearer)
+                .await
+                .map(|(body, _base)| body)
+        },
         last_logged,
     )
     .await;
@@ -3824,17 +3843,18 @@ async fn poll_controls_once() -> ControlsOutcome {
 }
 
 /// [`poll_controls_once`]'s outcome of one fetch, recording through `record`
-/// the capacity-model dial (cache #7) the answer carried.
+/// the capacity-model dial (cache #7) the answer carried, with the coord base
+/// that answered.
 fn controls_outcome(
-    fetched: Result<FleetPolicyResponse, FetchError>,
-    record: impl FnOnce(&serde_json::Value),
+    fetched: Result<(FleetPolicyResponse, String), FetchError>,
+    record: impl FnOnce(&serde_json::Value, &str),
 ) -> ControlsOutcome {
     match fetched {
-        Ok(body) => {
+        Ok((body, coord_base)) => {
             // Cache #7 rides the same answer. Only a 2xx that carried a dial
             // records one; every other arm below leaves the last good dial.
             if let Some(dial) = capacity_model_from(&body) {
-                record(dial);
+                record(dial, &coord_base);
             }
             ControlsOutcome::Updated(session_floors_from(&body))
         }
@@ -4022,13 +4042,14 @@ mod tests {
     fn the_last_recorded_dial_is_kept_unchanged() {
         let cache = RwLock::new(None);
         let first = serde_json::json!({"mode": "off", "permitted_consumers": []});
-        record_dial_in(&cache, &first);
+        record_dial_in(&cache, &first, "https://coord.qontinui.io");
         let read = cache.read().unwrap().clone().expect("a recorded dial");
         assert_eq!(read.dial, first);
+        assert_eq!(read.coord_base, "https://coord.qontinui.io");
         assert!(read.read_at <= chrono::Utc::now());
         let second =
             serde_json::json!({"mode": "enforce", "permitted_consumers": ["local_builds"]});
-        record_dial_in(&cache, &second);
+        record_dial_in(&cache, &second, "https://coord.qontinui.io");
         assert_eq!(
             cache.read().unwrap().as_ref().map(|r| &r.dial),
             Some(&second)
@@ -4041,19 +4062,26 @@ mod tests {
     #[test]
     fn only_a_dial_carrying_answer_records_the_dial() {
         let dial = serde_json::json!({"mode": "off", "permitted_consumers": []});
-        let answer = |v: serde_json::Value| -> Result<FleetPolicyResponse, FetchError> {
-            Ok(serde_json::from_value(v).expect("decode"))
+        let answer = |v: serde_json::Value| -> Result<(FleetPolicyResponse, String), FetchError> {
+            Ok((
+                serde_json::from_value(v).expect("decode"),
+                "https://coord.qontinui.io".to_string(),
+            ))
         };
         let mut recorded = Vec::new();
         let outcome = controls_outcome(
             answer(serde_json::json!({"domain": "fleet_resources", "capacity_model": dial})),
-            |d| recorded.push(d.clone()),
+            |d, base| recorded.push((d.clone(), base.to_string())),
         );
         assert!(
             matches!(outcome, ControlsOutcome::Updated(_)),
             "{outcome:?}"
         );
-        assert_eq!(recorded, vec![dial]);
+        assert_eq!(
+            recorded,
+            vec![(dial, "https://coord.qontinui.io".to_string())],
+            "the dial is recorded with the base that served it"
+        );
 
         for fetched in [
             answer(serde_json::json!({"domain": "fleet_resources", "capacity_model": null})),
@@ -4062,7 +4090,7 @@ mod tests {
             Err(FetchError::Failed("timeout".to_string())),
         ] {
             let mut wrote = false;
-            controls_outcome(fetched, |_| wrote = true);
+            controls_outcome(fetched, |_, _| wrote = true);
             assert!(!wrote, "only a dial-carrying 2xx records the dial");
         }
     }
@@ -4077,6 +4105,7 @@ mod tests {
         let read_at = chrono::Utc::now() - chrono::Duration::seconds(30);
         let reading = CapacityModelReading {
             dial: block.clone(),
+            coord_base: "https://coord.qontinui.io".to_string(),
             read_at,
         };
         let known = dial_view(
@@ -4085,6 +4114,10 @@ mod tests {
         );
         assert_eq!(known["state"], "known");
         assert_eq!(known["value"], block, "the block, unchanged");
+        assert_eq!(
+            known["coord_base"], "https://coord.qontinui.io",
+            "the coord that served it"
+        );
         assert_eq!(known["age_secs"], 30.0);
         assert_eq!(
             known["read_at"],
@@ -4102,6 +4135,7 @@ mod tests {
         let unknown = dial_view(None, chrono::Utc::now());
         assert_eq!(unknown["state"], "unknown");
         assert!(unknown.get("value").is_none(), "no default dial: {unknown}");
+        assert!(unknown.get("coord_base").is_none(), "{unknown}");
         assert!(unknown["reason"]
             .as_str()
             .unwrap()
@@ -4649,6 +4683,13 @@ mod tests {
     #[test]
     fn cold_start_is_record_with_no_scope_and_the_pin_restores_both() {
         assert_eq!(*new_plan_capture_cache().read().unwrap(), "record");
+        // Hold `env_lock` (reentrant, the pin's own hierarchy root) across the
+        // pin's whole life AND the post-drop reads. Without it the pin releases
+        // the lock on drop, another test's pin can set its own level before the
+        // two asserts below run, and the restore reads `off` — measured on
+        // runner#2957's Windows leg (`left: "off"`, `right: "record"`), GitHub
+        // Actions job 134174089416.
+        let _env = crate::test_env::env_lock();
         {
             let pin = pin_plan_capture_level_for_test("off");
             pin.set_scope(Some("tenant"));

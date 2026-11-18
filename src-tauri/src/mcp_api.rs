@@ -2706,6 +2706,13 @@ async fn health(
         // `silent-empty-is-unknown`. It is what separates "441 threads of
         // load" from "441 threads, 325 of them an idle tokio blocking pool".
         "threadCensus": crate::health_monitor::thread_name_census_json(),
+        // Plan 2026-11-11-runner-glibc-arena-retention-and-whole-log-tail,
+        // Phase 3: the glibc allocator as the health monitor's 60 s tick last
+        // read it — the arena count against the cap `main` attempted, malloc's
+        // in-use / free / system totals, the last hourly `malloc_trim(0)`, and
+        // `sampledAt`. `status: unknown` before the first tick and
+        // `unsupported` off linux-gnu: never zeros.
+        "allocator": qontinui_runner_lib::malloc_tuning::health_json(),
         // Plan 2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-
         // guard-dialog-says-low-memory, Phase 2: the thread ceilings the spawn
         // guard ENFORCES right now, every machine input they were derived from
@@ -6403,6 +6410,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_session",
     "coord_secret_presence",
     "coord_send_message",
+    // Plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account
+    // Phase 3: the cross-account session census read (coord grants it via
+    // DEVICE_DEFAULT_TOOLS; this list only forwards).
+    "coord_session_census",
     "coord_session_obligations",
     "coord_session_worktrees",
     "coord_sessions_unfinished",
@@ -18775,6 +18786,11 @@ mod coord_mcp_body_gate_tests {
             // receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
             // Phase 1), pinned with the coord tool rather than after a -32601.
             "coord_memory_get",
+            // The cross-account session census read (plan
+            // 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account
+            // Phase 3). Pinned with the coord tool's landing, like the line
+            // above, so it is never a fourth silent subtraction.
+            "coord_session_census",
         ] {
             assert!(
                 gate(serde_json::json!({

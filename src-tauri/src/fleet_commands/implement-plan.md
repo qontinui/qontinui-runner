@@ -1422,6 +1422,19 @@ file push. (A repo that is NOT coord sole-authority lands its PRs via normal Git
 > stale copy, that is the expected outcome: **report the residual and carry on.**
 > **Do NOT loop re-transitioning — the next scan wins again.**
 
+**Then declare the plan's phases on the unit, best-effort:**
+`bash <workspace-root>/qontinui-claude-config/scripts/declare-plan-phases.sh <plan-stem> <plan file>`.
+A unit a session minted carries no `phases` (on a multi-bound device no scanner
+writes them), and `coord_work_unit_attest_phase` refuses every phase of such a
+unit ("no established phase declaration"). The script skips a plan-backed unit,
+patches only on a difference, refuses any declaration that drops a phase coord
+has established (a narrowing is patched by hand), and bounds its own run time;
+its header is the contract. Quote its one verdict line in the report and
+continue whatever it says: it never blocks the implementation. Until the runner
+ships `qontinui-pr plan-phase-declaration` (that plan's Phase 1), the verdict is
+`UNKNOWN` on every box: expected, not a fault. `/vet-plan` §5.4
+step 1 runs the same script.
+
 #### Retire the vet→implement safety net — withdraw it (do this AT the stamp)
 
 The IN PROGRESS stamp is the moment this session provably took the work over, so
@@ -3181,6 +3194,10 @@ on — the manual call is the fallback for unwrapped machines and stays harmless
 everywhere (same match keys, best-effort oplog). Never `--no-verify` to bypass
 the hook — that defeats both the hook and the supervision signal.
 
+**Before every push that moves the head**, run the repository's pre-push stage
+when this checkout does not — see "Run the repository's pre-push stage when this
+checkout does not", beside Step 4.5's re-review rule.
+
 #### Step 4.3: Fold in open follow-ups on the files this diff touches
 
 *(Plan `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
@@ -3553,7 +3570,11 @@ and the task goals go under that same line**, as a path or a read command, never
 as text in the brief: they say what the change is FOR, which is exactly what
 Pass A judges without. Any review-focus text above the line names only WHAT to
 check (files, properties, failure shapes), never the plan's goals or the rules
-it sets. The repo standards (CLAUDE.md, the best-practices
+it sets. When the diff adds a name to a body this repository distributes to
+other machines (a bundled command, skill or agent), name that failure shape in
+the review focus: the repository's portability allowance for the new name, with
+a reason, and a regenerated portability census belong in the same diff. The repo
+standards (CLAUDE.md, the best-practices
 files) stay above it; they say nothing about this change. Tell the reviewer what the
 record's own THREAT MODEL says it cannot catch: `prove` is a control against
 honest mistakes, not against a constructed shadow (a `cfg` twin, a module no
@@ -4337,6 +4358,21 @@ after Step 4.5b's read-back. **Nothing harvests this line yet**, so never cite
 it as observed by coord or web. The read-back of that write is the evidence.
 When the PR moves to a new PR (the fresh-branch path below), carry the lines
 into the new body.
+
+**Run the repository's pre-push stage when this checkout does not.** Before every
+push that moves the branch's head, when the repo's `.pre-commit-config.yaml` puts
+hooks in its pre-push stage (a hook whose `stages:` names `pre-push`, or one with
+no `stages:` key at all, which runs at every stage) and this checkout's pre-push
+does not run each of them (no `$(git rev-parse --git-path hooks)/pre-push`, or one
+that does not name every such hook id and is not a hook manager's generated file),
+run each such `repo: local` hook whose `entry` is `bash <script>`, from the repo
+root over the head, feeding it the line git would, and name any other hook in the
+stage as not run. A non-zero exit is a red to fix before pushing. The line git
+would feed is:
+
+```bash
+printf 'HEAD %s refs/heads/%s 0000000000000000000000000000000000000000\n' "$(git rev-parse HEAD)" "<branch>"
+```
 
 **Re-review rule — every push that moves the head needs a new line.** The gate
 compares against the CURRENT head, so the moment you push again the recorded sha

@@ -129,8 +129,9 @@ done < "$LEDGER"
 ```
 
 `HELD` rows printed ⇒ **do not finish.** Name them, say the session still
-holds live coord claims, and stop. `UNKNOWN` rows do not refuse (closeability
-UNKNOWN never blocks a finish, step 0.6): name them in the report and go on.
+holds live coord claims, and stop. `UNKNOWN` rows do not refuse (a claim the
+ledger cannot settle is not proof of a held one; in step 0.6 only a run that
+left no usable verdict blocks on an UNKNOWN): name them in the report and go on.
 A `stolen`, `lapsed` or `owner_gone` row is a claim the session no longer
 holds, and prints nothing. The legitimate closeouts (`/implement-plan` Step 6,
 `/vet-imp` Step 5) release every row before they reach any finish, so a genuinely
@@ -157,7 +158,7 @@ Say in your report that the claim check was UNKNOWN. It does not refuse on its o
 because refusing on an absent file would make every such device unable to
 finish at all.
 
-**0.6. Refuse on a DEFINITE not-closeable; report an UNKNOWN one and finish anyway.**
+**0.6. Refuse on a DEFINITE not-closeable or on NO USABLE VERDICT; report any other UNKNOWN and finish anyway.**
 
 Finished and closeable are **separate axes**. `finished` (this command) says
 the work is done; `closeable` says closing the session would lose nothing, and
@@ -176,21 +177,33 @@ In a linked tree whose custody directory also holds another session's slot, a
 dirty path a peer could have written reads UNKNOWN for the same reason, and this
 session never commits or discards such a path.
 
-This step refuses a finish ONLY on a definite reason, because a definite reason
-means the work is not actually done. An UNKNOWN closeability does not block the
-finish: blocking on it would keep idle sessions alive, which is the opposite of
-what finishing is for. No closer reads this step's verdict. The runner's
-`finished_close` arm judges custody again at close time with its own gate and
-closes nothing that gate finds dirty or cannot read, while a missing custody
-slot or an unanswered obligations read, two of this step's UNKNOWN reasons, does
-not hold a session open there. `/close-finished-sessions` reads no closeability
-input at all.
+This step refuses a finish on a definite reason, because a definite reason
+means the work is not actually done. It also refuses when the script ran and
+left **no usable verdict** (plan
+`2026-11-17-port-session-closeable-hardening-onto-landed-2804` Phase 1): a
+timeout, a crash, a first line that is not the verdict its exit names, ANY
+failed git probe of a tree, no tree found or looked at, or a test seam honoured
+outside a test. Such a run shows less than any UNKNOWN reason does: a judge
+that dies cannot show that nothing of this session's is left. Only an ABSENT
+checker proceeds, with a WARNING: a `CCFG` that is a config checkout without
+the script means no checker exists on this box, a property of the deployment,
+and refusing on it would block every finish there. A `CCFG` that is no config
+checkout at all means the step did not run, and refuses.
+
+Any other UNKNOWN closeability does not block the finish: blocking on it would
+keep idle sessions alive, which is the opposite of what finishing is for. No
+closer reads this step's verdict. The runner's `finished_close` arm judges
+custody again at close time with its own gate and closes nothing that gate
+finds dirty or cannot read, while a missing custody slot or an unanswered
+obligations read, two of this step's UNKNOWN reasons, does not hold a session
+open there. `/close-finished-sessions` reads no closeability input at all.
 
 ```bash
 # SID: the same id step 0.5 used. Each --worktree: a tree this session
 # allocated or edited (omit them all and the script finds the trees holding
-# this session's custody slot; it reads finding none as UNKNOWN, so pass
-# --no-worktrees only when the session touched no repository tree at all).
+# this session's custody slot; finding none is UNKNOWN worktrees_unknown, which
+# REFUSES here, so set NO_TREES=1 -- --no-worktrees -- only when the session
+# touched no repository tree at all).
 # A non-empty list goes with --scan, so the list ADDS to that custody-slot
 # scan instead of replacing it: a list can miss the session's own tree.
 # --owed-items: what this session still owes, as a JSON list of
@@ -206,13 +219,54 @@ SID="${CLAUDE_CODE_SESSION_ID:-${QONTINUI_AGENT_SESSION_ID:-}}"
 CCFG=''          # the qontinui-claude-config checkout
 OWED_ITEMS=''    # the owed-items JSON file; empty = none passed (see below)
 TREES=()         # every tree this session allocated or edited
+NO_TREES=''      # 1 = this session touched no repository tree (--no-worktrees)
 CLOSEABLE_ARGS=()
+[ "$NO_TREES" != 1 ] || CLOSEABLE_ARGS+=(--no-worktrees)
 [ -z "$OWED_ITEMS" ] || CLOSEABLE_ARGS+=(--owed-items "$OWED_ITEMS")
 for t in "${TREES[@]}"; do CLOSEABLE_ARGS+=(--worktree "$t"); done
 [ ${#TREES[@]} -eq 0 ] || CLOSEABLE_ARGS+=(--scan)
-{ : "${SID:?no session id: step 0.6 did NOT run}"
-  bash "${CCFG:?fill CCFG with the qontinui-claude-config checkout: step 0.6 did NOT run}/scripts/session-closeable.sh" "$SID" "${CLOSEABLE_ARGS[@]}"
-  echo "session-closeable exit $?"; }
+{ : "${SID:?no session id: step 0.6 did NOT run}" "${CCFG:?fill CCFG with the qontinui-claude-config checkout: step 0.6 did NOT run}"
+  # The checker must be there. A CCFG that is a config checkout without it
+  # (an older tree) is "no checker on this box"; any other CCFG is a wrong
+  # path, so the step did not run. A config checkout is told by a file only
+  # that repo carries and that predates the checker (the probe below); a
+  # scripts/README.md is no proof, since other repos carry one too.
+  CHECKER_ABSENT=''; NO_VERDICT=''; CHECKER="$CCFG/scripts/session-closeable.sh"
+  if [ -f "$CHECKER" ]; then
+    CLOSEABLE_OUT="$(bash "$CHECKER" "$SID" "${CLOSEABLE_ARGS[@]}")"; CLOSEABLE_RC=$?
+  elif [ -f "$CCFG/scripts/install-guard-hooks.sh" ]; then
+    CLOSEABLE_OUT=''; CLOSEABLE_RC=127; CHECKER_ABSENT=1
+  else
+    CLOSEABLE_OUT=''; CLOSEABLE_RC=127; NO_VERDICT="CCFG $CCFG is not a config checkout: step 0.6 did NOT run"
+  fi
+  printf '%s\n' "$CLOSEABLE_OUT"
+  echo "session-closeable exit $CLOSEABLE_RC"
+  # ONE decision from the exit code and the lines together. Refused: a
+  # definite reason (exit 1 with a NOT_CLOSEABLE first line), a usage error,
+  # and a judge that ran but left no usable verdict (124, an exit outside 0-3,
+  # a first line that is not the verdict its exit names, ANY failed git probe
+  # of a tree, no tree found or looked at, a test seam honoured). Only an
+  # absent checker -- 127 under a real config checkout -- proceeds, with a
+  # WARNING.
+  DECISION=proceed
+  case "$CLOSEABLE_RC" in
+    0) case "$CLOSEABLE_OUT" in CLOSEABLE*) ;; *) NO_VERDICT="exit 0 without a CLOSEABLE line" ;; esac ;;
+    1) case "$CLOSEABLE_OUT" in NOT_CLOSEABLE*) DECISION=refuse ;; *) NO_VERDICT="exit 1 without a NOT_CLOSEABLE line" ;; esac ;;
+    2) DECISION=refuse ;;
+    3) case "$CLOSEABLE_OUT" in UNKNOWN*) ;; *) NO_VERDICT="exit 3 without an UNKNOWN line" ;; esac ;;
+    127) if [ -n "$CHECKER_ABSENT" ]; then
+           echo "WARNING: $CCFG carries no checker script (no checker on this box): closeability is UNKNOWN"
+         else NO_VERDICT="${NO_VERDICT:-exit 127}"; fi ;;
+    *) NO_VERDICT="exit $CLOSEABLE_RC" ;;
+  esac
+  if printf '%s\n' "$CLOSEABLE_OUT" | grep -E '^UNKNOWN (probe_failed|worktrees_unknown|worktrees_unresolvable) ' >/dev/null; then
+    NO_VERDICT="${NO_VERDICT:-a tree was not probed or none was found, or the workspace root to scan did not resolve}"
+  fi
+  if printf '%s\n' "$CLOSEABLE_OUT" | grep -E '^NOTE [A-Z_]+ is honoured' >/dev/null; then
+    NO_VERDICT="${NO_VERDICT:-a test seam was honoured outside a test}"
+  fi
+  if [ -n "$NO_VERDICT" ]; then echo "NO USABLE VERDICT ($NO_VERDICT): do not finish"; DECISION=refuse; fi
+  echo "DECISION: $DECISION"; }
 ```
 
 The script also reads coord's own derivation, `coord_session_obligations`
@@ -220,18 +274,21 @@ The script also reads coord's own derivation, `coord_session_obligations`
 and judges it beside the `--owed-items` list. **An empty `OWED_ITEMS` passes no
 `--owed-items` at all, which leaves the owed check to coord alone** -- and
 while coord does not serve that tool, that check is UNKNOWN (so is the whole
-verdict). Read its exit code:
+verdict). **Act on the block's last line, `DECISION: refuse` or `DECISION:
+proceed`.** It already combines the exit code with the lines, so the table
+below only explains a decision; it never overrides one. No `DECISION` line at
+all means the step did not run.
 
-| Exit | First line | Action |
+| DECISION | What it rests on | Action |
 |---|---|---|
-| 0 | `CLOSEABLE ...` | proceed to step 1 |
-| 0, but the first line is not `CLOSEABLE ...` -- empty, say: under `bash -t`, `bash -n`, or a `SHELLOPTS` holding `onecmd` or `noexec`, the script runs no check and prints nothing | anything but `CLOSEABLE ...` | **the check did not run.** Never proceed past it: re-run this step from a shell without those options (`env -u SHELLOPTS -u BASHOPTS bash ...`). `overlord-finish-guard.py` reads this exit as closeable-unknown, not as closeable |
-| 1, first line `NOT_CLOSEABLE ...`, and SID did NOT come from `$CLAUDE_CODE_SESSION_ID` (it came from `$QONTINUI_AGENT_SESSION_ID` or the box-global file, which step 1a treats as possibly a peer's) | `NOT_CLOSEABLE ...` | hold the verdict until step 1a has run. **If step 1a confirms the id is yours, the reasons are yours: apply the next row (do not finish).** If step 1a does not confirm the id (a peer's id, or an unproven one), step 1a's own refusal governs: the session is not finished, and these reasons are reported as UNKNOWN because they may be a peer's, not as your own not-closeable. A held claim was already refused by step 0.5 either way |
-| 1, first line `NOT_CLOSEABLE ...` | `NOT_CLOSEABLE ...` | **do not finish.** A definite reason: a dirty or untracked tree, a commit on no remote, a live claim (a ledger row still held -- `stolen` / `lapsed` / `owner_gone` rows are not), or an owed item that is `not_watched`, `owed` or `dropped`. Quote every `NOT_CLOSEABLE <reason> <detail>` line, fix it (commit and push, release the claim, get the item landed or watched), then re-run this step |
-| 3 | `UNKNOWN ...` | **proceed with the finish** and put in the report: `closeable: UNKNOWN (<the UNKNOWN reason lines>) — finished` |
-| no `session-closeable exit` line at all: the shell printed `SID: no session id: step 0.6 did NOT run` or `CCFG: fill CCFG ...: step 0.6 did NOT run` | — | **the step did not run.** Never proceed past it: fill `CCFG` (or resolve the session id) and re-run this step |
-| 2 | usage | the call was malformed (an empty `--owed-items` / `--worktree` value, a non-uuid id): fix it and re-run; do not proceed on a usage error |
-| 127 / `No such file or directory`, an exit 1 whose first line is NOT `NOT_CLOSEABLE` (the script crashed, or bash stopped it because POSIX mode would not come on: `UNKNOWN shell_environment` on stderr), or any other exit | — | the same as 3: proceed, and report `closeable: UNKNOWN (<what failed>) — finished` |
+| `refuse` | exit 1, first line `NOT_CLOSEABLE ...`, and SID did NOT come from `$CLAUDE_CODE_SESSION_ID` (it came from `$QONTINUI_AGENT_SESSION_ID` or the box-global file, which step 1a treats as possibly a peer's) | hold the verdict until step 1a has run. **If step 1a confirms the id is yours, the reasons are yours: apply the next row (do not finish).** If step 1a does not confirm the id (a peer's id, or an unproven one), step 1a's own refusal governs: the session is not finished, and these reasons are reported as UNKNOWN because they may be a peer's, not as your own not-closeable. A held claim was already refused by step 0.5 either way |
+| `refuse` | exit 1, first line `NOT_CLOSEABLE ...` | **do not finish.** A definite reason: a dirty or untracked tree, a commit on no remote, a live claim (a ledger row still held -- `stolen` / `lapsed` / `owner_gone` rows are not), or an owed item that is `not_watched`, `owed` or `dropped`. Quote every `NOT_CLOSEABLE <reason> <detail>` line, fix it (commit and push, release the claim, get the item landed or watched), then re-run this step |
+| `refuse` | exit 2 (usage) | the call was malformed (an empty `--owed-items` / `--worktree` value, a non-uuid id): fix it and re-run; do not proceed on a usage error |
+| `refuse` | the block printed `NO USABLE VERDICT (<why>): do not finish`: the script left no verdict to act on -- exit 124 (a timeout), an exit outside 0-3 (127 included, unless the checker is absent: the `WARNING` row below), a first line that is not the verdict its exit names (`CLOSEABLE` for 0, `NOT_CLOSEABLE` for 1, `UNKNOWN` for 3: a crash, or an exit 0 with nothing printed, as under `bash -t`, `bash -n` or a `SHELLOPTS` holding `onecmd` or `noexec`; re-run then from `env -u SHELLOPTS -u BASHOPTS bash ...`), ANY `UNKNOWN probe_failed` line (a git probe of a tree failed or warned -- rev-parse, status, unpushed, patch-landed, or either served-corpus `.claude/` listing), `UNKNOWN worktrees_unknown` (no tree found: fill `TREES`, or set `NO_TREES=1` when the session touched none), `UNKNOWN worktrees_unresolvable` (the workspace root to scan did not resolve, so a tree of this session's may be unseen), a `NOTE ... is honoured` line (a test seam took effect outside a test: unset `SESSION_CLOSEABLE_TEST_MODE`), or a `CCFG` that is not a config checkout | **do not finish.** Fix what it names and re-run this step (a timeout on a loaded box is retryable); `--force` is the deliberate override |
+| `proceed` | exit 0, `CLOSEABLE ...` | proceed to step 1 |
+| `proceed` | exit 3, first line `UNKNOWN ...`, and none of the lines above (`uncommitted_attributed_to_peer` and `custody_record_missing` are such UNKNOWNs) | **proceed with the finish** and put in the report: `closeable: UNKNOWN (<the UNKNOWN reason lines>) — finished` |
+| `proceed` | `CCFG` is a config checkout (it has the file the block probes, which only the config repo carries and which predates the checker; a `scripts/README.md` alone is another repo and refuses) that carries no checker script, and the block printed `WARNING: ... no checker on this box` | proceed, and report `closeable: UNKNOWN (no checker on this box) — finished`. A deployment property, not a failed judge: refusing here would block every finish on a box whose checkout predates the script |
+| none | no `DECISION` line: the shell printed `SID: no session id: step 0.6 did NOT run` or `CCFG: fill CCFG ...: step 0.6 did NOT run` | **the step did not run.** Never proceed past it: fill `CCFG` (or resolve the session id) and re-run this step |
 
 Report the closeable axis in exactly those words and nothing else: no
 paraphrase, and no sentence of your own about whether the session can be
@@ -241,7 +298,8 @@ message, as a veto of the whole message, and only that headline, when
 `/unattended` ran, states it.
 
 Report a refusal in these words: *"session NOT finished: not closeable"*,
-followed by the `NOT_CLOSEABLE` lines. `--force` overrides a refusal here as it
+followed by the `NOT_CLOSEABLE` lines, or by the `NO USABLE VERDICT` line and
+the lines it rests on. `--force` overrides a refusal here as it
 does step 0.5 — a deliberate act, never a fall-through — and the report must
 then quote the verdict line it overrode. An `--undo` skips this step: moving a
 row back to `working` closes nothing. A subagent never reaches this step (step

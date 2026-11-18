@@ -1867,6 +1867,9 @@ before it releases, and prints one line per `gate_id`. A net another device
 registered, or one the reserve's current holder owns when that is not this
 session, is skipped and named (`NET_INERT`), not withdrawn, unless `--net-gate`
 names it. Quote those lines, and its final line, in the report.
+`holder=unknown` on that final line means the holder read failed and the script
+fell back to device-wide selection, so a net of another holder on this same
+device may have been touched: check the per-net lines before you report.
 
 Two things wrap that release, both specified in Step 1.1:
 

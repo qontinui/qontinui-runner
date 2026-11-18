@@ -506,8 +506,17 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                         "launch template flag dropped: the allow-list permission mode owns it"
                     );
                 }
-                // Model is decided below (spec beats template).
+                // Model is decided below (spec beats template), in either
+                // spelling: an attached `--model=<m>` left in `other_units`
+                // would ride along after the spec's `--model` and, the CLI
+                // taking the last value, silently override it.
                 "--model" => template_model = unit.values.first().cloned(),
+                n if n.starts_with("--model=") => {
+                    template_model = n
+                        .strip_prefix("--model=")
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_string)
+                }
                 // Name is spec-owned when the caller supplies one: drop the
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
@@ -1343,6 +1352,23 @@ mod tests {
         assert_eq!(value_after(&argv, "--model"), Some("opus"));
         assert!(!argv.iter().any(|a| a == "sonnet"));
         assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
+    }
+
+    /// The attached spelling is the template's model too: dropped under a spec
+    /// model (never a second, last-wins `--model=`), kept as the model when
+    /// the spec names none.
+    #[test]
+    fn spec_model_beats_an_attached_template_model() {
+        let mut s = spec();
+        s.model = Some("opus".to_string());
+        let argv = render_argv(&s, &tmpl("claude --model=sonnet"), "claude");
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+        assert!(!argv.iter().any(|a| a.starts_with("--model=")), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
+
+        let argv = render_argv(&spec(), &tmpl("claude --model=sonnet"), "claude");
+        assert_eq!(value_after(&argv, "--model"), Some("sonnet"));
+        assert!(!argv.iter().any(|a| a.starts_with("--model=")), "{argv:?}");
     }
 
     #[test]

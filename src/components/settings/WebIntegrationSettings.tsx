@@ -38,6 +38,11 @@ import {
   ChevronRight,
   ExternalLink,
 } from "lucide-react";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 import { SectionHeader } from "./SectionHeader";
 import { EgressPrivacyPanel } from "./EgressPrivacyPanel";
 import type { LogFunction } from "./types";
@@ -933,8 +938,13 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       onLog("success", "Connected — this device is signed in to your Qontinui account");
     } catch (err) {
       const msg = String(err);
-      setConnectError(msg);
-      onLog("error", `Connect failed: ${msg}`);
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (isSignInCancelled(err)) {
+        onLog("info", "Sign-in cancelled");
+      } else {
+        setConnectError(msg);
+        onLog("error", `Connect failed: ${msg}`);
+      }
     } finally {
       setConnecting(false);
     }
@@ -1185,6 +1195,10 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
                 device is connected.
               </p>
             )}
+            <PendingSignInNotice
+              active={connecting}
+              noBrowserHint={NO_BROWSER_HINT.backendConnection}
+            />
             {connectError && (
               <p className="text-[11px] text-destructive flex items-center gap-1">
                 <AlertTriangle className="w-3 h-3 shrink-0" /> {truncate(connectError, 140)}

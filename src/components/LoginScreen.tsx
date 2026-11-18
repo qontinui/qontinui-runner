@@ -15,6 +15,11 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogIn, AlertCircle, Loader2, RotateCcw } from "lucide-react";
 import { createLogger } from "@/lib/logger";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 
 const log = createLogger("LoginScreen");
 
@@ -79,8 +84,11 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
       // (notably AuthProvider) so the gate re-evaluates without a poll cycle.
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
-      log.error("Cognito sign-in failed:", err);
-      setError(typeof err === "string" ? err : String(err));
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (!isSignInCancelled(err)) {
+        log.error("Cognito sign-in failed:", err);
+        setError(typeof err === "string" ? err : String(err));
+      }
     } finally {
       setLoading(false);
       setPending(null);
@@ -216,6 +224,12 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
               <p className="text-sm text-destructive">{error}</p>
             </div>
           )}
+
+          {/* The authorize URL, when the runner could not open a browser. */}
+          <PendingSignInNotice
+            active={pending !== null}
+            noBrowserHint={NO_BROWSER_HINT.loginScreen}
+          />
 
           {/* Federated social sign-in (Cognito Hosted UI per IdP). Labels,
               ordering, and provider names match the web auth UI verbatim. */}
