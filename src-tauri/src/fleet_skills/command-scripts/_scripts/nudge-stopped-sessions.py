@@ -17,9 +17,10 @@ its final reply states, which coord has not recorded) are nudged too, so
 /next-move reconciles or records them. That screen leans to "not finished" when
 unsure, which is the safe side for a close and the unsafe side for a nudge, so
 this script adds its own holds: a finish no later turn reopened (finished, a
-turn inside coord's 1 s stamp band, or a coord finish with no time), coord
-session_status waiting_human, and a last prompt that was a /next-move that
-changed nothing.
+turn inside coord's 1 s stamp band, or a coord finish with no time whose final
+message does not say work remains; one that does is CONTRADICTED, nudged
+above), coord session_status waiting_human, and a last prompt that was a
+/next-move that changed nothing.
 
 A row whose last prompt is /next-move is held by what changed, not by a
 clock. A /next-move followed by a work-class tool call (an edit, a commit, a
@@ -1073,7 +1074,33 @@ def cross_screen_selftest():
             or not held2 or held2[0] != "HELD":
         bad.append(f"cross-screen, untimed mark: close reads {verdict2} {why2}, finish_state {fs2}, nudge hold "
                    f"{held2}; want UNKNOWN (no usable time), unconfirmed/untimed_mark, HELD")
-    return bad, 4
+    # A reply that says work remains contradicts a finish whatever time the finish carries, so neither untimed
+    # shape above may sit between the screens when the message is that reply: finish_state returns
+    # contradicted/phrase_veto, the close screen reads CONTRADICTED (the owner /next-move takes), and this screen
+    # nudges it with no hold. Before the change the close screen read ACTIVE and this one held it.
+    tx3 = dict(tx, final_text="The deploy is still running; I'll check it in an hour.")
+    stubs3 = dict(stubs, transcript_facts=lambda row: dict(tx3))
+    for label, regx in (("coord-only finish", {"claudeSessionId": "s1"}),
+                        ("untimed runner mark", {"claudeSessionId": "s1", "finished": True, "finishedAt": None})):
+        saved = {k: getattr(cfs, k) for k in stubs3}
+        try:
+            for k, v in stubs3.items():
+                setattr(cfs, k, v)
+            verdict3, why3 = cfs.classify({"id": "t1", "isAlive": True, "pid": 10}, regx, {10: (1, ["bash"])}, 15, "",
+                                          ready)
+        finally:
+            for k, v in saved.items():
+                setattr(cfs, k, v)
+        facts3 = row_facts(regx, ready)
+        fs3 = cfs.finish_state(facts3, facts3, tx3, now, cfs.finish_hits(facts3, facts3, tx3, now))
+        judged3, reasons3 = judge(verdict3, why3, facts3, tx3, now, None)
+        if (verdict3 != "CONTRADICTED" or verdict3 in cfs.CLOSABLE or "says work remains" not in "; ".join(why3)
+                or fs3 is None or (fs3.state, fs3.rule) != ("contradicted", "phrase_veto")
+                or judged3 != "STOPPED" or status_hold(facts3, tx3, now, BACKSTOP_H) is not None):
+            bad.append(f"cross-screen, {label} beside a reply that says work remains: close reads {verdict3} {why3}, "
+                       f"finish_state {fs3}, nudge {judged3} {reasons3}; want CONTRADICTED, contradicted/phrase_veto, "
+                       "STOPPED with no hold")
+    return bad, 6
 
 
 def trusted_finish_selftest():
@@ -1425,12 +1452,15 @@ def selftest():
             bad.append(f"is_work_tool({block['name']} {block['input']}) != {want}")
     # A finished signal with a finish time beside a "work remains" message is
     # contradicted, and nudged so /next-move reconciles it (Phase 6; it was
-    # CONTRADICTED, for the operator); a coord finish with no time to weigh it against is only HELD.
+    # CONTRADICTED, for the operator); so is a coord finish with no time to weigh it against, because a reply
+    # that says work remains needs no finish time to contradict the finish (the time only dates a revival).
     still = dict(work, final_text="The deploy is still running; I'll check it in an hour.")
     for facts, t, want, frag in [
         ({"finished": True, "finishedAt": now - 42 * h}, dict(still, last_prompt=now - 43 * h, last_asst=now - 43 * h),
          "STOPPED", ("contradicts", "runner finished marker (", "the final message says work remains")),
-        ({"sessionStatus": "finished"}, still, "HELD", "no finish time"),
+        ({"sessionStatus": "finished"}, still, "STOPPED",
+         ("contradicts", "no finish time", "the final message says work remains")),
+        # ...while a coord finish with no time beside a plain landed message stays a hold: nothing contradicts it
         ({"sessionStatus": "finished"}, dict(work, final_text="PR #3 landed. SAFE TO CLOSE."), "HELD", "no finish time"),
         ({"finished": True, "finishedAt": now - 1800000}, work, "HELD", "runner finished marker ("),
     ]:
@@ -1463,11 +1493,11 @@ def selftest():
         # coord's finish beside a "work remains" message is contradicted: nudged, both signals named
         ("ACTIVE", dict(cf, sessionStatusSince=sn - 1800000), ss, "STOPPED",
          ("contradicts", "coord session_status=finished (", "work remains")),
-        ("ACTIVE", cf, ss, "HELD", no_time),
+        ("ACTIVE", cf, ss, "STOPPED", ("contradicts", no_time, "work remains")),  # no time to date it: still contradicted
         ("REVIVED", cf, sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=None), sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=str(sn - 2 * h)), sw, "HELD", no_time),
-        ("REVIVED", dict(cf, sessionStatusSince=float(sn - 2 * h)), ss, "HELD", no_time),
+        ("REVIVED", dict(cf, sessionStatusSince=float(sn - 2 * h)), ss, "STOPPED", ("contradicts", no_time, "work remains")),
         ("REVIVED", dict(cf, sessionStatusSince=True), sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=0), sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=-1), sw, "HELD", no_time),
@@ -1475,6 +1505,14 @@ def selftest():
         ("REVIVED", dict(cf, sessionStatusSince=sn + 10 * 60000), sw, "HELD", no_time),  # in the future
         # a stamp ahead of this clock is no usable time for either screen (the close screen's guard)
         ("REVIVED", dict(cf, sessionStatusSince=sn + 2 * 60000), sw, "HELD", no_time),
+        # ...and beside a message that says work remains each of those unusable stamps is contradicted, not held
+    ] + [("REVIVED", dict(cf, sessionStatusSince=stamp), ss, "STOPPED", ("contradicts", no_time, "work remains"))
+         for stamp in (None, str(sn - 2 * h), True, 0, -1, 1_000_000_000, sn + 10 * 60000, sn + 2 * 60000)] + [
+        # ...but a TIMED runner mark that nothing reopened keeps its marker-dated contradiction, not the no-time one:
+        # the undated arm falls through to the dated test, so the reason names the mark and never a missing finish
+        # time. This pin fails if the undated verdict is returned ahead of that test.
+        ("ACTIVE", dict(cf, finished=True, finishedAt=sn - 1800000), ss, "STOPPED",
+         ("contradicts", "runner finished marker (", "the final message says work remains", "!no finish time")),
         # the runner marker and coord's time disagree: coord's usable stamp decides, either way round
         ("REVIVED", dict(cf, finished=True, finishedAt=sn - 2 * h, sessionStatusSince=sn - 1800000), sw,
          "HELD", by_time),  # a re-finish after the revival
