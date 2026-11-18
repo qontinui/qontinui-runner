@@ -209,7 +209,9 @@ mod tests {
         assert!(pb.contains("Run it afresh before\n   EVERY uncounted spawn"));
         assert!(pb.contains("never reuse an answer from the\n   journal"));
         assert!(pb.contains("exists, so admission IS deployed"));
-        assert!(pb.contains("`000` or a timeout — UNKNOWN, which is a refusal"));
+        assert!(pb.contains("`000`, an empty code, or a timeout — UNKNOWN, which is a refusal"));
+        assert!(pb.contains("-d '{}') || true"));
+        assert!(pb.contains("# envelope-ok: reads only the HTTP status"));
         assert!(pb.contains("**Transport down**"));
         assert!(pb.contains("`ToolSearch`"));
         assert!(pb.contains("record the proof in the journal"));
