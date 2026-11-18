@@ -79,6 +79,12 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 use crate::capability_manifest::{self, ProvisionReport};
 
+/// The launch decision coord stamps on a spawn frame (`launch_model` /
+/// `launch_effort` / `launch_settings`) and how this runner applies it — plan
+/// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` D6.
+mod launch_frame;
+use launch_frame::{AppliedLaunch, LaunchFrame, LaunchSeam};
+
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
 // =============================================================================
@@ -158,6 +164,15 @@ pub struct LaunchPayload {
     /// is indistinguishable from one honoured.
     #[serde(default)]
     pub account: Option<String>,
+    /// The launch decision coord resolved for this spawn (`launch_model`,
+    /// `launch_effort`, `launch_settings`; plan
+    /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V5).
+    /// Flattened so the three keys sit at the frame's top level, exactly where
+    /// coord's `LaunchDecision` puts them; every key defaults, so a coord that
+    /// stamps nothing parses unchanged. Read it through
+    /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
+    #[serde(flatten)]
+    pub launch: LaunchFrame,
 }
 
 impl LaunchPayload {
@@ -349,6 +364,15 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The launch decision coord resolved for this spawn (`launch_model`,
+    /// `launch_effort`, `launch_settings`; plan
+    /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V5).
+    /// Flattened so the three keys sit at the frame's top level, exactly where
+    /// coord's `LaunchDecision` puts them; every key defaults, so a coord that
+    /// stamps nothing parses unchanged. Read it through
+    /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
+    #[serde(flatten)]
+    pub launch: LaunchFrame,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -813,6 +837,15 @@ pub struct ConditionCheckPayload {
     /// no placeholders.
     #[serde(default)]
     pub secrets: crate::condition_secrets::FrameSecrets,
+    /// The launch decision coord resolved for this spawn (`launch_model`,
+    /// `launch_effort`, `launch_settings`; plan
+    /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V5).
+    /// Flattened so the three keys sit at the frame's top level, exactly where
+    /// coord's `LaunchDecision` puts them; every key defaults, so a coord that
+    /// stamps nothing parses unchanged. Read it through
+    /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
+    #[serde(flatten)]
+    pub launch: LaunchFrame,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -849,6 +882,7 @@ impl std::fmt::Debug for ConditionCheckPayload {
                 ),
             )
             .field("secrets", &self.secrets)
+            .field("launch", &self.launch)
             .finish()
     }
 }
@@ -4219,12 +4253,32 @@ fn admit_launch(
     // RUNNING session twice (once in the readings, once here). Residual,
     // stated: a burst of LAUNCHES alone is bounded only by the readings.
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
-    let (projected, shadowed) = reading.projected(pending);
+    let (decision, shadowed) = launch_admission(&reading, pending);
     crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
-    match launch_deferral_reason(&projected) {
+    decision
+}
+
+/// PURE: [`admit_launch`]'s decision over one reading and its pending charge,
+/// with the shadowed lane beside it (logged by the caller, outside any lock).
+///
+/// The decision is [`crate::resource_guard::AdmissionReading::projected`] at
+/// `pending`, which is EXACTLY the projection
+/// [`crate::launch_capacity::launch_headroom`] counts from — so the headroom
+/// this device publishes is `0` precisely when this refuses (pinned by
+/// `launch_capacity`'s `launch_headroom_is_zero_exactly_when_admit_launch_refuses`,
+/// plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 2 step 2). Split out so that test can drive the real decision without
+/// the process-global continuation registry.
+pub(crate) fn launch_admission(
+    reading: &crate::resource_guard::AdmissionReading,
+    pending: usize,
+) -> (Result<(), String>, Option<crate::resource_guard::SpawnGate>) {
+    let (projected, shadowed) = reading.projected(pending);
+    let decision = match launch_deferral_reason(&projected) {
         Some(reason) => Err(reason),
         None => Ok(()),
-    }
+    };
+    (decision, shadowed)
 }
 
 /// [`evaluate_continuation_guard`] with the load reading taken LIVE through
@@ -4281,6 +4335,13 @@ pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
     )
 }
 
+/// Admitted, not-yet-running continuations — the pending charge
+/// [`admit_launch`] applies — for the launch capacity the host-lane sample
+/// publishes ([`crate::launch_capacity::live_with_memory`]).
+pub(crate) fn reserved_spawns_now() -> usize {
+    lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns
+}
+
 /// The severity word of a lane verdict, `"proceed"` when nothing tripped.
 fn verdict_word(gate: &crate::resource_guard::SpawnGate) -> &'static str {
     gate.tripped()
@@ -4307,6 +4368,16 @@ fn spawn_admission_json(
     reserved_spawns: usize,
     cost: crate::resource_guard::ProjectedSpawnCost,
 ) -> serde_json::Value {
+    // The launch capacity this device publishes on its host-lane sample — the
+    // same function, so `/health` and coord read one number (plan
+    // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    // Phase 2 step 3).
+    let launch = crate::launch_capacity::launch_headroom(
+        lanes,
+        reserved_spawns,
+        cost,
+        crate::launch_capacity::LAUNCH_HEADROOM_CAP,
+    );
     let Some(lanes) = lanes else {
         return serde_json::json!({
             "enabled": false,
@@ -4317,6 +4388,8 @@ fn spawn_admission_json(
             "liveContinuations": live_continuations,
             "reservedSpawns": reserved_spawns,
             "countCap": "retired",
+            "launchHeadroom": launch.headroom,
+            "launchVerdict": launch.verdict.as_str(),
         });
     };
     let composed = crate::resource_guard::projected_verdict(Some(lanes), reserved_spawns, cost);
@@ -4355,6 +4428,11 @@ fn spawn_admission_json(
         // readings as projected cost (`verdict` above already includes them).
         "reservedSpawns": reserved_spawns,
         "countCap": "retired",
+        // Further projected launches admitted before one is refused (`0` =
+        // the next launch is refused), and the verdict behind it — what the
+        // host-lane sample publishes to coord.
+        "launchHeadroom": launch.headroom,
+        "launchVerdict": launch.verdict.as_str(),
     })
 }
 
@@ -7574,6 +7652,7 @@ async fn run_gate_continuation_inner(
                 reservation,
                 pinned_session_id,
                 ctx,
+                &payload.launch,
             )
             .await;
             presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
@@ -7757,6 +7836,14 @@ pub(crate) fn build_continuation_claude_command(
     // against a fixed vector instead of whatever is on the machine's disk.
     hook_settings_args: Vec<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    // The model family coord decided for this spawn (`launch_model`, validated
+    // by [`LaunchFrame::resolve`]). Bound into `LaunchSpec.model`, which
+    // renders exactly one `--model` and drops any template `--model`, in
+    // either the `--model <m>` or the attached `--model=<m>` spelling. `None`
+    // keeps the template / account default — today's argv. The effort half is
+    // `LaunchSpec::effort`, owned by qontinui-runner#2569 (plan
+    // `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V8).
+    launch_model: Option<String>,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
 
@@ -7803,6 +7890,7 @@ pub(crate) fn build_continuation_claude_command(
         permission: PermissionMode::DangerouslySkip,
         session_id: Some(pinned_session_id.to_string()),
         name: session_name.map(str::to_string),
+        model: launch_model,
         extra_required,
         ..Default::default()
     };
@@ -8019,6 +8107,14 @@ async fn run_continuation_terminal(
     // once.
     let mut ctx = ctx;
     let mut attempt: u32 = 1;
+    // coord's launch decision, validated and logged once for every attempt
+    // below. The model binds into `LaunchSpec.model`; the effort waits on
+    // `LaunchSpec::effort` (qontinui-runner#2569) and the line says so.
+    let launch = payload.launch.resolve();
+    launch.log(
+        LaunchSeam::Terminal,
+        &format!("gate continuation agent={agent_id}"),
+    );
     loop {
         // Pre-pin the Claude session id (#548 Phase 1): the registry records
         // synchronously at spawn instead of mtime-guessing from transcripts.
@@ -8149,6 +8245,7 @@ async fn run_continuation_terminal(
             // must be checked (plan 2026-10-28-finished-gate-continuations-…).
             crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
+            launch.spec_model(),
         );
         // ...unless an operator template put a replacement prompt in the final
         // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
@@ -9158,6 +9255,14 @@ async fn run_condition_check_terminal(
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
+    // coord's launch decision for this check (`conditions/dispatch.rs`
+    // `spawn_frame` stamps the same `launch_*` keys): model via
+    // `LaunchSpec.model`; effort waits on qontinui-runner#2569.
+    let launch = payload.launch.resolve();
+    launch.log(
+        LaunchSeam::Terminal,
+        &format!("condition check run_id={:?}", payload.run_id),
+    );
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
         // UNKNOWN, and honestly so: this function does NO coord-mcp
         // provisioning of its own — it relies entirely on the downstream PTY
@@ -9192,6 +9297,7 @@ async fn run_condition_check_terminal(
         // with no SessionStart/PreCompact/Stop hook at all.
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
+        launch.spec_model(),
     );
     // Withheld when an operator template adds a replacement prompt.
     let policy_delivery =
@@ -9710,6 +9816,10 @@ async fn run_continuation_headless(
     // subprocess exits), matching the agent-spawn path's heartbeat-then-release
     // lifecycle; handed to the remover when the spawn fails before its child.
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    // The frame's `launch_*` keys, resolved here (as every other launch seam
+    // resolves its own payload's) and rendered as `--model` / `--effort` by
+    // [`headless_agent_args`].
+    launch: &LaunchFrame,
 ) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -9735,8 +9845,14 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
+    let launch = launch.resolve();
+    launch.log(
+        LaunchSeam::Headless,
+        &format!("gate continuation agent={agent_id}"),
+    );
     let session_args = headless_agent_args(
         &crate::settings::get_claude_session_permission(),
+        &launch,
         pinned_session_args(pinned_session_id),
     );
     match spawn_claude_child(
@@ -10655,6 +10771,14 @@ async fn run_agent_subprocess(
         let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
     }
 
+    // coord's launch decision for this spawn, validated once and logged once:
+    // every (re)spawn attempt below launches at the same model and effort.
+    let launch = payload.launch.resolve();
+    launch.log(
+        LaunchSeam::Headless,
+        &format!("coord agent spawn agent={}", payload.agent_id),
+    );
+
     loop {
         // Stop requested during a restart back-off (or before the first spawn):
         // bail without (re)spawning.
@@ -10668,6 +10792,7 @@ async fn run_agent_subprocess(
         // attempt: a restart is a new session, and the CLI refuses a reused id.
         let session_args = headless_agent_args(
             &crate::settings::get_claude_session_permission(),
+            &launch,
             session_pins.next_attempt(),
         );
         match spawn_claude_child(
@@ -12217,13 +12342,23 @@ fn pinned_session_args(session_id: uuid::Uuid) -> Vec<String> {
 /// The scheduler's RemoteAgent launch does NOT go through here: it passes its
 /// own bounded `-p --allowedTools` set to [`spawn_claude_child`].
 ///
+/// `launch` is coord's validated launch decision for this spawn
+/// ([`LaunchFrame::resolve`]): its `--model <family>` / `--effort <level>`
+/// follow the permission posture, each only when coord resolved it, so a
+/// frame with nothing decided renders exactly the argv it always did. A
+/// headless child has no launch template, so nothing else can carry either
+/// flag and neither is ever emitted twice (plan
+/// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V7).
+///
 /// [`PermissionMode::DangerouslySkip`]: crate::claude_session::launch_spec::PermissionMode::DangerouslySkip
 fn headless_agent_args(
     permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
+    launch: &AppliedLaunch,
     session_args: Vec<String>,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::PermissionMode;
     let mut args = permission.apply(PermissionMode::DangerouslySkip).render();
+    args.extend(launch.headless_args());
     args.extend(session_args);
     args
 }
@@ -12583,6 +12718,11 @@ async fn report_spawn_failed(
 /// caller that had a child. A trust-gate refusal never started one, and
 /// reporting it as `exited` would tell coord a process ran and stopped — so that
 /// one call site says [`SpawnPhase::Blocked`] instead.
+///
+/// One live attempt; a report that does not reach coord is spooled to the
+/// session outbox for the `CoordSync` drain to replay (see
+/// [`settle_spawn_failed_report`]), so a transient outage no longer leaves
+/// coord counting the allocation in flight until its horizon.
 async fn report_spawn_failed_in_phase(
     agent_id: uuid::Uuid,
     reason: &str,
@@ -12591,13 +12731,15 @@ async fn report_spawn_failed_in_phase(
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
 ) {
-    let _ = post_spawn_failed(
+    let body = spawn_failed_body(reason, exit_code, restarts_attempted, push_ref, spawn_phase);
+    let spool = crate::session::closeout_spool::global();
+    settle_spawn_failed_report(
         agent_id,
-        reason,
-        exit_code,
-        restarts_attempted,
-        push_ref,
-        spawn_phase,
+        &body,
+        1,
+        launch_deferral_retry_delay,
+        || post_spawn_failed(agent_id, &body),
+        spool.as_deref(),
     )
     .await;
 }
@@ -12615,34 +12757,39 @@ enum SpawnReportOutcome {
     Undelivered,
 }
 
-/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
-/// two arms that used to return silently (no coord base, no client).
-async fn post_spawn_failed(
-    agent_id: uuid::Uuid,
+/// The `spawn-failed` request body — built once per report, so every live
+/// attempt and the spooled replay send the same bytes.
+fn spawn_failed_body(
     reason: &str,
     exit_code: Option<i64>,
     restarts_attempted: u32,
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
-) -> SpawnReportOutcome {
+) -> SpawnFailedBody {
+    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
+        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
+    } else {
+        (None, SpawnPrContext::default())
+    };
+    SpawnFailedBody {
+        reason: reason.to_string(),
+        exit_code,
+        restarts_attempted: Some(restarts_attempted),
+        phase,
+        pr_context,
+    }
+}
+
+/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
+/// two arms that used to return silently (no coord base, no client).
+async fn post_spawn_failed(agent_id: uuid::Uuid, body: &SpawnFailedBody) -> SpawnReportOutcome {
+    let reason = body.reason.as_str();
     let Some(base) = connected_coord_base() else {
         warn!(
             "agent_runtime: spawn-failed NOT posted agent_id={agent_id} — no connected coord \
              base; reason={reason}"
         );
         return SpawnReportOutcome::Undelivered;
-    };
-    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
-        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
-    } else {
-        (None, SpawnPrContext::default())
-    };
-    let body = SpawnFailedBody {
-        reason: reason.to_string(),
-        exit_code,
-        restarts_attempted: Some(restarts_attempted),
-        phase,
-        pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -12663,7 +12810,7 @@ async fn post_spawn_failed(
     // agent) is classed Rejected below and not retried.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
-        .json(&body)
+        .json(body)
         .send()
         .await
     {
@@ -12681,7 +12828,16 @@ async fn post_spawn_failed(
             }
         }
         Err(e) => {
-            warn!("agent_runtime: spawn-failed POST agent_id={agent_id} failed: {e:#}");
+            // The FULL source chain, tagged `[timeout]` / `[connect]`:
+            // reqwest's own Display is only "error sending request for url
+            // (…)", which on 2026-11-14 hid whether 296 failures on spaceship
+            // were timeouts (plan
+            // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+            // Phase 6 step 1).
+            warn!(
+                "agent_runtime: spawn-failed POST agent_id={agent_id} failed: {}",
+                crate::session::coord_sync::transport_error(&e)
+            );
             SpawnReportOutcome::Undelivered
         }
     }
@@ -12704,23 +12860,118 @@ fn launch_deferral_should_retry(outcome: SpawnReportOutcome) -> bool {
     outcome == SpawnReportOutcome::Undelivered
 }
 
-/// Report a load-deferred launch to coord, with a bounded retry. Phase
-/// `blocked`: the launch was refused before any child existed.
+/// Report a load-deferred launch to coord, with a bounded retry, spooling it
+/// durably when every attempt is undelivered. Phase `blocked`: the launch was
+/// refused before any child existed.
 async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
-    for attempt in 0..LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
-        let outcome = post_spawn_failed(agent_id, reason, None, 0, None, SpawnPhase::Blocked).await;
+    let body = spawn_failed_body(reason, None, 0, None, SpawnPhase::Blocked);
+    let spool = crate::session::closeout_spool::global();
+    settle_spawn_failed_report(
+        agent_id,
+        &body,
+        LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+        launch_deferral_retry_delay,
+        || post_spawn_failed(agent_id, &body),
+        spool.as_deref(),
+    )
+    .await;
+}
+
+/// What finally became of one `spawn-failed` report.
+#[derive(Debug, Clone)]
+enum ReportSettlement {
+    /// coord took it (2xx).
+    Delivered,
+    /// coord refused it (4xx) — its verdict; never spooled.
+    Rejected,
+    /// Undelivered after every live attempt, and written to the session outbox
+    /// for the `CoordSync` drain to replay.
+    Spooled(crate::session::closeout_spool::Spooled),
+    /// Undelivered and NOT durably kept: no spool is installed (a headless
+    /// harness) or the outbox write failed. Logged at warn as lost.
+    Lost,
+}
+
+/// Post one report up to `attempts` times (retrying only the undelivered
+/// class, with `retry_delay` between attempts), then settle it: a report still
+/// UNDELIVERED is spooled to the session outbox ([`crate::session::spawn_report_spool`])
+/// so the `CoordSync` drain replays it under the device credential. A 4xx is
+/// coord's verdict and stays one — it is never spooled.
+///
+/// Plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 6 (D6): before this, a deferral undelivered after its 3 attempts was
+/// logged and dropped, and coord counted the allocation in flight for 7200 s.
+async fn settle_spawn_failed_report<P, Fut>(
+    agent_id: uuid::Uuid,
+    body: &SpawnFailedBody,
+    attempts: u32,
+    retry_delay: fn(u32) -> Duration,
+    mut post: P,
+    spool: Option<&crate::session::closeout_spool::CloseoutSpool>,
+) -> ReportSettlement
+where
+    P: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SpawnReportOutcome>,
+{
+    let mut outcome = SpawnReportOutcome::Undelivered;
+    for attempt in 0..attempts {
+        outcome = post().await;
         if !launch_deferral_should_retry(outcome) {
-            return;
+            break;
         }
-        if attempt + 1 < LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
-            tokio::time::sleep(launch_deferral_retry_delay(attempt)).await;
+        if attempt + 1 < attempts {
+            tokio::time::sleep(retry_delay(attempt)).await;
         }
     }
-    warn!(
-        "agent_runtime: launch deferral for agent_id={agent_id} NOT delivered after \
-         {LAUNCH_DEFERRAL_REPORT_ATTEMPTS} attempts — coord keeps counting the allocation \
-         in-flight until its own horizon; reason={reason}"
-    );
+    match outcome {
+        SpawnReportOutcome::Delivered => ReportSettlement::Delivered,
+        SpawnReportOutcome::Rejected => ReportSettlement::Rejected,
+        SpawnReportOutcome::Undelivered => {
+            spool_undelivered_report(agent_id, body, attempts, spool)
+        }
+    }
+}
+
+/// The undelivered arm of [`settle_spawn_failed_report`].
+fn spool_undelivered_report(
+    agent_id: uuid::Uuid,
+    body: &SpawnFailedBody,
+    attempts: u32,
+    spool: Option<&crate::session::closeout_spool::CloseoutSpool>,
+) -> ReportSettlement {
+    let reason = body.reason.as_str();
+    let Some(spool) = spool else {
+        warn!(
+            "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after {attempts} \
+             attempt(s) and NO durable spool is installed — LOST; coord keeps counting the \
+             allocation in-flight until its own horizon; reason={reason}"
+        );
+        return ReportSettlement::Lost;
+    };
+    let written = serde_json::to_value(body)
+        .map_err(std::io::Error::other)
+        .and_then(|json| {
+            crate::session::spawn_report_spool::spool_spawn_failed(spool, agent_id, &json)
+        });
+    match written {
+        Ok(spooled) => {
+            warn!(
+                "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after \
+                 {attempts} attempt(s) — spooled to the session outbox (lane {}, seq {}); the \
+                 coord drain replays it; reason={reason}",
+                spooled.session_id, spooled.seq
+            );
+            ReportSettlement::Spooled(spooled)
+        }
+        Err(e) => {
+            warn!(
+                "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after \
+                 {attempts} attempt(s) and the outbox spool FAILED ({e}) — LOST; coord keeps \
+                 counting the allocation in-flight until its own horizon; reason={reason}"
+            );
+            ReportSettlement::Lost
+        }
+    }
 }
 
 // =============================================================================
@@ -13608,6 +13859,7 @@ mod tests {
             report_token: report_token.map(|s| s.to_string()),
             condition_name: None,
             secrets: Default::default(),
+            launch: LaunchFrame::default(),
         }
     }
 
@@ -14255,6 +14507,7 @@ mod tests {
                 None,
                 Vec::new(),
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
+                None,
             )
         };
         let without = build(None);
@@ -14282,6 +14535,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -14309,6 +14563,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.last().map(String::as_str),
@@ -14339,6 +14594,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -14364,6 +14620,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         // The prompt stays the trailing positional behind `--`.
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
@@ -14420,6 +14677,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         let flag = cmd
             .iter()
@@ -14460,6 +14718,7 @@ mod tests {
                 "C:/hooks/claude_hook_settings.json".to_string(),
             ],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
         assert_eq!(cmd.get(cmd.len() - 2).map(String::as_str), Some("--"));
@@ -14492,6 +14751,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -14517,6 +14777,7 @@ mod tests {
             )),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -14548,6 +14809,7 @@ mod tests {
             Some(carrier),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -14587,6 +14849,7 @@ mod tests {
                     account_command: None,
                     ..Default::default()
                 },
+                None,
             )
         };
         let with = build(Some("claude --system-prompt operator-prompt"));
@@ -14605,6 +14868,116 @@ mod tests {
             delivery_unless_replacement(carrier.policy_delivery(), &without),
             carrier.policy_delivery()
         );
+    }
+
+    /// Plan `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type`
+    /// Phase 4, terminal seam: a frame carrying `launch_model: "sonnet"`
+    /// renders exactly ONE `--model sonnet`, beating an operator template's
+    /// `--model opus`; an invalid `launch_effort` beside it renders nothing,
+    /// and a frame with no launch keys keeps the template's model.
+    #[test]
+    fn continuation_command_binds_the_frames_launch_model_over_the_template() {
+        let build = |frame: serde_json::Value| {
+            let launch: LaunchFrame = serde_json::from_value(frame).unwrap();
+            build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                None,
+                vec![],
+                "do the thing".to_string(),
+                None,
+                vec![],
+                &crate::claude_session::launch_spec::LaunchConfig {
+                    default_template: Some("claude --model opus".to_string()),
+                    account_command: None,
+                    ..Default::default()
+                },
+                launch.resolve().spec_model(),
+            )
+        };
+        let model_values = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .enumerate()
+                .filter(|(_, a)| a.as_str() == "--model")
+                .filter_map(|(i, _)| argv.get(i + 1).cloned())
+                .collect()
+        };
+
+        let argv = build(serde_json::json!({
+            "launch_model": "sonnet",
+            "launch_effort": "warp-speed",
+        }));
+        assert_eq!(model_values(&argv), vec!["sonnet".to_string()], "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--effort"), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "opus"), "{argv:?}");
+
+        let untouched = build(serde_json::json!({}));
+        assert_eq!(
+            model_values(&untouched),
+            vec!["opus".to_string()],
+            "{untouched:?}"
+        );
+    }
+
+    /// The three `launch_*` keys parse off every frame shape this runner
+    /// reads, and their absence leaves each shape parsing as before (V5).
+    #[test]
+    fn every_spawn_frame_shape_reads_the_launch_keys() {
+        let keys = serde_json::json!({
+            "launch_model": "haiku",
+            "launch_effort": "max",
+            "launch_settings": {"spawn_type": "condition_autodispatch", "effort_source": "operator_setting"}
+        });
+        let with = |mut base: serde_json::Value| {
+            base.as_object_mut()
+                .unwrap()
+                .extend(keys.as_object().unwrap().clone());
+            base
+        };
+        let gate = serde_json::json!({
+            "target_device_id": "11111111-1111-4111-8111-111111111111",
+            "initial_prompt": "p",
+            "source": "gate_continuation",
+        });
+        let cond = serde_json::json!({
+            "run_id": "r",
+            "target_url": "http://x",
+            "initial_prompt": "p",
+            "source": "condition_check",
+        });
+        let launch = serde_json::json!({
+            "agent_id": "11111111-1111-4111-8111-111111111111",
+            "target_device_id": "11111111-1111-4111-8111-111111111111",
+            "worktrees": [],
+            "initial_prompt": "p",
+            "claim_token": "t",
+            "plan_phase": 4,
+            "jwt_exp": 0,
+        });
+
+        let g: GateContinuationPayload = serde_json::from_value(with(gate.clone())).unwrap();
+        let c: ConditionCheckPayload = serde_json::from_value(with(cond.clone())).unwrap();
+        let l: LaunchPayload = serde_json::from_value(with(launch.clone())).unwrap();
+        for applied in [g.launch.resolve(), c.launch.resolve(), l.launch.resolve()] {
+            assert_eq!(applied.model, Some("haiku"));
+            assert_eq!(applied.effort, Some("max"));
+            assert_eq!(
+                applied.spawn_type.as_deref(),
+                Some("condition_autodispatch")
+            );
+        }
+        assert_eq!(
+            l.plan_phase,
+            Some(4),
+            "flatten must not disturb the numeric fields"
+        );
+
+        let g: GateContinuationPayload = serde_json::from_value(gate).unwrap();
+        let c: ConditionCheckPayload = serde_json::from_value(cond).unwrap();
+        let l: LaunchPayload = serde_json::from_value(launch).unwrap();
+        for applied in [g.launch.resolve(), c.launch.resolve(), l.launch.resolve()] {
+            assert_eq!(applied, AppliedLaunch::default());
+        }
     }
 
     /// Both carriers, one rule: at most ONE system-prompt flag, always ahead of
@@ -14629,6 +15002,7 @@ mod tests {
                 carrier.clone(),
                 vec!["--settings".to_string(), "/h/s.json".to_string()],
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
+                None,
             );
             let flags: Vec<usize> = cmd
                 .iter()
@@ -14670,6 +15044,7 @@ mod tests {
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
             account: None,
+            launch: LaunchFrame::default(),
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -15850,6 +16225,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         let flag = cmd
             .iter()
@@ -17784,6 +18160,7 @@ mod tests {
         assert_eq!(
             headless_agent_args(
                 &SessionPermissionSetting::SiteDefault,
+                &AppliedLaunch::default(),
                 pinned_session_args(id)
             ),
             vec![
@@ -17803,7 +18180,8 @@ mod tests {
         let posture = SessionPermissionSetting::AllowList {
             tools: vec!["Read".to_string(), "Bash(git status)".to_string()],
         };
-        let args = headless_agent_args(&posture, pinned_session_args(id));
+        let args =
+            headless_agent_args(&posture, &AppliedLaunch::default(), pinned_session_args(id));
         assert_eq!(
             args,
             vec![
@@ -17817,6 +18195,58 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    /// Plan `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type`
+    /// V7, headless seam: a coord frame's `launch_model` / `launch_effort`
+    /// reach the child as exactly one `--model` and one `--effort`, between
+    /// the permission posture and the session pin.
+    #[test]
+    fn headless_agent_args_carry_the_frames_launch_decision() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let launch: LaunchFrame = serde_json::from_value(serde_json::json!({
+            "launch_model": "sonnet",
+            "launch_effort": "high",
+            "launch_settings": {"spawn_type": "pr_fix_red_ci", "model_source": "operator_setting"}
+        }))
+        .unwrap();
+        assert_eq!(
+            headless_agent_args(
+                &SessionPermissionSetting::SiteDefault,
+                &launch.resolve(),
+                pinned_session_args(id)
+            ),
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+                "--session-id".to_string(),
+                "99999999-9999-4999-8999-999999999999".to_string(),
+            ]
+        );
+    }
+
+    /// An invalid `launch_effort` renders nothing — dropped, never guessed —
+    /// while a valid `launch_model` beside it still applies.
+    #[test]
+    fn headless_agent_args_drop_an_invalid_launch_effort() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let launch: LaunchFrame = serde_json::from_value(serde_json::json!({
+            "launch_model": "opus",
+            "launch_effort": "turbo",
+        }))
+        .unwrap();
+        let args = headless_agent_args(
+            &SessionPermissionSetting::SiteDefault,
+            &launch.resolve(),
+            pinned_session_args(id),
+        );
+        assert!(!args.iter().any(|a| a == "--effort"));
+        assert_eq!(args.iter().filter(|a| *a == "--model").count(), 1);
     }
 
     /// Every spawn attempt runs under a FRESH session id, and the session
@@ -17885,6 +18315,7 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            launch: LaunchFrame::default(),
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -18024,6 +18455,7 @@ mod tests {
             AnchorReservation::none(),
             pinned,
             None,
+            &LaunchFrame::default(),
         )
         .await;
         assert!(
@@ -19650,6 +20082,141 @@ mod tests {
             total <= Duration::from_secs(10),
             "total backoff stays small"
         );
+    }
+
+    fn report_spool_in(
+        dir: &std::path::Path,
+    ) -> (
+        crate::session::closeout_spool::CloseoutSpool,
+        std::sync::Arc<crate::session::local_store::OutboxWriter>,
+    ) {
+        let outbox = std::sync::Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.join("outbox.jsonl")).unwrap(),
+        );
+        (
+            crate::session::closeout_spool::CloseoutSpool::new(
+                outbox.clone(),
+                uuid::Uuid::new_v4(),
+            ),
+            outbox,
+        )
+    }
+
+    /// A launch deferral every live attempt failed to deliver is SPOOLED to
+    /// the session outbox — on the agent's lane, carrying the deferral reason
+    /// and phase — not logged and dropped (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 6).
+    ///
+    /// Mutation: return `ReportSettlement::Lost` before the spool write in
+    /// `spool_undelivered_report` (the outbox stays empty).
+    #[tokio::test]
+    async fn an_undelivered_launch_deferral_is_spooled_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spool, outbox) = report_spool_in(dir.path());
+        let agent_id = uuid::Uuid::new_v4();
+        let reason = "deferred_load:thread_pressure:warn:380_over_376";
+        let body = spawn_failed_body(reason, None, 0, None, SpawnPhase::Blocked);
+        let posts = std::cell::Cell::new(0_u32);
+        let settled = settle_spawn_failed_report(
+            agent_id,
+            &body,
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                posts.set(posts.get() + 1);
+                async { SpawnReportOutcome::Undelivered }
+            },
+            Some(&spool),
+        )
+        .await;
+        assert_eq!(
+            posts.get(),
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            "every attempt spent first"
+        );
+        assert!(
+            matches!(settled, ReportSettlement::Spooled(_)),
+            "{settled:?}"
+        );
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one durable row");
+        let row = &pending[0];
+        assert_eq!(row.event_kind, "spawn_failed_report");
+        assert_eq!(
+            row.session_id,
+            crate::session::spawn_report_spool::spawn_report_lane(agent_id)
+        );
+        let (replay_agent, replay_body) =
+            crate::session::spawn_report_spool::replay_target(&row.payload).expect("replayable");
+        assert_eq!(replay_agent, agent_id);
+        assert_eq!(replay_body["reason"], reason);
+        assert_eq!(
+            replay_body,
+            serde_json::to_value(&body).unwrap(),
+            "the live body, verbatim"
+        );
+        if spawn_outcome_enrichment_enabled() {
+            assert_eq!(replay_body["phase"], "blocked");
+        }
+
+        // No spool installed: the loss is reported as a loss, never as kept.
+        let lost = settle_spawn_failed_report(
+            agent_id,
+            &body,
+            1,
+            |_| Duration::ZERO,
+            || async { SpawnReportOutcome::Undelivered },
+            None,
+        )
+        .await;
+        assert!(matches!(lost, ReportSettlement::Lost), "{lost:?}");
+    }
+
+    /// A 4xx is coord's verdict on the report: not retried, not spooled.
+    /// A delivered report is not spooled either.
+    ///
+    /// Mutation: spool on `Rejected` too (the outbox gains a row), or retry it.
+    #[tokio::test]
+    async fn a_4xx_spawn_failed_is_not_spooled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spool, outbox) = report_spool_in(dir.path());
+        let body = spawn_failed_body("spawn failure: x", Some(1), 0, None, SpawnPhase::Exited);
+        let posts = std::cell::Cell::new(0_u32);
+        let settled = settle_spawn_failed_report(
+            uuid::Uuid::new_v4(),
+            &body,
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                posts.set(posts.get() + 1);
+                async { SpawnReportOutcome::Rejected }
+            },
+            Some(&spool),
+        )
+        .await;
+        assert!(matches!(settled, ReportSettlement::Rejected), "{settled:?}");
+        assert_eq!(posts.get(), 1, "a 4xx is not retried");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a 4xx is never spooled"
+        );
+
+        let delivered = settle_spawn_failed_report(
+            uuid::Uuid::new_v4(),
+            &body,
+            1,
+            |_| Duration::ZERO,
+            || async { SpawnReportOutcome::Delivered },
+            Some(&spool),
+        )
+        .await;
+        assert!(
+            matches!(delivered, ReportSettlement::Delivered),
+            "{delivered:?}"
+        );
+        assert!(outbox.pending().unwrap().is_empty());
     }
 
     /// The fixed count cap is GONE (operator direction 2026-10-03): with
@@ -21692,6 +22259,7 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                launch: LaunchFrame::default(),
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -22388,6 +22956,9 @@ mod tests {
         assert_eq!(v["threads"]["gradedThreads"], 200);
         assert_eq!(v["threads"]["warnCeiling"], 256);
         assert_eq!(v["threads"]["criticalCeiling"], 400);
+        // The memory lane already warns, so the next launch is refused.
+        assert_eq!(v["launchHeadroom"], 0);
+        assert_eq!(v["launchVerdict"], "warn");
         assert_eq!(v["liveContinuations"], 7);
         assert_eq!(v["countCap"], "retired");
 
@@ -22434,6 +23005,9 @@ mod tests {
         assert_eq!(v["enabled"], false);
         assert_eq!(v["memory"], serde_json::Value::Null);
         assert_eq!(v["threads"], serde_json::Value::Null);
+        // No reading, no number: the headroom is UNKNOWN, never 0.
+        assert_eq!(v["launchHeadroom"], serde_json::Value::Null);
+        assert_eq!(v["launchVerdict"], "guard_disabled");
         assert_eq!(v["liveContinuations"], 3);
         assert_eq!(v["reservedSpawns"], 2);
     }

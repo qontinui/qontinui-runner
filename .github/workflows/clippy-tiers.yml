@@ -263,11 +263,16 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Pinned, not `latest`: the orphan-completion step below reads
+      # reviewdog's stderr for `failed to create check` / `failed to post` /
+      # `check-runs/<id>`, wording checked against v0.21.2 (the version
+      # qontinui-coord's ci.yml pins). Re-check that wording, and
+      # complete-orphaned-check-runs.sh's markers, on any bump.
       - name: Setup reviewdog
         id: setup_reviewdog
-        uses: reviewdog/action-setup@v1
+        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1
         with:
-          reviewdog_version: latest
+          reviewdog_version: v0.21.2
 
       # Bounded against a job-time apt hang — see the rationale on the same
       # step in .github/workflows/ci.yml.
@@ -346,20 +351,160 @@ jobs:
         # the diff. `-filter-mode=diff_context` = fail only on findings on
         # changed lines; `-fail-on-error=true` makes those diff findings fail
         # THIS (advisory, non-required) check only.
+        #
+        # Outputs whenever this shell exits (a normal end, a death under
+        # `set -e`, a SIGTERM/SIGINT from a cancel; not a SIGKILL or a runner
+        # death, which write nothing and read as unknown, while a helper that
+        # cannot be sourced writes rc=not-run-source-failed), for the completion
+        # step below: `rc`
+        # (reviewdog's exit status; `unknown` when the step dies before
+        # reviewdog returns), `started_at` / `ended_at` (the window a
+        # `clippy-diff` run of this job's reviewdog must have STARTED in, on
+        # GitHub's clock; a run outside it belongs to another workflow run on
+        # the same head -- a re-run gets its own concurrency group here),
+        # `clock` and `stderr_log` (reviewdog's stderr, whose `failed to post`
+        # / `check-runs/<id>` lines say whether it finished its run). Written
+        # by the sourced helper .github/scripts/reviewdog-step-outputs.sh,
+        # whose header is the contract and whose test checks every output read
+        # below; it is vendored from qontinui-coord and pinned with the other
+        # copies (see the completion step). The step still exits with
+        # reviewdog's status, so its pass/fail is unchanged.
         env:
           CARGO_BUILD_JOBS: 1
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # A helper that cannot be sourced writes no trap, so say so here:
+          # rc=not-run-source-failed tells the completion step reviewdog never
+          # ran. Exit 1 as before -- the failure is real and must be seen.
+          source .github/scripts/reviewdog-step-outputs.sh || {
+            echo "rc=not-run-source-failed" >> "$GITHUB_OUTPUT"
+            echo "::warning title=reviewdog-step-outputs::.github/scripts/reviewdog-step-outputs.sh could not be sourced; reviewdog did not run"
+            exit 1
+          }
+          rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
           cargo clippy --message-format=json > clippy-report.json 2>/dev/null || true
-          reviewdog \
+          # rso_run marks the window's start, captures reviewdog's stderr for
+          # the completion step and replays it into this log (after reviewdog
+          # returns, not interleaved), and sets rc only once reviewdog has
+          # returned -- a cancel mid-reviewdog leaves `unknown`, never a pass.
+          rso_run reviewdog \
             -f=clippy \
             -name="clippy-diff" \
             -filter-mode=diff_context \
             -reporter=github-pr-check \
             -fail-on-error=true \
             < clippy-report.json
+          exit "$rc"
         shell: bash
+
+      # reviewdog CREATES the `clippy-diff` check run through the API and
+      # completes it with a later PATCH. When that PATCH fails, the run stays
+      # `in_progress` for good: nothing else ever completes it, and the PR's
+      # check page says CI is still running when nothing is. On
+      # qontinui-coord#4159, rust-ci job 132648536974 logged `reviewdog:
+      # failed to post result: PATCH .../check-runs/132651515896: 404 Not
+      # Found` at 01:06:21.105Z, about 1 s after the step started at
+      # 01:06:20.22Z (log line 4367; verified by an independent reviewer's
+      # read of that job's log on 2026-11-17, and recorded in coord finding
+      # c58cd00f-7651-4dde-bd3d-d69fcc59f291; likely cause: read-after-write
+      # lag at GitHub, a hypothesis). That finding also records that coord
+      # held qontinui-coord#4159 and #4053 at block_reason_code ci-pending
+      # with the orphan as the only non-terminal check (plan
+      # 2026-11-16-finish-session-refuses-a-finish-whose-only-owed-pr-is-ci-pending,
+      # Phase 2b). Here a reviewdog failure already reds THIS job, so this step
+      # only completes the orphaned run as `neutral` -- with a summary naming
+      # reviewdog's rc and this job -- and leaves the job's own red to report
+      # the failure. It acts only when reviewdog itself reported that it did
+      # not finish its run (`failed to create check` / `failed to post` /
+      # `check-runs/<id>` in its stderr), or when the step ended before
+      # reviewdog returned: a clean reviewdog exit -- 0, or 1 for diff
+      # findings -- and a skipped step make no API call at all. It aims at
+      # the run THIS job's reviewdog created: the id
+      # in reviewdog's own failure line when there is one, otherwise a listing
+      # limited to `github-actions` runs that started inside reviewdog's
+      # window, read from GitHub's clock. A concurrent run on the same head
+      # whose reviewdog overlapped that window can still be a candidate; the
+      # window narrows that case, it does not exclude it (the script's header
+      # states exactly what is guaranteed, and what happens when a bound is
+      # unknown). Each run is read again before every PATCH; a run completed
+      # as of that re-read (by reviewdog, pass or fail) is not PATCHed, though
+      # one a concurrent job completes between the re-read and the PATCH can
+      # still be overwritten. Advisory:
+      # the script retries a 404, a 5xx, a secondary rate limit and a
+      # connection-class failure with a bounded backoff and otherwise warns
+      # and exits 0, and `continue-on-error` covers a failure in the script
+      # itself. It needs the checkout, so it runs only when that succeeded.
+      #
+      # This script, reviewdog-step-outputs.sh (sourced by the reviewdog step
+      # above) and their two tests are VENDORED byte-identical from
+      # qontinui-coord (canonical copies: qontinui-coord .github/scripts/, same
+      # names), the way secret-scan.yml vendors fetch-gitleaks.sh. Their sha256s live in
+      # ONE file, .github/scripts/complete-orphaned-check-runs.sha256, which this
+      # step and the test step below both check; update it with the copies.
+      # That pin catches only an edit to a copy made without updating the pin.
+      # It is NOT a drift or security control against coord's canonical copy:
+      # a copy that falls behind coord, with the pin updated alongside, passes.
+      # A scheduled drift check against coord is out of scope here. A mismatch
+      # in this step only skips the completion (with a warning); the test step
+      # below is the one that reds on it.
+      - name: Complete an orphaned clippy-diff check run
+        if: always() && github.event_name == 'pull_request' && steps.checkout.outcome == 'success'
+        continue-on-error: true
+        # The script bounds itself: each gh call is capped at 25 s (20 s plus
+        # a 5 s kill), retry sleeps share a 30 s budget, and -- since the
+        # calls are not capped by that budget -- it starts no new API call
+        # after 180 s of wall clock, warns and exits 0, so it ends in about
+        # 215 s at most. This timeout is a backstop that should never fire.
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STEP_RC: ${{ steps.clippy.outputs.rc }}
+          STEP_OUTCOME: ${{ steps.clippy.outcome }}
+          REVIEWDOG_STARTED_AT: ${{ steps.clippy.outputs.started_at }}
+          REVIEWDOG_ENDED_AT: ${{ steps.clippy.outputs.ended_at }}
+          REVIEWDOG_CLOCK: ${{ steps.clippy.outputs.clock }}
+          REVIEWDOG_STDERR_LOG: ${{ steps.clippy.outputs.stderr_log }}
+          JOB_CHECK_RUN_ID: ${{ job.check_run_id }}
+        run: |
+          if ! sha256sum -c --quiet .github/scripts/complete-orphaned-check-runs.sha256; then
+            echo "::warning title=complete-orphaned-check-runs does not match its sha256 pin::a vendored copy was changed without updating .github/scripts/complete-orphaned-check-runs.sha256, so no orphaned clippy-diff run was completed."
+            exit 0
+          fi
+          # Which API client the script will use: gh where it is installed,
+          # else curl with GH_TOKEN. Printed so a run's log shows it.
+          if command -v gh >/dev/null 2>&1; then
+            gh --version | head -n 1
+          else
+            echo "gh is not on PATH on this runner; complete-orphaned-check-runs.sh falls back to curl with GH_TOKEN"
+          fi
+          bash .github/scripts/complete-orphaned-check-runs.sh \
+            "$GITHUB_REPOSITORY" "$HEAD_SHA" "clippy-diff" \
+            "the reviewdog step ended with outcome '${STEP_OUTCOME:-unknown}'"
+        shell: bash
+
+      # The vendored scripts' own fixture tests, byte-identical to coord's
+      # (canonical: qontinui-coord .github/scripts/test-complete-orphaned-check-runs.sh
+      # and test-reviewdog-step-outputs.sh; the second also checks that every
+      # steps.clippy.outputs.* read in this file is one the helper writes).
+      # Hermetic (a stub gh and curl, an injected sleep), seconds on this
+      # existing hosted job. All four files are checked against
+      # complete-orphaned-check-runs.sha256 (see the step above for what that
+      # pin does and does not catch); a mismatch reds this advisory check, as
+      # secret-scan.yml's pin does for fetch-gitleaks.sh. `!cancelled()` so
+      # its verdict stands even when clippy or a setup step failed; it needs
+      # only the checkout. A failure here is a verdict on this PR (the
+      # vendored copy or its pin), so it is deliberately NOT one of the setup
+      # steps the next step names.
+      - name: Orphaned check-run completion tests
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          sha256sum -c --quiet .github/scripts/complete-orphaned-check-runs.sha256 \
+            || { echo "::error title=complete-orphaned-check-runs pin mismatch::a vendored copy was changed without updating .github/scripts/complete-orphaned-check-runs.sha256; copy the files from qontinui-coord and regenerate that file."; exit 1; }
+          bash .github/scripts/test-complete-orphaned-check-runs.sh
+          bash .github/scripts/test-reviewdog-step-outputs.sh
 
       # A setup death is NOT a verdict on this PR (plan
       # 2026-11-05-repair-classifier-reads-why-a-check-failed, Phase 3). When a

@@ -10882,9 +10882,31 @@ pub(crate) fn write_degraded_breadcrumb(
     );
     let line2 = breadcrumb_stamp_json(workdir, verdict, port);
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
-    if let Err(e) = std::fs::write(&path, format!("{line1}\n{line2}\n")) {
+    if let Err(e) = replace_breadcrumb(&path, &format!("{line1}\n{line2}\n")) {
         warn!("coord_mcp: failed to write degraded breadcrumb in {workdir}: {e}");
     }
+}
+
+/// Replace the breadcrumb at `path` with `body` ATOMICALLY: write a sibling
+/// temp file, then rename it over the breadcrumb. `std::fs::write` truncates
+/// before it writes, so a reader racing a rewrite (the probe re-stamping it,
+/// `/gate`, `/coord-revive`) could read an EMPTY file, which no reader can
+/// tell from a breadcrumb with no cause. On Windows a reader holding the old
+/// file open blocks the rename only if it opened WITHOUT `FILE_SHARE_DELETE`
+/// (Rust's own readers share delete; a .NET or CRT reader may not); the write
+/// then fails and is logged, leaving the previous breadcrumb in place. A temp
+/// file a crash leaves behind is excluded by the runner's managed excludes
+/// (`fleet::MANAGED_REPO_EXCLUDES`).
+fn replace_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_file_name(format!(
+        "{COORD_MCP_STATUS_FILE}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7().simple()
+    ));
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Write the NEVER-PROVISIONED breadcrumb (Phase 4): this spawn gave the session
@@ -10909,7 +10931,7 @@ pub(crate) fn write_unprovisioned_breadcrumb(workdir: &str, reason: &str) {
 /// a write failure only logs — losing the breadcrumb must never fail a spawn.
 fn write_status_breadcrumb(workdir: &str, line: &str) {
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
-    if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
+    if let Err(e) = replace_breadcrumb(&path, &format!("{line}\n")) {
         warn!("coord_mcp: failed to write status breadcrumb in {workdir}: {e}");
     }
 }
@@ -26554,6 +26576,13 @@ mod spawn_tenant_credential_tests {
     fn the_tenancy_report_names_a_row_credential_divergence_and_an_unknown() {
         use crate::commands::session_info::{project_tenancy, TENANCY_RESOLVED, TENANCY_UNKNOWN};
         let amb = crate::test_env::isolated_ambient();
+        // The UNKNOWN half needs a device JWT with no tenant claim, and
+        // `AuthManager::get_access_token` falls back to the OS keychain, which
+        // the fixture does not isolate: on a paired dev box that slot holds the
+        // operator's real token, whose tenant then resolves instead of the
+        // refusal. CI already runs with the keychain off; so does this test.
+        // Restored on drop: the key is in `ambient::AMBIENT_ENV_KEYS`.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         amb.write_active_tenant_id(tenant_a());
         let (wd, term) = (workdir(&amb, "report"), terminal());
         let _ = provision_coord_mcp_config_file(&wd, Some(&term), None, Some(PORT))

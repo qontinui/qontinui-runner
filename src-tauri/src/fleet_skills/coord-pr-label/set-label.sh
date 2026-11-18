@@ -16,9 +16,15 @@
 # coord's `GET /coord/agent-pr-labels` rather than trusting the write's 200.
 #
 # Exit codes: 0 ok (written AND read back) | 2 usage / invalid label |
-# 3 gh failed | 4 coord refused, failed, or CONTRADICTED its own write |
+# 3 gh failed, or the label is not on the PR (not a stale strip) | 4 coord refused, failed, or CONTRADICTED its own write |
 # 5 coord row withheld (write tenant not proven to own the repo) |
-# 6 written but read-back UNKNOWN (the read door could not be asked).
+# 6 written but read-back UNKNOWN (the read door could not be asked) |
+# 7 the edge is already satisfied: NOT-SENT (pre-flight: upstream already landed)
+#   or STRIPPED-STALE (added, then a recorded removal, upstream landed) |
+# 8 the GitHub label read-back could not be made (UNKNOWN, never ok; at the
+#   final re-read coord may already carry its row).
+# No success line is printed on gh's exit code alone: the PR's labels are READ
+# back from GitHub after the add and again before the final ok.
 
 set -euo pipefail
 
@@ -50,15 +56,28 @@ Optional env:
                        coord's websocket door and is ignored.
 
 Exit codes:
-  0  ok -- GitHub label applied, coord row written AND read back present
+  0  ok -- GitHub label read back present (after the add AND before this line),
+     coord row written AND read back present
   2  usage error or invalid label (nothing sent)
-  3  the GitHub-side label add failed
+  3  the GitHub-side label add failed, or GitHub accepted it and the label is
+     NOT on the PR (removed by someone, or no removal visible) for a reason
+     other than a stale-dep strip. After the coord write, coord may hold a row:
+     the message says so when it read one back.
   4  coord refused or failed the write, or its read door CONTRADICTED it
      (answered 200 without the label coord said it wrote)
   5  coord row WITHHELD -- the write tenant was not proven to own the repo
   6  written but read-back UNKNOWN -- the read door (GET /coord/agent-pr-labels)
      could not be asked: unreachable, 401, 404 (a coord predating the door
      404s for everyone), 5xx, an unparseable body, or no credential. Never ok.
+  7  the dependency edge is already satisfied -- its upstream PR has landed --
+     so this run sets no label and nothing needs doing (NOT-SENT reads no labels). Two verdicts:
+     NOT-SENT (the pre-flight read the upstream as landed; nothing was sent)
+     and STRIPPED-STALE (GitHub recorded a removal of this add). After the
+     coord write, a STRIPPED-STALE line says whether coord still holds a row.
+  8  GitHub accepted the add but the PR's labels could not be READ back, so
+     whether the label is on the PR is UNKNOWN. Never ok. Raised right after
+     the add (nothing sent to coord) or at the final re-read (coord may already
+     carry its row).
 
 Examples:
   set-label.sh --repo qontinui/qontinui-coord --pr 75 \
@@ -528,6 +547,228 @@ if [[ -z "${QONTINUI_AGENT_ID:-}" ]]; then
   exit 2
 fi
 
+# ----- GitHub read-back: no success claim rests on gh's exit code ------------
+#
+# A 2xx from `POST issues/<n>/labels` says GitHub ACCEPTED the add, not that the
+# label is on the PR when the caller reads this output. Measured 2026-11-17 on
+# qontinui/qontinui-coord#4227: `coord:downstream-of=qontinui/qontinui-web#2281`
+# was added at 09:50:21 and removed by qontinui-merge-orchestrator at 09:50:23,
+# because web#2281 had already LANDED (09:25:43) and coord strips a waiting-side
+# dep label whose upstream has landed. The script printed `ok: gh added label`,
+# then coord's write answered written=1 and its read door listed nothing -- a
+# "CONTRADICTION" that was in fact coord doing its job, and the report said
+# "gh-side label add succeeded (canonical)" about a label that was not there.
+#
+# So: (a) before sending a dep label, its upstream PR (this PR, for upstream-of) is read, and
+# one that has already landed is answered as NOT-SENT (exit 7) with
+# nothing sent; (b) after the add, the PR's labels are READ BACK from GitHub,
+# and only `present` lets the script go on; (c) before the final `ok:`, and
+# before calling a missing coord row a contradiction, GitHub is read again,
+# because coord's strip can land after (b). A label that is gone is explained
+# from the PR's own `unlabeled` events: removed + upstream landed is exit 7,
+# anything else is an error naming who removed it (or that nobody did).
+RC_STRIPPED_STALE=7
+RC_GH_READBACK_UNKNOWN=8
+
+# dep_upstream -> prints `<owner>/<repo>#<n>` of the PR whose LANDING satisfies
+# this label's dependency edge, or nothing for a label that carries no edge OR
+# whose upstream is not named unambiguously. downstream-of / stacked-on name it;
+# upstream-of=X says X waits on THIS PR. A BARE `<repo>#<n>` prints nothing:
+# coord resolves its owner under the owning tenant's org, not from --repo, so a
+# guess here could read another org's PR and drop a live edge as "stale".
+dep_upstream() {
+  local rest="${LABEL#coord:}" key val
+  key="${rest%%=*}"; val="${rest#*=}"
+  case "$key" in
+    downstream-of|stacked-on) ;;
+    upstream-of) printf '%s#%s' "$REPO" "$PR"; return 0 ;;
+    *) return 0 ;;
+  esac
+  case "$val" in
+    \#*)    printf '%s%s' "$REPO" "$val" ;;
+    */*\#*) printf '%s' "$val" ;;
+  esac
+}
+
+# pr_landed <owner/repo#n> -> PL_STATE: landed | open | closed_unlanded | unknown,
+# and PL_NOTE. coord's rebase-ff land leaves a PR CLOSED with merged_at null, so
+# a closed PR carrying `coord:landed` is landed too; a closed one without it is not.
+PL_PULL_JQ='[.state, (.merged_at // ""), ((.labels // []) | map(.name) | any(. == "coord:landed"))] | map(tostring) | join("|")'
+pr_landed() {
+  local ref="$1" out rc=0 st merged lbl
+  PL_STATE=unknown; PL_NOTE="gh could not read $ref"
+  out="$(gh api "repos/${ref%%#*}/pulls/${ref##*#}" \
+    --jq "$PL_PULL_JQ" 2>/dev/null)" || rc=$?
+  if (( rc != 0 )) || [[ -z "$out" ]]; then return 0; fi
+  # A `|`, not a tab: tab is IFS WHITESPACE, so an empty merged_at between two tabs
+  # would collapse and shift `false` into the merged_at field.
+  IFS='|' read -r st merged lbl <<<"$out"
+  lbl="${lbl%$'\r'}"
+  if [[ -n "$merged" ]]; then PL_STATE=landed; PL_NOTE="merged at $merged"
+  elif [[ "$st" == closed && "$lbl" == true ]]; then PL_STATE=landed; PL_NOTE="closed with coord:landed -- coord's rebase-ff land"
+  elif [[ "$st" == closed ]]; then PL_STATE=closed_unlanded; PL_NOTE="closed without landing"
+  elif [[ "$st" == open ]]; then PL_STATE=open; PL_NOTE="open"
+  fi
+}
+
+# gh_label_state -> GL_STATE: present | absent | unknown (the read failed).
+gh_label_state() {
+  local out rc=0
+  GL_STATE=unknown
+  out="$(gh api "repos/$REPO/issues/$PR/labels" --paginate --jq '.[].name' 2>/dev/null)" || rc=$?
+  if (( rc != 0 )); then return 0; fi
+  # GitHub label names are case-insensitive: an add naming an existing label in
+  # another case attaches THAT label, under its stored spelling.
+  # Compared in bash, not with `grep -i`: `grep -iF` aborts (SIGABRT) on the Git
+  # for Windows grep 3.0 this fleet runs.
+  local want="${LABEL,,}" line
+  GL_STATE=absent
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    if [[ "${line,,}" == "$want" ]]; then GL_STATE=present; break; fi
+  done <<<"$out"
+}
+
+# THIS run's add is identified by EVENT ID, not by clock: issue-event ids only
+# grow, so a `labeled` event for $LABEL with an id above the highest one seen
+# BEFORE the POST (PRE_ADD_ID, read by gh_pre_add_mark) is this run's -- and
+# only if exactly one such event exists (two mean a peer added it too). A
+# clock window cannot tell this run's add from a peer's or a retry's minutes
+# earlier, and GitHub records no `labeled` event at all for an add that
+# changed nothing. When PRE_ADD_ID could not be read, nothing is ours: fail
+# closed. Two windows stay open and cannot be closed from here: a peer whose
+# add lands between the mark and this run's POST makes the POST a no-op, and
+# its event is then taken for this run's (the REST POST does not say whether
+# the label was new); and events can lag the MARK as well as the POST, so a
+# peer's add+strip finished just before the mark but not yet visible in it
+# can surface afterwards as "the one new add". GR_EVENTS_JQ is shared with set-label-selftest.sh, which runs it.
+GR_EVENTS_JQ='.[] | select(.event=="unlabeled" or .event=="labeled") | [.id, .created_at, .event, (.actor.login // "?"), .label.name] | @tsv'
+PRE_ADD_OK=0
+PRE_ADD_ID=0
+PRE_ADD_WHY=""
+PRE_ADD_PRESENT=0
+
+# gh_label_events -> GE_OUT: this label's events, ascending by id; returns 1
+# when the events cannot be read.
+gh_label_events() {
+  local out rc=0
+  GE_OUT=""
+  out="$(gh api "repos/$REPO/issues/$PR/events" --paginate --jq "$GR_EVENTS_JQ" 2>/dev/null | LC_ALL=C sort -n -t$'\t' -k1,1)" || rc=$?
+  if (( rc != 0 )); then return 1; fi
+  GE_OUT="$out"
+}
+
+# gh_pre_add_mark -> PRE_ADD_OK / PRE_ADD_ID: the highest `labeled` event id
+# for $LABEL before this run's POST.
+gh_pre_add_mark() {
+  local id at ev who name
+  PRE_ADD_OK=0; PRE_ADD_ID=0; PRE_ADD_PRESENT=0
+  # A label ALREADY on the PR makes this run's POST a no-op that records no
+  # event, so any new `labeled` event would be someone else's: fail closed.
+  # So does a labels read that cannot be made.
+  gh_label_state
+  case "$GL_STATE" in
+    present) PRE_ADD_PRESENT=1; PRE_ADD_WHY="the label was already on the PR before this run's POST, so the POST recorded no add of its own"; return 0 ;;
+    absent) ;;
+    *) PRE_ADD_PRESENT=unknown; PRE_ADD_WHY="the PR's labels could not be read before the POST, so this run's add cannot be identified"; return 0 ;;
+  esac
+  if ! gh_label_events; then PRE_ADD_WHY="the PR's events could not be read before the POST, so this run's add cannot be identified"; return 0; fi
+  while IFS=$'\t' read -r id at ev who name; do
+    name="${name%$'\r'}"
+    [[ "$id" =~ ^[0-9]+$ && "$ev" == labeled && "${name,,}" == "${LABEL,,}" ]] || continue
+    if (( id > PRE_ADD_ID )); then PRE_ADD_ID="$id"; fi
+  done <<<"$GE_OUT"
+  PRE_ADD_OK=1
+}
+
+# gh_last_removal -> GR_BY / GR_AT of the `unlabeled` event that removed THIS
+# run's add (see above), or both empty when there is none -- yet: events can
+# lag the labels read -- or when this run's add cannot be told apart. Returns 1
+# when the events are unreadable.
+gh_last_removal() {
+  local id at ev who name ours_id="" ours_n=0
+  GR_BY=""; GR_AT=""
+  gh_label_events || return 1
+  [[ "$PRE_ADD_OK" == 1 ]] || return 0
+  while IFS=$'\t' read -r id at ev who name; do
+    name="${name%$'\r'}"
+    [[ "$id" =~ ^[0-9]+$ && "${name,,}" == "${LABEL,,}" ]] || continue
+    case "$ev" in
+      labeled) if (( id > PRE_ADD_ID )); then ours_n=$((ours_n + 1)); ours_id="$id"; GR_BY=""; GR_AT=""; fi ;;
+      unlabeled) if [[ -n "$ours_id" ]] && (( id > ours_id )); then GR_AT="$at"; GR_BY="$who"; fi ;;
+    esac
+  done <<<"$GE_OUT"
+  if (( ours_n != 1 )); then GR_BY=""; GR_AT=""; fi
+  return 0
+}
+
+stripped_stale_exit() { # <upstream> <what happened> <coord-row-note>
+  echo "STRIPPED-STALE: \"$LABEL\" is not on $REPO#$PR -- its upstream $1 has already landed ($PL_NOTE)."
+  echo "       $2"
+  echo "       The dependency is already satisfied (coord strips such a label as stale; the removal"
+  echo "       above names who removed this one) --"
+  echo "       so nothing waits on it and nothing needs doing. This is not an ok (the label is not"
+  echo "       set), and not a contradiction (a stale label is removed by design).$3"
+  exit "$RC_STRIPPED_STALE"
+}
+
+# satisfied_not_sent_exit <upstream> -- the PRE-FLIGHT verdict. Nothing was
+# added, so nothing was stripped and nothing about the PR's labels was read:
+# it says only that the edge this label would declare is already satisfied.
+satisfied_not_sent_exit() {
+  echo "NOT-SENT: the edge \"$LABEL\" would declare on $REPO#$PR is already satisfied -- its"
+  echo "       upstream $1 has already landed ($PL_NOTE). Nothing was sent to GitHub or coord,"
+  echo "       so the edge gates nothing. Not an ok: this run set no label (the PR's labels were"
+  echo "       not read)."
+  exit "$RC_STRIPPED_STALE"
+}
+
+# label_gone_exit <when> <exit-if-not-a-stale-strip> [coord-row-note] -- the
+# label is ABSENT on GitHub.
+label_gone_exit() {
+  local when="$1" fallback="$2" rownote="${3:-}" removal up
+  PL_NOTE=""
+  if gh_last_removal; then
+    if [[ -n "$GR_BY" ]]; then removal="GitHub records it removed by $GR_BY at $GR_AT"
+    elif [[ "$PRE_ADD_OK" != 1 ]]; then removal="no removal can be tied to THIS run's add -- $PRE_ADD_WHY -- so the cause is UNKNOWN"
+    else removal="GitHub records no removal of THIS add (yet: events can lag; and an add is this run's only once exactly one new labeled event is visible), so the cause is UNKNOWN"; fi
+  else
+    removal="who removed it is UNKNOWN (the PR's events could not be read)"
+  fi
+  up="$(dep_upstream)"
+  if [[ -n "$up" ]]; then
+    pr_landed "$up"
+    # Only a RECORDED removal of this add becomes STRIPPED-STALE; a landed
+    # upstream with no visible removal is named below, but stays an error.
+    if [[ "$PL_STATE" == landed && -n "$GR_BY" ]]; then
+      stripped_stale_exit "$up" "GitHub accepted the add, then $removal ($when)." "$rownote"
+    fi
+  fi
+  echo "error: \"$LABEL\" is NOT on $REPO#$PR $when, although GitHub accepted the add -- $removal." >&2
+  if [[ -n "$up" ]]; then echo "       Its upstream $up reads: ${PL_NOTE:-not checked}." >&2; fi
+  echo "       This is not an ok: read the PR's labels before relying on this edge.$rownote" >&2
+  exit "$fallback"
+}
+
+# A dep label whose upstream (this PR, for upstream-of) has ALREADY landed declares
+# a satisfied edge; a waiting-side one is stripped by coord
+# within seconds of being added, so it is answered here and never sent. An
+# unreadable upstream does not stop the add: the GitHub read-back below decides.
+UPSTREAM="$(dep_upstream)"
+case "${LABEL#coord:}" in
+  downstream-of=*|stacked-on=*)
+    if [[ -z "$UPSTREAM" ]]; then
+      echo "note: the upstream's owner is not stated (coord resolves a bare <repo>#<n> under the owning tenant's org), so whether it has landed is not checked here -- the GitHub read-back decides."
+    fi ;;
+esac
+if [[ -n "$UPSTREAM" ]] && command -v gh >/dev/null 2>&1; then
+  pr_landed "$UPSTREAM"
+  case "$PL_STATE" in
+    landed) satisfied_not_sent_exit "$UPSTREAM" ;;
+    unknown) echo "note: whether upstream $UPSTREAM has landed is UNKNOWN ($PL_NOTE); sending anyway -- the GitHub read-back decides." ;;
+  esac
+fi
+
 # ----- step 1: gh-side label add ---------------------------------------------
 
 if ! command -v gh >/dev/null 2>&1; then
@@ -545,6 +786,10 @@ fi
 # `gh pr edit` — does NOT create a missing dynamic-value label as a side
 # effect; that is done explicitly below, on the 404 this route reports for one.
 echo "step 1/3: gh api POST repos/$REPO/issues/$PR/labels \"$LABEL\""
+
+# Mark the label's newest `labeled` event id BEFORE the POST, so a removal can
+# be tied to THIS run's add (gh_last_removal).
+gh_pre_add_mark
 
 # gh's stderr is CAPTURED rather than let straight through, so that a
 # `'<label>' not found` can be answered here instead of left for the caller to
@@ -611,7 +856,48 @@ if (( GH_RC != 0 )); then
     exit 3
   fi
 fi
-echo "ok: gh added label \"$LABEL\" to $REPO#$PR"
+# step1_ok <read-note> -- the step-1 ok line, worded by what the pre-POST read
+# established: an add this run made, a label that was already there, or (the
+# pre-POST read failed) presence only.
+step1_ok() {
+  # On the retry arm a label that read present BEFORE the POST then absent
+  # after it was removed and put back -- likely by this POST -- so "changed
+  # nothing" is not established there: UNKNOWN.
+  if [[ "$PRE_ADD_PRESENT" == 1 && -n "$1" ]]; then
+    echo "ok: \"$LABEL\" is on $REPO#$PR (read back on GitHub: present$1; whether this run's add changed it is UNKNOWN -- it read present before the POST and absent after it)"
+    return 0
+  fi
+  case "$PRE_ADD_PRESENT" in
+    # Present before and after: whether this POST changed anything in between
+    # (a peer removal it undid) is not read, so it is not claimed.
+    1) echo "ok: \"$LABEL\" was already on $REPO#$PR (read back on GitHub: present before the POST and after it$1)" ;;
+    0) echo "ok: gh added label \"$LABEL\" to $REPO#$PR (read back on GitHub: present$1)" ;;
+    *) echo "ok: \"$LABEL\" is on $REPO#$PR (read back on GitHub: present$1; whether this run's add changed it is UNKNOWN -- the labels could not be read before the POST)" ;;
+  esac
+}
+
+# gh's exit 0 is GitHub ACCEPTING the add; whether the label is ON the PR is read.
+gh_label_state
+case "$GL_STATE" in
+  present) step1_ok "" ;;
+  absent)
+    # GitHub's read path can briefly lag a write it just accepted: read once
+    # more before treating "absent" as anything.
+    _rb_wait="${COORD_PR_LABEL_READBACK_RETRY_SECS:-2}"
+    [[ "$_rb_wait" =~ ^[0-9]{1,2}(\.[0-9]+)?$ ]] || _rb_wait=2   # at most 99 s
+    sleep "$_rb_wait"
+    gh_label_state
+    case "$GL_STATE" in
+      present) step1_ok ", on a second read" ;;
+      absent) label_gone_exit "right after the add" 3 ;;
+      *) echo "error: the PR's labels could not be READ back on a second read; whether \"$LABEL\" is on $REPO#$PR is UNKNOWN. Nothing was sent to coord." >&2
+         exit "$RC_GH_READBACK_UNKNOWN" ;;
+    esac ;;
+  *) echo "error: GitHub accepted the add, but the PR's labels could not be READ BACK, so whether" >&2
+     echo "       \"$LABEL\" is on $REPO#$PR is UNKNOWN; nothing was sent to coord. Read it with" >&2
+     echo "       gh api repos/$REPO/issues/$PR/labels --jq '.[].name'" >&2
+     exit "$RC_GH_READBACK_UNKNOWN" ;;
+esac
 
 # ----- step 2: coord-side ingest hook ----------------------------------------
 #
@@ -738,17 +1024,17 @@ non_2xx_exit() {
   if [[ "$POST_BODY" == *repo_not_owned_by_tenant* ]]; then
     echo "       coord's own ownership check (enforce) refused: no single tenant this" >&2
     echo "       agent's device is bound to owns $REPO. No row was written." >&2
-    echo "       gh-side label add succeeded (canonical); merge ordering reads it from GitHub." >&2
+    echo "       the GitHub label read back present at step 1 (canonical); merge ordering reads it from GitHub." >&2
     exit "$RC_WITHHELD"
   fi
-  echo "       gh-side label add succeeded (canonical); coord.pr_labels is out of sync" >&2
+  echo "       the GitHub label read back present at step 1 (canonical); coord.pr_labels is out of sync" >&2
   echo "       until the reconciler ingests the GitHub label event." >&2
   exit 4
 }
 
 withhold() { # <why>
   echo "WITHHELD: coord.pr_labels row NOT written -- $1" >&2
-  echo "       gh-side label add succeeded (canonical), and coord's merge ordering reads" >&2
+  echo "       the GitHub label read back present at step 1 (canonical), and coord's merge ordering reads" >&2
   echo "       the dependency edge from the GitHub label, so nothing is lost by withholding." >&2
   echo "       To also record the coord_skill row, use a QONTINUI_AGENT_ID allocated under the" >&2
   echo "       tenant that owns $REPO (a wrong-tenant row is what this guard exists to prevent)." >&2
@@ -759,7 +1045,7 @@ echo "step 2/3: probe the tenant coord would write under (POST $COORD_URL/pr-mer
 post_labels '[]'
 if [[ "$POST_CODE" == 000 ]]; then
   echo "error: POST $COORD_URL/pr-merge/labels failed (coord unreachable?)" >&2
-  echo "       gh-side label add succeeded; reconciler will eventually pick it up." >&2
+  echo "       the GitHub label read back present at step 1; reconciler will eventually pick it up." >&2
   exit 4
 fi
 [[ "$POST_CODE" == 2* ]] || non_2xx_exit
@@ -794,7 +1080,7 @@ echo "step 3/3: POST $COORD_URL/pr-merge/labels \"$LABEL\""
 post_labels "$(H_L="$LABEL" python3 -c 'import json,os; print(json.dumps([os.environ["H_L"]]))')"
 if [[ "$POST_CODE" == 000 ]]; then
   echo "error: POST $COORD_URL/pr-merge/labels failed (coord unreachable?)" >&2
-  echo "       gh-side label add succeeded; reconciler will eventually pick it up." >&2
+  echo "       the GitHub label read back present at step 1; reconciler will eventually pick it up." >&2
   exit 4
 fi
 [[ "$POST_CODE" == 2* ]] || non_2xx_exit
@@ -874,7 +1160,7 @@ readback_unknown() { # <reason>
   echo "error: written but read-back UNKNOWN: $1" >&2
   echo "       coord answered written=$WRITTEN (tenant_id=$TENANT_ID) for \"$LABEL\" on $REPO#$PR, but" >&2
   echo "       whether coord.pr_labels now carries it could not be READ, so this is not an ok." >&2
-  echo "       The gh-side label is applied (canonical). Re-ask later rather than re-send: the" >&2
+  echo "       The GitHub label read back present at step 1 (canonical). Re-ask later rather than re-send: the" >&2
   echo "       write is an upsert, so a re-send is harmless but cannot answer the question --" >&2
   echo "       GET $COORD_URL/coord/agent-pr-labels?repo=$REPO&pr_number=$PR under a device JWT" >&2
   echo "       for the owning tenant, or the \`labels\` field of coord_pr_status." >&2
@@ -984,15 +1270,38 @@ case "$RB_VERDICT" in
     RB_NAME="${RB_REST#* }"
     RB_AS=""
     if [[ "$RB_NAME" != "$LABEL" ]]; then RB_AS=", stored as \"$RB_NAME\""; fi
-    echo "ok: coord recorded label \"$LABEL\" in pr_labels (tenant_id=$TENANT_ID, written=$WRITTEN) (read back: present, source=$RB_SOURCE$RB_AS)"
+    # The ok line is a claim about GitHub too, and coord's strip can land after
+    # step 1's read -- so GitHub is read again rather than that answer reused.
+    gh_label_state
+    case "$GL_STATE" in
+      absent) label_gone_exit "after the coord write" 3 $'\n       coord DOES carry a coord_skill row for it (read back present above).' ;;
+      unknown)
+        echo "error: coord recorded \"$LABEL\" (read back present), but re-reading the PR's labels on" >&2
+        echo "       GitHub failed, so whether it is still on $REPO#$PR is UNKNOWN. Not an ok." >&2
+        exit "$RC_GH_READBACK_UNKNOWN" ;;
+    esac
+    echo "ok: coord recorded label \"$LABEL\" in pr_labels (tenant_id=$TENANT_ID, written=$WRITTEN) (read back: present, source=$RB_SOURCE$RB_AS; on GitHub: present)"
     ;;
   absent\ *)
+    # coord drops its row when it strips a stale label from GitHub, so a row
+    # missing here may be that strip rather than a lost write: ask GitHub first.
+    gh_label_state
+    case "$GL_STATE" in
+      absent) label_gone_exit "after the coord write (and coord's row is gone too)" 3 ;;
+      unknown)
+        echo "error: coord said written=$WRITTEN for \"$LABEL\" on $REPO#$PR and its read door does not list it," >&2
+        echo "       and re-reading the PR's labels on GitHub failed -- so whether coord stripped the label" >&2
+        echo "       (by design) or lost the write is UNKNOWN. Not an ok, and not yet a contradiction." >&2
+        echo "       write body: $POST_BODY" >&2
+        echo "       read body:  $RB_BODY" >&2
+        exit "$RC_GH_READBACK_UNKNOWN" ;;
+    esac
     echo "error: CONTRADICTION -- coord said written=$WRITTEN for \"$LABEL\" on $REPO#$PR, but its read door" >&2
     echo "       (GET /coord/agent-pr-labels, HTTP 200, ${RB_VERDICT#absent } label(s) listed) does not list it." >&2
     echo "       This is a coord defect, not a transient: report it with both bodies." >&2
     echo "       write body: $POST_BODY" >&2
     echo "       read body:  $RB_BODY" >&2
-    echo "       gh-side label add succeeded (canonical)." >&2
+    echo "       On GitHub the label reads $GL_STATE on a fresh read." >&2
     exit 4
     ;;
   *)

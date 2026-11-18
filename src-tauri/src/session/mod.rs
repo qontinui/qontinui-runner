@@ -101,6 +101,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
 pub use qontinui_runner_lib::tenant_pin;
 pub mod finish_heal; // Heal finished marks stamped synced over a write coord never applied; the finish read-back's coord.observed (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 5)
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
+pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6)
 pub mod stray_wait; // Tells a wait loop that can never end from work, so a finished session it holds can close (plan 2026-10-23-finished-sessions-stay-busy-behind-background-wait-loops-that-can-never-exit, Phase 4)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
@@ -421,6 +422,23 @@ pub enum SessionEventKind {
     /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
     #[serde(rename = "operator_touch")]
     OperatorTouch,
+    /// A `spawn-failed` report coord did not receive (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`,
+    /// Phase 6). Written by [`spawn_report_spool::spool_spawn_failed`] once the
+    /// live POST's bounded attempts end UNDELIVERED (transport class only — a
+    /// 4xx is coord's verdict and is never spooled), on a deterministic
+    /// per-agent synthetic lane, because a refused launch has no session.
+    ///
+    /// Drained to `POST /agents/<agent_id>/spawn-failed` under the device
+    /// credential, with the payload minus `agent_id` as the body
+    /// (`{reason, exit_code, restarts_attempted, phase?, push_ref?, pr?}`):
+    /// 2xx → Ack, 4xx → PermanentFailure (Ack-drop), transport/5xx → retry on
+    /// the lane's backoff. NOT best-effort: until coord hears it, coord counts
+    /// the allocation in flight.
+    ///
+    /// ⚠️ Like [`Self::CoordTransportRung`], a kind with no [`coord_sync`]
+    /// `push_record` arm is ACK-DROPPED silently. This kind HAS an arm.
+    SpawnFailedReport,
 }
 
 impl SessionEventKind {
@@ -445,6 +463,7 @@ impl SessionEventKind {
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
             SessionEventKind::AgentNotification => "agent_notification",
             SessionEventKind::OperatorTouch => "operator_touch",
+            SessionEventKind::SpawnFailedReport => "spawn_failed_report",
         }
     }
 }

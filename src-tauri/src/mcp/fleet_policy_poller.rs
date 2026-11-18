@@ -4649,6 +4649,13 @@ mod tests {
     #[test]
     fn cold_start_is_record_with_no_scope_and_the_pin_restores_both() {
         assert_eq!(*new_plan_capture_cache().read().unwrap(), "record");
+        // Hold `env_lock` (reentrant, the pin's own hierarchy root) across the
+        // pin's whole life AND the post-drop reads. Without it the pin releases
+        // the lock on drop, another test's pin can set its own level before the
+        // two asserts below run, and the restore reads `off` — measured on
+        // runner#2957's Windows leg (`left: "off"`, `right: "record"`), GitHub
+        // Actions job 134174089416.
+        let _env = crate::test_env::env_lock();
         {
             let pin = pin_plan_capture_level_for_test("off");
             pin.set_scope(Some("tenant"));
