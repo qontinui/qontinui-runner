@@ -758,27 +758,12 @@ async fn supervise_one(
     let drain =
         crate::coord_drain_state::drain_gate(crate::coord_drain_state::SpawnOrigin::LoopingAgent);
 
-    // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
+    // Observed BEFORE the lease reconcile (plan
+    // `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`,
+    // D5): a lane-closed holder hands its slot over at its first idle tick, so
+    // the hold decision needs this tick's idle verdict. One probe per tick,
+    // threaded through, as with liveness above.
     //
-    // MUST happen BEFORE `policy::decide` is acted on: `gate_action` rewrites
-    // any session-creating action to `None` unless we hold a lease, so the
-    // lease state is an INPUT to acting, never a check performed afterwards.
-    let lease_obs = lease::LeaseTickObs {
-        now_ms,
-        liveness,
-        proven_alive: spawn_streak_clears(liveness, spawn_grace_elapsed),
-        spawn_able: authz_permits_spawn && drain.allows() && backoff_elapsed,
-        spawn_grace_secs: rec.def.lifecycle_policy.spawn_grace_secs,
-        source: effective.source,
-        slots: effective.slots,
-    };
-    let lease_tick = reconcile_slot_lease(app, rec, &effective, &lease_obs).await;
-    // D3: an authoritative all-`held` walk over our live tab means a live peer
-    // fills every slot. Judged after the walk — a restarted runner re-acquires
-    // (`renewed`) its own slot first and is never displaced by itself.
-    let displaced =
-        update_displacement(&rec.def.id, lease_tick.walk, &lease_obs, effective.running);
-
     // Observe idle/context-low on the live grid, through the ONE quiescence
     // debounce (`TerminalSession::idle_quiescence_probe`) — never nudge into a
     // frame that is still streaming. `None` means the first read was not idle,
@@ -808,6 +793,29 @@ async fn supervise_one(
             );
         }
     }
+
+    // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
+    //
+    // MUST happen BEFORE `policy::decide` is acted on: `gate_action` rewrites
+    // any session-creating action to `None` unless we hold a lease, so the
+    // lease state is an INPUT to acting, never a check performed afterwards.
+    let lease_obs = lease::LeaseTickObs {
+        now_ms,
+        liveness,
+        proven_alive: spawn_streak_clears(liveness, spawn_grace_elapsed),
+        spawn_able: authz_permits_spawn && drain.allows() && backoff_elapsed,
+        spawn_grace_secs: rec.def.lifecycle_policy.spawn_grace_secs,
+        source: effective.source,
+        slots: effective.slots,
+        lane: lane_obs(&drain),
+        idle_past_grace: idle && spawn_grace_elapsed,
+    };
+    let lease_tick = reconcile_slot_lease(app, rec, &effective, &lease_obs).await;
+    // D3: an authoritative all-`held` walk over our live tab means a live peer
+    // fills every slot. Judged after the walk — a restarted runner re-acquires
+    // (`renewed`) its own slot first and is never displaced by itself.
+    let displaced =
+        update_displacement(&rec.def.id, lease_tick.walk, &lease_obs, effective.running);
 
     // SHADOW MODE (plan 2026-08-11-agent-bailout-detector-for-finish-to-zero,
     // Phase 2): a confirmed-idle tick is the moment a turn just ENDED, so it is
@@ -962,19 +970,35 @@ async fn supervise_one(
     // by a live peer, no new cycle starts on this unslotted tab; once that has
     // held for the whole window, the tab is retired at an idle, past-grace tick.
     let action = lease::displacement_action(action, displaced, quiescent && spawn_grace_elapsed);
+    // D5 (plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`):
+    // a known-closed lane + a held slot + an idle tab retires the tab and then
+    // hands the slot over. Applied after everything else, so nothing turns it
+    // back into a cycle; the Retire arm never respawns.
+    let action = lease::handover_action(action, lease_tick.hand_over);
 
     match action {
         Action::None => {}
         Action::Retire => {
             let Some((tid, _)) = &live else { return };
-            warn!(
-                agent = %rec.def.id,
-                terminal = %tid,
-                slots = effective.slots,
-                window_ms = lease::displacement_confirm_ms(rec.def.lifecycle_policy.spawn_grace_secs),
-                "looping_agent_supervisor: retiring unslotted shepherd tab — every slot has been \
-                 held by a live peer for the whole displacement window"
-            );
+            if lease_tick.hand_over {
+                warn!(
+                    agent = %rec.def.id,
+                    terminal = %tid,
+                    lane = ?lease_obs.lane,
+                    "looping_agent_supervisor: handing the shepherd slot over — this device's \
+                     agent lane is closed (drained or role-closed) and the tab is idle; retiring \
+                     the tab, then releasing the slot, with no respawn"
+                );
+            } else {
+                warn!(
+                    agent = %rec.def.id,
+                    terminal = %tid,
+                    slots = effective.slots,
+                    window_ms = lease::displacement_confirm_ms(rec.def.lifecycle_policy.spawn_grace_secs),
+                    "looping_agent_supervisor: retiring unslotted shepherd tab — every slot has been \
+                     held by a live peer for the whole displacement window"
+                );
+            }
             // `TerminalManager::close`, as the Relaunch arm and the stale-tab
             // closes use: `graceful_exit` refuses a pane with a live `claude`
             // until close authority can be minted. "Cleanly" is the timing gate
@@ -1001,6 +1025,13 @@ async fn supervise_one(
             });
             // A standby that later regains a tab starts with a clean window.
             clear_displacement(&rec.def.id);
+            // D5: only now that the tab is closed is the slot released — never
+            // before, or a peer could spawn while ours still ran. A failed close
+            // returned above with the slot still held, so the hand-over is
+            // retried on the next idle tick.
+            if lease_tick.hand_over {
+                release_handed_over_slot(app, &rec.def.id).await;
+            }
         }
         Action::Spawn(reason) => {
             // A registered tab whose process EXITED (coord finding `9089767f`):
@@ -1143,6 +1174,58 @@ fn drain_rewrite(action: Action, drain: &crate::coord_drain_state::DrainGate) ->
     }
 }
 
+/// PURE: fold the tick's drain read into the lease layer's lane observation
+/// (plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`,
+/// D5). `Drained` and `RoleClosed` are coord's KNOWN answers that the agent
+/// lane is shut; `Unknown` is an unread state and must stay distinct, because
+/// it may not release anything.
+fn lane_obs(drain: &crate::coord_drain_state::DrainGate) -> lease::LaneObs {
+    use crate::coord_drain_state::{DeferClass, DrainGate};
+    match drain {
+        DrainGate::Allow => lease::LaneObs::Open,
+        DrainGate::Defer {
+            class: DeferClass::Drained | DeferClass::RoleClosed,
+            ..
+        } => lease::LaneObs::Closed,
+        DrainGate::Defer {
+            class: DeferClass::Unknown,
+            ..
+        } => lease::LaneObs::Unknown,
+    }
+}
+
+/// D5's second step: release the slot whose tab the Retire arm just closed.
+/// The memo is cleared first so no later path in this process heartbeats a
+/// slot we have given up. No orphan cooldown is set — the lane being closed is
+/// what keeps this runner from re-taking it, and that clears the moment the
+/// lane reopens.
+async fn release_handed_over_slot(app: &tauri::AppHandle, agent_id: &str) {
+    let Some(slot) = clear_held_slot(agent_id) else {
+        return;
+    };
+    let Some(machine_id) = app
+        .try_state::<Arc<crate::session::SessionRegistry>>()
+        .map(|s| s.inner().machine_id())
+    else {
+        // Cannot name ourselves to coord; the lease lapses on its TTL, which
+        // is still a hand-over, only slower.
+        warn!(
+            agent = %agent_id,
+            resource_key = %slot.resource_key,
+            "looping_agent_supervisor: no machine id to release the handed-over slot — it \
+             lapses on its TTL instead"
+        );
+        return;
+    };
+    info!(
+        agent = %agent_id,
+        resource_key = %slot.resource_key,
+        "looping_agent_supervisor: released the shepherd slot after retiring its idle tab on a \
+         closed lane — a runner on an open device may take it"
+    );
+    crate::looping_agent_coord::release_slot(&slot.resource_key, &machine_id, agent_id).await;
+}
+
 /// Build the spawn prompt: the playbook + config + the one-cycle contract;
 /// relaunches add the "read your journal and continue" framing.
 ///
@@ -1260,19 +1343,50 @@ async fn reconcile_slot_lease(
                     anchor_age_ms = obs.now_ms.saturating_sub(slot.anchor_ms()),
                     liveness = ?obs.liveness,
                     "looping_agent_supervisor: releasing the slot lease — it no longer licenses \
-                     a live tab (TabNotAlive) or is above coord's count (OutOfRange)"
+                     a live tab (TabNotAlive), is above coord's count (OutOfRange), or sits on a \
+                     closed agent lane with no tab to retire (LaneClosed)"
                 );
                 clear_held_slot(agent_id);
                 crate::looping_agent_coord::release_slot(&slot.resource_key, &machine_id, agent_id)
                     .await;
-                if reason == lease::ReleaseReason::TabNotAlive {
-                    // Never walk on the tick we gave a slot up: we would take
-                    // back the slot we just released. The cooldown keeps us
-                    // out of the race for one TTL after this.
-                    set_last_orphan_release(agent_id, obs.now_ms);
-                    return NOT_HELD;
+                match reason {
+                    lease::ReleaseReason::TabNotAlive => {
+                        // Never walk on the tick we gave a slot up: we would
+                        // take back the slot we just released. The cooldown
+                        // keeps us out of the race for one TTL after this.
+                        set_last_orphan_release(agent_id, obs.now_ms);
+                        return NOT_HELD;
+                    }
+                    // A closed lane: nothing here may use a slot, so no walk —
+                    // and no cooldown either, so the first tick after the lane
+                    // reopens may take one again.
+                    lease::ReleaseReason::LaneClosed => return NOT_HELD,
+                    // OutOfRange: a live tab may re-home onto a lower free slot.
+                    lease::ReleaseReason::OutOfRange => {}
                 }
-                // OutOfRange: a live tab may re-home onto a lower free slot.
+            }
+            lease::HoldDecision::HandOver => {
+                // Keep the lease alive until the action stage has closed the
+                // tab (which then releases it): if the close fails, the slot is
+                // still ours and still backs a live tab.
+                let outcome = crate::looping_agent_coord::heartbeat_slot(
+                    &slot.resource_key,
+                    &machine_id,
+                    agent_id,
+                    claude_session_id.as_deref(),
+                )
+                .await;
+                if lease::still_held_after_heartbeat(&outcome) {
+                    return lease::LeaseTick::HAND_OVER;
+                }
+                // Already lost: there is nothing left to hand over.
+                warn!(
+                    agent = %agent_id,
+                    resource_key = %slot.resource_key,
+                    "looping_agent_supervisor: slot lease lost (stolen/expired) before the \
+                     lane-closed hand-over"
+                );
+                clear_held_slot(agent_id);
             }
             lease::HoldDecision::Keep => {
                 let outcome = crate::looping_agent_coord::heartbeat_slot(
@@ -2321,6 +2435,29 @@ mod drain_rewrite_tests {
         for action in ACTIONS.into_iter().filter(|a| *a != Action::Retire) {
             assert_eq!(drain_rewrite(action, &defer()), Action::None, "{action:?}");
         }
+    }
+
+    #[test]
+    fn the_lane_folds_drained_and_role_closed_to_closed_and_keeps_unknown_apart() {
+        use crate::coord_drain_state::DeferClass;
+        use qontinui_runner_lib::looping_agent::lease::LaneObs;
+        let defer = |class| DrainGate::Defer {
+            reason: "r".into(),
+            class,
+        };
+        assert_eq!(super::lane_obs(&DrainGate::Allow), LaneObs::Open);
+        assert_eq!(
+            super::lane_obs(&defer(DeferClass::Drained)),
+            LaneObs::Closed
+        );
+        assert_eq!(
+            super::lane_obs(&defer(DeferClass::RoleClosed)),
+            LaneObs::Closed
+        );
+        assert_eq!(
+            super::lane_obs(&defer(DeferClass::Unknown)),
+            LaneObs::Unknown
+        );
     }
 
     #[test]
