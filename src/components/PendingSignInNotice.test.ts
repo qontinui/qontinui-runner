@@ -47,10 +47,12 @@ describe("shouldShowPendingSignIn", () => {
 });
 
 describe("isSignInCancelled", () => {
-  it("recognises the user's own Cancel and nothing else", () => {
+  it("recognises a Cancel or a supersede, and no real failure", () => {
     expect(isSignInCancelled("sign-in cancelled")).toBe(true);
-    expect(isSignInCancelled("sign-in timed out after 5 minutes")).toBe(false);
-    expect(isSignInCancelled("sign-in superseded by a newer sign-in attempt")).toBe(false);
+    expect(isSignInCancelled("sign-in superseded by a newer sign-in attempt")).toBe(true);
+    expect(
+      isSignInCancelled("sign-in timed out after 300 s waiting for the browser callback"),
+    ).toBe(false);
   });
 });
 

@@ -51,9 +51,16 @@ export const LAUNCH_GRACE_SECS = 8;
 /** The error a user's own Cancel makes `cognito_sign_in` return (Rust `cognito::SIGN_IN_CANCELLED`). */
 export const SIGN_IN_CANCELLED = "sign-in cancelled";
 
-/** Whether a `cognito_sign_in` rejection is the user's own Cancel, not a failure to show. */
+/** The error a newer sign-in makes the one it replaced return (Rust `cognito::SIGN_IN_SUPERSEDED`). */
+export const SIGN_IN_SUPERSEDED = "sign-in superseded by a newer sign-in attempt";
+
+/**
+ * Whether a `cognito_sign_in` rejection is the user's own Cancel, or a newer
+ * attempt replacing this one: neither is a failure to show.
+ */
 export function isSignInCancelled(err: unknown): boolean {
-  return String(err) === SIGN_IN_CANCELLED;
+  const text = String(err);
+  return text === SIGN_IN_CANCELLED || text === SIGN_IN_SUPERSEDED;
 }
 
 /** Whether the notice has anything to show for `pending` at `nowUnix`. */
@@ -87,6 +94,8 @@ export function PendingSignInNotice({
   noBrowserHint: string;
 }) {
   const [pending, setPending] = useState<PendingSignIn | null>(null);
+  // When `pending` was read: render stays pure, and the 1 s poll moves it.
+  const [readAtUnix, setReadAtUnix] = useState(0);
   const [copied, setCopied] = useState(false);
   const [cancelling, setCancelling] = useState(false);
 
@@ -96,7 +105,10 @@ export function PendingSignInNotice({
     const read = async () => {
       try {
         const next = await invoke<PendingSignIn | null>("cognito_pending_sign_in");
-        if (!stopped) setPending(next);
+        if (!stopped) {
+          setPending(next);
+          setReadAtUnix(Date.now() / 1000);
+        }
       } catch {
         // A runner build without the command: nothing to show.
         if (!stopped) setPending(null);
@@ -113,7 +125,7 @@ export function PendingSignInNotice({
     };
   }, [active]);
 
-  if (!active || pending === null || !shouldShowPendingSignIn(pending, Date.now() / 1000)) {
+  if (!active || pending === null || !shouldShowPendingSignIn(pending, readAtUnix)) {
     return null;
   }
 

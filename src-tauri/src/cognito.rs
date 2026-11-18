@@ -266,8 +266,10 @@ pub fn pending_sign_in() -> Option<PendingSignIn> {
 }
 
 /// Cancel the pending Hosted-UI sign-in, if it is attempt `attempt_id`.
-/// Returns whether it was cancelled: `false` when nothing is pending or a
-/// different (newer) attempt is. The cancelled attempt releases the callback
+/// Returns whether the cancel was delivered: `false` when nothing is pending or
+/// a different (newer) attempt is. A callback that already delivered a code
+/// wins over a cancel that arrives after it, so `true` does not promise the
+/// sign-in will not complete. The cancelled attempt releases the callback
 /// port and returns [`SIGN_IN_CANCELLED`].
 pub fn cancel_pending_sign_in(attempt_id: u64) -> bool {
     match pending_slot().as_ref().filter(|slot| slot.id == attempt_id) {
@@ -620,17 +622,12 @@ fn await_authorization_code(
                 None => match cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     CANCEL_BY_USER => Err(SIGN_IN_CANCELLED.to_string()),
                     CANCEL_SUPERSEDED => Err(SIGN_IN_SUPERSEDED.to_string()),
-                    _ => Err(
-                        "sign-in timed out after 5 minutes waiting for the browser callback"
-                            .to_string(),
-                    ),
+                    _ => Err(timed_out(wait)),
                 },
             };
         }
         if Instant::now() >= deadline {
-            break Err(
-                "sign-in timed out after 5 minutes waiting for the browser callback".to_string(),
-            );
+            break Err(timed_out(wait));
         }
         std::thread::sleep(Duration::from_millis(200));
     };
@@ -646,6 +643,14 @@ fn await_authorization_code(
     // so a superseding attempt waiting on the slot can bind straight away.
     drop(attempt);
     captured
+}
+
+/// The error a sign-in returns when `wait` ran out with no browser callback.
+fn timed_out(wait: std::time::Duration) -> String {
+    format!(
+        "sign-in timed out after {} s waiting for the browser callback",
+        wait.as_secs()
+    )
 }
 
 /// Exchange an authorization code for tokens and identify the user.

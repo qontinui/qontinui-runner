@@ -6449,17 +6449,19 @@ pub(crate) fn recovery_detail(
 /// so a test of the recorded path must stay on one thread (`#[tokio::test]`'s
 /// default current-thread runtime) or call `derive_and_publish_posture_core`.
 #[cfg(not(test))]
-static RECOVERY_INVENTORY: std::sync::Mutex<Option<RecoveryInventory>> =
+static RECOVERY_INVENTORY: std::sync::Mutex<Option<(RecoveryInventory, bool)>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
 thread_local! {
-    static RECOVERY_INVENTORY: std::cell::Cell<Option<RecoveryInventory>> =
+    static RECOVERY_INVENTORY: std::cell::Cell<Option<(RecoveryInventory, bool)>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Swap the recorded inventory, returning the previous one.
-fn replace_recovery_inventory(inventory: RecoveryInventory) -> Option<RecoveryInventory> {
+/// Swap the recorded `(inventory, holds_credential)`, returning the previous pair.
+fn replace_recovery_inventory(
+    inventory: (RecoveryInventory, bool),
+) -> Option<(RecoveryInventory, bool)> {
     #[cfg(not(test))]
     {
         RECOVERY_INVENTORY
@@ -6480,18 +6482,24 @@ pub(crate) fn recovery_inventory() -> RecoveryInventory {
     let recorded = *RECOVERY_INVENTORY.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(test)]
     let recorded = RECOVERY_INVENTORY.with(std::cell::Cell::get);
-    recorded.unwrap_or(RecoveryInventory::UNKNOWN)
+    recorded.map_or(RecoveryInventory::UNKNOWN, |(inventory, _)| inventory)
 }
 
-/// Record `inventory`, logging a warning when it first shows — or newly
-/// shows — that no automatic recovery is left (P2.3: a boot-time warning, not
-/// only an outage-time error).
-pub(crate) fn record_recovery_inventory(inventory: RecoveryInventory, holds_credential: bool) {
-    let previous = replace_recovery_inventory(inventory);
-    if previous == Some(inventory) {
-        return;
+/// Record `inventory`, logging a warning when a runner that holds a credential
+/// first shows, or newly shows, that no automatic recovery is left (P2.3: a
+/// boot-time warning, not only an outage-time error). The dedupe is on the
+/// PAIR, so a runner first seen unpaired that then pairs with no recovery is
+/// still warned. Returns whether it warned.
+pub(crate) fn record_recovery_inventory(
+    inventory: RecoveryInventory,
+    holds_credential: bool,
+) -> bool {
+    let previous = replace_recovery_inventory((inventory, holds_credential));
+    if previous == Some((inventory, holds_credential)) {
+        return false;
     }
-    if holds_credential && inventory.needs_a_human_after_expiry() {
+    let warn_now = holds_credential && inventory.needs_a_human_after_expiry();
+    if warn_now {
         warn!(
             "device_jwt_refresher: this runner holds neither a Cognito session nor a device \
              machine key ({}); the next outage longer than the device-JWT lifetime (~4 h) \
@@ -6499,6 +6507,7 @@ pub(crate) fn record_recovery_inventory(inventory: RecoveryInventory, holds_cred
             inventory.missing().join(", ")
         );
     }
+    warn_now
 }
 
 /// The most recent MEASURED verdict, or `Unknown` before any tick measured one.
@@ -15760,6 +15769,18 @@ mod recovery_inventory_tests {
             recovery_detail(CoordCredentialPosture::Absent, &NONE_HELD),
             None
         );
+    }
+
+    #[test]
+    fn a_runner_that_pairs_with_no_recovery_is_warned_even_if_first_seen_unpaired() {
+        // Thread-local under test, so this sequence is this test's alone.
+        assert!(
+            !record_recovery_inventory(NONE_HELD, false),
+            "unpaired: no warning"
+        );
+        assert!(record_recovery_inventory(NONE_HELD, true), "paired: warned");
+        assert!(!record_recovery_inventory(NONE_HELD, true), "warned once");
+        assert_eq!(recovery_inventory(), NONE_HELD);
     }
 
     #[test]
