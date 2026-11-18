@@ -2952,8 +2952,8 @@ mod timeout_tests {
 /// The ONE code-only line lexer: comments removed, and string, raw-string and
 /// char literals emptied. Read by this file's source guards (through
 /// `source_scan`) and by the runner binary's own source-scan tests
-/// (`ci_node::executor`, `commands::project_logs`), which is why it is gated like
-/// `ambient::test_support`: `cargo test` builds this rlib for the binary's
+/// (`ci_node::executor`, `commands::project_logs`, `file_tail`), which is why it is
+/// gated like `ambient::test_support`: `cargo test` builds this rlib for the binary's
 /// tests WITH `debug_assertions` but without `cfg(test)`. A release build has
 /// neither and compiles none of this.
 #[cfg(any(test, debug_assertions))]
