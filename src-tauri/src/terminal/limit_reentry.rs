@@ -67,8 +67,13 @@ pub(crate) const REENTRY_RETRY_MS: i64 = super::limit_reset::PARK_WITHOUT_RESET_
 const FIRST_SIGHT_UNREADABLE_TRIES: u32 = 3;
 
 /// A live terminal with no confirmed open record (a plain shell, or a session
-/// not yet bound) is looked up again this long after a sweep found none.
+/// not yet bound) is looked up again after a delay that starts at
+/// [`NO_RECORD_FIRST_RECHECK_MS`] and doubles up to this.
 const NO_RECORD_RECHECK_MS: i64 = 5 * 60_000;
+
+/// The first no-record recheck delay: a restored pane is usually bound
+/// within seconds of boot.
+const NO_RECORD_FIRST_RECHECK_MS: i64 = 15_000;
 
 /// How often a first-sight sweep may start. A sweep reads only terminals not
 /// yet read, so after boot most sweeps find nothing to do.
@@ -135,9 +140,9 @@ pub(crate) struct FirstSight {
     read: HashSet<String>,
     /// UNKNOWN reads so far of a terminal not yet counted as read.
     unreadable_tries: std::collections::HashMap<String, u32>,
-    /// Terminals a sweep found no confirmed record for, and when to look
-    /// again ([`NO_RECORD_RECHECK_MS`]).
-    no_record_until_ms: std::collections::HashMap<String, i64>,
+    /// Terminals a sweep found no confirmed record for: when to look again,
+    /// and the delay that set it ([`NO_RECORD_RECHECK_MS`]).
+    no_record_until_ms: std::collections::HashMap<String, (i64, i64)>,
 }
 
 impl FirstSight {
@@ -146,7 +151,7 @@ impl FirstSight {
     pub(crate) fn unread(&self, live: &[String], now_ms: i64) -> Vec<String> {
         live.iter()
             .filter(|t| !self.read.contains(*t))
-            .filter(|t| self.no_record_until_ms.get(*t).is_none_or(|&u| u <= now_ms))
+            .filter(|t| self.no_record_until_ms.get(*t).is_none_or(|&(u, _)| u <= now_ms))
             .cloned()
             .collect()
     }
@@ -173,7 +178,8 @@ pub(crate) struct FirstSightPass {
     /// read again on later sweeps ([`FIRST_SIGHT_UNREADABLE_TRIES`]); the
     /// hint path also reads such a pane when its screen matches.
     pub unreadable: Vec<String>,
-    /// Terminals with no confirmed open record yet: looked up again after
+    /// Terminals with no confirmed open record yet: looked up again after a
+    /// delay doubling from [`NO_RECORD_FIRST_RECHECK_MS`] to
     /// [`NO_RECORD_RECHECK_MS`].
     pub no_record: Vec<String>,
 }
@@ -220,8 +226,14 @@ pub(crate) fn apply_first_sight(
     now_ms: i64,
 ) -> usize {
     for terminal_id in &pass.no_record {
+        let delay = seen
+            .no_record_until_ms
+            .get(terminal_id)
+            .map_or(NO_RECORD_FIRST_RECHECK_MS, |&(_, d)| {
+                (d * 2).min(NO_RECORD_RECHECK_MS)
+            });
         seen.no_record_until_ms
-            .insert(terminal_id.clone(), now_ms + NO_RECORD_RECHECK_MS);
+            .insert(terminal_id.clone(), (now_ms + delay, delay));
     }
     for terminal_id in &pass.read {
         seen.no_record_until_ms.remove(terminal_id);

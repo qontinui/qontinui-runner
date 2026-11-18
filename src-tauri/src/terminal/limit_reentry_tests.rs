@@ -180,12 +180,25 @@ fn a_terminal_whose_transcript_reads_stopped_at_first_sight_is_handled_with_no_s
     let mut parks = ParkList::default();
     assert_eq!(apply_first_sight(&mut seen, &mut parks, &pass, 50_000), 1);
     // Read once per process. An UNKNOWN read stays unread until its third
-    // try; a terminal with no confirmed record is looked up again 5 min later.
+    // try; a terminal with no confirmed record is looked up again 15 s later,
+    // then after 30 s, 60 s, ... up to 5 min.
     assert_eq!(seen.unread(&candidates, 50_000), vec!["gone".to_string()]);
     assert_eq!(
-        seen.unread(&candidates, 350_000),
+        seen.unread(&candidates, 65_000),
         vec!["gone".to_string(), "shell".to_string()]
     );
+    let shell_again = FirstSightPass {
+        no_record: vec!["shell".into()],
+        ..FirstSightPass::default()
+    };
+    apply_first_sight(&mut seen, &mut parks, &shell_again, 65_000);
+    assert_eq!(seen.unread(&candidates, 94_999), vec!["gone".to_string()]);
+    assert_eq!(seen.unread(&candidates, 95_000).len(), 2);
+    for _ in 0..10 {
+        apply_first_sight(&mut seen, &mut parks, &shell_again, 100_000);
+    }
+    assert_eq!(seen.unread(&candidates, 399_999), vec!["gone".to_string()]);
+    assert_eq!(seen.unread(&candidates, 400_000).len(), 2);
     let gone_again = FirstSightPass {
         unreadable: vec!["gone".into()],
         ..FirstSightPass::default()
@@ -194,7 +207,7 @@ fn a_terminal_whose_transcript_reads_stopped_at_first_sight_is_handled_with_no_s
     assert_eq!(seen.unread(&candidates, 50_000), vec!["gone".to_string()]);
     apply_first_sight(&mut seen, &mut parks, &gone_again, 50_000);
     assert!(seen.unread(&candidates, 50_000).is_empty());
-    assert_eq!(seen.unread(&candidates, 350_000), vec!["shell".to_string()]);
+    assert_eq!(seen.unread(&candidates, 400_000), vec!["shell".to_string()]);
     // Enrolled as due now: the next tick hands it to the handler.
     let mut pacer = Pacer::default();
     let due = take_reentries(
