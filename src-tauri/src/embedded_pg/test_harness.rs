@@ -1321,18 +1321,32 @@ fn sweep_holder_partials(dir: &Path) -> Vec<String> {
         if keep {
             continue;
         }
-        lines.push(match std::fs::remove_file(&path) {
-            Ok(()) => format!(
-                "removed {}, a partial cache-lock holder file pid {pid} left when it died",
-                path.display()
-            ),
-            Err(e) => format!(
-                "could not remove {}, a partial cache-lock holder file pid {pid} left: {e}",
-                path.display()
-            ),
-        });
+        lines.extend(partial_removal_line(
+            &path,
+            pid,
+            std::fs::remove_file(&path),
+        ));
     }
     lines
+}
+
+/// What [`sweep_holder_partials`] says of removing the partial holder file
+/// `path` that pid `pid` left, given how the removal went. A `NotFound` says
+/// nothing: the sweep also runs under a SHARED lock, so another process
+/// entering a cache at the same moment may have removed the same file first,
+/// and it is gone either way.
+fn partial_removal_line(path: &Path, pid: u32, removed: std::io::Result<()>) -> Option<String> {
+    match removed {
+        Ok(()) => Some(format!(
+            "removed {}, a partial cache-lock holder file pid {pid} left when it died",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!(
+            "could not remove {}, a partial cache-lock holder file pid {pid} left: {e}",
+            path.display()
+        )),
+    }
 }
 
 /// Enter the template cache in `template_dir` with `enter` once it is proven
@@ -3251,8 +3265,10 @@ fn marker_counts(is_file: bool, owner: u32, me: u32) -> bool {
 ///   chmodded: what they wrote into it while it was open would survive the
 ///   chmod. For a directory [`HARNESS_DIR_ENV`] names (`named`) the error says
 ///   to point it at a directory that does not exist yet, never to remove the
-///   one the tester named; otherwise it says to remove it, after which the
-///   harness makes it again;
+///   one the tester named; otherwise it names both remedies: remove it, after
+///   which the harness makes it again, or point [`HARNESS_DIR_ENV`] at a
+///   directory that does not exist yet — the way out where removal would only
+///   loop, on a filesystem that holds no modes;
 /// - a directory with no mark that counts — such as an existing directory
 ///   [`HARNESS_DIR_ENV`] names, which the harness never marks, or one it found
 ///   open — is never chmodded: the harness does not change the mode of a
@@ -5652,9 +5668,11 @@ mod tests {
     /// processes no longer live left behind, and never a live process's, which
     /// may be mid-write. A file that reads as a record is judged by that record
     /// (pid and start); one that does not is removed only once it is older
-    /// than [`HOLDER_PARTIAL_GRACE`] and its pid is not live here. The
-    /// cut-short cases name `u32::MAX`, which no process has on any platform,
-    /// so they do not depend on a reaped pid staying free.
+    /// than [`HOLDER_PARTIAL_GRACE`] and its pid is not live here. The two
+    /// dead cut-short cases (one fresh, kept; one aged, removed) name
+    /// `u32::MAX`, which the test first asserts is not live, so they do not
+    /// depend on a reaped pid staying free; the third, aged, names the test
+    /// runner's own live pid (this test process's parent), and is kept.
     #[tokio::test]
     async fn a_lock_taker_sweeps_only_dead_processes_partial_holder_files() {
         let gone = || {
@@ -5748,9 +5766,12 @@ mod tests {
     }
 
     /// The root scan of [`ReapChildCluster::of_child`] takes only a root whose
-    /// owner record is the child's — its pid, this namespace, its start — and
-    /// leaves one under the same pid whose record names another start, or that
-    /// has no record: it may be a live peer's. Neither root has a postmaster.
+    /// owner record is the child's — its pid, this namespace, its start. Four
+    /// roots are planted under the same pid, none with a postmaster: one whose
+    /// record is the child's (taken wherever a start is read), and three it
+    /// leaves because each may be a live peer's — one whose record names
+    /// another start, one whose record names another PID namespace, and one
+    /// with no record at all.
     #[test]
     fn the_child_root_scan_takes_only_roots_the_child_created() {
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -5798,6 +5819,34 @@ mod tests {
                 left.display()
             );
         }
+    }
+
+    /// A partial holder file another process removed first — a second taker
+    /// sweeping under the shared lock at the same moment — is gone either way:
+    /// its `NotFound` says nothing, while any other failure is said.
+    #[test]
+    fn a_partial_another_taker_removed_first_is_not_a_failure() {
+        let path = Path::new("/nowhere/.lock.holder.7-x");
+        assert_eq!(
+            partial_removal_line(
+                path,
+                7,
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            ),
+            None,
+            "a partial already removed is not a failure"
+        );
+        let refused = partial_removal_line(
+            path,
+            7,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .expect("any other failure is said");
+        assert!(refused.contains("could not remove"), "{refused}");
+        assert!(
+            partial_removal_line(path, 7, Ok(())).is_some_and(|line| line.starts_with("removed ")),
+            "a removal is said"
+        );
     }
 
     /// The pid in a partial holder file's name.
