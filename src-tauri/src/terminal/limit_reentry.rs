@@ -12,6 +12,12 @@
 //! transcript, re-probes and decides again (continue, migrate or park). The
 //! scan gate is untouched.
 //!
+//! A re-entry is not the end of a stop: [`take_reentries`] leaves a retry park
+//! [`REENTRY_RETRY_MS`] out, which the handler's own decision replaces (a new
+//! park) or removes (a continue that reached the pane, or a session no longer
+//! stopped). A handler that returns early, or skips on an unreadable
+//! transcript, leaves it, so a known stop is never dropped.
+//!
 //! Re-entries are paced: at most [`LIMIT_REENTRY_PER_MINUTE`] in any 60 s,
 //! oldest due first ([`take_reentries`]). 97 sessions parked until one reset
 //! re-enter over about 16 minutes instead of 97 turns starting in one tick.
@@ -21,7 +27,7 @@
 //! task so the screen scan is not delayed. A `Stopped` read enrols the
 //! terminal as due now ([`super::limit_stop::ParkList::enrol`]), and the
 //! handler decides. That covers panes whose screen never matched a pattern
-//! (43 of 103 restored panes on 2026-11-04), and a restart: the park list is in
+//! (43 of 103 restored panes on 2026-11-04, plan §Why item 4), and a restart: the park list is in
 //! memory only, and the next process re-derives every park from the
 //! transcripts. The read includes the session's background subagents'
 //! transcripts ([`super::limit_stop::transcript_limit_stop`]). A pane first
@@ -51,6 +57,14 @@ const PACE_WINDOW_MS: i64 = 60_000;
 /// The `matched_pattern` a re-entry hands the handler (it is logged, not
 /// matched).
 pub(crate) const REENTRY_HINT: &str = "limit-reset-due";
+
+/// When a dispatched re-entry is looked at again if the handler neither
+/// parks nor answers it.
+pub(crate) const REENTRY_RETRY_MS: i64 = super::limit_reset::PARK_WITHOUT_RESET_MS;
+
+/// A first-sight read that is UNKNOWN is retried on later sweeps, up to this
+/// many reads in all, before the terminal counts as read.
+const FIRST_SIGHT_UNREADABLE_TRIES: u32 = 3;
 
 /// How often a first-sight sweep may start. A sweep reads only terminals not
 /// yet read, so after boot most sweeps find nothing to do.
@@ -84,7 +98,8 @@ impl Pacer {
 
 /// The re-entries one tick dispatches: parks of terminals no longer live are
 /// dropped, then at most the pacer's room of the due parks are taken, oldest
-/// due first. The rest stay parked and due.
+/// due first. The rest stay parked and due. Each one taken leaves a retry park
+/// [`REENTRY_RETRY_MS`] out (see the module docs).
 pub(crate) fn take_reentries(
     parks: &mut ParkList,
     pacer: &mut Pacer,
@@ -98,6 +113,13 @@ pub(crate) fn take_reentries(
     }
     let due = parks.take_due(now_ms, room);
     pacer.record(now_ms, due.len());
+    for park in &due {
+        parks.enrol(
+            &park.terminal_id,
+            &park.claude_session_id,
+            now_ms + REENTRY_RETRY_MS,
+        );
+    }
     due
 }
 
@@ -107,6 +129,8 @@ pub(crate) fn take_reentries(
 #[derive(Debug, Default)]
 pub(crate) struct FirstSight {
     read: HashSet<String>,
+    /// UNKNOWN reads so far of a terminal not yet counted as read.
+    unreadable_tries: std::collections::HashMap<String, u32>,
 }
 
 impl FirstSight {
@@ -121,21 +145,24 @@ impl FirstSight {
     /// Forget terminals that are gone, like the scan gate does.
     pub(crate) fn retain_live(&mut self, live: &HashSet<&str>) {
         self.read.retain(|t| live.contains(t.as_str()));
+        self.unreadable_tries.retain(|t, _| live.contains(t.as_str()));
     }
 }
 
 /// What one first-sight sweep found.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FirstSightPass {
-    /// Terminals with an open record whose transcript was read (whatever it
-    /// said). A terminal with no open record yet is not here, so a later
-    /// sweep reads it once its record exists.
+    /// Terminals with a confirmed open record whose transcript was read and
+    /// answered (`Stopped` or `NotStopped`). A terminal with no confirmed
+    /// record yet is not here, so a later sweep reads it once its session is
+    /// bound.
     pub read: Vec<String>,
     /// `(terminal_id, claude_session_id)` of each read that is `Stopped`.
     pub stopped: Vec<(String, String)>,
-    /// How many reads were UNKNOWN (`Unreadable`). Not enrolled: the hint path
-    /// still reads such a pane when its screen matches.
-    pub unreadable: usize,
+    /// Terminals whose read was UNKNOWN (`Unreadable`). Not enrolled, and
+    /// read again on later sweeps ([`FIRST_SIGHT_UNREADABLE_TRIES`]); the
+    /// hint path also reads such a pane when its screen matches.
+    pub unreadable: Vec<String>,
 }
 
 /// One first-sight sweep over `candidates`. `open_record` finds a terminal's
@@ -158,23 +185,38 @@ pub(crate) fn first_sight_pass<R>(
                 .stopped
                 .push((terminal_id.clone(), session_id(&record))),
             LimitStopRead::NotStopped => {}
-            LimitStopRead::Unreadable(_) => pass.unreadable += 1,
+            LimitStopRead::Unreadable(_) => {
+                pass.unreadable.push(terminal_id.clone());
+                continue;
+            }
         }
         pass.read.push(terminal_id.clone());
     }
     pass
 }
 
-/// Record a sweep: its terminals are read, and each stopped one is enrolled
-/// as due at `now_ms` unless it is already parked. Returns how many were
-/// enrolled.
+/// Record a sweep: its answered terminals are read, an UNKNOWN one counts as
+/// read only after [`FIRST_SIGHT_UNREADABLE_TRIES`] reads, and each stopped
+/// one is enrolled as due at `now_ms` unless it is already parked. Returns how
+/// many were enrolled.
 pub(crate) fn apply_first_sight(
     seen: &mut FirstSight,
     parks: &mut ParkList,
     pass: &FirstSightPass,
     now_ms: i64,
 ) -> usize {
-    seen.read.extend(pass.read.iter().cloned());
+    for terminal_id in &pass.read {
+        seen.unreadable_tries.remove(terminal_id);
+        seen.read.insert(terminal_id.clone());
+    }
+    for terminal_id in &pass.unreadable {
+        let tries = seen.unreadable_tries.entry(terminal_id.clone()).or_default();
+        *tries += 1;
+        if *tries >= FIRST_SIGHT_UNREADABLE_TRIES {
+            seen.unreadable_tries.remove(terminal_id);
+            seen.read.insert(terminal_id.clone());
+        }
+    }
     pass.stopped
         .iter()
         .filter(|(terminal_id, session)| parks.enrol(terminal_id, session, now_ms))
@@ -198,7 +240,9 @@ static FIRST_SIGHT_RUNNING: AtomicBool = AtomicBool::new(false);
 pub(crate) fn after_screen_pass(live: &[String]) {
     let live_set: HashSet<&str> = live.iter().map(String::as_str).collect();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    // Lock order: the park list, then the pacer. Nothing else takes both.
+    // Lock orders: the park list, then the pacer (here); the first-sight
+    // record, then the park list ([`run_first_sight`]). Nothing takes the
+    // park list and then the first-sight record.
     let due = super::limit_stop::with_parks(|parks| {
         let mut pacer = PACER.lock().unwrap_or_else(|e| e.into_inner());
         take_reentries(
@@ -277,7 +321,10 @@ fn run_first_sight(candidates: &[String]) {
     let started = Instant::now();
     let pass = first_sight_pass(
         candidates,
-        |terminal_id| store.find_open_by_terminal(terminal_id),
+        // Confirmed only: the spawn-time identity seam writes a provisional
+        // row for every terminal, and its minted id is not always the id the
+        // session runs under, so its transcript would not be there yet.
+        |terminal_id| store.find_confirmed_open_by_terminal(terminal_id),
         |record| record.claude_session_id.clone(),
         |record| match record
             .config_dir
@@ -301,9 +348,9 @@ fn run_first_sight(candidates: &[String]) {
         );
     }
     let elapsed_ms = started.elapsed().as_millis();
-    if pass.unreadable > 0 {
+    if !pass.unreadable.is_empty() {
         warn!(
-            unreadable = pass.unreadable,
+            unreadable = pass.unreadable.len(),
             "first-sight transcript check: some transcripts could not be read — left to the screen hint"
         );
     }
