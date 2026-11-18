@@ -1812,6 +1812,18 @@ impl SecureStorage {
     /// device has never been issued a `dmk_` (vs an `Err` only on a
     /// decrypt/parse failure of an existing store). Mirror of
     /// [`Self::get_agent_machine_key`].
+    /// Whether the store holds a Cognito refresh token and a device machine
+    /// key, from ONE load: `(cognito_session, device_machine_key)`. An `Err`
+    /// is a store that could not be read, never "absent".
+    pub fn recovery_holdings(&self) -> Result<(bool, bool)> {
+        let tokens = self.load_tokens()?;
+        let held = |v: &Option<String>| v.as_deref().is_some_and(|t| !t.trim().is_empty());
+        Ok((
+            held(&tokens.oauth_refresh_token),
+            held(&tokens.device_machine_key),
+        ))
+    }
+
     pub fn get_device_machine_key(&self) -> Result<Option<String>> {
         let tokens = self.load_tokens()?;
         Ok(tokens.device_machine_key)

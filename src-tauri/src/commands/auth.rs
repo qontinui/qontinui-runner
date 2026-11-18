@@ -1197,12 +1197,14 @@ pub fn cognito_pending_sign_in() -> Option<qontinui_runner_lib::cognito::Pending
     qontinui_runner_lib::cognito::pending_sign_in()
 }
 
-/// Cancel the pending Hosted-UI sign-in, releasing the callback port. Returns
-/// whether there was one. The cancelled [`cognito_sign_in`] call returns
+/// Cancel the pending Hosted-UI sign-in `attempt_id` (from
+/// [`cognito_pending_sign_in`]), releasing the callback port. Returns whether
+/// it was cancelled; a stale id cancels nothing. The cancelled
+/// [`cognito_sign_in`] call returns
 /// [`qontinui_runner_lib::cognito::SIGN_IN_CANCELLED`].
 #[tauri::command]
-pub fn cognito_cancel_sign_in() -> bool {
-    qontinui_runner_lib::cognito::cancel_pending_sign_in()
+pub fn cognito_cancel_sign_in(attempt_id: u64) -> bool {
+    qontinui_runner_lib::cognito::cancel_pending_sign_in(attempt_id)
 }
 
 async fn cognito_sign_in_impl(

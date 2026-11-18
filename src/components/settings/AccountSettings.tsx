@@ -61,7 +61,7 @@ import {
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useAuth } from "@/components/AuthProvider";
-import { PendingSignInNotice } from "@/components/PendingSignInNotice";
+import { PendingSignInNotice, isSignInCancelled } from "@/components/PendingSignInNotice";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
@@ -228,8 +228,13 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       );
     } catch (err) {
       const msg = typeof err === "string" ? err : String(err);
-      setFlowError(msg);
-      onLog("error", `Qontinui sign-in failed: ${msg}`);
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (isSignInCancelled(err)) {
+        onLog("info", "Qontinui sign-in cancelled");
+      } else {
+        setFlowError(msg);
+        onLog("error", `Qontinui sign-in failed: ${msg}`);
+      }
     } finally {
       setCognitoState("idle");
     }

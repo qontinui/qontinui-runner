@@ -40,7 +40,7 @@ import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useTenant } from "@/contexts/TenantContext";
-import { PendingSignInNotice } from "@/components/PendingSignInNotice";
+import { PendingSignInNotice, isSignInCancelled } from "@/components/PendingSignInNotice";
 
 import {
   applyCredentialDarkSignal,
@@ -400,7 +400,8 @@ export function WebIntegrationAuthBanner() {
       setRetryRefresh(null);
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
-      setAuthorizeError(String(err));
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (!isSignInCancelled(err)) setAuthorizeError(String(err));
     } finally {
       setAuthorizing(false);
     }

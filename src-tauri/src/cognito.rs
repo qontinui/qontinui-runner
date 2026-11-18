@@ -222,6 +222,9 @@ fn bind_loopback_reuseaddr(port: u16) -> std::io::Result<std::net::TcpListener> 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingSignIn {
+    /// This attempt's id: what [`cancel_pending_sign_in`] must name, so a
+    /// Cancel on a stale notice cannot end a newer attempt.
+    pub attempt_id: u64,
     /// The Hosted-UI authorize URL this attempt is waiting on.
     pub authorize_url: String,
     /// Why the system browser could not be opened, or `None` when the launch
@@ -262,11 +265,12 @@ pub fn pending_sign_in() -> Option<PendingSignIn> {
     pending_slot().as_ref().map(|slot| slot.info.clone())
 }
 
-/// Cancel the pending Hosted-UI sign-in. Returns whether there was one. The
-/// cancelled attempt releases the callback port and returns
-/// [`SIGN_IN_CANCELLED`].
-pub fn cancel_pending_sign_in() -> bool {
-    match pending_slot().as_ref() {
+/// Cancel the pending Hosted-UI sign-in, if it is attempt `attempt_id`.
+/// Returns whether it was cancelled: `false` when nothing is pending or a
+/// different (newer) attempt is. The cancelled attempt releases the callback
+/// port and returns [`SIGN_IN_CANCELLED`].
+pub fn cancel_pending_sign_in(attempt_id: u64) -> bool {
+    match pending_slot().as_ref().filter(|slot| slot.id == attempt_id) {
         Some(slot) => {
             slot.cancel
                 .store(CANCEL_BY_USER, std::sync::atomic::Ordering::SeqCst);
@@ -319,6 +323,7 @@ impl PendingAttempt {
         *slot = Some(PendingSlot {
             id,
             info: PendingSignIn {
+                attempt_id: id,
                 authorize_url: authorize_url.to_string(),
                 browser_launch_error: None,
                 callback_port,
@@ -1043,14 +1048,23 @@ mod tests {
         );
 
         assert!(
-            cancel_pending_sign_in(),
+            !cancel_pending_sign_in(pending.attempt_id + 1),
+            "a Cancel naming another attempt cancels nothing"
+        );
+        assert!(
+            cancel_pending_sign_in(pending.attempt_id),
             "there was a pending sign-in to cancel"
         );
         let result = attempt.join().expect("attempt thread");
         assert_eq!(result, Err(SIGN_IN_CANCELLED.to_string()));
         assert_eq!(pending_sign_in(), None, "the slot is cleared on exit");
-        assert!(!cancel_pending_sign_in(), "nothing is left to cancel");
-        bind_loopback_reuseaddr(port).expect("the callback port is released");
+        assert!(
+            !cancel_pending_sign_in(pending.attempt_id),
+            "nothing is left to cancel"
+        );
+        // A plain bind (no SO_REUSEADDR, which on Windows would succeed over a
+        // live listener) proves the port is really free.
+        std::net::TcpListener::bind(("127.0.0.1", port)).expect("the callback port is released");
     }
 
     #[test]
@@ -1069,9 +1083,9 @@ mod tests {
             first.join().expect("first thread"),
             Err(SIGN_IN_SUPERSEDED.to_string())
         );
-        wait_for_pending("https://auth.example/authorize?attempt=second");
+        let second_pending = wait_for_pending("https://auth.example/authorize?attempt=second");
 
-        assert!(cancel_pending_sign_in());
+        assert!(cancel_pending_sign_in(second_pending.attempt_id));
         assert_eq!(
             second.join().expect("second thread"),
             Err(SIGN_IN_CANCELLED.to_string())

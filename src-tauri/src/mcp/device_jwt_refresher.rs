@@ -6380,22 +6380,13 @@ impl RecoveryInventory {
 
     /// Read the inventory from `auth_manager`'s store.
     pub(crate) fn read(auth_manager: &crate::auth::AuthManager) -> Self {
-        let device_machine_key = auth_manager
-            .get_device_machine_key()
-            .ok()
-            .map(|dmk| dmk.is_some_and(|k| !k.trim().is_empty()));
-        // Each getter loads the store on its own, so the session read is judged
-        // on its own error: only the store's "not found" answer means absent
-        // (`SecureStorage::get_oauth_refresh_token`); any other error is a
-        // store that could not be read, which is UNKNOWN.
-        let cognito_session = match auth_manager.get_oauth_refresh_token() {
-            Ok(t) => Some(!t.trim().is_empty()),
-            Err(e) if e.to_string().contains("not found") => Some(false),
-            Err(_) => None,
-        };
-        Self {
-            cognito_session,
-            device_machine_key,
+        // One store load: an unreadable store is UNKNOWN for both, never absent.
+        match auth_manager.recovery_holdings() {
+            Ok((cognito_session, device_machine_key)) => Self {
+                cognito_session: Some(cognito_session),
+                device_machine_key: Some(device_machine_key),
+            },
+            Err(_) => Self::UNKNOWN,
         }
     }
 
