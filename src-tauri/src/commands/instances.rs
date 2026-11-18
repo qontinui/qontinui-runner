@@ -441,20 +441,23 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
 
 #[cfg(test)]
 mod temp_runner_name_tests {
-    use super::*;
-
     /// A saved config refuses the supervisor's temp-runner prefix BEFORE it
-    /// writes anything, as `POST /instances/spawn` and the launcher do.
-    #[tokio::test]
-    async fn save_runner_instance_refuses_a_temp_runner_name() {
-        let err = save_runner_instance(
-            "inst-test".to_string(),
-            "test-1a1d5eb4953-22".to_string(),
-            29_890,
-            None,
-        )
-        .await
-        .expect_err("a test- name must be refused");
-        assert!(err.contains("reserved"), "{err}");
+    /// writes anything, as `POST /instances/spawn` and the launcher do. Checked
+    /// by source order rather than by calling the command, so a regressed guard
+    /// can never write the operator's real settings from a test.
+    #[test]
+    fn save_runner_instance_refuses_a_temp_runner_name_before_saving() {
+        let src = include_str!("instances.rs");
+        let (_, body) = src
+            .split_once("pub async fn save_runner_instance(")
+            .expect("save_runner_instance present");
+        let (body, _) = body.split_once("\n}\n").expect("function body ends");
+        let guard = body
+            .find("refuse_temp_runner_name(&name)?")
+            .expect("save_runner_instance calls refuse_temp_runner_name");
+        let save = body
+            .find("settings::save_runner_instance(")
+            .expect("save_runner_instance saves");
+        assert!(guard < save, "the name refusal must precede the save");
     }
 }
