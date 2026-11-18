@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::acquire_retry::RetryDeadline;
-use crate::test_coord::ScriptedCoord;
 use super::{
     allocate_and_materialize_with_claim, AllocateError, MaterializeOutcome, RepoRequest,
     SharedBranchPolicy,
 };
+use crate::test_coord::ScriptedCoord;
 
 const CLAIMS: &str = "/claims/acquire";
 const RELEASE: &str = "/claims/release";

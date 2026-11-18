@@ -242,11 +242,7 @@ impl ScriptedCoord {
 
 fn respond(state: &Arc<Mutex<State>>, req: Request) -> (u16, String) {
     let mut st = state.lock().unwrap();
-    let Some(idx) = st
-        .queues
-        .iter()
-        .position(|(p, _)| req.path.starts_with(p))
-    else {
+    let Some(idx) = st.queues.iter().position(|(p, _)| req.path.starts_with(p)) else {
         return (404, "{}".to_string());
     };
     let prefix = st.queues[idx].0;

@@ -262,8 +262,7 @@ async fn tick_strips_reports_after_a_422_naming_no_event() {
         &fx,
         vec![(
             422,
-            r#"{"problems":["computers[0].hostname: must be at most 255 characters"]}"#
-                .to_string(),
+            r#"{"problems":["computers[0].hostname: must be at most 255 characters"]}"#.to_string(),
         )],
     )
     .await;
@@ -273,7 +272,10 @@ async fn tick_strips_reports_after_a_422_naming_no_event() {
     reporter.tick().await;
 
     assert_eq!(coord.hits(ROUTE), 1);
-    assert!(reporter.strip_until.is_some(), "a 422 naming no event strips");
+    assert!(
+        reporter.strip_until.is_some(),
+        "a 422 naming no event strips"
+    );
 }
 
 /// (f) The `telemetry_gap` that `tick` itself queues (a previous tick a day
@@ -282,7 +284,11 @@ async fn tick_strips_reports_after_a_422_naming_no_event() {
 async fn tick_keeps_a_telemetry_gap_queued_until_coord_accepts_it() {
     let fx = coord_fixture();
     let host = host_id();
-    let state_path = fx.ambient.dir().join("runner").join("computer-observer.json");
+    let state_path = fx
+        .ambient
+        .dir()
+        .join("runner")
+        .join("computer-observer.json");
     let seeded = ObserverState {
         last_tick_at: Some(events::rfc3339(
             chrono::Utc::now() - chrono::Duration::days(1),
