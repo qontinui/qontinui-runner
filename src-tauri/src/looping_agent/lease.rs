@@ -297,11 +297,15 @@ pub fn in_orphan_cooldown(now_ms: i64, last_orphan_release_ms: Option<i64>) -> b
 
 /// **May this tick walk the candidate slots at all?** Pure.
 ///
-/// * Never on a KNOWN-closed lane ([`LaneObs::Closed`], D5): nothing may run
-///   here, so a slot taken here could only be handed straight back. This is
-///   what keeps a runner that has just handed a slot over from re-adopting it
-///   on the next tick, when the tab it closed can still read `PendingRestore`
-///   while its lifecycle record closes. An `Unknown` lane is not closed.
+/// * On a KNOWN-closed lane ([`LaneObs::Closed`], D5) only a `Live` tab may
+///   walk. It must: a restarted runner (the held-slot memo is in memory only)
+///   renews its OWN slot for a busy restored tab this way, and a holder whose
+///   heartbeat lapsed re-adopts — without the walk the TTL would lapse, an
+///   open peer would spawn, and two Shepherds would run. The tab then hands
+///   the slot over at its first idle tick, as any closed-lane holder does.
+///   Nothing else walks there: no spawn can follow, and a just-closed tab
+///   that still reads `PendingRestore` while its lifecycle record closes must
+///   not re-take the slot it handed over. An `Unknown` lane is not closed.
 /// * A live (or restoring) tab may always adopt a free slot: adopting is not a
 ///   spawn, so neither the agent registry nor the drain governs it.
 /// * Otherwise only a runner that could actually spawn may take a slot, and
@@ -311,7 +315,7 @@ pub fn in_orphan_cooldown(now_ms: i64, last_orphan_release_ms: Option<i64>) -> b
 ///   just gave up on the next tick.
 pub fn acquire_permitted(obs: &LeaseTickObs, last_orphan_release_ms: Option<i64>) -> bool {
     if obs.lane == LaneObs::Closed {
-        return false;
+        return obs.liveness == Liveness::Live;
     }
     obs.liveness.tab_alive()
         || (obs.spawn_able && !in_orphan_cooldown(obs.now_ms, last_orphan_release_ms))
@@ -499,12 +503,21 @@ pub fn handover_action(action: Action, hand_over: bool) -> Action {
     }
 }
 
-/// D5 for a tab that holds NO slot on a known-closed lane (its lease was lost
-/// or never taken): it can never get one here ([`acquire_permitted`]) and the
+/// D5 for a tab that coord has AUTHORITATIVELY said holds no slot, on a
+/// known-closed lane ([`LeaseTick::unslotted`]: the agent is running, its slot
+/// key could be named, and coord answered that the slot is not ours). The
 /// drain stops every new cycle, so at its first idle tick it is retired too —
 /// with nothing to release. A busy tab runs its turn out first.
-pub fn retire_unslotted_on_closed_lane(obs: &LeaseTickObs, holds: bool) -> bool {
-    !holds && obs.lane == LaneObs::Closed && obs.liveness == Liveness::Live && obs.idle_past_grace
+///
+/// `unslotted` is NOT `!holds`: a tick that could not name a slot (no fleet
+/// role, no tenant, no machine id), an agent that is not wanted running, and a
+/// walk coord did not answer all hold nothing too, and none of them is
+/// evidence that this tab should go.
+pub fn retire_unslotted_on_closed_lane(obs: &LeaseTickObs, unslotted: bool) -> bool {
+    unslotted
+        && obs.lane == LaneObs::Closed
+        && obs.liveness == Liveness::Live
+        && obs.idle_past_grace
 }
 
 /// What the lease reconcile reports to the supervisor for one tick.
@@ -518,6 +531,12 @@ pub struct LeaseTick {
     /// D5: we still hold the slot, but this tick must retire the idle tab and
     /// then release it ([`HoldDecision::HandOver`]).
     pub hand_over: bool,
+    /// The agent is wanted running, its slot could be NAMED (role, tenant and
+    /// machine id all resolved), and coord answered authoritatively that no
+    /// slot is ours this tick (every candidate `held` by a peer, or our lease
+    /// `stolen`/`not_held` at a hand-over). Only this feeds
+    /// [`retire_unslotted_on_closed_lane`].
+    pub unslotted: bool,
 }
 
 impl LeaseTick {
@@ -526,18 +545,29 @@ impl LeaseTick {
         holds: false,
         walk: WalkVerdict::NotWalked,
         hand_over: false,
+        unslotted: false,
+    };
+    /// A tick on which coord answered that our lease is gone (stolen or
+    /// expired at a hand-over) and we did not walk.
+    pub const LOST: LeaseTick = LeaseTick {
+        holds: false,
+        walk: WalkVerdict::NotWalked,
+        hand_over: false,
+        unslotted: true,
     };
     /// A tick on which we kept the slot we already held.
     pub const HELD: LeaseTick = LeaseTick {
         holds: true,
         walk: WalkVerdict::NotWalked,
         hand_over: false,
+        unslotted: false,
     };
     /// A tick on which we hold the slot only until the idle tab is retired.
     pub const HAND_OVER: LeaseTick = LeaseTick {
         holds: true,
         walk: WalkVerdict::NotWalked,
         hand_over: true,
+        unslotted: false,
     };
 
     /// The report for a tick whose walk ran.
@@ -546,6 +576,9 @@ impl LeaseTick {
             holds: matches!(walk, WalkVerdict::Acquired { .. }),
             walk,
             hand_over: false,
+            // Only the authoritative "every slot is a peer's" answer; an
+            // unavailable walk says nothing about ownership.
+            unslotted: matches!(walk, WalkVerdict::AllHeld),
         }
     }
 }
@@ -1137,6 +1170,9 @@ mod tests {
                 "{l:?}: the same observation on an open lane may walk"
             );
         }
+        // A LIVE tab on a closed lane may walk: a restarted runner renews its
+        // own slot for a busy restored tab, a lapsed holder re-adopts.
+        assert!(acquire_permitted(&lane_obs(LaneObs::Closed, false), None));
         // The tab just closed can read PendingRestore for a tick or two; that
         // must not re-adopt the slot just handed over.
         let restoring = LeaseTickObs {
@@ -1160,31 +1196,41 @@ mod tests {
 
     #[test]
     fn an_unslotted_idle_tab_on_a_closed_lane_retires() {
+        // `walked` reports unslotted only for coord's authoritative all-held.
+        assert!(LeaseTick::walked(WalkVerdict::AllHeld).unslotted);
+        for w in [
+            WalkVerdict::Acquired { slot: 0 },
+            WalkVerdict::Unavailable,
+            WalkVerdict::NotWalked,
+        ] {
+            assert!(!LeaseTick::walked(w).unslotted, "{w:?}");
+        }
+        assert!(!LeaseTick::NOT_HELD.unslotted && LeaseTick::LOST.unslotted);
         assert!(retire_unslotted_on_closed_lane(
-            &lane_obs(LaneObs::Closed, true),
-            false
-        ));
-        // Not while it holds a slot (that is the hand-over), not busy, not on
-        // an open or unknown lane, not without a live tab.
-        assert!(!retire_unslotted_on_closed_lane(
             &lane_obs(LaneObs::Closed, true),
             true
         ));
+        // Not without coord's "not ours" answer, not busy, not on an open or
+        // unknown lane, not without a live tab.
+        assert!(!retire_unslotted_on_closed_lane(
+            &lane_obs(LaneObs::Closed, true),
+            false
+        ));
         assert!(!retire_unslotted_on_closed_lane(
             &lane_obs(LaneObs::Closed, false),
-            false
+            true
         ));
         for lane in [LaneObs::Open, LaneObs::Unknown] {
             assert!(!retire_unslotted_on_closed_lane(
                 &lane_obs(lane, true),
-                false
+                true
             ));
         }
         let pending = LeaseTickObs {
             liveness: Liveness::PendingRestore,
             ..lane_obs(LaneObs::Closed, true)
         };
-        assert!(!retire_unslotted_on_closed_lane(&pending, false));
+        assert!(!retire_unslotted_on_closed_lane(&pending, true));
     }
 
     #[test]
@@ -1481,6 +1527,7 @@ mod tests {
         // -- Hold. --
         let mut holds = false;
         let mut hand_over = false;
+        let mut unslotted = false;
         let mut may_walk = true;
         if let Some(h) = r.held.as_mut() {
             if o.proven_alive {
@@ -1508,6 +1555,7 @@ mod tests {
                         hand_over = true;
                     } else {
                         r.held = None;
+                        unslotted = true;
                     }
                     may_walk = false;
                 }
@@ -1535,6 +1583,7 @@ mod tests {
                 }
             }
             walk = walk_verdict(&outcomes);
+            unslotted = walk == WalkVerdict::AllHeld;
             if let WalkVerdict::Acquired { slot } = walk {
                 r.held = Some(HeldSlot {
                     slot,
@@ -1584,7 +1633,7 @@ mod tests {
         let action = displacement_action(action, displaced, r.idle && grace_elapsed);
         let action = handover_action(
             action,
-            hand_over || retire_unslotted_on_closed_lane(&o, holds),
+            hand_over || retire_unslotted_on_closed_lane(&o, unslotted),
         );
 
         // -- Act. --
@@ -1667,26 +1716,73 @@ mod tests {
         assert_eq!(t0.action, Action::Retire);
         assert!(r0.held.is_none() && !r0.live_tab());
         assert_eq!(r0.releases, vec![(now, ReleaseReason::LaneClosed)]);
+
+        // r0's closed tab may read PendingRestore while its record closes.
+        // Ticked FIRST, with slot 0 free, it must not re-take what it just
+        // handed over.
+        r0.tab = Liveness::PendingRestore;
+        let t0 = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+        assert_eq!(t0.walk, WalkVerdict::NotWalked);
+        assert_eq!(coord.live_owner(&key(0), now), None);
+
         let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
         assert_eq!(t1.walk, WalkVerdict::Acquired { slot: 0 });
         assert_eq!(r1.spawns, 1);
         assert_eq!(live_tabs_anywhere(&[&r0, &r1]), 1);
 
-        // r0's closed tab may read PendingRestore while its record closes; it
-        // must not re-adopt, nor spawn, for as long as its lane is shut.
-        r0.tab = Liveness::PendingRestore;
+        // With a second slot free the whole time, r0 still takes none — nor
+        // spawns — for as long as its lane is shut.
         for i in 0..200 {
             now += TICK_MS;
             if i == 2 {
                 r0.tab = Liveness::Dead;
             }
-            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
-            sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            let t0 = sim_tick(&mut coord, &mut r0, 2, DesiredSource::Coord, now);
+            sim_tick(&mut coord, &mut r1, 2, DesiredSource::Coord, now);
+            assert_eq!(t0.walk, WalkVerdict::NotWalked, "t={now}");
             assert!(r0.held.is_none(), "t={now}");
+            assert_eq!(coord.live_owner(&key(1), now), None, "t={now}");
             assert_eq!(r0.spawns, 0, "t={now}");
             assert!(r1.held.is_some(), "the slot ends on the open device");
             assert_eq!(slotted_live_tabs(&[&r0, &r1]), 1);
         }
+    }
+
+    /// Round-2 A3: a runner restarted on a closed lane (its held-slot memo is
+    /// in memory only) re-walks for its busy restored tab and RENEWS its own
+    /// slot, so the TTL never lapses into a second Shepherd on the open
+    /// device; at the first idle tick it hands over as usual.
+    #[test]
+    fn a_restarted_busy_holder_on_a_closed_lane_renews_its_own_slot() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok); // no memo
+        r0.lane = LaneObs::Closed;
+        r0.idle = false;
+        let mut r1 = SimRunner::new("r1", Liveness::Dead, SpawnBehavior::Ok);
+
+        let mut now = 0;
+        let t0 = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+        assert_eq!(t0.walk, WalkVerdict::Acquired { slot: 0 }, "renewed");
+        assert_eq!(t0.action, Action::None);
+        // Several TTLs of a busy tab: r1 never gets in, never two Shepherds.
+        while now < 3 * TTL_MS {
+            now += TICK_MS;
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            assert!(r0.held.is_some() && r0.live_tab(), "t={now}");
+            assert_eq!(t1.walk, WalkVerdict::AllHeld, "t={now}");
+            assert_eq!(live_tabs_anywhere(&[&r0, &r1]), 1);
+        }
+        now += TICK_MS;
+        r0.idle = true;
+        assert_eq!(
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now).action,
+            Action::Retire
+        );
+        let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+        assert_eq!(t1.walk, WalkVerdict::Acquired { slot: 0 });
+        assert_eq!(live_tabs_anywhere(&[&r0, &r1]), 1);
     }
 
     /// D5: a failed close keeps the slot (heartbeated) and the hand-over is

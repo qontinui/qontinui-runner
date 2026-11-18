@@ -765,12 +765,12 @@ async fn supervise_one(
     // keeps its old place after the reconcile: the 1.5 s debounce must not
     // delay the heartbeat/acquire, nor age the verdict a `Nudge` acts on. One
     // probe per tick either way.
-    let lane = lane_obs(&drain);
-    let early_probe = if lane == lease::LaneObs::Closed {
+    let early_probe = if lane_obs(&drain) == lease::LaneObs::Closed {
         Some(probe_tab(&rec.def, &live).await)
     } else {
         None
     };
+    let (lane, idle_past_grace) = closed_lane_fields(&drain, early_probe, spawn_grace_elapsed);
 
     // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
     //
@@ -786,10 +786,7 @@ async fn supervise_one(
         source: effective.source,
         slots: effective.slots,
         lane,
-        // The RAW turn-complete verdict, not the dialog-vetoed `idle`: a
-        // hand-over closes the tab and types nothing, like the displacement
-        // retire below, so a tab parked on a dialog still hands over.
-        idle_past_grace: early_probe.is_some_and(|p| p.quiescent) && spawn_grace_elapsed,
+        idle_past_grace,
     };
     let lease_tick = reconcile_slot_lease(app, rec, &effective, &lease_obs).await;
     // D3: an authoritative all-`held` walk over our live tab means a live peer
@@ -800,7 +797,7 @@ async fn supervise_one(
 
     // Observe idle/context-low on the live grid (on a closed lane this tick's
     // probe was already taken above). See [`probe_tab`].
-    let TabProbe {
+    let GridProbe {
         idle,
         context_low,
         quiescent,
@@ -970,7 +967,7 @@ async fn supervise_one(
     // A tab holding NO slot on that lane (its lease was lost, or never taken)
     // can never get one here, and the drain stops its every cycle, so it too
     // is retired at its first idle tick — with nothing to release.
-    let retire_unslotted = lease::retire_unslotted_on_closed_lane(&lease_obs, lease_tick.holds);
+    let retire_unslotted = retire_unslotted_tab(effective.running, &lease_tick, &lease_obs);
     let action = lease::handover_action(action, lease_tick.hand_over || retire_unslotted);
 
     match action {
@@ -1181,7 +1178,7 @@ fn drain_rewrite(action: Action, drain: &crate::coord_drain_state::DrainGate) ->
 
 /// One tick's reading of the live grid.
 #[derive(Debug, Clone, Copy, Default)]
-struct TabProbe {
+struct GridProbe {
     /// Turn complete AND no dialog on screen ([`nudge_safe_idle`]): every
     /// action this unlocks types into the tab, and Enter on a dialog answers
     /// it (coord finding `9089767f`).
@@ -1203,19 +1200,19 @@ struct TabProbe {
 async fn probe_tab(
     def: &LoopingAgentDef,
     live: &Option<(String, Arc<crate::terminal::session::TerminalSession>)>,
-) -> TabProbe {
+) -> GridProbe {
     let Some((tid, session)) = live else {
-        return TabProbe::default();
+        return GridProbe::default();
     };
     let Some(probe) = session
         .idle_quiescence_probe(IDLE_QUIESCENCE_DEBOUNCE)
         .await
     else {
-        return TabProbe::default();
+        return GridProbe::default();
     };
     let (safe, dialog) = nudge_safe_idle(probe.idle, &probe.lines);
     log_dialog_transition(&def.id, tid, dialog);
-    TabProbe {
+    GridProbe {
         idle: safe,
         context_low: snapshot_context_low(
             &probe.lines,
@@ -1243,6 +1240,31 @@ fn lane_obs(drain: &crate::coord_drain_state::DrainGate) -> lease::LaneObs {
             ..
         } => lease::LaneObs::Unknown,
     }
+}
+
+/// PURE: the two D5 fields of the tick's lease observation. `lane` is the
+/// drain read's fold ([`lane_obs`]). `idle_past_grace` is the early probe's RAW
+/// turn-complete verdict, not the dialog-vetoed `idle`: a hand-over closes the
+/// tab and types nothing, like the displacement retire, so a tab parked on a
+/// dialog still hands over. The probe is taken early only on a closed lane, so
+/// on every other lane this is `false`.
+fn closed_lane_fields(
+    drain: &crate::coord_drain_state::DrainGate,
+    early_probe: Option<GridProbe>,
+    spawn_grace_elapsed: bool,
+) -> (lease::LaneObs, bool) {
+    let lane = lane_obs(drain);
+    let idle = lane == lease::LaneObs::Closed && early_probe.is_some_and(|p| p.quiescent);
+    (lane, idle && spawn_grace_elapsed)
+}
+
+/// PURE: whether this tick retires a tab that holds no slot on a closed lane
+/// (D5). Only for an agent that is WANTED running — decide's rule (1): a
+/// disabled agent's tab is never touched — and only on coord's authoritative
+/// "not ours" ([`lease::LeaseTick::unslotted`]), never on a tick that could
+/// not name a slot at all.
+fn retire_unslotted_tab(running: bool, tick: &lease::LeaseTick, obs: &lease::LeaseTickObs) -> bool {
+    running && lease::retire_unslotted_on_closed_lane(obs, tick.unslotted)
 }
 
 /// D5's second step: release the slot whose tab the Retire arm just closed.
@@ -1441,7 +1463,7 @@ async fn reconcile_slot_lease(
                      lane-closed hand-over"
                 );
                 clear_held_slot(agent_id);
-                return NOT_HELD;
+                return lease::LeaseTick::LOST;
             }
             lease::HoldDecision::Keep => {
                 let outcome = crate::looping_agent_coord::heartbeat_slot(
@@ -2567,6 +2589,121 @@ mod drain_rewrite_tests {
             ..obs(Liveness::Live, true)
         };
         assert_eq!(hold_decision(0, 0, &unknown), HoldDecision::Keep);
+    }
+
+    fn closed(class: crate::coord_drain_state::DeferClass) -> DrainGate {
+        DrainGate::Defer {
+            reason: "closed".into(),
+            class,
+        }
+    }
+
+    fn grid(quiescent: bool) -> super::GridProbe {
+        super::GridProbe {
+            // A dialog on screen: the vetoed `idle` is false either way.
+            idle: false,
+            context_low: false,
+            quiescent,
+        }
+    }
+
+    /// The lease observation the supervisor builds for a closed-lane tick.
+    fn closed_lane_obs(
+        drain: &DrainGate,
+        liveness: qontinui_runner_lib::looping_agent::policy::Liveness,
+        probe: super::GridProbe,
+    ) -> qontinui_runner_lib::looping_agent::lease::LeaseTickObs {
+        let (lane, idle_past_grace) = super::closed_lane_fields(drain, Some(probe), true);
+        qontinui_runner_lib::looping_agent::lease::LeaseTickObs {
+            now_ms: 1_000_000,
+            liveness,
+            proven_alive: true,
+            spawn_able: drain.allows(),
+            spawn_grace_secs: 90,
+            source: qontinui_runner_lib::looping_agent::desired_state::DesiredSource::Coord,
+            slots: 1,
+            lane,
+            idle_past_grace,
+        }
+    }
+
+    #[test]
+    fn the_hand_over_reads_the_raw_quiescence_not_the_dialog_veto() {
+        use crate::coord_drain_state::DeferClass;
+        use qontinui_runner_lib::looping_agent::lease::LaneObs;
+        // `grid` has `idle: false` (a dialog): quiescent alone decides.
+        assert_eq!(
+            super::closed_lane_fields(&closed(DeferClass::Drained), Some(grid(true)), true),
+            (LaneObs::Closed, true)
+        );
+        assert_eq!(
+            super::closed_lane_fields(&closed(DeferClass::Drained), Some(grid(true)), false),
+            (LaneObs::Closed, false),
+            "never inside the spawn grace"
+        );
+        // Off a closed lane the field is false whatever the probe said.
+        for drain in [DrainGate::Allow, closed(DeferClass::Unknown)] {
+            assert!(!super::closed_lane_fields(&drain, Some(grid(true)), true).1);
+        }
+    }
+
+    /// Round-2 A2: a disabled agent on a closed lane is left alone. The
+    /// reconcile's clean-stop branch reports `NOT_HELD`, and even a tick
+    /// reporting "not ours" must not close a tab the operator switched off.
+    #[test]
+    fn a_disabled_agent_on_a_closed_lane_is_left_alone() {
+        use crate::coord_drain_state::DeferClass;
+        use qontinui_runner_lib::looping_agent::lease::LeaseTick;
+        use qontinui_runner_lib::looping_agent::policy::Liveness;
+        for class in [DeferClass::Drained, DeferClass::RoleClosed] {
+            let obs = closed_lane_obs(&closed(class), Liveness::Live, grid(true));
+            assert!(obs.idle_past_grace);
+            // Clean stop (disabled) and every can't-name-a-slot return.
+            assert!(!super::retire_unslotted_tab(
+                false,
+                &LeaseTick::NOT_HELD,
+                &obs
+            ));
+            assert!(!super::retire_unslotted_tab(
+                true,
+                &LeaseTick::NOT_HELD,
+                &obs
+            ));
+            assert!(!super::retire_unslotted_tab(false, &LeaseTick::LOST, &obs));
+            // A running agent coord says holds nothing IS retired at idle.
+            assert!(super::retire_unslotted_tab(true, &LeaseTick::LOST, &obs));
+            // And the action stage leaves the disabled tab's action as it was.
+            assert_eq!(
+                qontinui_runner_lib::looping_agent::lease::handover_action(
+                    Action::None,
+                    LeaseTick::NOT_HELD.hand_over
+                        || super::retire_unslotted_tab(false, &LeaseTick::NOT_HELD, &obs)
+                ),
+                Action::None
+            );
+        }
+    }
+
+    /// Round-2 A3: a runner restarted on a closed lane has no held-slot memo,
+    /// so its busy restored tab must still be allowed to walk and renew its own
+    /// slot (else the TTL lapses and an open peer spawns a second Shepherd);
+    /// once renewed it keeps the slot while busy. A closing tab reading
+    /// `PendingRestore` still may not walk.
+    #[test]
+    fn a_restarted_busy_live_tab_on_a_closed_lane_renews_its_own_slot() {
+        use crate::coord_drain_state::DeferClass;
+        use qontinui_runner_lib::looping_agent::lease::{
+            acquire_permitted, hold_decision, HoldDecision,
+        };
+        use qontinui_runner_lib::looping_agent::policy::Liveness;
+        for class in [DeferClass::Drained, DeferClass::RoleClosed] {
+            let busy = closed_lane_obs(&closed(class), Liveness::Live, grid(false));
+            assert!(!busy.spawn_able, "the drain forbids a spawn");
+            assert!(acquire_permitted(&busy, None), "{class:?}: renew/adopt");
+            assert_eq!(hold_decision(0, 0, &busy), HoldDecision::Keep);
+            let closing = closed_lane_obs(&closed(class), Liveness::PendingRestore, grid(false));
+            assert!(!acquire_permitted(&closing, None), "{class:?}");
+        }
     }
 
     #[test]
