@@ -155,10 +155,10 @@ use super::{
 /// directory that another user owns or that anyone else can reach
 /// ([`require_private`]), and on one with an ancestor another user could swap
 /// the tree through ([`require_safe_ancestors`]). The harness changes the mode
-/// only of a directory it marked as its own ([`MADE_MARKER`]): one it made, or
-/// an existing one it found already private to this user. One it found open is
-/// never chmodded but refused: name a directory that does not exist yet, such
-/// as `/dev/shm/<you>/qontinui-test-pg`, and the harness creates it, with any
+/// only of a directory it made itself ([`MADE_MARKER`]): an existing directory
+/// named here is never marked or chmodded, and is refused unless it is already
+/// private. Name a directory that does not exist yet, such as
+/// `/dev/shm/<you>/qontinui-test-pg`, and the harness creates it, with any
 /// parent it lacks, private. Windows is not checked. It is also the
 /// boot-failure self-test's hook: pointed at a regular file, the harness cannot
 /// boot and must fail every test that asks it for a database.
@@ -286,8 +286,9 @@ const LOG_TAIL_BYTES: usize = 2048;
 const REMOVE_RETRY_WINDOW: Duration = Duration::from_secs(10);
 /// The file the harness writes into each directory it creates and may later
 /// make private again: the harness directory and every template cache, and an
-/// existing harness directory it finds already private to this user
-/// ([`prepare_harness_dir`]). The harness changes the mode of no directory that
+/// existing harness directory at the DEFAULT location it finds already private
+/// to this user ([`prepare_harness_dir`]); never a directory [`HARNESS_DIR_ENV`]
+/// names that the harness did not make. The harness changes the mode of no directory that
 /// lacks it, and counts as the mark only a regular file this user owns
 /// ([`require_private`]).
 const MADE_MARKER: &str = ".made-by-qontinui-test-pg";
@@ -1034,8 +1035,14 @@ struct LockPatience {
 /// each well inside the bound, is waited out however long it is. A holder the
 /// file does not name — no file, an unreadable one, or one naming a process
 /// that is no longer live ([`LockHolder::is_live`]), such as a holder from
-/// before the file existed — is timed as one unnamed holder. Timed with
-/// `tokio::time`, so a test can run the wait on paused time.
+/// before the file existed — is timed as one unnamed holder. Liveness is
+/// judged whenever the file's text changes and again at every progress line,
+/// so a named holder that dies while another process keeps the lock (a second
+/// shared holder, or one that never named itself) becomes unnamed by the next
+/// line. Timed with `tokio::time`, so a test can run the wait on paused time.
+///
+/// Once it has the lock it removes the partial holder files that processes no
+/// longer live left behind ([`sweep_holder_partials`]), then names itself.
 async fn take_cache_lock(
     lock: &std::fs::File,
     exclusive: bool,
@@ -1059,6 +1066,9 @@ async fn take_cache_lock(
         };
         match attempt {
             Ok(()) => {
+                for line in sweep_holder_partials(&dir) {
+                    report(line);
+                }
                 write_lock_holder(&dir, &key, if exclusive { "building" } else { "entering" });
                 return Ok(());
             }
@@ -1071,11 +1081,13 @@ async fn take_cache_lock(
             }
         }
         let now = tokio::time::Instant::now();
-        // Liveness is judged when a name first appears, not on every poll: a
-        // named holder that dies lets go of the lock with its life, and whoever
-        // takes it next writes a new name.
+        let waited = now - started;
+        let report_due = waited >= next_report;
+        // Liveness is judged when the file's text changes and at every progress
+        // line, not on every poll: the file names only the last process to take
+        // the lock, which may die while another keeps it.
         let read = read_lock_holder(&dir);
-        if read != last_read {
+        if read != last_read || report_due {
             last_live = read.as_ref().is_some_and(LockHolder::is_live);
             last_read = read;
         }
@@ -1104,8 +1116,7 @@ async fn take_cache_lock(
                 (now - started).as_secs()
             ));
         }
-        let waited = now - started;
-        if waited >= next_report {
+        if report_due {
             report(format!(
                 "still waiting, after {} s, for the {kind} cache lock for {}: held by {named} \
                  for {} s; this boot gives up once one holder has held it for {} s",
@@ -1200,11 +1211,16 @@ impl LockHolder {
         })
     }
 
-    /// Whether the recorded process may still be running, judged as
-    /// [`owner_may_be_live`] judges a root's owner: a holder in another PID
-    /// namespace cannot be checked from here and counts as live; otherwise its
-    /// pid must be live and, where both starts are read, have started when the
-    /// holder did.
+    /// Whether the recorded process may still be running: a holder in another
+    /// PID namespace cannot be checked from here and counts as live, however
+    /// old its record; otherwise its pid must be live and, where both starts
+    /// are read, have started when the holder did — this process's own pid
+    /// included, since a record of this process with its own start IS this
+    /// process. Unlike [`owner_may_be_live`] it neither ages a foreign record
+    /// out nor counts this process's pid as a dead predecessor's: what it
+    /// decides is only whom a waiting process names and times, and which
+    /// partial holder files are swept, so it errs towards live, which keeps a
+    /// file and costs at most a name.
     fn is_live(&self) -> bool {
         if self.pid_ns.as_deref() != own_pid_namespace() {
             return true;
@@ -1254,6 +1270,57 @@ fn read_lock_holder(dir: &Path) -> Option<LockHolder> {
     LockHolder::parse(&std::fs::read_to_string(dir.join(LOCK_HOLDER_FILE)).ok()?)
 }
 
+/// Remove the partial holder files (`.lock.holder.<pid>-<nonce>`,
+/// [`write_lock_holder`]) in `dir` that a process no longer live left behind,
+/// by dying between the write and the rename. Run under the cache lock, which
+/// its caller has just taken. A file whose text records its process is judged
+/// as a waiter judges a named holder ([`LockHolder::is_live`]: pid and start);
+/// one whose text cannot be read as a record — cut short by the death — by the
+/// pid in its name alone. A live process's file is never removed: it may be
+/// mid-write. One line per removal or failure.
+fn sweep_holder_partials(dir: &Path) -> Vec<String> {
+    let prefix = format!("{LOCK_HOLDER_FILE}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let path = entry.path();
+        let live = match std::fs::read_to_string(&path)
+            .ok()
+            .as_deref()
+            .and_then(LockHolder::parse)
+            .filter(|holder| holder.pid == pid)
+        {
+            Some(holder) => holder.is_live(),
+            None => crate::runner_breadcrumb::pid_is_live(pid),
+        };
+        if live {
+            continue;
+        }
+        lines.push(match std::fs::remove_file(&path) {
+            Ok(()) => format!(
+                "removed {}, a partial cache-lock holder file pid {pid} left when it died",
+                path.display()
+            ),
+            Err(e) => format!(
+                "could not remove {}, a partial cache-lock holder file pid {pid} left: {e}",
+                path.display()
+            ),
+        });
+    }
+    lines
+}
+
 /// Enter the template cache in `template_dir` with `enter` once it is proven
 /// private ([`require_private`]): it holds the binaries the cluster runs and
 /// its superuser password. Marks it used ([`LAST_USED_FILE`]) first.
@@ -1261,7 +1328,7 @@ fn enter_private<T>(
     template_dir: &Path,
     enter: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    require_private(template_dir)?;
+    require_private(template_dir, false)?;
     touch_last_used(template_dir);
     enter()
 }
@@ -1686,7 +1753,7 @@ fn external_schema_error(error: String) -> String {
         "{error}. The canonical schema creates pgcrypto, and vector where the server offers \
          it, for itself, and the harness's template is a copy of template0, so an extension \
          pre-installed in template1 does not reach it: the role {EXTERNAL_URL_ENV} names must \
-         be able to create both extensions"
+         be able to create pgcrypto, and vector where the server offers it"
     )
 }
 
@@ -3060,15 +3127,21 @@ fn private_dir_builder() -> std::fs::DirBuilder {
 ///   it.
 /// - A missing directory is created private, with any parent it lacks, and
 ///   marked as the harness's ([`MADE_MARKER`]).
-/// - An existing one that is already private to this user and carries no mark
-///   is marked now ([`found_private`]): the default location a harness from
-///   before the mark made has none, and opened later it would otherwise only
-///   be refused, although the harness made it.
+/// - An existing one at the DEFAULT location (`!named`) that is already
+///   private to this user and carries no mark is marked now
+///   ([`found_private`]): a harness from before the mark made it and left none,
+///   and opened later it would otherwise only be refused, although the harness
+///   made it. An existing directory [`HARNESS_DIR_ENV`] names is never marked:
+///   the tester made it, and the harness never changes its mode.
 ///
 /// Either way it must then be private ([`require_private`]).
 fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
     if named {
         require_safe_ancestors(dir)?;
+    }
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| hook.borrow_mut().take()) {
+        hook();
     }
     let made = !dir.exists();
     create_private_dir_all(dir).map_err(|e| {
@@ -3080,14 +3153,24 @@ fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
     if named {
         require_safe_ancestors(dir)?;
     }
-    if made || found_private(dir) {
+    if made || (!named && found_private(dir)) {
         mark_made(dir)?;
     }
-    require_private(dir)
+    require_private(dir, named)
+}
+
+// Test seam: run once, by the next `prepare_harness_dir` on this thread,
+// between its first ancestor check and its create, so a test can make an
+// ancestor appear in that window. Compiles to nothing outside `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_ANCESTOR_CHECK_AND_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Mark `dir`, which the harness has just created, or found private to this
-/// user ([`found_private`]), as the harness's own ([`MADE_MARKER`]).
+/// user at the default location ([`found_private`]), as the harness's own
+/// ([`MADE_MARKER`]).
 fn mark_made(dir: &Path) -> Result<(), String> {
     let marker = dir.join(MADE_MARKER);
     std::fs::write(
@@ -3152,19 +3235,21 @@ fn marker_counts(is_file: bool, owner: u32, me: u32) -> bool {
 ///   0700 again;
 /// - one such directory that its group or others can WRITE is refused, not
 ///   chmodded: what they wrote into it while it was open would survive the
-///   chmod. The error says to remove it, after which the harness makes it
-///   again;
-/// - a directory with no mark that counts — one the harness found open rather
-///   than made, such as an existing directory [`HARNESS_DIR_ENV`] names that
-///   others can reach — is never chmodded: the harness does not change the
-///   mode of a directory it did not make;
+///   chmod. For a directory [`HARNESS_DIR_ENV`] names (`named`) the error says
+///   to point it at a directory that does not exist yet, never to remove the
+///   one the tester named; otherwise it says to remove it, after which the
+///   harness makes it again;
+/// - a directory with no mark that counts — such as an existing directory
+///   [`HARNESS_DIR_ENV`] names, which the harness never marks, or one it found
+///   open — is never chmodded: the harness does not change the mode of a
+///   directory it did not make;
 /// - then the directory must be owned by that user and open to no one else
 ///   ([`privacy_problem`]), or the boot fails with an error naming it and the
 ///   remedy.
 ///
 /// Windows is not checked: its access lists are not modes, and the harness
 /// reads none.
-fn require_private(dir: &Path) -> Result<(), String> {
+fn require_private(dir: &Path, named: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -3182,12 +3267,20 @@ fn require_private(dir: &Path) -> Result<(), String> {
         let me = unsafe { libc::geteuid() };
         let (owner, mode) = owner_and_mode(dir)?;
         let made = is_marked(dir, me);
+        let fresh_dir = format!(
+            "point {HARNESS_DIR_ENV} at a directory that does not exist yet, which the \
+             harness then creates"
+        );
         if made && owner == me && mode & 0o022 != 0 {
+            let remedy = if named {
+                fresh_dir.clone()
+            } else {
+                "remove it, and the harness makes it again".to_string()
+            };
             return Err(format!(
                 "{} carries the harness's mark but is writable by its group or others (mode \
                  {:o}), and whatever was written into it while it was open would survive \
-                 making it private again, so the harness does not use it: remove it, and the \
-                 harness makes it again",
+                 making it private again, so the harness does not use it: {remedy}",
                 dir.display(),
                 mode & 0o7777
             ));
@@ -3202,15 +3295,18 @@ fn require_private(dir: &Path) -> Result<(), String> {
             let tried = unchanged
                 .map(|e| format!(" (setting it to 0700 failed: {e})"))
                 .unwrap_or_default();
-            let remedy = if made {
-                "remove it, and the harness makes it again".to_string()
-            } else {
-                format!(
+            let remedy = match (made, named) {
+                (true, false) => "remove it, and the harness makes it again".to_string(),
+                (false, false) => format!(
                     "make it private yourself (chmod 700; the harness changes the mode only \
                      of a directory it made), remove it if it is an old harness directory or \
-                     cache, or point {HARNESS_DIR_ENV} at a directory that does not exist \
-                     yet, which the harness then creates"
-                )
+                     cache, or {fresh_dir}"
+                ),
+                (_, true) => format!(
+                    "make it private yourself (chmod 700; the harness never changes the mode \
+                     of a directory {HARNESS_DIR_ENV} names that it did not make), or \
+                     {fresh_dir}"
+                ),
             };
             return Err(format!(
                 "{} is {problem}{tried}. The harness runs PostgreSQL out of it and keeps a \
@@ -3800,13 +3896,18 @@ mod tests {
 
     const CHILD_MODE_ENV: &str = "QONTINUI_TEST_PG_CHILD";
     const CHILD_REPORT_ENV: &str = "QONTINUI_TEST_PG_CHILD_REPORT";
-    /// How long a child may run. Comfortably above [`LOCK_PATIENCE`]'s bound,
-    /// so a child waiting behind a held cache lock gives up by itself, and says
-    /// why, before it is killed.
+    /// How long a child may take to boot, and then to finish
+    /// ([`run_child_within`]). Comfortably above [`LOCK_PATIENCE`]'s bound, so
+    /// a child that waits behind ONE holder keeping the cache lock past that
+    /// bound gives up by itself, and says why, before it is killed. That is
+    /// all it guarantees: the bound is per holder, so a child behind a queue of
+    /// holders, or one that then builds the cache itself (`initdb` has no
+    /// bound), can still be killed first — and then the failure carries what
+    /// the child said, its "still waiting" lines among it.
     const CHILD_TIMEOUT: Duration = Duration::from_secs(900);
     const _: () = assert!(
         CHILD_TIMEOUT.as_secs() >= LOCK_PATIENCE.give_up.as_secs() + 240,
-        "a child must outlive its own wait for the cache lock"
+        "a child must outlive one holder's hold on the cache lock"
     );
     /// How long a postmaster may take to disappear after its process ended (on
     /// Windows the job's kill lands asynchronously).
@@ -3932,18 +4033,26 @@ mod tests {
         run_child_within(mode, report, harness_dir, CHILD_TIMEOUT)
     }
 
-    /// Run [`child_helper`] in `mode`, its report at `report`, for at most
-    /// `limit`. Its stdout and stderr go to files beside the report, so a
-    /// child that overruns still shows what it said — a lock wait's lines and
-    /// its give-up among them. One that overruns has its process group killed
-    /// and FAILS the test, with that output; its cluster, which `pg_ctl` started
-    /// in a session of its own and so outside that group, is ended first
-    /// ([`ReapChildCluster`]).
+    /// Run [`child_helper`] in `mode`, its report at `report`: for at most
+    /// [`CHILD_TIMEOUT`] until it has booted — it has written its report, the
+    /// boot signal — or exited, and then for at most `after_boot`. Its stdout
+    /// and stderr go to files beside the report, so a child that overruns
+    /// still shows what it said — a lock wait's lines and its give-up among
+    /// them.
+    ///
+    /// One that overruns either phase is killed and FAILS the test, with that
+    /// output. The kill takes its process tree: on Unix its process group,
+    /// which the postmaster `pg_ctl` starts in a session of its own has left;
+    /// on Windows its kill-on-close job, which takes the postmaster with it.
+    /// Either way its cluster is then ended, once proven its, and its root
+    /// removed ([`ReapChildCluster::of_child`]): the one its report names, and
+    /// any root named for its pid in the harness directory, which covers a
+    /// child killed after its postmaster started but before its report.
     fn run_child_within(
         mode: &str,
         report: &Path,
         harness_dir: Option<&Path>,
-        limit: Duration,
+        after_boot: Duration,
     ) -> ChildRun {
         let stdout_path = report.with_extension("stdout");
         let stderr_path = report.with_extension("stderr");
@@ -3972,7 +4081,16 @@ mod tests {
             .spawn()
             .unwrap_or_else(|e| panic!("could not run the {mode} child: {e}"));
         let tree = crate::process_helpers::ChildTreeGuard::attach_armed(&child);
-        wait_for(|| !matches!(child.try_wait(), Ok(None)), limit);
+        let booted = wait_for(
+            || report.is_file() || !matches!(child.try_wait(), Ok(None)),
+            CHILD_TIMEOUT,
+        );
+        let (phase, limit) = if booted {
+            wait_for(|| !matches!(child.try_wait(), Ok(None)), after_boot);
+            ("after booting", after_boot)
+        } else {
+            ("to boot", CHILD_TIMEOUT)
+        };
         match child.try_wait() {
             Ok(Some(status)) => {
                 tree.disarm();
@@ -3986,9 +4104,10 @@ mod tests {
                 drop(tree);
                 let _ = child.kill();
                 let _ = child.wait();
-                let _reap = ReapChildCluster::reported(report);
+                let _reap = ReapChildCluster::of_child(report, pid, harness_dir);
                 panic!(
-                    "the {mode} child (pid {pid}) did not finish within {} s ({outcome:?}):\n{}",
+                    "the {mode} child (pid {pid}) did not finish within {} s {phase} \
+                     ({outcome:?}):\n{}",
                     limit.as_secs(),
                     output()
                 )
@@ -4013,7 +4132,7 @@ mod tests {
     /// self-test ends — above all when it ends in a panic, which is when the
     /// child left them: a red run must not leave a live cluster on a shared or
     /// self-hosted runner. A no-op when both are already gone.
-    struct ReapChildCluster(Option<EmbeddedFacts>);
+    struct ReapChildCluster(Vec<(PathBuf, Option<u32>)>);
 
     impl ReapChildCluster {
         /// Armed with the cluster the child reported, if it reported one: taken
@@ -4024,19 +4143,51 @@ mod tests {
                 std::fs::read_to_string(report)
                     .ok()
                     .as_deref()
-                    .and_then(parse_facts),
+                    .and_then(parse_facts)
+                    .map(|facts| (facts.root, Some(facts.postmaster_pid)))
+                    .into_iter()
+                    .collect(),
             )
+        }
+
+        /// [`Self::reported`], and every root named for the child's `pid` in
+        /// its harness directory (`named_dir`, else the one this process
+        /// resolves, which the child shares): a child killed between its
+        /// postmaster's start and its report leaves a root and a cluster that
+        /// no report names. Only for a child that has been killed and reaped,
+        /// whose roots nothing else owns; each postmaster is still ended only
+        /// once proven a postmaster of that root's data directory.
+        fn of_child(report: &Path, pid: u32, named_dir: Option<&Path>) -> Self {
+            let mut reap = Self::reported(report);
+            let dir = named_dir
+                .map(Path::to_path_buf)
+                .or_else(|| harness_dir().ok().map(|dir| dir.path));
+            let prefix = format!("{RUN_PREFIX}{pid}-");
+            let named: Vec<PathBuf> = dir
+                .and_then(|dir| std::fs::read_dir(dir).ok())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                .map(|entry| entry.path())
+                .collect();
+            for root in named {
+                if !reap.0.iter().any(|(known, _)| same_dir(known, &root)) {
+                    reap.0.push((root, None));
+                }
+            }
+            reap
         }
     }
 
     impl Drop for ReapChildCluster {
         fn drop(&mut self) {
-            if let Some(facts) = self.0.take() {
-                let ended = reap_postmaster(&facts.root, Some(facts.postmaster_pid));
-                let removed = if !facts.root.exists() {
+            for (root, postmaster) in self.0.drain(..) {
+                let ended = reap_postmaster(&root, postmaster);
+                let removed = if !root.exists() {
                     "already gone".to_string()
                 } else {
-                    match remove_dir_all_retrying(&facts.root) {
+                    match remove_dir_all_retrying(&root) {
                         Ok(()) => "removed".to_string(),
                         Err(e) => format!("NOT removed ({e})"),
                     }
@@ -4044,7 +4195,7 @@ mod tests {
                 if std::thread::panicking() {
                     say(format!(
                         "after a failed child-process self-test: {ended}; root {} {removed}",
-                        facts.root.display()
+                        root.display()
                     ));
                 }
             }
@@ -4153,15 +4304,16 @@ mod tests {
     /// A child that overruns its limit FAILS its test with what it said, and
     /// leaves no cluster behind: killing its process group does not reach the
     /// postmaster, which `pg_ctl` starts in a session of its own, so
-    /// [`run_child_within`] ends that cluster before it fails. The parent boots
-    /// the shared harness first, so the child enters a READY cache and boots
-    /// well inside the limit. Unix only: on Windows the child's kill-on-close
-    /// job takes the cluster with it.
+    /// [`run_child_within`] ends that cluster before it fails. The short limit
+    /// starts only once the child has booted (its report is its boot signal),
+    /// so however long it takes to build or enter the bundled cache — it always
+    /// runs on the bundled cluster, whatever server the parent uses — is
+    /// bounded by [`CHILD_TIMEOUT`] alone. Unix only: on Windows the child's
+    /// kill-on-close job takes the cluster with it.
     #[cfg(unix)]
     #[test]
     fn a_child_that_overruns_fails_with_its_output_and_leaves_no_cluster() {
-        const OVERRUN_LIMIT: Duration = Duration::from_secs(60);
-        let _warm = fresh_database_blocking();
+        const OVERRUN_LIMIT: Duration = Duration::from_secs(10);
         let scratch = tempfile::tempdir().expect("scratch directory");
         let report = scratch.path().join("child-report");
         let overran = std::panic::catch_unwind(|| {
@@ -4178,12 +4330,12 @@ mod tests {
             panic!(
                 "the hang child never booted within {} s, so nothing here is proven ({e}):\n\
                  {failure}",
-                OVERRUN_LIMIT.as_secs()
+                CHILD_TIMEOUT.as_secs()
             )
         });
         let facts = parse_facts(&text).expect("the hang child's report");
         assert!(
-            failure.contains("did not finish within")
+            failure.contains("did not finish within 10 s after booting")
                 && failure.contains("--- child stderr ---")
                 && failure.contains("bundled PostgreSQL"),
             "the failure carries what the child said, its boot line among it: {failure}"
@@ -4241,7 +4393,7 @@ mod tests {
             .stderr(output_file);
         // Declared before the child, so dropped after it: killing the child
         // orphans its postmaster, which this then ends.
-        let mut reap = ReapChildCluster(None);
+        let mut reap = ReapChildCluster(Vec::new());
         let mut child = Hanging(command.spawn().expect("spawn the hang child"));
         let output = || {
             format!(
@@ -4257,7 +4409,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("the hang child wrote no report ({e}):\n{}", output()));
         let facts = parse_facts(&text)
             .unwrap_or_else(|| panic!("the child's report is malformed: {text:?}\n{}", output()));
-        reap.0 = Some(facts.clone());
+        reap.0
+            .push((facts.root.clone(), Some(facts.postmaster_pid)));
         #[cfg(target_os = "linux")]
         let (segment, shm_files) = {
             let segment = sysv_segment_of(&facts.data_dir).unwrap_or_else(|| {
@@ -4746,7 +4899,7 @@ mod tests {
         );
 
         assert!(
-            require_private(&dir.join("not-there")).is_err(),
+            require_private(&dir.join("not-there"), false).is_err(),
             "a directory whose mode cannot be read must be refused, not passed over"
         );
 
@@ -4776,7 +4929,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, planted.join(MADE_MARKER))
             .expect("plant the mark as a symlink");
         widen(&planted, 0o755);
-        let refused = require_private(&planted)
+        let refused = require_private(&planted, false)
             .expect_err("a directory whose mark is a symlink is not the harness's");
         assert!(
             refused.contains("chmod 700"),
@@ -4818,6 +4971,100 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700, "it was not made private again");
+    }
+
+    /// An existing directory HARNESS_DIR_ENV names is the tester's, so the
+    /// harness never marks or chmods it: private, it is used and left unmarked;
+    /// opened, it is refused with a remedy that never says to remove it. A
+    /// named directory the harness made is marked, but found writable it too
+    /// is refused without telling the tester to remove what they named.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_named_directory_is_never_marked_or_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|e| panic!("read the mode of {}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .unwrap_or_else(|e| panic!("set the mode of {}: {e}", path.display()));
+        };
+        let scratch = tempfile::tempdir().expect("scratch directory");
+
+        let found = scratch.path().join("the-testers-own");
+        create_private_dir(&found).expect("plant a private directory the tester made");
+        prepare_harness_dir(&found, true).expect("a private named directory is used");
+        assert!(
+            !found.join(MADE_MARKER).exists(),
+            "the harness marked a named directory it did not make"
+        );
+        set_mode(&found, 0o755);
+        let refused = prepare_harness_dir(&found, true)
+            .expect_err("a named directory others can read must be refused");
+        assert_eq!(
+            mode_of(&found),
+            0o755,
+            "the harness chmodded a named directory it did not make"
+        );
+        assert!(
+            refused.contains("chmod 700")
+                && refused.contains(HARNESS_DIR_ENV)
+                && !refused.contains("remove it"),
+            "the remedy names chmod and a fresh directory, never removal: {refused}"
+        );
+
+        let made = scratch.path().join("made-by-the-harness");
+        prepare_harness_dir(&made, true).expect("a missing named directory is created");
+        assert!(
+            made.join(MADE_MARKER).is_file(),
+            "a directory it made is marked"
+        );
+        set_mode(&made, 0o775);
+        let refused = prepare_harness_dir(&made, true)
+            .expect_err("a marked named directory others can write must be refused");
+        assert_eq!(mode_of(&made), 0o775, "it was chmodded, not refused");
+        assert!(
+            refused.contains("does not exist yet") && !refused.contains("remove it"),
+            "the remedy points at a fresh directory, never at removing the named one: \
+             {refused}"
+        );
+    }
+
+    /// An ancestor that comes into being between the ancestor check and the
+    /// create — another user squatting a missing parent — is judged by the
+    /// second check after the create, and refuses the boot. The window is
+    /// opened by a test-only seam (`BETWEEN_ANCESTOR_CHECK_AND_CREATE`),
+    /// which here makes the missing parent, open to others (0757).
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_that_appears_between_the_check_and_the_create_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let parent = scratch.path().join("appears");
+        let named = parent.join("qontinui-test-pg");
+        let squat = parent.clone();
+        BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::create_dir(&squat).expect("make the parent in the window");
+                std::fs::set_permissions(&squat, std::fs::Permissions::from_mode(0o757))
+                    .expect("open it to others");
+            }));
+        });
+        let refused = prepare_harness_dir(&named, true);
+        assert!(
+            BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| hook.borrow().is_none()),
+            "the seam did not run, so the window was never opened"
+        );
+        let refused = refused.expect_err("an ancestor that appeared in the window must fail");
+        assert!(
+            refused.contains(&format!("its ancestor {} is", parent.display()))
+                && refused.contains("not sticky"),
+            "the error names the ancestor that appeared: {refused}"
+        );
     }
 
     /// Only a regular file this user owns is the harness's mark: not a symlink
@@ -5239,6 +5486,192 @@ mod tests {
             "the taker of an exclusive lock names itself, building its key: {taker:?}"
         );
         let _ = waiter.unlock();
+    }
+
+    /// A named holder that dies while the lock stays held — by another shared
+    /// holder, or one that never named itself — is re-judged at the next
+    /// progress line, and from then on is named as a process that has not
+    /// named itself, its clock restarted; the file's text never changed. Run
+    /// on paused time; the holder is a `sleep` this test kills as the first
+    /// line is said. Unix only, for `sleep`.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_named_holder_that_dies_while_the_lock_is_held_becomes_unnamed() {
+        struct Sleeper(Option<std::process::Child>);
+        impl Sleeper {
+            fn end(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        impl Drop for Sleeper {
+            fn drop(&mut self) {
+                self.end();
+            }
+        }
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let template_dir = scratch.path().join(format!("{TEMPLATE_PREFIX}waiting"));
+        let waiter = open_lock(scratch.path()).expect("the cache lock");
+        let holder = open_lock(scratch.path()).expect("another descriptor on the cache lock");
+        holder
+            .lock_shared()
+            .expect("hold the lock, as a holder that never named itself would");
+
+        let mut sleeper = Sleeper(Some(
+            std::process::Command::new("sleep")
+                .arg("3600")
+                .spawn()
+                .expect("spawn the named holder"),
+        ));
+        let pid = sleeper.0.as_ref().map(std::process::Child::id).unwrap_or(0);
+        let named = LockHolder {
+            pid,
+            pid_ns: own_pid_namespace().map(str::to_owned),
+            started: process_start(pid),
+            key: "short-lived".to_string(),
+            action: "entering".to_string(),
+        };
+        assert!(
+            named.is_live(),
+            "the named holder must be live to begin with"
+        );
+        std::fs::write(scratch.path().join(LOCK_HOLDER_FILE), named.render())
+            .expect("name the holder");
+
+        let mut lines: Vec<String> = Vec::new();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(7200),
+            take_cache_lock(
+                &waiter,
+                true,
+                &template_dir,
+                LockPatience {
+                    give_up: Duration::from_secs(300),
+                    ..LOCK_PATIENCE
+                },
+                |line| {
+                    if lines.is_empty() {
+                        sleeper.end();
+                    }
+                    lines.push(line);
+                },
+            ),
+        )
+        .await
+        .expect("the wait must give up by itself, not hang")
+        .expect_err("a lock nobody lets go of must fail the boot");
+
+        let first = format!("held by pid {pid} (entering short-lived)");
+        let unnamed = "held by a process that has not named itself";
+        assert!(
+            lines.first().is_some_and(|line| line.contains(&first)),
+            "the first line names the live holder: {lines:?}"
+        );
+        assert!(
+            lines.len() > 1 && lines.iter().skip(1).all(|line| line.contains(unnamed)),
+            "from the next line on, the dead holder is unnamed: {lines:?}"
+        );
+        assert!(
+            lines
+                .get(1)
+                .is_some_and(|line| line.contains(&format!("{unnamed} for 0 s"))),
+            "its clock restarts when it becomes unnamed: {lines:?}"
+        );
+        assert!(
+            refused.contains(&format!("{unnamed} for 300 s")),
+            "the give-up names the unnamed holder: {refused}"
+        );
+        drop(holder);
+    }
+
+    /// The process that takes the cache lock removes the partial holder files
+    /// processes no longer live left behind — judged by the record in the file
+    /// where it reads as one, else by the pid in its name — and never a live
+    /// process's, which may be mid-write.
+    #[tokio::test]
+    async fn a_lock_taker_sweeps_only_dead_processes_partial_holder_files() {
+        let gone = || {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("this test binary"))
+                    .args(["--list", "--exact", "no-such-test"])
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn a process that exits at once");
+            child.wait().expect("reap it");
+            child.id()
+        };
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path();
+        let partial = |pid: u32, nonce: &str| dir.join(format!("{LOCK_HOLDER_FILE}.{pid}-{nonce}"));
+        let record = |pid: u32| {
+            LockHolder {
+                pid,
+                ..LockHolder::this_process("partial", "building")
+            }
+            .render()
+        };
+
+        let dead_recorded = partial(gone(), "a");
+        let dead_cut_short = partial(gone(), "b");
+        let own = partial(std::process::id(), "c");
+        let live_cut_short = partial(a_live_pid_not_ours(), "d");
+        std::fs::write(&dead_recorded, record(gone_pid_of(&dead_recorded))).expect("plant");
+        std::fs::write(&dead_cut_short, "pid=").expect("plant");
+        std::fs::write(&own, record(std::process::id())).expect("plant");
+        std::fs::write(&live_cut_short, "").expect("plant");
+        std::fs::write(dir.join(LOCK_HOLDER_FILE), record(std::process::id())).expect("plant");
+
+        let lock = open_lock(dir).expect("the cache lock");
+        let mut lines = Vec::new();
+        take_cache_lock(
+            &lock,
+            true,
+            &dir.join(format!("{TEMPLATE_PREFIX}sweeping")),
+            LOCK_PATIENCE,
+            |line| lines.push(line),
+        )
+        .await
+        .expect("an uncontested lock is taken");
+        let _ = lock.unlock();
+
+        for removed in [&dead_recorded, &dead_cut_short] {
+            assert!(
+                !removed.exists(),
+                "a dead process's partial holder file {} survived: {lines:?}",
+                removed.display()
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&removed.display().to_string())),
+                "its removal was not said: {lines:?}"
+            );
+        }
+        for kept in [&own, &live_cut_short] {
+            assert!(
+                kept.exists(),
+                "a live process's partial holder file {} was removed",
+                kept.display()
+            );
+        }
+        assert!(
+            dir.join(LOCK_HOLDER_FILE).is_file(),
+            "the holder file itself is not a partial"
+        );
+    }
+
+    /// The pid in a partial holder file's name.
+    fn gone_pid_of(partial: &Path) -> u32 {
+        partial
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(&format!("{LOCK_HOLDER_FILE}.")))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse().ok())
+            .expect("a partial holder file's name carries a pid")
     }
 
     static PANICKING_TEMPLATE: DerivedTemplate =
