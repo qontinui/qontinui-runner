@@ -1110,6 +1110,12 @@ pub struct AccountUsageInfo {
     /// `"probe"` (Haiku header probe fallback).
     #[serde(default)]
     pub source: Option<String>,
+    /// Lowercase hex SHA-256 of the account's `oauthAccount.accountUuid`
+    /// ([`account_hash_for`]): the one identity equal across devices and
+    /// config-dir names for the same Claude account. `None` when no identity
+    /// was readable, which is UNKNOWN and never equal to another `None`.
+    #[serde(default)]
+    pub account_hash: Option<String>,
 }
 
 /// One per-model scoped weekly limit, mirrored to the frontend.
@@ -1244,6 +1250,64 @@ fn account_label(config_dir: &str) -> String {
         .unwrap_or_else(|| config_dir.to_string())
 }
 
+/// The account identity of a Claude config dir: lowercase hex SHA-256 of its
+/// `.claude.json` `oauthAccount.accountUuid`, trimmed and lowercased first.
+///
+/// `.claude.json` is resolved as:
+/// 1. `<config_dir>/.claude.json` — the `CLAUDE_CONFIG_DIR` layout, which every
+///    session the runner spawns uses (it pins `CLAUDE_CONFIG_DIR`).
+/// 2. Only when (1) is absent AND `config_dir` is the user's default home
+///    (`<home>/.claude`, compared as paths): `<home>/.claude.json`, where Claude
+///    Code keeps its global config when `CLAUDE_CONFIG_DIR` is unset.
+///
+/// `home` is the user's home dir (`dirs::home_dir()` at the call site). Returns
+/// `None` on any read or parse failure, or when no uuid is recorded: the home
+/// is not logged in, or its identity is unreadable. Never errors.
+pub(crate) fn account_hash_for(config_dir: &str, home: Option<&std::path::Path>) -> Option<String> {
+    use crate::claude_session::workspace_trust::CONFIG_FILE;
+    use sha2::{Digest, Sha256};
+
+    // Only the one field is deserialized: `.claude.json` also carries the CLI's
+    // whole per-project history and can run to megabytes.
+    #[derive(Deserialize)]
+    struct ClaudeJson {
+        #[serde(rename = "oauthAccount")]
+        oauth_account: Option<OauthAccount>,
+    }
+    #[derive(Deserialize)]
+    struct OauthAccount {
+        #[serde(rename = "accountUuid")]
+        account_uuid: Option<serde_json::Value>,
+    }
+
+    let dir = std::path::Path::new(config_dir);
+    let dir_local = dir.join(CONFIG_FILE);
+    let content = match std::fs::read_to_string(&dir_local) {
+        Ok(content) => content,
+        // Fallback only when the dir's own file is ABSENT — an unreadable one
+        // is an unknown identity, not a reason to borrow another file's.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let home = home?;
+            if dir != home.join(".claude") {
+                return None;
+            }
+            std::fs::read_to_string(home.join(CONFIG_FILE)).ok()?
+        }
+        Err(_) => return None,
+    };
+    let parsed: ClaudeJson = serde_json::from_str(&content).ok()?;
+    let uuid = parsed
+        .oauth_account?
+        .account_uuid?
+        .as_str()?
+        .trim()
+        .to_lowercase();
+    if uuid.is_empty() {
+        return None;
+    }
+    Some(hex::encode(Sha256::digest(uuid.as_bytes())))
+}
+
 /// Probe a single account for its weekly rate limit utilization.
 ///
 /// Reads through a shared single-flight + TTL cache
@@ -1265,16 +1329,27 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
     // outlives the switch.
     if crate::model_gateway::gateway_declared() {
         let label = account_label(&config_dir);
+        let account_hash = account_hash_for(&config_dir, dirs::home_dir().as_deref());
         return AccountUsageInfo {
             config_dir,
             label,
             error: Some(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string()),
+            account_hash,
             ..Default::default()
         };
     }
     let key = config_dir.clone();
     USAGE_PROBE_CACHE
-        .get_or_fetch(&key, move || probe_account_usage_uncached(config_dir))
+        .get_or_fetch(&key, move || async move {
+            // Identity is read here, after the probe, so every return path of
+            // the probe (token error, probe error, success) carries it: an
+            // errored row is exactly the one a consumer must collapse onto its
+            // healthy twin on another device.
+            let hash_dir = config_dir.clone();
+            let mut info = probe_account_usage_uncached(config_dir).await;
+            info.account_hash = account_hash_for(&hash_dir, dirs::home_dir().as_deref());
+            info
+        })
         .await
 }
 
@@ -1374,6 +1449,8 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
                         })
                         .collect(),
                     source: Some("oauth_usage".to_string()),
+                    // Filled by `probe_account_usage`'s cached closure.
+                    account_hash: None,
                 };
             }
             Err(e) => {
@@ -1805,8 +1882,9 @@ mod usage_twin_report {
     use tracing::{debug, warn};
 
     /// Wire shape — SHARED CONTRACT with coord's
-    /// `POST /coord/claude-accounts/usage` ingest. Account identity is the
-    /// config-dir basename (label), never the full local path. Utilizations
+    /// `POST /coord/claude-accounts/usage` ingest. The row's display name is
+    /// the config-dir basename (label), never the full local path; the
+    /// cross-device account identity is `account_hash`. Utilizations
     /// are 0.0–1.0 fractions; reset times unix seconds.
     #[derive(Serialize)]
     struct WireAccount<'a> {
@@ -1835,6 +1913,12 @@ mod usage_twin_report {
         /// which one runs?". At most one account is `true`; all-`false` is a
         /// legitimate state (no dir resolved yet on this machine).
         is_active: bool,
+        /// Lowercase hex SHA-256 of the account's `oauthAccount.accountUuid`
+        /// ([`super::account_hash_for`]): the identity equal across devices
+        /// and config-dir names, which `label` is not. `null` when the home's
+        /// identity was unreadable — UNKNOWN, never equal to another `null`.
+        /// Coord's ingest stores it as the launch-budget usage-history key.
+        account_hash: Option<&'a str>,
     }
 
     /// One prepaid provider balance — SHARED CONTRACT with coord's
@@ -1949,6 +2033,7 @@ mod usage_twin_report {
                     error: r.error.is_some(),
                     status: r.status.as_deref(),
                     is_active: active_dirs.contains(&r.config_dir),
+                    account_hash: r.account_hash.as_deref(),
                 })
                 .collect(),
             prepaid: prepaid.iter().map(WirePrepaid::from_info).collect(),
@@ -2085,6 +2170,7 @@ mod usage_twin_report {
         /// data loss (serde drops unknown keys on the ingest side). Pin them.
         #[test]
         fn wire_body_key_names_are_the_shared_contract() {
+            const HASH: &str = "5f0c4a0b4d1e4ad0b2b8b1c1d0e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9";
             let limits: Vec<super::super::ModelLimitInfo> = Vec::new();
             let body = WireBody {
                 accounts: vec![WireAccount {
@@ -2099,6 +2185,7 @@ mod usage_twin_report {
                     error: false,
                     status: None,
                     is_active: true,
+                    account_hash: Some(HASH),
                 }],
                 prepaid: Vec::new(),
                 account_selection_mode: "least_usage",
@@ -2118,6 +2205,8 @@ mod usage_twin_report {
                 acct.get("config_dir").is_none(),
                 "the wire must never carry a local path"
             );
+            // coord's `WireAccount::account_hash` reads exactly this key.
+            assert_eq!(acct["account_hash"], serde_json::json!(HASH));
         }
 
         /// An expired credential against coord's uniform
@@ -2172,6 +2261,7 @@ mod usage_twin_report {
             let row = |label: &str| crate::commands::ai_settings::AccountUsageInfo {
                 config_dir: format!("/x/{label}"),
                 label: label.into(),
+                account_hash: Some(format!("hash-of-{label}")),
                 ..Default::default()
             };
             let rows = [
@@ -2193,6 +2283,11 @@ mod usage_twin_report {
                 "only the bare-name row is sent: {accounts:?}"
             );
             assert_eq!(accounts[0]["label"], serde_json::json!(".claude-silent"));
+            assert_eq!(
+                accounts[0]["account_hash"],
+                serde_json::json!("hash-of-.claude-silent"),
+                "the row's identity rides the report"
+            );
             assert!(
                 accounts[0].get("status").is_none(),
                 "no status means no key: {}",
@@ -2218,12 +2313,16 @@ mod usage_twin_report {
                     error: true,
                     status: None,
                     is_active: false,
+                    account_hash: None,
                 }],
                 prepaid: Vec::new(),
                 account_selection_mode: "manual",
             };
             let v = serde_json::to_value(&body).expect("serializes");
             assert_eq!(v["accounts"][0]["is_active"], serde_json::json!(false));
+            // An unreadable identity is sent as an explicit `null` (UNKNOWN),
+            // not dropped.
+            assert_eq!(v["accounts"][0]["account_hash"], serde_json::Value::Null);
             assert_eq!(v["account_selection_mode"], serde_json::json!("manual"));
         }
 
@@ -3578,5 +3677,146 @@ mod exhaustion_tests {
     fn rejected_status_is_exhausted() {
         assert!(probe_result_exhausted(&usage(0.50, Some("rejected"), None)));
         assert!(probe_result_exhausted(&usage(0.50, Some("BLOCKED"), None)));
+    }
+}
+
+#[cfg(test)]
+mod account_hash_tests {
+    use super::account_hash_for;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+
+    const UUID: &str = "5BB69DD9-1234-4ABC-8DEF-0123456789AB";
+
+    fn write_identity(path: &Path, uuid: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::json!({"oauthAccount": {"accountUuid": uuid}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn expected(uuid: &str) -> String {
+        hex::encode(Sha256::digest(uuid.trim().to_lowercase().as_bytes()))
+    }
+
+    #[test]
+    fn hash_is_lowercase_64_hex_of_the_trimmed_lowercased_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude-a");
+        write_identity(&dir.join(".claude.json"), &format!("  {UUID}\n"));
+
+        let h = account_hash_for(dir.to_str().unwrap(), None).expect("hash");
+        assert_eq!(h.len(), 64);
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert_eq!(h, expected(UUID));
+        assert_eq!(
+            h,
+            hex::encode(Sha256::digest(UUID.to_lowercase().as_bytes()))
+        );
+    }
+
+    #[test]
+    fn two_dirs_signed_into_one_account_hash_equal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join(".claude-gmail");
+        let b = tmp.path().join("elsewhere").join(".claude");
+        write_identity(&a.join(".claude.json"), UUID);
+        write_identity(&b.join(".claude.json"), &UUID.to_lowercase());
+        let c = tmp.path().join(".claude-other");
+        write_identity(
+            &c.join(".claude.json"),
+            "00000000-0000-4000-8000-000000000000",
+        );
+
+        let ha = account_hash_for(a.to_str().unwrap(), None).unwrap();
+        let hb = account_hash_for(b.to_str().unwrap(), None).unwrap();
+        let hc = account_hash_for(c.to_str().unwrap(), None).unwrap();
+        assert_eq!(ha, hb, "one account, two dir names, one key");
+        assert_ne!(ha, hc, "different accounts, different keys");
+    }
+
+    #[test]
+    fn dir_local_file_wins_over_the_default_home_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let default_home = home.join(".claude");
+        write_identity(&default_home.join(".claude.json"), UUID);
+        write_identity(
+            &home.join(".claude.json"),
+            "11111111-1111-4111-8111-111111111111",
+        );
+
+        assert_eq!(
+            account_hash_for(default_home.to_str().unwrap(), Some(home)),
+            Some(expected(UUID))
+        );
+    }
+
+    #[test]
+    fn default_home_falls_back_to_the_home_level_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let default_home = home.join(".claude");
+        std::fs::create_dir_all(&default_home).unwrap();
+        write_identity(&home.join(".claude.json"), UUID);
+
+        assert_eq!(
+            account_hash_for(default_home.to_str().unwrap(), Some(home)),
+            Some(expected(UUID))
+        );
+        // Compared as paths, not strings: a trailing separator is the same dir.
+        let with_sep = format!("{}/", default_home.to_str().unwrap());
+        assert_eq!(
+            account_hash_for(&with_sep, Some(home)),
+            Some(expected(UUID))
+        );
+        // No home known: no fallback.
+        assert_eq!(account_hash_for(default_home.to_str().unwrap(), None), None);
+    }
+
+    #[test]
+    fn a_non_default_home_never_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_identity(&home.join(".claude.json"), UUID);
+        // `C:/claude/.claude-x`-style homes and any other dir under home.
+        for dir in [
+            home.join(".claude-x"),
+            home.join("claude").join(".claude-x"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            assert_eq!(
+                account_hash_for(dir.to_str().unwrap(), Some(home)),
+                None,
+                "{} must not borrow the default home's identity",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_invalid_or_logged_out_identity_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude-a");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(".claude.json");
+        let d = dir.to_str().unwrap();
+
+        assert_eq!(account_hash_for(d, None), None, "no file");
+        for body in [
+            "not json",
+            "{}",
+            r#"{"oauthAccount":null}"#,
+            r#"{"oauthAccount":{}}"#,
+            r#"{"oauthAccount":{"accountUuid":42}}"#,
+            r#"{"oauthAccount":{"accountUuid":"   "}}"#,
+        ] {
+            std::fs::write(&file, body).unwrap();
+            assert_eq!(account_hash_for(d, None), None, "{body}");
+        }
     }
 }
