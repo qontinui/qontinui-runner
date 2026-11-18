@@ -40,7 +40,11 @@ import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useTenant } from "@/contexts/TenantContext";
-import { PendingSignInNotice, isSignInCancelled } from "@/components/PendingSignInNotice";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 
 import {
   applyCredentialDarkSignal,
@@ -543,6 +547,7 @@ export function WebIntegrationAuthBanner() {
             ) : null}
             <PendingSignInNotice
               active={presentation.ctaAction === "cognito_sign_in" && authorizing}
+              noBrowserHint={NO_BROWSER_HINT.settings}
             />
           </div>
           {presentation.showSwitchTenant && tenantSwitcherOpen ? (
@@ -760,7 +765,7 @@ export function WebIntegrationAuthBanner() {
               <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
             </>
           ) : null}
-          <PendingSignInNotice active={authorizing} />
+          <PendingSignInNotice active={authorizing} noBrowserHint={NO_BROWSER_HINT.settings} />
         </div>
       </div>
       <button

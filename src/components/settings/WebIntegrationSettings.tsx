@@ -38,7 +38,11 @@ import {
   ChevronRight,
   ExternalLink,
 } from "lucide-react";
-import { PendingSignInNotice, isSignInCancelled } from "@/components/PendingSignInNotice";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 import { SectionHeader } from "./SectionHeader";
 import { EgressPrivacyPanel } from "./EgressPrivacyPanel";
 import type { LogFunction } from "./types";
@@ -1191,7 +1195,10 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
                 device is connected.
               </p>
             )}
-            <PendingSignInNotice active={connecting} />
+            <PendingSignInNotice
+              active={connecting}
+              noBrowserHint={NO_BROWSER_HINT.backendConnection}
+            />
             {connectError && (
               <p className="text-[11px] text-destructive flex items-center gap-1">
                 <AlertTriangle className="w-3 h-3 shrink-0" /> {truncate(connectError, 140)}

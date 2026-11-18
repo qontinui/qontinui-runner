@@ -1230,7 +1230,15 @@ async fn cognito_sign_in_impl(
     .map_err(|e| {
         // Most common cause: a prior sign-in leaked the fixed loopback port
         // (BUG 1, now fixed) so the bind fails with os error 10048.
-        error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+        // A user's Cancel, or a newer attempt superseding this one, is not a
+        // failure: keep it out of the error log.
+        if e == qontinui_runner_lib::cognito::SIGN_IN_CANCELLED
+            || e == qontinui_runner_lib::cognito::SIGN_IN_SUPERSEDED
+        {
+            info!("cognito_sign_in: {e}");
+        } else {
+            error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+        }
         AppError::Raw(e)
     })?;
 

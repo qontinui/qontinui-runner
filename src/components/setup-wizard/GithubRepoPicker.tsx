@@ -3,7 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { PendingSignInNotice, isSignInCancelled } from "@/components/PendingSignInNotice";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 import {
   FolderOpen,
   Search,
@@ -462,7 +466,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
             <SignInButton signingIn={signingIn} onSignIn={signIn} />
           )}
         </div>
-        <PendingSignInNotice active={signingIn} />
+        <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
         {signInError && (
           <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
         )}
@@ -484,7 +488,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
           </div>
         </div>
         <SignInButton signingIn={signingIn} onSignIn={signIn} />
-        <PendingSignInNotice active={signingIn} />
+        <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
         {signInError && (
           <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
         )}

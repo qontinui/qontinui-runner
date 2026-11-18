@@ -64,7 +64,28 @@ export function shouldShowPendingSignIn(pending: PendingSignIn | null, nowUnix: 
   );
 }
 
-export function PendingSignInNotice({ active }: { active: boolean }) {
+/**
+ * The no-browser door each place that renders the notice can actually reach.
+ * The sign-in screen and the setup wizard own the whole viewport, so Settings
+ * is out of reach there.
+ */
+export const NO_BROWSER_HINT = {
+  loginScreen: "Cancel, then use the email-and-password form on this screen. It needs no browser.",
+  settings:
+    "Cancel, then redeem a pair code under Settings → Backend Connection. It needs no browser.",
+  backendConnection: "Cancel, then redeem a pair code in the section below. It needs no browser.",
+  setupWizard:
+    "Cancel, then pair from a shell on this box with `qontinui_profile device pair --pair-code <CODE>`. It needs no browser.",
+} as const;
+
+export function PendingSignInNotice({
+  active,
+  noBrowserHint,
+}: {
+  active: boolean;
+  /** The no-browser door reachable from where this notice renders ({@link NO_BROWSER_HINT}). */
+  noBrowserHint: string;
+}) {
   const [pending, setPending] = useState<PendingSignIn | null>(null);
   const [copied, setCopied] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -165,10 +186,7 @@ export function PendingSignInNotice({ active }: { active: boolean }) {
           Cancel
         </button>
       </div>
-      <div style={{ opacity: 0.75 }}>
-        No browser to use? Cancel, then sign in with your email and password on the sign-in screen,
-        or redeem a pair code under Settings → Backend Connection. Neither needs a browser.
-      </div>
+      <div style={{ opacity: 0.75 }}>No browser to use? {noBrowserHint}</div>
       <div style={{ opacity: 0.75 }}>
         If the browser is on another machine, forward the callback port first:{" "}
         <code>{sshForwardHint(pending.callbackPort)}</code>
