@@ -6358,9 +6358,9 @@ pub(crate) const MISSING_DEVICE_MACHINE_KEY: &str = "no_device_machine_key";
 /// store could not be read. An UNKNOWN never produces a token.
 ///
 /// Whether a browser can be opened is deliberately NOT probed here: a launcher
-/// on PATH proves nothing (on 2026-11-15 `gio` was present and failed), so the
-/// signal is the launch failure itself, which the pending sign-in records
-/// (`cognito::pending_sign_in`).
+/// on PATH does not prove a browser will open (on a display with no registered
+/// browser it fails anyway), so the signal is the launch result itself, which
+/// the pending sign-in records (`cognito::pending_sign_in`).
 ///
 /// Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
 /// P2.1 (the tokens on `unrefreshable`) and P2.3 (the warning while the
