@@ -19390,11 +19390,6 @@ mod coord_mcp_body_gate_tests {
         );
     }
 
-    /// The agent escalate-evidence door and the ten device-floor names found
-    /// beside it (see [`COORD_MCP_ALLOWED_TOOLS`]'s note) must be forwarded,
-    /// while the operator escape hatch for the same block stays withheld. A
-    /// literal enumeration, so dropping any one name — or moving the operator
-    /// attest onto the allowlist — reds this test by name.
     /// `coord_child_slot` (coord plan
     /// `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`
     /// Phase 3) is on coord's device floor and must be forwarded: a session
@@ -19419,6 +19414,11 @@ mod coord_mcp_body_gate_tests {
         );
     }
 
+    /// The agent escalate-evidence door and the ten device-floor names found
+    /// beside it (see [`COORD_MCP_ALLOWED_TOOLS`]'s note) must be forwarded,
+    /// while the operator escape hatch for the same block stays withheld. A
+    /// literal enumeration, so dropping any one name — or moving the operator
+    /// attest onto the allowlist — reds this test by name.
     #[test]
     fn escalate_evidence_door_and_device_floor_drift_are_forwarded() {
         for tool in [
