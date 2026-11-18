@@ -62,6 +62,9 @@ use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
+mod identity_cas;
+pub use identity_cas::IdentityCas;
+
 /// The runner's own app-data root, `~/.qontinui/runner`, keeping the existing
 /// "." fallback for a home-less environment. Base for the instance-scoped
 /// path helpers below.
@@ -498,6 +501,9 @@ pub struct SessionIdentityUpdate {
     pub task_run_id: Option<String>,
     /// Whether this session runs with provider permissions bypassed.
     pub bypass_permissions: Option<bool>,
+    /// The account root the live process runs under, from pid-exact evidence
+    /// (the pane's own provider row — `session::reconcile::config_dir_repair`).
+    pub config_dir: Option<String>,
 }
 
 impl SessionIdentityUpdate {
@@ -511,6 +517,7 @@ impl SessionIdentityUpdate {
             && self.tenant_id.is_none()
             && self.task_run_id.is_none()
             && self.bypass_permissions.is_none()
+            && self.config_dir.is_none()
     }
 
     /// Normalize every empty/whitespace-only string to `None` so the sticky
@@ -524,6 +531,7 @@ impl SessionIdentityUpdate {
             tenant_id: non_empty(self.tenant_id),
             task_run_id: non_empty(self.task_run_id),
             bypass_permissions: self.bypass_permissions,
+            config_dir: non_empty(self.config_dir),
         }
     }
 
@@ -546,6 +554,7 @@ impl SessionIdentityUpdate {
         sticky!(tenant_id);
         sticky!(task_run_id);
         sticky!(bypass_permissions);
+        sticky!(config_dir);
         changed
     }
 }

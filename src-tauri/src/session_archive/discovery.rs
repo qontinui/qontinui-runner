@@ -100,18 +100,26 @@ pub fn is_default_config_home(config_dir: &str, home_dir: Option<&Path>) -> bool
     let Some(home) = home_dir else {
         return false;
     };
-    let norm = |p: &str| {
-        let p = p.replace('\\', "/").trim_end_matches('/').to_string();
-        if cfg!(windows) {
-            p.to_lowercase()
-        } else {
-            p
-        }
-    };
     let default_home = home.join(".claude");
     default_home
         .to_str()
-        .is_some_and(|d| norm(d) == norm(config_dir.trim()))
+        .is_some_and(|d| config_dir_compare_key(d) == config_dir_compare_key(config_dir))
+}
+
+/// The form two spellings of one config dir share, for comparing them:
+/// trimmed, backslashes folded to `/`, any trailing slash dropped, and lowercased on
+/// Windows only, where the filesystem folds case. Never a path to open.
+///
+/// The one rule for "is this the same account root?" — the default-home test
+/// above and the session reconcile's config-dir choice and repair all use it.
+pub fn config_dir_compare_key(config_dir: &str) -> String {
+    let p = config_dir.trim().replace('\\', "/");
+    let p = p.trim_end_matches('/');
+    if cfg!(windows) {
+        p.to_lowercase()
+    } else {
+        p.to_string()
+    }
 }
 
 /// [`is_default_config_home`] against this machine's home dir.
