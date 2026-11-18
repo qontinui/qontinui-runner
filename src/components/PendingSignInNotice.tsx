@@ -21,6 +21,7 @@ import { createLogger } from "@/lib/logger";
 
 /** Wire shape of `cognito_pending_sign_in` (Rust `cognito::PendingSignIn`). */
 export interface PendingSignIn {
+  attemptId: number;
   authorizeUrl: string;
   browserLaunchError: string | null;
   callbackPort: number;
@@ -40,9 +41,27 @@ export function sshForwardHint(callbackPort: number): string {
   return `ssh -L ${callbackPort}:127.0.0.1:${callbackPort} <this-box>`;
 }
 
-/** Whether the notice has anything to show for `pending`. */
-export function shouldShowPendingSignIn(pending: PendingSignIn | null): boolean {
-  return pending !== null && pending.browserLaunchError !== null;
+/**
+ * How long a sign-in may wait with no launch error before the URL is shown
+ * anyway: a launcher that hangs, or exits 0 onto a display nobody watches,
+ * reports no error at all.
+ */
+export const LAUNCH_GRACE_SECS = 8;
+
+/** The error a user's own Cancel makes `cognito_sign_in` return (Rust `cognito::SIGN_IN_CANCELLED`). */
+export const SIGN_IN_CANCELLED = "sign-in cancelled";
+
+/** Whether a `cognito_sign_in` rejection is the user's own Cancel, not a failure to show. */
+export function isSignInCancelled(err: unknown): boolean {
+  return String(err) === SIGN_IN_CANCELLED;
+}
+
+/** Whether the notice has anything to show for `pending` at `nowUnix`. */
+export function shouldShowPendingSignIn(pending: PendingSignIn | null, nowUnix: number): boolean {
+  if (pending === null) return false;
+  return (
+    pending.browserLaunchError !== null || nowUnix - pending.startedAtUnix >= LAUNCH_GRACE_SECS
+  );
 }
 
 export function PendingSignInNotice({ active }: { active: boolean }) {
@@ -73,7 +92,7 @@ export function PendingSignInNotice({ active }: { active: boolean }) {
     };
   }, [active]);
 
-  if (!active || !shouldShowPendingSignIn(pending) || pending === null) {
+  if (!active || pending === null || !shouldShowPendingSignIn(pending, Date.now() / 1000)) {
     return null;
   }
 
@@ -89,7 +108,7 @@ export function PendingSignInNotice({ active }: { active: boolean }) {
   const handleCancel = async () => {
     setCancelling(true);
     try {
-      await invoke<boolean>("cognito_cancel_sign_in");
+      await invoke<boolean>("cognito_cancel_sign_in", { attemptId: pending.attemptId });
     } catch (err) {
       log.error("cognito_cancel_sign_in failed:", err);
     } finally {
@@ -111,8 +130,10 @@ export function PendingSignInNotice({ active }: { active: boolean }) {
       }}
     >
       <div>
-        The runner could not open a browser ({pending.browserLaunchError}). Open this URL in a
-        browser to finish signing in:
+        {pending.browserLaunchError !== null
+          ? `The runner could not open a browser (${pending.browserLaunchError}).`
+          : "Browser didn't open?"}{" "}
+        Open this URL in a browser to finish signing in:
       </div>
       <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
         <input
