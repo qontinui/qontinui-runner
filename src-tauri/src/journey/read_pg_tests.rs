@@ -23,8 +23,9 @@
 //!
 //! (f) compares answers through `test_fixtures::verdict`, which reads each
 //! conclusion by identity — which nodes, edges, dead ends and reached nodes an
-//! answer lists, with the fields that describe them — and reads no count, since
-//! a grouped read counts each group once. An older group never adds a node or
+//! answer lists, each with a named few of the fields that describe it (its own
+//! doc lists them, and the describing fields it leaves out) — and reads no
+//! count, since a grouped read counts each group once. An older group never adds a node or
 //! an edge: the filter excludes it first, so it shows in (f) only through the
 //! doubt it leaves, such as an arrival whose destination is unknown.
 
