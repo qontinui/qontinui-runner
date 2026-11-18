@@ -201,6 +201,23 @@ async fn an_unreadable_transcript_keeps_the_pending_park() {
 }
 
 #[tokio::test]
+async fn an_unreadable_transcript_on_an_exhausted_account_keeps_the_pending_park() {
+    let mut env = Fake::new(LimitStopRead::Unreadable("cannot open transcript".to_string()));
+    env.auto_migrate = false;
+    env.known_exhausted = true;
+    env.roster = vec![AccountUsageInfo {
+        config_dir: SRC.to_string(),
+        utilization: 1.0,
+        ..Default::default()
+    }];
+    env.own = env.roster[0].clone();
+    run_hint(&env, SRC).await;
+    let calls = env.calls();
+    assert_eq!(calls.skips, vec![SkipReason::MigrateDisabled]);
+    assert_eq!(calls.forgets, 0);
+}
+
+#[tokio::test]
 async fn a_stop_not_yet_reset_is_parked_not_skipped() {
     let env = Fake::new(LimitStopRead::Stopped(stop(Some(NOW + 600_000))));
     run_hint(&env, SRC).await;

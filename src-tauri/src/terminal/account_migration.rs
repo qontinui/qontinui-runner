@@ -383,6 +383,9 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // Only sessions the lifecycle registry knows about can migrate — a plain
     // shell pane (or an unregistered session) has no transcript binding.
     let Some(record) = store.find_open_by_terminal(&terminal_id) else {
+        // No session to continue or migrate here: a pending park (a
+        // re-entry's retry) has nothing to come back for.
+        super::limit_stop::with_parks(|p| p.forget(&terminal_id));
         info!(
             terminal_id,
             matched_pattern,
