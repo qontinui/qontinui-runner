@@ -107,7 +107,7 @@ fn same_coord(read_base: Option<&str>, dial: &Value) -> Option<bool> {
         .filter(|state| *state == "known")
         .and_then(|_| dial.get("coord_base"))
         .and_then(Value::as_str)?;
-    Some(read_base.trim_end_matches('/') == dial_base.trim_end_matches('/'))
+    crate::fleet_capacity::same_coord_base(Some(read_base), Some(dial_base))
 }
 
 /// `GET /fleet/capacity` — this device's capacity, from the runner's cache or
