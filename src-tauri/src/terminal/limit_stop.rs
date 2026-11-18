@@ -268,7 +268,9 @@ fn subagent_limit_stop(dir: &Path, after_ms: i64) -> LimitStopRead {
             }
             LimitStopRead::NotStopped => {}
             LimitStopRead::Unreadable(why) => {
-                unreadable.get_or_insert_with(|| format!("subagent transcript {}: {why}", path.display()));
+                unreadable.get_or_insert_with(|| {
+                    format!("subagent transcript {}: {why}", path.display())
+                });
             }
         }
     }
@@ -550,7 +552,12 @@ impl ParkList {
     /// parked: a park the handler decided keeps its own due time. Reports
     /// nothing (the handler reports what it decides when the entry comes
     /// due). Returns whether it was enrolled.
-    pub(crate) fn enrol(&mut self, terminal_id: &str, claude_session_id: &str, due_at_ms: i64) -> bool {
+    pub(crate) fn enrol(
+        &mut self,
+        terminal_id: &str,
+        claude_session_id: &str,
+        due_at_ms: i64,
+    ) -> bool {
         if self.by_terminal.contains_key(terminal_id) {
             return false;
         }
@@ -582,10 +589,7 @@ impl ParkList {
     }
 
     /// The park on `terminal_id`, if any.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by tests")
-    )]
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by tests"))]
     pub(crate) fn get(&self, terminal_id: &str) -> Option<&Park> {
         self.by_terminal.get(terminal_id)
     }
@@ -1079,7 +1083,10 @@ mod tests {
             SUBAGENT_PARENT,
             &[
                 ("agent-a0c1d2e3f4a5b6c7d.jsonl", SUBAGENT_STOP),
-                ("agent-a0c1d2e3f4a5b6c7d.meta.json", "{\"agentType\":\"general-purpose\"}"),
+                (
+                    "agent-a0c1d2e3f4a5b6c7d.meta.json",
+                    "{\"agentType\":\"general-purpose\"}",
+                ),
             ],
         );
         assert_eq!(
@@ -1151,7 +1158,10 @@ mod tests {
     fn an_unreadable_subagent_file_written_since_the_last_turn_is_unknown() {
         let (_dir, main) = session(
             SUBAGENT_PARENT,
-            &[("agent-a0c1d2e3f4a5b6c7d.jsonl", "{\"type\":\"assistant\",\"isSide\n")],
+            &[(
+                "agent-a0c1d2e3f4a5b6c7d.jsonl",
+                "{\"type\":\"assistant\",\"isSide\n",
+            )],
         );
         assert!(matches!(
             transcript_limit_stop(&main),
@@ -1192,10 +1202,9 @@ mod tests {
         let old = std::time::UNIX_EPOCH + Duration::from_secs(1_794_456_000);
         std::fs::File::options()
             .write(true)
-            .open(
-                dir.path()
-                    .join("0f1e2d3c-4b5a-4968-8776-655443322110/subagents/agent-a0c1d2e3f4a5b6c7d.jsonl"),
-            )
+            .open(dir.path().join(
+                "0f1e2d3c-4b5a-4968-8776-655443322110/subagents/agent-a0c1d2e3f4a5b6c7d.jsonl",
+            ))
             .and_then(|f| f.set_modified(old))
             .expect("set mtime");
         assert_eq!(transcript_limit_stop(&main), LimitStopRead::NotStopped);

@@ -151,7 +151,11 @@ impl FirstSight {
     pub(crate) fn unread(&self, live: &[String], now_ms: i64) -> Vec<String> {
         live.iter()
             .filter(|t| !self.read.contains(*t))
-            .filter(|t| self.no_record_until_ms.get(*t).is_none_or(|&(u, _)| u <= now_ms))
+            .filter(|t| {
+                self.no_record_until_ms
+                    .get(*t)
+                    .is_none_or(|&(u, _)| u <= now_ms)
+            })
             .cloned()
             .collect()
     }
@@ -159,8 +163,10 @@ impl FirstSight {
     /// Forget terminals that are gone, like the scan gate does.
     pub(crate) fn retain_live(&mut self, live: &HashSet<&str>) {
         self.read.retain(|t| live.contains(t.as_str()));
-        self.unreadable_tries.retain(|t, _| live.contains(t.as_str()));
-        self.no_record_until_ms.retain(|t, _| live.contains(t.as_str()));
+        self.unreadable_tries
+            .retain(|t, _| live.contains(t.as_str()));
+        self.no_record_until_ms
+            .retain(|t, _| live.contains(t.as_str()));
     }
 }
 
@@ -241,7 +247,10 @@ pub(crate) fn apply_first_sight(
         seen.read.insert(terminal_id.clone());
     }
     for terminal_id in &pass.unreadable {
-        let tries = seen.unreadable_tries.entry(terminal_id.clone()).or_default();
+        let tries = seen
+            .unreadable_tries
+            .entry(terminal_id.clone())
+            .or_default();
         *tries += 1;
         if *tries >= FIRST_SIGHT_UNREADABLE_TRIES {
             seen.unreadable_tries.remove(terminal_id);
