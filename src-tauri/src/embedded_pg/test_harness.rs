@@ -1251,7 +1251,12 @@ impl LockHolder {
 /// cache `key` (`action`: `entering`, `building` or `collecting`). Written to
 /// a file of this process's own and renamed into place, so a waiter never
 /// reads half of one. Best effort: a holder that cannot name itself still
-/// holds the lock, and a waiter then names it as unnamed.
+/// holds the lock, so it removes the record left by whoever took the lock
+/// before — which would otherwise name that process, possibly still live, as
+/// the holder — and a waiter then names this one as unnamed. Removing it is
+/// sound because this process holds the lock: at worst it also removes the
+/// record a concurrent SHARED taker just wrote, which costs that taker its
+/// name in a waiter's line, nothing more.
 fn write_lock_holder(dir: &Path, key: &str, action: &str) {
     let path = dir.join(LOCK_HOLDER_FILE);
     let partial = dir.join(format!(
@@ -1263,8 +1268,14 @@ fn write_lock_holder(dir: &Path, key: &str, action: &str) {
         .and_then(|()| std::fs::rename(&partial, &path));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&partial);
+        let stale = match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                format!("; the previous holder's record could not be removed either: {e}")
+            }
+            _ => String::new(),
+        };
         say(format!(
-            "could not name this process as the cache lock's holder ({}): {e}",
+            "could not name this process as the cache lock's holder ({}): {e}{stale}",
             path.display()
         ));
     }
@@ -3154,7 +3165,9 @@ fn private_dir_builder() -> std::fs::DirBuilder {
 ///   first time, and the creation accepts an existing directory whoever owns
 ///   it.
 /// - A missing directory is created private, with any parent it lacks, and
-///   marked as the harness's ([`MADE_MARKER`]).
+///   marked as the harness's ([`MADE_MARKER`]). Only the create that made it
+///   counts as making it: one that appears between the checks and the create
+///   is found, not made.
 /// - An existing one at the DEFAULT location (`!named`) that is already
 ///   private to this user and carries no mark is marked now
 ///   ([`found_private`]): a harness from before the mark made it and left none,
@@ -3171,13 +3184,24 @@ fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
     if let Some(hook) = BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| hook.borrow_mut().take()) {
         hook();
     }
-    let made = !dir.exists();
-    create_private_dir_all(dir).map_err(|e| {
+    // The parents first, then the directory itself with one create: whether
+    // THIS call made it is the create's own answer, so a directory that
+    // appears in between — made by someone else — is never taken for the
+    // harness's and marked.
+    let cannot_create = |e: std::io::Error| {
         format!(
             "could not create the harness directory {}: {e}",
             dir.display()
         )
-    })?;
+    };
+    if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        create_private_dir_all(parent).map_err(cannot_create)?;
+    }
+    let made = match create_private_dir(dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => false,
+        Err(e) => return Err(cannot_create(e)),
+    };
     if named {
         require_safe_ancestors(dir)?;
     }
@@ -5144,6 +5168,36 @@ mod tests {
         );
     }
 
+    /// A named directory that comes into being between the ancestor check and
+    /// the create — made by someone other than this call — was found, not
+    /// made, so the harness does not mark it: only the create's own success
+    /// counts as making it. The window is opened by the test-only seam
+    /// (`BETWEEN_ANCESTOR_CHECK_AND_CREATE`), which here makes the named
+    /// directory itself, private.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_directory_that_appears_in_the_window_is_not_marked() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let named = scratch.path().join("appears-itself");
+        let squat = named.clone();
+        BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                create_private_dir(&squat).expect("make the named directory in the window");
+            }));
+        });
+        let entered = prepare_harness_dir(&named, true);
+        assert!(
+            BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| hook.borrow().is_none()),
+            "the seam did not run, so the window was never opened"
+        );
+        entered.expect("a private directory the tester owns is used");
+        assert!(
+            !named.join(MADE_MARKER).exists(),
+            "the harness marked a named directory that appeared in the window, which it did \
+             not make"
+        );
+    }
+
     /// Only a regular file this user owns is the harness's mark: not a symlink
     /// or anything else, and not a file another user owns, who could plant
     /// one in a directory open to them.
@@ -5207,7 +5261,8 @@ mod tests {
         };
         let scratch = tempfile::tempdir().expect("scratch directory");
 
-        // One a tester names, such as a project directory.
+        // An existing directory at the default location (`named` false), as a
+        // project directory a tester made open there would be.
         let found = scratch.path().join("found");
         plant_open(&found);
         let refused = prepare_harness_dir(&found, false)
@@ -5846,6 +5901,33 @@ mod tests {
         assert!(
             partial_removal_line(path, 7, Ok(())).is_some_and(|line| line.starts_with("removed ")),
             "a removal is said"
+        );
+    }
+
+    /// A process that takes the lock but cannot name itself removes the record
+    /// its predecessor left, so a waiter names it as unnamed rather than name
+    /// that predecessor, which may still be live. The write is made to fail by
+    /// a directory where this process's partial file goes.
+    #[test]
+    fn a_holder_that_cannot_name_itself_removes_the_previous_record() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path();
+        let previous = LockHolder {
+            pid: a_live_pid_not_ours(),
+            ..LockHolder::this_process("earlier", "entering")
+        };
+        std::fs::write(dir.join(LOCK_HOLDER_FILE), previous.render())
+            .expect("plant the previous holder's record");
+        let partial = dir.join(format!(
+            "{LOCK_HOLDER_FILE}.{}-{}",
+            std::process::id(),
+            process_nonce()
+        ));
+        std::fs::create_dir(&partial).expect("block this process's partial file");
+        write_lock_holder(dir, "now", "building");
+        assert!(
+            read_lock_holder(dir).is_none(),
+            "the previous holder's record survived a failed write, so a waiter would name it"
         );
     }
 
