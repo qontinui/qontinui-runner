@@ -3243,6 +3243,45 @@ mod tests {
         assert!(begin_migration(&unpinned, "C:/a", || Some(unpinned.clone())).is_ok());
     }
 
+    // ---- the hint's transcript read sees a background subagent's stop -------
+    // (plan 2026-11-05 Phase 3, coord finding 1776d1cf)
+
+    /// The read every hint makes, through the session record the way the
+    /// handler resolves it: a stop recorded only in the session's background
+    /// subagent transcript, after its last main-thread turn, reads Stopped.
+    #[tokio::test]
+    async fn the_hint_read_sees_a_background_subagent_stop() {
+        let config = tempfile::tempdir().expect("tempdir");
+        let working_dir = "/work/limit-reentry-proj";
+        let sid = "0f1e2d3c-4b5a-4968-8776-655443322110";
+        let project = config
+            .path()
+            .join("projects")
+            .join(super::super::transcript::encode_project_path(working_dir));
+        let subagents = project.join(sid).join("subagents");
+        std::fs::create_dir_all(&subagents).expect("mkdir");
+        std::fs::write(
+            project.join(format!("{sid}.jsonl")),
+            include_str!("fixtures/limit_stop/subagent_parent.jsonl"),
+        )
+        .expect("write main");
+        std::fs::write(
+            subagents.join("agent-a0c1d2e3f4a5b6c7d.jsonl"),
+            include_str!("fixtures/limit_stop/subagent_stop.jsonl"),
+        )
+        .expect("write subagent");
+        let mut rec = session_record(sid, "t-1", None);
+        rec.working_dir = Some(working_dir.to_string());
+        let src = config.path().to_str().expect("utf-8 path");
+        match read_limit_stop(&rec, src).await {
+            super::super::limit_stop::LimitStopRead::Stopped(stop) => {
+                assert_eq!(stop.entry_uuid, "5a000004-0000-4000-8000-000000000004");
+                assert_eq!(stop.resets_at_ms, Some(1_795_032_000_000));
+            }
+            other => panic!("expected the subagent's stop, read {other:?}"),
+        }
+    }
+
     // ---- the guard's async shape (S6) ---------------------------------------
 
     /// The migration future dropped while it is still in its async prepare
