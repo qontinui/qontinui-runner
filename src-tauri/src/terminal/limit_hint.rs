@@ -145,6 +145,14 @@ pub(crate) async fn run_hint(env: &impl HintEnv, config_dir: &str) -> HintFlow {
     match action {
         LimitAction::Skip(why) => {
             env.skip(why, &read);
+            // A decided skip of a stop, or of a finished session, is final:
+            // drop the pane's pending park, including a re-entry's retry
+            // park, so it does not come back every hour. An unreadable
+            // transcript is not a decision and keeps it; a read that is not a
+            // stop dropped it above.
+            if matches!(read, LimitStopRead::Stopped(_)) || why == SkipReason::Finished {
+                env.forget_park();
+            }
             HintFlow::Done
         }
         LimitAction::Park {
