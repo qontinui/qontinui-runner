@@ -1309,6 +1309,19 @@ fn record_session_open_into(
                 )
             }
         };
+    // A zone is only meaningful on the page it was recorded against. When the
+    // live pane is on a different page than the row the layout was inherited
+    // from (a shimmed hand `claude --resume S` from a tab on another page),
+    // that row's zone names a cell of the wrong page: use the terminal's own
+    // row's zone when that row is on the live page, else the unzoned marker.
+    let zone_index = match live_page {
+        Some(live) if live != page_id => terminal_latest
+            .as_ref()
+            .filter(|t| t.page_id == live)
+            .map(|t| t.zone_index)
+            .unwrap_or_else(|| crate::session::session_lifecycle_store::recorded_zone_for(None)),
+        _ => zone_index,
+    };
     let page_id = live_page.map(str::to_string).unwrap_or(page_id);
     // config_dir: the hook DOES know the real account (CLAUDE_CONFIG_DIR) —
     // take it when present, but never erase a known one with None. The terminal
@@ -3519,6 +3532,96 @@ mod tests {
             Some("qontinui-root"),
             "title still derived from the hook's cwd"
         );
+    }
+
+    /// A zone is a cell of ONE page. A shimmed hand `claude --resume S` from a
+    /// tab on page P2, where S's old row sits on P1 zone 4, must not record
+    /// zone 4 against P2: the terminal's own row's zone when that row is on the
+    /// live page, else the unzoned marker.
+    #[test]
+    fn session_open_from_another_page_does_not_inherit_the_old_rows_zone() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE, UNZONED_ZONE_INDEX,
+        };
+        let row =
+            |id: &str, term: &str, page: &str, zone: i32, state: &str| TerminalSessionRecord {
+                claude_session_id: id.to_string(),
+                config_dir: None,
+                working_dir: Some("D:\\w".to_string()),
+                page_id: page.to_string(),
+                zone_index: zone,
+                title: Some("t".to_string()),
+                terminal_id: term.to_string(),
+                opened_at: 0,
+                last_seen_at: 0,
+                state: state.to_string(),
+                closed_at: None,
+                close_reason: None,
+                provider: "claude".to_string(),
+                origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+                restore_pending_at: None,
+                awaiting_account_since: None,
+                confirmed_at: None,
+                handle: None,
+                account_label: None,
+                account_wrapper: None,
+                session_name: None,
+                name_source: None,
+                tenant_id: None,
+                task_run_id: None,
+                bypass_permissions: None,
+                restored_from_boot_at: None,
+                restore_tier: None,
+                finished_at: None,
+                wind_down_outcome: None,
+                wind_down_at: None,
+                wind_down_arm: None,
+                finish_reason: None,
+                finish_synced: false,
+                spawn_device_default: None,
+                adopted_from: None,
+                last_session_start_at: None,
+                last_alive_at: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
+            };
+        let req = |term: &str| SessionOpenRequest {
+            terminal_id: term.to_string(),
+            session_id: "S".to_string(),
+            source: Some("resume".to_string()),
+            provider: Some("claude".to_string()),
+            config_dir: None,
+            cwd: Some("/d/w".to_string()),
+        };
+
+        // The terminal has no row on the live page: unzoned, never 4.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(row("S", "old-term", "P1", 4, "closed"));
+        record_session_open_into(&store, &req("term-2"), "claude", Some("P2"));
+        let rec = store.get("S").unwrap();
+        assert_eq!(rec.page_id, "P2");
+        assert_eq!(
+            rec.zone_index, UNZONED_ZONE_INDEX,
+            "P1's zone 4 is not P2's"
+        );
+
+        // The terminal's own row IS on the live page: its zone is the zone.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(row("S", "old-term", "P1", 4, "closed"));
+        store.record_open(row("other", "term-2", "P2", 3, "open"));
+        record_session_open_into(&store, &req("term-2"), "claude", Some("P2"));
+        let rec = store.get("S").unwrap();
+        assert_eq!((rec.page_id.as_str(), rec.zone_index), ("P2", 3));
+
+        // Same page: the row's own zone is still inherited.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(row("S", "old-term", "P1", 4, "closed"));
+        record_session_open_into(&store, &req("term-2"), "claude", Some("P1"));
+        assert_eq!(store.get("S").unwrap().zone_index, 4);
     }
 
     /// MSYS drive-path normalization for hook-created records (Windows).

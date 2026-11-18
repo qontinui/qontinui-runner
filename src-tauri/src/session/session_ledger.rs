@@ -677,7 +677,7 @@ fn generation_file_name(rotated_at_ms: i64) -> String {
 
 /// `session-ledger.<digits>.json` → `<digits>`. Anything else (the live file,
 /// an atomic-write temp, a stray) is not a generation.
-fn parse_generation_file_name(name: &str) -> Option<i64> {
+pub(crate) fn parse_generation_file_name(name: &str) -> Option<i64> {
     let ts = name
         .strip_prefix("session-ledger.")?
         .strip_suffix(".json")?;
