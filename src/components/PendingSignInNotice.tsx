@@ -82,7 +82,7 @@ export const NO_BROWSER_HINT = {
     "Cancel, then redeem a pair code under Settings → Backend Connection. It needs no browser.",
   backendConnection: "Cancel, then redeem a pair code in the section below. It needs no browser.",
   setupWizard:
-    "Cancel, then pair from a shell on this box with `qontinui_profile device pair --pair-code <CODE>`. It needs no browser.",
+    "Cancel, then pair from a shell on this box with: qontinui_profile device pair --pair-code <CODE>. It needs no browser.",
 } as const;
 
 export function PendingSignInNotice({
