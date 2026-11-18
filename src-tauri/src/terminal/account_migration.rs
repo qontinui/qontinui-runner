@@ -891,13 +891,18 @@ async fn continue_after_reset(
     )
     .await;
     match run {
-        ContinueRun::NotClaimed(claim) => info!(
-            terminal_id,
-            session = %record.claude_session_id,
-            entry_uuid = %stop.entry_uuid,
-            ?claim,
-            "limit-reset-continue not started — this stop's continue is in flight, done, or out of attempts"
-        ),
+        ContinueRun::NotClaimed(claim) => {
+            // Another run owns this stop, or it is answered or out of
+            // attempts: nothing for a re-entry's retry park to do.
+            super::limit_stop::with_parks(|p| p.forget(&terminal_id));
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                entry_uuid = %stop.entry_uuid,
+                ?claim,
+                "limit-reset-continue not started — this stop's continue is in flight, done, or out of attempts"
+            )
+        }
         ContinueRun::Ran {
             outcome: IdlePromptOutcome::Submitted,
             ..
@@ -950,6 +955,8 @@ async fn continue_after_reset(
                     + super::limit_reset::LIMIT_RESET_MARGIN_MS;
                 park_stop(app, record, src, due_at_ms, ParkReason::ContinueRetry);
             } else {
+                // Out of attempts: told, and not tried again.
+                super::limit_stop::with_parks(|p| p.forget(&terminal_id));
                 let (event, payload) = super::limit_reset::gave_up_event(
                     &record.claude_session_id,
                     src,
