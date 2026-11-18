@@ -196,9 +196,18 @@ mod tests {
         assert!(pb.contains("`granted`"));
         assert!(pb.contains("`heartbeat`"));
         assert!(pb.contains("A Fixer that a deployed admission did not grant must not run"));
-        // Undeployed admission is not a refusal: the Fixer runs uncounted.
-        assert!(pb.contains("**child slots not deployed**"));
-        assert!(pb.contains("Start the Fixer uncounted"));
+        // Undeployed admission needs POSITIVE proof from coord's own door:
+        // only an exact 404 from the unauthenticated probe starts a child
+        // uncounted; any other code means deployed; 000 and a dead transport
+        // are refusals; the proof is journaled.
+        assert!(pb.contains("#### Resolving `coord_child_slot`"));
+        assert!(pb.contains("https://coord.qontinui.io/coord/child-slots"));
+        assert!(pb.contains("exactly `404` — **child slots are not deployed**"));
+        assert!(pb.contains("exists, so admission IS deployed"));
+        assert!(pb.contains("`000` or a timeout — UNKNOWN, which is a refusal"));
+        assert!(pb.contains("**Transport down**"));
+        assert!(pb.contains("`ToolSearch`"));
+        assert!(pb.contains("record the proof in the journal"));
         // The wait door is Monitor on a bounded until-loop.
         assert!(pb.contains("the `Monitor` tool on a bounded until-loop"));
         // D3.5: the parent is the single claimant.

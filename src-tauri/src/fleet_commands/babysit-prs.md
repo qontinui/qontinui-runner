@@ -1794,10 +1794,43 @@ an admin-merge happened — produces a plan so the defect class dies:
 - **Subagents are counted by coord, and fixers stay bounded.** Every subagent
   this command starts (a fresh-context reviewer, or a fixer) first takes a child
   slot: `coord_child_slot {action: "acquire"}`, and spawns on `granted`.
-  **Child slots not deployed** (the tool is not in your tool list, or the call
-  is rejected as an unknown tool or method) is NOT a refusal: spawn the child
-  uncounted, as before child slots existed, and say in the exit report that it
-  ran uncounted because child slots are not deployed. Run every child as a
+  Any other answer (the tool missing, unknown, unreachable or silent) is
+  settled by this rule, and nothing else:
+
+  **Resolve `coord_child_slot` before relying on any answer that is not
+  `granted` or `refused`.** "Not deployed" needs POSITIVE proof from coord
+  itself, because a coord that serves the tool also produces every other
+  symptom (a deferred tool not loaded yet, a dead native transport, a `-32601`
+  from a stale runner-proxy allowlist):
+
+  1. **Load it.** If the tool is not in your tool list, load it with
+     `ToolSearch` (`select:` its name). A tool that loads is used: call it.
+  2. **Probe coord's own door** when it does not load, or its call is
+     rejected as an unknown tool or method. This is unauthenticated and goes
+     around both the MCP client and the runner proxy:
+
+     ```bash
+     curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}'
+     ```
+
+     - exactly `404` — **child slots are not deployed**. Start the child
+       uncounted, as before child slots existed, within every other rule here.
+       There is no slot to heartbeat or release for it.
+     - any other HTTP code (`401`, `403`, `405`, `422`, ...) — the route
+       exists, so admission IS deployed and the tool must work. Call it through
+       `coord-revive.sh call coord_child_slot '{"action":"acquire"}'` (the
+       coord-revive skill's resolver). If that fails too, it is a refusal.
+     - `000` or a timeout — UNKNOWN, which is a refusal.
+  3. **Transport down** — the call is unreachable, times out, or answers
+     "Command failed with no output" — is a refusal for this cycle: start no
+     child. A reviewer waits and retries (the bounded backoff below); it never
+     reviews inline.
+
+  Whenever a child runs uncounted, record the proof in the exit report: the
+  probe's HTTP code and its UTC time. Whenever a transport failure refused a
+  child, record the door and the exact error.
+
+  Run every child as a
   BACKGROUND Agent call: a foreground child blocks you, and a blocked parent
   cannot heartbeat. Wait for children with `Monitor` on a bounded until-loop
   with a timeout of a few minutes (well inside the slot's 600 s lapse), never a
