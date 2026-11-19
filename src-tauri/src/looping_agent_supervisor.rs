@@ -1098,7 +1098,9 @@ async fn supervise_one(
                     }
                 }
             }
-            let prompt = spawn_prompt(&rec.def, reason != SpawnReason::FirstSpawn).await;
+            let assignment = slot_assignment(&rec.def.id, effective.slots);
+            let prompt =
+                spawn_prompt(&rec.def, reason != SpawnReason::FirstSpawn, assignment).await;
             let focus = reason == SpawnReason::FirstSpawn;
             do_spawn(app, registry, &rec.def, prompt, focus, false).await;
         }
@@ -1148,7 +1150,8 @@ async fn supervise_one(
                     );
                 }
             }
-            let prompt = spawn_prompt(&rec.def, true).await;
+            let assignment = slot_assignment(&rec.def.id, effective.slots);
+            let prompt = spawn_prompt(&rec.def, true, assignment).await;
             do_spawn(app, registry, &rec.def, prompt, false, true).await;
         }
     }
@@ -1315,7 +1318,11 @@ async fn release_handed_over_slot(app: &tauri::AppHandle, agent_id: &str) {
 /// The fetch happens per spawn rather than per tick: spawns are rare (first
 /// enable, relaunch, death-respawn) and each one is the exact moment the
 /// freshest instructions matter, so there is nothing to cache.
-async fn spawn_prompt(def: &LoopingAgentDef, is_relaunch: bool) -> String {
+async fn spawn_prompt(
+    def: &LoopingAgentDef,
+    is_relaunch: bool,
+    assignment: Option<playbook::SlotAssignment>,
+) -> String {
     let coord_body = crate::looping_agent_coord::fetch_playbook(&def.playbook_ref).await;
     if coord_body.is_none() {
         debug!(
@@ -1326,10 +1333,21 @@ async fn spawn_prompt(def: &LoopingAgentDef, is_relaunch: bool) -> String {
     }
     let pb = playbook::resolve_playbook(coord_body.as_deref(), &def.playbook_ref);
     if is_relaunch {
-        playbook::relaunch_prompt(pb, &def.journal_path, &def.repos)
+        playbook::relaunch_prompt(pb, &def.journal_path, &def.repos, assignment)
     } else {
-        playbook::initial_prompt(pb, &def.journal_path, &def.repos)
+        playbook::initial_prompt(pb, &def.journal_path, &def.repos, assignment)
     }
+}
+
+/// The Shepherd slot this agent's tab is spawned under: the lease it holds and
+/// the resolved slot count. `None` when no lease is held, which the spawn gate
+/// (`gate_action`) normally makes unreachable; the prompt then tells the agent
+/// every repo is its own rather than inventing a partition.
+fn slot_assignment(agent_id: &str, slots: u32) -> Option<playbook::SlotAssignment> {
+    held_slot_for(agent_id).map(|held| playbook::SlotAssignment {
+        slot: held.slot,
+        count: slots,
+    })
 }
 
 /// Reconcile this agent's slot lease for one tick and report whether we hold
@@ -1973,6 +1991,14 @@ async fn spawn_looping_agent_terminal(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port, None);
     crate::fleet_commands::provision_fleet_commands_for_session(&workdir);
     crate::fleet_skills::provision_fleet_skills_for_session(&workdir);
+    {
+        // Off the async worker: the ownership probe may run git per destination.
+        let wd = workdir.clone();
+        let _ = spawn_blocking_tracked(move || {
+            crate::agent_runtime::provision_agent_definitions_recorded(&wd)
+        })
+        .await;
+    }
 
     // Interactive `claude` argv with the prompt as the trailing positional
     // arg (the proven continuation recipe — flags before prompt, `--`
@@ -2162,6 +2188,41 @@ pub(crate) fn status_snapshot(
         displaced: last_displaced_for(&rec.def.id)
             .filter(|d| *d != lease::Displaced::NotDisplaced)
             .map(lease::Displaced::label),
+    }
+}
+
+/// Plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`
+/// D3.4: the spawn prompt's `shepherd_slot` comes from the lease this
+/// supervisor holds for the agent, beside the resolved slot count.
+#[cfg(test)]
+mod slot_assignment_tests {
+    use super::*;
+
+    #[test]
+    fn slot_assignment_reads_the_held_lease_and_the_count() {
+        let agent = "slot-assignment-test-agent".to_string();
+        assert_eq!(
+            slot_assignment(&agent, 3),
+            None,
+            "no lease held: no assignment"
+        );
+        set_held_slot(
+            &agent,
+            HeldSlot {
+                slot: 2,
+                resource_key: "role:t:merge-shepherd:2".to_string(),
+                acquired_at_ms: 0,
+                last_proven_alive_ms: None,
+            },
+        );
+        let held = slot_assignment(&agent, 3);
+        clear_held_slot(&agent);
+        assert_eq!(held, Some(playbook::SlotAssignment { slot: 2, count: 3 }));
+        assert_eq!(
+            slot_assignment(&agent, 3),
+            None,
+            "a released lease clears it"
+        );
     }
 }
 

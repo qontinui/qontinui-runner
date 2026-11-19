@@ -3430,7 +3430,7 @@ def main():
         for label, r in operator_rows(res):
             code = f"{r['reason_code']} " if label == "HELD" else ""
             print(f"  {label:<12} {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]} - "
-                  f"{'nudged: ' if label == 'CONTRADICTED' else ''}{code}{'; '.join(r['reasons'])[:160]}")
+                  f"{'nudged: ' if label == 'CONTRADICTED' else ''}{code}{cfs.fit_reasons(r['reasons'], 160)}")
         if a.act:
             cap = ["--cooldown-hours", str(a.cooldown_hours)] if a.cooldown_hours is not None else []
             port = ["--port", a.port] if a.port else []
