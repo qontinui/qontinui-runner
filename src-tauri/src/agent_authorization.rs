@@ -3871,6 +3871,17 @@ mod drain_tests {
             HeartbeatOutcome, GLOBAL_TEST_LOCK,
         };
         let _g = GLOBAL_TEST_LOCK.lock().await;
+        // Restore the boot state on exit, even on panic: the tokio mutex does
+        // not poison, so a failed assertion would otherwise leave `ci_node`
+        // cached for the next test.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::coord_drain_state::reset_global_for_test();
+            }
+        }
+        crate::coord_drain_state::reset_global_for_test();
+        let _restore = Restore;
         let body = r#"{"drain":{"state":"clear","dispatch_role":"ci_node"}}"#;
         note_heartbeat(HeartbeatOutcome::Registered {
             drain: parse_register_response(body),
@@ -3896,7 +3907,6 @@ mod drain_tests {
             ),
             None
         );
-        crate::coord_drain_state::reset_global_for_test();
     }
 
     /// The SEAM, not the pure gate: a `ci_node` / `bench` role served on the

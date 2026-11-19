@@ -2458,7 +2458,7 @@ enum SpawnDecision {
     /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
     /// paused by coord's device drain (drained, or drain state unknown): do NOT
     /// spawn; leave the row pending for the backstop poll, like a load deferral.
-    /// Produced only by [`apply_drain_to_claim`].
+    /// Produced only by [`apply_drain_to_claim_with_role`].
     DeferClaimErrorByDrain {
         cause: String,
         reason: String,
@@ -2471,6 +2471,7 @@ enum SpawnDecision {
 /// clear enough to reach it) and every coord refusal (`SkipCancelled`,
 /// `SkipSuperseded`, `SkipRerouted`) are left alone — a refusal spawns nothing,
 /// so there is nothing for the drain to pause.
+#[cfg(test)]
 fn apply_drain_to_claim(
     decision: SpawnDecision,
     drain: &crate::coord_drain_state::CoordDrainState,
@@ -2482,7 +2483,7 @@ fn apply_drain_to_claim(
     )
 }
 
-/// PURE: [`apply_drain_to_claim`] with the device's dispatch role, so the
+/// PURE: the drain re-check of a claim decision, with the device's dispatch role, so the
 /// re-check after the claim's await also sees a role that closed the agent
 /// lane while it waited.
 fn apply_drain_to_claim_with_role(
@@ -6428,7 +6429,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 ///
 /// **Drain (plan `2026-09-13-drained-runner-never-reaches-idle`, Phase 3):**
 /// every error arm — no coord base, no client, a failed POST, an unexpected
-/// status — goes through [`apply_drain_to_claim`], so while the device is
+/// status — goes through [`apply_drain_to_claim_with_role`], so while the device is
 /// drained or its drain state is unknown the "spawn anyway" becomes
 /// [`SpawnDecision::DeferClaimErrorByDrain`], a leave-pending deferral.
 async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> SpawnDecision {
