@@ -80,6 +80,8 @@ import {
   parseConcurrencyInput,
   parseThreadCeilingInput,
   type CiNodeHostSuggestion,
+  unsetConcurrencyCount,
+  unsetConcurrencyText,
   type ThreadCeilingsReport,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
@@ -753,7 +755,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
                     hostSuggestion.mem_gib ?? "unknown"
                   } GB)`
                 : "Suggestion unavailable"}
-              {ciNode.max_concurrent_builds === null ? " — in use (not set explicitly)." : "."}
+              .
             </p>
             <button
               type="button"
@@ -765,9 +767,23 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
               disabled={!ciNode.enabled || ciNode.max_concurrent_builds === null}
               className="text-[10px] px-2 py-0.5 rounded-md bg-muted/50 hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {hostSuggestion ? `Use suggested (${hostSuggestion.suggested})` : "Use suggested"}
+              {(() => {
+                const n = unsetConcurrencyCount(hostSuggestion);
+                return n === null ? "Clear to unset" : `Clear to unset (${n})`;
+              })()}
             </button>
           </div>
+          {(() => {
+            const text = unsetConcurrencyText(hostSuggestion);
+            return text ? (
+              <p
+                data-ui-bridge-id="settings.resource-guard-max-builds-unset-resolves-to"
+                className="text-[10px] text-muted-foreground"
+              >
+                {text}
+              </p>
+            ) : null;
+          })()}
           {ciNode.enabled &&
             (() => {
               const warning = concurrencyAboveSuggestionWarning(
@@ -787,9 +803,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
               ) : null;
             })()}
           <p className="text-[10px] text-muted-foreground">
-            Also the build capacity this device advertises to coord. Unset follows the host
-            suggestion; an explicit value always wins, and &quot;Use suggested&quot; returns to it.
-            Range {MAX_CONCURRENT_BUILDS_MIN}-{MAX_CONCURRENT_BUILDS_MAX}.
+            Also the build capacity this device advertises to coord. Unset follows coord&apos;s
+            capacity model when it answers, else the host suggestion; an explicit value always wins,
+            and &quot;Clear to unset&quot; returns to it. Range {MAX_CONCURRENT_BUILDS_MIN}-
+            {MAX_CONCURRENT_BUILDS_MAX}.
           </p>
         </div>
 

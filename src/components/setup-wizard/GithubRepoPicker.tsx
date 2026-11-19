@@ -4,6 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
+import {
   FolderOpen,
   Search,
   Loader2,
@@ -358,7 +363,8 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
       await loadRepos();
     } catch (err) {
-      setSignInError(`${err}`);
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (!isSignInCancelled(err)) setSignInError(`${err}`);
     } finally {
       setSigningIn(false);
     }
@@ -460,6 +466,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
             <SignInButton signingIn={signingIn} onSignIn={signIn} />
           )}
         </div>
+        <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
         {signInError && (
           <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
         )}
@@ -481,6 +488,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
           </div>
         </div>
         <SignInButton signingIn={signingIn} onSignIn={signIn} />
+        <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
         {signInError && (
           <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
         )}

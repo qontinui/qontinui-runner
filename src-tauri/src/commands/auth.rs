@@ -1184,6 +1184,29 @@ pub async fn cognito_sign_in(
         .map_err(String::from)
 }
 
+/// The Hosted-UI sign-in currently waiting for its browser callback, if any:
+/// its authorize URL and, when the system browser could not be opened, why.
+///
+/// The UI polls this while a [`cognito_sign_in`] is in flight so a box with no
+/// browser launcher can show the URL with a copy control instead of waiting
+/// five silent minutes (plan
+/// `2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human`
+/// P1.1).
+#[tauri::command]
+pub fn cognito_pending_sign_in() -> Option<qontinui_runner_lib::cognito::PendingSignIn> {
+    qontinui_runner_lib::cognito::pending_sign_in()
+}
+
+/// Cancel the pending Hosted-UI sign-in `attempt_id` (from
+/// [`cognito_pending_sign_in`]), releasing the callback port. Returns whether
+/// it was cancelled; a stale id cancels nothing. The cancelled
+/// [`cognito_sign_in`] call returns
+/// [`qontinui_runner_lib::cognito::SIGN_IN_CANCELLED`].
+#[tauri::command]
+pub fn cognito_cancel_sign_in(attempt_id: u64) -> bool {
+    qontinui_runner_lib::cognito::cancel_pending_sign_in(attempt_id)
+}
+
 async fn cognito_sign_in_impl(
     backend_url: String,
     identity_provider: Option<String>,
@@ -1207,7 +1230,15 @@ async fn cognito_sign_in_impl(
     .map_err(|e| {
         // Most common cause: a prior sign-in leaked the fixed loopback port
         // (BUG 1, now fixed) so the bind fails with os error 10048.
-        error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+        // A user's Cancel, or a newer attempt superseding this one, is not a
+        // failure: keep it out of the error log.
+        if e == qontinui_runner_lib::cognito::SIGN_IN_CANCELLED
+            || e == qontinui_runner_lib::cognito::SIGN_IN_SUPERSEDED
+        {
+            info!("cognito_sign_in: {e}");
+        } else {
+            error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+        }
         AppError::Raw(e)
     })?;
 
@@ -2222,6 +2253,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             set_runner_tier,
             cognito_sign_in,
             cognito_sign_in_password,
+            cognito_pending_sign_in,
+            cognito_cancel_sign_in,
             qontinui_sign_out,
             sign_out_full,
             reset_credential_store,

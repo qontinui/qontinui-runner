@@ -119,6 +119,8 @@
 # FAILURE: advisory, like the step it follows. Every API, parse or tool failure
 # prints one `::warning` and exits 0; only a wiring error (wrong arguments)
 # exits 2.
+# ARGUMENTS are checked against an allowlist first (see the ALLOWLIST comment
+# below): a repo, head_sha or check_name outside it is also a wiring error.
 #
 # USAGE: complete-orphaned-check-runs.sh <owner/repo> <head_sha> <check_name> <reason>
 #   <reason> is one sentence on why the posting step may have left the run, and
@@ -147,6 +149,8 @@
 #   COMPLETE_ORPHANS_CALL_TIMEOUT  seconds one gh call may take (default 20).
 #   COMPLETE_ORPHANS_DEADLINE_SECS no new API call after this many seconds (default 180).
 set -uo pipefail
+# The allowlist ranges below are ASCII ranges only in the C locale.
+export LC_ALL=C
 
 TITLE='complete-orphaned-check-runs'
 APP_SLUG='github-actions'
@@ -167,6 +171,17 @@ if [ "$#" -ne 4 ] || [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
   exit 2
 fi
 repo="$1" head_sha="$2" check_name="$3" reason="$4"
+
+# ALLOWLIST: repo and head_sha are interpolated into API paths, and check_name
+# into ::warning lines and summaries, so each must match a narrow shape before
+# any use. A value outside it is a wiring error (exit 2), never sanitized into
+# something else. check_name is also URL-encoded for the query string.
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+  || { echo "refusing repo '${repo//[^[:print:]]/?}': expected <owner>/<repo> of [A-Za-z0-9_.-]" >&2; exit 2; }
+[[ "$head_sha" =~ ^[0-9a-fA-F]{7,64}$ ]] \
+  || { echo "refusing head_sha '${head_sha//[^[:print:]]/?}': expected 7 to 64 hex digits" >&2; exit 2; }
+[[ "$check_name" =~ ^[A-Za-z0-9\ ._\(\)/:,+#-]{1,100}$ ]] \
+  || { echo "refusing check_name '${check_name//[^[:print:]]/?}': expected 1 to 100 of [A-Za-z0-9 ._()/:,+#-] (no control characters)" >&2; exit 2; }
 
 case "${STEP_RC:-}" in
   not-run*)
@@ -230,6 +245,13 @@ done
 
 work="$(mktemp -d -p "${RUNNER_TEMP:-${TMPDIR:-/tmp}}")" || give_up "mktemp failed, so no check run was read; orphaned check runs on this head will NOT be completed."
 trap 'rm -rf -- "$work"' EXIT
+# A job cancel sends SIGINT, then SIGTERM. Without these, bash defers an
+# untrapped SIGINT behind a foreground child that did not die of it and may
+# carry on, leaving $work (which holds curl's credential file) behind. exit
+# runs the EXIT trap above; the trap fires once the current call returns (at
+# most the per-call bound).
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The API client: gh when it is on PATH; otherwise curl with GH_TOKEN, making
 # the same REST calls. With neither, nothing can be read or completed.

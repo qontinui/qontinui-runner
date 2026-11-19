@@ -5947,7 +5947,10 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   (the dial governing the caller's OWN autonomy), `coord_pending_agent_questions`,
 ///   `coord_primary_tree_branch_status`, `coord_work_unit_overview`;
 /// * self-scoped or bounded writes — `coord_adopt_pr` (the PR adoption claim a
-///   fixer takes before acting on a PR it did not author),
+///   fixer takes before acting on a PR it did not author), `coord_child_slot`
+///   (the child slot a session takes before it starts a fixer subagent, keyed
+///   by its own proven identity; coord plan
+///   `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap` D2),
 ///   `coord_answer_agent_question` / `coord_withdraw_agent_question` (the
 ///   agent-audience queue's only consumers; neither can write `audience` or
 ///   erase an operator answer), `coord_operator_touch_classify` (append-only
@@ -6129,6 +6132,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_check_install_safety",
     "coord_check_publish_safety",
     "coord_check_repo_name",
+    "coord_child_slot",
     // Plan 2026-11-05-agent-github-reads-go-through-coord-not-the-shared-user-token
     // Phases 2b/2c (qontinui-coord#3824, #3825): a run's jobs and a failed
     // job's bounded log tail, read through coord's GitHub App installation
@@ -15936,6 +15940,7 @@ mod self_id_chain_tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -19380,6 +19385,30 @@ mod coord_mcp_body_gate_tests {
             gate(serde_json::json!({
                 "jsonrpc":"2.0","id":1,"method":"tools/call",
                 "params":{"name":tool,"arguments":{}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
+    }
+
+    /// `coord_child_slot` (coord plan
+    /// `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`
+    /// Phase 3) is on coord's device floor and must be forwarded: a session
+    /// whose proxy refuses it can start no fixer subagent at all (an
+    /// unreachable door fails closed to serial work). Mutation: drop it from
+    /// `COORD_MCP_ALLOWED_TOOLS`.
+    #[test]
+    fn child_slot_door_is_forwarded() {
+        let tool = "coord_child_slot";
+        assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+        assert!(
+            !coord_mcp_withholding_is_deliberate(tool),
+            "{tool} must not be both allowed and listed as a deliberate exclusion"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{"action":"acquire"}}
             }))
             .is_ok(),
             "{tool} must be callable through the proxy"

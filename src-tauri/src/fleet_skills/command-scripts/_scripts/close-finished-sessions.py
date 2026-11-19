@@ -1827,6 +1827,12 @@ def selftest():
     if sorted(subtree({1: (2, []), 2: (1, [])}, 1)) != [1, 2]:
         bad.append("subtree does not terminate on a parent cycle")
     empty, prompt_cases = EMPTY_PROMPT_SCREEN, 0
+    # The box-less walk back's shapes (the input row is row 18, its marker at column 1): `n` markers on OTHER rows
+    # (rows 2 to n + 1, each with text after it), and the row's own marker re-emitted alone.
+    reemit = "\x1b[18;1H\u276f\xa0"
+
+    def other_rows(n):
+        return "".join(f"\x1b[{r};1H\u276f old" for r in range(2, n + 2))
     for raw, want in [(empty, "empty"),
                       ("\x1b[26;1H\r\x1b[2B\x1b[39m\u276f\xa0\x1b[2mrun /vet-imp on the plan\r\x1b[47C\x1b[22m"
                        "\x1b[K\x1b[30;1H\x1b[28;3H\x1b[?25h", "empty"),
@@ -1850,6 +1856,20 @@ def selftest():
                       # the sticky header repeats the last prompt on a grey background after the input row
                       (empty + "\x1b[?25l\x1b[H\x1b[48;5;237m\x1b[38;5;239m\u276f run /babysit-prs #1\x1b[39m"
                        "\x1b[49m\x1b[20;1H\x1b[18;3H\x1b[?25h", "empty"),
+                      # controls: the row's own marker re-emitted with nothing typed is still empty, however often it
+                      # was redrawn (16 older draws of its cell is the last the walk back steps through) and however
+                      # many other rows' markers stand between (8 is the last it steps past); the first one past
+                      # each bound reads unknown, or text where the replay it reached shows some, below
+                      (empty + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + "\x1b[?25l" + reemit * 8 + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + "\x1b[?25l" + reemit * 16 + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + other_rows(1) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + other_rows(8) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      # a marker drawn right of the row's own and then erased is no typed marker to adopt
+                      ("\x1b[18;9H\u276f \x1b[18;9H\x1b[K\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      # ...and eight of them, drawn and erased on the input row, are the last the walk back steps past
+                      (empty + "\x1b[?25l" + ("\x1b[18;9H\u276f\x1b[18;9H\x1b[K") * 8 + reemit + "\x1b[18;3H\x1b[?25h",
+                       "empty"),
                       (empty + "\x1b[?25l", "unknown"), ("no prompt here", "unknown")]:
         prompt_cases += 1
         if prompt_state(raw, cols=None)[0] != want:
@@ -1913,35 +1933,94 @@ def selftest():
         (idle_c + f"\x1b[?25l\x1b[3;3Hsee {mk} \x1b[3;9H\x1b[?25h", w),  # the same, typed after the frame
         # no box on the screen: the leftmost marker on the row is the row's own
         (empty + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", None),
+        # ...found by walking back past a marker on ANOTHER row (the walk back used to stop at it, and the typed
+        # marker was then read as the row's own: nothing right of it, the caret two columns on). Seven such rows
+        # make the row's own marker the eighth step, the last one the walk back may take.
+        (empty + other_rows(1) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", None),
+        (empty + other_rows(7) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", None),
+        # ...and back over older draws at the same row and column: the row's own marker re-emitted alone after a
+        # draft, the caret sent Home and two columns on, leaves the draft before the replay's start (once, 3, 8
+        # and 16 times, the last the walk back steps through)
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit + "\x1b[18;3H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 3 + "\x1b[18;3H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 8 + "\x1b[18;3H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 16 + "\x1b[18;3H\x1b[?25h", None),
+        # both at once: a draft ending in a typed marker, another row's marker, the row's own marker re-emitted
+        (empty + f"\x1b[?25l\x1b[18;3Hsee {mk} " + other_rows(1) + reemit + "\x1b[18;3H\x1b[?25h", None),
+        # eight markers typed into the row: with the row's own, the eighth step and the last one allowed
+        (empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 8 + "\x1b[18;19H\x1b[?25h", None),
+        # a bound stops the walk where it is, but the read goes on from the marker reached, so a draft that replay
+        # shows is still text: typed after 17 redraws of the row's own marker (the 17th older draw is the bound),
+        # or after 9 other rows' markers (the 9th is), and 9 or 10 markers typed into the row (the row's own is
+        # then the 9th step, and the bound)
+        (empty + "\x1b[?25l" + reemit * 17 + "\x1b[18;3Hhello world\x1b[?25h", None),
+        (empty + other_rows(9) + "\x1b[?25l" + reemit + "\x1b[18;3Hhello world\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 9 + "\x1b[18;21H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 10 + "\x1b[18;23H\x1b[?25h", None),
         # a second input row that starts with a typed marker, caret after it: only a marker directly
         # under a rule line is the box's
         (scrolled.replace(box_input, box_input + f"\r\n{mk} \x1b[K", 1).replace("\x1b[4;3H", "\x1b[5;3H"), w)]
+    d_redrawn, d_rows, d_typed = ("prompt marker redrawn too often to rule a draft out",
+                                  "prompt markers other than the row's own",
+                                  "prompt markers typed into the input row")
     for raw, cols in drafts:
         prompt_cases += 1
-        if prompt_state(raw, cols=cols)[0] != "text":
-            bad.append(f"a draft read {prompt_state(raw, cols=cols)}, want text: cols={cols} {raw[-90:]!r}")
-    # Ten markers typed into the row of a screen with no box: the walk back to the row's own marker
-    # stops after BOX_SEARCH_MARKS steps and reads text.
-    prompt_cases += 1
-    got = prompt_state(empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 10 + "\x1b[18;23H\x1b[?25h", cols=None)
-    if got != ("text", "prompt markers typed into the input row"):
-        bad.append(f"ten typed markers read {got}, want text: prompt markers typed into the input row")
+        got = prompt_state(raw, cols=cols)
+        # a draft is read off the screen: a bound's own detail never stands in for one (the typed-marker cap
+        # returned text with its detail, whatever the replay it reached showed)
+        if got[0] != "text" or got[1] in (d_redrawn, d_rows, d_typed):
+            bad.append(f"a draft read {got}, want text from the screen: cols={cols} {raw[-90:]!r}")
+    # Past a bound the read goes on from the marker the walk reached, and a replay that shows no text may start
+    # after a draft: it reads unknown, not empty (it read empty before), with the bound as its detail. Each of
+    # these is the first case past the last one allowed above: nine other rows' markers before the row's own
+    # re-emitted one (its 9th step), 17 draws of its cell, 8 other rows' markers before a typed marker (the row's
+    # own is then the 9th step, a typed one) and 9 of them, a draft re-emitted over 17 times, and nine markers
+    # drawn and erased right of the row's own (they are on the input row, not on another one).
+    for raw, want in [(empty + other_rows(9) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", d_rows),
+                      (empty + "\x1b[?25l" + reemit * 17 + "\x1b[18;3H\x1b[?25h", d_redrawn),
+                      (empty + other_rows(8) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", d_typed),
+                      (empty + other_rows(9) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", d_rows),
+                      (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 17 + "\x1b[18;3H\x1b[?25h", d_redrawn),
+                      (empty + "\x1b[?25l" + ("\x1b[18;9H" + mk + "\x1b[18;9H\x1b[K") * 9 + reemit
+                       + "\x1b[18;3H\x1b[?25h", d_rows)]:
+        prompt_cases += 1
+        got = prompt_state(raw, cols=None)
+        if got != ("unknown", want):
+            bad.append(f"a bound read {got}, want unknown: {want}: {raw[-90:]!r}")
+
+    def placements(raw, cols):
+        """(prompt_state's read of `raw`, how many markers it had _place_mark place)."""
+        asked, real_place = [], _place_mark
+        globals()["_place_mark"] = lambda raw, i, cols, anchors: asked.append(i) or real_place(raw, i, cols, anchors)
+        try:
+            return prompt_state(raw, cols=cols), len(asked)
+        finally:
+            globals()["_place_mark"] = real_place
     # The box search replays at most BOX_SEARCH_MARKS (8) markers, however often a dialog is
-    # redrawn (each older marker costs a replay of the rest of the window), then reads as before:
-    # 10 placements in all, with the fallback's own and its one look at the marker before it.
-    # Literal numbers, so raising the bound fails here too.
-    redrawn = ("\x1b[?25l\x1b[16;1H" + "\u2500" * w + "\x1b[17;1HDo you want to proceed?\x1b[K\x1b[18;1H"
-               "\u276f 1. Yes\x1b[K\x1b[19;1H   2. No\x1b[K\x1b[18;3H\x1b[?25h") * 40
+    # redrawn (each older marker costs a replay of the rest of the window), then the walk back goes on:
+    # 26 placements in all, the box search's 8, the fallback's own, up to SAME_CELL_DRAWS (16) older draws
+    # of that same cell stepped back through (counted apart from the other steps), and the one past that
+    # bound, which stops the walk. The replay it reached still shows the dialog's selection line, so the
+    # read stays text, as it was at 10 placements while the walk back stopped at the first marker that was
+    # not a typed one. 17 draws are the last case with no bound (16 older ones); 18 and 40 are past it.
+    # Literal numbers, so raising either bound fails here too.
+    dialog = ("\x1b[?25l\x1b[16;1H" + "\u2500" * w + "\x1b[17;1HDo you want to proceed?\x1b[K\x1b[18;1H"
+              "\u276f 1. Yes\x1b[K\x1b[19;1H   2. No\x1b[K\x1b[18;3H\x1b[?25h")
+    for n_draws in (17, 18, 40):
+        prompt_cases += 1
+        got, n_placed = placements(dialog * n_draws, w)
+        if got != ("text", "1.Yes") or n_placed > 26 or BOX_SEARCH_MARKS != 8 or SAME_CELL_DRAWS != 16:
+            bad.append(f"a dialog redrawn {n_draws} times read {got} after {n_placed} placements with "
+                       f"BOX_SEARCH_MARKS {BOX_SEARCH_MARKS} and SAME_CELL_DRAWS {SAME_CELL_DRAWS}, want text "
+                       "'1.Yes' after at most 26, with 8 and 16")
+    # A window that starts mid-screen holds markers before any absolute cursor position, which cannot be placed.
+    # None older than the first of them can either, so the walk back stops there: 10 placements in all (the box
+    # search's 8, the fallback's own, and that first one), not one more per marker left in the window.
     prompt_cases += 1
-    placed, real_place = [], _place_mark
-    globals()["_place_mark"] = lambda raw, i, cols, anchors: placed.append(i) or real_place(raw, i, cols, anchors)
-    try:
-        got = prompt_state(redrawn, cols=w)
-    finally:
-        globals()["_place_mark"] = real_place
-    if got[0] != "text" or len(placed) > 10 or BOX_SEARCH_MARKS != 8:
-        bad.append(f"a dialog redrawn 40 times read {got} after {len(placed)} placements with BOX_SEARCH_MARKS "
-                   f"{BOX_SEARCH_MARKS}, want text after at most 10, with 8")
+    got, n_placed = placements("\u276f " * 12 + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", None)
+    if got != ("empty", "") or n_placed > 10:
+        bad.append(f"12 markers before any cursor position read {got} after {n_placed} placements, want empty "
+                   "after at most 10")
     # The width is required, by keyword: a caller that omits it fails, never misreads (D3).
     for args in ((empty,), (empty, None), (empty, w)):
         prompt_cases += 1
@@ -2079,6 +2158,12 @@ def stranded_cases(bad):
         # a finish its final message contradicts, on both arms
         (marker, {"sessionStatus": "finished"}, remains, "CONTRADICTED", "finish_stranded.phrase_veto"),
         ({}, cf, remains, "CONTRADICTED", "finish_stranded.phrase_veto"),
+        # ...and on coord's finish with no usable time: the veto reads the message, not the time
+        ({}, {"sessionStatus": "finished"}, remains, "CONTRADICTED", "finish_stranded.phrase_veto"),
+        ({"finished": True, "finishedAt": None}, {"sessionStatus": "finished"}, remains, "CONTRADICTED",
+         "finish_stranded.phrase_veto"),
+        (marker, {"sessionStatus": "finished"}, dict(remains, last_asst=now - 30 * m, last_activity=now - 30 * m),
+         "CONTRADICTED", "finish_stranded.phrase_veto"),
         # a runner mark coord's readable status does not confirm
         (marker, {"sessionStatus": "waiting_human"}, base, "CONTRADICTED", "finish_stranded.coord_status"),
         (marker, {"sessionStatus": "working"}, base, "CONTRADICTED", "finish_stranded.coord_status"),
@@ -2089,7 +2174,8 @@ def stranded_cases(bad):
         (marker, {"sessionStatus": "finished"}, worked, "REVIVED", None),
         # a turn inside coord's 1 s stamp band: close keeps it, nudge holds it
         ({}, dict(cf, sessionStatusSince=lp + 500), base, "REVIVED", "finish_stranded.in_band"),
-        # no code: no finish signal, a revival by a prompt, a closable row, coord's finish with no time
+        # no code: no finish signal, a revival by a prompt, a closable row, coord's finish with no time (and a
+        # reply that does not say work remains: one that does is the veto above)
         ({}, {"sessionStatus": "working"}, remains, "ACTIVE", None),
         ({}, dict(cf, sessionStatusSince=lp - 5000), base, "REVIVED", None),
         ({"finished": True, "finishedAt": lp - 5000}, {"sessionStatus": "finished"}, base, "REVIVED", None),
@@ -2119,6 +2205,12 @@ def stranded_cases(bad):
             got, why = classify(term, dict(row, claudeSessionId="s1"), {10: (1, ["bash"])}, 15, "", {"s1": rp})
             n += 1
             lines = [w for w in why if w.startswith("finish_stranded.")]
+            # A phrase_veto row opens with the contradiction itself: evidence that rides along (the kept-working
+            # line of a finish only work reopened) follows it and never leads it. Keyed on the code the row
+            # carries, so a row the check below already fails is not reported twice.
+            if (stranded_code(why) == "finish_stranded.phrase_veto"
+                    and "but the final message says work remains" not in why[0]):
+                bad.append(f"stranded: first reason of a phrase_veto row must state the contradiction: {why}")
             if got != want or stranded_code(why) != code or len(lines) != (1 if code else 0):
                 bad.append(f"stranded: classify(row={row}, readiness={rp}, final={tx['final_text'][:24]!r}) = "
                            f"{got} code {stranded_code(why)!r} {why}; want {want} code {code!r}")
@@ -2286,6 +2378,37 @@ def finish_time_cases(bad):
         # a finish whose own final message says work remains is contradicted (plan Phase 6), never closed
         ({}, at(after), dict(base, final_text="The deploy is still running; I'll check it in an hour."),
          "CONTRADICTED", ("coord session_status=finished (", "but the final message says work remains")),
+        # ...and so is a finish with no usable time: the time only dates a REOPENING, which is another question, so a
+        # reply that says work remains needs none. These shapes read ACTIVE here, and /nudge-stopped-sessions held
+        # them (an unconfirmed finish), so nothing owned them: coord-only, coord-only beside a stamp that is no time
+        # (a float), a mark with no usable time beside it, and a timed mark that only work past it reopened (its
+        # reasons keep the kept-working line).
+        ({}, cf, dict(base, final_text="The deploy is still running; I'll check it in an hour."), "CONTRADICTED",
+         ("coord session_status=finished (no finish time", "but the final message says work remains",
+          "finish_stranded.phrase_veto")),
+        ({}, cf, dict(base, final_text=no), "CONTRADICTED", ("no finish time", "says work remains (not safe to close)")),
+        ({}, dict(cf, sessionStatusSince=float(after)), dict(base, final_text=no), "CONTRADICTED",
+         ("no finish time", "says work remains (not safe to close)")),  # a float stamp is no usable time
+        ({"finished": True, "finishedAt": None}, cf, dict(base, final_text=no), "CONTRADICTED",
+         ("no finish time", "says work remains (not safe to close)", "!no usable time either")),
+        ({"finished": True, "finishedAt": after}, cf, dict(base, final_text="Still running; I'll check it later.",
+                                                           last_asst=now - 30 * m, last_activity=now - 30 * m),
+         "CONTRADICTED", ("no finish time", "says work remains", "kept working", "!then prompted")),
+        # ...but a TIMED mark that nothing reopened keeps its marker-dated contradiction: the undated arm falls
+        # through to the dated test, so the reason names the mark's time and never a missing finish time. This pin
+        # fails if the undated verdict is returned ahead of that test (the verdict is the same either way, the
+        # reason text is not).
+        (mark, cf, dict(base, final_text="The deploy is still running; I'll check it in an hour."), "CONTRADICTED",
+         ("runner finished marker (", "says work remains", "!no finish time")),
+        # ...and a reopening a time CAN date outranks the contradiction: a prompt or a turn opener after a timed
+        # runner mark beside coord's untimed finish is a revival (a reopened finish is no contradiction), so such a
+        # reply reads ACTIVE as it did (controls: the same at the base)
+        (marker, cf, dict(base, final_text=no), "ACTIVE", ("final message says work remains", "!contradicts")),
+        (marker, cf, dict(base, final_text=no, last_turn_open=now - 30 * m, last_turn_open_text=wake,
+                          last_prompt=before - m), "ACTIVE", ("final message says work remains", "!contradicts")),
+        # a trusted /unattended report keeps its relaxed wording: no veto, so no contradiction either (control)
+        (ua, cf, dict(hedgy, final_text="PR #3 landed.\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; "
+                                        "hand-off declared for 1."), "FINISHED", ("runner finished marker (", "!remains")),
         ({}, at(now - 40 * m), dict(base, last_prompt=now - 50 * m), "ACTIVE", "has no reply"),
         # a turn 30m after coord's stamp with no prompt and no closeout keeps it open (finished-criteria cond. 4)
         ({}, at(after), dict(base, last_asst=now - 30 * m, last_activity=now - 30 * m), "REVIVED",
@@ -2488,9 +2611,12 @@ def finish_time_cases(bad):
         (dict(ua, finishedAt=before), {}, hedgy, "ACTIVE", "says work remains"),
         (ua, at(before), hedgy, "ACTIVE", "says work remains"),  # coord's stamp predates the prompt
         (ua, cf, dict(hedgy, last_turn_open=now - 40 * m, last_turn_open_text=wake), "ACTIVE", "says work remains"),
-        # kept working 30m past the mark: never trusted, closeout phrase or not
+        # kept working 30m past the mark: never trusted, closeout phrase or not. With no closeout in the reply only
+        # that work reopened it, and coord's finish has no usable time, so a reply that says work remains
+        # contradicts the finish, and the reasons keep the kept-working line (it read ACTIVE while the undated arm
+        # returned unconfirmed first)
         (ua, cf, dict(hedgy, final_text="PR #3 is pushed; its checks are still running.", last_asst=now - 30 * m,
-                      last_activity=now - 30 * m), "ACTIVE", "says work remains"),
+                      last_activity=now - 30 * m), "CONTRADICTED", ("says work remains", "kept working")),
         (ua, cf, dict(hedgy, last_asst=now - 30 * m, last_activity=now - 30 * m), "CONTRADICTED", "says work remains"),
         (ua, {"sessionStatus": "working", "sessionStatusSince": now - 30 * m}, hedgy, "CONTRADICTED", "says work remains"),
         (dict(ua, finishedAt=None), {}, hedgy, "ACTIVE", "says work remains"),
@@ -2889,7 +3015,10 @@ def limit_menu_cases(bad):
     no cursor-show, so they reach only its no-cursor branch; LIMIT_MENU_RAW,
     its cursor shown beside the option mark, reaches its input-row reading and
     must not read empty. LIMIT_MENU_RAW_DIM does read empty there, so both raw
-    screens must read as an open menu, which ready_to_type refuses by itself.
+    screens must read as an open menu, which ready_to_type refuses by itself. Four
+    more cells run the same classify() over screens whose prompt read reaches a
+    bound: two whose replay shows no text are BUSY on "input prompt not read" with
+    the bound's detail, and two whose replay shows text are BUSY on that text.
     Appends failures; returns the count."""
     now = time.time() * 1000
     m = 60000
@@ -2981,11 +3110,11 @@ def limit_menu_cases(bad):
         ("the menu over a live tool shell", LIMIT_MENU_SCREEN, None, base, [12], "BUSY",
          ("tool shell(s) running", "!" + said)),
         ("the waiting spinner with no menu", spinner + "\r" + note, None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
         ("the waiting spinner while a turn runs", spinner + "\u2026 (esc to interrupt)", None, base, [], "BUSY",
          ("running turn", "!" + said)),
         ("a menu left in scrollback", LIMIT_MENU_SCREEN + "\r\u276f ", None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
         ("a menu followed by a reply", unbordered + "\n\u25cf Resumed.", None, base, [], "BUSY", ("!" + said,)),
         ("a spinner frame above the menu", "\u2722 Forging\u2026 (esc to interrupt)\r" + LIMIT_MENU_SCREEN, None, base,
          [], "LIMITED", (said, "!running turn")),
@@ -3007,12 +3136,32 @@ def limit_menu_cases(bad):
          dict(base, final_text="You've hit your weekly limit \u00b7 resets Nov 18, 9pm"), [], "LIMITED",
          ("usage limit mid-work", said)),
         ("an older menu above a later dialog on the same key hint", later_dialog, None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
         ("the menu with its spaces dropped", spaceless, None, base, [], "LIMITED", (said,)),
         ("a border 1000 cells wide", LIMIT_MENU_SCREEN + "\u2594" * 925, None, base, [], "LIMITED", (said,)),
         ("a limit option further than MENU_SPAN above the key hint", far, None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
     ]
+    # A walk back that reaches a bound goes on to read the replay it reached. One that shows no text may start after
+    # a draft, so its row is BUSY because the prompt was not read, with the bound's own detail (Phase 3 of the plan
+    # that added the bounds audits by it), not because there was "text at the input prompt". One that shows text is
+    # BUSY on that text, as it was before the bounds. The screens are prompt_state's bound cases, through the same
+    # classify().
+    mk, reemit = PROMPT_MARK, "\x1b[18;1H" + PROMPT_MARK + "\xa0"
+    seen_text = "text at the input prompt (unsent draft or a dialog): 'cursor at row 18"
+    cases += [(case, EMPTY_PROMPT_SCREEN + body, None, base, [], "BUSY", frags + ("!" + said,))
+              for case, body, frags in (
+                  ("a marker redrawn 17 times, nothing typed", "\x1b[?25l" + reemit * 17 + "\x1b[18;3H\x1b[?25h",
+                   ("input prompt not read: prompt marker redrawn too often to rule a draft out",
+                    "!text at the input prompt")),
+                  ("nine other rows' markers before the row's own, nothing typed",
+                   "".join(f"\x1b[{r};1H{mk} old" for r in range(2, 11)) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h",
+                   ("input prompt not read: prompt markers other than the row's own", "!text at the input prompt")),
+                  ("ten markers typed into the row", "\x1b[?25l\x1b[18;3H" + f"{mk} " * 10 + "\x1b[18;23H\x1b[?25h",
+                   (seen_text, "!input prompt not read")),
+                  ("a draft typed after 17 redraws of the row's own marker",
+                   "\x1b[?25l" + reemit * 17 + "\x1b[18;3Hhello world\x1b[?25h",
+                   (seen_text, "!input prompt not read")))]
     # The span from the option to the hint grows with the width before HSPACE_RUN is
     # read as one space (1163 characters at 300 columns, 1203 at 310), and not after.
     cases += [(f"a {cols}-column pane, every row written full-width", limit_menu_full_width(cols), None, base, [],
@@ -3949,8 +4098,23 @@ RULE_CHARS = "\u2500\u2501"  # the cells of the input box's two rule lines
 # How many markers not drawn on a background the input-box search replays,
 # newest first. Every frame redraws the box's marker, so it is among the newest
 # few; past them the box is not on screen, and each older marker costs a replay
-# of the rest of the window, which a dialog redrawn many times makes slow.
+# of the rest of the window, which a dialog redrawn many times makes slow. The
+# fallback's walk back to the row's own marker counts against the same cap each
+# marker it steps past or onto that is not an older draw of one cell: a marker on
+# another row or further right on the row (stepped past), or one typed into the
+# input row (stepped onto).
 BOX_SEARCH_MARKS = 8
+# How many older draws of the SAME cell (row and column) the fallback walk back
+# steps back through, counted apart from the markers above. The row's own marker
+# is re-emitted alone after a draft with the caret sent Home, so the draft lies
+# before the replay's start, and only an older draw of that cell starts the replay
+# early enough. Each costs one anchor-to-marker replay, not a window replay. Past
+# the bound the read goes on from the marker reached: text it shows is still text,
+# and an empty replay, which may start after a draft, reads unknown. The plan that
+# set it (2026-11-18-triage-sessions-untimed-contradicted-finish-and-hidden-prompt-draft)
+# reports a longest run of 7 draws of one cell on 84 live panes (2026-11-10), so it
+# is 16, twice BOX_SEARCH_MARKS.
+SAME_CELL_DRAWS = 2 * BOX_SEARCH_MARKS
 
 
 def on_background(raw, i):
@@ -4007,7 +4171,15 @@ def prompt_state(raw, *, cols):
     a bare screen, a box drawn before the window), the last `\u276f` not drawn on
     a background is read instead, as before the box was looked for. Either way a
     `\u276f` with another `\u276f` left of it on its row is text typed into that row,
-    not the row's own marker: the leftmost is read.
+    not the row's own marker, so the row's own is the leftmost one on its row. The
+    box-less walk back finds that one rather than assuming it: it steps past a
+    `\u276f` on another row (counted toward BOX_SEARCH_MARKS, as is each typed one it
+    steps onto) and back over older draws of the `\u276f` at the same row and column
+    (up to SAME_CELL_DRAWS, counted apart), so a draft typed after another row's
+    `\u276f`, or before the row's own `\u276f` was re-emitted alone with the cursor sent
+    Home, stays inside the replay. Past either bound the read goes on from the
+    `\u276f` the walk has reached: text it shows is still "text", and an empty replay,
+    which may start after a draft, reads "unknown", never "empty".
 
     The prompt is empty only when BOTH hold on that `\u276f`:
     1. the visible cursor sits on its row, two columns right of it (an empty
@@ -4048,19 +4220,41 @@ def prompt_state(raw, *, cols):
     if placed is None:
         return "unknown", "no absolute cursor position before the prompt"
     # A marker typed into the input row is drawn right of the row's own: an older
-    # marker on the same row, further left. The leftmost one is read.
-    for steps, i in enumerate(marks_before(last)):
+    # marker on the same row, further left. The leftmost one is read. The walk back
+    # steps onto that one, steps past a marker on another row (or further right on
+    # the row), and steps back to an older draw at the same row and column. The
+    # first two count toward BOX_SEARCH_MARKS; the draws of one cell are counted
+    # apart, up to SAME_CELL_DRAWS, so a draft the row's own marker was re-emitted
+    # after stays inside the replay. A bound stops the walk where it is, and the read
+    # goes on from the marker reached: text it shows is still text, but an empty
+    # replay may start after a draft, so it reads unknown, never empty.
+    steps = draws = 0
+    bound = None  # what stopped the walk short of the row's own marker, if a bound did
+    for i in marks_before(last):
         older = _place_mark(raw, i, cols, anchors)
-        if older is None or older[1] != placed[1] or older[2] >= placed[2]:
+        if older is None:
+            break  # no absolute position before it, so none before it has one either
+        if older[1:] == placed[1:]:
+            draws += 1
+            if draws > SAME_CELL_DRAWS:
+                bound = "prompt marker redrawn too often to rule a draft out"
+                break
+            last, placed = i, older
+            continue
+        steps += 1
+        typed = older[1] == placed[1] and older[2] < placed[2]
+        if steps > BOX_SEARCH_MARKS:
+            bound = ("prompt markers typed into the input row" if typed
+                     else "prompt markers other than the row's own")
             break
-        if steps == BOX_SEARCH_MARKS:
-            return "text", "prompt markers typed into the input row"
-        last, placed = i, older
+        if typed:
+            last, placed = i, older
     cur, mrow, mcol = placed
     cur.feed(raw[last:show])
     low = _lower_rule(_rule_rows(cur), mrow)
     # With no rule below, the rows under the marker are status lines, not input.
-    return _read_input(cur, mrow, mcol, range(mrow, low) if low is not None else (mrow,))
+    state, seen = _read_input(cur, mrow, mcol, range(mrow, low) if low is not None else (mrow,))
+    return ("unknown", bound) if bound and state == "empty" else (state, seen)
 
 
 def _place_mark(raw, i, cols, anchors):
@@ -6314,7 +6508,8 @@ def finish_hits(row, rp, tx, now_ms=None):
 BAND_MS = 1000  # a turn-opening record within 1 s of coord's stamp is the stamp's own band
 KEPT_WORKING_MS = 10 * 60000  # assistant work this far past a finish, with no closeout, reopened it
 # finish_state's answer: `state` one of FINISH_STATES, `at` the finish time judged against (unix ms; None when
-# unconfirmed), `by` whose time that is ("coord" or "marker"; None when unconfirmed), `why` the reasons.
+# unconfirmed, or contradicted by a reply with no finish time to judge it against), `by` whose time that is
+# ("coord" or "marker"; None in the same two cases), `why` the reasons.
 # `rule`, when set, names the screen rule that holds a finish the row's structured signal states (STRANDED_CODES),
 # or is `untimed_mark` on an `unconfirmed` finish neither coord nor the runner mark can date (not a stranded code).
 Finish = collections.namedtuple("Finish", "state at by why rule", defaults=(None,))
@@ -6384,10 +6579,12 @@ def finish_state(row, rp, tx, now_ms, hits=None):
 
       unconfirmed   coord says finished with no usable time, and no runner mark
                     settles it: there is none, its finishedAt is unusable, or
-                    only work past it reopened it. Nothing says that finish is
-                    wrong, and nothing dates it. (A prompt or turn opener after a
-                    TIMED mark is `revived` instead, by="marker": condition 4
-                    cannot be ruled out against an untimed coord finish.)
+                    only work past it reopened it. Its final message does not
+                    say work remains (one that does is `contradicted`, below),
+                    so nothing says that finish is wrong, and nothing dates it.
+                    (A prompt or turn opener after a TIMED mark is `revived`
+                    instead, by="marker": condition 4 cannot be ruled out
+                    against an untimed coord finish.)
       revived       after the finish time a real prompt arrived, or any record
                     that opens a turn (last_turn_open: a Session Bus delivery, a
                     /loop or ScheduleWakeup wake, a task notification), or
@@ -6400,8 +6597,16 @@ def finish_state(row, rp, tx, now_ms, hits=None):
       contradicted  none of those, but the final message carries a well-formed
                     No or a work-remains phrase (phrase_hits' negatives), or
                     coord's readable session_status is not finished while the
-                    runner mark says finished. close never closes it; nudge sends
-                    /next-move, which reconciles the two signals.
+                    runner mark says finished. The message needs no finish time
+                    to contradict a finish, so it does so dated or not: coord's
+                    finished with no usable time (no runner mark, a mark with no
+                    usable finishedAt, or one only work past it reopened) beside
+                    such a message is contradicted too, with at and by None (and
+                    the kept-working line in its reasons when work reopened it).
+                    A prompt or turn opener after a TIMED mark is still
+                    `revived` (a reopened finish is no contradiction). close
+                    never closes it; nudge sends /next-move, which reconciles
+                    the two signals.
       finished      none of the above.
 
     `rule` names the screen rule that holds a finish its structured signal
@@ -6411,9 +6616,12 @@ def finish_state(row, rp, tx, now_ms, hits=None):
     has none: the session was reopened, not held. classify_row adds it to the
     row only when the finish signal was positively read (stranded_line).
     `untimed_mark` tags an unconfirmed finish where coord serves no usable
-    time and the runner mark has no usable finishedAt either; classify_row
-    reads it UNKNOWN. It is not a stranded code: a missing time is an unknown
-    input, not a detector hit."""
+    time and the runner mark has no usable finishedAt either, and whose final
+    message does not say work remains (one that does is contradicted, rule
+    phrase_veto, first); classify_row reads it UNKNOWN. It is not a stranded
+    code: a missing time is an unknown input, not a detector hit. The
+    contradicted finish with no time does carry phrase_veto, though: the
+    message was read even though the time was not."""
     row, rp, tx = row or {}, rp or {}, tx or {}
     status = rp.get("sessionStatus")
     marked = bool(row.get("finished"))
@@ -6436,14 +6644,24 @@ def finish_state(row, rp, tx, now_ms, hits=None):
     if status == "finished" and since is None:
         untimed = "coord session_status=finished (no finish time to compare a revival against)"
         mat = marker_at(row) if marked else None
+        # A reply that says work remains contradicts a finish whether or not the finish is dated
+        # (plan 2026-11-18-triage-sessions-untimed-contradicted-finish-and-hidden-prompt-draft
+        # Phase 2): the time only dates a REOPENING, which is another question. `remains` stands
+        # in for each unconfirmed return below and for nothing else. A prompt or turn opener after
+        # a TIMED mark is still the revival (a reopened finish is no contradiction), and a timed
+        # mark nothing reopened falls through to the dated contradiction, whose reason names the
+        # mark's time. /next-move reconciles it.
+        remains = Finish("contradicted", None, None,
+                         [f"{untimed}, but the final message says work remains ({neg[0]})"], "phrase_veto") if neg else None
         if marked and mat is None:
             # A runner mark with no usable finishedAt beside coord's untimed finish: no
             # time on either side dates any turn, so a reopening can be neither claimed
             # nor ruled out. Unconfirmed, tagged untimed_mark: close reads it UNKNOWN
-            # (never closed), nudge holds it.
-            return Finish("unconfirmed", None, None,
-                          [untimed, "its runner finish mark has no usable time either, so no turn can be dated "
-                                    "against either finish"], "untimed_mark")
+            # (never closed), nudge holds it. Unless the reply says work remains: that
+            # needs no time, so `remains` is returned instead.
+            return remains or Finish("unconfirmed", None, None,
+                                     [untimed, "its runner finish mark has no usable time either, so no turn can be "
+                                               "dated against either finish"], "untimed_mark")
         reopened = _reopened(tx, mat, "marker", pos) if marked else None
         if reopened and reopened[0] in ("prompt", "turn"):
             # A prompt or turn opener after the runner mark, and coord's finish carries no
@@ -6455,6 +6673,10 @@ def finish_state(row, rp, tx, now_ms, hits=None):
                           [f"coord session_status=finished with no finish time, and the session was reopened after "
                            f"its runner finish mark: {reopened[1]}"])
         if not marked or reopened:
+            if remains:
+                # A reopening by work alone (a prompt or turn opener returned above) rides along in the
+                # reasons, as it does on the unconfirmed return below: the reply decides the verdict.
+                return remains._replace(why=remains.why + ([reopened[1]] if reopened else []))
             return Finish("unconfirmed", None, None, [untimed] + ([reopened[1]] if reopened else []))
     reopened = _reopened(tx, at, by, pos)
     if reopened:
@@ -6493,7 +6715,11 @@ def finish_state(row, rp, tx, now_ms, hits=None):
 # fires no code: an unreadable transcript or screen never reaches a coded arm
 # (UNKNOWN / BUSY first), a mark with no usable time and coord's finish with no
 # time (unconfirmed) code nothing, and screen_all drops every code when the
-# readiness read failed (coded_row).
+# readiness read failed (coded_row). One undated finish does carry a code (plan
+# 2026-11-18-triage-sessions-untimed-contradicted-finish-and-hidden-prompt-draft
+# Phase 2): coord's finished with no usable time whose final message says work
+# remains is contradicted, and phrase_veto codes it, because the message was
+# read even though the time was not.
 STRANDED_CODES = ("phrase_veto", "kept_working", "coord_status", "in_band")
 STRANDED_HOLDS = {
     "phrase_veto": "a finish its own final message contradicts (work remains): never closed",
@@ -6713,7 +6939,9 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
         if state == "text":
             busy.append(f"text at the input prompt (unsent draft or a dialog): {typed[:50]!r}")
         elif state == "unknown":
-            busy.append("input prompt not found on screen")
+            # The detail says which: no prompt or cursor on the screen, or a walk-back bound past which an
+            # empty replay left a draft unruled out (a bound whose replay shows text reads as text, above).
+            busy.append(f"input prompt not read: {typed}")
     coord_finished = rp.get("sessionStatus") == "finished"
     if busy:
         if finished or coord_finished:

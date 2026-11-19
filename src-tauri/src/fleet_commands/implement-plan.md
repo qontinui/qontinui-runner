@@ -3194,6 +3194,10 @@ on — the manual call is the fallback for unwrapped machines and stays harmless
 everywhere (same match keys, best-effort oplog). Never `--no-verify` to bypass
 the hook — that defeats both the hook and the supervision signal.
 
+**Before every push that moves the head**, run the repository's pre-push stage
+when this checkout does not — see "Run the repository's pre-push stage when this
+checkout does not", beside Step 4.5's re-review rule.
+
 #### Step 4.3: Fold in open follow-ups on the files this diff touches
 
 *(Plan `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
@@ -3566,7 +3570,11 @@ and the task goals go under that same line**, as a path or a read command, never
 as text in the brief: they say what the change is FOR, which is exactly what
 Pass A judges without. Any review-focus text above the line names only WHAT to
 check (files, properties, failure shapes), never the plan's goals or the rules
-it sets. The repo standards (CLAUDE.md, the best-practices
+it sets. When the diff adds a name to a body this repository distributes to
+other machines (a bundled command, skill or agent), name that failure shape in
+the review focus: the repository's portability allowance for the new name, with
+a reason, and a regenerated portability census belong in the same diff. The repo
+standards (CLAUDE.md, the best-practices
 files) stay above it; they say nothing about this change. Tell the reviewer what the
 record's own THREAT MODEL says it cannot catch: `prove` is a control against
 honest mistakes, not against a constructed shadow (a `cfg` twin, a module no
@@ -4322,7 +4330,7 @@ and a retracted item would otherwise linger) and push the edited body over REST,
 then read it back:
 
 ```bash
-gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@$PR_BODY"
+bash <workspace-root>/qontinui-claude-config/scripts/pr-body-publish.sh <owner>/<repo> <n> "$PR_BODY"   # refuses an empty/collapsed body, reads it back
 gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep -F "Coord-Handoff-Head: $(git -C "$WORKTREE" rev-parse HEAD)"   # read back the NEW head
 ```
 
@@ -4351,6 +4359,21 @@ it as observed by coord or web. The read-back of that write is the evidence.
 When the PR moves to a new PR (the fresh-branch path below), carry the lines
 into the new body.
 
+**Run the repository's pre-push stage when this checkout does not.** Before every
+push that moves the branch's head, when the repo's `.pre-commit-config.yaml` puts
+hooks in its pre-push stage (a hook whose `stages:` names `pre-push`, or one with
+no `stages:` key at all, which runs at every stage) and this checkout's pre-push
+does not run each of them (no `$(git rev-parse --git-path hooks)/pre-push`, or one
+that does not name every such hook id and is not a hook manager's generated file),
+run each such `repo: local` hook whose `entry` is `bash <script>`, from the repo
+root over the head, feeding it the line git would, and name any other hook in the
+stage as not run. A non-zero exit is a red to fix before pushing. The line git
+would feed is:
+
+```bash
+printf 'HEAD %s refs/heads/%s 0000000000000000000000000000000000000000\n' "$(git rev-parse HEAD)" "<branch>"
+```
+
 **Re-review rule — every push that moves the head needs a new line.** The gate
 compares against the CURRENT head, so the moment you push again the recorded sha
 stops matching and the PR reads `not-reviewed` until the new head is reviewed.
@@ -4378,7 +4401,7 @@ section): re-run Step 4.4 items 3–6 on the new head (a new
 then EDIT the PR body to add a second `Coord-Reviewed-Head:` line for it:
 
 ```
-gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"
+bash <workspace-root>/qontinui-claude-config/scripts/pr-body-publish.sh <owner>/<repo> <n> "<file>"
 gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep 'Coord-Reviewed-Head'   # read it back
 ```
 
@@ -4488,7 +4511,7 @@ whose PR may already have landed" decides whether it still carries yours.
 read**, never from the create call's output: the review-arm `prs[]` row
 (`number`, `url`) Step 4.4's recorder writes, Step 4.3 item 4's `fixing`
 write (run it now, for every fold), the Step 4.5 trailer edits
-(`gh api -X PATCH repos/<owner>/<repo>/pulls/<n>`), Step 4.7's corroboration,
+(`pr-body-publish.sh <owner>/<repo> <n> <file>`), Step 4.7's corroboration,
 and Step 6.5's gates. A number no
 read returned is a number nothing verified.
 
@@ -4759,7 +4782,7 @@ touched), and exits on the **worst** verdict:
 | exit | verdict | what it means | what you do |
 |---|---|---|---|
 | `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, the re-measured tree equals the artifact's `reviewed_tree`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
-| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
+| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`pr-body-publish.sh <owner>/<repo> <n> <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
 | `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the detail quotes the bound the door named, or says UNKNOWN-bound when the door's line names none) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared (`unknown_tree`), for example: no `--tree-root` covers the row's repo; no worktree stood at the reviewed head at the recorded time (reaped, or never offered — a same-named checkout is never a substitute); ANY candidate worktree's HEAD reflog cannot answer (logging off, an unreadable or gapped log, a gc-emptied log on a worktree standing at the reviewed head or a newer commit, a review older than the reflog expiry) or a root git could not list, which blocks the row even when the reviewed worktree is intact; the row's `measured=` time or its `reviewed_tree` line cannot be parsed; two or more worktrees were bound and now disagree; the producer refused or timed out; or a line carries the unresolved sentinel (two unresolved measurements never compare SAME). The row's detail names which | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
 | `4` | **USAGE** | no artifact, no session id | the same finding Step 6 item 6 names: the review gate never wrote its record |
 | any other | **UNKNOWN** | any other exit (1, 129/130/143, …): the run did not complete — a crash, or a HUP / INT / TERM, e.g. a foreground Bash-tool timeout — and the artifact may or may not have been rewritten | report *"corroboration UNKNOWN: the run did not complete (exit <n>)"*; never corroborated |

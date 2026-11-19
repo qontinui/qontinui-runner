@@ -1699,7 +1699,7 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   CONTRADICTION also
   means the PR body's `Coord-Reviewed-Head:` line is stale — coord's
   `require_review` gate reads that line, not the artifact — so the re-review
-  must edit the body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`,
+  must edit the body (`pr-body-publish.sh <owner>/<repo> <n> <file>`,
   `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
@@ -1867,6 +1867,9 @@ before it releases, and prints one line per `gate_id`. A net another device
 registered, or one the reserve's current holder owns when that is not this
 session, is skipped and named (`NET_INERT`), not withdrawn, unless `--net-gate`
 names it. Quote those lines, and its final line, in the report.
+`holder=unknown` on that final line means the holder read failed and the script
+fell back to device-wide selection, so a net of another holder on this same
+device may have been touched: check the per-net lines before you report.
 
 Two things wrap that release, both specified in Step 1.1:
 

@@ -1415,6 +1415,12 @@ impl AuthManager {
         self.secure_storage.get_device_machine_key()
     }
 
+    /// `(cognito_session, device_machine_key)` held, from one store load. See
+    /// [`SecureStorage::recovery_holdings`].
+    pub fn recovery_holdings(&self) -> Result<(bool, bool)> {
+        self.secure_storage.recovery_holdings()
+    }
+
     /// `true` iff the Cognito access token is missing OR within
     /// [`COGNITO_REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
     /// refresher to refresh the Cognito token *first* when it's stale (so the
