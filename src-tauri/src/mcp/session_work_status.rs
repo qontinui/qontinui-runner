@@ -117,6 +117,17 @@ struct WireRow {
     /// malformed body, settled as unresolved rather than guessed.
     #[serde(default)]
     coord_session_id: Option<String>,
+    /// The answering row's liveness axis (`active`, `closed`, ...). Served
+    /// since the route was created; a missing key reads as `None` (UNKNOWN).
+    #[serde(default)]
+    state: Option<String>,
+    /// When the answering row was REGISTERED (`coord.sessions.started_at`),
+    /// RFC 3339. Additive (plan
+    /// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`,
+    /// Phase 3); coord OMITS it when unread, and a coord predating the field
+    /// never sends it, so absence is UNKNOWN, never a value.
+    #[serde(default)]
+    started_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +221,14 @@ pub struct ObservedRow {
     pub since_ms: Option<i64>,
     /// WHICH `coord.sessions` row answered; `None` on a coord predating it.
     pub coord_session_id: Option<String>,
+    /// The answering row's liveness axis (`active`, `closed`, ...); `None`
+    /// when coord served none (UNKNOWN).
+    pub state: Option<String>,
+    /// When the answering row was registered (coord's `started_at`), verbatim
+    /// (RFC 3339); `None` when coord served none (UNKNOWN).
+    pub started_at: Option<String>,
+    /// [`Self::started_at`] as unix millis; `None` when absent or unparseable.
+    pub started_at_ms: Option<i64>,
 }
 
 impl StatusFetch {
@@ -380,6 +399,16 @@ fn rows_from_body(body: &WireResponse) -> HashMap<String, ObservedRow> {
                 .as_deref()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.timestamp_millis());
+            let started_at = row
+                .started_at
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let started_at_ms = started_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis());
             (
                 id.clone(),
                 ObservedRow {
@@ -397,6 +426,14 @@ fn rows_from_body(body: &WireResponse) -> HashMap<String, ObservedRow> {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string),
+                    state: row
+                        .state
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    started_at,
+                    started_at_ms,
                 },
             )
         })
@@ -945,6 +982,32 @@ mod tests {
             "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         }));
+    }
+
+    /// The observed row carries coord's `state` and `started_at` (the finish
+    /// heal's re-address needs both); an omitted `started_at` reads `None`,
+    /// never a value.
+    #[test]
+    fn an_observed_row_carries_state_and_started_at() {
+        let b = body(json!({
+            "statuses": {
+                "a": {"session_status": null, "since": null, "coord_session_id": ROW,
+                      "state": "active", "started_at": "2026-11-05T11:00:00Z"},
+                "b": {"session_status": null, "since": null, "coord_session_id": ROW,
+                      "state": "closed"}
+            },
+            "unknown": [], "invalid": [], "accepted": 2, "input_truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        let rows = rows_from_body(&b);
+        let a = &rows["a"];
+        assert_eq!(a.state.as_deref(), Some("active"));
+        assert_eq!(a.started_at.as_deref(), Some("2026-11-05T11:00:00Z"));
+        assert_eq!(a.started_at_ms, Some(1_793_876_400_000));
+        let b = &rows["b"];
+        assert_eq!(b.state.as_deref(), Some("closed"));
+        assert_eq!(b.started_at, None);
+        assert_eq!(b.started_at_ms, None);
     }
 
     #[test]

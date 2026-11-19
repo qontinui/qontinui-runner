@@ -206,16 +206,46 @@ pub fn discover_account_homes(
 /// `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
 /// RC5).
 pub fn discover_account_homes_from_env(configured: &[String]) -> Vec<AccountHome> {
+    ambient_discovery().discover(configured)
+}
+
+/// What [`discover_account_homes`] reads from the machine itself, apart from
+/// the injected `configured` roster. [`ambient_discovery`] fills it from this
+/// process; a test builds one around a temp home instead. Holding the inputs,
+/// rather than a second copy of how they are read, keeps one discovery rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AmbientDiscovery {
+    /// `CLAUDE_CONFIG_DIR`.
+    pub env_config_dir: Option<String>,
+    /// The home dir (`~/.claude` is the last candidate).
+    pub home_dir: Option<PathBuf>,
+    /// The `.claude-*` scan root ([`claude_root_for`]).
+    pub claude_root: Option<PathBuf>,
+}
+
+impl AmbientDiscovery {
+    /// [`discover_account_homes`] over these inputs and `configured`.
+    pub fn discover(&self, configured: &[String]) -> Vec<AccountHome> {
+        discover_account_homes(
+            self.env_config_dir.clone(),
+            configured,
+            self.home_dir.clone(),
+            self.claude_root.clone(),
+        )
+    }
+}
+
+/// This process's [`AmbientDiscovery`].
+pub fn ambient_discovery() -> AmbientDiscovery {
     // `USERPROFILE` on Windows, `HOME` elsewhere — `dirs` already resolves
     // both, and the runner's own device-identity code uses the same door.
-    let home = dirs::home_dir();
-    let claude_root = claude_root_for(home.as_deref(), cfg!(windows));
-    discover_account_homes(
-        std::env::var("CLAUDE_CONFIG_DIR").ok(),
-        configured,
-        home,
+    let home_dir = dirs::home_dir();
+    let claude_root = claude_root_for(home_dir.as_deref(), cfg!(windows));
+    AmbientDiscovery {
+        env_config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        home_dir,
         claude_root,
-    )
+    }
 }
 
 /// The directory whose `.claude-*` children are scanned as account homes.
