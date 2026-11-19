@@ -739,7 +739,14 @@ async fn api_get(client: &reqwest::Client, url: &str, token: Option<&str>) -> Op
 
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    github_budget::record_response(BUDGET_CONSUMER, url, cache_mode, status, &headers);
+    github_budget::record_response(
+        &github_budget::CredentialKey::of_optional_token(token),
+        BUDGET_CONSUMER,
+        url,
+        cache_mode,
+        status,
+        &headers,
+    );
 
     if status == 304 {
         // Free. Replay, and report the 200 the cached body stands for — no
