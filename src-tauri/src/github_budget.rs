@@ -124,7 +124,10 @@ const LOW_FRACTION_ENV: &str = "QONTINUI_GITHUB_BUDGET_LOW_FRACTION";
 /// conditional GETs went out unconditional (plan
 /// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
 /// D5). 4,096 leaves the byte budget below as the binding bound: at the
-/// measured ~12.8 KB per entry it holds ~2,500 entries, above one cycle.
+/// measured ~12.8 KB per entry it holds ~2,600 entries, above one mean-sized
+/// cycle. The cache is process-global (the ticket and CI-sibling clients store
+/// into it too), so a burst of MB-scale bodies can still evict part of a cycle;
+/// `etagCache.approxBytes` near the budget on `/github-budget` is the tell.
 const ETAG_CACHE_MAX_ENTRIES: usize = 4_096;
 
 /// Heap budget for the ETag cache. The entry ceiling alone is not a bound: a
@@ -843,7 +846,10 @@ impl EtagCache {
             body,
         };
         let added = entry.heap_bytes();
-        if let Some(old) = self.entries.put(url.to_string(), entry) {
+        // `push` returns the displaced pair both when it replaces this key and
+        // when it evicts the LRU entry to honour the entry ceiling, so the byte
+        // counter stays exact without re-summing the cache on every store.
+        if let Some((_, old)) = self.entries.push(url.to_string(), entry) {
             self.bytes = self.bytes.saturating_sub(old.heap_bytes());
         }
         self.bytes = self.bytes.saturating_add(added);
@@ -870,13 +876,9 @@ impl EtagCache {
     }
 
     /// Evict least-recently-used entries until the byte budget holds. The entry
-    /// ceiling is enforced by [`LruCache`] itself on `put`, but that eviction
-    /// bypasses our byte counter, so re-derive it whenever the two could drift.
+    /// ceiling is enforced by [`LruCache::push`] in [`Self::store`], which hands
+    /// back what it evicted so the byte counter is already exact here.
     fn evict_to_budget(&mut self) {
-        // `LruCache::put` may have silently evicted to honour the entry cap.
-        // Re-deriving the total is O(entries) and only runs on a store, which is
-        // orders of magnitude rarer than a lookup.
-        self.bytes = self.entries.iter().map(|(_, e)| e.heap_bytes()).sum();
         while self.bytes > self.max_bytes && self.entries.len() > 1 {
             match self.entries.pop_lru() {
                 Some((_, old)) => self.bytes = self.bytes.saturating_sub(old.heap_bytes()),
@@ -1582,6 +1584,20 @@ mod tests {
         assert!(cache.replay("/c").is_some());
     }
 
+    /// The byte counter is maintained incrementally, so an entry the LRU evicts
+    /// to honour the entry ceiling — and a same-key replacement — must leave it
+    /// exact, not inflated by the departed entry.
+    #[test]
+    fn etag_cache_byte_counter_stays_exact_across_cap_eviction_and_replace() {
+        let mut cache = EtagCache::new(2, 1024 * 1024);
+        cache.store("/a", "1", Bytes::from_static(b"aaaa")); // 5 bytes
+        cache.store("/b", "2", Bytes::from_static(b"bb")); // 3 bytes
+        cache.store("/c", "3", Bytes::from_static(b"c")); // evicts /a; 2 bytes
+        assert_eq!(cache.stats(), (2, 5), "evicted /a's bytes subtracted");
+        cache.store("/b", "22", Bytes::from_static(b"bbbbbb")); // replace: 8 bytes
+        assert_eq!(cache.stats(), (2, 10), "replaced /b's old bytes subtracted");
+    }
+
     #[test]
     fn etag_cache_evicts_on_the_byte_budget() {
         // Entry ceiling is generous; the byte budget is what must bind — a
@@ -1603,6 +1619,7 @@ mod tests {
     /// every second-pass lookup misses (the measured 512-entry thrash).
     #[test]
     fn etag_cache_default_holds_a_full_reconcile_cycle() {
+        // Comfortably above one ~670-URL cycle, and far above the old 512 cap.
         const URLS: usize = 1_000;
         const BODY_BYTES: usize = 12_800; // the measured mean entry size
         let mut cache = EtagCache::default();
