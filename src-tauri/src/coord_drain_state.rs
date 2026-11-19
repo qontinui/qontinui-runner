@@ -1197,7 +1197,11 @@ fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
         dispatch_role: inner.dispatch_role.role().map(DispatchRole::as_wire),
         dispatch_role_source: role_source_label(state, inner.dispatch_role, inner.role_provenance),
         dispatch_role_observed_at: inner.role_provenance.observed_at(),
-        agent_lane_closed_by_role: inner.dispatch_role.closes_agent_lane(),
+        // A runner that is not a coord device has no agent lane for a role to
+        // close: the role kept in memory does not gate it (see
+        // `gate_with_role_at`), so the banner must not say it does.
+        agent_lane_closed_by_role: !matches!(state, CoordDrainState::NotEnrolled { .. })
+            && inner.dispatch_role.closes_agent_lane(),
         until,
         reason,
         since,
@@ -1750,6 +1754,9 @@ pub fn ensure_seeded() {
             inner.role_provenance = RoleProvenance::Persisted {
                 observed_at: persisted.observed_at,
             };
+            // Published under the lock, like every other publish here, so a
+            // fold landing right after cannot be overwritten by this state.
+            global().tx.send_replace(current_locked(&inner));
             true
         } else {
             false
@@ -1762,7 +1769,6 @@ pub fn ensure_seeded() {
             observed_at = %persisted.observed_at,
             "coord_drain_state: seeded the dispatch role from the persisted reading"
         );
-        global().tx.send_replace(current());
         emit_snapshot();
     }
 }
@@ -3359,6 +3365,12 @@ mod tests {
         assert_eq!(snap.dispatch_role, Some("ci_node"));
 
         assert_eq!(snap.dispatch_role_source, "coord");
+
+        // A runner that is not a coord device keeps the role in memory, but no
+        // lane is closed by it, and the snapshot must not say one is.
+        let snap = snapshot_of(&CoordDrainState::NotEnrolled { why: "test" }, &inner);
+        assert!(snap.autonomous_spawns_allowed);
+        assert!(!snap.agent_lane_closed_by_role);
 
         inner.dispatch_role = RoleReading::Known(None);
         let snap = snapshot_of(&CoordDrainState::Clear, &inner);
