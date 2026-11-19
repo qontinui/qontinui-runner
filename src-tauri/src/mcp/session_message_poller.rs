@@ -153,6 +153,20 @@ struct PendingMessage {
     priority: String,
     #[serde(default)]
     body: String,
+    /// When coord wrote the row (RFC 3339, coord's `created_at`). Rendered
+    /// with its age into the frame so the recipient can tell a fresh message
+    /// from one that sat pending for hours about a world that has since moved
+    /// (plan `2026-11-19-coord-message-reaches-a-session-that-cannot-act-on-it`,
+    /// Phase 6). Kept as the raw string: an unparseable stamp is still shown,
+    /// just without an age.
+    #[serde(default)]
+    created_at: Option<String>,
+    /// coord's `action` JSONB. Only a PR subject
+    /// (`{"subject":"pr","repo","pr_number","head_sha",…}`) is read, by
+    /// [`pr_subject_clause`], and rendered as data the message carries — not
+    /// as coord-attested metadata; any other shape is ignored.
+    #[serde(default)]
+    action: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,6 +191,11 @@ struct DeliveryGuard {
     /// `to_session -> Instant of last successful injection`. Enforces the
     /// per-session [`PER_SESSION_COOLDOWN`].
     last_injected: HashMap<String, Instant>,
+    /// Message ids currently held because their recipient is finished
+    /// ([`skip_finished_recipient`]), so `recipient_finished` counts each
+    /// held message once rather than once per poll tick. Trimmed to coord's
+    /// pending set every tick.
+    finished_held: std::collections::HashSet<String>,
 }
 
 impl DeliveryGuard {
@@ -398,7 +417,14 @@ impl DeliveredArm {
 const PUSH_OK_SLOT: usize = 0;
 const PUSH_MISS_SLOT_BASE: usize = 1;
 const DELIVERED_ARM_SLOT_BASE: usize = PUSH_MISS_SLOT_BASE + BlockReason::ALL.len();
-const PUSH_COUNTER_SLOTS: usize = DELIVERED_ARM_SLOT_BASE + DeliveredArm::ALL.len();
+/// Distinct messages left pending because their resolved recipient's
+/// lifecycle record is marked finished, with no session start since (plan
+/// `2026-11-19-coord-message-reaches-a-session-that-cannot-act-on-it`,
+/// Phase 6). Local-only: deliberately NOT a [`BlockReason`], because coord's
+/// `DELIVERY_BLOCKED_REASONS` refuses unknown reasons and a POST would raise
+/// an alert for correct behaviour.
+const RECIPIENT_FINISHED_SLOT: usize = DELIVERED_ARM_SLOT_BASE + DeliveredArm::ALL.len();
+const PUSH_COUNTER_SLOTS: usize = RECIPIENT_FINISHED_SLOT + 1;
 
 fn push_counters() -> &'static [std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS] {
     static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS]> =
@@ -434,12 +460,20 @@ fn record_push_ok(arm: DeliveredArm) {
     push_counters()[arm_slot(arm)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// One more message held back because its recipient is finished — counted
+/// once per message id, not per tick (see [`skip_finished_recipient`]).
+/// Never reported to coord.
+fn record_recipient_finished() {
+    push_counters()[RECIPIENT_FINISHED_SLOT].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The `data.sessionMessages` block of `GET /health`:
 ///
 /// ```json
 /// { "push_ok": n,
 ///   "push_miss": { "target_not_live": n, "pty_never_idle": n, "no_pusher": n },
-///   "delivered_arm": { "sdk": n, "terminal": n } }
+///   "delivered_arm": { "sdk": n, "terminal": n },
+///   "recipient_finished": n }
 /// ```
 ///
 /// Every series is present even at zero — an absent key would read as "this
@@ -465,6 +499,7 @@ pub(crate) fn health_snapshot() -> serde_json::Value {
         "push_ok": counters[PUSH_OK_SLOT].load(Relaxed),
         "push_miss": serde_json::Value::Object(push_miss),
         "delivered_arm": serde_json::Value::Object(delivered_arm),
+        "recipient_finished": counters[RECIPIENT_FINISHED_SLOT].load(Relaxed),
     })
 }
 
@@ -1108,6 +1143,76 @@ fn resolve_target(
     None
 }
 
+/// Is the resolved recipient a session its own lifecycle record marks
+/// FINISHED, with no session start since? Such a pane has declared its work
+/// done and may sit at its prompt for hours; injecting a message there wakes a
+/// session that cannot act on it (plan
+/// `2026-11-19-coord-message-reaches-a-session-that-cannot-act-on-it`,
+/// Phase 6).
+///
+/// `finished_at` is sticky — `record_open` never clears it — so a finished
+/// session that was resumed (`/resume`, or a fresh `claude` in the pane) would
+/// otherwise have its messages held forever. The skip therefore holds only
+/// when `last_session_start_at` (the provider SessionStart hook stamp, set on
+/// startup AND resume) is absent or not newer than `finished_at`.
+/// `last_alive_at` is deliberately NOT used: the liveness poll touches it on
+/// every tick while the finished pane idles at its prompt, so it would be
+/// newer than `finished_at` for every live finished session and void the skip.
+///
+/// The record is looked up by the target's own key — the terminal's
+/// `claude_session_id`, or an SDK session's `task_run_id`. An SDK session with
+/// no lifecycle record is NOT finished by this test: absence of a record says
+/// nothing about the work axis, so it is delivered as before.
+fn recipient_finished(
+    lifecycle_store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    target: &ResolvedTarget,
+) -> bool {
+    let key = match target {
+        ResolvedTarget::Sdk { task_run_id } => task_run_id.as_str(),
+        ResolvedTarget::Terminal {
+            claude_session_id, ..
+        } => claude_session_id.as_str(),
+    };
+    lifecycle_store.get(key).is_some_and(|rec| {
+        rec.finished_at.is_some_and(|finished| {
+            rec.last_session_start_at
+                .is_none_or(|started| started <= finished)
+        })
+    })
+}
+
+/// The finished-recipient skip [`deliver_once`] applies after a successful
+/// [`resolve_target`]: `true` ⇒ hold the message (it stays pending), and — the
+/// first time this message id is held — bump the local `recipient_finished`
+/// counter and log at info. `held` is the per-loop set of ids already counted
+/// ([`DeliveryGuard::finished_held`]), so a message held for an hour counts
+/// once, not once per poll tick. NO `delivery-blocked` POST — coord's
+/// `DELIVERY_BLOCKED_REASONS` refuses an unknown reason, and a finished
+/// recipient is correct behaviour, not an alert. Coord itself does not yet
+/// stop offering such a row: a drain gate that does is the companion coord
+/// change (Phase 1 of the plan), not existing behaviour.
+fn skip_finished_recipient(
+    lifecycle_store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    target: &ResolvedTarget,
+    held: &mut std::collections::HashSet<String>,
+    message_id: &str,
+    to_session: &str,
+) -> bool {
+    if !recipient_finished(lifecycle_store, target) {
+        held.remove(message_id);
+        return false;
+    }
+    if held.insert(message_id.to_string()) {
+        record_recipient_finished();
+        info!(
+            "session_message_poller: msg {message_id} to session {to_session} ({target:?}) held — \
+             the recipient's lifecycle record is finished with no session start since; \
+             leaving it pending"
+        );
+    }
+    true
+}
+
 /// Does the runner host `session_id` — would [`resolve_target`] route a
 /// message to it right now? The ONE "live local session the runner hosts"
 /// predicate, shared with the session census's `runner_hosted` column so the
@@ -1280,6 +1385,76 @@ fn neutralize_reminder_close(s: &str) -> Cow<'_, str> {
 /// recipient directly. The `kind`/`priority` blank defaults are unaffected —
 /// those literals are ours, not coord's.
 fn frame_message(msg: &PendingMessage) -> String {
+    frame_message_at(msg, chrono::Utc::now())
+}
+
+/// Render a non-negative age as its two largest units (`45s`, `12m30s`,
+/// `3h05m`, `2d04h`). A stamp in the future (clock skew) reads `0s`.
+fn render_age(age: chrono::Duration) -> String {
+    let secs = age.num_seconds().max(0);
+    let (d, h, m, s) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60, secs % 60);
+    if d > 0 {
+        format!("{d}d{h:02}h")
+    } else if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// `created <ts> (<age> ago)` — or `created <ts> (age unknown)` for a stamp
+/// that does not parse, or `created at an unknown time` when coord sent none.
+/// An absent stamp is UNKNOWN, never "just now".
+fn created_clause(created_at: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> String {
+    match created_at.map(str::trim).filter(|s| !s.is_empty()) {
+        None => "created at an unknown time".to_string(),
+        Some(raw) => {
+            let ts = neutralize_reminder_close(raw);
+            match chrono::DateTime::parse_from_rfc3339(raw) {
+                Ok(at) => format!(
+                    "created {ts} ({} ago)",
+                    render_age(now.signed_duration_since(at.with_timezone(&chrono::Utc)))
+                ),
+                Err(_) => format!("created {ts} (age unknown)"),
+            }
+        }
+    }
+}
+
+/// `, about <repo>#<pr> @ <head> (from the message's action)` when the
+/// message's `action.subject` is `"pr"`; empty otherwise. It is rendered as
+/// data the message carries, not as coord-attested metadata. A missing head
+/// is simply not rendered.
+fn pr_subject_clause(action: Option<&serde_json::Value>) -> String {
+    let Some(action) = action else {
+        return String::new();
+    };
+    if action.get("subject").and_then(|v| v.as_str()) != Some("pr") {
+        return String::new();
+    }
+    let field = |key: &str| -> Option<String> {
+        match action.get(key)? {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+    let repo = field("repo").unwrap_or_else(|| "<unknown repo>".to_string());
+    let pr = field("pr_number").unwrap_or_else(|| "?".to_string());
+    let head = field("head_sha")
+        .map(|h| format!(" @ {}", neutralize_reminder_close(&h)))
+        .unwrap_or_default();
+    format!(
+        ", about {}#{}{head} (from the message's action)",
+        neutralize_reminder_close(&repo),
+        neutralize_reminder_close(&pr)
+    )
+}
+
+/// [`frame_message`] with `now` injected, so the rendered age is testable.
+fn frame_message_at(msg: &PendingMessage, now: chrono::DateTime<chrono::Utc>) -> String {
     let from = msg
         .from_session
         .as_deref()
@@ -1295,9 +1470,29 @@ fn frame_message(msg: &PendingMessage) -> String {
     } else {
         neutralize_reminder_close(&msg.priority)
     };
+    let created = created_clause(msg.created_at.as_deref(), now);
+    let subject = pr_subject_clause(msg.action.as_ref());
+    // The addressee is named so a session reading a message meant for a
+    // sibling pane (or a finished predecessor) can tell; the ack carries it
+    // as `session_id` so the ack is matched against the row's own recipient.
+    let (addressed, ack_session) = match msg.to_session.as_deref() {
+        Some(to) => {
+            let to = neutralize_reminder_close(to);
+            (
+                format!("addressed to session {to}"),
+                format!(" session_id={to}"),
+            )
+        }
+        None => ("addressed to no session".to_string(), String::new()),
+    };
     format!(
-        "<system-reminder>Session Bus {kind} message ({priority} priority{from}). \
-         Act on it, then coord_ack_message message_id={}. Message: {}</system-reminder>",
+        "<system-reminder>Session Bus {kind} message ({priority} priority{from}), \
+         {created}, {addressed}{subject}. \
+         Act on it, then coord_ack_message message_id={}{ack_session} \
+         (if coord answers already_acked, or on an older coord acked:false, the inbox \
+         hook may already have closed it; re-check session_id if you suspect a wrong \
+         addressee). \
+         Message: {}</system-reminder>",
         neutralize_reminder_close(&msg.message_id),
         neutralize_reminder_close(&msg.body)
     )
@@ -1534,6 +1729,9 @@ async fn deliver_once(
         .map(|m| m.message_id.as_str())
         .collect();
     tracker.retain_pending(&pending_ids);
+    guard
+        .finished_held
+        .retain(|id| pending_ids.contains(id.as_str()));
     if pending.messages.is_empty() {
         return Ok(());
     }
@@ -1604,6 +1802,18 @@ async fn deliver_once(
             surface_blocked_delivery(&ctx, tracker, msg, to_session, reason, detail, now).await;
             continue;
         };
+
+        // A finished recipient is not woken: the message stays pending,
+        // counted locally only (see `skip_finished_recipient`).
+        if skip_finished_recipient(
+            &lifecycle_store,
+            &target,
+            &mut guard.finished_held,
+            &msg.message_id,
+            to_session,
+        ) {
+            continue;
+        }
 
         // Turn arbitration: SDK queues safely; a typed terminal PTY must be
         // idle, and its input box must also be EMPTY (an operator may be
@@ -1836,13 +2046,148 @@ mod tests {
             kind: "ci_red_triage".to_string(),
             priority: "blocking".to_string(),
             body: "Your PR is red, please rework.".to_string(),
+            created_at: None,
+            action: None,
         };
         let framed = frame_message(&msg);
-        assert!(framed.contains("coord_ack_message message_id=m-42"));
+        assert!(framed.contains("coord_ack_message message_id=m-42 session_id=sess "));
+        assert!(framed.contains("addressed to session sess"));
+        // coord sent no created_at: UNKNOWN, never "just now".
+        assert!(framed.contains("created at an unknown time"));
         assert!(framed.contains("ci_red_triage"));
         assert!(framed.contains("blocking priority"));
         assert!(framed.contains("from session author"));
         assert!(framed.contains("Your PR is red"));
+    }
+
+    /// A fixed clock for the age assertions.
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .expect("valid fixture stamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn phase6_msg() -> PendingMessage {
+        PendingMessage {
+            message_id: "m-42".to_string(),
+            to_session: Some("sess-to".to_string()),
+            from_session: Some("author".to_string()),
+            kind: "ci_red_triage".to_string(),
+            priority: "blocking".to_string(),
+            body: "Your PR is red, please rework.".to_string(),
+            created_at: Some("2026-11-19T10:00:00Z".to_string()),
+            action: Some(serde_json::json!({
+                "subject": "pr",
+                "repo": "qontinui-runner",
+                "pr_number": 2336,
+                "head_sha": "abc1234def",
+                "block_reason_code": "ci_red",
+            })),
+        }
+    }
+
+    #[test]
+    fn frame_message_carries_created_age_addressee_and_session_ack() {
+        // Plan 2026-11-19-coord-message-reaches-a-session-that-cannot-act-on-it,
+        // Phase 6: the recipient sees how old the message is, whom it was
+        // addressed to, and acks against the row's own recipient.
+        let framed = frame_message_at(&phase6_msg(), at("2026-11-19T13:05:00Z"));
+        assert!(
+            framed.contains("created 2026-11-19T10:00:00Z (3h05m ago)"),
+            "{framed}"
+        );
+        assert!(framed.contains("addressed to session sess-to"), "{framed}");
+        assert!(
+            framed.contains("coord_ack_message message_id=m-42 session_id=sess-to"),
+            "{framed}"
+        );
+        assert!(
+            framed.contains(
+                "if coord answers already_acked, or on an older coord acked:false, \
+                 the inbox hook may already have closed it; re-check session_id"
+            ),
+            "{framed}"
+        );
+        assert_one_trailing_closer(&framed);
+    }
+
+    #[test]
+    fn frame_message_renders_the_pr_subject() {
+        let framed = frame_message_at(&phase6_msg(), at("2026-11-19T13:05:00Z"));
+        assert!(
+            framed.contains("about qontinui-runner#2336 @ abc1234def (from the message's action)"),
+            "{framed}"
+        );
+
+        // A string pr_number and no head: rendered without the `@`.
+        let mut m = phase6_msg();
+        m.action = Some(serde_json::json!({"subject":"pr","repo":"r","pr_number":"7"}));
+        let framed = frame_message_at(&m, at("2026-11-19T13:05:00Z"));
+        assert!(
+            framed.contains("about r#7 (from the message's action)."),
+            "{framed}"
+        );
+        assert!(!framed.contains(" @ "), "{framed}");
+
+        // Any other subject (or none) renders no PR clause.
+        for action in [
+            None,
+            Some(serde_json::json!({"subject":"gate","repo":"r","pr_number":1})),
+            Some(serde_json::json!({"repo":"r","pr_number":1})),
+        ] {
+            let mut m = phase6_msg();
+            m.action = action;
+            let framed = frame_message_at(&m, at("2026-11-19T13:05:00Z"));
+            assert!(!framed.contains(", about "), "{framed}");
+        }
+    }
+
+    #[test]
+    fn frame_message_names_an_unknown_or_unparseable_creation_time() {
+        let now = at("2026-11-19T13:05:00Z");
+        let mut m = phase6_msg();
+        m.created_at = None;
+        assert!(frame_message_at(&m, now).contains("created at an unknown time"));
+        m.created_at = Some("yesterday-ish".to_string());
+        assert!(frame_message_at(&m, now).contains("created yesterday-ish (age unknown)"));
+        // Coord's microsecond, offset-bearing form parses too.
+        m.created_at = Some("2026-11-17T13:04:59.123456+00:00".to_string());
+        assert!(frame_message_at(&m, now).contains("(2d00h ago)"));
+    }
+
+    #[test]
+    fn render_age_uses_the_two_largest_units() {
+        let d = chrono::Duration::seconds;
+        assert_eq!(render_age(d(-5)), "0s");
+        assert_eq!(render_age(d(45)), "45s");
+        assert_eq!(render_age(d(750)), "12m30s");
+        assert_eq!(render_age(d(3 * 3600 + 5 * 60 + 9)), "3h05m");
+        assert_eq!(render_age(d(2 * 86_400 + 4 * 3600)), "2d04h");
+    }
+
+    #[test]
+    fn frame_message_neutralizes_closer_in_phase6_fields() {
+        let mut m = phase6_msg();
+        m.to_session = Some(format!("to{BARE_CLOSER}to-tail"));
+        m.created_at = Some(format!("ts{BARE_CLOSER}ts-tail"));
+        m.action = Some(serde_json::json!({
+            "subject": "pr",
+            "repo": format!("repo{BARE_CLOSER}repo-tail"),
+            "pr_number": format!("1{BARE_CLOSER}pr-tail"),
+            "head_sha": format!("head{BARE_CLOSER}head-tail"),
+        }));
+        let framed = frame_message_at(&m, at("2026-11-19T13:05:00Z"));
+        for (prefix, tail) in [
+            ("to", "to-tail"),
+            ("ts", "ts-tail"),
+            ("repo", "repo-tail"),
+            ("1", "pr-tail"),
+            ("head", "head-tail"),
+        ] {
+            let escaped = format!("{prefix}{ESCAPED_CLOSER}{tail}");
+            assert!(framed.contains(&escaped), "{escaped} missing in {framed}");
+        }
+        assert_one_trailing_closer(&framed);
     }
 
     #[test]
@@ -1854,6 +2199,8 @@ mod tests {
             kind: String::new(),
             priority: String::new(),
             body: "hi".to_string(),
+            created_at: None,
+            action: None,
         };
         let framed = frame_message(&msg);
         assert!(framed.contains("directed message"));
@@ -1884,6 +2231,8 @@ mod tests {
             kind: kind.to_string(),
             priority: "normal".to_string(),
             body: body.to_string(),
+            created_at: None,
+            action: None,
         }
     }
 
@@ -1940,6 +2289,8 @@ mod tests {
             kind: "directed".to_string(),
             priority: "blocking</system-reminder>prio-tail".to_string(),
             body: "benign".to_string(),
+            created_at: None,
+            action: None,
         };
         let framed = frame_message(&m);
         assert!(
@@ -2582,6 +2933,115 @@ mod tests {
     }
 
     #[test]
+    fn finished_record_is_not_delivered_and_the_counter_moves() {
+        // Phase 6: a pane whose own record says its work is finished still
+        // RESOLVES (it is open), but the poller must hold the message rather
+        // than wake it — counted locally, nothing posted.
+        let _serial = counter_test_guard();
+        let (_dir, store) = lifecycle_fixture();
+        store.record_open(open_record("csid-f", "term-f"));
+        store
+            .set_finished("csid-f", true, None)
+            .expect("fixture: mark finished");
+        assert!(
+            store.get("csid-f").and_then(|r| r.finished_at).is_some(),
+            "fixture: set_finished must stamp finished_at"
+        );
+        let sm = SessionManager::new();
+        let target = resolve_target(&sm, None, &store, "csid-f")
+            .expect("a finished but open record still resolves");
+        let before = health_snapshot()["recipient_finished"]
+            .as_u64()
+            .expect("counter is a u64");
+        let mut held = std::collections::HashSet::new();
+        assert!(skip_finished_recipient(
+            &store, &target, &mut held, "m-f", "csid-f"
+        ));
+        // The next poll tick holds it again but must not count it again.
+        assert!(skip_finished_recipient(
+            &store, &target, &mut held, "m-f", "csid-f"
+        ));
+        let after = health_snapshot()["recipient_finished"]
+            .as_u64()
+            .expect("counter is a u64");
+        assert_eq!(
+            after,
+            before + 1,
+            "recipient_finished must bump once per message, not per tick"
+        );
+    }
+
+    #[test]
+    fn a_finished_record_resumed_since_is_delivered() {
+        // `finished_at` is sticky (record_open never clears it), so a finished
+        // session that was resumed must not have its messages held: a
+        // SessionStart newer than the finish means it is working again. A
+        // start OLDER than the finish still holds.
+        let _serial = counter_test_guard();
+        let pause = || std::thread::sleep(Duration::from_millis(5));
+        let sm = SessionManager::new();
+        let mut held = std::collections::HashSet::new();
+
+        // Start, then finish: held.
+        let (_dir, store) = lifecycle_fixture();
+        store.record_open(open_record("csid-r", "term-r"));
+        store.note_session_start_hook("csid-r");
+        pause();
+        store
+            .set_finished("csid-r", true, None)
+            .expect("fixture: mark finished");
+        let target = resolve_target(&sm, None, &store, "csid-r").expect("resolves");
+        assert!(
+            skip_finished_recipient(&store, &target, &mut held, "m-r1", "csid-r"),
+            "a start before the finish must still hold"
+        );
+
+        // Then resumed: a SessionStart newer than the finish delivers.
+        pause();
+        store.note_session_start_hook("csid-r");
+        let rec = store.get("csid-r").expect("record");
+        assert!(
+            rec.last_session_start_at > rec.finished_at,
+            "fixture: the resume stamp must be newer than the finish"
+        );
+        assert!(
+            !skip_finished_recipient(&store, &target, &mut held, "m-r2", "csid-r"),
+            "a finished session resumed since must be delivered"
+        );
+    }
+
+    #[test]
+    fn unfinished_record_and_recordless_sdk_target_are_delivered() {
+        let _serial = counter_test_guard();
+        let (_dir, store) = lifecycle_fixture();
+        store.record_open(open_record("csid-u", "term-u"));
+        let sm = SessionManager::new();
+        let target = resolve_target(&sm, None, &store, "csid-u").expect("resolves");
+        let before = health_snapshot()["recipient_finished"]
+            .as_u64()
+            .expect("counter is a u64");
+        let mut held = std::collections::HashSet::new();
+        assert!(!skip_finished_recipient(
+            &store, &target, &mut held, "m-u", "csid-u"
+        ));
+        // An SDK session with no lifecycle record is not skipped.
+        let sdk = ResolvedTarget::Sdk {
+            task_run_id: "task-run-no-record".to_string(),
+        };
+        assert!(!skip_finished_recipient(
+            &store,
+            &sdk,
+            &mut held,
+            "m-s",
+            "task-run-no-record"
+        ));
+        let after = health_snapshot()["recipient_finished"]
+            .as_u64()
+            .expect("counter is a u64");
+        assert_eq!(after, before, "no skip, no bump");
+    }
+
+    #[test]
     fn absent_record_resolves_none() {
         // A session this device has never recorded is not ours to inject
         // into — the message stays pending for whichever device hosts it.
@@ -2727,6 +3187,8 @@ mod tests {
             kind: "directed".to_string(),
             priority: "normal".to_string(),
             body: "hello".to_string(),
+            created_at: None,
+            action: None,
         };
         let before = health_snapshot()["push_miss"]["target_not_live"]
             .as_u64()
@@ -2797,6 +3259,22 @@ mod tests {
             "expected the typed-terminal PTY arm to report gate misses; \
              found {gate_sites}"
         );
+        // Phase 6: the finished-recipient hold sits after a successful
+        // resolve and before the idle gate (and so before any inject).
+        let resolve_at = loop_src
+            .find("resolve_target(")
+            .expect("deliver_once resolves the target");
+        let skip_at = loop_src
+            .find("skip_finished_recipient(")
+            .expect("deliver_once applies the finished-recipient hold");
+        let idle_at = loop_src
+            .find("idle_gate(")
+            .expect("deliver_once gates the typed terminal on idle");
+        assert!(
+            resolve_at < skip_at && skip_at < idle_at,
+            "skip_finished_recipient must come after resolve_target and before idle_gate \
+             (resolve {resolve_at}, skip {skip_at}, idle {idle_at})"
+        );
     }
 
     // ---- /health counter family --------------------------------------------
@@ -2809,7 +3287,15 @@ mod tests {
             k
         };
         let snap = health_snapshot();
-        assert_eq!(keys(&snap), ["delivered_arm", "push_miss", "push_ok"]);
+        assert_eq!(
+            keys(&snap),
+            [
+                "delivered_arm",
+                "push_miss",
+                "push_ok",
+                "recipient_finished"
+            ]
+        );
         assert_eq!(
             keys(&snap["push_miss"]),
             ["no_pusher", "pty_never_idle", "target_not_live"]
