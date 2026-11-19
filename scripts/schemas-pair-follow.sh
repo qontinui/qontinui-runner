@@ -56,6 +56,9 @@
 #             3 = UNKNOWN or refused (the lane goes red); 2 = usage;
 #             75 = TRANSIENT (`scan` only): a GitHub read still failed with a
 #                  transient class after every retry, so nothing was decided.
+#             `merge-and-pin` and `push` report the same condition as a named
+#             outcome instead (MODE=TRANSIENT / RESULT=TRANSIENT, exit 0): it is
+#             only ever met before either leg has changed anything.
 #
 # TRANSIENT vs UNKNOWN. Every `gh api` read is retried (SPF_GH_ATTEMPTS tries,
 # exponential backoff from SPF_GH_BACKOFF_SECS) on HTTP 5xx, 429, a secondary
@@ -115,6 +118,15 @@ SPF_TRANSIENT_MARK="$SPF_MARK_DIR/transient"
 trap 'rm -rf "$SPF_MARK_DIR"' EXIT
 mark_transient() { : >"$SPF_TRANSIENT_MARK"; }
 saw_transient() { [ -e "$SPF_TRANSIENT_MARK" ]; }
+# warn_transient WHAT -> a workflow warning on STDERR (stdout carries only the
+# MODE= / RESULT= lines the caller parses and appends to $GITHUB_OUTPUT).
+warn_transient() {
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "::warning::TRANSIENT — $1: GitHub did not answer after retries. Nothing was changed; the next schedule tick retries." >&2
+  else
+    err "TRANSIENT — $1: GitHub did not answer after retries"
+  fi
+}
 
 # is_transient_err FILE -> rc 0 when gh's stderr names a retryable, SHORT-LIVED
 # failure: HTTP 5xx, HTTP 429, a SECONDARY rate-limit 403, or a network timeout /
@@ -536,7 +548,18 @@ cmd_merge_and_pin() {
       fi
       return 0 ;;
     1) ;;
-    *) err "containment unknown"; exit 3 ;;
+    *)
+      # A compare that ran out of retries on a transient class says nothing
+      # about the pin. Nothing has been pushed (this leg cannot push), so name
+      # it: the later steps run only on FOLLOW / MERGE_ONLY, no bundle is
+      # uploaded, and the next tick re-decides from scratch.
+      if saw_transient; then
+        warn_transient "containment read for #$m"
+        echo "MODE=TRANSIENT"
+        echo "REASON=compare $a...$pin hit a transient GitHub error after retries"
+        return 0
+      fi
+      err "containment unknown"; exit 3 ;;
   esac
   rewrite_pin "$CONF" "$a"
   [ "$(pin_of <"$CONF")" = "$a" ] || { err "pin rewrite did not take"; exit 3; }
@@ -711,11 +734,25 @@ cmd_push() {
   tip_pin="$(git show "$new:$CONF" | pin_of)"
   [ -n "$tip_pin" ] || { err "patch-scope: pushed tip has no schemas pin"; exit 3; }
   contains "$a" "$tip_pin" || cc=$?
+  # Every TRANSIENT exit below happens before the first write (label removal),
+  # so it leaves the PR exactly as it was.
+  if [ "$cc" -eq 3 ] && saw_transient; then
+    warn_transient "push-time containment read for #$m"
+    echo "RESULT=TRANSIENT containment-read"
+    return 0
+  fi
   [ "$cc" -eq 0 ] || { err "patch-scope: the pushed tip's pin $tip_pin does not contain $a"; exit 3; }
 
   # Re-read the PR immediately before touching anything.
   local mj
-  mj="$(gh_get "repos/$RUNNER/pulls/$m")" || { err "re-read $RUNNER#$m failed"; exit 3; }
+  local mrc=0
+  mj="$(gh_get "repos/$RUNNER/pulls/$m")" || mrc=$?
+  if [ "$mrc" -eq "$RC_TRANSIENT" ]; then
+    warn_transient "push-time re-read of #$m"
+    echo "RESULT=TRANSIENT pr-re-read"
+    return 0
+  fi
+  [ "$mrc" -eq 0 ] || { err "re-read $RUNNER#$m failed"; exit 3; }
   if [ "$(jq -r .state <<<"$mj")" != "open" ] ||
     [ "$(jq -r '.head.repo.full_name // ""' <<<"$mj")" != "$RUNNER" ] ||
     [ "$(jq -r '.head.ref // ""' <<<"$mj")" != "$ref" ] ||
@@ -778,7 +815,16 @@ cmd_push() {
 refuse_for_human() {
   local m="$1" n="$2" a="$3" why="$4" marker comments
   marker="$(refused_marker "$a")"
-  comments="$(gh_get "repos/$RUNNER/issues/$m/comments?per_page=100")" || { err "read $RUNNER#$m comments failed"; exit 3; }
+  local crc=0
+  comments="$(gh_get "repos/$RUNNER/issues/$m/comments?per_page=100")" || crc=$?
+  # Transient here: the refusal comment is not posted this run, and the next
+  # tick decides and refuses again, so it is told exactly once all the same.
+  if [ "$crc" -eq "$RC_TRANSIENT" ]; then
+    warn_transient "refusal-comment read for #$m"
+    echo "RESULT=TRANSIENT refusal-comment-read"
+    return 0
+  fi
+  [ "$crc" -eq 0 ] || { err "read $RUNNER#$m comments failed"; exit 3; }
   if ! jq -r '.[].body' <<<"$comments" | grep -qF "$marker"; then
     gh_write POST "repos/$RUNNER/issues/$m/comments" -f "body=Schemas pair-follow could not finish this PR by itself. \`qontinui/qontinui-schemas#$n\` landed as \`${a:0:9}\`, and moving this PR's pin there needs a \`Cargo.lock\` change pair-follow is not allowed to make: $why. Please move the pin in \`.github/sibling-pins.conf\` to \`$a\` and refresh \`Cargo.lock\` in the same commit (\`cargo metadata --format-version 1\` with that schemas commit checked out beside the runner). $marker" ||
       { err "could not post the refusal comment"; exit 3; }
