@@ -1303,8 +1303,8 @@ states that legitimately stop the lifecycle must stop it here too:
   > whose session left PRs (unless `/vet-plan` case 2b adopts it — the stamp
   > is gate-delegated and this run is that hold gate's continuation),
   > still stops at `/vet-plan`'s pre-edit capture; a
-  > complete plan still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT
-  > STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
+  > complete plan still stamped `VETTED` or `DRAFT` (or legacy `PARTIAL` /
+  > `NOT STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
   > guard is `/implement-plan` Step 0.45 check 2 — a `git log origin/main -20`
   > grep that misses anything older — though `/vet-plan` §2's claim verification
   > may also notice the plan's premises are already met. That cost
