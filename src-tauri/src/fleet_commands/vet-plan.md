@@ -1110,7 +1110,9 @@ If, on the values captured above:
   positively attribute). **Run case 2's probes HERE to decide that** — they are
   the only thing separating "adopt" from "a peer is mid-flight", and every one of
   them is read-only: does the stamping session's transcript tail show it died;
-  are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
+  for a death read on this device, does no live successor carry its id (§5's
+  void rule: `claude-successor.sh <sid>` must answer 1, and a 0 or 2 is a
+  STOP); are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
   exist for the plan. If all of them hold this is case 2 (**adopt**) and you
   proceed — do not STOP. **Evaluate case 2b HERE too, before taking any STOP**:
   when `printenv QONTINUI_GATE_ID` names the gate in the captured block's last
@@ -2110,7 +2112,10 @@ inline.
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    products — transcript tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides), its worktrees clean and 0 ahead of
 >    `origin/main`, and no PRs and no branches for the plan — **or that it
 >    delegated the plan to a hold gate whose continuation you are (the arm
 >    table's case 2b)**. Only then adopt it and append your own marker.
@@ -2155,10 +2160,35 @@ refusing a first-time vet.
 |---|---|---|---|
 | 0 | The marker **IS** your own current session id | a resume, or a Step 0.5 re-run | **Refresh**, never take over: update the date and keep the trail. |
 | 1 | Work has **landed** | delivery **arm 1** | **Refuse.** Do not overwrite; route to closeout. |
-| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
+| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND, when that death was read on THIS device (the ledger `.alert`, a transcript on this box, or a coord row for a session that last ran here), no live successor carries its id (the void rule below the table; a cross-machine death is decided by "Case 2 across machines" alone) — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
 | 2b | The stamping session **handed the rest to a hold gate, and you are that gate's continuation** (gate-delegated adoption) | the marker is a session id ≠ yours, AND `printenv QONTINUI_GATE_ID` (by NAME, never an `env` dump) names gate G, AND the **last** `Held behind gate` line in the captured block is literally `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` with G's **full** id (written only at the owner's closeout — `/implement-plan` Step 6.5), AND a FRESH `coord_gate_inspect {gate_id: G}` reads `verdict: cleared`, `continuation.consumed_by` equal to `$QONTINUI_GATE_DEVICE_ID` **and** to this device (`$QONTINUI_MACHINE_ID`, else `device_id` in `~/.qontinui/machine.json`), and an `anchor.work_unit_id` equal to this plan's unit or to the line's `anchor <work_unit_id>`. The `anchor <work_unit_id>` token is the last thing before the line's closing `)` — parse it from the RIGHT, so a predicate containing `;` or `)` cannot break the match. Case 2's zero-work-products checks do **not** apply: the predecessor's PRs are the expected state | **Adopt**, as case 2: keep the fresh write, and in place of the `Held behind gate` line (never keep it) write `History: adopted from <prior session id> via consumed hold <G full id>` **inside that one block** — a spelling that can never satisfy case 2b again. |
 | 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and neither case 2's nor case 2b's checks all hold | **STOP.** Do not vet and do not implement. |
 | — | **Anything else** — the stamp carries **no** session marker, or one you cannot positively attribute | no evidence of death, and no evidence it is yours | **STOP**, exactly as case 3. |
+
+**A live successor VOIDS every death signal on this device.** A live Claude
+process whose argv carries the stamping session's id is that session, resumed:
+an account migration restarts it as `claude --resume <sid>` under a new pid.
+It voids the ledger `.alert` `OWNER_GONE … pid_dead` / `pid_reused`, the tail
+of a transcript on this box, and a closed or finished coord row for a session
+that last ran here, and it forces STOP. A session that ran on another machine
+gets no scan here (its successor would run there): "Case 2 across machines"
+decides it. Probe it with
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>
+```
+
+Exit 0 prints the live successor pid(s): LIVE, so STOP. Exit 1 means none, and
+the death signal stands. Exit 2 is UNKNOWN, which makes the death clause
+UNKNOWN: STOP. On Git Bash the probe answers 2 (UNAVAILABLE), so a same-box
+death clause there reads UNKNOWN and STOPs until a Windows successor source
+exists. A substring `pgrep -af <sid>` or `ps … | grep <sid>` is never
+this probe, because it matches the probing shell (measured on nilan:
+`pgrep -af <an unused uuid>` from Claude Code's Bash tool returns rc 0). On
+2026-11-16 two migrated sessions logged `OWNER_GONE pid_dead` while their
+`--resume` successors were alive, the second's coord row read closed, and a net
+dispatched a duplicate onto each (findings `2a648c75` and `dd69d0ed`, dossier
+`implement-ship-net-fires-on-a-live-session`, mechanism 4).
 
 **Case 2b reads coord, never the environment alone.** `QONTINUI_GATE_ID` is
 injected by the runner into a gate continuation (`_gate-registration` →
@@ -2183,7 +2213,10 @@ D3)*. When the stamping session's transcript is not on this box, the death probe
 is **UNKNOWN**, and with it case 2 does not hold — the row is **STOP** unless one
 of these says dead-or-done. A signal stands in for the transcript-tail check
 ONLY; case 2's other three checks (worktrees clean and 0 ahead, no PRs, no
-branches) must still all hold beside it.
+branches) must still all hold beside it. Across machines no process scan can
+run, so where signal 3 is the stand-in it holds only if EVERY row matching the
+`claudeCodeSessionId`, in every tenant, reads closed or finished — one open row
+means LIVE. Signals 1 and 2 are unchanged.
 
 **Stage the credentials ONCE, first, and use them for all three signals.**
 §0.25 has already deleted its own bearers, and signals 2 and 3 need one (the
@@ -2248,8 +2281,12 @@ directory).
    the signal holds only if every bearer's walk completed AND every matched
    row, under any bearer, reads `finished` / closed. Rows
    that disagree (closed under one tenant, active or `working` under another)
-   are UNKNOWN, never dead. Stopping at the first `closed` row would adopt a
-   live peer.
+   read LIVE, never dead: one open row is enough. Stopping at the first
+   `closed` row would adopt a live peer. **The residual:** a migrated successor
+   whose only coord row reads closed still reads dead here, because no process
+   scan reaches another box (f51a0efc's row read `closed_at` while its
+   successor ran). That is a binding-drift dossier follow-up (finding
+   `dd69d0ed`), not something this signal can see.
 
 **Silence on the bus is never adoptable**, and an empty `coord_orient`
 `session_activity` is UNKNOWN by that tool's own contract (it lists live sessions
