@@ -713,7 +713,7 @@ def print_report(res, warnings):
             print(f"\n== {cur}")
         screen_v = f"[{r['screen']}] " if r["screen"] != r["verdict"] else ""
         print(f"  {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['account']:<13.13}  {r['name'][:60]}")
-        print(f"            - {screen_v}{'; '.join(r['reasons'])[:200]}")
+        print(f"            - {screen_v}{cfs.fit_reasons(r['reasons'], 200 - len(screen_v))}")
 
 
 def offset_of(path):
@@ -1140,6 +1140,26 @@ def trusted_finish_selftest():
             or cfs.finish_since({"sessionStatusSince": ahead}, True) is not None):
         bad.append("finish_since must judge coord's stamp against the caller's now_ms")
     return bad, 7
+
+
+def report_fit_selftest():
+    """print_report fits a row's reasons whole, the screen prefix counted in the width. Returns (bad, checks)."""
+    import contextlib
+    import io
+    bad = []
+    reasons = ["marked finished, but 1 tool shell(s) running under claude (Bash/Monitor/background task)",
+               "last assistant turn has a tool call with no result", "8 stray wait loop(s) " + "x" * 60,
+               "last turn activity 1m ago (< 15m idle floor)"]
+    row = {"terminalId": "t0000001", "tab": "t", "account": "a", "name": "n", "verdict": "BUSY",
+           "screen": "FOOTER-FINISHED", "reasons": reasons}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print_report([row], [])
+    line = next((l for l in out.getvalue().splitlines() if l.startswith("            - ")), "")
+    if len(line) - len("            - ") > 200 or not line.endswith(" (+2 more)") or \
+            "[FOOTER-FINISHED] marked finished, but 1 tool shell" not in line:
+        bad.append(f"nudge print_report did not fit the reasons whole: {line!r}")
+    return bad, 1
 
 
 def menu_limit_selftest():
@@ -2083,6 +2103,8 @@ def selftest():
     bad += cross_bad
     menu_bad, menu_checks = menu_limit_selftest()
     bad += menu_bad
+    fit_bad, fit_checks = report_fit_selftest()
+    bad += fit_bad
     for b in bad:
         print("FAIL: " + b)
     print(f"selftest: {len(cases)} reset cases, 7 prompt cases, {len(judge_cases)} judge cases, "
@@ -2091,7 +2113,7 @@ def selftest():
           f"{len(complete_cases)} completion cases, {len(transcript_cases) + 11} transcript cases, "
           f"2 send cases, {roster_checks} verdict-roster checks, {trusted_checks} trusted-finish checks, "
           f"{cross_checks} cross-screen checks, "
-          f"{menu_checks} open-menu checks, "
+          f"{menu_checks} open-menu checks, {fit_checks} report-fit checks, "
           f"{len(bad)} failure(s)")
     return 1 if bad else 0
 
