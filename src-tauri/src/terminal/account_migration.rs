@@ -1488,6 +1488,10 @@ fn migrate_session(
             // lock, so the anchor moves from held-by-permit to
             // held-by-session with no gap.
             if let Some((mut carried, reservation)) = carried_continuation {
+                // D4: coord clears the old pane's start proof; the new pane must
+                // prove its own. Before the re-pin, which is what orders it ahead
+                // of that proof. Infallible and non-blocking (see GUARD above).
+                crate::continuation_start_proof::report_respawned(carried.gate_id, &terminal_id);
                 // The respawned pane runs `claude --resume` as its direct
                 // child, so its exit facts are the agent's even when the old
                 // pane was a restored shell.

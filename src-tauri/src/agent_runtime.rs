@@ -3583,6 +3583,12 @@ impl ContinuationRegistry {
         consuming_device_id: Option<uuid::Uuid>,
         shell_hosted: bool,
     ) {
+        // A `SessionStart` that reached the runner before this registration
+        // was parked by the start-proof module; this is the moment it can be
+        // joined to its gate (plan `2026-11-10-coord-counts-a-gate-continuation-
+        // consumed-only-once-its-session-proves-it-started`, D1). Takes only
+        // that module's own lock and spawns, so it is safe under this one.
+        crate::continuation_start_proof::on_continuation_registered(&terminal_id, gate_id);
         self.live.insert(
             terminal_id.clone(),
             ContinuationSession {
@@ -5051,6 +5057,24 @@ pub(crate) fn register_restored_continuation(
         consuming_device_id,
         true,
     );
+}
+
+/// The gate a LIVE continuation registration on `terminal_id` answers, or
+/// `None` for an operator tab or a work-unit dispatch (which has no gate row).
+/// Read by the start-proof hook on every `SessionStart`
+/// (`continuation_start_proof::on_session_start`).
+pub(crate) fn continuation_gate_for_terminal(terminal_id: &str) -> Option<uuid::Uuid> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .get(terminal_id)
+        .and_then(|s| s.gate_id)
+}
+
+/// Register a gate continuation on `terminal_id` through the production
+/// insert point (tests in other modules).
+#[cfg(test)]
+pub(crate) fn register_continuation_for_proof_test(terminal_id: String, gate_id: uuid::Uuid) {
+    register_continuation_session_with_device(terminal_id, None, Some(gate_id), None);
 }
 
 /// Drop one live continuation registration without an exit (tests in other
@@ -7483,7 +7507,7 @@ async fn run_gate_continuation_inner(
     // AFTER the #469 guards pass and AWAITED — its result decides whether to
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
     // the poll and now, coord returns 409 cancelled and we skip the spawn.
-    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
+    if let ConsumeTarget::Gate(gate_id, attempt) = consume_target {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
         // logs — lives in `settle_claim_decision`, which the unit test drives
@@ -7498,7 +7522,12 @@ async fn run_gate_continuation_inner(
         // there and only the await lands at this call site.
         let decision = post_continuation_claim(gate_id, device_id).await;
         match settle_claim_decision(&decision, consume_target, gate_id) {
-            ClaimOutcome::Spawn => {}
+            // The attempt this run claimed is what its session's start proof
+            // names (`continuation_start_proof`); recorded only once coord's
+            // claim lets the spawn proceed.
+            ClaimOutcome::Spawn => {
+                crate::continuation_start_proof::record_dispatch_attempt(gate_id, attempt);
+            }
             ClaimOutcome::Skip => return Ok(()),
             ClaimOutcome::DeferUnclaimed(class) => {
                 defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class))

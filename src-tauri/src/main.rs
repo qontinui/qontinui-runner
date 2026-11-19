@@ -94,6 +94,7 @@ mod config_storage;
 mod constraint_engine;
 mod container;
 mod context;
+mod continuation_start_proof; // Plan 2026-11-10 Phase 2 — the start proof coord counts a continuation consumed on
 mod coord_doctor_cmd;
 mod coord_drain_state;
 mod coord_http;
