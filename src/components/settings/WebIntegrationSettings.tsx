@@ -44,6 +44,7 @@ import {
   isSignInCancelled,
 } from "@/components/PendingSignInNotice";
 import { SectionHeader } from "./SectionHeader";
+import { deriveStatusBanner } from "./webIntegrationBanner";
 import { EgressPrivacyPanel } from "./EgressPrivacyPanel";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
@@ -61,7 +62,7 @@ import {
 // ---------------------------------------------------------------------------
 
 /** Shape of `get_web_integration_status` response from the runner. */
-interface WebIntegrationStatus {
+export interface WebIntegrationStatus {
   enabled: boolean;
   backendUrl: string;
   /**
@@ -251,6 +252,93 @@ function deriveWebAppUrl(backendUrl: string): string | null {
 // ---------------------------------------------------------------------------
 
 const PLACEHOLDER_BACKEND_URL = "https://api.qontinui.io";
+
+/**
+ * The connection-state banner. Renders from `deriveStatusBanner`, so every
+ * state is named and none is a fall-through. Only "Reconnecting" shows a
+ * spinner: it is the one state backed by an observed fact (a runner id was
+ * issued and the socket has since dropped).
+ */
+export function StatusBanner({
+  status,
+  onRetry,
+}: {
+  status: WebIntegrationStatus | null;
+  onRetry: () => void;
+}) {
+  const banner = deriveStatusBanner(status);
+  const backend = status?.backendUrl || PLACEHOLDER_BACKEND_URL;
+  switch (banner.kind) {
+    case "none":
+      return null;
+    case "connected":
+      return (
+        <div className="flex items-start gap-2 p-3 rounded-md bg-green-500/10 border border-green-500/20">
+          <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0 mt-0.5" />
+          <div className="text-xs">
+            <div className="font-medium text-green-500">
+              Connected as runner <code className="font-mono">{banner.runnerId}</code>
+            </div>
+            <div className="text-muted-foreground">
+              Last heartbeat {formatRelativeTime(status?.lastHeartbeatAt ?? null)}
+            </div>
+          </div>
+        </div>
+      );
+    case "reconnecting":
+      // Runner was registered earlier in the session but the WS has dropped.
+      // The relay is reconnecting in the background.
+      return (
+        <div className="flex items-start gap-2 p-3 rounded-md bg-yellow-500/10 border border-yellow-500/20">
+          <Loader2 className="w-4 h-4 text-yellow-500 shrink-0 mt-0.5 animate-spin" />
+          <div className="text-xs">
+            <div className="font-medium text-yellow-500">Reconnecting…</div>
+            <div className="text-muted-foreground">Lost connection to {backend}; retrying.</div>
+          </div>
+        </div>
+      );
+    case "failed":
+      return (
+        <div className="flex items-start gap-2 p-3 rounded-md bg-destructive/10 border border-destructive/20">
+          <XCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
+          <div className="text-xs flex-1 min-w-0">
+            <div className="font-medium text-destructive">Registration failed</div>
+            <div className="text-muted-foreground truncate" title={banner.error}>
+              {truncate(banner.error, 140)}
+            </div>
+            <button onClick={onRetry} className="mt-1.5 text-primary hover:underline text-xs">
+              Retry
+            </button>
+          </div>
+        </div>
+      );
+    case "not-connected":
+      return (
+        <div className="flex items-start gap-2 p-3 rounded-md bg-muted/30 border border-border">
+          <AlertTriangle className="w-4 h-4 text-muted-foreground shrink-0 mt-0.5" />
+          <div className="text-xs">
+            <div className="font-medium">Not connected yet</div>
+            <div className="text-muted-foreground">
+              This runner has not been signed in to a Qontinui account. Use Sign in with Qontinui or
+              Pair with a code below to connect it.
+            </div>
+          </div>
+        </div>
+      );
+    case "unknown":
+      return (
+        <div className="flex items-start gap-2 p-3 rounded-md bg-muted/30 border border-border">
+          <AlertTriangle className="w-4 h-4 text-muted-foreground shrink-0 mt-0.5" />
+          <div className="text-xs">
+            <div className="font-medium">Status unknown</div>
+            <div className="text-muted-foreground">
+              The runner reports a connection but no runner id, so its state cannot be confirmed.
+            </div>
+          </div>
+        </div>
+      );
+  }
+}
 
 export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   // --- Persisted/server state ------------------------------------------------
@@ -955,7 +1043,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     return (
       <div className="space-y-6">
         <SectionHeader
-          title="Web Integration"
+          title="Backend Connection"
           description="Register this runner with qontinui-web so it can be dispatched to and its phase events stream back."
           icon={<Globe className="w-6 h-6" />}
         />
@@ -966,71 +1054,6 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       </div>
     );
   }
-
-  // --- Status banner --------------------------------------------------------
-  const renderStatusBanner = () => {
-    if (!status?.enabled) return null;
-    if (status.wsConnected && status.runnerId) {
-      return (
-        <div className="flex items-start gap-2 p-3 rounded-md bg-green-500/10 border border-green-500/20">
-          <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0 mt-0.5" />
-          <div className="text-xs">
-            <div className="font-medium text-green-500">
-              Connected as runner <code className="font-mono">{status.runnerId}</code>
-            </div>
-            <div className="text-muted-foreground">
-              Last heartbeat {formatRelativeTime(status.lastHeartbeatAt)}
-            </div>
-          </div>
-        </div>
-      );
-    }
-    if (status.runnerId && !status.wsConnected) {
-      // Runner was registered earlier in the session but the WS has dropped.
-      // The relay is reconnecting in the background.
-      return (
-        <div className="flex items-start gap-2 p-3 rounded-md bg-yellow-500/10 border border-yellow-500/20">
-          <Loader2 className="w-4 h-4 text-yellow-500 shrink-0 mt-0.5 animate-spin" />
-          <div className="text-xs">
-            <div className="font-medium text-yellow-500">Reconnecting…</div>
-            <div className="text-muted-foreground">
-              Lost connection to {status.backendUrl || PLACEHOLDER_BACKEND_URL}; retrying.
-            </div>
-          </div>
-        </div>
-      );
-    }
-    if (status.registrationError) {
-      return (
-        <div className="flex items-start gap-2 p-3 rounded-md bg-destructive/10 border border-destructive/20">
-          <XCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
-          <div className="text-xs flex-1 min-w-0">
-            <div className="font-medium text-destructive">Registration failed</div>
-            <div className="text-muted-foreground truncate" title={status.registrationError}>
-              {truncate(status.registrationError, 140)}
-            </div>
-            <button
-              onClick={handleRetryRegistration}
-              className="mt-1.5 text-primary hover:underline text-xs"
-            >
-              Retry
-            </button>
-          </div>
-        </div>
-      );
-    }
-    return (
-      <div className="flex items-start gap-2 p-3 rounded-md bg-yellow-500/10 border border-yellow-500/20">
-        <Loader2 className="w-4 h-4 text-yellow-500 shrink-0 mt-0.5 animate-spin" />
-        <div className="text-xs">
-          <div className="font-medium text-yellow-500">Registering…</div>
-          <div className="text-muted-foreground">
-            Contacting {status.backendUrl || PLACEHOLDER_BACKEND_URL}
-          </div>
-        </div>
-      </div>
-    );
-  };
 
   // --- Test result inline indicator -----------------------------------------
   const renderTestResult = () => {
@@ -1067,14 +1090,14 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           );
         }
         return (
-          <div className="flex items-center gap-1.5 text-xs text-green-500" title={testState.detail}>
+          <div
+            className="flex items-center gap-1.5 text-xs text-green-500"
+            title={testState.detail}
+          >
             <CheckCircle2 className="w-3.5 h-3.5" />
             Connected as device <code className="font-mono">{testState.deviceId}</code>
             {testState.tokenFormatValid === false && (
-              <span className="text-yellow-500">
-                {" "}
-                · saved runner token is malformed
-              </span>
+              <span className="text-yellow-500"> · saved runner token is malformed</span>
             )}
           </div>
         );
@@ -1097,7 +1120,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   return (
     <div className="space-y-6">
       <SectionHeader
-        title="Web Integration"
+        title="Backend Connection"
         description="Register this runner with qontinui-web so it can be dispatched to and its phase events stream back."
         icon={<Globe className="w-6 h-6" />}
       />
@@ -1126,7 +1149,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         </div>
       )}
 
-      {renderStatusBanner()}
+      <StatusBanner status={status} onRetry={handleRetryRegistration} />
 
       {/* Master toggle */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
@@ -1239,7 +1262,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
                 }
               }}
               placeholder="A7K2P3"
-              className="flex-1 min-w-0 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono tracking-[0.3em] uppercase"
+              className="flex-1 min-w-0 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary font-mono tracking-[0.3em] uppercase"
             />
             <button
               type="button"
@@ -1263,6 +1286,37 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         </div>
       </div>
 
+      {/* BACKEND — where this runner registers and signs in. Shown next to the
+          connection state, not buried in Advanced; the Account tab reads it. */}
+      <div className="space-y-3 rounded-lg bg-card/50 p-4" data-ui-bridge-id="settings.backend-url">
+        <h4 className="font-medium text-sm">Backend</h4>
+        <div className="space-y-1.5">
+          <label htmlFor="web-integration-backend-url" className="text-xs font-medium">
+            Backend URL
+          </label>
+          <input
+            id="web-integration-backend-url"
+            type="url"
+            autoComplete="off"
+            spellCheck={false}
+            value={formBackendUrl}
+            onChange={(e) => handleBackendUrlChange(e.target.value)}
+            placeholder={PLACEHOLDER_BACKEND_URL}
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary"
+          />
+          {urlError ? (
+            <p className="text-[10px] text-destructive flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3" /> {urlError}
+            </p>
+          ) : (
+            <p className="text-[10px] text-muted-foreground">
+              Base URL of the qontinui-web backend (API) this runner registers with and signs in
+              against. The Account tab uses this same URL.
+            </p>
+          )}
+        </div>
+      </div>
+
       {/* Privacy — the six outbound data flows and this project's switch for
           each (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
           Phase 8). Read-only: the switches are written in the web console.
@@ -1276,11 +1330,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1 pr-4">
             <div className="text-sm font-medium">Session metadata sync</div>
-            <div className="text-xs text-muted-foreground">
-              Shares session lifecycle info (provider, working directory, last command) with your
-              coord tenant so a session can be resumed or handed off from another machine.
-              Recommended — no conversation content leaves this machine. Off: this session can only
-              be resumed on this machine.
+            <div className="text-sm text-muted-foreground">
+              <strong className="font-medium text-foreground">On by default.</strong> Shares session
+              lifecycle info (provider, working directory, last command) with your coord tenant so a
+              session can be resumed or handed off from another machine. Recommended — no
+              conversation content leaves this machine. Off: this session can only be resumed on
+              this machine.
             </div>
           </div>
           {sessionMetadataSyncEnabled === null ? (
@@ -1329,10 +1384,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1 pr-4">
             <div className="text-sm font-medium">AI content sync</div>
-            <div className="text-xs text-muted-foreground">
-              Syncs AI conversation transcripts and tenant agentic memory (task outcomes, reflection
-              fixes) to your coord tenant (warm tier ~7 days post-close, cold archive 90 days). Off:
-              no conversation or memory content leaves this machine.
+            <div className="text-sm text-muted-foreground">
+              <strong className="font-medium text-foreground">On by default.</strong> Syncs AI
+              conversation transcripts and tenant agentic memory (task outcomes, reflection fixes)
+              to your coord tenant. Retained in the warm tier for ~7 days after the session closes,
+              then in a cold archive for 90 days. Off: no conversation or memory content leaves this
+              machine.
             </div>
             <div className="text-[10px] text-muted-foreground">
               Secrets matching common credential patterns are redacted before upload —
@@ -1383,16 +1440,20 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           content sync above, which governs whether that shared content
           actually leaves the machine. Saves immediately, same as the two
           blocks above. */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-bridge-id="settings.share-terminal-output">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-bridge-id="settings.share-terminal-output"
+      >
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1 pr-4">
             <div className="text-sm font-medium">Share terminal output</div>
-            <div className="text-xs text-muted-foreground">
-              Default for new sessions: stream this session&apos;s terminal output to your coord
-              tenant through the same warm/cold retention tiers as AI content sync above. Off: a
-              new session&apos;s output stays local, whether or not AI content sync is on.
-              Existing sessions keep whatever they started with — this sets the default for
-              sessions started after the change, not a live switch on open ones.
+            <div className="text-sm text-muted-foreground">
+              <strong className="font-medium text-foreground">On by default.</strong> Default for
+              new sessions: stream this session&apos;s terminal output to your coord tenant through
+              the same retention as AI content sync above (warm ~7 days after the session closes,
+              cold archive 90 days). Off: a new session&apos;s output stays local, whether or not AI
+              content sync is on. Existing sessions keep whatever they started with — this sets the
+              default for sessions started after the change, not a live switch on open ones.
             </div>
           </div>
           {perfCapsLoadState !== "loaded" ? (
@@ -1427,9 +1488,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         <div className="px-3 space-y-1.5" data-ui-bridge-id="settings.redact-terminal-secrets">
           <div className="text-xs font-medium">Redact secrets in shared output</div>
           <div className="text-[10px] text-muted-foreground">
-            Scrubs shared terminal output for common secret patterns before it leaves this
-            machine — defense-in-depth, not a security boundary. Left on &quot;Follow
-            sharing&quot;, redaction tracks the toggle above (on whenever sharing is on).
+            Scrubs shared terminal output for common secret patterns before it leaves this machine —
+            defense-in-depth, not a security boundary. Left on &quot;Follow sharing&quot;, redaction
+            tracks the toggle above (on whenever sharing is on).
           </div>
           <div className="flex gap-2 pt-1">
             {(
@@ -1458,8 +1519,8 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
         {shareOutputError && (
           <p className="text-[10px] text-destructive px-3">
-            Could not save this setting ({truncate(shareOutputError, 100)}). It has NOT been
-            changed — the runner is still using whatever you last saved.
+            Could not save this setting ({truncate(shareOutputError, 100)}). It has NOT been changed
+            — the runner is still using whatever you last saved.
           </p>
         )}
       </div>
@@ -1481,31 +1542,6 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
         <div className="mt-4 space-y-4">
           <div className="space-y-1.5">
-            <label htmlFor="web-integration-backend-url" className="text-xs font-medium">
-              Backend URL
-            </label>
-            <input
-              id="web-integration-backend-url"
-              type="url"
-              autoComplete="off"
-              spellCheck={false}
-              value={formBackendUrl}
-              onChange={(e) => handleBackendUrlChange(e.target.value)}
-              placeholder={PLACEHOLDER_BACKEND_URL}
-              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
-            />
-            {urlError ? (
-              <p className="text-[10px] text-destructive flex items-center gap-1">
-                <AlertTriangle className="w-3 h-3" /> {urlError}
-              </p>
-            ) : (
-              <p className="text-[10px] text-muted-foreground">
-                Base URL of the qontinui-web backend (API) this runner registers with.
-              </p>
-            )}
-          </div>
-
-          <div className="space-y-1.5">
             <label htmlFor="web-integration-web-base-url" className="text-xs font-medium">
               Web base URL <span className="text-muted-foreground font-normal">(optional)</span>
             </label>
@@ -1517,7 +1553,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
               value={formWebBaseUrl}
               onChange={(e) => handleWebBaseUrlChange(e.target.value)}
               placeholder={webAppUrl ?? "https://qontinui.io"}
-              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary"
             />
             {webBaseUrlError ? (
               <p className="text-[10px] text-destructive flex items-center gap-1">
@@ -1555,7 +1591,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
                     ? status.runnerTokenMasked
                     : "qontinui_runner_…"
                 }
-                className="flex-1 min-w-0 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
+                className="flex-1 min-w-0 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary font-mono"
               />
               <button
                 type="button"
