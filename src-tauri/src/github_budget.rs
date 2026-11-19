@@ -117,10 +117,18 @@ const DEFAULT_LOW_FRACTION: f64 = 0.20;
 const LOW_FRACTION_ENV: &str = "QONTINUI_GITHUB_BUDGET_LOW_FRACTION";
 
 /// Hard entry ceiling for the ETag cache.
-const ETAG_CACHE_MAX_ENTRIES: usize = 512;
+///
+/// Sized to hold one whole session-PR reconciler cycle. A full tick on a box
+/// with ~120 open sessions visits ~670 distinct URLs in a fixed order, so a
+/// 512-entry LRU evicted every entry before the next tick reached it and the
+/// conditional GETs went out unconditional (plan
+/// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+/// D5). 4,096 leaves the byte budget below as the binding bound: at the
+/// measured ~12.8 KB per entry it holds ~2,500 entries, above one cycle.
+const ETAG_CACHE_MAX_ENTRIES: usize = 4_096;
 
 /// Heap budget for the ETag cache. The entry ceiling alone is not a bound: a
-/// `/compare/{a}...{b}` body is MB-scale, so 512 of them is not "small". Both
+/// `/compare/{a}...{b}` body is MB-scale, so 4,096 of them is not "small". Both
 /// limits are enforced; whichever binds first evicts.
 const ETAG_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
@@ -1587,6 +1595,28 @@ mod tests {
         assert!(entries < 6, "eviction happened, {entries} entries left");
         assert!(cache.replay("/big/5").is_some(), "newest survives");
         assert!(cache.replay("/big/0").is_none(), "oldest evicted");
+    }
+
+    /// The default cache must hold a whole reconciler cycle: one tick visits
+    /// every URL once, in the same order, and the next tick revisits them. A cap
+    /// below the cycle length evicts each entry before it is reached again, so
+    /// every second-pass lookup misses (the measured 512-entry thrash).
+    #[test]
+    fn etag_cache_default_holds_a_full_reconcile_cycle() {
+        const URLS: usize = 1_000;
+        const BODY_BYTES: usize = 12_800; // the measured mean entry size
+        let mut cache = EtagCache::default();
+        let url = |i: usize| format!("/repos/o/r{i}/pulls?state=all&head=o:b{i}");
+        for i in 0..URLS {
+            cache.store(&url(i), "\"e\"", Bytes::from(vec![0u8; BODY_BYTES]));
+        }
+        for i in 0..URLS {
+            assert!(
+                cache.replay(&url(i)).is_some(),
+                "second-pass replay missed at entry {i} of {URLS}: the cache does not hold one cycle"
+            );
+        }
+        assert_eq!(cache.stats().0, URLS);
     }
 
     #[test]
