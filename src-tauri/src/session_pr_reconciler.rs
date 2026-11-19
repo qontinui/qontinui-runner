@@ -803,20 +803,24 @@ async fn run_tick(
     // credential's headroom line its reads are deferred rather than sent
     // (plan 2026-10-30-…, D4) — the identity's interactive sessions keep the
     // rest of the window.
-    let client = GitHubClient::new(&token, "session_pr_reconciler")?
-        .with_spend_class(SpendClass::Background);
+    let client = reconciler_client(&token)?;
     let mut budget = TickBudget::default();
 
-    // The login, once per credential per process: a conditional `GET /user`
-    // (one charged call, `304` after). Phase 4 keys the shared bucket by it.
-    if crate::github_budget::login_for(client.credential()).is_none() {
-        match client.authenticated_login().await {
-            Ok(login) => {
+    // The login, once per credential per process: a conditional `GET /user`.
+    // Phase 4 keys the shared bucket by it. A credential that cannot answer
+    // (an installation token answers `403`) backs off rather than being
+    // re-asked every tick; a deferral is not a failure and is asked again.
+    if crate::github_budget::login_lookup_due(client.credential()) {
+        match budget.spend(|| client.authenticated_login()).await {
+            Some(Ok(login)) => {
                 crate::github_budget::record_login(client.credential(), &login);
                 crate::github_budget::record_identity(token_source, Some(login));
             }
-            Err(GhError::Deferred(_)) => budget.deferred_by_gate(),
-            Err(e) => debug!("session-pr-reconciler: GET /user failed (login UNKNOWN): {e}"),
+            Some(Err(e)) => {
+                crate::github_budget::record_login_failure(client.credential());
+                debug!("session-pr-reconciler: GET /user failed (login UNKNOWN, backing off): {e}");
+            }
+            None => {}
         }
     }
 
@@ -932,38 +936,55 @@ async fn run_tick(
     Ok(())
 }
 
+/// The reconciler's GitHub client — BACKGROUND spend (plan 2026-10-30-…,
+/// D4). Nobody is waiting on a reconcile, so under the credential's headroom
+/// line its reads are deferred rather than sent, and a rate-limited refusal is
+/// never slept on: the identity's interactive sessions keep the rest of the
+/// window. The one place the reconciler's spend class is decided.
+pub(crate) fn reconciler_client(token: &str) -> Result<GitHubClient, String> {
+    Ok(GitHubClient::new(token, "session_pr_reconciler")?.with_spend_class(SpendClass::Background))
+}
+
 /// One cycle's GitHub spend state (plan 2026-10-30-…, Phase 3, D4).
 ///
-/// The first read the headroom gate defers ends the cycle's spending: every
-/// later read is skipped without asking again, and counted, so the tick line's
-/// `deferred_budget` says how many reads this cycle did not make for budget —
-/// a skip that is observable rather than inferred. Free work (local repo
-/// resolution, trailer reads, stored-row bookkeeping) still runs.
+/// The first budget stop — a read the headroom gate deferred, or one GitHub
+/// refused for rate — ends the cycle's spending: every later read is skipped
+/// without asking again, and counted, so the tick line's `deferred_budget` says
+/// how many reads this cycle did not make for budget — a skip that is
+/// observable rather than inferred. Free work (local repo resolution, trailer
+/// reads, stored-row bookkeeping) still runs. Every GitHub read in a tick goes
+/// through [`TickBudget::spend`].
 #[derive(Debug, Default)]
 struct TickBudget {
-    /// Reads not made this cycle for budget: the gate's deferral plus every
+    /// Reads not made this cycle for budget: the stopping read plus every
     /// read skipped after it.
     deferred: usize,
-    /// Set by the first deferral; the cycle spends nothing more.
+    /// Set by the first budget stop; the cycle spends nothing more.
     spent_out: bool,
 }
 
 impl TickBudget {
-    /// May this cycle put another GitHub read on the wire? A `false` counts
-    /// the read being skipped.
-    fn admit(&mut self) -> bool {
+    /// Make one GitHub read under this cycle's budget. `None` means the read
+    /// was not made for budget — skipped because the cycle is spent out, or
+    /// deferred / rate-limited now (which spends the cycle out) — and is
+    /// counted. A plain failure is `Some(Err)` and does not stop the cycle.
+    /// `read` is not even called once the cycle is spent out.
+    async fn spend<T, Fut>(&mut self, read: impl FnOnce() -> Fut) -> Option<Result<T, GhError>>
+    where
+        Fut: std::future::Future<Output = Result<T, GhError>>,
+    {
         if self.spent_out {
             self.deferred += 1;
-            false
-        } else {
-            true
+            return None;
         }
-    }
-
-    /// The headroom gate deferred a read: count it and stop spending.
-    fn deferred_by_gate(&mut self) {
-        self.deferred += 1;
-        self.spent_out = true;
+        match read().await {
+            Err(e) if e.is_budget_stop() => {
+                self.deferred += 1;
+                self.spent_out = true;
+                None
+            }
+            other => Some(other),
+        }
     }
 }
 
@@ -1003,19 +1024,14 @@ async fn attribute_session_in_repo(
         .iter()
         .filter(|b| b.session_ids.iter().any(|s| s == &session_str))
     {
-        if !budget.admit() {
-            continue;
-        }
-        let prs = match client
-            .list_prs_for_head(&info.owner, &info.repo, &bt.branch)
+        let prs = match budget
+            .spend(|| client.list_prs_for_head(&info.owner, &info.repo, &bt.branch))
             .await
         {
-            Ok(prs) => prs,
-            Err(GhError::Deferred(_)) => {
-                budget.deferred_by_gate();
-                continue;
-            }
-            Err(e) => {
+            // Not made for budget: counted in `deferred_budget`.
+            None => continue,
+            Some(Ok(prs)) => prs,
+            Some(Err(e)) => {
                 debug!(
                     "session-pr-reconciler: list_prs_for_head({repo_full}, {}) failed: {e}",
                     bt.branch
@@ -1112,12 +1128,13 @@ async fn refresh_stored_statuses(
         let Some((owner, repo)) = row.repo.split_once('/') else {
             continue;
         };
-        if !budget.admit() {
-            // Spent out this cycle: the row keeps its prior status.
-            continue;
-        }
-        match client.get_pr(owner, repo, row.pr_number as u64).await {
-            Ok(pr) => {
+        match budget
+            .spend(|| client.get_pr(owner, repo, row.pr_number as u64))
+            .await
+        {
+            // Not made for budget: the row keeps its prior status.
+            None => {}
+            Some(Ok(pr)) => {
                 // CALL SITE 2 of the land cascade. THIS is the ff-land path in
                 // practice: a landed PR's branch is usually deleted, which is
                 // exactly why the branch path above no longer reaches it.
@@ -1156,8 +1173,7 @@ async fn refresh_stored_statuses(
                     warn!("session-pr-reconciler: update_session_pr_status failed: {e}");
                 }
             }
-            Err(GhError::Deferred(_)) => budget.deferred_by_gate(),
-            Err(e) => {
+            Some(Err(e)) => {
                 debug!(
                     "session-pr-reconciler: get_pr({}/#{}) failed (leaving prior status): {e}",
                     row.repo, row.pr_number
@@ -1863,22 +1879,103 @@ fn record_resolved_identity(source: &str, token: &str) {
 mod tests {
     use super::*;
 
-    /// Phase 3 (D4): the first deferral ends the cycle's spending, and every
-    /// read the cycle then skips is counted in `deferred_budget`.
-    #[test]
-    fn a_deferred_read_stops_the_cycles_spending_and_every_skip_is_counted() {
-        let mut budget = TickBudget::default();
-        assert!(budget.admit(), "a fresh cycle spends");
-        assert!(budget.admit());
-        assert_eq!(budget.deferred, 0, "admitted reads are not deferrals");
+    fn a_deferral() -> GhError {
+        GhError::Deferred(crate::github_budget::BudgetDeferral {
+            credential: crate::github_budget::CredentialKey::of_token("t"),
+            remaining: 0,
+            limit: 5000,
+            reset_at_unix: 0,
+        })
+    }
 
-        budget.deferred_by_gate();
-        assert_eq!(budget.deferred, 1);
-        assert!(!budget.admit(), "no read is sent after a deferral");
-        assert!(!budget.admit());
-        assert_eq!(budget.deferred, 3, "each skipped read is counted");
+    /// Phase 3 (D4): the first budget stop — a deferral OR a rate-limited
+    /// refusal — ends the cycle's spending; every read the cycle then skips is
+    /// counted in `deferred_budget` and is never even attempted. A plain
+    /// failure does not stop the cycle.
+    #[tokio::test]
+    async fn a_budget_stop_ends_the_cycles_spending_and_every_skip_is_counted() {
+        for (why, stop) in [
+            ("deferred", a_deferral()),
+            ("rate-limited", GhError::RateLimited { status: 429 }),
+        ] {
+            let mut budget = TickBudget::default();
+            let got: Option<Result<u8, GhError>> = budget.spend(|| async { Ok(7) }).await;
+            assert!(matches!(got, Some(Ok(7))), "{why}: a fresh cycle spends");
+            let got: Option<Result<u8, GhError>> = budget
+                .spend(|| async { Err(GhError::Failed("boom".into())) })
+                .await;
+            assert!(matches!(got, Some(Err(GhError::Failed(_)))), "{why}");
+            assert_eq!(budget.deferred, 0, "{why}: a failure is not a budget stop");
 
-        assert!(TickBudget::default().admit(), "the next cycle spends again");
+            let got: Option<Result<u8, GhError>> =
+                budget.spend(move || async move { Err(stop) }).await;
+            assert!(
+                got.is_none(),
+                "{why}: the stop is not handed back as a failure"
+            );
+            assert_eq!(budget.deferred, 1, "{why}");
+
+            let attempted = std::cell::Cell::new(0);
+            for _ in 0..2 {
+                let got: Option<Result<u8, GhError>> = budget
+                    .spend(|| {
+                        attempted.set(attempted.get() + 1);
+                        async { Ok(1) }
+                    })
+                    .await;
+                assert!(got.is_none(), "{why}: no read after a stop");
+            }
+            assert_eq!(
+                attempted.get(),
+                0,
+                "{why}: a spent-out cycle never calls the read"
+            );
+            assert_eq!(budget.deferred, 3, "{why}: each skipped read is counted");
+        }
+    }
+
+    /// The arming proof, entered where the reconciler's population enters: a
+    /// client from the reconciler's own constructor, `list_prs_for_head`, a
+    /// credential seeded short of the headroom line, a refusing port. The answer
+    /// is the typed deferral — not a transport failure — and the meter counts
+    /// exactly one `deferred` with nothing sent. Bypass the gate (or build the
+    /// reconciler's client interactive) and the request reaches port 1: red.
+    #[tokio::test]
+    async fn a_background_list_prs_for_head_under_the_headroom_line_is_never_sent() {
+        let client = reconciler_client("budget-test-reconciler-entry")
+            .expect("client builds")
+            .with_api_base("http://127.0.0.1:1");
+        crate::github_budget::seed_reading_for_test(
+            client.credential(),
+            &crate::github_budget::RateLimitObservation {
+                limit: Some(5000),
+                remaining: Some(50),
+                used: Some(4950),
+                reset_at_unix: Some(crate::trigger_system::github_api::now_unix() + 1800),
+                resource: Some("core".to_string()),
+            },
+        );
+
+        let err = client
+            .list_prs_for_head("budget-test-entry-owner", "entry-repo", "feat/x")
+            .await
+            .expect_err("a short window defers");
+        assert!(
+            matches!(&err, GhError::Deferred(d) if d.credential == *client.credential()),
+            "{err}"
+        );
+
+        let row = crate::github_budget::snapshot_top(usize::MAX)
+            .consumers
+            .into_iter()
+            .find(|r| {
+                r.consumer == "session_pr_reconciler"
+                    && r.template == "/repos/budget-test-entry-owner/entry-repo/pulls"
+            })
+            .expect("the deferral was metered");
+        assert_eq!(row.deferred, 1);
+        assert_eq!(row.transport_error, 0, "nothing was put on the wire");
+        assert_eq!(row.charged + row.not_modified + row.rate_limited, 0);
     }
 
     #[test]
