@@ -172,6 +172,8 @@ pub(crate) enum MigrateError {
     RespawnDied {
         exit_code: Option<i32>,
         attempts: usize,
+        /// The last retry's spawn error, when a retry could not even spawn.
+        retry_spawn_error: Option<String>,
     },
     /// The resumed child runs but never painted by the deadline. With the old
     /// pane still running (its CLI seen, or its subtree unreadable) the
@@ -215,7 +217,12 @@ impl MigrateError {
             Self::RespawnDied {
                 exit_code,
                 attempts,
-            } => super::respawn_liveness::RespawnOutcome::died_reason(*exit_code, *attempts),
+                retry_spawn_error,
+            } => super::respawn_liveness::RespawnOutcome::died_detail(
+                *exit_code,
+                *attempts,
+                retry_spawn_error.as_deref(),
+            ),
             Self::Unconfirmed { .. } => "migration-unconfirmed".to_string(),
         }
     }
@@ -241,8 +248,11 @@ impl std::fmt::Display for MigrateError {
             Self::RespawnDied {
                 exit_code,
                 attempts,
-            } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_reason(
-                *exit_code, *attempts,
+                retry_spawn_error,
+            } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_detail(
+                *exit_code,
+                *attempts,
+                retry_spawn_error.as_deref(),
             )),
             Self::Unconfirmed {
                 new_terminal_id,
@@ -1924,10 +1934,10 @@ async fn confirm_migration(
             let err = MigrateError::RespawnDied {
                 exit_code,
                 attempts,
+                retry_spawn_error,
             };
             warn!(
                 session = %record.claude_session_id,
-                retry_spawn_error = ?retry_spawn_error,
                 "{err} — rolled back onto the old pane if it still runs, else the session ended"
             );
             emit_skipped(app, record, src_config_dir, &err.skip_reason());
@@ -2937,6 +2947,7 @@ mod tests {
             MigrateError::RespawnDied {
                 exit_code: Some(127),
                 attempts: 3,
+                retry_spawn_error: None,
             },
             MigrateError::Unconfirmed {
                 new_terminal_id: "new-1".into(),
@@ -2945,6 +2956,22 @@ mod tests {
         ] {
             assert!(!e.reached_destination(), "{e}");
         }
+    }
+
+    /// A died migration whose last retry could not spawn says so in its skip
+    /// reason, instead of reading as one more pane that exited.
+    #[test]
+    fn a_died_migration_names_a_retry_that_could_not_spawn() {
+        let e = MigrateError::RespawnDied {
+            exit_code: Some(127),
+            attempts: 3,
+            retry_spawn_error: Some("claude not found".into()),
+        };
+        assert_eq!(
+            e.skip_reason(),
+            "respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"
+        );
+        assert_eq!(e.to_string(), e.skip_reason());
     }
 
     /// The died / unconfirmed arms reported themselves (they changed panes):
@@ -2958,6 +2985,7 @@ mod tests {
                 MigrateError::RespawnDied {
                     exit_code: Some(127),
                     attempts: 3,
+                    retry_spawn_error: None,
                 },
                 true,
             ),

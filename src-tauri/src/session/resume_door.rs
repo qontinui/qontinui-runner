@@ -765,10 +765,10 @@ fn proven_terminal(
         RespawnOutcome::Died {
             exit_code,
             attempts,
-            ..
+            retry_spawn_error,
         } => Err(Box::new(ResumeRow::failed(
             id,
-            RespawnOutcome::died_reason(exit_code, attempts),
+            RespawnOutcome::died_detail(exit_code, attempts, retry_spawn_error.as_deref()),
             None,
         ))),
         // The pane is LEFT RUNNING (it keeps the row): a caller must not read
@@ -1285,6 +1285,20 @@ mod tests {
         assert_eq!(
             died.verdict,
             "failed(respawn-died: exit 127 after 3 attempts)"
+        );
+        let retry_unspawnable = proven_terminal(
+            ID,
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: Some("claude not found".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            retry_unspawnable.reason.as_deref(),
+            Some("respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"),
+            "a retry that never spawned must be named, not reported as a third death"
         );
         let unconfirmed = proven_terminal(
             ID,

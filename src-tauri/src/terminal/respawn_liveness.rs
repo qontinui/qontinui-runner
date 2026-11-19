@@ -371,6 +371,21 @@ impl RespawnOutcome {
         let code = exit_code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
         format!("respawn-died: exit {code} after {attempts} attempts")
     }
+
+    /// [`Self::died_reason`], plus the last retry's spawn error when a retry
+    /// could not even spawn — so a report of the death says the final attempts
+    /// never launched, rather than reading as one more pane that exited.
+    pub(crate) fn died_detail(
+        exit_code: Option<i32>,
+        attempts: usize,
+        retry_spawn_error: Option<&str>,
+    ) -> String {
+        let base = Self::died_reason(exit_code, attempts);
+        match retry_spawn_error {
+            Some(e) => format!("{base}; last retry could not spawn: {e}"),
+            None => base,
+        }
+    }
 }
 
 /// What became of the OLD pane (an account migration's) while the respawn ran.
