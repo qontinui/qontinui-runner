@@ -44,11 +44,8 @@ use crate::ticket_system::types::{
 use crate::trigger_system::github_api::{
     at_api_base, cache_action, cached_link_next, extract_next_url, interactive_floor,
     is_terminal_403, link_cache_key, now_unix, retry_backoff_secs, CacheAction, GhError,
-    GITHUB_API_BASE,
+    GITHUB_API_BASE, PAGINATION_CAP,
 };
-
-/// Maximum total results to accumulate across paginated GitHub API calls.
-const PAGINATION_CAP: usize = 500;
 
 /// The budget-histogram label for every call this module makes.
 const BUDGET_CONSUMER: &str = "ticket_system";
