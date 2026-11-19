@@ -1410,7 +1410,8 @@ fn fold_with_role(
                 }
             }
         };
-        let (mut transition, state) = fold_locked(&mut inner, f, Instant::now(), now, stale_after());
+        let (mut transition, state) =
+            fold_locked(&mut inner, f, Instant::now(), now, stale_after());
         let episode_changed = transition.changed;
         transition.changed |= role_changed;
         if transition.changed {
@@ -2202,7 +2203,6 @@ pub fn coord_drain_state_get() -> CoordDrainSnapshot {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
 
 #[cfg(test)]
 mod tests {
@@ -3511,7 +3511,10 @@ mod tests {
         assert_every_autonomous_origin_is_role_deferred();
         // Only a SERVED role replaces it.
         cache_role_from_me_drain(r#"{"state":"clear","dispatch_role":"workhorse"}"#);
-        assert_eq!(current_dispatch_role().role(), Some(DispatchRole::Workhorse));
+        assert_eq!(
+            current_dispatch_role().role(),
+            Some(DispatchRole::Workhorse)
+        );
         for o in SpawnOrigin::ALL {
             assert_eq!(drain_gate(o), DrainGate::Allow, "{o:?}");
         }
