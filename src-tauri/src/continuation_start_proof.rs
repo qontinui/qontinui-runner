@@ -12,14 +12,17 @@
 //! Two posts, both best-effort, both off the caller's path:
 //!
 //! - **`continuation-started`** — `POST /coord/agent-gates/{gate_id}/continuation-started`
-//!   `{attempt, claude_session_id}`, fired when a continuation pane's
-//!   `SessionStart` hook reaches the runner's `GET /sessions/{id}/policy-context`
+//!   `{attempt, claude_session_id, terminal_id}`, fired when a continuation
+//!   pane's `SessionStart` hook reaches the runner's `GET /sessions/{id}/policy-context`
 //!   route ([`on_session_start`]). That route is hit by every `SessionStart`
 //!   whatever `QONTINUI_POLICY_INJECTION` says, which is why the hook sits
 //!   before the route's mode branch rather than at the "injecting" log line
 //!   (D1). Coord accepts it only when `claude_session_id` equals the session id
 //!   it bound onto the gate's placeholder row, so the runner relays a proof it
-//!   cannot originate.
+//!   cannot originate. `terminal_id` is the pane whose `SessionStart` produced
+//!   the proof (the route's raw path id, also for a proof parked before its
+//!   registration); while a respawn terminal is stored, coord refuses a proof
+//!   from any other terminal (`409 stale_terminal`, a quiet decline).
 //! - **`continuation-respawned`** — `POST /coord/agent-gates/{gate_id}/continuation-respawned`
 //!   `{attempt, new_terminal_id}`, fired when a carried continuation is
 //!   re-pinned onto a NEW pane ([`report_respawned`]) by the account
@@ -126,9 +129,10 @@
 //!
 //! ## Dedupe
 //!
-//! At most one start proof per `(gate_id, attempt, claude_session_id)` per
-//! runner process. `SessionStart` also fires on `--resume` and on `compact`, so
-//! without it one long session would post on every compaction. A resume of the
+//! At most one start proof per `(gate_id, attempt, claude_session_id,
+//! terminal_id)` per runner process. `SessionStart` also fires on `--resume`
+//! and on `compact`, so without it one long session would post on every
+//! compaction. A resume of the
 //! same session is a legitimate re-proof to coord, which is why the dedupe is
 //! in-process only and why a respawn clears it. A proof whose retries end on a
 //! transient answer un-marks its key, so the next `SessionStart` of that
@@ -188,11 +192,15 @@ const RESPAWN_BARRIER_WAIT: Duration = Duration::from_secs(80);
 /// One post this module makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProofPost {
-    /// `continuation-started {attempt, claude_session_id}`.
+    /// `continuation-started {attempt, claude_session_id, terminal_id}`.
+    /// `terminal_id` is the pane whose `SessionStart` produced the proof — for
+    /// a migrated pane the NEW pane, the same id its reset sent as
+    /// `new_terminal_id`.
     Started {
         gate_id: Uuid,
         attempt: u32,
         claude_session_id: Uuid,
+        terminal_id: String,
     },
     /// `continuation-respawned {attempt, new_terminal_id}`.
     Respawned {
@@ -206,6 +214,19 @@ impl ProofPost {
     fn gate_id(&self) -> Uuid {
         match self {
             ProofPost::Started { gate_id, .. } | ProofPost::Respawned { gate_id, .. } => *gate_id,
+        }
+    }
+
+    /// The dedupe key of a start proof; `None` for a reset.
+    fn proof_key(&self) -> Option<ProofKey> {
+        match self {
+            ProofPost::Started {
+                gate_id,
+                attempt,
+                claude_session_id,
+                terminal_id,
+            } => Some((*gate_id, *attempt, *claude_session_id, terminal_id.clone())),
+            ProofPost::Respawned { .. } => None,
         }
     }
 
@@ -228,10 +249,12 @@ impl ProofPost {
             ProofPost::Started {
                 attempt,
                 claude_session_id,
+                terminal_id,
                 ..
             } => serde_json::json!({
                 "attempt": attempt,
                 "claude_session_id": claude_session_id.to_string(),
+                "terminal_id": terminal_id,
             }),
             ProofPost::Respawned {
                 attempt,
@@ -268,9 +291,10 @@ pub(crate) enum PostVerdict {
     /// `coord.gates` start-proof columns are not migrated yet.
     SchemaPending,
     /// 409 `stale_attempt` / `continuation_not_consumed` / `no_placeholder` /
-    /// `continuation_retired` — an ordinary race (a replaced pane's late
-    /// report, a gate never consumed, a placeholder already gone, a
-    /// continuation coord has retired). Quiet: nothing this runner can fix.
+    /// `continuation_retired` / `stale_terminal` — an ordinary race (a replaced
+    /// pane's late report, a gate never consumed, a placeholder already gone, a
+    /// continuation coord has retired, a proof from a terminal other than the
+    /// stored respawn terminal). Quiet: nothing this runner can fix.
     Declined { status: u16, code: String },
     /// 409 `session_mismatch` / `foreign_session`, 403 `not_consumer`, or any
     /// answer this build does not recognise — coord refused a proof the runner
@@ -386,7 +410,8 @@ pub(crate) fn classify_response(status: u16, body: &str) -> PostVerdict {
                 c @ ("stale_attempt"
                 | "continuation_not_consumed"
                 | "no_placeholder"
-                | "continuation_retired"),
+                | "continuation_retired"
+                | "stale_terminal"),
             ),
         ) => PostVerdict::Declined {
             status,
@@ -463,8 +488,8 @@ struct ParkedStart {
     at: Instant,
 }
 
-/// Dedupe key: one proof per `(gate, attempt, session)` per process.
-type ProofKey = (Uuid, u32, Uuid);
+/// Dedupe key: one proof per `(gate, attempt, session, terminal)` per process.
+type ProofKey = (Uuid, u32, Uuid, String);
 
 /// The module's process state, under ONE lock. Never held while the
 /// continuation registry's lock is taken (see the module doc's "Lock order").
@@ -532,7 +557,7 @@ impl ProofState {
 
     /// Mark `key` in flight; `false` when it already was (a duplicate).
     fn mark(&mut self, key: ProofKey) -> bool {
-        if !self.sent.insert(key) {
+        if !self.sent.insert(key.clone()) {
             return false;
         }
         self.sent_order.push_back(key);
@@ -554,8 +579,8 @@ impl ProofState {
     }
 
     fn forget_gate(&mut self, gate_id: Uuid) {
-        self.sent.retain(|(g, _, _)| *g != gate_id);
-        self.sent_order.retain(|(g, _, _)| *g != gate_id);
+        self.sent.retain(|(g, ..)| *g != gate_id);
+        self.sent_order.retain(|(g, ..)| *g != gate_id);
     }
 }
 
@@ -603,7 +628,7 @@ fn plan_started(terminal_id: &str, gate_id: Uuid, claude_session_id: Uuid) -> Op
         );
         return None;
     };
-    if !st.mark((gate_id, attempt, claude_session_id)) {
+    if !st.mark((gate_id, attempt, claude_session_id, terminal_id.to_string())) {
         drop(st);
         debug!(
             gate_id = %gate_id,
@@ -618,6 +643,7 @@ fn plan_started(terminal_id: &str, gate_id: Uuid, claude_session_id: Uuid) -> Op
             gate_id,
             attempt,
             claude_session_id,
+            terminal_id: terminal_id.to_string(),
         },
         generation: st.generation(gate_id),
     })
@@ -764,13 +790,8 @@ fn dispatch(planned: PlannedStart) {
     let PlannedStart { post, generation } = planned;
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         debug!(gate_id = %post.gate_id(), "continuation start proof: no tokio runtime — not posted");
-        if let ProofPost::Started {
-            gate_id,
-            attempt,
-            claude_session_id,
-        } = post
-        {
-            state().unmark(&(gate_id, attempt, claude_session_id));
+        if let Some(key) = post.proof_key() {
+            state().unmark(&key);
         }
         return;
     };
@@ -798,16 +819,9 @@ fn dispatch(planned: PlannedStart) {
             return;
         };
         log_verdict(&post, &verdict);
-        if let ProofPost::Started {
-            gate_id,
-            attempt,
-            claude_session_id,
-        } = &post
-        {
-            if verdict.is_transient() {
-                // Un-mark so the session's next SessionStart retries.
-                state().unmark(&(*gate_id, *attempt, *claude_session_id));
-            }
+        if let Some(key) = post.proof_key().filter(|_| verdict.is_transient()) {
+            // Un-mark so the session's next SessionStart retries.
+            state().unmark(&key);
         }
     });
 }
@@ -883,6 +897,7 @@ mod tests {
             gate_id: g,
             attempt: 2,
             claude_session_id: s,
+            terminal_id: "term-pane".into(),
         };
         assert_eq!(
             started.path(),
@@ -890,7 +905,11 @@ mod tests {
         );
         assert_eq!(
             started.body(),
-            serde_json::json!({"attempt": 2, "claude_session_id": s.to_string()})
+            serde_json::json!({
+                "attempt": 2,
+                "claude_session_id": s.to_string(),
+                "terminal_id": "term-pane",
+            })
         );
         let respawned = ProofPost::Respawned {
             gate_id: g,
@@ -936,6 +955,7 @@ mod tests {
             "continuation_not_consumed",
             "no_placeholder",
             "continuation_retired",
+            "stale_terminal",
         ] {
             assert_eq!(
                 classify_response(409, &format!(r#"{{"error":"{code}","message":"m"}}"#)),
@@ -980,7 +1000,8 @@ mod tests {
             Some(ProofPost::Started {
                 gate_id: g,
                 attempt: 3,
-                claude_session_id: s
+                claude_session_id: s,
+                terminal_id: "term-a".into(),
             })
         );
     }
@@ -1026,7 +1047,7 @@ mod tests {
         record_dispatch_attempt(g, 0);
         let lookup = move |_: &str| Some(g);
         assert!(plan_session_start("term-r", s, &lookup).is_some());
-        state().unmark(&(g, 0, s));
+        state().unmark(&(g, 0, s, "term-r".to_string()));
         assert!(plan_session_start("term-r", s, &lookup).is_some());
     }
 
@@ -1046,7 +1067,8 @@ mod tests {
             Some(ProofPost::Started {
                 gate_id: g,
                 attempt: 1,
-                claude_session_id: s
+                claude_session_id: s,
+                terminal_id: "term-early".into(),
             })
         );
         assert_eq!(plan_registered("term-early", Some(g)), None, "taken once");
@@ -1196,6 +1218,7 @@ mod tests {
             gate_id: gate(),
             attempt: 1,
             claude_session_id: Uuid::new_v4(),
+            terminal_id: "term-x".into(),
         }
     }
 
@@ -1307,7 +1330,9 @@ mod tests {
             "the old pane's retry must not be sent after the respawn"
         );
         assert!(
-            state().sent.contains(&(g, 0, s)),
+            state()
+                .sent
+                .contains(&(g, 0, s, "term-fence-new".to_string())),
             "the dropped retry must not un-mark the new pane's key"
         );
     }
@@ -1362,7 +1387,9 @@ mod tests {
             ]
         );
         assert!(
-            state().sent.contains(&(g, 0, s)),
+            state()
+                .sent
+                .contains(&(g, 0, s, "term-last-new".to_string())),
             "the discarded last answer must not un-mark the new pane's key"
         );
     }
@@ -1414,7 +1441,8 @@ mod tests {
                 ProofPost::Started {
                     gate_id: g,
                     attempt: 0,
-                    claude_session_id: s
+                    claude_session_id: s,
+                    terminal_id: old.clone(),
                 },
                 ProofPost::Respawned {
                     gate_id: g,
@@ -1426,10 +1454,13 @@ mod tests {
                     attempt: 0,
                     new_terminal_id: new.clone()
                 },
+                // The new pane's proof names the NEW pane — the same id the
+                // reset sent as new_terminal_id.
                 ProofPost::Started {
                     gate_id: g,
                     attempt: 0,
-                    claude_session_id: s
+                    claude_session_id: s,
+                    terminal_id: new.clone(),
                 },
             ]
         );
