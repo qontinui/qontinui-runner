@@ -2294,6 +2294,20 @@ fn live_sessions_payload(
 /// handoff strategy (`ai_provider::pick_migration_target`), excluding the
 /// session's current account; an explicit target is recorded as a handoff
 /// too.
+///
+/// **This call can take minutes to resolve, and it reports no progress
+/// meanwhile.** It resolves only once the resumed CLI is PROVEN alive or the
+/// respawn has given up (`respawn_liveness::confirm_respawn`). Worst case, per
+/// attempt: up to 45 s for a launchable `claude` to reappear on PATH
+/// (`claude_cli_spawn::RESUME_RESOLVE_DELAYS`), plus up to 180 s for the pane
+/// to paint (`respawn_liveness::RESUME_LIVENESS_DEADLINE`). With
+/// `respawn_liveness::MAX_RESPAWN_ATTEMPTS` (3) attempts and the 1 s and 3 s
+/// pauses between them, that comes to about 11 minutes (3 × 225 s + 4 s =
+/// 679 s), plus the transcript carry before the first spawn. A caller with a
+/// UI should show the migration as pending for that long, and must not read a
+/// slow answer as a hang. Returning at the first spawn and reporting the
+/// verdict by event would take a new event contract with the webview. That is
+/// deliberately not done here.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,

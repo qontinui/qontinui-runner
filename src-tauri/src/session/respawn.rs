@@ -792,11 +792,15 @@ async fn materialize(
         child_intent.purpose,
         &claude_session_id[..8.min(claude_session_id.len())]
     );
-    let model_transcript = crate::terminal::transcript::session_transcript_path(
-        std::path::Path::new(&config_dir),
-        &working_dir,
-        &claude_session_id,
-    );
+    // The model sniff is a blocking whole-transcript read: off the worker.
+    let model = crate::terminal::account_migration::sniff_transcript_model(
+        crate::terminal::transcript::session_transcript_path(
+            std::path::Path::new(&config_dir),
+            &working_dir,
+            &claude_session_id,
+        ),
+    )
+    .await;
     let (terminal_id, _coord_id) = crate::terminal::account_migration::spawn_resumed_pane(
         &app,
         &terminal_manager,
@@ -805,7 +809,7 @@ async fn materialize(
             claude_bin,
             claude_session_id: &claude_session_id,
             working_dir: &working_dir,
-            model_transcript,
+            model,
             config_dir: &config_dir,
             title,
             // Land back on the tile the session used to occupy when this box

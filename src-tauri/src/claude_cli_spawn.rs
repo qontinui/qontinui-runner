@@ -357,7 +357,8 @@ where
                 // (coord finding 00525a01; carries main's 9269613e9 logging).
                 tracing::info!(
                     attempts = attempt + 1,
-                    "claude_cli_spawn: a launchable `claude` reappeared for a --resume respawn                      after a retry — a reinstall window was ridden out"
+                    "claude_cli_spawn: a launchable `claude` reappeared for a --resume respawn \
+                     after a retry — a reinstall window was ridden out"
                 );
             }
             return Ok(path);
