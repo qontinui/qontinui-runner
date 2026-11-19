@@ -760,7 +760,7 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
         let hosted = |id: &str| substrate.hosts(id);
         let may_host = super::claude_session_registry::may_host_claude(&snap);
         build_snapshot(
-            &crate::terminal::transcript::find_claude_config_dirs(),
+            &crate::terminal::transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE),
             &live_pids,
             Utc::now(),
             Some(env!("RUNNER_BUILD_ID").to_string()),
