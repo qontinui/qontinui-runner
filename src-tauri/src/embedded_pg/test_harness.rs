@@ -1256,7 +1256,9 @@ impl LockHolder {
 /// the holder — and a waiter then names this one as unnamed. Removing it is
 /// sound because this process holds the lock: at worst it also removes the
 /// record a concurrent SHARED taker just wrote, which costs that taker its
-/// name in a waiter's line, nothing more.
+/// name in a waiter's lines — and, because the waiter then sees an unnamed
+/// holder where it saw a named one, restarts that waiter's per-holder clock
+/// ([`take_cache_lock`]); nothing more.
 fn write_lock_holder(dir: &Path, key: &str, action: &str) {
     let path = dir.join(LOCK_HOLDER_FILE);
     let partial = dir.join(format!(
@@ -3137,10 +3139,13 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 /// Create `path` and every parent it lacks, each new one private (0700 on
 /// Unix); an existing directory is left as it is, and `path` existing as a file
-/// fails, as with `create_dir_all`. The harness directory is created this way:
-/// it holds every template cache, and with it each cluster's superuser
-/// password (`tpl-*/pg-pass`, which `postgresql_embedded` writes with the
-/// default file mode).
+/// fails, as with `create_dir_all`. The harness directory's PARENTS are created
+/// this way ([`prepare_harness_dir`]); the harness directory itself — which
+/// holds every template cache, and with it each cluster's superuser password
+/// (`tpl-*/pg-pass`, which `postgresql_embedded` writes with the default file
+/// mode) — is created by one [`create_private_dir`], whose own answer says
+/// whether this call made it, because this function accepts a directory that
+/// already exists.
 fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     private_dir_builder().recursive(true).create(path)
 }
@@ -3197,6 +3202,10 @@ fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
     if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         create_private_dir_all(parent).map_err(cannot_create)?;
     }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_THE_HARNESS_DIR_CREATE.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let made = match create_private_dir(dir) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => false,
@@ -3211,12 +3220,21 @@ fn prepare_harness_dir(dir: &Path, named: bool) -> Result<(), String> {
     require_private(dir, named)
 }
 
-// Test seam: run once, by the next `prepare_harness_dir` on this thread,
-// between its first ancestor check and its create, so a test can make an
-// ancestor appear in that window. Compiles to nothing outside `cfg(test)`.
+// Test seams, each run once by the next `prepare_harness_dir` on this thread
+// and compiled to nothing outside `cfg(test)`:
+//
+// - BETWEEN_ANCESTOR_CHECK_AND_CREATE runs between the first ancestor check
+//   and any create, so a test can make an ANCESTOR appear there and see the
+//   second check refuse it.
+// - BEFORE_THE_HARNESS_DIR_CREATE runs after the parents exist and
+//   immediately before the single create of the harness directory itself, so
+//   a test can make the NAMED DIRECTORY appear there and see that the harness,
+//   which did not make it, does not mark it.
 #[cfg(test)]
 thread_local! {
     static BETWEEN_ANCESTOR_CHECK_AND_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_THE_HARNESS_DIR_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -5172,22 +5190,23 @@ mod tests {
     /// the create — made by someone other than this call — was found, not
     /// made, so the harness does not mark it: only the create's own success
     /// counts as making it. The window is opened by the test-only seam
-    /// (`BETWEEN_ANCESTOR_CHECK_AND_CREATE`), which here makes the named
-    /// directory itself, private.
+    /// (`BEFORE_THE_HARNESS_DIR_CREATE`), which runs after the parents exist
+    /// and immediately before the harness directory's own create, and here
+    /// makes the named directory itself, private.
     #[cfg(unix)]
     #[test]
     fn a_named_directory_that_appears_in_the_window_is_not_marked() {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let named = scratch.path().join("appears-itself");
         let squat = named.clone();
-        BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| {
+        BEFORE_THE_HARNESS_DIR_CREATE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 create_private_dir(&squat).expect("make the named directory in the window");
             }));
         });
         let entered = prepare_harness_dir(&named, true);
         assert!(
-            BETWEEN_ANCESTOR_CHECK_AND_CREATE.with(|hook| hook.borrow().is_none()),
+            BEFORE_THE_HARNESS_DIR_CREATE.with(|hook| hook.borrow().is_none()),
             "the seam did not run, so the window was never opened"
         );
         entered.expect("a private directory the tester owns is used");
