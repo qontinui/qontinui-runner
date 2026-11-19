@@ -68,19 +68,26 @@
 //!
 //! ## Lock order
 //!
-//! Two locks meet here: the continuation registry's and this module's own
-//! [`ProofState`] lock. The only nesting is registry → proof state (the
-//! registration's take runs under the registry lock). This module never takes
-//! the registry lock while it holds its own: the hook parks, RELEASES, then
-//! reads the registry, then takes its own lock again. So the two can never
+//! Three locks meet here: the continuation registry's, this module's own
+//! [`ProofState`] lock, and the transport's `sender_slot` mutex. The only
+//! nestings are registry → proof state (the registration's take runs under the
+//! registry lock) and registry → `sender_slot` (the registration's dispatch
+//! runs [`current_sender`] under it). This module never takes the registry
+//! lock while it holds its own: the hook parks, RELEASES, then reads the
+//! registry, then takes its own lock again. `sender_slot` is a LEAF: it is
+//! taken only by [`current_sender`] (and the test setter), which clones the
+//! sender and releases it with no other lock taken in between, and it is never
+//! taken while the [`ProofState`] lock is held. So none of the three can
 //! deadlock.
 //!
 //! ## Stale retries are fenced
 //!
 //! Every respawn bumps a per-gate generation ([`ProofState::gate_generation`]).
-//! Each post captures its gate's generation when it is planned, and
-//! [`post_with_retry`] checks it before EVERY try: a post whose gate has been
-//! respawned since is dropped, not sent. Otherwise the old pane's start proof,
+//! Each post captures its gate's generation when it is planned — a start proof
+//! in [`plan_started`], under the same lock as its dedupe mark; a reset in
+//! [`plan_respawned`], which is what bumps it — and [`post_with_retry`] checks
+//! it before EVERY try and once more after the last: a post whose gate has
+//! been respawned since is dropped (not sent, or its answer discarded). Otherwise the old pane's start proof,
 //! asleep in a 5xx backoff across the hop, would land after the reset and
 //! re-prove a pane that is gone, and an older respawn's retry would re-clear
 //! the new pane's proof. A dropped start proof also skips its dedupe un-mark,
@@ -334,6 +341,18 @@ async fn post_with_retry(
         tries += 1;
         verdict = sender.post(post.clone()).await;
     }
+    // Once more after the LAST try: a respawn reported while that try was in
+    // flight supersedes its answer too, so the caller neither un-marks a key
+    // that may now be the new pane's nor reports an old reset as FAILED.
+    if !still_current(gate_id, generation) {
+        debug!(
+            gate_id = %gate_id,
+            "{}: gate respawned while the last try was in flight — discarding its answer \
+             {verdict:?}",
+            post.verb()
+        );
+        return (None, tries);
+    }
     (Some(verdict), tries)
 }
 
@@ -560,9 +579,17 @@ pub(crate) fn record_dispatch_attempt(gate_id: Uuid, attempt: u32) {
     state().remember_attempt(gate_id, attempt);
 }
 
+/// A start proof ready to dispatch, with the gate's respawn generation captured
+/// when it was planned (under the same lock as its dedupe mark).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedStart {
+    post: ProofPost,
+    generation: u64,
+}
+
 /// Decide the start proof for a continuation terminal whose session is known:
 /// `None` for an unknown attempt (logged) or a duplicate.
-fn plan_started(terminal_id: &str, gate_id: Uuid, claude_session_id: Uuid) -> Option<ProofPost> {
+fn plan_started(terminal_id: &str, gate_id: Uuid, claude_session_id: Uuid) -> Option<PlannedStart> {
     let mut st = state();
     let Some(attempt) = st.attempts.get(&gate_id).copied() else {
         drop(st);
@@ -586,10 +613,13 @@ fn plan_started(terminal_id: &str, gate_id: Uuid, claude_session_id: Uuid) -> Op
         );
         return None;
     }
-    Some(ProofPost::Started {
-        gate_id,
-        attempt,
-        claude_session_id,
+    Some(PlannedStart {
+        post: ProofPost::Started {
+            gate_id,
+            attempt,
+            claude_session_id,
+        },
+        generation: st.generation(gate_id),
     })
 }
 
@@ -600,7 +630,7 @@ fn plan_session_start(
     terminal_id: &str,
     claude_session_id: Uuid,
     gate_for: &dyn Fn(&str) -> Option<Uuid>,
-) -> Option<ProofPost> {
+) -> Option<PlannedStart> {
     let now = Instant::now();
     // Park FIRST, then read the registry — see the module doc for why this
     // order (with the registration's insert-then-take) can never lose both.
@@ -615,7 +645,7 @@ fn plan_session_start(
 /// The registration half: `terminal_id` was just inserted into the live
 /// continuation registry for `gate_id`. Returns the proof for a parked
 /// `SessionStart`, if one is waiting.
-fn plan_registered(terminal_id: &str, gate_id: Option<Uuid>) -> Option<ProofPost> {
+fn plan_registered(terminal_id: &str, gate_id: Option<Uuid>) -> Option<PlannedStart> {
     let parked = state().take_parked(terminal_id, Instant::now())?;
     let gate_id = gate_id?;
     plan_started(terminal_id, gate_id, parked)
@@ -633,16 +663,16 @@ pub(crate) fn on_session_start(terminal_id: &str, claude_session_id: Option<Uuid
         return;
     };
     let lookup = |tid: &str| crate::agent_runtime::continuation_gate_for_terminal(tid);
-    if let Some(post) = plan_session_start(terminal_id, claude_session_id, &lookup) {
-        dispatch(post);
+    if let Some(planned) = plan_session_start(terminal_id, claude_session_id, &lookup) {
+        dispatch(planned);
     }
 }
 
 /// Called from the continuation registry's single insert point. May run
 /// under the registry's lock: it takes only this module's lock and spawns.
 pub(crate) fn on_continuation_registered(terminal_id: &str, gate_id: Option<Uuid>) {
-    if let Some(post) = plan_registered(terminal_id, gate_id) {
-        dispatch(post);
+    if let Some(planned) = plan_registered(terminal_id, gate_id) {
+        dispatch(planned);
     }
 }
 
@@ -730,7 +760,8 @@ pub(crate) fn report_respawned(gate_id: Option<Uuid>, new_terminal_id: &str) {
 
 /// Post `post` on a spawned task. A start proof first waits (bounded) for any
 /// in-flight respawn reset of its gate.
-fn dispatch(post: ProofPost) {
+fn dispatch(planned: PlannedStart) {
+    let PlannedStart { post, generation } = planned;
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         debug!(gate_id = %post.gate_id(), "continuation start proof: no tokio runtime — not posted");
         if let ProofPost::Started {
@@ -743,15 +774,10 @@ fn dispatch(post: ProofPost) {
         }
         return;
     };
-    let (barrier, generation) = {
-        let st = state();
-        (
-            st.respawn_inflight
-                .get(&post.gate_id())
-                .map(|(_, rx)| rx.clone()),
-            st.generation(post.gate_id()),
-        )
-    };
+    let barrier = state()
+        .respawn_inflight
+        .get(&post.gate_id())
+        .map(|(_, rx)| rx.clone());
     let sender = current_sender();
     handle.spawn(async move {
         if let Some(mut rx) = barrier {
@@ -950,7 +976,7 @@ mod tests {
         record_dispatch_attempt(g, 3);
         let lookup = move |tid: &str| (tid == "term-a").then_some(g);
         assert_eq!(
-            plan_session_start("term-a", s, &lookup),
+            plan_session_start("term-a", s, &lookup).map(|p| p.post),
             Some(ProofPost::Started {
                 gate_id: g,
                 attempt: 3,
@@ -1016,7 +1042,7 @@ mod tests {
         let unregistered = |_: &str| None;
         assert_eq!(plan_session_start("term-early", s, &unregistered), None);
         assert_eq!(
-            plan_registered("term-early", Some(g)),
+            plan_registered("term-early", Some(g)).map(|p| p.post),
             Some(ProofPost::Started {
                 gate_id: g,
                 attempt: 1,
@@ -1086,6 +1112,7 @@ mod tests {
         posts: Arc<StdMutex<Vec<ProofPost>>>,
         script: Arc<StdMutex<VecDeque<PostVerdict>>>,
         delay: Duration,
+        started_delay: Duration,
     }
 
     impl Recorder {
@@ -1094,7 +1121,14 @@ mod tests {
                 posts: Arc::new(StdMutex::new(Vec::new())),
                 script: Arc::new(StdMutex::new(script.into())),
                 delay,
+                started_delay: Duration::ZERO,
             }
+        }
+
+        /// Delay every start-proof post too, so a try can be in flight.
+        fn with_started_delay(mut self, d: Duration) -> Self {
+            self.started_delay = d;
+            self
         }
     }
 
@@ -1107,11 +1141,12 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(PostVerdict::Accepted);
-            let delay = self.delay;
+            let delay = match post {
+                ProofPost::Respawned { .. } => self.delay,
+                ProofPost::Started { .. } => self.started_delay,
+            };
             Box::pin(async move {
-                if matches!(post, ProofPost::Respawned { .. }) {
-                    tokio::time::sleep(delay).await;
-                }
+                tokio::time::sleep(delay).await;
                 posts.lock().unwrap().push(post);
                 next
             })
@@ -1246,8 +1281,9 @@ mod tests {
         let s = Uuid::new_v4();
         record_dispatch_attempt(g, 0);
         let lookup = move |_: &str| Some(g);
-        let old = plan_session_start("term-fence-old", s, &lookup).expect("planned");
-        dispatch(old.clone());
+        let planned = plan_session_start("term-fence-old", s, &lookup).expect("planned");
+        let old = planned.post.clone();
+        dispatch(planned);
         settle(&posts, 1).await; // try 1 answered 500; now in backoff
 
         report_respawned(Some(g), "term-fence-new");
@@ -1273,6 +1309,61 @@ mod tests {
         assert!(
             state().sent.contains(&(g, 0, s)),
             "the dropped retry must not un-mark the new pane's key"
+        );
+    }
+
+    /// The old pane's LAST try is in flight when the gate is respawned: its
+    /// answer (here a transient one) is discarded, so it neither un-marks the
+    /// new pane's key nor counts as this gate's verdict.
+    #[tokio::test(start_paused = true)]
+    async fn a_last_try_in_flight_across_a_respawn_is_discarded() {
+        let _l = lock();
+        reset_for_test();
+        let rec = Recorder::new(
+            Duration::ZERO,
+            vec![
+                rejected(500),
+                rejected(500),
+                PostVerdict::NoAnswer("timeout".into()),
+            ],
+        )
+        .with_started_delay(Duration::from_secs(5));
+        let posts = rec.posts.clone();
+        set_sender_for_test(Arc::new(rec));
+        let g = gate();
+        let s = Uuid::new_v4();
+        record_dispatch_attempt(g, 0);
+        let lookup = move |_: &str| Some(g);
+        let planned = plan_session_start("term-last-old", s, &lookup).expect("planned");
+        let old = planned.post.clone();
+        dispatch(planned);
+        // Tries answer at 5 s and 20+5 s; the last starts after the 40 s
+        // backoff (t=65 s) and answers at t=70 s. Respawn inside that window.
+        tokio::time::sleep(Duration::from_secs(67)).await;
+        assert_eq!(posts.lock().unwrap().len(), 2, "two tries answered so far");
+        report_respawned(Some(g), "term-last-new");
+        assert!(plan_session_start("term-last-new", s, &lookup).is_some());
+        settle(&posts, 4).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        set_sender_for_test(Arc::new(HttpProofSender));
+        let got = posts.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                old.clone(),
+                old.clone(),
+                ProofPost::Respawned {
+                    gate_id: g,
+                    attempt: 0,
+                    new_terminal_id: "term-last-new".into()
+                },
+                old,
+            ]
+        );
+        assert!(
+            state().sent.contains(&(g, 0, s)),
+            "the discarded last answer must not un-mark the new pane's key"
         );
     }
 
