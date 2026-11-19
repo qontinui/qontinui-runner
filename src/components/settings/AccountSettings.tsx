@@ -108,6 +108,7 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
   // pairing was removed (web backend is Cognito-only); Cognito sign-in (and
   // browser SSO) are the only sign-in paths.
   const [savedBackendUrl, setSavedBackendUrl] = useState<string | null>(null);
+  const [backendUrlLoadFailed, setBackendUrlLoadFailed] = useState(false);
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
 
   // --- Coord Doctor self-check (plan 2026-06-13 Phase 4) --------------------
@@ -215,9 +216,15 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
     const load = async () => {
       try {
         const st = await invoke<{ backendUrl: string }>("get_web_integration_status");
-        if (!cancelled) setSavedBackendUrl(st.backendUrl);
+        if (!cancelled) {
+          setSavedBackendUrl(st.backendUrl);
+          setBackendUrlLoadFailed(false);
+        }
       } catch (err) {
-        if (!cancelled) onLog("error", `Failed to load saved backend URL: ${err}`);
+        if (!cancelled) {
+          setBackendUrlLoadFailed(true);
+          onLog("error", `Failed to load saved backend URL: ${err}`);
+        }
       }
     };
     void load();
@@ -532,6 +539,7 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
           cognitoSigningIn={cognitoState === "signing-in"}
           onCognitoSignIn={handleCognitoSignIn}
           backendUrl={savedBackendUrl}
+          backendUrlLoadFailed={backendUrlLoadFailed}
           onOpenBackendConnection={onOpenBackendConnection}
         />
       )}
@@ -633,6 +641,7 @@ interface SignedOutPanelProps {
   onCognitoSignIn: () => void;
   /** Saved backend URL; `null` while unknown. */
   backendUrl: string | null;
+  backendUrlLoadFailed: boolean;
   onOpenBackendConnection: () => void;
 }
 
@@ -640,6 +649,7 @@ function SignedOutPanel({
   cognitoSigningIn,
   onCognitoSignIn,
   backendUrl,
+  backendUrlLoadFailed,
   onOpenBackendConnection,
 }: SignedOutPanelProps) {
   const cognitoDisabled = cognitoSigningIn || !backendUrl || backendUrl.trim().length === 0;
@@ -662,7 +672,8 @@ function SignedOutPanel({
         <div className="text-xs">
           <span className="font-medium">Backend: </span>
           <span id="account-saved-backend" className="font-mono break-all">
-            {backendUrl ?? "loading…"}
+            {backendUrl ??
+              (backendUrlLoadFailed ? "Could not read the saved backend URL" : "loading…")}
           </span>{" "}
           <button
             type="button"
