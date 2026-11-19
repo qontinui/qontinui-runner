@@ -22,17 +22,27 @@
 //! 3. In each repo, read every local AND `origin/*` branch's HEAD-commit
 //!    `Session-Id` trailer(s) in ONE `git for-each-ref` and keep the branches
 //!    whose trailer names this session.
-//! 4. Resolve each matching branch → its PR(s) via the GitHub API
-//!    (`GitHubClient::list_prs_for_head`, `state=all`).
+//! 4. Resolve each matching branch → its PR(s), first against the cycle's
+//!    per-REPO discovery (one open listing plus a closed-since-mark listing per
+//!    repo, at most every `DISCOVERY_INTERVAL`, keyed by `head.label`), and only
+//!    for a branch with no known PR whose head moved — or whose repo's discovery
+//!    failed or overflowed — via `GitHubClient::list_prs_for_head`. The default
+//!    branch is never attributed.
 //! 5. VERIFY the PR's head-commit `Session-Id` trailer == this session (a
 //!    branch touched by multiple sessions carries only the LAST session's
 //!    trailer on its HEAD; this disambiguates), then upsert the PR — the
 //!    upsert also lands fresh open/merged status.
-//! 6. STATUS (Phase 3): for any already-stored PR of this session whose local
-//!    branch is gone (so step 4 didn't refresh it this tick), refresh
-//!    open/merged via `GitHubClient::get_pr` and `update_session_pr_status`.
-//!    Folded into this same tick — NOT a second GitHub poll loop; scoped to
-//!    the session's OWN PRs (never a fleet scan).
+//! 6. STATUS: for any already-stored PR of this session that step 4 did not
+//!    account for, refresh open/merged — from a newer observation in the memo
+//!    when there is one (no request), else via `GitHubClient::get_pr` when the
+//!    row's timer says it is due. An irreversibly landed row (`github-merge`,
+//!    `ff-land`) is never re-read. Folded into this same tick — NOT a second
+//!    GitHub poll loop; scoped to the session's OWN PRs (never a fleet scan).
+//!
+//! What may be skipped, and when, is [`pacing`]'s job (plan
+//! `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+//! Phase 2): every skip is keyed on time since the last read or on a moved head
+//! sha, never on tick count, and every skip is counted on the `tick done` line.
 //!
 //! LANDED IS NOT GITHUB'S `merged` BOOLEAN. coord fast-forward lands are the
 //! majority of this fleet's landings and leave `merged=false` / `state=closed`
@@ -58,7 +68,7 @@
 //! or an API error skips the affected unit and logs — a passive dropdown never
 //! justifies noisy failures.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -70,11 +80,25 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::database::pg::session_pr_ops::SessionPrStatus;
+use crate::database::pg::session_pr_ops::{SessionPrRow, SessionPrStatus};
 use crate::database::pg::PgDb;
 use crate::github_budget::SpendClass;
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
-use crate::trigger_system::github_api::{has_coord_landed_label, GhError, GitHubClient};
+use crate::trigger_system::github_api::{
+    has_coord_landed_label, GhError, GitHubClient, HeadPr, RepoPrSlice,
+};
+
+mod pacing;
+
+use pacing::{
+    branch_plan, discovery_due, plan_row_refresh, row_class, BranchPlan, ReconcileMemo, RowClass,
+    RowPlan, TickTally, DISCOVERY_INTERVAL, NUDGE_DISCOVERY_FLOOR,
+};
+
+/// Budget-histogram label for the reconciler's per-repo discovery listings, so
+/// the meter — not just the log — splits listing traffic from per-branch
+/// lookups and per-row reads (`/github-budget` templates drop the query string).
+const DISCOVERY_CONSUMER: &str = "session_pr_reconciler_discovery";
 
 /// Reconcile cadence. Matches the "similar poller" cadence in the crate
 /// (min-10s pollers, 45s lifecycle poll) — 30s is responsive enough for a
@@ -193,6 +217,26 @@ struct RepoInfo {
     owner: String,
     repo: String,
     branches: Vec<BranchTrailer>,
+    /// The repo's default branch, from `refs/remotes/origin/HEAD`. Never
+    /// attributed: a session that commits on `main` would otherwise look `main`
+    /// up every time it moves (plan 2026-10-30-…, D3). `None` when the clone
+    /// has no `origin/HEAD`.
+    default_branch: Option<String>,
+}
+
+impl RepoInfo {
+    /// This session's branches in the repo: HEAD trailer names it, and it is
+    /// not the default branch.
+    fn session_branches<'a>(&'a self, session: &'a str) -> impl Iterator<Item = &'a BranchTrailer> {
+        self.branches.iter().filter(move |b| {
+            Some(b.branch.as_str()) != self.default_branch.as_deref()
+                && b.session_ids.iter().any(|s| s == session)
+        })
+    }
+
+    fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
 }
 
 /// How long a resolved `working_dir → repo set` mapping is trusted.
@@ -670,6 +714,10 @@ pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
         let mut last_nudge: HashMap<Uuid, Instant> = HashMap::new();
         // Whole-tick failures, deduped — see `TickFailureLedger`.
         let mut tick_failures = TickFailureLedger::default();
+        // Cross-tick pacing memory (plan 2026-10-30-…, Phase 2): which PRs were
+        // read when, each repo's discovery, each branch's last lookup. Empty
+        // at start, so a runner start re-reads every non-terminal row once.
+        let mut memo = ReconcileMemo::default();
 
         // `interval` (not `sleep`) so a nudge cannot postpone the periodic
         // tick, and `Delay` so a slow tick does not produce a burst of
@@ -715,7 +763,15 @@ pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
             // A whole-tick error means the feature produced NOTHING this pass.
             // Reported at `warn!` — deduped by `TickFailureLedger` so a
             // persistent condition does not emit every 30s.
-            match run_tick(&lifecycle_store, &mut repo_sets, &mut warned_no_repos, only).await {
+            match run_tick(
+                &lifecycle_store,
+                &mut repo_sets,
+                &mut warned_no_repos,
+                &mut memo,
+                only,
+            )
+            .await
+            {
                 Err(e) => match tick_failures.record(&e) {
                     TickFailureReport::New => warn!(
                         "session-pr-reconciler: tick FAILED — {e}; no session PRs are being \
@@ -754,10 +810,17 @@ pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
 ///
 /// `only` restricts the pass to a single session (the on-demand nudge path);
 /// `None` reconciles every open session.
+///
+/// Three stages (plan 2026-10-30-…, Phase 2): local resolution of every session
+/// in scope, which also builds the cycle's discovery set; per-repo discovery,
+/// each repo at most once per floor; then per session, attribution against the
+/// discovered PRs and the paced status pass. `memo` carries what was read when
+/// across ticks.
 async fn run_tick(
     store: &SessionLifecycleStore,
     repo_sets: &mut RepoSetCache,
     warned_no_repos: &mut HashSet<Uuid>,
+    memo: &mut ReconcileMemo,
     only: Option<Uuid>,
 ) -> Result<(), String> {
     if !crate::database::pg::pg_available() {
@@ -786,7 +849,8 @@ async fn run_tick(
         // made it indistinguishable from the reconciler not running at all.
         info!(
             "session-pr-reconciler: tick done — sessions_seen=0 sessions_with_repos=0 \
-             repos_scanned=0 prs_upserted=0 scope={}",
+             repos_scanned=0 prs_upserted=0 skipped_terminal=0 skipped_fresh=0 \
+             discovery_calls=0 discovery_overflow=0 deferred_budget=0 scope={}",
             tick_scope(only)
         );
         return Ok(());
@@ -804,6 +868,9 @@ async fn run_tick(
     // (plan 2026-10-30-…, D4) — the identity's interactive sessions keep the
     // rest of the window.
     let client = reconciler_client(&token)?;
+    // The per-repo discovery listings spend the same credential under their
+    // own meter label, also BACKGROUND.
+    let discovery_client = reconciler_discovery_client(&token)?;
     let mut budget = TickBudget::default();
 
     // The login, once per credential per process: a conditional `GET /user`.
@@ -843,6 +910,15 @@ async fn run_tick(
     let mut sessions_with_repos = 0usize;
     let mut repos_scanned = 0usize;
     let mut prs_upserted = 0usize;
+    let mut tally = TickTally::default();
+
+    // ---- Pass 1: local resolution, and the cycle's discovery set (D3) ------
+    // Discover only repos where a session in scope has a branch whose HEAD
+    // trailer names it, plus — on a full tick — repos holding a stored row
+    // that is not irreversibly landed. Built ONCE per cycle, so the cost scales
+    // with repos that have candidate branches, not sessions × branches.
+    let mut work: Vec<SessionWork> = Vec::new();
+    let mut discovery_set: BTreeMap<String, (String, String)> = BTreeMap::new();
 
     for (session_id, working_dir) in records {
         let repos: Vec<String> = match repo_sets.get(&working_dir) {
@@ -882,61 +958,124 @@ async fn run_tick(
         warned_no_repos.remove(&session_id);
         sessions_with_repos += 1;
 
-        // Union of every repo's Phase-2 results, plus `owner/name → local dir`
-        // for the whole set, so the once-per-session Phase-3 pass below can run
-        // its content proof against the PR's OWN checkout.
-        let mut refreshed: HashSet<(String, i64)> = HashSet::new();
-        let mut repo_dirs: HashMap<String, String> = HashMap::new();
-
+        let session_str = session_id.to_string();
         for toplevel in &repos {
             if !repo_cache.contains_key(toplevel) {
                 let info = resolve_repo(toplevel).await;
                 repo_cache.insert(toplevel.clone(), info);
             }
+            if let Some(info) = repo_cache.get(toplevel).and_then(|o| o.as_ref()) {
+                if info.session_branches(&session_str).next().is_some() {
+                    discovery_set
+                        .entry(info.full_name())
+                        .or_insert_with(|| (info.owner.clone(), info.repo.clone()));
+                }
+            }
+        }
+
+        let stored = pg_db.list_session_prs(session_id).await.unwrap_or_default();
+        if only.is_none() {
+            for row in &stored {
+                if row_class(row.land_signal.as_deref(), row.pr_state.as_deref())
+                    == RowClass::Immutable
+                {
+                    continue;
+                }
+                if let Some((owner, repo)) = row.repo.split_once('/') {
+                    discovery_set
+                        .entry(row.repo.clone())
+                        .or_insert_with(|| (owner.to_string(), repo.to_string()));
+                }
+            }
+        }
+
+        work.push(SessionWork {
+            session_id,
+            repos,
+            stored,
+        });
+    }
+
+    // ---- Discovery: per repo, at most once per floor (D1, D3) --------------
+    // The nudge path discovers only its own session's repos (the set above is
+    // already that), floored at NUDGE_DISCOVERY_FLOOR rather than unfloored.
+    let floor = if only.is_some() {
+        NUDGE_DISCOVERY_FLOOR
+    } else {
+        DISCOVERY_INTERVAL
+    };
+    for (repo_full, (owner, repo)) in &discovery_set {
+        if !discovery_due(memo.repos.get(repo_full), floor, Instant::now()) {
+            continue;
+        }
+        discover_repo(
+            &discovery_client,
+            memo,
+            &mut budget,
+            &mut tally,
+            repo_full,
+            owner,
+            repo,
+        )
+        .await;
+    }
+
+    // ---- Pass 2: attribution, then the stored-row status pass -------------
+    for w in work {
+        // Union of every repo's attribution results, plus `owner/name → local
+        // dir` for the whole set, so the once-per-session status pass below can
+        // run its content proof against the PR's OWN checkout.
+        let mut refreshed: HashSet<(String, i64)> = HashSet::new();
+        let mut repo_dirs: HashMap<String, String> = HashMap::new();
+
+        for toplevel in &w.repos {
             let Some(info) = repo_cache.get(toplevel).and_then(|o| o.as_ref()) else {
                 continue;
             };
             repos_scanned += 1;
-            repo_dirs.insert(format!("{}/{}", info.owner, info.repo), toplevel.clone());
+            repo_dirs.insert(info.full_name(), toplevel.clone());
 
-            match attribute_session_in_repo(
+            let (keys, upserted) = attribute_session_in_repo(
                 &pg_db,
                 &client,
+                memo,
                 &mut budget,
-                session_id,
+                w.session_id,
                 toplevel,
                 info,
+                &w.stored,
             )
-            .await
-            {
-                Ok(keys) => {
-                    prs_upserted += keys.len();
-                    refreshed.extend(keys);
-                }
-                Err(e) => debug!(
-                    "session-pr-reconciler: session {session_id} in {toplevel} failed (skipping): {e}"
-                ),
-            }
+            .await;
+            prs_upserted += upserted;
+            refreshed.extend(keys);
         }
 
-        if let Err(e) = refresh_stored_statuses(
+        refresh_stored_statuses(
             &pg_db,
             &client,
+            memo,
             &mut budget,
-            session_id,
+            &mut tally,
+            w.session_id,
+            &w.stored,
             &refreshed,
             &repo_dirs,
+            only.is_some(),
         )
-        .await
-        {
-            debug!("session-pr-reconciler: status refresh for {session_id} failed: {e}");
-        }
+        .await;
     }
+
+    memo.prune();
 
     info!(
         "session-pr-reconciler: tick done — sessions_seen={sessions_seen} \
          sessions_with_repos={sessions_with_repos} repos_scanned={repos_scanned} \
-         prs_upserted={prs_upserted} deferred_budget={} scope={}",
+         prs_upserted={prs_upserted} skipped_terminal={} skipped_fresh={} \
+         discovery_calls={} discovery_overflow={} deferred_budget={} scope={}",
+        tally.skipped_terminal,
+        tally.skipped_fresh,
+        tally.discovery_calls,
+        tally.discovery_overflow,
         budget.deferred,
         tick_scope(only)
     );
@@ -957,6 +1096,89 @@ fn login_failure_is_terminal(e: &GhError) -> bool {
     )
 }
 
+/// One session's pass-1 resolution, carried into pass 2.
+struct SessionWork {
+    session_id: Uuid,
+    /// Repo toplevels resolved for the session.
+    repos: Vec<String>,
+    /// The session's stored rows, read once per cycle.
+    stored: Vec<SessionPrRow>,
+}
+
+/// Discover one repo (D3): every open PR, then the closed PRs updated since the
+/// repo's high-water mark. Both conditional, both under [`DISCOVERY_CONSUMER`].
+///
+/// A budget stop (a deferral, or a rate-limited refusal) ends the cycle's
+/// spending and records no attempt (the repo is
+/// retried as soon as the budget allows); an error records a failed attempt, so
+/// the repo is retried after [`DISCOVERY_INTERVAL`] and its rows meanwhile fall
+/// back to their per-row timers. An open listing already read is kept either
+/// way — it is free, current data.
+async fn discover_repo(
+    client: &GitHubClient,
+    memo: &mut ReconcileMemo,
+    budget: &mut TickBudget,
+    tally: &mut TickTally,
+    repo_full: &str,
+    owner: &str,
+    repo: &str,
+) {
+    let open = match budget
+        .spend(|| client.list_repo_prs(owner, repo, RepoPrSlice::Open))
+        .await
+    {
+        // Not made for budget (deferred, rate-limited, or the cycle is spent
+        // out): counted in `deferred_budget`, and no attempt is recorded.
+        None => return,
+        Some(Ok(listing)) => listing,
+        Some(Err(e)) => {
+            debug!("session-pr-reconciler: open-PR discovery of {repo_full} failed: {e}");
+            memo.discovery_failed(repo_full, Instant::now());
+            return;
+        }
+    };
+    tally.discovery_calls += open.requests;
+    let now = Instant::now();
+    for pr in open.prs {
+        memo.observe(repo_full, pr, now);
+    }
+
+    let mark = memo
+        .repos
+        .get(repo_full)
+        .and_then(|d| d.closed_mark.clone());
+    let closed = match budget
+        .spend(|| {
+            client.list_repo_prs(
+                owner,
+                repo,
+                RepoPrSlice::RecentlyClosed {
+                    since: mark.as_deref(),
+                },
+            )
+        })
+        .await
+    {
+        None => return,
+        Some(Ok(listing)) => listing,
+        Some(Err(e)) => {
+            debug!("session-pr-reconciler: closed-PR discovery of {repo_full} failed: {e}");
+            memo.discovery_failed(repo_full, Instant::now());
+            return;
+        }
+    };
+    tally.discovery_calls += closed.requests;
+    let overflow = open.overflow || closed.overflow;
+    if overflow {
+        tally.discovery_overflow += 1;
+    }
+    let now = Instant::now();
+    for pr in &closed.prs {
+        memo.observe(repo_full, pr.clone(), now);
+    }
+    memo.finish_discovery(repo_full, &closed.prs, !overflow, now);
+}
+
 /// The reconciler's GitHub client — BACKGROUND spend (plan 2026-10-30-…,
 /// D4). Nobody is waiting on a reconcile, so under the credential's headroom
 /// line its reads are deferred rather than sent, and a rate-limited refusal is
@@ -964,6 +1186,13 @@ fn login_failure_is_terminal(e: &GhError) -> bool {
 /// window. The one place the reconciler's spend class is decided.
 pub(crate) fn reconciler_client(token: &str) -> Result<GitHubClient, String> {
     Ok(GitHubClient::new(token, "session_pr_reconciler")?.with_spend_class(SpendClass::Background))
+}
+
+/// The reconciler's per-repo discovery client: the same BACKGROUND spend as
+/// [`reconciler_client`], metered under [`DISCOVERY_CONSUMER`] so the meter
+/// splits listing traffic from per-branch lookups and per-row reads.
+pub(crate) fn reconciler_discovery_client(token: &str) -> Result<GitHubClient, String> {
+    Ok(GitHubClient::new(token, DISCOVERY_CONSUMER)?.with_spend_class(SpendClass::Background))
 }
 
 /// One cycle's GitHub spend state (plan 2026-10-30-…, Phase 3, D4).
@@ -1018,50 +1247,113 @@ fn tick_scope(only: Option<Uuid>) -> String {
     }
 }
 
-/// Phase 2 — attribute this session's branches in ONE repo to PRs and upsert
-/// them. Returns the `(repo_full, pr_number)` keys it refreshed, so the
-/// once-per-session Phase-3 pass ([`refresh_stored_statuses`]) can skip a
-/// redundant `get_pr` for them.
+/// Attribution — this session's branches in ONE repo, resolved to PRs and
+/// upserted. Returns the `(repo_full, pr_number)` keys it accounted for — so the
+/// once-per-session status pass ([`refresh_stored_statuses`]) does not handle
+/// them again — and how many rows it actually wrote.
 ///
-/// Phase 3 is deliberately NOT here: a session now reconciles against a SET of
-/// repos, and running the stored-row status refresh per repo would re-`get_pr`
-/// every stored row once per repo in the set.
+/// Each branch resolves against the cycle's discovery first, by head label
+/// (D3). A per-branch `list_prs_for_head` runs only when [`branch_plan`] says
+/// so: a branch with no known PR whose head moved, or whose repo's discovery
+/// failed or overflowed — never sooner than [`DISCOVERY_INTERVAL`] after the
+/// last lookup. An observation already written to this session's row is not
+/// written again.
+///
+/// The status pass is deliberately NOT here: a session reconciles against a SET
+/// of repos, and running it per repo would revisit every stored row once per
+/// repo in the set.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one cycle's shared state (db, client, memo, budget) plus the unit of work"
+)]
 async fn attribute_session_in_repo(
     pg_db: &PgDb,
     client: &GitHubClient,
+    memo: &mut ReconcileMemo,
     budget: &mut TickBudget,
     session_id: Uuid,
     repo_dir: &str,
     info: &RepoInfo,
-) -> Result<HashSet<(String, i64)>, String> {
+    stored: &[SessionPrRow],
+) -> (HashSet<(String, i64)>, usize) {
     let session_str = session_id.to_string();
-    let repo_full = format!("{}/{}", info.owner, info.repo);
+    let repo_full = info.full_name();
+    let discovery_complete = memo
+        .repos
+        .get(&repo_full)
+        .is_some_and(|d| d.governs(Instant::now()));
 
     let mut refreshed: HashSet<(String, i64)> = HashSet::new();
+    let mut upserted = 0usize;
 
-    // ---- Phase 2: attribution (branch → PR), for THIS session's branches ---
-    for bt in info
-        .branches
-        .iter()
-        .filter(|b| b.session_ids.iter().any(|s| s == &session_str))
-    {
-        let prs = match budget
-            .spend(|| client.list_prs_for_head(&info.owner, &info.repo, &bt.branch))
-            .await
-        {
-            // Not made for budget: counted in `deferred_budget`.
-            None => continue,
-            Some(Ok(prs)) => prs,
-            Some(Err(e)) => {
-                debug!(
-                    "session-pr-reconciler: list_prs_for_head({repo_full}, {}) failed: {e}",
-                    bt.branch
-                );
-                continue;
+    for bt in info.session_branches(&session_str) {
+        let listed = memo.prs_for_branch(&repo_full, &info.owner, &bt.branch);
+        let known_stored = stored
+            .iter()
+            .any(|r| r.repo == repo_full && r.head_branch.as_deref() == Some(bt.branch.as_str()));
+        let now = Instant::now();
+        let plan = branch_plan(
+            !listed.is_empty(),
+            known_stored,
+            discovery_complete,
+            memo.branch(&repo_full, &bt.branch),
+            &bt.sha,
+            now,
+        );
+
+        let candidates: Vec<(HeadPr, Instant)> = match plan {
+            BranchPlan::Nothing => continue,
+            BranchPlan::FromDiscovery => {
+                memo.note_branch(&repo_full, &bt.branch, &bt.sha, None);
+                listed.into_iter().map(|o| (o.pr, o.at)).collect()
+            }
+            BranchPlan::Lookup => {
+                match budget
+                    .spend(|| client.list_prs_for_head(&info.owner, &info.repo, &bt.branch))
+                    .await
+                {
+                    // Not made for budget: counted in `deferred_budget`.
+                    None => continue,
+                    Some(Ok(prs)) => {
+                        let at = Instant::now();
+                        memo.note_branch(&repo_full, &bt.branch, &bt.sha, Some(at));
+                        for pr in &prs {
+                            memo.observe(&repo_full, pr.clone(), at);
+                        }
+                        prs.into_iter().map(|pr| (pr, at)).collect()
+                    }
+                    Some(Err(e)) => {
+                        // Retried after DISCOVERY_INTERVAL, never every tick.
+                        memo.note_lookup_failed(&repo_full, &bt.branch, Instant::now());
+                        debug!(
+                            "session-pr-reconciler: list_prs_for_head({repo_full}, {}) failed: {e}",
+                            bt.branch
+                        );
+                        continue;
+                    }
+                }
             }
         };
 
-        for pr in prs {
+        for (pr, observed_at) in candidates {
+            let key = (repo_full.clone(), pr.number as i64);
+            // A closed, unmerged PR's land verdict also rests on the LOCAL
+            // content proof, which a `git fetch` can change with no GitHub
+            // update — so its row is re-probed now and then even unchanged.
+            let reprobe_due = pr.state == "closed"
+                && !pr.merged
+                && memo
+                    .applied_wall(session_id, &key)
+                    .is_none_or(|w| w.elapsed() >= pacing::CLOSED_REFRESH_EARLY);
+            if !reprobe_due
+                && memo
+                    .applied_at(session_id, &key)
+                    .is_some_and(|applied| applied >= observed_at)
+            {
+                // This observation is already on the session's row.
+                refreshed.insert(key);
+                continue;
+            }
             // VERIFY the PR's head-commit trailer names this session. When the
             // PR head equals the local branch HEAD we already matched, it is
             // verified by construction; otherwise read the PR head's trailer
@@ -1079,7 +1371,6 @@ async fn attribute_session_in_repo(
                 continue;
             }
 
-            let pr_number = pr.number as i64;
             // CALL SITE 1 of the land cascade (the branch-attribution path).
             let proof = probe_land(
                 Some(repo_dir),
@@ -1106,7 +1397,7 @@ async fn attribute_session_in_repo(
                 .upsert_session_pr(
                     session_id,
                     &repo_full,
-                    pr_number,
+                    key.1,
                     Some(bt.branch.as_str()),
                     &status,
                 )
@@ -1115,95 +1406,153 @@ async fn attribute_session_in_repo(
                 warn!("session-pr-reconciler: upsert_session_pr failed: {e}");
                 continue;
             }
-            refreshed.insert((repo_full.clone(), pr_number));
+            upserted += 1;
+            memo.mark_applied(session_id, key.clone(), observed_at, Instant::now());
+            refreshed.insert(key);
         }
     }
 
-    Ok(refreshed)
+    (refreshed, upserted)
 }
 
-/// Phase 3 — status refresh for this session's stored rows that the branch
-/// path did not reach this tick. A session's merged PR usually has its local
-/// branch deleted, so Phase 2 no longer refreshes it; pull each such row's
-/// current state directly. Scoped to this session's OWN PRs — never a fleet
-/// scan — and run ONCE per session, over the union of every repo's Phase-2
-/// results.
+/// The status pass — this session's stored rows that attribution did not
+/// account for this cycle. A session's merged PR usually has its local branch
+/// deleted, so attribution no longer reaches it. Scoped to this session's OWN
+/// PRs — never a fleet scan — and run ONCE per session, over the union of every
+/// repo's attribution results.
+///
+/// Every row goes through [`plan_row_refresh`] before any request (D1, D2): an
+/// irreversibly landed row is skipped outright, a newer observation in the memo
+/// (a repo listing, or another session's read of the same PR) is written with
+/// no request, and a `get_pr` runs only when the row's timer says it is due.
+/// `nudge` is the on-demand path for THIS session: it exempts the session's
+/// OPEN rows from `OPEN_REFRESH`, and nothing else.
 ///
 /// `repo_dirs` maps `owner/name` → a local checkout of that repo (every repo in
 /// the session's resolved set). The land content-proof needs a local checkout OF
 /// THE PR'S OWN REPO; a row whose repo is not in the set stays UNKNOWN
 /// (`not_a_repo`), never a confident negative.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one cycle's shared state (db, client, memo, budget, tally) plus the unit of work"
+)]
 async fn refresh_stored_statuses(
     pg_db: &PgDb,
     client: &GitHubClient,
+    memo: &mut ReconcileMemo,
     budget: &mut TickBudget,
+    tally: &mut TickTally,
     session_id: Uuid,
+    stored: &[SessionPrRow],
     refreshed: &HashSet<(String, i64)>,
     repo_dirs: &HashMap<String, String>,
-) -> Result<(), String> {
-    let stored = pg_db.list_session_prs(session_id).await.unwrap_or_default();
+    nudge: bool,
+) {
     for row in stored {
-        if refreshed.contains(&(row.repo.clone(), row.pr_number)) {
+        let key = (row.repo.clone(), row.pr_number);
+        if refreshed.contains(&key) {
             continue;
         }
         let Some((owner, repo)) = row.repo.split_once('/') else {
             continue;
         };
-        match budget
-            .spend(|| client.get_pr(owner, repo, row.pr_number as u64))
-            .await
-        {
-            // Not made for budget: the row keeps its prior status.
-            None => {}
-            Some(Ok(pr)) => {
-                // CALL SITE 2 of the land cascade. THIS is the ff-land path in
-                // practice: a landed PR's branch is usually deleted, which is
-                // exactly why the branch path above no longer reaches it.
-                //
-                // The content proof needs a local checkout OF THIS PR'S repo.
-                // A session that moved between repos can hold rows for a repo
-                // this tick did not resolve — that is UNKNOWN (`not_a_repo`),
-                // never a confident negative.
-                let dir_for_row = repo_dirs.get(&row.repo).map(String::as_str);
-                let proof = probe_land(
-                    dir_for_row,
-                    pr.merged,
-                    &pr.state,
-                    &pr.head_sha,
-                    &pr.base_ref,
-                )
-                .await;
-                let verdict = land_verdict(
-                    pr.merged,
-                    &pr.state,
-                    has_coord_landed_label(&pr.labels),
-                    proof,
-                );
-                // A stamp the branch path already recorded wins; otherwise
-                // take GitHub's own `merged_at` (absent for an ff-land).
-                let status = session_pr_status(
-                    &verdict,
-                    &pr.state,
-                    stored_or_fetched_merged_at(row.merged_at, pr.merged_at.as_deref()),
-                    pr.closed_at.as_deref().and_then(parse_ts),
-                );
-                if let Err(e) = pg_db
-                    .update_session_pr_status(session_id, &row.repo, row.pr_number, &status)
+        let class = row_class(row.land_signal.as_deref(), row.pr_state.as_deref());
+        let now = Instant::now();
+        let first_closed_seen =
+            (class == RowClass::ClosedMutable).then(|| memo.note_closed(&key, now));
+        let plan = plan_row_refresh(
+            memo.row_inputs(
+                session_id,
+                &key,
+                class,
+                first_closed_seen,
+                nudge && class == RowClass::Open,
+                now,
+            ),
+            now,
+        );
+
+        let dir_for_row = repo_dirs.get(&row.repo).map(String::as_str);
+        match plan {
+            RowPlan::SkipTerminal => tally.skipped_terminal += 1,
+            RowPlan::SkipFresh => tally.skipped_fresh += 1,
+            RowPlan::Apply => {
+                tally.skipped_fresh += 1;
+                let Some(observed) = memo.observation(&key).cloned() else {
+                    continue;
+                };
+                apply_observed_status(pg_db, session_id, row, &observed.pr, dir_for_row).await;
+                memo.mark_applied(session_id, key, observed.at, Instant::now());
+            }
+            RowPlan::Read => {
+                match budget
+                    .spend(|| client.get_pr(owner, repo, row.pr_number as u64))
                     .await
                 {
-                    warn!("session-pr-reconciler: update_session_pr_status failed: {e}");
+                    // Not made for budget: the row keeps its prior status.
+                    None => {}
+                    Some(Ok(pr)) => {
+                        let at = Instant::now();
+                        let observed = pacing::observed_from_status(row.pr_number, pr);
+                        apply_observed_status(pg_db, session_id, row, &observed, dir_for_row).await;
+                        memo.observe(&row.repo, observed, at);
+                        memo.mark_applied(session_id, key, at, at);
+                    }
+                    Some(Err(e)) => {
+                        memo.note_attempt(key, Instant::now());
+                        debug!(
+                            "session-pr-reconciler: get_pr({}/#{}) failed (leaving prior status): {e}",
+                            row.repo, row.pr_number
+                        );
+                    }
                 }
-            }
-            Some(Err(e)) => {
-                debug!(
-                    "session-pr-reconciler: get_pr({}/#{}) failed (leaving prior status): {e}",
-                    row.repo, row.pr_number
-                );
             }
         }
     }
+}
 
-    Ok(())
+/// Write one observation of a stored row's PR to the row — CALL SITE 2 of the
+/// land cascade. THIS is the ff-land path in practice: a landed PR's branch is
+/// usually deleted, which is exactly why attribution no longer reaches it.
+///
+/// The content proof needs a local checkout OF THIS PR'S repo. A session that
+/// moved between repos can hold rows for a repo this tick did not resolve —
+/// that is UNKNOWN (`not_a_repo`), never a confident negative.
+async fn apply_observed_status(
+    pg_db: &PgDb,
+    session_id: Uuid,
+    row: &SessionPrRow,
+    pr: &HeadPr,
+    dir_for_row: Option<&str>,
+) {
+    let proof = probe_land(
+        dir_for_row,
+        pr.merged,
+        &pr.state,
+        &pr.head_sha,
+        &pr.base_ref,
+    )
+    .await;
+    let verdict = land_verdict(
+        pr.merged,
+        &pr.state,
+        has_coord_landed_label(&pr.labels),
+        proof,
+    );
+    // A stamp the branch path already recorded wins; otherwise take GitHub's
+    // own `merged_at` (absent for an ff-land).
+    let status = session_pr_status(
+        &verdict,
+        &pr.state,
+        stored_or_fetched_merged_at(row.merged_at, pr.merged_at.as_deref()),
+        pr.closed_at.as_deref().and_then(parse_ts),
+    );
+    if let Err(e) = pg_db
+        .update_session_pr_status(session_id, &row.repo, row.pr_number, &status)
+        .await
+    {
+        warn!("session-pr-reconciler: update_session_pr_status failed: {e}");
+    }
 }
 
 /// Map the LAND verdict + GitHub's lifecycle to the projection's `pr_state`
@@ -1620,11 +1969,12 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 async fn resolve_repo(toplevel: &str) -> Option<RepoInfo> {
     let remote = git_remote_url(toplevel).await?;
     let (owner, repo) = parse_owner_repo(&remote)?;
-    let branches = branch_trailers(toplevel).await;
+    let (branches, default_branch) = branch_trailers(toplevel).await;
     Some(RepoInfo {
         owner,
         repo,
         branches,
+        default_branch,
     })
 }
 
@@ -1692,17 +2042,21 @@ fn parse_owner_repo(remote: &str) -> Option<(String, String)> {
 /// `for-each-ref` invocation with two patterns, not extra GitHub fan-out — the
 /// `Session-Id` trailer filter still runs entirely locally, before any API call.
 ///
-/// Line format: `<sha> <full refname> <trailer values…>` (git ref names contain
-/// no whitespace, so the first two whitespace fields are unambiguous; the
-/// remainder is the space-joined trailer value set). The FULL refname is used
-/// rather than `refname:short` so local and remote are distinguishable without
-/// guessing at an `origin/` prefix.
-async fn branch_trailers(dir: &str) -> Vec<BranchTrailer> {
+/// Line format: `<sha> <full refname> <symref|-> <trailer values…>` (git ref
+/// names contain no whitespace, so the first three whitespace fields are
+/// unambiguous; the remainder is the space-joined trailer value set). The FULL
+/// refname is used rather than `refname:short` so local and remote are
+/// distinguishable without guessing at an `origin/` prefix. The symref field is
+/// `-` except on `refs/remotes/origin/HEAD`, whose target names the default
+/// branch — read in the same invocation rather than by a second subprocess.
+///
+/// Returns the branches and the default branch (`None` without `origin/HEAD`).
+async fn branch_trailers(dir: &str) -> (Vec<BranchTrailer>, Option<String>) {
     let out = match run_git(
         dir,
         &[
             "for-each-ref",
-            "--format=%(objectname) %(refname) %(trailers:key=Session-Id,valueonly,separator=%x20)",
+            "--format=%(objectname) %(refname) %(if)%(symref)%(then)%(symref)%(else)-%(end)              %(trailers:key=Session-Id,valueonly,separator=%x20)",
             "refs/heads/",
             "refs/remotes/origin/",
         ],
@@ -1715,13 +2069,19 @@ async fn branch_trailers(dir: &str) -> Vec<BranchTrailer> {
                 "session-pr-reconciler: for-each-ref in {dir} failed: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             );
-            return Vec::new();
+            return (Vec::new(), None);
         }
         // Spawn failure or timeout — already logged by `run_git`.
-        None => return Vec::new(),
+        None => return (Vec::new(), None),
     };
 
-    normalize_branch_trailers(String::from_utf8_lossy(&out.stdout).lines())
+    parse_for_each_ref(String::from_utf8_lossy(&out.stdout).lines())
+}
+
+/// The branch set alone, for the tests that predate the default branch.
+#[cfg(test)]
+fn normalize_branch_trailers<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<BranchTrailer> {
+    parse_for_each_ref(lines).0
 }
 
 /// Parse + dedupe `for-each-ref` output into the branch set to attribute. Pure
@@ -1732,14 +2092,25 @@ async fn branch_trailers(dir: &str) -> Vec<BranchTrailer> {
 /// it). Local wins: it is the ref the session actually committed on, so its
 /// HEAD sha is the one the PR-head verification compares against.
 /// `refs/remotes/origin/HEAD` is dropped — it is a symbolic alias for the
-/// default branch, not a branch of its own.
-fn normalize_branch_trailers<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<BranchTrailer> {
+/// default branch, not a branch of its own — but its target is returned as the
+/// default branch.
+fn parse_for_each_ref<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> (Vec<BranchTrailer>, Option<String>) {
     let mut out: Vec<BranchTrailer> = Vec::new();
     let mut remote: Vec<BranchTrailer> = Vec::new();
+    let mut default_branch: Option<String> = None;
     for line in lines {
-        let Some((sha, refname, session_ids)) = split_for_each_ref_line(line) else {
+        let Some((sha, refname, symref, session_ids)) = split_for_each_ref_line(line) else {
             continue;
         };
+        if refname == "refs/remotes/origin/HEAD" {
+            default_branch = symref
+                .and_then(|t| t.strip_prefix("refs/remotes/origin/"))
+                .filter(|b| !b.is_empty())
+                .map(str::to_string);
+            continue;
+        }
         if let Some(branch) = refname.strip_prefix("refs/heads/") {
             out.push(BranchTrailer {
                 branch: branch.to_string(),
@@ -1762,17 +2133,31 @@ fn normalize_branch_trailers<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Br
             out.push(bt);
         }
     }
-    out
+    (out, default_branch)
 }
 
-/// Split one `for-each-ref` line into `(sha, full refname, trailer values)`.
-/// `None` for a line missing the sha/refname fields.
-fn split_for_each_ref_line(line: &str) -> Option<(String, &str, Vec<String>)> {
-    let mut it = line.split_whitespace();
+/// One parsed `for-each-ref` line: sha, full refname, symref target (if any),
+/// trailer values.
+type ForEachRefLine<'a> = (String, &'a str, Option<&'a str>, Vec<String>);
+
+/// Split one `for-each-ref` line. `None` for a line missing the sha/refname
+/// fields. The symref field is optional on input: `-` (no target) and a
+/// `refs/…` target are consumed; anything else is the first trailer value — a
+/// `Session-Id` is a uuid, never `-` or `refs/…`.
+fn split_for_each_ref_line(line: &str) -> Option<ForEachRefLine<'_>> {
+    let mut it = line.split_whitespace().peekable();
     let sha = it.next()?.to_string();
     let refname = it.next()?;
+    let symref = match it.peek() {
+        Some(&"-") => {
+            it.next();
+            None
+        }
+        Some(t) if t.starts_with("refs/") => it.next(),
+        _ => None,
+    };
     let session_ids: Vec<String> = it.map(|s| s.to_string()).collect();
-    Some((sha, refname, session_ids))
+    Some((sha, refname, symref, session_ids))
 }
 
 /// Read the `Session-Id` trailer value(s) on a specific commit, or `None` if
@@ -2441,6 +2826,38 @@ mod tests {
         assert!(normalize_branch_trailers([""].into_iter()).is_empty());
         // A ref under neither pattern is not a branch.
         assert!(normalize_branch_trailers(["sha refs/tags/v1"].into_iter()).is_empty());
+    }
+
+    /// `origin/HEAD`'s symref names the default branch, which is returned and
+    /// never attributed; the symref field is `-` on every other ref.
+    #[test]
+    fn the_default_branch_is_read_from_origin_head_and_never_attributed() {
+        let (branches, default) = parse_for_each_ref(
+            [
+                "h refs/remotes/origin/HEAD refs/remotes/origin/main sess",
+                "m refs/heads/main - sess",
+                "f refs/heads/feat/x - sess",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(default.as_deref(), Some("main"));
+        assert_eq!(branches.len(), 2, "origin/HEAD is not a branch");
+        assert_eq!(
+            branches[1].session_ids,
+            vec!["sess"],
+            "the `-` field is not a trailer"
+        );
+        let info = RepoInfo {
+            owner: "o".into(),
+            repo: "r".into(),
+            branches,
+            default_branch: default,
+        };
+        let names: Vec<&str> = info
+            .session_branches("sess")
+            .map(|b| b.branch.as_str())
+            .collect();
+        assert_eq!(names, vec!["feat/x"]);
     }
 
     /// Exactly one entry for a branch that exists locally AND on `origin`, and
