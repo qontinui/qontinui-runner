@@ -55,7 +55,8 @@
 //! them emits whichever order they run in:
 //!
 //! - the hook parks first, then reads the registry; and
-//! - the registration inserts the live row first, then takes the parked entry.
+//! - the registration takes the parked entry and inserts the live row, both
+//!   inside one registry critical section (`insert_live` takes, then inserts).
 //!
 //! What makes that exhaustive is the continuation REGISTRY's mutex, not the
 //! order of the two statements inside the registration: the take runs inside
@@ -64,6 +65,27 @@
 //! section (the hook parked earlier still, so the take finds the entry) or
 //! wholly after it (the read sees the row). There is no interleaving in which
 //! both miss.
+//!
+//! ## Lock order
+//!
+//! Two locks meet here: the continuation registry's and this module's own
+//! [`ProofState`] lock. The only nesting is registry → proof state (the
+//! registration's take runs under the registry lock). This module never takes
+//! the registry lock while it holds its own: the hook parks, RELEASES, then
+//! reads the registry, then takes its own lock again. So the two can never
+//! deadlock.
+//!
+//! ## Stale retries are fenced
+//!
+//! Every respawn bumps a per-gate generation ([`ProofState::gate_generation`]).
+//! Each post captures its gate's generation when it is planned, and
+//! [`post_with_retry`] checks it before EVERY try: a post whose gate has been
+//! respawned since is dropped, not sent. Otherwise the old pane's start proof,
+//! asleep in a 5xx backoff across the hop, would land after the reset and
+//! re-prove a pane that is gone, and an older respawn's retry would re-clear
+//! the new pane's proof. A dropped start proof also skips its dedupe un-mark,
+//! which would otherwise clear the new pane's key (same gate, attempt and —
+//! after a migration — Claude session).
 //!
 //! **A respawn's reset should reach coord before the new pane's proof.** The
 //! two posts are independent tasks, so nothing orders them on the wire by
@@ -238,16 +260,18 @@ pub(crate) enum PostVerdict {
     /// 503 `schema_migration_pending` — coord's receiver is deployed but its
     /// `coord.gates` start-proof columns are not migrated yet.
     SchemaPending,
-    /// 409 `stale_attempt` / `continuation_not_consumed` / `no_placeholder` —
-    /// an ordinary race (a replaced pane's late report, a gate never consumed,
-    /// a placeholder already gone). Quiet: nothing this runner can fix.
+    /// 409 `stale_attempt` / `continuation_not_consumed` / `no_placeholder` /
+    /// `continuation_retired` — an ordinary race (a replaced pane's late
+    /// report, a gate never consumed, a placeholder already gone, a
+    /// continuation coord has retired). Quiet: nothing this runner can fix.
     Declined { status: u16, code: String },
     /// 409 `session_mismatch` / `foreign_session`, 403 `not_consumer`, or any
     /// answer this build does not recognise — coord refused a proof the runner
     /// believed in, which means the runner's view of the gate is wrong.
     Rejected { status: u16, detail: String },
     /// No answer: no coord configured, no client, a transport error or the
-    /// timeout. Only this verdict un-marks a start proof's dedupe key.
+    /// timeout. Transient, like a 5xx and `SchemaPending`: a start proof whose
+    /// retries END on any transient verdict un-marks its dedupe key.
     NoAnswer(String),
 }
 
@@ -266,9 +290,26 @@ impl PostVerdict {
     }
 }
 
+/// Whether the gate's respawn generation still equals `generation` — i.e. no
+/// respawn has been reported since the post holding it was planned.
+fn still_current(gate_id: Uuid, generation: u64) -> bool {
+    state().generation(gate_id) == generation
+}
+
 /// Post `post`, retrying a transient answer after each of [`RETRY_DELAYS`].
-/// Returns the last verdict and how many tries it took.
-async fn post_with_retry(sender: &dyn ProofSender, post: &ProofPost) -> (PostVerdict, usize) {
+/// `generation` is the gate's respawn generation when `post` was planned;
+/// before EVERY try the post is dropped if it has moved. Returns the last
+/// verdict (`None` when the post was dropped as superseded) and how many tries
+/// were sent.
+async fn post_with_retry(
+    sender: &dyn ProofSender,
+    post: &ProofPost,
+    generation: u64,
+) -> (Option<PostVerdict>, usize) {
+    let gate_id = post.gate_id();
+    if !still_current(gate_id, generation) {
+        return (None, 0);
+    }
     let mut tries = 1;
     let mut verdict = sender.post(post.clone()).await;
     for delay in RETRY_DELAYS {
@@ -282,10 +323,18 @@ async fn post_with_retry(sender: &dyn ProofSender, post: &ProofPost) -> (PostVer
             delay.as_secs()
         );
         tokio::time::sleep(delay).await;
+        if !still_current(gate_id, generation) {
+            debug!(
+                gate_id = %gate_id,
+                "{}: gate respawned during the backoff — dropping the stale retry",
+                post.verb()
+            );
+            return (None, tries);
+        }
         tries += 1;
         verdict = sender.post(post.clone()).await;
     }
-    (verdict, tries)
+    (Some(verdict), tries)
 }
 
 /// The `error` code of a coord JSON error body, if it has one.
@@ -312,12 +361,18 @@ pub(crate) fn classify_response(status: u16, body: &str) -> PostVerdict {
     match (status, code.as_deref()) {
         (404, _) => PostVerdict::RouteAbsent,
         (503, Some("schema_migration_pending")) => PostVerdict::SchemaPending,
-        (409, Some(c @ ("stale_attempt" | "continuation_not_consumed" | "no_placeholder"))) => {
-            PostVerdict::Declined {
-                status,
-                code: c.to_string(),
-            }
-        }
+        (
+            409,
+            Some(
+                c @ ("stale_attempt"
+                | "continuation_not_consumed"
+                | "no_placeholder"
+                | "continuation_retired"),
+            ),
+        ) => PostVerdict::Declined {
+            status,
+            code: c.to_string(),
+        },
         _ => PostVerdict::Rejected {
             status,
             detail: body.chars().take(200).collect(),
@@ -393,7 +448,7 @@ struct ParkedStart {
 type ProofKey = (Uuid, u32, Uuid);
 
 /// The module's process state, under ONE lock. Never held while the
-/// continuation registry's lock is taken (see the module doc's lock order).
+/// continuation registry's lock is taken (see the module doc's "Lock order").
 #[derive(Default)]
 struct ProofState {
     /// gate id → the attempt this process claimed it under.
@@ -408,7 +463,11 @@ struct ProofState {
     /// the generation that opened it (a second respawn of the same gate
     /// replaces it, and only the opener may remove its own).
     respawn_inflight: HashMap<Uuid, (u64, tokio::sync::watch::Receiver<bool>)>,
-    respawn_generation: u64,
+    /// gate id → how many respawns this process has reported for it. A post
+    /// captures it when planned and is dropped once it moves (see the module
+    /// doc's "Stale retries are fenced"). Absent reads 0. Its keys are a
+    /// subset of [`Self::attempts`]' and are evicted with them.
+    gate_generation: HashMap<Uuid, u64>,
 }
 
 impl ProofState {
@@ -418,6 +477,7 @@ impl ProofState {
             while self.attempt_order.len() > MEMORY_CAP {
                 if let Some(old) = self.attempt_order.pop_front() {
                     self.attempts.remove(&old);
+                    self.gate_generation.remove(&old);
                 }
             }
         }
@@ -468,6 +528,10 @@ impl ProofState {
     fn unmark(&mut self, key: &ProofKey) {
         self.sent.remove(key);
         self.sent_order.retain(|k| k != key);
+    }
+
+    fn generation(&self, gate_id: Uuid) -> u64 {
+        self.gate_generation.get(&gate_id).copied().unwrap_or(0)
     }
 
     fn forget_gate(&mut self, gate_id: Uuid) {
@@ -604,8 +668,8 @@ fn plan_respawned(
         return None;
     };
     let (tx, rx) = tokio::sync::watch::channel(false);
-    st.respawn_generation += 1;
-    let generation = st.respawn_generation;
+    let generation = st.generation(gate_id) + 1;
+    st.gate_generation.insert(gate_id, generation);
     st.respawn_inflight.insert(gate_id, (generation, rx));
     Some((
         ProofPost::Respawned {
@@ -638,9 +702,11 @@ pub(crate) fn report_respawned(gate_id: Option<Uuid>, new_terminal_id: &str) {
     };
     let sender = current_sender();
     handle.spawn(async move {
-        let (verdict, tries) = post_with_retry(sender.as_ref(), &post).await;
-        log_verdict(&post, &verdict);
-        if verdict.is_transient() {
+        let (verdict, tries) = post_with_retry(sender.as_ref(), &post, generation).await;
+        if let Some(verdict) = &verdict {
+            log_verdict(&post, verdict);
+        }
+        if verdict.as_ref().is_some_and(PostVerdict::is_transient) {
             warn!(
                 gate_id = %gate_id,
                 tries,
@@ -677,10 +743,15 @@ fn dispatch(post: ProofPost) {
         }
         return;
     };
-    let barrier = state()
-        .respawn_inflight
-        .get(&post.gate_id())
-        .map(|(_, rx)| rx.clone());
+    let (barrier, generation) = {
+        let st = state();
+        (
+            st.respawn_inflight
+                .get(&post.gate_id())
+                .map(|(_, rx)| rx.clone()),
+            st.generation(post.gate_id()),
+        )
+    };
     let sender = current_sender();
     handle.spawn(async move {
         if let Some(mut rx) = barrier {
@@ -694,7 +765,12 @@ fn dispatch(post: ProofPost) {
                 );
             }
         }
-        let (verdict, _tries) = post_with_retry(sender.as_ref(), &post).await;
+        let (verdict, _tries) = post_with_retry(sender.as_ref(), &post, generation).await;
+        // Dropped as superseded: no log of a verdict that never came, and NO
+        // un-mark — the key may now be the new pane's.
+        let Some(verdict) = verdict else {
+            return;
+        };
         log_verdict(&post, &verdict);
         if let ProofPost::Started {
             gate_id,
@@ -833,6 +909,7 @@ mod tests {
             "stale_attempt",
             "continuation_not_consumed",
             "no_placeholder",
+            "continuation_retired",
         ] {
             assert_eq!(
                 classify_response(409, &format!(r#"{{"error":"{code}","message":"m"}}"#)),
@@ -1098,8 +1175,8 @@ mod tests {
                 PostVerdict::Accepted,
             ],
         );
-        let (v, tries) = post_with_retry(&rec, &a_post()).await;
-        assert_eq!((v, tries), (PostVerdict::Accepted, 3));
+        let (v, tries) = post_with_retry(&rec, &a_post(), 0).await;
+        assert_eq!((v, tries), (Some(PostVerdict::Accepted), 3));
     }
 
     /// The budget is bounded: the last transient answer is returned.
@@ -1114,9 +1191,9 @@ mod tests {
                 PostVerdict::Accepted,
             ],
         );
-        let (v, tries) = post_with_retry(&rec, &a_post()).await;
+        let (v, tries) = post_with_retry(&rec, &a_post(), 0).await;
         assert_eq!(tries, RETRY_DELAYS.len() + 1);
-        assert_eq!(v, PostVerdict::NoAnswer("c".into()));
+        assert_eq!(v, Some(PostVerdict::NoAnswer("c".into())));
     }
 
     /// A 4xx — and a repeat, a stale attempt, a declined race — is never retried.
@@ -1134,18 +1211,69 @@ mod tests {
             classify_response(200, r#"{"accepted":true,"recorded":true,"repeat":true}"#),
         ] {
             let rec = Recorder::new(Duration::ZERO, vec![first.clone(), PostVerdict::Accepted]);
-            let (v, tries) = post_with_retry(&rec, &a_post()).await;
-            assert_eq!((v, tries), (first, 1));
+            let (v, tries) = post_with_retry(&rec, &a_post(), 0).await;
+            assert_eq!((v, tries), (Some(first), 1));
         }
     }
 
+    /// Wait in (paused) virtual time until `n` posts exist — up to 150 s, past
+    /// [`RESPAWN_BARRIER_WAIT`] plus every retry delay — and panic naming
+    /// the posts it saw if they never come.
     async fn settle(posts: &Arc<StdMutex<Vec<ProofPost>>>, n: usize) {
-        for _ in 0..200 {
+        for _ in 0..150 {
             if posts.lock().unwrap().len() >= n {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        panic!(
+            "expected {n} posts within 150 s of virtual time, saw {:?}",
+            posts.lock().unwrap()
+        );
+    }
+
+    /// A2: the old pane's start proof, asleep in a 5xx backoff when the gate
+    /// is respawned, is dropped on wake — not sent, and its un-mark skipped so
+    /// the new pane's dedupe key survives.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_old_pane_retry_is_dropped_across_a_respawn() {
+        let _l = lock();
+        reset_for_test();
+        let rec = Recorder::new(Duration::ZERO, vec![rejected(500)]);
+        let posts = rec.posts.clone();
+        set_sender_for_test(Arc::new(rec));
+        let g = gate();
+        let s = Uuid::new_v4();
+        record_dispatch_attempt(g, 0);
+        let lookup = move |_: &str| Some(g);
+        let old = plan_session_start("term-fence-old", s, &lookup).expect("planned");
+        dispatch(old.clone());
+        settle(&posts, 1).await; // try 1 answered 500; now in backoff
+
+        report_respawned(Some(g), "term-fence-new");
+        // The new pane's proof re-marks the same (gate, attempt, session).
+        assert!(plan_session_start("term-fence-new", s, &lookup).is_some());
+        settle(&posts, 2).await; // the reset
+        tokio::time::sleep(RESPAWN_BARRIER_WAIT * 2).await; // past every backoff
+
+        set_sender_for_test(Arc::new(HttpProofSender));
+        let got = posts.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                old,
+                ProofPost::Respawned {
+                    gate_id: g,
+                    attempt: 0,
+                    new_terminal_id: "term-fence-new".into()
+                },
+            ],
+            "the old pane's retry must not be sent after the respawn"
+        );
+        assert!(
+            state().sent.contains(&(g, 0, s)),
+            "the dropped retry must not un-mark the new pane's key"
+        );
     }
 
     /// End to end through the real continuation registry: the SessionStart
