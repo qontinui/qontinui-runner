@@ -1103,9 +1103,11 @@ fn proven_terminal(
         RespawnOutcome::Died {
             exit_code,
             attempts,
-            ..
-        } => Err(RespawnError::Died(RespawnOutcome::died_reason(
-            exit_code, attempts,
+            retry_spawn_error,
+        } => Err(RespawnError::Died(RespawnOutcome::died_detail(
+            exit_code,
+            attempts,
+            retry_spawn_error.as_deref(),
         ))),
     }
 }
@@ -1722,6 +1724,22 @@ mod tests {
         assert!(
             msg.contains("not retried") && msg.contains("re-issue"),
             "a died respawn must not claim it stays pending: {msg}"
+        );
+        let msg = proven_terminal(
+            Uuid::nil(),
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: Some("claude not found".into()),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.starts_with(
+                "respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"
+            ),
+            "{msg}"
         );
         assert!(matches!(
             proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned("x".into())),
