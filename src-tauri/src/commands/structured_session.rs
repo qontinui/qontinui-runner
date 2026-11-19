@@ -120,6 +120,8 @@ fn structured_record(
         wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
+        finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         // A structured launch is never a `/clear` adoption of another session.
         adopted_from: None,

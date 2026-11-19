@@ -1246,6 +1246,8 @@ fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
             // The dead pane's exit hook already answered any gate it carried.
             gate_identity: None,
             origin: crate::coord_drain_state::SpawnOrigin::Respawn,
+            // Runs inside an async task, so it must never sleep.
+            claude_bin_wait: std::time::Duration::ZERO,
         },
     )?;
 
