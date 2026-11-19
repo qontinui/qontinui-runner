@@ -374,7 +374,14 @@ pub struct GitHubClient {
     /// deferred, never slept on; interactive ones keep the floor and the
     /// rate-limit retry. Interactive unless [`Self::with_spend_class`] says so.
     spend_class: SpendClass,
+    /// Scheme + host every route is built against: [`GITHUB_API_BASE`] in
+    /// production. A test points it at a refusing port so a request that
+    /// escapes a gate shows up as a transport error instead of reaching GitHub.
+    api_base: &'static str,
 }
+
+/// The GitHub REST API origin every URL builder in this module spells.
+const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrStatus {
@@ -410,7 +417,24 @@ impl GitHubClient {
             credential: CredentialKey::of_token(token),
             consumer,
             spend_class: SpendClass::Interactive,
+            api_base: GITHUB_API_BASE,
         })
+    }
+
+    /// Point every route at `base` instead of [`GITHUB_API_BASE`].
+    #[cfg(test)]
+    fn with_api_base(mut self, base: &'static str) -> Self {
+        self.api_base = base;
+        self
+    }
+
+    /// `url` (built against [`GITHUB_API_BASE`]) re-rooted at this client's
+    /// `api_base`. The identity in production.
+    fn at_base(&self, url: String) -> String {
+        match url.strip_prefix(GITHUB_API_BASE) {
+            Some(path) if self.api_base != GITHUB_API_BASE => format!("{}{path}", self.api_base),
+            _ => url,
+        }
     }
 
     /// Set this client's spend class (default [`SpendClass::Interactive`]).
@@ -675,7 +699,7 @@ impl GitHubClient {
     /// because the alternative is guessing, and the `cached` row's own ratio
     /// will say what it actually buys here.
     pub async fn get_pr(&self, owner: &str, repo: &str, number: u64) -> Result<PrStatus, GhError> {
-        let url = pr_url(owner, repo, number);
+        let url = self.at_base(pr_url(owner, repo, number));
         let resp = self
             .send_metered(
                 &url,
@@ -719,7 +743,7 @@ impl GitHubClient {
         repo: &str,
         branch: &str,
     ) -> Result<Vec<HeadPr>, GhError> {
-        let url = prs_by_head_url(owner, repo, branch);
+        let url = self.at_base(prs_by_head_url(owner, repo, branch));
         let resp = self
             .send_metered(
                 &url,
@@ -764,11 +788,12 @@ impl GitHubClient {
     /// client's own spend class, so a background client may get
     /// [`GhError::Deferred`] here like anywhere else.
     pub async fn authenticated_login(&self) -> Result<String, GhError> {
+        let url = self.at_base(USER_URL.to_string());
         let resp = self
             .send_metered(
-                USER_URL,
+                &url,
                 CacheMode::Cached,
-                self.client.get(USER_URL).headers(self.headers()),
+                self.client.get(&url).headers(self.headers()),
             )
             .await?;
         if !resp.is_success() {
@@ -1131,6 +1156,48 @@ mod tests {
         let row = row_for("budget_test_bg_other").expect("recorded");
         assert_eq!(row.transport_error, 1, "sent on its own (unknown) bucket");
         assert_eq!(row.deferred, 0);
+    }
+
+    /// The same gate, entered where the reconciler's population enters it:
+    /// `list_prs_for_head`. Under the headroom line it answers with the typed
+    /// deferral — not a transport failure from the refusing port — and the
+    /// meter counts exactly one `deferred` and nothing sent. Bypassing the gate
+    /// sends to port 1 and turns this red.
+    #[tokio::test]
+    async fn a_background_list_prs_for_head_under_the_headroom_line_is_never_sent() {
+        let client = GitHubClient::new("budget-test-background-list", "budget_test_bg_list")
+            .expect("client builds")
+            .with_spend_class(SpendClass::Background)
+            .with_api_base("http://127.0.0.1:1");
+        github_budget::seed_reading_for_test(client.credential(), &one_percent_left());
+
+        let err = client
+            .list_prs_for_head("o", "r", "feat/x")
+            .await
+            .expect_err("a short window defers");
+        assert!(
+            matches!(&err, GhError::Deferred(d) if d.credential == *client.credential()),
+            "{err}"
+        );
+
+        let row = row_for("budget_test_bg_list").expect("the deferral was metered");
+        assert_eq!(row.template, "/repos/o/r/pulls");
+        assert_eq!(row.deferred, 1);
+        assert_eq!(row.transport_error, 0, "nothing was put on the wire");
+        assert_eq!(row.charged + row.not_modified + row.rate_limited, 0);
+    }
+
+    #[test]
+    fn the_api_base_override_re_roots_every_route_and_is_the_identity_by_default() {
+        let prod = GitHubClient::new("t", "c").expect("builds");
+        assert_eq!(prod.at_base(pr_url("o", "r", 7)), pr_url("o", "r", 7));
+        let test = GitHubClient::new("t", "c")
+            .expect("builds")
+            .with_api_base("http://127.0.0.1:1");
+        assert_eq!(
+            test.at_base(pr_url("o", "r", 7)),
+            "http://127.0.0.1:1/repos/o/r/pulls/7"
+        );
     }
 
     #[test]
