@@ -1311,7 +1311,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           ) : (
             <p className="text-[10px] text-muted-foreground">
               Base URL of the qontinui-web backend (API) this runner registers with and signs in
-              against. The Account tab uses this same URL.
+              against. The Account tab uses the saved URL, so save changes here before signing in.
             </p>
           )}
         </div>
