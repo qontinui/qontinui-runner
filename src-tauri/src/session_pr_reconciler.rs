@@ -803,7 +803,7 @@ async fn run_tick(
     // credential's headroom line its reads are deferred rather than sent
     // (plan 2026-10-30-…, D4) — the identity's interactive sessions keep the
     // rest of the window.
-    let client = GitHubClient::new(&token, "session_pr_reconciler")?
+    let client = GitHubClient::new(&token, crate::github_budget::USER_BUDGET_REPORT_CONSUMER)?
         .with_spend_class(SpendClass::Background);
     let mut budget = TickBudget::default();
 
