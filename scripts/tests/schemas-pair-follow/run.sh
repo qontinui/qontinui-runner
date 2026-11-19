@@ -577,6 +577,8 @@ case "$o" in
   503) echo "gh: Service Unavailable (HTTP 503)" >&2 ;;
   429) echo "gh: Too Many Requests (HTTP 429)" >&2 ;;
   rl403) echo "gh: You have exceeded a secondary rate limit. (HTTP 403)" >&2 ;;
+  pri403) echo "gh: API rate limit exceeded for installation ID 1. (HTTP 403)" >&2 ;;
+  pri429) echo "gh: API rate limit exceeded for installation ID 1. (HTTP 429)" >&2 ;;
   timeout) echo "Get \"https://api.github.com/$p\": net/http: TLS handshake timeout" >&2 ;;
   404) echo "gh: Not Found (HTTP 404)" >&2 ;;
   422) echo "gh: Validation Failed (HTTP 422)" >&2 ;;
@@ -623,6 +625,13 @@ stub_decide "5xx on all 3 attempts -> TRANSIENT (not UNKNOWN)" TRANSIENT "GitHub
 [ "$(calls_to "$EV")" = 3 ] && ok "  ...bounded at SPF_GH_ATTEMPTS=3 (no 4th call)" || bad "  ...attempt bound" "calls=$(calls_to "$EV")"
 grep -q 'failed TRANSIENTLY after 3 attempt' "$STUB/stderr" && ok "  ...the log names the exhausted retries" || bad "  ...exhausted-retry log line" "$(cat "$STUB/stderr")"
 
+stub_base; stub "$EV" "pri403 ok" '[]'
+stub_decide "primary rate-limit 403 is not retried -> UNKNOWN (red)" UNKNOWN "read $R#100 events"
+[ "$(calls_to "$EV")" = 1 ] && ok "  ...primary 403 called once" || bad "  ...primary 403 retried" "calls=$(calls_to "$EV")"
+
+stub_base; stub "$EV" "pri429 ok" '[]'
+stub_decide "primary rate limit served as 429 is not retried -> UNKNOWN (red)" UNKNOWN "read $R#100 events"
+
 stub_base; stub "$EV" "422 ok" '[]'
 stub_decide "422 is never retried -> UNKNOWN (red)" UNKNOWN "read $R#100 events"
 [ "$(calls_to "$EV")" = 1 ] && ok "  ...422 called once" || bad "  ...422 retried" "calls=$(calls_to "$EV")"
@@ -642,6 +651,7 @@ rc=0; PATH="$STUB/bin:$PATH" STUB_DIR="$STUB" SPF_GH_BACKOFF_SECS=0 bash "$SUT" 
 
 echo "# verdict job (the workflow's own step script)"
 VERDICT="$TMP/verdict.sh"
+python3 -c 'import yaml' 2>/dev/null || { bad "verdict tests need python3 with PyYAML (pip install pyyaml)"; printf '\n%d passed, %d failed\n' "$passes" "$fails"; exit 1; }
 python3 - "$HERE/../../../.github/workflows/schemas-pair-follow.yml" "$VERDICT" <<'PY'
 import sys, yaml
 wf = yaml.safe_load(open(sys.argv[1]))

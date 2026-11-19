@@ -58,9 +58,10 @@
 #                  transient class after every retry, so nothing was decided.
 #
 # TRANSIENT vs UNKNOWN. Every `gh api` read is retried (SPF_GH_ATTEMPTS tries,
-# exponential backoff from SPF_GH_BACKOFF_SECS) on HTTP 5xx, 429, a rate-limit
-# 403, and network timeouts / resets. A 404, a 422 or any other 4xx is never
-# retried. When the retries run out on a transient class, `decide` emits
+# exponential backoff from SPF_GH_BACKOFF_SECS) on HTTP 5xx, 429, a secondary
+# rate-limit 403, and network timeouts / resets. A 404, a 422 or any other 4xx is
+# never retried, nor is a primary rate limit, a DNS failure or connection-refused.
+# When the retries run out on a transient class, `decide` emits
 # TRANSIENT instead of UNKNOWN and `scan` exits 75 instead of 3: GitHub did not
 # answer, which says nothing about the candidate. An UNKNOWN is kept for state
 # that cannot be decided from reads that DID succeed (an unresolvable land
@@ -115,13 +116,18 @@ trap 'rm -rf "$SPF_MARK_DIR"' EXIT
 mark_transient() { : >"$SPF_TRANSIENT_MARK"; }
 saw_transient() { [ -e "$SPF_TRANSIENT_MARK" ]; }
 
-# is_transient_err FILE -> rc 0 when gh's stderr names a retryable failure:
-# HTTP 5xx, HTTP 429, a rate-limit 403, or a network timeout / reset. A 404,
-# a 422 and every other 4xx are deterministic answers and are never retried.
+# is_transient_err FILE -> rc 0 when gh's stderr names a retryable, SHORT-LIVED
+# failure: HTTP 5xx, HTTP 429, a SECONDARY rate-limit 403, or a network timeout /
+# reset. Deliberately excluded, so they end UNKNOWN (red) rather than TRANSIENT
+# (a warning): a primary rate-limit 403 (it lasts until the hourly reset), DNS
+# failures and connection-refused (on a runner they mean misconfiguration), and
+# 404 / 422 / every other 4xx, which are deterministic answers.
 is_transient_err() {
+  # A primary rate limit can arrive as a 403 OR a 429; either way it is not short-lived.
+  grep -qi 'API rate limit exceeded' "$1" && return 1
   grep -Eq 'HTTP 5[0-9][0-9]|HTTP 429' "$1" && return 0
-  grep -q 'HTTP 403' "$1" && grep -Eqi 'rate limit' "$1" && return 0
-  grep -Eqi 'timeout|timed out|deadline exceeded|connection reset|connection refused|unexpected EOF|broken pipe|TLS handshake|no such host|temporary failure in name resolution' "$1"
+  grep -q 'HTTP 403' "$1" && grep -Eqi 'secondary rate limit' "$1" && return 0
+  grep -Eqi 'timeout|timed out|deadline exceeded|connection reset|unexpected EOF' "$1"
 }
 
 # gh_get PATH -> body on stdout. rc 0 = ok, 44 = HTTP 404,
