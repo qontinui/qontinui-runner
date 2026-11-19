@@ -6,12 +6,18 @@
 //! must remember. See [`crate::github_budget`] and the plan
 //! `2026-08-30-github-rest-budget-is-structurally-oversubscribed`.
 //!
-//! Ticket sync is BACKGROUND spend (plan
+//! Ticket SYNC — the polled reads, `fetch_actionable` and `fetch_comments` — is
+//! BACKGROUND spend (plan
 //! `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
-//! D4): every request passes [`github_budget::background_gate`] for the
-//! configured token's own bucket, and one under the headroom line is deferred —
-//! never sent, never slept on. The provider's own copy of the old floor and its
-//! sleep-then-send check are gone, and so is the rate-limit retry.
+//! D4): each read passes [`github_budget::background_gate`] for the configured
+//! token's own bucket, and one under the headroom line is deferred — never sent,
+//! never slept on. The next poll asks again.
+//!
+//! The WRITES (`add_comment`, `update_state`) are INTERACTIVE. They are one-shot
+//! write-backs of a completed task (`ticket_system::service::on_task_completed`) that
+//! nothing retries, so deferring one would drop it for good; instead they keep
+//! the shared interactive floor ([`interactive_floor`]) and the single
+//! rate-limit retry. The provider's own copy of the old floor is gone either way.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,14 +26,13 @@ use reqwest::header::{
 };
 use tracing::{debug, warn};
 
-use crate::github_budget::CredentialKey;
-use crate::github_budget::{self, CacheMode};
+use crate::github_budget::{self, CacheMode, CredentialKey, SpendClass};
 use crate::ticket_system::types::{
     Ticket, TicketComment, TicketProvider, TicketProviderConfig, TicketSource, TicketState,
 };
 use crate::trigger_system::github_api::{
-    cache_action, cached_link_next, extract_next_url, is_terminal_403, link_cache_key, CacheAction,
-    GhError,
+    cache_action, cached_link_next, extract_next_url, interactive_floor, is_terminal_403,
+    link_cache_key, now_unix, retry_backoff_secs, CacheAction, GhError,
 };
 
 /// Maximum total results to accumulate across paginated GitHub API calls.
@@ -63,7 +68,9 @@ impl TicketResponse {
 struct RawExchange {
     resp: TicketResponse,
     etag: Option<String>,
+    retry_after: Option<u64>,
     remaining: Option<i64>,
+    reset_at_unix: Option<i64>,
 }
 
 pub struct GitHubTicketProvider {
@@ -122,6 +129,10 @@ impl GitHubTicketProvider {
             .get(LINK)
             .and_then(|v| v.to_str().ok())
             .and_then(extract_next_url);
+        let retry_after = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
         let body = resp
             .bytes()
             .await
@@ -134,19 +145,22 @@ impl GitHubTicketProvider {
                 link_next,
             },
             etag,
+            retry_after,
             remaining: rate.remaining,
+            reset_at_unix: rate.reset_at_unix,
         })
     }
 
-    /// Send a request through the background headroom gate, with budget
+    /// Send a request with a budget pre-check for its spend class, budget
     /// metering and conditional-request handling.
     ///
     /// `token` is the configured credential, used only to key its bucket by
-    /// digest. A request under that bucket's headroom line returns
+    /// digest. BACKGROUND: under that bucket's headroom line the request returns
     /// [`GhError::Deferred`] without being sent (already counted as `deferred`
-    /// on the meter). A rate-limited refusal is not slept on or retried: it is
-    /// a failure, and it refreshes the bucket's reading so the next request is
-    /// deferred by the gate instead.
+    /// on the meter), and a rate-limited refusal returns
+    /// [`GhError::RateLimited`] without a sleep or a retry. INTERACTIVE: the
+    /// shared [`interactive_floor`] and one retry after a rate-limited refusal.
+    /// Both ask the one classifier, [`retry_backoff_secs`].
     ///
     /// `url` is passed explicitly rather than recovered from the built request:
     /// it is the ETag cache key AND the meter's template source, and a
@@ -154,13 +168,19 @@ impl GitHubTicketProvider {
     async fn send_metered(
         &self,
         token: &str,
+        spend_class: SpendClass,
         url: &str,
         cache_mode: CacheMode,
         request: reqwest::RequestBuilder,
     ) -> Result<TicketResponse, GhError> {
         let credential = CredentialKey::of_token(token);
-        github_budget::background_gate(&credential, BUDGET_CONSUMER, url, cache_mode)
-            .map_err(GhError::Deferred)?;
+        match spend_class {
+            SpendClass::Background => {
+                github_budget::background_gate(&credential, BUDGET_CONSUMER, url, cache_mode)
+                    .map_err(GhError::Deferred)?;
+            }
+            SpendClass::Interactive => interactive_floor(&credential).await,
+        }
 
         let unconditional = request.try_clone();
         let request = match cache_mode {
@@ -173,20 +193,33 @@ impl GitHubTicketProvider {
             },
             _ => request,
         };
+        let retry_clone = request.try_clone();
         let mut ex = self
             .send_once(&credential, url, cache_mode, request)
             .await?;
 
-        let status = ex.resp.status.as_u16();
-        if status == 429 || (status == 403 && ex.remaining == Some(0)) {
-            // Background spend is never slept on. The refusal is already on the
-            // meter as `rate_limited`.
-            return Err(GhError::Failed(format!(
-                "GitHub API rate limited ({}); background ticket request not retried",
-                ex.resp.status
-            )));
+        let backoff = retry_backoff_secs(
+            ex.resp.status.as_u16(),
+            ex.retry_after,
+            ex.remaining,
+            ex.reset_at_unix,
+            now_unix(),
+        );
+        if backoff.is_some() && spend_class == SpendClass::Background {
+            // Background spend is never slept on; the next poll asks again.
+            return Err(GhError::RateLimited {
+                status: ex.resp.status.as_u16(),
+            });
         }
-        if is_terminal_403(status, ex.remaining) {
+        if let Some(wait) = backoff {
+            warn!(
+                "GitHub API rate limited ({}), retrying after {}s",
+                ex.resp.status, wait
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            let retry = retry_clone.ok_or("Failed to clone request for potential retry")?;
+            ex = self.send_once(&credential, url, cache_mode, retry).await?;
+        } else if is_terminal_403(ex.resp.status.as_u16(), ex.remaining) {
             // A permission 403, not an empty bucket. Terminal, as before.
             return Err(GhError::Failed(format!(
                 "GitHub API returned {}: {}",
@@ -240,6 +273,9 @@ impl GitHubTicketProvider {
 
     /// Issue a write and drop every cached representation it changes.
     ///
+    /// INTERACTIVE spend: a write is a one-shot write-back nothing retries, so
+    /// it is never deferred (see the module docs).
+    ///
     /// `invalidates` carries FULL urls built the same way the reads build them —
     /// the cache keys on the exact URL including its query string, so a
     /// hand-typed near-miss silently invalidates nothing.
@@ -251,7 +287,13 @@ impl GitHubTicketProvider {
         request: reqwest::RequestBuilder,
     ) -> Result<TicketResponse, GhError> {
         let resp = self
-            .send_metered(token, url, CacheMode::Uncacheable, request)
+            .send_metered(
+                token,
+                SpendClass::Interactive,
+                url,
+                CacheMode::Uncacheable,
+                request,
+            )
             .await?;
         if resp.is_success() {
             for stale in invalidates {
@@ -403,6 +445,7 @@ impl TicketProvider for GitHubTicketProvider {
             let resp = self
                 .send_metered(
                     &config.api_token,
+                    SpendClass::Background,
                     &url,
                     CacheMode::Cached,
                     self.client
@@ -457,6 +500,7 @@ impl TicketProvider for GitHubTicketProvider {
             let resp = self
                 .send_metered(
                     &config.api_token,
+                    SpendClass::Background,
                     &url,
                     CacheMode::Cached,
                     self.client
@@ -692,7 +736,13 @@ mod tests {
         let url = "http://127.0.0.1:1/probe/ticket-deferred";
 
         let err = provider
-            .send_metered(token, url, CacheMode::Cached, provider.client.get(url))
+            .send_metered(
+                token,
+                SpendClass::Background,
+                url,
+                CacheMode::Cached,
+                provider.client.get(url),
+            )
             .await
             .err()
             .expect("a short window defers");
@@ -707,9 +757,14 @@ mod tests {
     /// its own the request is sent (and fails on the refusing port).
     #[tokio::test]
     async fn ticket_sync_reads_its_own_tokens_bucket() {
-        github_budget::seed_reading_for_test(
+        // Exhaust the SHARED slot with another token's reading, so a regression
+        // to reading it (rather than this token's bucket) defers and goes red.
+        let _global = github_budget::global_last_lock().await;
+        let mut empty = short_window();
+        empty.remaining = Some(0);
+        github_budget::seed_global_last_for_test(
             &CredentialKey::of_token("ticket-system-test-other-token"),
-            &short_window(),
+            &empty,
         );
         let provider = GitHubTicketProvider::new().expect("provider builds");
         let url = "http://127.0.0.1:1/probe/ticket-own-bucket";
@@ -717,6 +772,7 @@ mod tests {
         let err = provider
             .send_metered(
                 "ticket-system-test-healthy-token",
+                SpendClass::Background,
                 url,
                 CacheMode::Cached,
                 provider.client.get(url),
@@ -728,5 +784,26 @@ mod tests {
         let row = row_for(BUDGET_CONSUMER, "/probe/ticket-own-bucket").expect("metered");
         assert_eq!(row.transport_error, 1, "sent on its own bucket");
         assert_eq!(row.deferred, 0);
+    }
+
+    /// A completion write-back (`add_comment` / `update_state`) is one-shot and
+    /// nothing retries it, so a write is INTERACTIVE: under the headroom line it
+    /// is still sent (here, to a refusing port) — never deferred and dropped.
+    #[tokio::test]
+    async fn a_ticket_write_under_the_headroom_line_is_not_deferred() {
+        let token = "ticket-system-test-token-write";
+        github_budget::seed_reading_for_test(&CredentialKey::of_token(token), &short_window());
+        let provider = GitHubTicketProvider::new().expect("provider builds");
+        let url = "http://127.0.0.1:1/probe/ticket-write";
+
+        let err = provider
+            .send_write(token, url, &[], provider.client.post(url))
+            .await
+            .err()
+            .expect("port 1 refuses");
+        assert!(matches!(err, GhError::Failed(_)), "{err}");
+        let row = row_for(BUDGET_CONSUMER, "/probe/ticket-write").expect("metered");
+        assert_eq!(row.deferred, 0, "a write-back is never deferred");
+        assert_eq!(row.transport_error, 1, "the write was sent");
     }
 }

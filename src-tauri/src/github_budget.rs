@@ -380,11 +380,20 @@ pub fn low_fraction() -> f64 {
 }
 
 /// Pure parse of a fraction knob: the value must parse and lie strictly inside
-/// `(0, 1)`, else `default`. Shared by [`low_fraction`] and [`HeadroomKnobs`] so
-/// every fraction this module reads from the environment is judged alike.
+/// `(0, 1)`, else `default`. Used by [`low_fraction`] and for the background
+/// reserve, where `0` and `1` are both meaningless thresholds.
 pub fn parse_fraction(raw: Option<String>, default: f64) -> f64 {
     raw.and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+        .unwrap_or(default)
+}
+
+/// Pure parse of the background GUARD knob, matching coord's
+/// `parse_background_guard_fraction`: the CLOSED `[0, 1]` is accepted (`0`
+/// leaves only the reserve as the margin), anything else is `default`.
+pub fn parse_guard_fraction(raw: Option<String>, default: f64) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
         .unwrap_or(default)
 }
 
@@ -435,6 +444,11 @@ impl std::fmt::Display for CredentialKey {
 /// for. A runner spends a handful; the cap only stops an unbounded map if some
 /// caller keyed per request by mistake. Over it, the stalest reading is evicted.
 const CREDENTIAL_KEY_CAP: usize = 32;
+
+/// After a failed `GET /user`, how long before the login is asked again. A
+/// credential that cannot answer it (an installation token answers `403`)
+/// would otherwise be re-asked every tick for the life of the process.
+const LOGIN_RETRY_AFTER_SECS: i64 = 6 * 3600;
 
 /// GitHub's rate-limit window, seconds.
 const RATELIMIT_WINDOW_SECS: f64 = 3600.0;
@@ -488,15 +502,17 @@ pub struct HeadroomKnobs {
 }
 
 impl HeadroomKnobs {
-    /// The env-configured knobs, each parsed like
-    /// `QONTINUI_GITHUB_BUDGET_LOW_FRACTION` ([`parse_fraction`]).
+    /// The env-configured knobs. The reserve is parsed like
+    /// `QONTINUI_GITHUB_BUDGET_LOW_FRACTION` ([`parse_fraction`], open
+    /// `(0, 1)`); the guard like coord's ([`parse_guard_fraction`], closed
+    /// `[0, 1]`).
     pub fn from_env() -> Self {
         Self {
             min_reserve_fraction: parse_fraction(
                 std::env::var(BACKGROUND_MIN_RESERVE_FRACTION_ENV).ok(),
                 DEFAULT_BACKGROUND_MIN_RESERVE_FRACTION,
             ),
-            guard_fraction: parse_fraction(
+            guard_fraction: parse_guard_fraction(
                 std::env::var(BACKGROUND_GUARD_FRACTION_ENV).ok(),
                 DEFAULT_BACKGROUND_GUARD_FRACTION,
             ),
@@ -917,6 +933,8 @@ pub struct Registry {
     /// reader can ask "which bucket is the reconciler billing?" without
     /// re-resolving its token (plan 2026-10-30-…, Phase 4).
     consumer_credentials: HashMap<String, CredentialKey>,
+    /// When a login lookup last FAILED, per credential (unix seconds).
+    login_failures: HashMap<CredentialKey, i64>,
     rows: HashMap<RowKey, RowCounts>,
     templates_dropped: u64,
     calls_dropped: u64,
@@ -1144,6 +1162,30 @@ impl Registry {
             meter_started_at_unix,
             now_unix,
         )
+    }
+
+    /// Record that a login lookup for `credential` failed at `now_unix`. A
+    /// DEFERRED lookup is not a failure — it was never sent — so callers do
+    /// not record one.
+    pub fn record_login_failure(&mut self, credential: &CredentialKey, now_unix: i64) {
+        if !self.login_failures.contains_key(credential)
+            && self.login_failures.len() >= CREDENTIAL_KEY_CAP
+        {
+            return;
+        }
+        self.login_failures.insert(credential.clone(), now_unix);
+    }
+
+    /// Should `credential`'s login be looked up now? No once it is known, and
+    /// not within [`LOGIN_RETRY_AFTER_SECS`] of a failed lookup.
+    pub fn login_lookup_due(&self, credential: &CredentialKey, now_unix: i64) -> bool {
+        if self.logins.contains_key(credential) {
+            return false;
+        }
+        match self.login_failures.get(credential) {
+            Some(failed_at) => now_unix - failed_at >= LOGIN_RETRY_AFTER_SECS,
+            None => true,
+        }
     }
 
     /// Fold a delta into the totals (always) and into its histogram row (if the
@@ -1523,6 +1565,23 @@ pub fn login_for(credential: &CredentialKey) -> Option<String> {
     registry().lock().ok()?.login_for(credential)
 }
 
+/// Should `credential`'s login be looked up now? See
+/// [`Registry::login_lookup_due`]. A poisoned meter answers `false`: no
+/// lookup is better than one every tick.
+pub fn login_lookup_due(credential: &CredentialKey) -> bool {
+    registry()
+        .lock()
+        .map(|reg| reg.login_lookup_due(credential, now_unix()))
+        .unwrap_or(false)
+}
+
+/// Record a failed login lookup for `credential`, starting its back-off.
+pub fn record_login_failure(credential: &CredentialKey) {
+    if let Ok(mut reg) = registry().lock() {
+        reg.record_login_failure(credential, now_unix());
+    }
+}
+
 /// Seed ONE credential's reading without touching the snapshot's global
 /// reading — so a test can put a bucket under the headroom line without racing
 /// tests that assert on the process-global snapshot.
@@ -1530,6 +1589,36 @@ pub fn login_for(credential: &CredentialKey) -> Option<String> {
 pub(crate) fn seed_reading_for_test(credential: &CredentialKey, obs: &RateLimitObservation) {
     if let Ok(mut reg) = registry().lock() {
         reg.record_reading(credential, obs, now_unix());
+    }
+}
+
+/// Serializes the tests that write or assert the process-global `last`
+/// reading, so one test's deliberately exhausted global reading cannot leak
+/// into another's assertions.
+#[cfg(test)]
+pub(crate) async fn global_last_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// Same lock, for a synchronous test.
+#[cfg(test)]
+pub(crate) fn global_last_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    futures::executor::block_on(global_last_lock())
+}
+
+/// Set the process-global `last` reading (the snapshot's slot) to `obs` as if
+/// `credential` had answered with it — the shape a regression to reading the
+/// shared slot would act on. Hold [`global_last_lock`] around it.
+#[cfg(test)]
+pub(crate) fn seed_global_last_for_test(credential: &CredentialKey, obs: &RateLimitObservation) {
+    if let Ok(mut reg) = registry().lock() {
+        let now = now_unix();
+        reg.record_reading(credential, obs, now);
+        reg.last = Some(obs.clone());
+        reg.observed_at_unix = Some(now);
     }
 }
 
@@ -2430,6 +2519,75 @@ mod tests {
     }
 
     #[test]
+    fn the_guard_knob_accepts_the_closed_unit_interval_like_coord() {
+        assert_eq!(parse_guard_fraction(Some("0".into()), 0.10), 0.0);
+        assert_eq!(parse_guard_fraction(Some("1".into()), 0.10), 1.0);
+        assert_eq!(parse_guard_fraction(Some(" 0.25 ".into()), 0.10), 0.25);
+        for bad in ["-0.1", "1.01", "NaN", "inf", "x", ""] {
+            assert_eq!(
+                parse_guard_fraction(Some(bad.into()), 0.10),
+                0.10,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(parse_guard_fraction(None, 0.10), 0.10);
+    }
+
+    /// A credential that cannot answer `GET /user` is not re-asked every tick:
+    /// a failure backs off for [`LOGIN_RETRY_AFTER_SECS`], and a known login is
+    /// never looked up again.
+    #[test]
+    fn a_failed_login_lookup_backs_off_and_a_known_login_is_never_re_asked() {
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        let now = 1_000_000;
+        assert!(reg.login_lookup_due(&a, now), "never asked: due");
+
+        reg.record_login_failure(&a, now);
+        assert!(
+            !reg.login_lookup_due(&a, now + 30),
+            "next tick: not re-asked"
+        );
+        assert!(!reg.login_lookup_due(&a, now + LOGIN_RETRY_AFTER_SECS - 1));
+        assert!(reg.login_lookup_due(&a, now + LOGIN_RETRY_AFTER_SECS));
+
+        let b = CredentialKey::of_token("token-b");
+        assert!(reg.login_lookup_due(&b, now + 30), "per credential");
+
+        reg.record_login(&a, "jspinak");
+        assert!(!reg.login_lookup_due(&a, now + 10 * LOGIN_RETRY_AFTER_SECS));
+    }
+
+    /// The verdict reads the credential's OWN reading, never the shared slot:
+    /// with the global `last` exhausted by another credential, B still sends.
+    #[test]
+    fn the_shared_last_reading_never_defers_another_credential() {
+        let now = 1_000_000;
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        let b = CredentialKey::of_token("token-b");
+        let empty = reading(5000, 0, now + 1800);
+        reg.record_reading(&a, &empty, now);
+        reg.record(
+            "c",
+            "/repos/o/r/pulls/1",
+            CacheMode::Cached,
+            200,
+            empty,
+            now,
+        );
+        assert_eq!(
+            reg.snapshot(1, 0.2, now).remaining,
+            Some(0),
+            "shared slot exhausted"
+        );
+        assert_eq!(
+            reg.background_verdict(&b, now, HeadroomKnobs::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn fraction_knobs_parse_like_the_low_fraction() {
         assert_eq!(parse_fraction(None, 0.2), 0.2);
         assert_eq!(parse_fraction(Some(" 0.35 ".into()), 0.2), 0.35);
@@ -2725,6 +2883,8 @@ mod tests {
     fn global_wrappers_do_not_panic_and_report_honestly() {
         // The process-global registry is shared with any other test that touches
         // it, so this asserts only shape-and-liveness invariants, never counts.
+        // The tests that seed an exhausted global reading hold the same lock.
+        let _global = global_last_lock_blocking();
         record_identity("QONTINUI_RUNNER_GITHUB_TOKEN", None);
         record_response(
             &CredentialKey::of_token("global-wrappers-probe-token"),
