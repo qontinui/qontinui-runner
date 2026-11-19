@@ -482,6 +482,8 @@ pub fn wind_down_for_process(
         .copied()
         .unwrap_or(TerminalObservation::UNOBSERVABLE);
     let work_status = work_status_for(process);
+    // coord's finish stamp — carried on the view so the close guard's revival
+    // arm judges against the stamp of the SAME fresh pass as its eligibility.
     let finished_at_ms = match work_status {
         WorkStatus::Finished => process
             .session_id
@@ -504,10 +506,9 @@ pub fn wind_down_for_process(
         finished_at_ms,
         grace,
     };
-    Some(WindDownView::from_verdict(
-        &wind_down::eligibility(&inputs, now_ms),
-        kind,
-    ))
+    let mut view = WindDownView::from_verdict(&wind_down::eligibility(&inputs, now_ms), kind);
+    view.finished_at_ms = finished_at_ms;
+    Some(view)
 }
 
 /// Attach [`wind_down_for_process`] to every process in `processes`.
@@ -593,6 +594,186 @@ pub type OwnershipRead = Result<CoordOwnership, String>;
 /// chunk that failed) as UNKNOWN.
 pub async fn fetch_ownership(claude_session_ids: &[String]) -> OwnershipRead {
     custody::coord::fetch_live_ownership(claude_session_ids).await
+}
+
+/// Per-request deadline for coord's obligations read. Coord bounds its own
+/// inline verdicts at 25 s (`VERDICT_DEADLINE` in `overlord_proof.rs`) and
+/// serves the answer after that with the stragglers marked `unknown`, so the
+/// client waits past it; shorter would turn a slow-but-answering coord into a
+/// transport failure and lose the typed `unknown` items it would have served.
+pub const OBLIGATIONS_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// `{base}/coord/overlord/session-obligations/{id}` — the HTTP twin of the
+/// `coord_session_obligations` MCP tool (qontinui-coord#2913), each over one
+/// shared core in coord, so this is the same derivation `/next-move` and
+/// `session-closeable.sh` read.
+pub fn obligations_url(base: &str, claude_session_id: &str) -> String {
+    format!(
+        "{}/coord/overlord/session-obligations/{}",
+        base.trim_end_matches('/'),
+        urlencoding::encode(claude_session_id.trim())
+    )
+}
+
+/// GET `req` with `timeout` and decode a 2xx body as JSON. Every failure is
+/// `Err` with its cause chain — the caller feeds it to
+/// [`wind_down::obligations_gate`], where `Err` is UNKNOWN and never "nothing
+/// owed". Split from [`fetch_obligations`] so a test can drive it over a
+/// loopback socket without a device bearer.
+pub async fn read_obligations(
+    req: reqwest::RequestBuilder,
+    url: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let what = |e: &(dyn std::error::Error + 'static)| {
+        format!("{url}: {}", crate::util::error_chain::error_chain(e))
+    };
+    let resp = req
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("GET {}", what(&e)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(200).collect();
+        return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("decode GET {}", what(&e)))
+}
+
+/// Read coord's obligations for one session — the REMOTE half of `closeable`
+/// (plan `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+/// Phase 6). `Err` when no coord base is configured, the shared client could
+/// not be built, or the read failed in any way; the gate reads every `Err` as
+/// UNKNOWN. Like [`fetch_ownership`] it presents the device's default
+/// credential, and relies on the answer's `session_proven_in_tenant` to refuse
+/// a session that credential cannot place.
+pub async fn fetch_obligations(claude_session_id: &str) -> Result<serde_json::Value, String> {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        return Err(
+            "no coord base is configured, so the session's obligations cannot be read".to_string(),
+        );
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Err(
+            "the shared coord HTTP client could not be built, so the session's obligations \
+             cannot be read"
+                .to_string(),
+        );
+    };
+    let url = obligations_url(&base, claude_session_id);
+    read_obligations(
+        crate::coord_http::coord_get(client, &url),
+        &url,
+        OBLIGATIONS_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+/// The first worktree in coord's obligations answer (`worktrees.items[]`)
+/// that the custody gate did NOT cover — the rule that keeps the remote half
+/// of `closeable` from vouching for a tree the local half never looked at
+/// (#2981 review concern 3, coord finding `9f265810`).
+///
+/// coord's obligations read and the custody gate's keyed ownership read both
+/// derive from `coord.agent_worktrees`, but through different keys and at
+/// different moments, so they can disagree: a row allocated between the two
+/// reads, or one keyed to the session one way and not the other. Each item's
+/// `worktree_path` must match a path in `covered` (the gather's
+/// [`wind_down::CustodyInputs::covered`]) by [`custody::worktree_path_matches`]
+/// — exact after normalization, or the covered absolute path ending in coord's
+/// relative ledger path. An item with no `worktree_path` cannot be matched and
+/// is returned as `<absent>`. A body with no `worktrees` block, or one whose
+/// `items` is not a list, returns `None`: the obligations gate judges that
+/// block's coverage itself.
+///
+/// `Some` makes a `watched` obligations verdict UNKNOWN
+/// (`ObligationsUnknown::WorktreeNotProbed`), never the reverse: it only ever
+/// withholds a close.
+pub fn first_uncovered_coord_worktree(
+    doc: &serde_json::Value,
+    covered: &[String],
+) -> Option<String> {
+    let items = doc.get("worktrees")?.get("items")?.as_array()?;
+    items.iter().find_map(|item| {
+        match item
+            .get("worktree_path")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(path) if !path.trim().is_empty() => (!covered
+                .iter()
+                .any(|c| custody::worktree_path_matches(c, path)))
+            .then(|| path.to_string()),
+            _ => Some("<absent>".to_string()),
+        }
+    })
+}
+
+/// Per-request deadline for coord's pending-message read (the close guard's
+/// "no undelivered message" input) — the delivery poller's own bound.
+pub const PENDING_MESSAGES_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// coord's undelivered, unacked, unexpired messages for this device — `GET
+/// /coord/session-messages/pending`, the door the delivery poller pulls — as
+/// `(message_id, to_session)` pairs. `?live=` names the session when its id is
+/// a UUID, which ranks its oldest row onto the page (coord's round-robin puts
+/// a `live` recipient's first row ahead of every other recipient's). `Err`
+/// when there is no coord base, no shared client, no device credential (coord
+/// refuses an anonymous read), the read fails, or the body is not the shape
+/// coord serves: the close guard reads every `Err` as UNKNOWN.
+pub async fn fetch_pending_messages(
+    claude_session_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        return Err("no coord base is configured, so pending messages cannot be read".to_string());
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Err("the shared coord HTTP client could not be built".to_string());
+    };
+    if !crate::coord_http::have_device_token() {
+        return Err(
+            "no device credential: coord's pending-message read refuses an anonymous caller"
+                .to_string(),
+        );
+    }
+    let mut url = format!(
+        "{}/coord/session-messages/pending",
+        base.trim_end_matches('/')
+    );
+    if let Ok(uuid) = claude_session_id.trim().parse::<uuid::Uuid>() {
+        url.push_str(&format!("?live={uuid}"));
+    }
+    let body = read_obligations(
+        crate::coord_http::coord_get(client, &url),
+        &url,
+        PENDING_MESSAGES_TIMEOUT,
+    )
+    .await?;
+    pending_message_rows(&body)
+}
+
+/// The `(message_id, to_session)` rows of a pending-message body. A body with
+/// no `messages` list, or a row missing either id, is `Err`: a row that cannot
+/// be attributed must not vanish.
+pub fn pending_message_rows(body: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let rows = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "the pending-message body carries no `messages` list".to_string())?;
+    rows.iter()
+        .map(|row| {
+            let field = |key: &str| {
+                row.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("a pending message has no `{key}`: {row}"))
+            };
+            Ok((field("message_id")?, field("to_session")?))
+        })
+        .collect()
 }
 
 /// What the runner knows about one candidate before any probe runs.
@@ -774,10 +955,20 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             session_dir,
             ownership,
             members: Vec::new(),
+            covered: Vec::new(),
         };
     };
 
     let mut members: Vec<CustodyMember> = Vec::new();
+    // Every path this gather looked at — what the obligations cross-check
+    // holds coord's `worktrees` block against. An attributed path is covered
+    // whatever its probe found (a failed probe is already this gate's own
+    // Unknown, and a reaped one was positively seen gone).
+    let mut covered: Vec<String> = attributed
+        .iter()
+        .map(|w| w.path.display().to_string())
+        .chain(isolated.iter().map(|p| p.display().to_string()))
+        .collect();
     let mut named: Vec<(&Path, bool)> = vec![(dir.as_path(), true)];
     for worktree in &attributed {
         if worktree.retired {
@@ -825,6 +1016,7 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             }),
         }
     }
+    covered.extend(roots.iter().map(|r| r.display().to_string()));
     for root in roots {
         let state = probe.member_state(&root).await;
         let slot_wip_state = probe.slot_wip_state(&root, claude_session_id).await;
@@ -838,6 +1030,7 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
         session_dir,
         ownership,
         members,
+        covered,
     }
 }
 
@@ -1812,5 +2005,134 @@ mod tests {
         // And outside any repository there is no root at all.
         let outside = tempfile::tempdir().unwrap();
         assert_eq!(probe.worktree_root(outside.path()).await.unwrap(), None);
+    }
+
+    #[test]
+    fn pending_message_rows_keep_every_row_and_refuse_a_malformed_one() {
+        let body = serde_json::json!({"messages": [
+            {"message_id": "m1", "to_session": "s1", "kind": "ci_rework", "priority": "blocking"},
+            {"message_id": "m2", "to_session": "0192aaaa-0000-7000-8000-000000000001"},
+        ]});
+        assert_eq!(
+            pending_message_rows(&body).unwrap(),
+            vec![
+                ("m1".to_string(), "s1".to_string()),
+                (
+                    "m2".to_string(),
+                    "0192aaaa-0000-7000-8000-000000000001".to_string()
+                ),
+            ]
+        );
+        assert!(pending_message_rows(&serde_json::json!({"messages": []}))
+            .unwrap()
+            .is_empty());
+        assert!(pending_message_rows(&serde_json::json!({"error": "x"})).is_err());
+        assert!(
+            pending_message_rows(&serde_json::json!({"messages": [{"message_id": "m"}]})).is_err(),
+            "a row with no recipient cannot be ruled out as this session's"
+        );
+    }
+
+    // ── Obligations read (finished_close, remote half of `closeable`) ────
+
+    #[test]
+    fn the_obligations_url_is_the_http_twin_with_the_id_encoded() {
+        assert_eq!(
+            obligations_url(
+                "https://coord.example/",
+                "0a1b2c3d-0000-4000-8000-000000000001"
+            ),
+            "https://coord.example/coord/overlord/session-obligations/0a1b2c3d-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            obligations_url("http://h", " a/b "),
+            "http://h/coord/overlord/session-obligations/a%2Fb"
+        );
+    }
+
+    fn plain_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    /// Serve one canned HTTP response on a loopback port; return its URL.
+    async fn serve_once(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/coord/overlord/session-obligations/s",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        url
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The whole remote half over a real socket: the transport and the gate,
+    /// for an answer that is clean, one that is unwatched, and the three ways a
+    /// read fails (timeout, non-2xx, undecodable body) — none of which may
+    /// read as "watched".
+    #[tokio::test]
+    async fn the_read_and_the_gate_together_never_read_a_failed_read_as_watched() {
+        let watched = r#"{"all_tracked_sources_read":true,"session_proven_in_tenant":true,
+            "prs":{"coverage":"read","items":[]},
+            "gates":{"coverage":"read","items":[{"item":{"gate_id":"g"},"verdict":"watched"}]}}"#;
+        let url = serve_once(http_ok(watched)).await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        assert_eq!(
+            wind_down::obligations_gate(&read),
+            wind_down::ObligationsVerdict::Watched { judged: 1 }
+        );
+
+        let owed = watched.replace("\"watched\"}]", "\"not_watched\"}]");
+        let url = serve_once(http_ok(&owed)).await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        assert_eq!(wind_down::obligations_gate(&read).as_str(), "unwatched");
+
+        let url = serve_once(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy"
+                .to_string(),
+        )
+        .await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        let err = read.as_ref().unwrap_err();
+        assert!(err.contains("503") && err.contains("busy"), "{err}");
+        let verdict = wind_down::obligations_gate(&read);
+        assert_eq!(verdict.reason(), Some("obligations_unreadable"));
+        assert!(!verdict.is_watched());
+
+        let url = serve_once(http_ok("not-json")).await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        assert!(
+            read.as_ref().unwrap_err().starts_with("decode GET"),
+            "{read:?}"
+        );
+        assert!(!wind_down::obligations_gate(&read).is_watched());
+
+        // Bound and never answered: the request times out.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/x",
+            listener.local_addr().unwrap().port()
+        );
+        let read =
+            read_obligations(plain_client().get(&url), &url, Duration::from_millis(200)).await;
+        let err = read.as_ref().unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        let verdict = wind_down::obligations_gate(&read);
+        assert_eq!(verdict.as_str(), "unknown");
+        assert!(!verdict.is_watched());
+        drop(listener);
     }
 }
