@@ -2243,9 +2243,12 @@ impl CloseEffects for LiveCloseEffects<'_> {
         Ok(rows
             .into_iter()
             .map(|(message_id, to_session)| {
-                // The same resolution the delivery poller routes on: a
-                // lifecycle record keyed by the id, else coord's session UUID
-                // through the registrar's forward index.
+                // Two of the delivery poller's three resolutions: a lifecycle
+                // record keyed by the id, else coord's session UUID through
+                // the registrar's forward index. Its direct SDK-session arm is
+                // not applied, so a row addressed to an SDK session's own
+                // task-run id stays unattributed here, which the messages arm
+                // reads as UNKNOWN.
                 let owner = self
                     .store
                     .as_ref()

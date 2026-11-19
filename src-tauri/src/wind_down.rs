@@ -735,8 +735,8 @@ impl CustodyView {
 /// withdrawn gate whose object is still held) — nothing is owed, so nothing
 /// lives only in the session. Leaving it out would make every session that ever
 /// had a gate clear read Unknown, and the arm would close nothing.
-/// `scripts/session-closeable.sh` predates `retired` and reads it as Unknown;
-/// the two answer differently on that one word until it is taught it.
+/// `scripts/session-closeable.sh` passes `retired` as well, so the two agree
+/// on that word.
 pub const WATCHED_OBLIGATION_VERDICTS: [&str; 3] = ["landed", "watched", "retired"];
 
 /// The source blocks of coord's obligations read whose items ALL carry a
@@ -911,10 +911,11 @@ impl ObligationsVerdict {
 
 /// Decide whether every obligation coord attributes to a session is watched.
 /// Pure over the decoded body of `coord_session_obligations` (or its HTTP twin
-/// `GET /coord/overlord/session-obligations/:id`), which is the SAME rule
-/// `scripts/session-closeable.sh`'s coord judge applies, so the two halves of
-/// `closeable` cannot drift on what "watched" means (with the one `retired`
-/// difference documented at [`WATCHED_OBLIGATION_VERDICTS`]).
+/// `GET /coord/overlord/session-obligations/:id`). It accepts the same passing
+/// words as `scripts/session-closeable.sh`'s coord judge. The two differ on one
+/// case: a non-passing item whose `attribution` is `uncertain` is Unknown here,
+/// while the script notes some such items without letting them move its
+/// verdict. This gate is the stricter of the two.
 ///
 /// Evaluated in this order:
 ///

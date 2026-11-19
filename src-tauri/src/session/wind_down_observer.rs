@@ -757,7 +757,9 @@ pub async fn fetch_pending_messages(
 
 /// The `(message_id, to_session)` rows of a pending-message body. A body with
 /// no `messages` list, or a row missing either id, is `Err`: a row that cannot
-/// be attributed must not vanish.
+/// be attributed must not vanish. The error names such a row by its
+/// `message_id` alone and never quotes it: a row carries the message body, and
+/// this text reaches the close-guard log line and `/restart-readiness`.
 pub fn pending_message_rows(body: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
     let rows = body
         .get("messages")
@@ -769,7 +771,13 @@ pub fn pending_message_rows(body: &serde_json::Value) -> Result<Vec<(String, Str
                 row.get(key)
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
-                    .ok_or_else(|| format!("a pending message has no `{key}`: {row}"))
+                    .ok_or_else(|| {
+                        let id = row
+                            .get("message_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("<no message_id>");
+                        format!("pending message {id} has no `{key}`")
+                    })
             };
             Ok((field("message_id")?, field("to_session")?))
         })
@@ -2031,6 +2039,13 @@ mod tests {
             pending_message_rows(&serde_json::json!({"messages": [{"message_id": "m"}]})).is_err(),
             "a row with no recipient cannot be ruled out as this session's"
         );
+        // The refusal names the row by id and never quotes it.
+        let err = pending_message_rows(&serde_json::json!({"messages": [
+            {"message_id": "m9", "body": "private words", "to_session": null},
+        ]}))
+        .unwrap_err();
+        assert!(err.contains("m9") && err.contains("to_session"), "{err}");
+        assert!(!err.contains("private words"), "{err}");
     }
 
     // ── Obligations read (finished_close, remote half of `closeable`) ────

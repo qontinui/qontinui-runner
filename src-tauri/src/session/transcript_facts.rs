@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use super::transcript_last_turn::{last_turn_ms, FileStamp, ReadBudget, TAIL_WIDE};
+use super::transcript_last_turn::{last_turn_ms, FileStamp, ReadBudget, TurnRead, TAIL_WIDE};
 use crate::agent_worktree::custody::{order_by_newest_turn, TranscriptCopy};
 use qontinui_runner_lib::file_tail::read_tail_lossy;
 
@@ -263,6 +263,37 @@ pub fn facts_from_tail(tail: &str, whole_file: bool) -> TranscriptFacts {
     f
 }
 
+/// How many lines of a transcript tail could not be read as dated records: a
+/// line that is not JSON, and a `user`, `assistant` or `queue-operation`
+/// record with no parseable `timestamp`. [`facts_from_tail`] skips both, so a
+/// tail holding one says less than it seems to: a prompt written on such a
+/// line would read as no prompt at all. A window that is not the whole file
+/// starts mid-line, so its first line is not counted. Blank lines are not
+/// counted, and a record of any other type needs no timestamp.
+pub fn unread_lines(tail: &str, whole_file: bool) -> usize {
+    use serde_json::Value;
+    tail.lines()
+        .enumerate()
+        .filter(|&(index, line)| {
+            if line.trim().is_empty() || (index == 0 && !whole_file) {
+                return false;
+            }
+            let Ok(e) = serde_json::from_str::<Value>(line) else {
+                return true;
+            };
+            let dated = e
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .is_some_and(|ts| chrono::DateTime::parse_from_rfc3339(ts).is_ok());
+            !dated
+                && matches!(
+                    e.get("type").and_then(Value::as_str),
+                    Some("user" | "assistant" | "queue-operation")
+                )
+        })
+        .count()
+}
+
 type Cache = HashMap<(PathBuf, u64), (FileStamp, TranscriptFacts)>;
 
 fn cache() -> &'static Mutex<Cache> {
@@ -275,7 +306,10 @@ const CACHE_CAP: usize = 4096;
 
 /// The facts of the last `window` bytes of `path`, from the cache when the
 /// file's `(len, mtime)` still matches `stamp`. `None` when the file could not
-/// be read. An unstamped file is read and never cached.
+/// be read, when a line of the window is not a dated record
+/// ([`unread_lines`]), or when the whole file holds no dated record: none of
+/// those may read as "nothing happened after the finish". An unstamped file is
+/// read and never cached.
 pub fn read_facts(path: &Path, stamp: Option<FileStamp>, window: u64) -> Option<TranscriptFacts> {
     let key = (path.to_path_buf(), window);
     if let Some(stamp) = stamp {
@@ -292,7 +326,14 @@ pub fn read_facts(path: &Path, stamp: Option<FileStamp>, window: u64) -> Option<
     // Stat again AFTER the read: a file that grew past the window between the
     // two calls was not read whole, whatever the first length said (review A5).
     let len_after = std::fs::metadata(path).ok()?.len();
-    let facts = facts_from_tail(&tail, len.max(len_after) <= window);
+    let whole_file = len.max(len_after) <= window;
+    if unread_lines(&tail, whole_file) > 0 {
+        return None;
+    }
+    let facts = facts_from_tail(&tail, whole_file);
+    if whole_file && facts.window_floor_ms.is_none() {
+        return None;
+    }
     if let Some(stamp) = stamp {
         if let Ok(mut guard) = cache().lock() {
             if guard.len() >= CACHE_CAP {
@@ -336,18 +377,38 @@ pub fn find_copies(roots: &[PathBuf], session_id: &str) -> Result<Vec<Transcript
 }
 
 /// The copy holding the NEWEST turn, by the ordering `--resume` relies on.
-pub fn newest_copy(mut copies: Vec<TranscriptCopy>) -> Option<TranscriptCopy> {
+///
+/// `Err` when there are several copies and one of them cannot be ranked: its
+/// tail was unreadable, or held no turn. That ordering puts such a copy last,
+/// so an unreadable LIVE copy would hand the read to a stale one, whose turns
+/// all predate the finish, and the revival arm would answer ok. One copy needs
+/// no ranking.
+pub fn newest_copy(mut copies: Vec<TranscriptCopy>) -> Result<Option<TranscriptCopy>, String> {
     let mut budget = ReadBudget::Unbounded;
+    if copies.len() > 1 {
+        for copy in &copies {
+            let read = last_turn_ms(&copy.path, copy.stamp, &mut budget);
+            if !matches!(read, TurnRead::Read(Some(_))) {
+                return Err(format!(
+                    "{} is one of {} transcript copies and its newest turn could not be read, so \
+                     the newest copy is not known",
+                    copy.path.display(),
+                    copies.len()
+                ));
+            }
+        }
+    }
     order_by_newest_turn(&mut copies, &mut |c| {
         last_turn_ms(&c.path, c.stamp, &mut budget)
     });
-    copies.into_iter().next()
+    Ok(copies.into_iter().next())
 }
 
 /// The facts of `session_id`'s newest transcript copy under `roots`, from a
 /// window deep enough to reach `stamp_ms` when the file allows it. `Err` names
 /// why no facts could be read: no copy at all, a root that could not be
-/// listed, or a copy that could not be read.
+/// listed, several copies of which one could not be ranked, or a newest copy
+/// that could not be read as dated records.
 pub fn facts_for_session_in(
     roots: &[PathBuf],
     session_id: &str,
@@ -356,7 +417,7 @@ pub fn facts_for_session_in(
 ) -> Result<TranscriptFacts, String> {
     let copies = find_copies(roots, session_id)?;
     let count = copies.len();
-    let Some(copy) = newest_copy(copies) else {
+    let Some(copy) = newest_copy(copies)? else {
         return Err(format!(
             "no transcript for session {session_id} under any of {} account root(s)",
             roots.len()
@@ -364,7 +425,7 @@ pub fn facts_for_session_in(
     };
     let unreadable = || {
         format!(
-            "the newest of {count} transcript cop(ies), {}, could not be read",
+            "the newest of {count} transcript cop(ies), {}, could not be read as dated records",
             copy.path.display()
         )
     };
@@ -708,7 +769,7 @@ mod tests {
         let roots = vec![stale_root.clone(), live_root.clone()];
         let copies = find_copies(&roots, sid).unwrap();
         assert_eq!(copies.len(), 2);
-        let newest = newest_copy(copies).unwrap();
+        let newest = newest_copy(copies).unwrap().unwrap();
         assert_eq!(newest.config_dir, live_root);
         let f = facts_for_session_in(&roots, sid, Some(t(600)), 1000).unwrap();
         assert_eq!(f.last_prompt_ms, Some(t(4000)));
@@ -745,5 +806,90 @@ mod tests {
             Some(t(500))
         );
         assert!(read_facts(&tmp.path().join("gone.jsonl"), None, TAIL_WIDE).is_none());
+    }
+
+    /// A line that is not a dated record is counted, never skipped in silence:
+    /// a prompt written on it would otherwise read as no prompt.
+    #[test]
+    fn lines_that_are_not_dated_records_are_counted() {
+        let good = user(0, serde_json::json!("work"), &[]);
+        let undated = serde_json::json!({
+            "type": "user", "timestamp": "not a time",
+            "message": {"role": "user", "content": "one more thing"},
+        })
+        .to_string();
+        let meta = serde_json::json!({"type": "summary", "summary": "s"}).to_string();
+        let tail = |lines: &[&str]| lines.join("\n");
+        assert_eq!(unread_lines(&tail(&[good.as_str(), "{cut off"]), true), 1);
+        assert_eq!(
+            unread_lines(&tail(&[good.as_str(), undated.as_str()]), true),
+            1
+        );
+        // A record of another type needs no timestamp; a blank line is no record.
+        assert_eq!(
+            unread_lines(&tail(&[good.as_str(), meta.as_str(), ""]), true),
+            0
+        );
+        // A window that is not the whole file starts mid-line.
+        assert_eq!(
+            unread_lines(&tail(&["end of a cut line", good.as_str()]), false),
+            0
+        );
+        assert_eq!(
+            unread_lines(&tail(&["end of a cut line", good.as_str()]), true),
+            1
+        );
+    }
+
+    /// A file with a line that is not a dated record, or with no dated record
+    /// at all, yields no facts: it must not answer "nothing after the finish".
+    #[test]
+    fn a_file_with_an_unread_line_or_no_record_yields_no_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("u.jsonl");
+        write(
+            &p,
+            &[
+                user(0, serde_json::json!("go"), &[]),
+                "{cut off".to_string(),
+            ],
+        );
+        assert!(read_facts(&p, None, TAIL_WIDE).is_none());
+        write(&p, &[]);
+        assert!(read_facts(&p, None, TAIL_WIDE).is_none());
+        write(&p, &[user(0, serde_json::json!("go"), &[])]);
+        assert!(read_facts(&p, None, TAIL_WIDE).is_some());
+    }
+
+    /// With several copies, one that cannot be ranked makes the newest copy
+    /// UNKNOWN: the ordering puts such a copy last, so an unreadable live copy
+    /// would otherwise hand the read to a stale one.
+    #[test]
+    fn several_copies_with_one_that_cannot_be_ranked_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "5472e347-0000-4000-8000-000000000002";
+        let a = tmp.path().join(".claude-a");
+        let b = tmp.path().join(".claude-b");
+        write(
+            &a.join("projects").join("p1").join(format!("{sid}.jsonl")),
+            &[
+                user(0, serde_json::json!("work"), &[]),
+                said(600, "end_turn"),
+            ],
+        );
+        // A second copy that holds no turn at all.
+        write(
+            &b.join("projects").join("p2").join(format!("{sid}.jsonl")),
+            &[],
+        );
+        let roots = vec![a.clone(), b];
+        let copies = find_copies(&roots, sid).unwrap();
+        assert_eq!(copies.len(), 2);
+        assert!(newest_copy(copies).is_err());
+        assert!(facts_for_session_in(&roots, sid, Some(t(600)), 1000).is_err());
+        // One copy needs no ranking.
+        let only = find_copies(&[a], sid).unwrap();
+        assert_eq!(only.len(), 1);
+        assert!(newest_copy(only).unwrap().is_some());
     }
 }
