@@ -391,7 +391,8 @@ pub(super) fn replay_pending_with<M, F>(
 }
 
 /// Respawns this process may materialize at once. Each one can take minutes
-/// (the 180 s liveness proof per attempt, a 120 s CLI-install wait, retries),
+/// (the 180 s liveness proof per attempt, up to 120 s of CLI-install wait before
+/// the drain check and again before each resolve, retries),
 /// so a catch-up replaying many pending rows must not open every PTY at once.
 const MAX_CONCURRENT_RESPAWNS: usize = 4;
 
@@ -852,6 +853,12 @@ async fn materialize(
     coord_url: &str,
     respawn: &PendingRespawn,
 ) -> Result<String, RespawnError> {
+    // Wait out a runner-owned CLI install before step 0, so the drain check
+    // below is fresh when the spawn follows; the `--resume` resolver (step 4b)
+    // waits on the same flag and returns at once after this. The pending row
+    // is untouched by the wait.
+    crate::claude_cli_spawn::await_cli_update_quiescent().await;
+
     // 0. Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     //    D3). A respawn is autonomous. Coord already withholds respawn rows from
     //    a drained device; this is defence in depth for a push that raced the
