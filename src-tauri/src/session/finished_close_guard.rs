@@ -284,7 +284,10 @@ pub fn obligations_arm(verdict: &ObligationsVerdict) -> ArmVerdict {
 /// `completed` and there is at least one; a completed check with no
 /// conclusion is UNKNOWN. Anything else — including a head with no
 /// non-`coord_gate` check yet — is held `first_verdict_pending`. Branch-only
-/// items (no PR) carry no facts; the obligations arm already judged them.
+/// items (`item.pr_number` an explicit null) carry no facts; the obligations
+/// arm already judged them. An item with no `item.pr_number` key at all is
+/// UNKNOWN: coord writes that key on every item, so its absence says the item
+/// was not read, not that it has no PR.
 pub fn first_verdict_arm(body: Option<&Value>) -> ArmVerdict {
     let Some(body) = body else {
         return ArmVerdict::unknown(
@@ -303,8 +306,13 @@ pub fn first_verdict_arm(body: Option<&Value>) -> ArmVerdict {
         );
     };
     for item in items {
-        let pr = item.get("item").and_then(|i| i.get("pr_number"));
-        if pr.is_none_or(Value::is_null) {
+        let Some(pr) = item.get("item").and_then(|i| i.get("pr_number")) else {
+            return ArmVerdict::unknown(
+                "pr_item_unreadable",
+                "a prs item carries no item.pr_number, so it cannot be told from a PR",
+            );
+        };
+        if pr.is_null() {
             continue;
         }
         let name = item
@@ -895,6 +903,17 @@ mod tests {
                                       "verdict": "watched", "facts": null}])
             ),
             CLOSE
+        );
+
+        // unknown: a prs item with no `item.pr_number` key is not branch-only.
+        assert_eq!(
+            with(serde_json::json!([{"item": {"repo": "o/r", "branch": "b"},
+                                      "verdict": "watched", "facts": null}])),
+            unknown("first_verdict", "pr_item_unreadable")
+        );
+        assert_eq!(
+            with(serde_json::json!([{"verdict": "watched", "facts": null}])),
+            unknown("first_verdict", "pr_item_unreadable")
         );
 
         // held: CI still running, or no CI check at all yet.
