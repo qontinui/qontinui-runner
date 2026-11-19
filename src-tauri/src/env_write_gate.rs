@@ -471,7 +471,19 @@ mod tests {
     }
 
     /// A live capture names the probe that reached the gate, not the gate.
+    ///
+    /// Not run on Windows: `[profile.dev] debug = 0` leaves the MSVC test
+    /// binary without full symbols, so a capture there resolves frames to a
+    /// layout-dependent nearby symbol (CI read `schema_export::export_all_schemas`
+    /// at one head on two attempts), and no assertion on the live name is
+    /// sound. The frame rule itself stays covered on every platform by the
+    /// fixed-trace test
+    /// `the_caller_frame_is_the_first_outside_the_runtime_and_the_doors` above.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "debug = 0 MSVC test binaries resolve backtrace frames to a layout-dependent symbol"
+    )]
     fn a_live_refusal_names_the_function_that_reached_the_gate() {
         #[inline(never)]
         fn gate_caller_probe() -> Result<(), String> {
