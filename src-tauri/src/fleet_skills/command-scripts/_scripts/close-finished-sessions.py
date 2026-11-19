@@ -2088,6 +2088,7 @@ def selftest():
     opener_n = opener_cases(bad)
     compaction_n = compaction_cases(bad)
     menu_n = limit_menu_cases(bad)
+    fit_n = report_fit_cases(bad)
     stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad) + zombie_live_selftest(bad)
     for row, want in [({"account": {"label": "paktis"}, "configDir": "/h/.claude-x"}, "paktis"),
                       ({"account": {"label": "unknown"}, "configDir": "/h/.claude-lukas"}, "lukas"),
@@ -2131,7 +2132,7 @@ def selftest():
           f"cases, {prompt_cases} prompt cases, {sgr_cases} SGR cases, {condition_one_cases} condition-1 cases, "
           f"{roster_checks} verdict-roster checks, {stranded_n} finish_stranded cases, {opener_n} opener-class cases, {compaction_n} compaction cases, "
           f"{menu_n} limit-menu cases, "
-          f"{stray_cases} stray-shell cases, {len(bad)} failure(s)")
+          f"{stray_cases} stray-shell cases, {fit_n} report-fit cases, {len(bad)} failure(s)")
     return 1 if bad else 0
 
 
@@ -3422,6 +3423,41 @@ def end_strays_selftest(bad):
     return n
 
 
+def busy_has(got, text):
+    """Whether a classify() result's reasons carry `text`, bare or as the first reason of a finished row."""
+    return text in got[1] or "marked finished, but " + text in got[1]
+
+
+def report_fit_cases(bad):
+    """fit_reasons and the report row it feeds. Returns the number of cases run."""
+    n = 0
+    a = ["marked finished, but 1 tool shell(s) running under claude (Bash/Monitor/background task)",
+         "last assistant turn has a tool call with no result", "8 stray wait loop(s) " + "x" * 60,
+         "last turn activity 1m ago (< 15m idle floor)"]
+    got = fit_reasons(a)
+    n += 1
+    if len(got) > 200 or not got.endswith(" (+2 more)") or not got.startswith("; ".join(a[:2])) or \
+            "8 stray" in got:
+        bad.append(f"fit_reasons over >200 chars: {got!r}")
+    one = "word " * 60
+    got = fit_reasons([one])
+    n += 1
+    if len(got) > 200 or not got.endswith("\u2026") or one[:len(got) - 1].rstrip() != got[:-1] or \
+            one[len(got) - 1] != " ":
+        bad.append(f"fit_reasons over one 300-char reason: {got!r}")
+    n += 1
+    if fit_reasons(["a", "b"]) != "a; b" or fit_reasons([]) != "":
+        bad.append("fit_reasons changed a short row")
+    n += 1
+    row = {"terminalId": "t0000001", "tab": "t", "account": "a", "name": "n", "verdict": "BUSY", "reasons": a}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print_report([row], [])
+    if json.loads(json.dumps(row))["reasons"] != a or "(+2 more)" not in out.getvalue():
+        bad.append(f"report row or --json reasons wrong: {out.getvalue()!r}")
+    return n
+
+
 def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
     """The stray-wait-loop classifier on synthetic process tables (nothing live is
     read). Returns the number of cases run."""
@@ -3712,9 +3748,19 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                                    f"zero shells -> {zero}, want {want}")
                 got = verdict(mix, marked, {})
                 shell_reason = "1 tool shell(s) running under claude (Bash/Monitor/background task)"
-                if got[0] != "BUSY" or got[1][:2] != ["marked finished, but", shell_reason] or \
+                if got[0] != "BUSY" or got[1][0] != "marked finished, but " + shell_reason or \
                         got[1][-1] != "8 stray wait loop(s)":
                     bad.append(f"stray + cargo test on a finished row -> {got}")
+                # A finished row held by the idle floor: the lead-in joins the first reason, never stands alone.
+                n += 1
+                tx["last_activity"] = now_ms - 60e3
+                try:
+                    got = verdict(base, marked, {})
+                finally:
+                    tx["last_activity"] = now_ms - 31 * 3600e3
+                if got[0] != "BUSY" or not got[1][0].startswith("marked finished, but last turn activity") or \
+                        "but;" in "; ".join(got[1]):
+                    bad.append(f"finished row held by the idle floor -> {got}")
                 got = verdict(live, marked, {})
                 if got[0] != "BUSY" or "waits on live pid 800 (self-matching loop: will never exit on its own)" \
                         not in got[1]:
@@ -3728,7 +3774,7 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                     bad.append(f"record_shell with only strays under claude must not hold the row: {got}")
                 for label, table in (("work beside the strays", mix), ("no shell seen", base)):
                     got = verdict(table, marked, shell_veto)
-                    if got[0] != "BUSY" or veto_text not in got[1]:
+                    if got[0] != "BUSY" or not busy_has(got, veto_text):
                         bad.append(f"record_shell with {label} must still veto: {got}")
                 # A job that exec'd away the snapshot argv is a shell to the record, not to proc_facts.
                 tick = os.sysconf("SC_CLK_TCK")
@@ -3736,7 +3782,7 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 job = dict(d2)
                 job[900] = (21033, ["python3", "long_job.py"])
                 got = verdict(job, marked, shell_veto, tasks={900: "bjob"}, start=boot)
-                if got[0] != "BUSY" or veto_text not in got[1]:
+                if got[0] != "BUSY" or not busy_has(got, veto_text):
                     bad.append(f"record_shell with an exec'd job beside the strays must still veto: {got}")
                 got = verdict(job, marked, shell_veto, start=boot)  # the same process, no task file: an MCP server
                 if got[0] != "FINISHED":
@@ -3745,13 +3791,13 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 for label, start in (("started late", {21033: 1000, 900: 1000 + (SESSION_START_CHILD_S + 1) * tick}),
                                      ("with an unreadable start", {21033: 1000})):
                     got = verdict(job, marked, shell_veto, start=start)
-                    if got[0] != "BUSY" or veto_text not in got[1]:
+                    if got[0] != "BUSY" or not busy_has(got, veto_text):
                         bad.append(f"record_shell with a child {label} beside the strays must still veto: {got}")
                 for argv in (["bash", "-l"], ["claude", "-p", "go"]):  # exec'd into what proc_facts files elsewhere
                     held = dict(d2)
                     held[901] = (21033, argv)
                     got = verdict(held, marked, shell_veto, tasks={901: "bjob"}, start=boot)
-                    if got[0] != "BUSY" or veto_text not in got[1]:
+                    if got[0] != "BUSY" or not busy_has(got, veto_text):
                         bad.append(f"record_shell with an exec'd {argv[0]} beside the strays must still veto: {got}")
                 def link(target=None, exc=None):
                     def readlink(path):
@@ -3768,13 +3814,13 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 tx["last_activity"] = None
                 got = verdict(d2, marked, shell_veto)
                 tx["last_activity"] = now_ms - 31 * 3600e3
-                if got[0] != "BUSY" or veto_text not in got[1]:
+                if got[0] != "BUSY" or not busy_has(got, veto_text):
                     bad.append(f"record_shell with no readable message time must still veto: {got}")
                 got = verdict(d2, marked, shell_veto, tasks={445647: "bloop"})  # a loop's own sleep inherits fd 1
                 if got[0] != "FINISHED":
                     bad.append(f"a stray's own sleep must not read as an unseen task: {got}")
                 got = verdict(d2, marked, {"s": {"windDown": {"reason": "record_busy"}}})
-                if got[0] != "BUSY" or WIND_DOWN_VETO["record_busy"] not in got[1]:
+                if got[0] != "BUSY" or not busy_has(got, WIND_DOWN_VETO["record_busy"]):
                     bad.append(f"only record_shell gives way to strays, not record_busy: {got}")
                 # The report names each stray: what a --close of that row would end.
                 saved_screen = {k: globals()[k] for k in ("terminals", "open_rows", "page_names", "proc_table",
@@ -6945,7 +6991,7 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
     coord_finished = rp.get("sessionStatus") == "finished"
     if busy:
         if finished or coord_finished:
-            busy.insert(0, "marked finished, but")
+            busy[0] = "marked finished, but " + busy[0]
         return "BUSY", busy
 
     if LIMIT_RE.search(tx["final_text"][-300:]):
@@ -7083,6 +7129,37 @@ ORDER = ["FINISHED", "EXITED-FINISHED", "CUSTODY", "CLOSEOUT", "FOOTER-FINISHED"
          "FOOTER-ONLY", "BUSY", "LIMITED", "ACTIVE", "EXITED", "UNKNOWN", "SHELL", "SELF"]
 
 
+def fit_reasons(reasons, width=200):
+    """The reasons joined with "; " for a one-line report row, never cut mid-reason. Whole reasons are
+    kept while they fit; when later ones are dropped the line ends " (+N more)" inside `width`. A first
+    reason alone longer than `width` is cut at the last space and ends with "…". Display only: --json
+    keeps every reason."""
+    reasons = [str(r) for r in reasons]
+    full = "; ".join(reasons)
+    if len(full) <= width:
+        return full
+    kept = []
+    for i, r in enumerate(reasons):
+        tail = f" (+{len(reasons) - i - 1} more)" if i < len(reasons) - 1 else ""
+        # the line this prefix would print if it were the last one kept
+        cand = "; ".join(kept + [r])
+        left = len(reasons) - len(kept) - 1
+        if len(cand) + (len(f" (+{left} more)") if left else 0) > width:
+            break
+        kept.append(r)
+    if not kept:
+        first, mark = reasons[0], "\u2026"
+        if len(reasons) > 1:
+            mark = "\u2026" + f" (+{len(reasons) - 1} more)"
+        room = max(width - len(mark), 1)
+        cut = first[:room]
+        if len(first) > room:
+            sp = cut.rfind(" ")
+            cut = cut[:sp] if sp > 0 else cut
+        return cut.rstrip() + mark
+    return "; ".join(kept) + f" (+{len(reasons) - len(kept)} more)"
+
+
 def print_report(res, warnings):
     for w in warnings:
         print("WARNING: " + w)
@@ -7095,7 +7172,7 @@ def print_report(res, warnings):
             cur = r["verdict"]
             print(f"\n== {cur}")
         print(f"  {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['account']:<13.13}  {r['name'][:60]}")
-        print(f"            - {'; '.join(r['reasons'])[:200]}")
+        print(f"            - {fit_reasons(r['reasons'])}")
         for s in r.get("strays") or []:  # what a --close of this row would end if it outlives the pane
             print(f"            - stray pid {s['pid']} ({s['class']}): {s['why'][:160]}")
     print_stranded(res)

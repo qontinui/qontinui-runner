@@ -224,7 +224,7 @@ pub async fn execute_htn_attempt(
     let workspace_root = crate::workspace_paths::require_workspace_root();
     if let Err(why) = &workspace_root {
         warn!(
-            "HTN: no Qontinui workspace root resolved, so neither qontinui/src nor \
+            "HTN: neither qontinui/src nor \
              multistate/src was added to PYTHONPATH — the planner will see only what \
              is already installed for this interpreter. {why}"
         );

@@ -6680,6 +6680,7 @@ dependencies = [
  "reqwest 0.13.2",
  "restate-sdk",
  "rustls",
+ "same-file",
  "schemars 1.2.1",
  "scopeguard",
  "semver",
