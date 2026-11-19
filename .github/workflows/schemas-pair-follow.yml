@@ -18,7 +18,7 @@ name: schemas pair-follow
 #            label. It only dispatches this workflow from main with GITHUB_TOKEN.
 #            It never runs PR code and never holds the PAT.
 #   plan     schedule/dispatch, main's code. Scans both declaration forms and
-#            decides FOLLOW / SKIP / UNKNOWN for each candidate. It reads four
+#            decides FOLLOW / SKIP / UNKNOWN / TRANSIENT for each candidate. It reads four
 #            coord claims and never touches a PR with a live claim.
 #   compute  UNPRIVILEGED (contents: read, no secrets, no cache actions). Merges
 #            main into the PR head, moves the pin, refreshes Cargo.lock, and uploads
@@ -35,7 +35,10 @@ name: schemas pair-follow
 #            claims, then pushes with --force-with-lease on the head it built on
 #            (PAT). Then it comments.
 #   verdict  Red on any UNKNOWN or failed leg. A refusal is a named SKIP; an
-#            unanswerable read is never "nothing to do".
+#            unanswerable read is never "nothing to do". A TRANSIENT (GitHub
+#            still answering 5xx / 429 / a timeout after the script's retries) is
+#            a WARNING, not red: the next 30-min tick re-scans from scratch, and
+#            a lone 502 had turned main red twice in ~30h (finding ed052f9c).
 #
 # KILL SWITCH: repository variable SCHEMAS_PAIR_FOLLOW=off. Unset = on.
 
@@ -120,6 +123,8 @@ jobs:
     outputs:
       followups: ${{ steps.decide.outputs.followups }}
       unknowns: ${{ steps.decide.outputs.unknowns }}
+      transients: ${{ steps.decide.outputs.transients }}
+      scan_transient: ${{ steps.decide.outputs.scan_transient }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -142,7 +147,25 @@ jobs:
               { echo "::error::inputs pr and partner must both be numbers"; exit 1; }
             cands="$INPUT_PR $INPUT_PARTNER"
           else
-            cands="$(bash scripts/schemas-pair-follow.sh scan)"
+            # Exit 75 = TRANSIENT: GitHub still failed after the script's retries,
+            # so no candidate list exists. That is reported, not red; any other
+            # non-zero (3 = UNKNOWN) still fails this step.
+            scan_rc=0
+            cands="$(bash scripts/schemas-pair-follow.sh scan)" || scan_rc=$?
+            if [ "$scan_rc" -eq 75 ]; then
+              echo "::warning::scan: GitHub did not answer after retries (TRANSIENT); nothing was decided this run — the next schedule tick re-scans"
+              {
+                echo "### schemas pair-follow decisions"
+                echo ""
+                echo "**TRANSIENT:** the scan's GitHub reads still failed with a 5xx / 429 / timeout after retries, so no candidate was decided this run. This is not a red; the next schedule tick re-scans from scratch."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "followups=[]" >> "$GITHUB_OUTPUT"
+              echo "unknowns=0" >> "$GITHUB_OUTPUT"
+              echo "transients=0" >> "$GITHUB_OUTPUT"
+              echo "scan_transient=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$scan_rc" -eq 0 ] || exit "$scan_rc"
           fi
           results='[]'
           while read -r m n; do
@@ -160,8 +183,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           followups="$(jq -c '[.[] | select(.action == "FOLLOW")]' <<<"$results")"
           unknowns="$(jq '[.[] | select(.action == "UNKNOWN")] | length' <<<"$results")"
+          transients="$(jq '[.[] | select(.action == "TRANSIENT")] | length' <<<"$results")"
           echo "followups=$followups" >> "$GITHUB_OUTPUT"
           echo "unknowns=$unknowns" >> "$GITHUB_OUTPUT"
+          echo "transients=$transients" >> "$GITHUB_OUTPUT"
+          echo "scan_transient=false" >> "$GITHUB_OUTPUT"
 
   compute:
     name: "Build the pair-follow commits (unprivileged) #${{ matrix.item.pr }}"
@@ -312,19 +338,38 @@ jobs:
     runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMAS_PAIR_FOLLOW || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
-      - name: Red on UNKNOWN or a failed leg
+      - name: Red on UNKNOWN or a failed leg; warn on TRANSIENT
         env:
           PLAN: ${{ needs.plan.result }}
           COMPUTE: ${{ needs.compute.result }}
           PUSH: ${{ needs.push.result }}
           UNKNOWNS: ${{ needs.plan.outputs.unknowns }}
+          TRANSIENTS: ${{ needs.plan.outputs.transients }}
+          SCAN_TRANSIENT: ${{ needs.plan.outputs.scan_transient }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "plan=$PLAN compute=$COMPUTE push=$PUSH unknowns=${UNKNOWNS:-?}"
+          echo "plan=$PLAN compute=$COMPUTE push=$PUSH unknowns=${UNKNOWNS:-?} transients=${TRANSIENTS:-?} scan_transient=${SCAN_TRANSIENT:-?}"
           [ "$PLAN" = "success" ] || { echo "::error::plan did not succeed"; exit 1; }
           [ "${UNKNOWNS:-0}" = "0" ] || { echo "::error::$UNKNOWNS candidate(s) decided UNKNOWN — see the plan job"; exit 1; }
           for r in "$COMPUTE" "$PUSH"; do
             [ "$r" = "failure" ] && { echo "::error::a compute or push leg failed"; exit 1; }
           done
+          # TRANSIENT is not red: GitHub kept failing (5xx / 429 / timeout) after
+          # the script's retries, which says nothing about any candidate, and the
+          # next tick re-scans. Say so plainly rather than passing silently.
+          msg=""
+          if [ "${SCAN_TRANSIENT:-false}" = "true" ]; then
+            msg="the scan hit a transient GitHub error after retries, so NO candidate was decided this run"
+          elif [ "${TRANSIENTS:-0}" != "0" ]; then
+            msg="$TRANSIENTS candidate(s) were left undecided by a transient GitHub error after retries"
+          fi
+          if [ -n "$msg" ]; then
+            echo "::warning::TRANSIENT — $msg. Not red; the next schedule tick retries. See the plan job."
+            {
+              echo "### schemas pair-follow verdict: green with a TRANSIENT warning"
+              echo ""
+              echo "TRANSIENT — $msg. This run is **not** red because the failure was GitHub's, not a candidate's; the next schedule tick re-scans. A real UNKNOWN or a failed leg would still be red."
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
           exit 0
