@@ -113,3 +113,58 @@ describe("ClaudeCliSection under a fleet account-selection policy", () => {
     expect(html).not.toContain("account-selection-fleet-unread");
   });
 });
+
+/**
+ * The usage-limit reset-continue toggle (plan 2026-11-05 Phase 2). It is not
+ * a migration setting, so a single-account runner shows it too, while the
+ * two migration toggles stay behind the two-account check.
+ */
+describe("ClaudeCliSection — continue after a limit reset", () => {
+  function renderWith(dirs: string[], cont: boolean | undefined) {
+    const settings: AiSettings = {
+      ...DEFAULT_AI_SETTINGS,
+      claude_cli: {
+        ...DEFAULT_AI_SETTINGS.claude_cli,
+        auto_continue_after_limit_reset: cont,
+      },
+    };
+    return renderToStaticMarkup(
+      <ClaudeCliSection
+        settings={settings}
+        setSettings={() => {}}
+        onLog={() => {}}
+        cliAuth={null}
+        refreshingAuth={false}
+        onRefreshAuth={() => {}}
+        onCheckAuth={() => {}}
+        claudeConfigDirs={dirs}
+        setClaudeConfigDirs={() => {}}
+        accountUsages={[]}
+        setAccountUsages={() => {}}
+      />,
+    );
+  }
+
+  /** The `<input>` tag carrying the toggle's test id. */
+  function toggleTag(html: string): string {
+    const tag = html.match(/<input[^>]*data-testid="auto-continue-after-limit-reset"[^>]*>/);
+    expect(tag).not.toBeNull();
+    return tag![0];
+  }
+
+  it("is shown on a single-account runner, without the migration toggles", () => {
+    const html = renderWith([DIRS[0]], undefined);
+    expect(html).toContain("Continue sessions after a limit reset");
+    expect(html).not.toContain("Auto-migrate exhausted sessions");
+  });
+
+  it("is on by default and beside the migration toggles with two accounts", () => {
+    const html = renderWith(DIRS, undefined);
+    expect(toggleTag(html)).toContain("checked");
+    expect(html).toContain("Auto-migrate exhausted sessions");
+  });
+
+  it("reflects an explicit off", () => {
+    expect(toggleTag(renderWith(DIRS, false))).not.toContain("checked");
+  });
+});

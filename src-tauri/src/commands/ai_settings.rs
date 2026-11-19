@@ -145,6 +145,7 @@ pub fn save_ai_settings(
     interactive_sessions_enabled: Option<bool>,
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
+    auto_continue_after_limit_reset: Option<bool>,
     account_selection_pinned: Option<bool>,
     runner_manages_cli_updates: Option<bool>,
 ) -> Result<CommandResponse, String> {
@@ -203,6 +204,8 @@ pub fn save_ai_settings(
                 ),
                 auto_continue_after_migration: auto_continue_after_migration
                     .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
+                auto_continue_after_limit_reset: auto_continue_after_limit_reset
+                    .unwrap_or(existing_settings.claude_cli.auto_continue_after_limit_reset),
                 // `None` (an older frontend) preserves the configured value.
                 runner_manages_cli_updates: runner_manages_cli_updates
                     .unwrap_or(existing_settings.claude_cli.runner_manages_cli_updates),
@@ -1528,7 +1531,7 @@ pub(crate) const EXHAUSTION_UTILIZATION: f64 = 0.99;
 /// window; the header probe leaves it `None`). The session-window arm is what
 /// lets a "5-hour limit reached" migration hint confirm — the weekly number
 /// alone stays low when only the session window is exhausted.
-fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
+pub(crate) fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
     if info.error.is_some() || info.utilization >= EXHAUSTION_UTILIZATION {
         return true;
     }
