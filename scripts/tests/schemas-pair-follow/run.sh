@@ -227,6 +227,35 @@ setup_base withdrawn
 gh_fx "repos/$R/issues/100/events?per_page=100" '[{"event":"labeled","label":{"name":"coord:downstream-of=qontinui-schemas#50"}},{"event":"unlabeled","actor":{"login":"an-author"},"label":{"name":"coord:downstream-of=qontinui-schemas#50"}}]'
 expect_decide "label withdrawn by the author (not a coord strip) -> SKIP" SKIP no-declaration
 
+# TRANSIENT (finding ed052f9c): a read that ran out of retries on a 5xx /
+# timeout / 429 is TRANSIENT, not UNKNOWN — GitHub did not answer. __TRN__ is
+# gh_get's post-retry transient outcome; the retry loop itself is exercised
+# against a stubbed `gh` further down.
+setup_base trnevents
+gh_fx "repos/$R/issues/100/events?per_page=100" "__TRN__"
+expect_decide "events read transient after retries -> TRANSIENT (not UNKNOWN)" TRANSIENT "GitHub transient: read $R#100 events"
+
+setup_base trncompare
+gh_fx "repos/$SC/compare/$A...$OLD" "__TRN__"
+expect_decide "compare transient (through contains' rc 3) -> TRANSIENT" TRANSIENT "GitHub transient:"
+
+setup_base trnland
+gh_fx "repos/$SC/issues/50/comments?per_page=100" "__TRN__"
+expect_decide "land-comment read transient (through land_commit) -> TRANSIENT" TRANSIENT "GitHub transient: land-commit-unresolvable"
+
+setup_base trnmain
+gh_fx "repos/$R/commits/main" "__TRN__"
+expect_decide "runner main read transient (piped read) -> TRANSIENT" TRANSIENT "GitHub transient:"
+
+setup_base trnconf
+gh_fx "repos/$R/contents/.github/sibling-pins.conf?ref=$HEAD" "__TRN__"
+expect_decide "PR head conf read transient (rc through conf_at) -> TRANSIENT" TRANSIENT "GitHub transient:"
+
+# A genuine UNKNOWN stays UNKNOWN: every read succeeded, the state is undecidable.
+setup_base unkcompare
+gh_fx "repos/$SC/compare/$A...$OLD" '{"status":"weird"}'
+expect_decide "compare answered an unrecognised status (reads succeeded) -> still UNKNOWN" UNKNOWN "containment"
+
 echo "# scan"
 new_fx scan
 gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" '[{"number":100,"created_at":"2026-09-01T00:00:00Z","labels":[]},{"number":101,"created_at":"2026-09-05T00:00:00Z","labels":[{"name":"coord:downstream-of=qontinui/qontinui-schemas#60"}]},{"number":102,"created_at":"2026-09-06T00:00:00Z","labels":[]},{"number":103,"created_at":"2026-09-06T00:00:00Z","labels":[]}]'
@@ -240,7 +269,15 @@ got="$(SPF_FIXTURES="$FX" bash "$SUT" scan 2>"$FX/stderr" | tr '\n' ';')"
 got="$(SPF_FIXTURES="$FX" SPF_KILL_SWITCH=off bash "$SUT" scan 2>/dev/null | tr '\n' ';')"
 [ -z "$got" ] && ok "scan: kill switch -> no candidates" || bad "scan kill switch" "got '$got'"
 gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" "__ERR__"
-if SPF_FIXTURES="$FX" bash "$SUT" scan >/dev/null 2>&1; then bad "scan: unreadable PR list must fail (UNKNOWN)"; else ok "scan: unreadable PR list fails red"; fi
+rc=0; SPF_FIXTURES="$FX" bash "$SUT" scan >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 3 ] && ok "scan: unreadable PR list (non-transient) fails red, exit 3" || bad "scan: unreadable PR list must exit 3" "rc=$rc"
+gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" "__TRN__"
+rc=0; SPF_FIXTURES="$FX" bash "$SUT" scan >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 75 ] && ok "scan: PR list transient after retries -> exit 75 (TRANSIENT)" || bad "scan: transient PR list must exit 75" "rc=$rc"
+gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" '[{"number":100,"created_at":"2026-09-01T00:00:00Z","labels":[]}]'
+gh_fx "repos/$R/issues/100/events?per_page=100" "__TRN__"
+rc=0; SPF_FIXTURES="$FX" bash "$SUT" scan >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 75 ] && ok "scan: per-PR events transient (inside the piped group) -> exit 75" || bad "scan: transient events must exit 75" "rc=$rc"
 
 # A page of open PRs BIGGER THAN MAX_ARG_STRLEN (128 KiB). The accumulator used
 # `jq --argjson c "$chunk"`, which hands the page to execve as ONE argument —
@@ -519,6 +556,108 @@ if SPF_FIXTURES="$FX" SPF_FETCH_URL="file://$G/remote.git" SPF_FETCH_FILTER="" S
 else
   grep -q CLORINDE_AUTOCOMMIT_TOKEN "$FX/stderr" && ok "push: no PAT for an https remote -> red, naming CLORINDE_AUTOCOMMIT_TOKEN" || bad "no-PAT message" "$(cat "$FX/stderr")"
 fi
+
+echo "# gh retry (stubbed gh on PATH, the real gh_get path — no SPF_FIXTURES)"
+# The stub answers each `gh api <path>` from $STUB/<fxname path>.seq: line N is
+# the Nth call's outcome — ok (print .body), 502, 503, 429, rl403 (a secondary
+# rate-limit 403), timeout, 404 or 422. Calls are logged to $STUB/calls.log.
+STUB="$TMP/ghstub"
+mkdir -p "$STUB/bin"
+cat >"$STUB/bin/gh" <<'GH'
+#!/usr/bin/env bash
+[ "$1" = api ] || { echo "stub gh: only 'api' is stubbed" >&2; exit 2; }
+p="$2"
+f="$STUB_DIR/$(printf '%s' "$p" | sed 's#[^A-Za-z0-9._-]#_#g')"
+echo "$p" >>"$STUB_DIR/calls.log"
+n=$(( $(cat "$f.n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$f.n"
+o="$(sed -n "${n}p" "$f.seq" 2>/dev/null)"; [ -n "$o" ] || o="$(tail -n1 "$f.seq" 2>/dev/null)"
+case "$o" in
+  ok) cat "$f.body"; exit 0 ;;
+  502) echo "gh: Server Error (HTTP 502)" >&2 ;;
+  503) echo "gh: Service Unavailable (HTTP 503)" >&2 ;;
+  429) echo "gh: Too Many Requests (HTTP 429)" >&2 ;;
+  rl403) echo "gh: You have exceeded a secondary rate limit. (HTTP 403)" >&2 ;;
+  timeout) echo "Get \"https://api.github.com/$p\": net/http: TLS handshake timeout" >&2 ;;
+  404) echo "gh: Not Found (HTTP 404)" >&2 ;;
+  422) echo "gh: Validation Failed (HTTP 422)" >&2 ;;
+  *) echo "stub gh: no outcome for $p" >&2 ;;
+esac
+exit 1
+GH
+chmod +x "$STUB/bin/gh"
+stub_reset() { rm -f "$STUB"/*.seq "$STUB"/*.body "$STUB"/*.n "$STUB/calls.log"; }
+stub() { # path "outcome outcome ..." [body]
+  local f; f="$STUB/$(fxname "$1")"
+  tr ' ' '\n' <<<"$2" >"$f.seq"
+  [ -n "${3:-}" ] && printf '%s' "$3" >"$f.body"
+  return 0
+}
+calls_to() { grep -cxF "$1" "$STUB/calls.log" 2>/dev/null || true; }
+stub_decide() { # name action reason-prefix
+  local out act rsn
+  out="$(PATH="$STUB/bin:$PATH" STUB_DIR="$STUB" SPF_GH_BACKOFF_SECS=0 bash "$SUT" decide 100 50 2>"$STUB/stderr")"
+  act="$(jq -r .action <<<"$out" 2>/dev/null)"; rsn="$(jq -r .reason <<<"$out" 2>/dev/null)"
+  if [ "$act" = "$2" ] && [[ "$rsn" == "$3"* ]]; then ok "$1"; else bad "$1" "want $2/$3* got action=$act reason=$rsn; stderr: $(tr '\n' ' ' <"$STUB/stderr")"; fi
+}
+EV="repos/$R/issues/100/events?per_page=100"
+# No label on either side, so decide's FOURTH read is the events read: an empty
+# event list ends it as SKIP no-declaration with no claim or coord read.
+stub_base() {
+  stub_reset
+  stub "repos/$SC/pulls/50" ok '{"number":50,"state":"closed","merged_at":null,"base":{"ref":"main"},"labels":[{"name":"coord:landed"}]}'
+  stub "repos/$R/pulls/100" ok '{"number":100,"state":"open","base":{"ref":"main"},"labels":[]}'
+}
+
+stub_base; stub "$EV" "502 ok" '[]'
+stub_decide "one 502 then success -> retried, decided normally (SKIP no-declaration)" SKIP no-declaration
+[ "$(calls_to "$EV")" = 2 ] && ok "  ...events read called exactly twice" || bad "  ...events read call count" "$(calls_to "$EV")"
+
+stub_base; stub "$EV" "timeout 429 ok" '[]'
+stub_decide "timeout, then 429, then success -> decided normally" SKIP no-declaration
+
+stub_base; stub "$EV" "rl403 ok" '[]'
+stub_decide "secondary-rate-limit 403 then success -> retried" SKIP no-declaration
+
+stub_base; stub "$EV" "502 503 502 ok" '[]'
+stub_decide "5xx on all 3 attempts -> TRANSIENT (not UNKNOWN)" TRANSIENT "GitHub transient: read $R#100 events"
+[ "$(calls_to "$EV")" = 3 ] && ok "  ...bounded at SPF_GH_ATTEMPTS=3 (no 4th call)" || bad "  ...attempt bound" "calls=$(calls_to "$EV")"
+grep -q 'failed TRANSIENTLY after 3 attempt' "$STUB/stderr" && ok "  ...the log names the exhausted retries" || bad "  ...exhausted-retry log line" "$(cat "$STUB/stderr")"
+
+stub_base; stub "$EV" "422 ok" '[]'
+stub_decide "422 is never retried -> UNKNOWN (red)" UNKNOWN "read $R#100 events"
+[ "$(calls_to "$EV")" = 1 ] && ok "  ...422 called once" || bad "  ...422 retried" "calls=$(calls_to "$EV")"
+
+stub_base; stub "repos/$R/pulls/100" "404"
+stub_decide "404 is never retried -> UNKNOWN (red)" UNKNOWN "read $R#100"
+[ "$(calls_to "repos/$R/pulls/100")" = 1 ] && ok "  ...404 called once" || bad "  ...404 retried" "calls=$(calls_to "repos/$R/pulls/100")"
+
+stub_reset
+stub "repos/$R/pulls?state=open&per_page=100&page=1" "502 502 502"
+rc=0; PATH="$STUB/bin:$PATH" STUB_DIR="$STUB" SPF_GH_BACKOFF_SECS=0 bash "$SUT" scan >/dev/null 2>"$STUB/stderr" || rc=$?
+[ "$rc" -eq 75 ] && ok "scan: PR list 502 x3 -> exit 75 TRANSIENT" || bad "scan transient exit" "rc=$rc; $(cat "$STUB/stderr")"
+stub_reset
+stub "repos/$R/pulls?state=open&per_page=100&page=1" "502 ok" '[]'
+rc=0; PATH="$STUB/bin:$PATH" STUB_DIR="$STUB" SPF_GH_BACKOFF_SECS=0 bash "$SUT" scan >/dev/null 2>"$STUB/stderr" || rc=$?
+[ "$rc" -eq 0 ] && ok "scan: PR list 502 then ok -> exit 0" || bad "scan retry-then-ok" "rc=$rc; $(cat "$STUB/stderr")"
+
+echo "# verdict job (the workflow's own step script)"
+VERDICT="$TMP/verdict.sh"
+python3 - "$HERE/../../../.github/workflows/schemas-pair-follow.yml" "$VERDICT" <<'PY'
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+open(sys.argv[2], 'w').write(wf['jobs']['verdict']['steps'][0]['run'])
+PY
+verdict() { # name want-rc want-grep PLAN UNKNOWNS TRANSIENTS SCAN_TRANSIENT [COMPUTE]
+  local out rc=0
+  out="$(PLAN="$4" UNKNOWNS="$5" TRANSIENTS="$6" SCAN_TRANSIENT="$7" COMPUTE="${8:-skipped}" PUSH=skipped GITHUB_STEP_SUMMARY="$TMP/summary.md" bash "$VERDICT" 2>&1)" || rc=$?
+  if [ "$rc" = "$2" ] && grep -q -- "$3" <<<"$out"; then ok "$1"; else bad "$1" "rc=$rc want $2; out: $(tr '\n' ' ' <<<"$out")"; fi
+}
+verdict "all clear -> green" 0 "plan=success" success 0 0 false
+verdict "one TRANSIENT decide -> green with a warning" 0 "::warning::TRANSIENT — 1 candidate" success 0 1 false
+verdict "scan TRANSIENT -> green with a warning naming that nothing was decided" 0 "NO candidate was decided" success 0 0 true
+verdict "an UNKNOWN beside a TRANSIENT -> still red" 1 "decided UNKNOWN" success 1 1 false
+verdict "plan failed -> red" 1 "plan did not succeed" failure "" "" ""
+verdict "TRANSIENT does not mask a failed compute leg -> red" 1 "compute or push leg failed" success 0 1 false failure
 
 printf '\n%d passed, %d failed\n' "$passes" "$fails"
 [ "$fails" -eq 0 ]
