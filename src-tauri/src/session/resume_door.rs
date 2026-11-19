@@ -698,10 +698,13 @@ async fn resume_one(
     let spawn = {
         let (app, tm, registry, cand) = (app.clone(), tm.clone(), registry.clone(), cand.clone());
         tokio::task::spawn_blocking(move || {
-            let model_transcript = crate::terminal::transcript::session_transcript_path(
-                Path::new(&cand.config_dir),
-                &cand.working_dir,
-                &cand.id,
+            // Already on the blocking pool, so the blocking sniff runs here.
+            let model = crate::terminal::account_migration::transcript_last_model(
+                &crate::terminal::transcript::session_transcript_path(
+                    Path::new(&cand.config_dir),
+                    &cand.working_dir,
+                    &cand.id,
+                ),
             );
             crate::terminal::account_migration::spawn_resumed_pane(
                 &app,
@@ -711,7 +714,7 @@ async fn resume_one(
                     claude_bin,
                     claude_session_id: &cand.id,
                     working_dir: &cand.working_dir,
-                    model_transcript,
+                    model,
                     config_dir: &cand.config_dir,
                     title: cand.title.clone(),
                     page_id: cand.page_id.clone(),

@@ -642,7 +642,7 @@ fn settle_hint_migration(
 /// most recent assistant turn (`.message.model`). `None` when the transcript
 /// is unreadable or records no real model (synthetic error turns are
 /// skipped) — the respawn then omits `--model` and the CLI default applies.
-fn transcript_last_model(path: &Path) -> Option<String> {
+pub(crate) fn transcript_last_model(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     for line in content.lines().rev() {
         // Cheap pre-filter before parsing multi-KB JSONL lines.
@@ -1099,10 +1099,14 @@ pub(crate) struct ResumeSpawn<'a> {
     /// The session's working dir — both the PTY cwd and the transcript
     /// resolver's project path.
     pub working_dir: &'a str,
-    /// Transcript to sniff the session's last real model from, so `--resume`
-    /// does not silently drop to the target account's default model. A missing
-    /// or unreadable file simply omits `--model`.
-    pub model_transcript: std::path::PathBuf,
+    /// The session's last real model, sniffed by the CALLER off the source
+    /// transcript ([`transcript_last_model`] on the blocking pool, or
+    /// [`sniff_transcript_model`] from an async worker), so `--resume` does not
+    /// silently drop to the target account's default model. `None` (a missing
+    /// or unreadable transcript) omits `--model`. Sniffed by the caller, not
+    /// here, because this seam runs inline on an async worker and the sniff is
+    /// a blocking whole-file read.
+    pub model: Option<String>,
     /// `CLAUDE_CONFIG_DIR` for the new PTY — the TARGET account's dir. It also
     /// keeps the durable restore record consistent (the record stores the dir
     /// the session actually launched under).
@@ -1139,6 +1143,20 @@ pub(crate) struct ResumeSpawn<'a> {
     pub origin: crate::coord_drain_state::SpawnOrigin,
 }
 
+/// [`transcript_last_model`] off the async worker. It reads the WHOLE
+/// transcript with blocking `std::fs` I/O, which must not stall a tokio worker
+/// (a long session's transcript runs to megabytes). Only the read goes to the
+/// blocking pool, never the PTY spawn: a read orphaned by a cancelled caller
+/// creates nothing, while a spawn orphaned the same way would create a pane the
+/// respawn's close hold never learns about. A join failure reads as no model,
+/// which omits `--model` exactly as an unreadable transcript does.
+pub(crate) async fn sniff_transcript_model(path: std::path::PathBuf) -> Option<String> {
+    tokio::task::spawn_blocking(move || transcript_last_model(&path))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Spawn `claude --permission-mode bypassPermissions [--model m] --resume <sid>`
 /// in a fresh PTY pinned to `spec.config_dir`, tracked in the lifecycle store
 /// and mirrored into coord. Returns `(terminal_id, coord_session_id)`.
@@ -1159,7 +1177,7 @@ pub(crate) fn spawn_resumed_pane(
     session_registry: &std::sync::Arc<crate::session::SessionRegistry>,
     spec: ResumeSpawn<'_>,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
-    let model = transcript_last_model(&spec.model_transcript);
+    let model = spec.model;
     // Compose the respawn argv through the shared launch seam so the operator's
     // global + per-account (destination) launch flags layer onto the required
     // resume flags. `permission = BypassPermissions` preserves today's emitted
@@ -1608,6 +1626,16 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
             &crate::claude_cli_spawn::RESUME_RESOLVE_DELAYS,
         )
         .await?;
+        // Model is sniffed off the SOURCE transcript: `--resume` alone
+        // restores the conversation but the model falls back to the target
+        // account's default. The read is blocking I/O, so it goes to the
+        // blocking pool; the spawn below stays inline.
+        let model = sniff_transcript_model(super::transcript::session_transcript_path(
+            Path::new(self.src_config_dir),
+            self.working_dir,
+            &self.record.claude_session_id,
+        ))
+        .await;
         // The seam is synchronous and runs here, on the async worker, NOT on
         // the blocking pool: a spawn handed to `spawn_blocking` keeps running
         // when this future is cancelled (task abort, shutdown), and would
@@ -1623,14 +1651,7 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
                 claude_bin,
                 claude_session_id: &self.record.claude_session_id,
                 working_dir: self.working_dir,
-                // Model is sniffed off the SOURCE transcript: `--resume` alone
-                // restores the conversation but the model falls back to the
-                // target account's default.
-                model_transcript: super::transcript::session_transcript_path(
-                    Path::new(self.src_config_dir),
-                    self.working_dir,
-                    &self.record.claude_session_id,
-                ),
+                model,
                 config_dir: self.dst_config_dir,
                 title: self.title.clone(),
                 page_id: self.record.page_id.clone(),
