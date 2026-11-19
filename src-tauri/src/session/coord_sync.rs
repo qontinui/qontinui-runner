@@ -2085,8 +2085,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             let inner = inner.clone();
             let abort = abort.clone();
             async move {
+                let kinds_dbg: Vec<String> = chain.iter().map(|r| format!("{}#{}", r.event_kind, r.seq)).collect();
                 let mut out = push_chain(inner, chain, session_attempts, abort, trip_abort).await;
                 out.keepalive = keepalive;
+                eprintln!("DBGFLAKE keepalive={keepalive} chain={kinds_dbg:?} aborted={} succeeded={:?} blocked={:?} t={:?}", out.aborted, out.succeeded.iter().map(|k| k.1).collect::<Vec<_>>(), out.blocked_on.as_deref().map(|e| e.chars().take(80).collect::<String>()), std::time::Instant::now());
                 out
             }
         }))
