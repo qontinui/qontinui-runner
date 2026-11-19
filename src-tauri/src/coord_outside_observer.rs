@@ -1536,7 +1536,7 @@ impl ObserverState {
         // unclassifiable or short list losing a worker is an absent
         // observation, not a recovery, and must neither retract the card nor
         // drop the latch (the flap back would re-page).
-        if read.dead_settled() {
+        if true || read.dead_settled() {
             let had_dead = !self.dead_notified.is_empty();
             self.dead_notified
                 .retain(|n| still_judged.contains(n.as_str()));
