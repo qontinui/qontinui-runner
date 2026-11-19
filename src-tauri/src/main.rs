@@ -792,8 +792,17 @@ use video_recorder::VideoRecordingService;
 /// for a restart. Fire-and-forget: an emit failure is logged and never affects
 /// the registry writes, which happened before the pass returned.
 fn emit_session_bound(handle: &tauri::AppHandle, actions: &[session::reconcile::ReconcileAction]) {
+    emit_session_bound_payloads(handle, session::reconcile::session_bound_payloads(actions));
+}
+
+/// Emit already-built `session-bound` payloads (the binds' and the config-dir
+/// repairs'). One emitter, so both log a failed emit the same way.
+fn emit_session_bound_payloads(
+    handle: &tauri::AppHandle,
+    payloads: Vec<session::reconcile::SessionBoundPayload>,
+) {
     use tauri::Emitter;
-    for payload in session::reconcile::session_bound_payloads(actions) {
+    for payload in payloads {
         if let Err(e) = handle.emit(session::reconcile::SESSION_BOUND_EVENT, payload.clone()) {
             warn!(
                 terminal = %payload.terminal_id,
@@ -5485,6 +5494,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // 2026-10-23-a-hookless-resume-…, Phase 1b). A valid
                         // row pre-empts the rung-2 argv id and re-keys the
                         // pane's coord row; anything else re-keys nothing.
+                        //
+                        // The config-dir repair below decides from the store as
+                        // it stood BEFORE this evidence was read, and writes only
+                        // while a record still matches that read.
+                        let pre_evidence =
+                            session::reconcile::config_dir_repair::PreEvidenceSnapshot::take(
+                                &poll_lifecycle_store,
+                            );
                         let provider_rows =
                             session::reconcile::compute_provider_rows(&live_ptys, &look).await;
                         let actions = if needs_reconcile {
@@ -5527,6 +5544,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             &look,
                         );
 
+                        // Config-dir repair (plan 2026-11-16-boot-reconcile-
+                        // reverts-…, D2): write each open record's config_dir
+                        // from its own pane's valid provider row. Outside the
+                        // `needs_reconcile` guard for the title pass's reason —
+                        // a CONFIRMED row is exactly the one the bind pass leaves
+                        // alone. Same `provider_rows` as the re-key. A record
+                        // this tick's bind wrote is past `pre_evidence`, so it is
+                        // settled on the next tick, from fresh evidence. Each
+                        // landed repair stamps its tab. One targeted argv read
+                        // of the anchors (none when nothing is a candidate) lets
+                        // it skip a session another live pane was resumed with.
+                        let anchor_argv =
+                            session::reconcile::config_dir_repair::AnchorArgvIds::read(
+                                &pre_evidence,
+                                &provider_rows,
+                            )
+                            .await;
+                        let repairs = session::reconcile::config_dir_repair::repair_config_dirs(
+                            &poll_lifecycle_store,
+                            &pre_evidence,
+                            &provider_rows,
+                            &anchor_argv,
+                        );
+                        emit_session_bound_payloads(
+                            &poll_app_handle,
+                            session::reconcile::config_dir_repair::repair_bound_payloads(&repairs),
+                        );
+
                         poll_lifecycle_store.prune(
                             chrono::Utc::now().timestamp_millis(),
                             &live_terminal_ids,
@@ -5567,6 +5612,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // The boot pass reads the provider rows too, so a pane whose
                     // claude was resumed before this runner started is re-keyed
                     // from its own registry file, not its stale argv.
+                    // Read before the provider evidence, for the config-dir
+                    // repair's compare-and-set (see the periodic tick).
+                    let pre_evidence =
+                        session::reconcile::config_dir_repair::PreEvidenceSnapshot::take(
+                            &reconcile_lifecycle_store,
+                        );
                     let boot_roots: Vec<u32> = live.iter().filter_map(|pty| pty.pid).collect();
                     let boot_look =
                         crate::terminal::graceful_exit::PaneLook::take(&boot_roots).await;
@@ -5574,7 +5625,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         session::reconcile::compute_provider_rows(&live, &boot_look).await;
                     let actions =
                         session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
+                    // Config-dir repair (D2), from the same provider rows. A
+                    // record the boot bind (or a migration racing it) wrote is
+                    // past `pre_evidence`, so it waits for the periodic tick.
+                    let anchor_argv = session::reconcile::config_dir_repair::AnchorArgvIds::read(
+                        &pre_evidence,
+                        &provider_rows,
+                    )
+                    .await;
+                    let repairs = session::reconcile::config_dir_repair::repair_config_dirs(
+                        &reconcile_lifecycle_store,
+                        &pre_evidence,
+                        &provider_rows,
+                        &anchor_argv,
+                    );
                     emit_session_bound(&reconcile_app_handle, &actions);
+                    emit_session_bound_payloads(
+                        &reconcile_app_handle,
+                        session::reconcile::config_dir_repair::repair_bound_payloads(&repairs),
+                    );
                     session::coord_identity::apply_reconcile_tick_in_app(
                         &reconcile_app_handle,
                         &actions,
