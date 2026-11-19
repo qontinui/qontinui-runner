@@ -582,8 +582,9 @@ coord_adopt_pr {repo: "<owner/repo>", pr_number: <N>, head_sha: "<current head, 
 - **`head_not_current`** — re-read the head and claim once more.
 - **`capped`** — the PR's shared attempt budget is spent. Stop fixing it and
   report it as `blocked-legitimate` with the answer quoted.
-- **`not_visible`**, an error, or the tool unreachable over every door
-  (`coord-revive.sh call coord_adopt_pr '<json>'` is the fallback) — UNKNOWN.
+- **`not_visible`**, an error, or no answer at all — if every door fails to
+  carry the call (`coord-revive.sh call coord_adopt_pr '<json>'` is the
+  fallback) — UNKNOWN.
   Make no commit to the PR this round; say so in the exit report.
 
 Release every claim you still hold before you exit, whatever the outcome
