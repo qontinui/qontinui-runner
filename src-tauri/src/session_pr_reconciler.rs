@@ -1900,6 +1900,44 @@ fn record_resolved_identity(source: &str, token: &str) {
 mod tests {
     use super::*;
 
+    /// The Retry-After hold, entered where the reconciler enters: a client
+    /// from `reconciler_client`, `list_prs_for_head`. GitHub refuses the first
+    /// read for rate with `Retry-After`; the reconciler's next read on that
+    /// credential is deferred with the `RetryAfter` reason — not sent (the
+    /// one-shot server is gone, so a send would be a transport failure).
+    #[tokio::test]
+    async fn a_retry_after_hold_defers_the_reconcilers_next_read() {
+        let base = crate::trigger_system::github_api::one_shot_server_for_test(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let client = reconciler_client("budget-test-reconciler-retry-after")
+            .expect("client builds")
+            .with_api_base(base);
+
+        let first = client
+            .list_prs_for_head("budget-test-hold-owner", "hold-repo", "feat/x")
+            .await
+            .expect_err("refused for rate");
+        assert!(
+            matches!(first, GhError::RateLimited { status: 429 }),
+            "{first}"
+        );
+
+        let next = client
+            .list_prs_for_head("budget-test-hold-owner", "hold-repo", "feat/y")
+            .await
+            .expect_err("held");
+        assert!(
+            matches!(
+                &next,
+                GhError::Deferred(d)
+                    if matches!(d.reason, crate::github_budget::DeferralReason::RetryAfter { .. })
+            ),
+            "{next}"
+        );
+    }
+
     #[test]
     fn only_a_terminal_refusal_starts_the_login_back_off() {
         let status = |status| GhError::HttpStatus {

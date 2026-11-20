@@ -441,7 +441,38 @@ pub struct GitHubClient {
 }
 
 /// The GitHub REST API origin every URL builder in this module spells.
-const GITHUB_API_BASE: &str = "https://api.github.com";
+pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// `url` (built against [`GITHUB_API_BASE`]) re-rooted at `base`. The identity
+/// whenever `base` is [`GITHUB_API_BASE`], i.e. in production; a test points
+/// `base` at a loopback port so a request that escapes a gate never reaches
+/// GitHub. Shared by [`GitHubClient`] and the ticket provider.
+pub(crate) fn at_api_base(base: &str, url: String) -> String {
+    match url.strip_prefix(GITHUB_API_BASE) {
+        Some(path) if base != GITHUB_API_BASE => format!("{base}{path}"),
+        _ => url,
+    }
+}
+
+/// One canned HTTP response on a loopback port, for the rate-limit arms a
+/// refusing port cannot produce. Returns the base URL. Test-only.
+#[cfg(test)]
+pub(crate) async fn one_shot_server_for_test(response: &'static str) -> &'static str {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    Box::leak(format!("http://{addr}").into_boxed_str())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrStatus {
@@ -491,10 +522,7 @@ impl GitHubClient {
     /// `url` (built against [`GITHUB_API_BASE`]) re-rooted at this client's
     /// `api_base`. The identity in production.
     fn at_base(&self, url: String) -> String {
-        match url.strip_prefix(GITHUB_API_BASE) {
-            Some(path) if self.api_base != GITHUB_API_BASE => format!("{}{path}", self.api_base),
-            _ => url,
-        }
+        at_api_base(self.api_base, url)
     }
 
     /// Set this client's spend class (default [`SpendClass::Interactive`]).
@@ -636,6 +664,9 @@ impl GitHubClient {
             });
         }
         if let Some(wait) = backoff {
+            // Hold this credential's BACKGROUND spend for the same window, so a
+            // poller does not send inside the Retry-After GitHub just gave.
+            github_budget::record_rate_limited_refusal(&self.credential, wait);
             warn!(
                 "GitHub API rate limited ({}), retrying after {}s",
                 ex.status, wait
@@ -1197,23 +1228,39 @@ mod tests {
         assert_eq!(row.deferred, 0);
     }
 
-    /// One canned HTTP response on a loopback port, for the rate-limit arms
-    /// that a refusing port cannot produce. Returns the base URL.
-    async fn one_shot_server(response: &'static str) -> &'static str {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
-        });
-        Box::leak(format!("http://{addr}").into_boxed_str())
+    /// An INTERACTIVE rate refusal holds the credential's BACKGROUND spend
+    /// for GitHub's Retry-After window: while the interactive caller sleeps
+    /// before its one retry, a background read on the same credential is
+    /// deferred, not sent.
+    #[tokio::test]
+    async fn an_interactive_rate_refusal_holds_the_credentials_background_spend() {
+        let token = "budget-test-interactive-refusal-hold";
+        let base = one_shot_server_for_test(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 3\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let interactive = GitHubClient::new(token, "budget_test_interactive_hold")
+            .expect("client builds")
+            .with_api_base(base);
+        let pending = tokio::spawn(async move { interactive.get_pr("o", "r", 1).await });
+        // Let the refusal land and the interactive caller start its sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let background = GitHubClient::new(token, "budget_test_interactive_hold_bg")
+            .expect("client builds")
+            .with_spend_class(SpendClass::Background)
+            .with_api_base("http://127.0.0.1:1");
+        let err = background.get_pr("o", "r", 2).await.expect_err("held");
+        assert!(
+            matches!(
+                &err,
+                GhError::Deferred(d)
+                    if matches!(d.reason, github_budget::DeferralReason::RetryAfter { .. })
+            ),
+            "{err}"
+        );
+        // The interactive retry goes to the (now closed) one-shot server.
+        let _ = pending.await;
     }
 
     /// On the background path a rate-limited refusal — a `429`, or a
@@ -1243,7 +1290,7 @@ mod tests {
                 "HTTP/1.1 403 Forbidden\r\nretry-after: 120\r\nx-ratelimit-remaining: 4000\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
             ),
         ] {
-            let base = one_shot_server(response).await;
+            let base = one_shot_server_for_test(response).await;
             let client = GitHubClient::new(token, consumer)
                 .expect("client builds")
                 .with_spend_class(SpendClass::Background)
