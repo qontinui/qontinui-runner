@@ -1149,7 +1149,8 @@ impl TrackingHealthReport {
     ) {
         for p in self.terminal_hosted.iter_mut() {
             if p.nested_under_claude
-                || p.session_status.as_deref() != Some(SessionWorkStatus::Finished.as_wire().as_str())
+                || p.session_status.as_deref()
+                    != Some(SessionWorkStatus::Finished.as_wire().as_str())
                 || p.has_live_children.is_none()
             {
                 continue;
@@ -1165,7 +1166,8 @@ impl TrackingHealthReport {
                     !strays.contains(kid)
                         && !verdict.is_some_and(|v| {
                             v.children.iter().any(|c| {
-                                c.pid == *kid && c.class == session_lifecycle::ChildClass::ShimOrPump
+                                c.pid == *kid
+                                    && c.class == session_lifecycle::ChildClass::ShimOrPump
                             })
                         })
                 })
@@ -4037,7 +4039,10 @@ mod tests {
         (snap, report)
     }
 
-    fn child_verdict(pid: u32, class: session_lifecycle::ChildClass) -> session_lifecycle::ChildVerdict {
+    fn child_verdict(
+        pid: u32,
+        class: session_lifecycle::ChildClass,
+    ) -> session_lifecycle::ChildVerdict {
         session_lifecycle::ChildVerdict {
             pid,
             class,
@@ -4073,27 +4078,45 @@ mod tests {
         let (snap, mut report) = boot_window_fixture();
         // Before: the window rule — only 20's late bash is work.
         assert_eq!(stray_row(&report, 20), (Some(true), 0));
-        assert_eq!(stray_row(&report, 30), (Some(false), 0), "window: all boot-time");
+        assert_eq!(
+            stray_row(&report, 30),
+            (Some(false), 0),
+            "window: all boot-time"
+        );
         assert_eq!(stray_row(&report, 40), (Some(false), 0));
         assert_eq!(stray_row(&report, 50), (Some(false), 0));
 
         let verdicts: HashMap<u32, session_lifecycle::SessionVerdict> = [
-            session_verdict(20, vec![child_verdict(21, ShimOrPump), child_verdict(22, Work)]),
-            session_verdict(30, vec![child_verdict(31, ShimOrPump), child_verdict(32, Work)]),
+            session_verdict(
+                20,
+                vec![child_verdict(21, ShimOrPump), child_verdict(22, Work)],
+            ),
+            session_verdict(
+                30,
+                vec![child_verdict(31, ShimOrPump), child_verdict(32, Work)],
+            ),
             session_verdict(40, vec![child_verdict(41, Unknown)]),
             session_verdict(50, vec![child_verdict(51, Work)]),
         ]
         .into_iter()
         .collect();
         // 22 is a proven stray: 20 is then held by a shim and a stray only.
-        report.replace_boot_window_for_finished(&snap, &[22u32].into_iter().collect(), Some(&verdicts));
+        report.replace_boot_window_for_finished(
+            &snap,
+            &[22u32].into_iter().collect(),
+            Some(&verdicts),
+        );
         assert_eq!(stray_row(&report, 20), (Some(false), 1), "shim + stray");
         assert_eq!(
             stray_row(&report, 30),
             (Some(true), 0),
             "an early rg the window waved through is work"
         );
-        assert_eq!(stray_row(&report, 40), (Some(true), 0), "UNKNOWN keeps it open");
+        assert_eq!(
+            stray_row(&report, 40),
+            (Some(true), 0),
+            "UNKNOWN keeps it open"
+        );
         assert_eq!(
             stray_row(&report, 50),
             (Some(false), 0),
@@ -4122,7 +4145,10 @@ mod tests {
         let verdicts: HashMap<u32, session_lifecycle::SessionVerdict> = [
             session_verdict(40, vec![child_verdict(41, ShimOrPump)]),
             // 31 is a child of 30, not of 20; 20 has no verdict.
-            session_verdict(30, vec![child_verdict(31, ShimOrPump), child_verdict(32, ShimOrPump)]),
+            session_verdict(
+                30,
+                vec![child_verdict(31, ShimOrPump), child_verdict(32, ShimOrPump)],
+            ),
         ]
         .into_iter()
         .collect();

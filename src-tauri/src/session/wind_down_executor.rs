@@ -3434,7 +3434,10 @@ mod tests {
         );
         assert_eq!(both.clone().with_shim_or_pump(), both);
         assert_eq!(
-            arm_exemptions(CloseArm::Drain, ChildExemptions::from_strays(vec![stray.clone()])),
+            arm_exemptions(
+                CloseArm::Drain,
+                ChildExemptions::from_strays(vec![stray.clone()])
+            ),
             ChildExemptions::from_strays(vec![stray])
         );
         // The live impl and the one graceful_exit call pass it through.

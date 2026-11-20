@@ -2961,7 +2961,10 @@ mod tests {
             ChildExemption::AdmitForTest(999),
         ]);
         assert_eq!(exempt.admitted(None, &[210, 211]).await, set(&[210]));
-        assert!(ChildExemptions::none().admitted(None, &[210]).await.is_empty());
+        assert!(ChildExemptions::none()
+            .admitted(None, &[210])
+            .await
+            .is_empty());
         assert!(ChildExemptions::none().is_empty());
         // A recorded stray whose pid is not among the children is not
         // admitted. (This pid could not re-prove either; the live twin in
@@ -2994,8 +2997,8 @@ mod tests {
         assert!(shim.admitted(None, &[210, 211]).await.is_empty());
         assert!(shim.admitted(Some(4_000_000_005), &[210]).await.is_empty());
         // It composes with the other classes.
-        let mixed = ChildExemptions::for_test(vec![ChildExemption::AdmitForTest(210)])
-            .with_shim_or_pump();
+        let mixed =
+            ChildExemptions::for_test(vec![ChildExemption::AdmitForTest(210)]).with_shim_or_pump();
         assert_eq!(mixed.admitted(None, &[210, 211]).await, set(&[210]));
     }
 

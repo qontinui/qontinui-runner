@@ -659,7 +659,9 @@ mod tests {
     #[tokio::test]
     async fn shim_children_fails_closed() {
         assert!(shim_children(10, &[]).await.is_empty());
-        assert!(shim_children(4_000_000_003, &[4_000_000_004]).await.is_empty());
+        assert!(shim_children(4_000_000_003, &[4_000_000_004])
+            .await
+            .is_empty());
     }
 
     #[test]
