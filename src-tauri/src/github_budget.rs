@@ -1506,6 +1506,7 @@ pub(crate) fn seed_reading_for_test(credential: &CredentialKey, obs: &RateLimitO
 /// reading, so one test's deliberately exhausted global reading cannot leak
 /// into another's assertions.
 #[cfg(test)]
+// test-lock: standalone — its four holders (github_budget, ticket_system::github, trigger_system::github_api tests) take no other test lock and never touch env
 pub(crate) async fn global_last_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -1515,6 +1516,7 @@ pub(crate) async fn global_last_lock() -> tokio::sync::MutexGuard<'static, ()> {
 
 /// Same lock, for a synchronous test.
 #[cfg(test)]
+// test-lock: standalone — its four holders (github_budget, ticket_system::github, trigger_system::github_api tests) take no other test lock and never touch env
 pub(crate) fn global_last_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
     futures::executor::block_on(global_last_lock())
 }
