@@ -512,6 +512,9 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 }
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
+                n if n.starts_with("--model=") => {
+                    template_model = Some(n["--model=".len()..].to_string())
+                }
                 // Effort is spec-owned when the caller supplies one.
                 "--effort" if spec.effort.is_some() => {}
                 n if spec.effort.is_some() && n.starts_with("--effort=") => {}
@@ -1012,6 +1015,15 @@ mod tests {
         let argv = render_argv(&s, &tmpl("claude --effort=high"), "claude");
         assert_eq!(argv.iter().filter(|a| a.starts_with("--effort")).count(), 1);
         assert_eq!(value_after(&argv, "--effort"), Some("low"));
+    }
+
+    #[test]
+    fn spec_model_beats_an_attached_template_model() {
+        let mut s = spec();
+        s.model = Some("sonnet".to_string());
+        let argv = render_argv(&s, &tmpl("claude --model=opus"), "claude");
+        assert_eq!(argv.iter().filter(|a| a.starts_with("--model")).count(), 1);
+        assert_eq!(value_after(&argv, "--model"), Some("sonnet"));
     }
 
     #[test]

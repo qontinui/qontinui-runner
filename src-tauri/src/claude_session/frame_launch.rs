@@ -18,12 +18,29 @@ use serde_json::Value;
 /// reads as "the frame said nothing".
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FrameLaunchKeys {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_none")]
     pub launch_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_none")]
     pub launch_effort: Option<String>,
     #[serde(default)]
     pub launch_settings: Option<Value>,
+}
+
+/// A non-string value reads as absent (warned later by nothing: it carries no
+/// usable choice) so a mistyped key can never fail the whole frame's parse.
+fn string_or_none<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Value::deserialize(d)? {
+        Value::String(s) => Ok(Some(s)),
+        other => {
+            if !other.is_null() {
+                tracing::warn!(value = %other, "launch key is not a string; ignored");
+            }
+            Ok(None)
+        }
+    }
 }
 
 impl FrameLaunchKeys {
@@ -162,6 +179,15 @@ mod tests {
         assert_eq!(l.effort, None);
         let bare: FrameLaunchKeys = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(bare.resolve().is_empty());
+    }
+
+    #[test]
+    fn a_non_string_key_does_not_fail_the_frame() {
+        let k: FrameLaunchKeys = serde_json::from_value(serde_json::json!({
+            "launch_model": 7, "launch_effort": {"x": 1}
+        }))
+        .unwrap();
+        assert!(k.resolve().is_empty());
     }
 
     #[test]
