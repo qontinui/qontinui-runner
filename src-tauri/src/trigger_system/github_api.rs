@@ -1584,7 +1584,7 @@ mod tests {
         let same = listed(Some("2026-11-19T10:00:00Z"));
         let older = listed(Some("2026-11-19T09:59:59Z"));
         assert!(
-            !closed_page_reaches_mark(&[newer.clone()], mark),
+            !closed_page_reaches_mark(std::slice::from_ref(&newer), mark),
             "all newer: keep paging"
         );
         assert!(closed_page_reaches_mark(&[newer.clone(), same], mark));
