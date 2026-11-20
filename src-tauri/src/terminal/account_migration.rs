@@ -14,7 +14,22 @@
 //!
 //! 1. **Hint** — [`super::usage_limit::scan_grids_once`] sees a usage-limit
 //!    message on a terminal's rendered screen and calls
-//!    [`handle_usage_limit_hint`] (debounced per terminal).
+//!    [`handle_usage_limit_hint`] (debounced per terminal), which answers with
+//!    a [`HintOutcome`]. A hint that did not migrate the session but might
+//!    later keeps its screen due ([`HintOutcome::retry`]): no usable target, a
+//!    failed migration that started no resumed `claude`, a respawn that died
+//!    or never painted and was rolled back onto the old pane, or another
+//!    mover of the session in flight retry every debounce, and an
+//!    unconfirmed probe retries once per appearance. A migration that failed
+//!    after its resumed `claude` may have started rests its SESSION for the
+//!    cap's 24 h window, since that child may still be running: not retried,
+//!    and any later hint on that session ends the same way without migrating
+//!    ([`cap_then_pick`], [`rest_after_child_started`]).
+//!    So a pane frozen on the limit menu is retried until a target frees, instead
+//!    of waiting for a repaint that never comes. Each retry re-probes every
+//!    configured account, and the probe's 60 s usage cache keeps that to at
+//!    most one upstream probe per account per minute for the whole runner,
+//!    however many panes are stranded.
 //! 2. **Confirm** — re-probe every configured account
 //!    (`refresh_account_usage_snapshot`) and require the *probe* to agree the
 //!    session's account is exhausted. Conversation text that merely quotes a
@@ -60,11 +75,17 @@
 //! its row — and also refuses a session that already moved or is closed),
 //! settings kill-switch
 //! (`claude_cli.auto_migrate_on_token_exhaustion`), and a no-op with fewer
-//! than two configured accounts. A refusal by [`begin_migration`] is not a
-//! failure: the automatic path logs it, reports nothing to the UI and gives
-//! back the cap slot it took ([`settle_hint_migration`]). The manual Tauri
-//! command (`terminal_migrate_session_account`) reuses step 4 directly — an
-//! operator click is its own confirmation.
+//! than two configured accounts. The cap counts migrations that ran: a hint
+//! that found no usable target gives back the slot it took
+//! ([`cap_then_pick`]), or the retries of a frozen no-target pane would spend
+//! the whole cap without moving anything and then strand it on
+//! [`HintOutcome::CapReached`] for a day. A refusal by [`begin_migration`] is
+//! not a failure: the automatic path logs it, reports nothing to the UI and
+//! gives back the cap slot it took ([`settle_hint_migration`]). A retried
+//! no-target or failed hint is reported once per stranding episode, not on
+//! every retry ([`worth_reporting`]). The manual Tauri command
+//! (`terminal_migrate_session_account`) reuses step 4 directly — an operator
+//! click is its own confirmation.
 //!
 //! The in-flight guard covers the migration itself — carry, trust, respawn,
 //! the liveness proof and its retries or rollback, close — and NOT the
@@ -91,13 +112,14 @@ use std::sync::Mutex;
 
 use serde_json::json;
 use tauri::Emitter;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::terminal::graceful_exit::ProcIdentity;
 use crate::terminal::session_carry::{
     copy_transcript, CarriedSubagent, DeltaSyncOutcome, TranscriptCopy,
 };
+use crate::terminal::spawn_refusal::SpawnFailure;
 
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
 /// A second hop is legitimate (the target can run dry too); an unbounded
@@ -129,8 +151,147 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     true
 }
 
+/// What every refusal and error about a child-started failure tells its
+/// reader: the migration error ([`MigrateError::FailedAfterChild`]), the
+/// manual command's refusal ([`child_started_rest_refusal`]), the respawn
+/// receiver's and the resume door's.
+pub(crate) const CHILD_MAY_RUN_WARNING: &str = "a resumed claude of this session may still be \
+     running with no pane; do not migrate or resume this session again until it is confirmed gone";
+
+/// Per-session rest after a migration (or respawn) that failed after its
+/// resumed `claude` may have started ([`MigrateError::FailedAfterChild`]):
+/// when it was recorded (unix millis). Kept beside the cap history and bounded
+/// by the same rolling [`MIGRATION_CAP_WINDOW_MS`] (24 h).
+///
+/// Per SESSION, not per terminal: the grid scanner's per-terminal last outcome
+/// is overwritten by any later hint (`NotConfirmed`, `RefusedInFlight`, ...)
+/// and cleared by one scan without the limit text, either of which would end
+/// the rest while that child may still run, and the next hint would resume the
+/// session a second time beside it. Nothing the scanner sees proves the child
+/// gone, so only time ends the rest.
+///
+/// Recorded by the mover itself WHILE it still holds the session's in-flight
+/// claim ([`rest_if_child_may_run`]: the account migration, the respawn
+/// receiver, the resume door), and re-checked by each of them AFTER taking the
+/// claim ([`begin_migration`], and the receiver's and the door's own gates),
+/// so no mover can slip between another's failure and its record. The checks
+/// before the claim (the hint's [`cap_then_pick`], the manual command) are
+/// fast paths only.
+///
+/// The residual, stated plainly so nobody reads more into it:
+/// - The rest is honoured for 24 h. That expiry is a TIME BOUND, not proof the
+///   orphaned child is gone; a child still running after it is not seen by
+///   anything here.
+/// - The map is IN MEMORY only: a runner restart clears it.
+/// - So coord's respawn row for the session may stay pending, and after a
+///   restart or once the 24 h pass, a catch-up can replay it. Making the rest
+///   durable is follow-up plan
+///   `2026-11-20-the-frozen-limit-screen-retry-leaves-six-follow-ups-unowned`.
+///
+/// An entry is honoured for 24 h from its stamp, but REMOVED only when its own
+/// session is read again after that ([`resting_after_child_started`]);
+/// recording one never touches another, so no stamp — however far in the
+/// future — can end another session's rest. Entries are rare (one per
+/// child-started failure), so an unread expired one costs a few bytes until
+/// the process exits.
+static CHILD_STARTED_REST: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+/// Start (or restart) `claude_session_id`'s rest at `now_ms`
+/// ([`CHILD_STARTED_REST`]). Touches only that session's entry.
+pub(crate) fn rest_after_child_started(claude_session_id: &str, now_ms: i64) {
+    let mut rest = CHILD_STARTED_REST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    rest.get_or_insert_with(HashMap::new)
+        .insert(claude_session_id.to_string(), now_ms);
+}
+
+/// Whether `claude_session_id` is resting at `now_ms` ([`CHILD_STARTED_REST`]).
+/// An entry older than the window at `now_ms` is removed here — that entry
+/// only.
+pub(crate) fn resting_after_child_started(claude_session_id: &str, now_ms: i64) -> bool {
+    let mut rest = CHILD_STARTED_REST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(map) = rest.as_mut() else {
+        return false;
+    };
+    match map.get(claude_session_id) {
+        Some(at) if now_ms - *at <= MIGRATION_CAP_WINDOW_MS => true,
+        Some(_) => {
+            map.remove(claude_session_id);
+            false
+        }
+        None => false,
+    }
+}
+
+/// The refusal for a session resting after a child-started failure, or `None`.
+/// The manual migrate command checks it first: an operator click is its own
+/// confirmation of WHICH account, not proof the orphaned `claude` is gone.
+pub(crate) fn child_started_rest_refusal(claude_session_id: &str, now_ms: i64) -> Option<String> {
+    resting_after_child_started(claude_session_id, now_ms).then(|| {
+        format!(
+            "not migrating {claude_session_id}: an earlier migration or respawn of it failed after \
+             its resumed claude started — {CHILD_MAY_RUN_WARNING}"
+        )
+    })
+}
+
+/// When `outcome` carries a spawn that failed after its resumed `claude`
+/// started ([`super::respawn_liveness::RespawnOutcome::child_may_run`]),
+/// record `claude_session_id`'s rest at `now_ms` and return that failure.
+/// Every mover calls it WHILE it still holds the session's in-flight claim,
+/// so the rest exists before any other mover can claim the session.
+pub(crate) fn rest_if_child_may_run<'a>(
+    claude_session_id: &str,
+    outcome: &'a super::respawn_liveness::RespawnOutcome,
+    now_ms: i64,
+) -> Option<&'a SpawnFailure> {
+    let failure = outcome.child_may_run()?;
+    rest_after_child_started(claude_session_id, now_ms);
+    Some(failure)
+}
+
+/// The migration's answer to a respawn whose spawn failed after its resumed
+/// `claude` started: rest the session ([`rest_if_child_may_run`]) and build
+/// the [`MigrateError::FailedAfterChild`] it ends on, or `None` when no child
+/// may run. The ONE place the migration path (manual and automatic) records
+/// the rest; [`confirm_migration`] calls it while it still holds the
+/// session's in-flight claim.
+fn rested_failed_after_child(
+    claude_session_id: &str,
+    outcome: &super::respawn_liveness::RespawnOutcome,
+    now_ms: i64,
+) -> Option<MigrateError> {
+    use super::respawn_liveness::RespawnOutcome;
+    let failure = rest_if_child_may_run(claude_session_id, outcome, now_ms)?;
+    let ended = match outcome {
+        RespawnOutcome::NotSpawned(_) => "the first spawn failed".to_string(),
+        RespawnOutcome::Died {
+            exit_code,
+            attempts,
+            ..
+        } => RespawnOutcome::died_reason(*exit_code, *attempts),
+        RespawnOutcome::ClosedByUser { .. } => {
+            "the user closed the resumed pane after a retry spawn failed".to_string()
+        }
+        RespawnOutcome::OldPaneClosed { .. } => {
+            "the user closed the old pane after a retry spawn failed".to_string()
+        }
+        RespawnOutcome::Alive { .. }
+        | RespawnOutcome::Unconfirmed { .. }
+        | RespawnOutcome::UnconfirmedRolledBack { .. } => "the respawn ended".to_string(),
+    };
+    Some(MigrateError::FailedAfterChild(format!(
+        "{ended}; a spawn failed after its resumed claude started: {}",
+        failure.message
+    )))
+}
+
 /// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
-/// migration that never ran (refused by [`begin_migration`]). Removes exactly
+/// migration that never ran (no usable target, [`cap_then_pick`], or refused
+/// by [`begin_migration`], [`settle_hint_migration`]). Removes exactly
 /// one entry with that stamp under the history lock, so two hints that took
 /// slots in the same millisecond still leave the count right; a stamp already
 /// aged out of the window is a no-op.
@@ -146,7 +307,7 @@ fn refund_migration_cap(claude_session_id: &str, stamp: i64) {
 }
 
 /// Why [`migrate_session_off_runtime`] did not migrate.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum MigrateError {
     /// [`begin_migration`] refused before anything was read or written: the
     /// session is already migrating, has already moved, is closed, or is gone. Nothing
@@ -160,24 +321,47 @@ pub(crate) enum MigrateError {
     /// under proof was closed with the session, as the user asked.
     Refused(MigrationRefusal),
     /// The migration ran and did not move the session: a step before the
-    /// respawn failed, or the FIRST spawn did — the old pane is untouched, still
-    /// at its usage-limit prompt. Also a user close of the resumed pane while it
-    /// was being proven (`closed_by_user`): the session is back on the old pane
-    /// when that still runs, else the close ended it.
+    /// respawn failed, or the FIRST spawn did (before any child started) — the
+    /// old pane is untouched, still at its usage-limit prompt.
     Failed(String),
+    /// The USER closed the resumed pane while it was being proven
+    /// ([`super::respawn_liveness::RespawnOutcome::ClosedByUser`], no child
+    /// left running): the session is back on the old pane when that still
+    /// runs, else the close ended it. The user undid the migration, so the
+    /// automatic path does not retry it on that screen
+    /// ([`HintOutcome::DeclinedByUser`]).
+    DeclinedByUser,
+    /// The respawn failed AFTER its resumed `claude` may have started
+    /// ([`SpawnFailure::child_started`]), so that child may still be running
+    /// in no pane the migration knows: the first spawn's backend failed past
+    /// its child spawn (a holder pane refused its attach, the new pane's
+    /// reader or writer could not be wired, the built session could not be
+    /// registered — [`super::respawn_liveness::RespawnOutcome::NotSpawned`]),
+    /// or a liveness retry's did, which ends the retries
+    /// ([`super::respawn_liveness::RespawnOutcome::child_may_run`]). The
+    /// session's row names the old pane (the backend returns before its
+    /// capture re-keys the row, and a died respawn rolls back onto it), so a
+    /// second migration would start another `claude --resume` of the session
+    /// beside that child. Not reported by the migration itself: the caller
+    /// reports it.
+    FailedAfterChild(String),
     /// Every respawn attempt exited before painting. With the old pane still
-    /// running, rolled back: the row, its account and the continuation are on
-    /// the old pane again, and the old pane is open. With the old pane gone
-    /// mid-proof, the session ended with its last pane.
+    /// running, rolled back (`rolled_back`): the row, its account and the
+    /// continuation are on the old pane again, and the old pane is open — and
+    /// no resumed child runs, since every attempt's pane exited and was
+    /// closed. With the old pane gone mid-proof, the session ended with its
+    /// last pane. A death whose last retry spawn failed after its child
+    /// started is [`Self::FailedAfterChild`] instead.
     RespawnDied {
         exit_code: Option<i32>,
         attempts: usize,
+        rolled_back: bool,
     },
     /// The resumed child runs but never painted by the deadline. With the old
     /// pane still running (its CLI seen, or its subtree unreadable) the
-    /// migration was ROLLED BACK onto it (the unproven pane closed); with the
-    /// old pane gone, or read to be a shell whose CLI exited, the new pane
-    /// keeps the row.
+    /// migration was ROLLED BACK onto it (the unproven pane closed — a tree
+    /// kill, `TerminalManager::close`); with the old pane gone, or read to be
+    /// a shell whose CLI exited, the new pane keeps the row.
     Unconfirmed {
         new_terminal_id: String,
         rolled_back: bool,
@@ -212,9 +396,12 @@ impl MigrateError {
         match self {
             Self::Refused(refusal) => refusal.to_string(),
             Self::Failed(e) => format!("migration-failed: {e}"),
+            Self::DeclinedByUser => "migration-declined-by-user".to_string(),
+            Self::FailedAfterChild(e) => format!("migration-failed-after-child-started: {e}"),
             Self::RespawnDied {
                 exit_code,
                 attempts,
+                ..
             } => super::respawn_liveness::RespawnOutcome::died_reason(*exit_code, *attempts),
             Self::Unconfirmed { .. } => "migration-unconfirmed".to_string(),
         }
@@ -238,9 +425,19 @@ impl std::fmt::Display for MigrateError {
         match self {
             Self::Refused(refusal) => refusal.fmt(f),
             Self::Failed(e) => f.write_str(e),
+            Self::DeclinedByUser => f.write_str(
+                "closed_by_user: the user closed the resumed pane mid-migration — the migration is \
+                 not retried automatically on this screen; the session is back on the old pane if \
+                 that pane still runs, otherwise the close ended it",
+            ),
+            Self::FailedAfterChild(e) => write!(
+                f,
+                "{e} — {CHILD_MAY_RUN_WARNING} (the automatic path rests this session for 24h)"
+            ),
             Self::RespawnDied {
                 exit_code,
                 attempts,
+                ..
             } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_reason(
                 *exit_code, *attempts,
             )),
@@ -284,6 +481,11 @@ pub(crate) enum MigrationRefusal {
     AlreadyMoved { to: String },
     /// The session's lifecycle record is gone.
     Unknown { session: String },
+    /// The session is resting after a migration or respawn that failed after
+    /// its resumed `claude` started ([`CHILD_STARTED_REST`]): seen AFTER the
+    /// in-flight claim was taken, so a rest recorded between a caller's fast
+    /// path and its claim is honoured.
+    ChildMayRun { session: String },
     /// The session's lifecycle record is closed: there is no pane to migrate.
     Closed { session: String },
 }
@@ -307,6 +509,11 @@ impl std::fmt::Display for MigrationRefusal {
                     "session {session} is closed — there is no pane to migrate"
                 )
             }
+            Self::ChildMayRun { session } => write!(
+                f,
+                "not migrating {session}: an earlier migration or respawn of it failed after its \
+                 resumed claude started — {CHILD_MAY_RUN_WARNING}"
+            ),
         }
     }
 }
@@ -359,6 +566,17 @@ pub(crate) fn begin_migration(
     current_record: impl FnOnce() -> Option<TerminalSessionRecord>,
 ) -> Result<MigrationInFlight, MigrationRefusal> {
     let guard = claim_migration_slot(&caller_record.claude_session_id)?;
+    // Under the claim: a rest another mover recorded after this caller's
+    // fast-path check (and before this claim) is seen here. The guard drops
+    // with the refusal.
+    if resting_after_child_started(
+        &caller_record.claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        return Err(MigrationRefusal::ChildMayRun {
+            session: caller_record.claude_session_id.clone(),
+        });
+    }
     still_migratable(caller_record, src_config_dir, current_record())?;
     Ok(guard)
 }
@@ -416,24 +634,272 @@ pub struct MigrationOutcome {
     pub to_config_dir: String,
 }
 
-/// Entry point for a usage-limit hint (spawned async by the grid scanner,
+/// How one usage-limit hint ended ([`handle_usage_limit_hint`]). The grid
+/// scanner keeps the last one per terminal until the screen no longer shows a
+/// limit message: its [`HintOutcome::retry`] rule decides whether a screen
+/// frozen on the limit message stays due, and it is handed back to the
+/// terminal's next hint as `previous`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintOutcome {
+    /// The hint cannot apply here: a declared model gateway, no app handle or
+    /// lifecycle store, no registered Claude session on the terminal, an
+    /// unknown account, or fewer than two configured accounts.
+    NotEligible,
+    /// `claude_cli.auto_migrate_on_token_exhaustion` is off.
+    Disabled,
+    /// The probe did not confirm that the session's account is exhausted.
+    NotConfirmed,
+    /// The session already spent [`MIGRATION_CAP`] migrations in the window.
+    CapReached,
+    /// Exhaustion confirmed, but every other account is exhausted, cooled
+    /// down or unauthenticated. The cap slot was given back.
+    NoUsableTarget,
+    /// The session moved to another account.
+    Migrated,
+    /// [`MigrationRefusal::InFlight`]: another mover of this session (a
+    /// migration, the resume door, the respawn receiver) holds its slot — also
+    /// the early exit that sees it before probing
+    /// ([`crate::session::in_flight::is_in_flight`]).
+    RefusedInFlight,
+    /// [`MigrationRefusal::AlreadyMoved`], [`MigrationRefusal::Unknown`] or
+    /// [`MigrationRefusal::Closed`]: there is no pane here left to migrate.
+    RefusedGone,
+    /// The migration ran and failed with no resumed `claude` known to have
+    /// started; the old pane is left in place.
+    Failed,
+    /// [`MigrateError::FailedAfterChild`]: the respawn failed after its resumed
+    /// `claude` may have started, which may still be running beside the old
+    /// pane. The SESSION rests for the cap's 24 h window
+    /// ([`rest_after_child_started`]): every later hint on it ends the same way
+    /// without migrating ([`cap_then_pick`]).
+    FailedAfterChild,
+    /// [`MigrateError::DeclinedByUser`]: the user closed the resumed pane mid-proof.
+    DeclinedByUser,
+    /// [`MigrateError::RespawnDied`] rolled back: every resumed child exited
+    /// before painting (each dead pane closed), and the session is back on the
+    /// still-running old pane, at its limit prompt.
+    RespawnDiedRolledBack,
+    /// [`MigrateError::RespawnDied`] with the old pane gone mid-proof: the
+    /// session ended with its last dead pane.
+    RespawnDiedEnded,
+    /// [`MigrateError::Unconfirmed`] rolled back: the resumed child ran but
+    /// never painted, so its pane was closed (a tree kill) and the session
+    /// kept on the still-running old pane.
+    UnconfirmedRolledBack,
+    /// [`MigrateError::Unconfirmed`] kept: the unpainted new pane holds the row
+    /// on the destination account ([`MigrateError::reached_destination`]).
+    UnconfirmedKept,
+}
+
+/// Whether the grid scanner hints again on a screen whose grid has not changed
+/// since its last hint ([`HintOutcome::retry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// Keep the screen due: it hints again each time the debounce allows.
+    EveryDebounce,
+    /// Hint once more per appearance (per terminal, per grid generation).
+    OncePerAppearance,
+    /// Leave the screen at rest until its grid changes.
+    Never,
+}
+
+impl HintOutcome {
+    /// The retry rule for a screen frozen on the limit message whose hint
+    /// ended this way. No `_` arm, on purpose: a new variant must be
+    /// classified here before the crate compiles.
+    pub(crate) fn retry(self) -> Retry {
+        match self {
+            // Still stranded, and a later hint can move it: a target frees
+            // when its account resets; a failed attempt is a real hop, which
+            // the cap already counts and bounds; and an in-flight migration
+            // that rolls back leaves this pane where it was.
+            Self::NoUsableTarget | Self::Failed | Self::RefusedInFlight => Retry::EveryDebounce,
+            // Rolled back: the session is back on the old pane, at its limit
+            // prompt, and no resumed child of the attempt can still run —
+            // every died attempt's pane exited and was closed, and an
+            // unpainted one was closed with a tree kill. A death whose retry
+            // spawn may have left a child is `FailedAfterChild`, not this. So
+            // it is a failed attempt like `Failed`: a real hop, its cap slot
+            // kept, which bounds these retries (and their own reports) to
+            // `MIGRATION_CAP` per window. A CLI that died mid-reinstall or
+            // painted too slowly is exactly what a later attempt can fix.
+            Self::RespawnDiedRolledBack | Self::UnconfirmedRolledBack => Retry::EveryDebounce,
+            // A probe error reads as exhausted, so this probe positively
+            // reported the account usable. Of the causes — echoed text, a
+            // per-model cap, no sample, a cached sample up to 60 s stale —
+            // only the stale sample is fixed by time, and one retry a debounce
+            // later settles it. Every debounce would poll an idle pane forever.
+            Self::NotConfirmed => Retry::OncePerAppearance,
+            // Done; deliberately braked (the cap is a churn brake, and its own
+            // toast already told the operator); switched off; or nothing this
+            // pane can migrate.
+            Self::Migrated
+            | Self::CapReached
+            | Self::Disabled
+            | Self::NotEligible
+            | Self::RefusedGone => Retry::Never,
+            // The session reached the destination (its unpainted new pane
+            // holds the row, treated like `Migrated`), or ended with its last
+            // dead pane: no session is left on this pane to move. A later hint
+            // here would find no open row anyway (`NotEligible`); `Never` says
+            // so rather than relying on it.
+            Self::UnconfirmedKept | Self::RespawnDiedEnded => Retry::Never,
+            // The user closed the resumed pane mid-proof: they undid this
+            // migration, and retrying it on the same screen would redo what
+            // they just undid. A new grid generation (the pane repainted) may
+            // hint again as usual.
+            Self::DeclinedByUser => Retry::Never,
+            // A resumed child may already be running: the session's row still
+            // names the old pane, so a retry would migrate it again and start a
+            // second `claude --resume` beside the first. The session rests for
+            // the cap's 24 h window, so a repaint, or any later hint on it,
+            // does not migrate either ([`cap_then_pick`]).
+            Self::FailedAfterChild => Retry::Never,
+        }
+    }
+}
+
+/// Whether a hint that ended in `outcome` reports it as
+/// `session-account-migration-skipped`: not when the terminal's previous hint
+/// ended the same way. Each such event is a new error toast and nothing
+/// downstream dedupes them, so a stranded pane retried every debounce would
+/// otherwise toast every five minutes for as long as it stays stranded. The
+/// grid scanner drops a terminal's previous outcome once its screen no longer
+/// shows a limit message (`usage_limit::scan_terminal`), so each stranding
+/// episode is reported once.
+pub(super) fn worth_reporting(previous: Option<HintOutcome>, outcome: HintOutcome) -> bool {
+    previous != Some(outcome)
+}
+
+/// The [`HintOutcome`] a migration that did not succeed ends its hint on. One
+/// arm per [`MigrateError`] sub-case, no `_`: a new error must be classified
+/// here (and so in [`HintOutcome::retry`]) before the crate compiles.
+fn hint_outcome_of(e: &MigrateError) -> HintOutcome {
+    match e {
+        MigrateError::Refused(MigrationRefusal::InFlight { .. }) => HintOutcome::RefusedInFlight,
+        // Seen under the claim; the same rest `cap_then_pick` checks first.
+        // Refused, so its cap slot is given back, as the fast path never takes
+        // one.
+        MigrateError::Refused(MigrationRefusal::ChildMayRun { .. }) => {
+            HintOutcome::FailedAfterChild
+        }
+        MigrateError::Refused(
+            MigrationRefusal::AlreadyMoved { .. }
+            | MigrationRefusal::Unknown { .. }
+            | MigrationRefusal::Closed { .. },
+        ) => HintOutcome::RefusedGone,
+        MigrateError::Failed(_) => HintOutcome::Failed,
+        MigrateError::DeclinedByUser => HintOutcome::DeclinedByUser,
+        MigrateError::FailedAfterChild(_) => HintOutcome::FailedAfterChild,
+        MigrateError::RespawnDied {
+            rolled_back: true, ..
+        } => HintOutcome::RespawnDiedRolledBack,
+        MigrateError::RespawnDied {
+            rolled_back: false, ..
+        } => HintOutcome::RespawnDiedEnded,
+        MigrateError::Unconfirmed {
+            rolled_back: true, ..
+        } => HintOutcome::UnconfirmedRolledBack,
+        MigrateError::Unconfirmed {
+            rolled_back: false, ..
+        } => HintOutcome::UnconfirmedKept,
+    }
+}
+
+/// The cap-then-pick step of a confirmed hint, free of the app handle so it is
+/// testable: take a [`MIGRATION_CAP`] slot at `cap_stamp`, then pick a
+/// migration target with `pick`. Returns the target, or the outcome the hint
+/// ends on, already logged and reported through `emit_skipped`. A no-target
+/// outcome that repeats the terminal's previous one ([`worth_reporting`]) is
+/// logged at debug and not reported again.
+///
+/// First, though, a hint for a session resting after a migration that failed
+/// after its resumed `claude` may have started ([`rest_after_child_started`])
+/// ends [`HintOutcome::FailedAfterChild`], taking no slot and picking nothing:
+/// that child may still be running, so no hint may migrate the session again
+/// beside it until the rest ages out with the cap's rolling window. Not
+/// reported again: the hint that failed already did. The rest is per session,
+/// so no other outcome the terminal records in between ends it.
+///
+/// With no usable target the slot is given back ([`refund_migration_cap`]):
+/// nothing migrated, and the grid scanner retries such a hint every debounce,
+/// so keeping the slot would spend the whole cap in about fifteen minutes and
+/// leave the pane on [`HintOutcome::CapReached`] for a day. Refund rather than
+/// pick before the cap: a successful pick records a handoff
+/// (`pick_migration_target`), which a cap refusing after it would have to undo.
+pub(super) fn cap_then_pick(
+    claude_session_id: &str,
+    src: &str,
+    cap_stamp: i64,
+    previous: Option<HintOutcome>,
+    pick: impl FnOnce() -> Option<String>,
+    emit_skipped: impl FnOnce(&str),
+) -> Result<String, HintOutcome> {
+    if resting_after_child_started(claude_session_id, cap_stamp) {
+        info!(
+            session = %claude_session_id,
+            from = %src,
+            "usage-limit hint on a session whose last migration failed after its resumed claude may have started — not migrating again"
+        );
+        return Err(HintOutcome::FailedAfterChild);
+    }
+    if !migration_cap_permits(claude_session_id, cap_stamp) {
+        warn!(
+            session = %claude_session_id,
+            cap = MIGRATION_CAP,
+            "migration cap reached for this session — not migrating again"
+        );
+        emit_skipped("migration-cap-reached");
+        return Err(HintOutcome::CapReached);
+    }
+    let Some(dst) = pick() else {
+        refund_migration_cap(claude_session_id, cap_stamp);
+        if worth_reporting(previous, HintOutcome::NoUsableTarget) {
+            warn!(
+                session = %claude_session_id,
+                from = %src,
+                "no usable migration target (every other account exhausted/cooled/unauthenticated) — cap slot given back"
+            );
+            emit_skipped("no-usable-target");
+        } else {
+            // A retry of a pane already reported stranded: not news.
+            debug!(
+                session = %claude_session_id,
+                from = %src,
+                "still no usable migration target — cap slot given back"
+            );
+        }
+        return Err(HintOutcome::NoUsableTarget);
+    };
+    Ok(dst)
+}
+
+/// Entry point for a usage-limit hint (run by the grid scanner's hint task,
 /// [`super::usage_limit::scan_grids_once`]). Resolves everything it needs from
 /// the global app handle, mirrors `agent_runtime`'s state-access pattern.
-pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'static str) {
+///
+/// `previous` is how the terminal's last hint ended. The returned outcome is
+/// what the scanner records for the next one, and what decides whether the
+/// screen stays due ([`HintOutcome::retry`]).
+pub async fn handle_usage_limit_hint(
+    terminal_id: String,
+    matched_pattern: &'static str,
+    previous: Option<HintOutcome>,
+) -> HintOutcome {
     use tauri::Manager;
 
     // Migration moves a session between subscription accounts, and those are
     // off while a model gateway is declared (`crate::model_gateway`).
     if crate::model_gateway::gateway_declared() {
         crate::model_gateway::note_subscription_path_off("account_migration");
-        return;
+        return HintOutcome::NotEligible;
     }
 
     let Some(app) = crate::tauri_app_handle::current() else {
-        return;
+        return HintOutcome::NotEligible;
     };
     let Some(store) = app.try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>() else {
-        return;
+        return HintOutcome::NotEligible;
     };
 
     // Only sessions the lifecycle registry knows about can migrate — a plain
@@ -444,7 +910,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             matched_pattern,
             "usage-limit hint on a terminal with no registered Claude session — ignoring"
         );
-        return;
+        return HintOutcome::NotEligible;
     };
 
     // A respawn is already moving this session (a migration proving its new
@@ -460,7 +926,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             session = %record.claude_session_id,
             "usage-limit hint on a session a respawn is already moving — ignoring"
         );
-        return;
+        return HintOutcome::RefusedInFlight;
     }
 
     // Source account: the dir the session launched under, else the runner's
@@ -476,7 +942,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             session = %record.claude_session_id,
             "usage-limit hint but the session's account is unknown — cannot migrate"
         );
-        return;
+        return HintOutcome::NotEligible;
     };
 
     let ai_settings = crate::settings::get_ai_settings();
@@ -485,10 +951,10 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             session = %record.claude_session_id,
             "usage-limit confirmed-candidate but auto-migration is disabled in settings"
         );
-        return;
+        return HintOutcome::Disabled;
     }
     if crate::settings::get_claude_config_dirs().len() < 2 {
-        return; // nothing to migrate to
+        return HintOutcome::NotEligible; // nothing to migrate to
     }
 
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
@@ -503,7 +969,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             matched_pattern,
             "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
         );
-        return;
+        return HintOutcome::NotConfirmed;
     }
 
     // Keep spawn-time selection off the dead account, and repoint the global
@@ -525,24 +991,16 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     crate::ai_provider::pick_best_account();
 
     let cap_stamp = chrono::Utc::now().timestamp_millis();
-    if !migration_cap_permits(&record.claude_session_id, cap_stamp) {
-        warn!(
-            session = %record.claude_session_id,
-            cap = MIGRATION_CAP,
-            "migration cap reached for this session — not migrating again"
-        );
-        emit_skipped(&app, &record, &src, "migration-cap-reached");
-        return;
-    }
-
-    let Some(dst) = crate::ai_provider::pick_migration_target(&src) else {
-        warn!(
-            session = %record.claude_session_id,
-            from = %src,
-            "no usable migration target (every other account exhausted/cooled/unauthenticated)"
-        );
-        emit_skipped(&app, &record, &src, "no-usable-target");
-        return;
+    let dst = match cap_then_pick(
+        &record.claude_session_id,
+        &src,
+        cap_stamp,
+        previous,
+        || crate::ai_provider::pick_migration_target(&src),
+        |reason| emit_skipped(&app, &record, &src, reason),
+    ) {
+        Ok(dst) => dst,
+        Err(outcome) => return outcome,
     };
 
     info!(
@@ -570,49 +1028,93 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     settle_hint_migration(
         &record.claude_session_id,
         cap_stamp,
+        previous,
         result,
         || crate::ai_provider::unrecord_handoff(&dst),
         |reason| emit_skipped(&app, &record, &src, reason),
-    );
+    )
 }
 
-/// The automatic path's answer to the migration's result.
+/// The automatic path's answer to the migration's result, as the hint's
+/// [`HintOutcome`].
 ///
-/// - Migrated: logged.
+/// - Migrated: logged; [`HintOutcome::Migrated`].
 /// - [`MigrateError::Refused`]: another migration of this session holds its
-///   slot, or already moved it (or its record is gone, or closed — no pane
-///   is left to migrate). Nothing failed, so it
+///   slot ([`HintOutcome::RefusedInFlight`]), or already moved it, or its
+///   record is gone, or closed — no pane is left to migrate
+///   ([`HintOutcome::RefusedGone`]). Nothing failed, so it
 ///   is logged at info and NOT reported as `session-account-migration-skipped`
 ///   — the UI would otherwise toast a "migration failed" for a session that
 ///   is migrating or has migrated. The cap slot this hint took at
 ///   `cap_stamp` is given back ([`refund_migration_cap`]) since no migration
 ///   ran; the refund, not a pre-check, because only the guard inside
 ///   [`begin_migration`] decides a refusal race-free.
-/// - [`MigrateError::Failed`]: warned and reported `migration-failed: …`.
+/// - [`MigrateError::Refused`] with [`MigrationRefusal::ChildMayRun`]: the
+///   session rests after a migration or respawn that failed after its resumed
+///   `claude` started, seen under the claim ([`begin_migration`]). WARNED,
+///   since that claude may still be running orphaned, but not reported again
+///   (the failure that started the rest was); [`HintOutcome::FailedAfterChild`],
+///   and the cap slot is given back like every refusal.
+/// - [`MigrateError::Failed`]: warned and reported `migration-failed: …`,
+///   unless the terminal's `previous` hint also failed ([`worth_reporting`]);
+///   [`HintOutcome::Failed`].
+/// - [`MigrateError::FailedAfterChild`]: warned and reported
+///   `migration-failed-after-child-started: …`; [`HintOutcome::FailedAfterChild`].
+///   The migration recorded the session's rest before it released its claim
+///   ([`rest_if_child_may_run`]): no hint
+///   migrates the session again for the cap's rolling window
+///   ([`cap_then_pick`]), and none of those hints reports again. The cap slot
+///   is KEPT, as for `Failed`: a child may have started, so this was a real
+///   migration attempt — what the cap counts and bounds. Refunding it would
+///   let a later appearance try again with the budget of an attempt that
+///   never ran.
+/// - [`MigrateError::DeclinedByUser`]: the user closed the resumed pane
+///   mid-proof. Reported `migration-declined-by-user` (once per episode,
+///   [`worth_reporting`]); [`HintOutcome::DeclinedByUser`], never retried on
+///   that screen. The cap slot is KEPT: the hop happened — a pane was spawned
+///   under the destination account — and the user, not a missing target,
+///   ended it.
 /// - [`MigrateError::RespawnDied`] / [`MigrateError::Unconfirmed`]: warned;
-///   the migration already reported itself (it changed panes), so nothing is
-///   emitted here. The cap slot stays consumed: a dead respawn counts as a
-///   hop.
+///   the migration already reported itself (it changed panes,
+///   [`MigrateError::reported_itself`]), so nothing is emitted here, whatever
+///   `previous` says. The cap slot stays consumed: a dead or unproven respawn
+///   is a hop. That also bounds their own reports: a rolled-back one is
+///   retried ([`HintOutcome::retry`]), but each retry is a hop, so a stranding
+///   episode reports at most [`MIGRATION_CAP`] of them.
 ///
 /// Every arm but an unconfirmed migration that kept the new pane
 /// ([`MigrateError::reached_destination`]) `unrecord_handoff`s: the session
 /// never reached the target this hint picked, so it must not count as a
-/// handoff to it.
-fn settle_hint_migration(
+/// handoff to it. The hint's outcome is [`hint_outcome_of`].
+pub(super) fn settle_hint_migration(
     claude_session_id: &str,
     cap_stamp: i64,
+    previous: Option<HintOutcome>,
     result: Result<MigrationOutcome, MigrateError>,
     unrecord_handoff: impl FnOnce(),
     emit_skipped: impl FnOnce(&str),
-) {
+) -> HintOutcome {
     match result {
-        Ok(outcome) => info!(
-            session = %claude_session_id,
-            new_terminal = %outcome.new_terminal_id,
-            from = %outcome.from_config_dir,
-            to = %outcome.to_config_dir,
-            "session migrated"
-        ),
+        Ok(outcome) => {
+            info!(
+                session = %claude_session_id,
+                new_terminal = %outcome.new_terminal_id,
+                from = %outcome.from_config_dir,
+                to = %outcome.to_config_dir,
+                "session migrated"
+            );
+            HintOutcome::Migrated
+        }
+        Err(MigrateError::Refused(refusal @ MigrationRefusal::ChildMayRun { .. })) => {
+            warn!(
+                session = %claude_session_id,
+                %refusal,
+                "usage-limit migration not started — the session rests after a migration or respawn that failed after its resumed claude started; that claude may still be running (orphaned)"
+            );
+            unrecord_handoff();
+            refund_migration_cap(claude_session_id, cap_stamp);
+            hint_outcome_of(&MigrateError::Refused(refusal))
+        }
         Err(MigrateError::Refused(refusal)) => {
             info!(
                 session = %claude_session_id,
@@ -621,6 +1123,7 @@ fn settle_hint_migration(
             );
             unrecord_handoff();
             refund_migration_cap(claude_session_id, cap_stamp);
+            hint_outcome_of(&MigrateError::Refused(refusal))
         }
         Err(e) => {
             warn!(
@@ -631,9 +1134,11 @@ fn settle_hint_migration(
             if !e.reached_destination() {
                 unrecord_handoff();
             }
-            if !e.reported_itself() {
+            let outcome = hint_outcome_of(&e);
+            if !e.reported_itself() && worth_reporting(previous, outcome) {
                 emit_skipped(&e.skip_reason());
             }
+            outcome
         }
     }
 }
@@ -1171,12 +1676,16 @@ pub(crate) async fn sniff_transcript_model(path: std::path::PathBuf) -> Option<S
 /// session under a different account than it ran on. It is never a
 /// `switch_claude_account` mutation, which would leak this one spawn's account
 /// choice into every later spawn on the box.
+///
+/// A failure keeps its [`SpawnFailure::child_started`] bit: after one that
+/// started a child, the resumed `claude` may outlive the error, so a caller
+/// must not simply spawn the session again.
 pub(crate) fn spawn_resumed_pane(
     app: &tauri::AppHandle,
     terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
     session_registry: &std::sync::Arc<crate::session::SessionRegistry>,
     spec: ResumeSpawn<'_>,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), SpawnFailure> {
     let model = spec.model;
     // Compose the respawn argv through the shared launch seam so the operator's
     // global + per-account (destination) launch flags layer onto the required
@@ -1262,7 +1771,8 @@ pub(crate) fn spawn_resumed_pane(
         Some(spec.page_id),
         spec.resource_override,
     )
-    .map_err(String::from)
+    // No isolated edit context was handed in, so the failure is all there is.
+    .map_err(|backend| backend.failure)
 }
 
 /// The full PTY-child argv of the `--resume` respawn. With no operator launch
@@ -1620,12 +2130,14 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
         &self.record.claude_session_id
     }
 
-    async fn spawn_next(&mut self) -> Result<String, String> {
+    async fn spawn_next(&mut self) -> Result<String, SpawnFailure> {
         // The async pre-step (D3.1): the ABSOLUTE binary, retried, never bare.
+        // No binary, no child.
         let claude_bin = crate::claude_cli_spawn::resolve_resume_claude_bin(
             &crate::claude_cli_spawn::RESUME_RESOLVE_DELAYS,
         )
-        .await?;
+        .await
+        .map_err(SpawnFailure::before_child)?;
         // Model is sniffed off the SOURCE transcript: `--resume` alone
         // restores the conversation but the model falls back to the target
         // account's default. The read is blocking I/O, so it goes to the
@@ -1879,18 +2391,29 @@ async fn confirm_migration(
         crate::agent_runtime::restore_continuation_registration(host, c, reservation);
     });
 
+    // A spawn that failed after its resumed `claude` started — the first, or
+    // the retry that ended the retries, whatever the respawn ended as after
+    // it (a death, or a user close) — may have left that child running with
+    // no pane. Whatever else happened, the session must not be migrated again
+    // beside it: `FailedAfterChild`, which the automatic path rests on
+    // (`cap_then_pick`). Not reported here: the caller reports it.
+    // Rested HERE, while `_in_flight` still holds the session, stamped now.
+    if let Some(err) = rested_failed_after_child(
+        &record.claude_session_id,
+        &outcome,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        warn!(session = %record.claude_session_id, "{err}");
+        return Err(err);
+    }
     let new_terminal_id = match outcome {
         RespawnOutcome::Alive { terminal_id, .. } => terminal_id,
-        RespawnOutcome::NotSpawned(e) => return Err(MigrateError::Failed(e)),
-        // The user closed the new pane while it was being proven: no retry;
-        // the session is back on the old pane if that still runs, else the
-        // user's close ended it.
-        RespawnOutcome::ClosedByUser { .. } => {
-            return Err(MigrateError::Failed(
-                "closed_by_user: the user closed the resumed pane mid-migration — nothing retried; the session is back on the old pane if that pane still runs, otherwise the close ended it"
-                    .to_string(),
-            ))
-        }
+        // `child_may_run` above took every child-started failure.
+        RespawnOutcome::NotSpawned(e) => return Err(MigrateError::Failed(e.message)),
+        // The user closed the new pane while it was being proven: the
+        // session is back on the old pane if that still runs, else the user's
+        // close ended it. Not retried on that screen (`DeclinedByUser`).
+        RespawnOutcome::ClosedByUser { .. } => return Err(MigrateError::DeclinedByUser),
         // The old pane closed (before the first spawn, or by the user during
         // the proof): the same fact `still_migratable` refuses up front, met
         // one step later — a refusal, not a failure, so the auto path reports
@@ -1904,10 +2427,12 @@ async fn confirm_migration(
             exit_code,
             attempts,
             retry_spawn_error,
+            rolled_back,
         } => {
             let err = MigrateError::RespawnDied {
                 exit_code,
                 attempts,
+                rolled_back,
             };
             warn!(
                 session = %record.claude_session_id,
@@ -2687,22 +3212,25 @@ mod tests {
 
     // ---- the auto path's answer to a refusal (W1) ----------------------------
 
-    /// What `settle_hint_migration` did: (unrecorded, skipped reason).
+    /// What `settle_hint_migration` did after the terminal's `previous` hint:
+    /// (unrecorded, skipped reason, the hint's outcome).
     fn settle(
         sid: &str,
         stamp: i64,
+        previous: Option<HintOutcome>,
         result: Result<MigrationOutcome, MigrateError>,
-    ) -> (bool, Option<String>) {
+    ) -> (bool, Option<String>, HintOutcome) {
         let mut unrecorded = false;
         let mut skipped = None;
-        settle_hint_migration(
+        let outcome = settle_hint_migration(
             sid,
             stamp,
+            previous,
             result,
             || unrecorded = true,
             |reason| skipped = Some(reason.to_string()),
         );
-        (unrecorded, skipped)
+        (unrecorded, skipped, outcome)
     }
 
     /// How many more migrations the cap admits for `sid` at `now` (consumes
@@ -2716,23 +3244,43 @@ mod tests {
     #[test]
     fn a_refused_auto_migration_reports_nothing_and_gives_its_cap_slot_back() {
         let base = 1_760_000_000_000i64;
-        for (i, refusal) in [
-            MigrationRefusal::InFlight {
-                session: "s".to_string(),
-                holder: IN_FLIGHT_HOLDER,
-            },
-            MigrationRefusal::AlreadyMoved {
-                to: "C:/b".to_string(),
-            },
+        for (i, (refusal, expected)) in [
+            (
+                MigrationRefusal::InFlight {
+                    session: "s".to_string(),
+                    holder: IN_FLIGHT_HOLDER,
+                },
+                HintOutcome::RefusedInFlight,
+            ),
+            (
+                MigrationRefusal::AlreadyMoved {
+                    to: "C:/b".to_string(),
+                },
+                HintOutcome::RefusedGone,
+            ),
+            (
+                MigrationRefusal::Unknown {
+                    session: "s".to_string(),
+                },
+                HintOutcome::RefusedGone,
+            ),
+            (
+                MigrationRefusal::Closed {
+                    session: "s".to_string(),
+                },
+                HintOutcome::RefusedGone,
+            ),
         ]
         .into_iter()
         .enumerate()
         {
             let sid = format!("test/account_migration/refused-{i}");
             assert!(migration_cap_permits(&sid, base), "the hint takes a slot");
-            let (unrecorded, skipped) = settle(&sid, base, Err(MigrateError::Refused(refusal)));
+            let (unrecorded, skipped, outcome) =
+                settle(&sid, base, None, Err(MigrateError::Refused(refusal)));
             assert!(unrecorded, "the picked target must not count as a handoff");
             assert_eq!(skipped, None, "no session-account-migration-skipped");
+            assert_eq!(outcome, expected);
             assert_eq!(
                 cap_left(&sid, base + 10),
                 MIGRATION_CAP,
@@ -2777,9 +3325,11 @@ mod tests {
 
         let base = 1_760_000_000_000i64;
         assert!(migration_cap_permits(sid, base), "the hint takes a slot");
-        let (unrecorded, skipped) = settle(sid, base, Err(MigrateError::Refused(refusal)));
+        let (unrecorded, skipped, outcome) =
+            settle(sid, base, None, Err(MigrateError::Refused(refusal)));
         assert!(unrecorded);
         assert_eq!(skipped, None, "no session-account-migration-skipped");
+        assert_eq!(outcome, HintOutcome::RefusedGone);
         assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP);
     }
 
@@ -2856,13 +3406,15 @@ mod tests {
         );
         let base = 1_770_000_000_000i64;
         assert!(migration_cap_permits(sid, base));
-        let (unrecorded, skipped) = settle(
+        let (unrecorded, skipped, outcome) = settle(
             sid,
             base,
+            None,
             out.map(|()| -> MigrationOutcome { unreachable!() }),
         );
         assert!(unrecorded, "a late refusal gives the cap slot back");
         assert_eq!(skipped, None, "and reports nothing");
+        assert_eq!(outcome, HintOutcome::RefusedGone);
     }
 
     #[test]
@@ -2870,13 +3422,15 @@ mod tests {
         let base = 1_760_000_000_000i64;
         let sid = "test/account_migration/failed";
         assert!(migration_cap_permits(sid, base));
-        let (unrecorded, skipped) = settle(
+        let (unrecorded, skipped, outcome) = settle(
             sid,
             base,
+            None,
             Err(MigrateError::Failed("respawn failed".to_string())),
         );
         assert!(unrecorded);
         assert_eq!(skipped.as_deref(), Some("migration-failed: respawn failed"));
+        assert_eq!(outcome, HintOutcome::Failed);
         assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP - 1);
     }
 
@@ -2917,10 +3471,18 @@ mod tests {
         .reached_destination());
         for e in [
             MigrateError::Failed("spawn failed".into()),
+            MigrateError::FailedAfterChild("reader wiring failed".into()),
+            MigrateError::DeclinedByUser,
             MigrateError::Refused(MigrationRefusal::AlreadyMoved { to: "C:/b".into() }),
             MigrateError::RespawnDied {
                 exit_code: Some(127),
                 attempts: 3,
+                rolled_back: true,
+            },
+            MigrateError::RespawnDied {
+                exit_code: Some(127),
+                attempts: 3,
+                rolled_back: false,
             },
             MigrateError::Unconfirmed {
                 new_terminal_id: "new-1".into(),
@@ -2932,18 +3494,36 @@ mod tests {
     }
 
     /// The died / unconfirmed arms reported themselves (they changed panes):
-    /// the auto path emits nothing more, keeps the cap slot (a dead respawn
-    /// is a hop), and withdraws the handoff unless the new pane kept the row.
+    /// the auto path emits nothing more — whatever the previous hint was —
+    /// keeps the cap slot (a dead respawn is a hop), and withdraws the handoff
+    /// unless the new pane kept the row. Each gets its own outcome, whose
+    /// retry rule follows where the session ended up: back on the old pane
+    /// with no resumed child left running is retried; on the destination, or
+    /// ended, is not. Mutation: emit in the self-reported arms
+    /// (`reported_itself` ignored), or classify a rolled-back arm as `Never`.
     #[test]
     fn a_died_or_unconfirmed_auto_migration_is_not_reported_twice() {
         let base = 1_780_000_000_000i64;
-        for (i, (e, handoff_withdrawn)) in [
+        for (i, (e, handoff_withdrawn, expected, rule)) in [
             (
                 MigrateError::RespawnDied {
                     exit_code: Some(127),
                     attempts: 3,
+                    rolled_back: true,
                 },
                 true,
+                HintOutcome::RespawnDiedRolledBack,
+                Retry::EveryDebounce,
+            ),
+            (
+                MigrateError::RespawnDied {
+                    exit_code: Some(127),
+                    attempts: 3,
+                    rolled_back: false,
+                },
+                true,
+                HintOutcome::RespawnDiedEnded,
+                Retry::Never,
             ),
             (
                 MigrateError::Unconfirmed {
@@ -2951,6 +3531,8 @@ mod tests {
                     rolled_back: true,
                 },
                 true,
+                HintOutcome::UnconfirmedRolledBack,
+                Retry::EveryDebounce,
             ),
             (
                 MigrateError::Unconfirmed {
@@ -2958,17 +3540,460 @@ mod tests {
                     rolled_back: false,
                 },
                 false,
+                HintOutcome::UnconfirmedKept,
+                Retry::Never,
             ),
         ]
         .into_iter()
         .enumerate()
         {
-            let sid = format!("test/account_migration/self-reported-{i}");
-            assert!(migration_cap_permits(&sid, base));
-            let (unrecorded, skipped) = settle(&sid, base, Err(e));
-            assert_eq!(unrecorded, handoff_withdrawn, "case {i}");
-            assert_eq!(skipped, None, "case {i}: reported once, by the migration");
-            assert_eq!(cap_left(&sid, base + 10), MIGRATION_CAP - 1, "case {i}");
+            for previous in [None, Some(HintOutcome::Failed), Some(expected)] {
+                let sid = format!("test/account_migration/self-reported-{i}-{previous:?}");
+                assert!(migration_cap_permits(&sid, base));
+                let (unrecorded, skipped, outcome) = settle(&sid, base, previous, Err(e.clone()));
+                assert_eq!(unrecorded, handoff_withdrawn, "case {i}");
+                assert_eq!(
+                    skipped, None,
+                    "case {i} after {previous:?}: reported once, by the migration"
+                );
+                assert_eq!(outcome, expected, "case {i}");
+                assert_eq!(outcome.retry(), rule, "case {i}");
+                assert_eq!(cap_left(&sid, base + 10), MIGRATION_CAP - 1, "case {i}");
+            }
+        }
+    }
+
+    /// A respawn that failed AFTER its resumed `claude` may have started is
+    /// never retried: the session's row still names the old pane, so a retry
+    /// would resume it again beside that child. The typed `SpawnFailure`
+    /// carries the bit into `MigrateError`; a failure before the child keeps
+    /// its retry, and both keep their cap slot. Mutation: settle
+    /// `FailedAfterChild` as the retryable `HintOutcome::Failed`.
+    #[test]
+    fn a_migration_whose_resumed_child_started_is_never_retried() {
+        let base = 1_790_000_000_000i64;
+        let sid = "test/account_migration/failed-after-child";
+        assert!(migration_cap_permits(sid, base), "the hint takes a slot");
+        let (unrecorded, skipped, outcome) = settle(
+            sid,
+            base,
+            None,
+            Err(MigrateError::FailedAfterChild(
+                "terminal reader wiring failed".to_string(),
+            )),
+        );
+        assert_eq!(outcome, HintOutcome::FailedAfterChild);
+        assert_eq!(outcome.retry(), Retry::Never);
+        assert_eq!(
+            skipped.as_deref(),
+            Some("migration-failed-after-child-started: terminal reader wiring failed")
+        );
+        assert!(unrecorded, "the migration did not complete: not a handoff");
+        assert_eq!(
+            cap_left(sid, base + 10),
+            MIGRATION_CAP - 1,
+            "a started child was a real attempt: its slot is kept"
+        );
+
+        let sid = "test/account_migration/failed-before-child";
+        assert!(migration_cap_permits(sid, base), "the hint takes a slot");
+        let (_, _, outcome) = settle(
+            sid,
+            base,
+            None,
+            Err(MigrateError::Failed("PTY open failed".to_string())),
+        );
+        assert_eq!(outcome, HintOutcome::Failed);
+        assert_eq!(outcome.retry(), Retry::EveryDebounce);
+    }
+
+    /// A child-started failure rests its SESSION: every later hint ends
+    /// `FailedAfterChild` without taking a cap slot, picking a target or
+    /// reporting, whatever the terminal recorded in between — a
+    /// `NotConfirmed`, a `RefusedInFlight`, or no outcome at all (a scan
+    /// without the limit text cleared it) — until the cap's rolling window has
+    /// passed. Mutation: neutralise the rest check in `cap_then_pick` — the
+    /// next hint then picks (and panics here).
+    #[test]
+    fn a_child_started_failure_rests_its_session_for_the_cap_window() {
+        let sid = "test/account_migration/rest-after-child";
+        let base = 1_795_000_000_000i64;
+        assert!(migration_cap_permits(sid, base), "the hint takes a slot");
+        // The migration rests the session under its claim
+        // (`rest_if_child_may_run`), then the hint settles.
+        rest_after_child_started(sid, base);
+        let (_, _, outcome) = settle(
+            sid,
+            base,
+            None,
+            Err(MigrateError::FailedAfterChild(
+                "reader wiring failed".into(),
+            )),
+        );
+        assert_eq!(outcome, HintOutcome::FailedAfterChild);
+
+        for (i, previous) in [
+            Some(HintOutcome::FailedAfterChild),
+            Some(HintOutcome::NotConfirmed),
+            Some(HintOutcome::RefusedInFlight),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut skipped = None;
+            let picked = cap_then_pick(
+                sid,
+                "C:/a",
+                base + 1_000 * (i as i64 + 1),
+                previous,
+                || panic!("a hint after a child-started failure must not pick a target"),
+                |reason| skipped = Some(reason.to_string()),
+            );
+            assert_eq!(
+                picked,
+                Err(HintOutcome::FailedAfterChild),
+                "after {previous:?}"
+            );
+            assert_eq!(skipped, None, "the hint that failed already reported it");
+        }
+        assert_eq!(
+            cap_left(sid, base + 10_000),
+            MIGRATION_CAP - 1,
+            "only the failed migration's own slot was taken"
+        );
+
+        // The rest is per session: another session migrates as usual...
+        let other = "test/account_migration/rest-after-child-other-session";
+        let (picked, _) = cap_pick(other, base, None, Some("C:/b"));
+        assert_eq!(picked, Ok("C:/b".to_string()));
+        // ...and this one once the cap's rolling window has passed.
+        let later = base + MIGRATION_CAP_WINDOW_MS + 1;
+        let (picked, _) = cap_pick(sid, later, None, Some("C:/b"));
+        assert_eq!(picked, Ok("C:/b".to_string()));
+    }
+
+    /// A rest another mover records AFTER a caller's fast-path check and
+    /// BEFORE its claim is honoured under the claim: `begin_migration` refuses
+    /// (`ChildMayRun`, releasing the claim), and the hint path settles that
+    /// refusal as `FailedAfterChild`, giving its cap slot back and reporting
+    /// nothing. Mutation: drop the re-check in `begin_migration`.
+    #[test]
+    fn a_rest_recorded_after_the_fast_path_is_honoured_under_the_claim() {
+        let sid = "test/account_migration/rest-under-claim";
+        let rec = session_record(sid, "t-1", Some("C:/a"));
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            !resting_after_child_started(sid, now),
+            "the fast path passes"
+        );
+        // Another mover's child-started failure lands in between.
+        rest_after_child_started(sid, now);
+        let refusal = begin_migration(&rec, "C:/a", || Some(rec.clone())).unwrap_err();
+        assert_eq!(
+            refusal,
+            MigrationRefusal::ChildMayRun {
+                session: sid.to_string()
+            }
+        );
+        assert!(refusal.to_string().contains(CHILD_MAY_RUN_WARNING));
+        assert!(
+            !crate::session::in_flight::is_in_flight(sid),
+            "the claim is released with the refusal"
+        );
+
+        let stamp = 1_799_000_000_000i64;
+        assert!(migration_cap_permits(sid, stamp), "the hint took a slot");
+        let (unrecorded, skipped, outcome) =
+            settle(sid, stamp, None, Err(MigrateError::Refused(refusal)));
+        assert!(unrecorded);
+        assert_eq!(skipped, None);
+        assert_eq!(outcome, HintOutcome::FailedAfterChild);
+        assert_eq!(cap_left(sid, stamp + 10), MIGRATION_CAP, "slot given back");
+    }
+
+    /// The migration path's ONE rest record: `rested_failed_after_child`
+    /// rests the session AND builds `FailedAfterChild` for a child-started
+    /// outcome, and does neither otherwise. Mutation: build the error from a
+    /// bare `outcome.child_may_run()` without resting.
+    #[test]
+    fn a_migration_whose_child_may_run_rests_the_session_and_fails_after_child() {
+        use super::super::respawn_liveness::RespawnOutcome;
+        let now = 1_799_800_000_000i64;
+        let sid = "test/account_migration/rested-failed-after-child";
+        let outcome = RespawnOutcome::Died {
+            exit_code: Some(127),
+            attempts: 2,
+            retry_spawn_error: Some(SpawnFailure::after_child("wiring failed")),
+            rolled_back: true,
+        };
+        let err = rested_failed_after_child(sid, &outcome, now).expect("a child may run");
+        let MigrateError::FailedAfterChild(text) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            text.starts_with("respawn-died: exit 127 after 2 attempts;"),
+            "{text}"
+        );
+        assert!(text.ends_with("wiring failed"), "{text}");
+        assert!(
+            resting_after_child_started(sid, now + 1),
+            "the migration rested the session"
+        );
+
+        let spared = "test/account_migration/rested-no-child";
+        let outcome = RespawnOutcome::NotSpawned(SpawnFailure::before_child("pty open failed"));
+        assert!(rested_failed_after_child(spared, &outcome, now).is_none());
+        assert!(!resting_after_child_started(spared, now));
+    }
+
+    /// Every mover rests the session through `rest_if_child_may_run`: an
+    /// outcome carrying a child-started failure rests it, one that does not
+    /// leaves it alone.
+    #[test]
+    fn only_a_child_started_outcome_rests_the_session() {
+        use super::super::respawn_liveness::RespawnOutcome;
+        let now = 1_799_500_000_000i64;
+        let rested = "test/account_migration/rest-if-child";
+        let outcome = RespawnOutcome::NotSpawned(SpawnFailure::after_child("wiring failed"));
+        assert!(rest_if_child_may_run(rested, &outcome, now).is_some());
+        assert!(resting_after_child_started(rested, now));
+        let spared = "test/account_migration/rest-if-no-child";
+        let outcome = RespawnOutcome::NotSpawned(SpawnFailure::before_child("pty open failed"));
+        assert!(rest_if_child_may_run(spared, &outcome, now).is_none());
+        assert!(!resting_after_child_started(spared, now));
+    }
+
+    /// The manual command's check: a resting session is refused with the shared
+    /// warning; another session, or this one after the window, is not.
+    /// Mutation: make `child_started_rest_refusal` always `None`.
+    #[test]
+    fn a_resting_session_refuses_a_manual_migration() {
+        let sid = "test/account_migration/manual-refused";
+        let base = 1_798_000_000_000i64;
+        assert_eq!(child_started_rest_refusal(sid, base), None);
+        rest_after_child_started(sid, base);
+        let refusal = child_started_rest_refusal(sid, base + 60_000).expect("refused");
+        assert!(refusal.contains(CHILD_MAY_RUN_WARNING), "{refusal}");
+        assert_eq!(
+            child_started_rest_refusal("test/account_migration/manual-other", base),
+            None
+        );
+        assert_eq!(
+            child_started_rest_refusal(sid, base + MIGRATION_CAP_WINDOW_MS + 1),
+            None,
+            "the time bound ends the rest"
+        );
+    }
+
+    /// Recording one session's rest never ends another's, however far apart
+    /// their stamps are (two tests sharing this process-global map once did
+    /// exactly that). Mutation: evict every stale entry on insert.
+    #[test]
+    fn recording_a_rest_never_evicts_another_sessions_rest() {
+        let early = "test/account_migration/rest-early";
+        let late = "test/account_migration/rest-late";
+        let base = 1_700_000_000_000i64;
+        rest_after_child_started(early, base);
+        rest_after_child_started(late, base + 10 * MIGRATION_CAP_WINDOW_MS);
+        assert!(resting_after_child_started(early, base + 1_000));
+    }
+
+    /// A user who closes the resumed pane mid-proof undid the migration: it is
+    /// reported once, never retried on that screen, keeps its cap slot (the
+    /// hop happened) and withdraws the handoff. Mutation: classify
+    /// `DeclinedByUser` as `Retry::EveryDebounce`, or refund its slot.
+    #[test]
+    fn a_migration_the_user_declined_is_not_retried_and_keeps_its_cap_slot() {
+        let base = 1_796_000_000_000i64;
+        let sid = "test/account_migration/declined";
+        assert!(migration_cap_permits(sid, base), "the hint takes a slot");
+        let (unrecorded, skipped, outcome) =
+            settle(sid, base, None, Err(MigrateError::DeclinedByUser));
+        assert!(unrecorded, "the session never reached the target");
+        assert_eq!(skipped.as_deref(), Some("migration-declined-by-user"));
+        assert_eq!(outcome, HintOutcome::DeclinedByUser);
+        assert_eq!(outcome.retry(), Retry::Never);
+        assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP - 1);
+        assert!(MigrateError::DeclinedByUser
+            .to_string()
+            .contains("not retried automatically"));
+    }
+
+    /// The manual command surfaces `Display`: a child-started failure must
+    /// warn that a resumed claude may still run and must not be retried by hand.
+    #[test]
+    fn a_failed_after_child_error_warns_against_a_retry_by_hand() {
+        let text = MigrateError::FailedAfterChild("reader wiring failed".into()).to_string();
+        assert!(text.starts_with("reader wiring failed"), "{text}");
+        assert!(text.contains("may still be running"), "{text}");
+        assert!(text.contains("do not"), "{text}");
+    }
+
+    /// A migration that ran keeps its cap slot and its handoff. Mutation: refund
+    /// the slot in the `Ok` arm too — the cap then reads untouched.
+    #[test]
+    fn a_migrated_hint_keeps_its_cap_slot_and_handoff_and_reports_nothing() {
+        let sid = "test/account_migration/migrated";
+        let base = 1_780_000_000_000i64;
+        assert!(migration_cap_permits(sid, base), "the hint takes a slot");
+        let (unrecorded, skipped, outcome) = settle(
+            sid,
+            base,
+            None,
+            Ok(MigrationOutcome {
+                new_terminal_id: "t-2".to_string(),
+                from_config_dir: "C:/a".to_string(),
+                to_config_dir: "C:/b".to_string(),
+            }),
+        );
+        assert!(!unrecorded, "the session reached the target it picked");
+        assert_eq!(skipped, None);
+        assert_eq!(outcome, HintOutcome::Migrated);
+        assert_eq!(
+            cap_left(sid, base + 10),
+            MIGRATION_CAP - 1,
+            "the migration that ran keeps its slot"
+        );
+    }
+
+    // ---- a frozen limit screen whose hint did not migrate -------------------
+    // Plan 2026-11-11-a-frozen-usage-limit-screen-whose-hint-did-not-migrate-is-never-rescanned.
+
+    /// What `cap_then_pick` did with a pick that finds `target`, after the
+    /// terminal's `previous` hint: (its result, the skipped reason it reported).
+    fn cap_pick(
+        sid: &str,
+        stamp: i64,
+        previous: Option<HintOutcome>,
+        target: Option<&str>,
+    ) -> (Result<String, HintOutcome>, Option<String>) {
+        let mut skipped = None;
+        let picked = cap_then_pick(
+            sid,
+            "C:/a",
+            stamp,
+            previous,
+            || target.map(str::to_string),
+            |reason| skipped = Some(reason.to_string()),
+        );
+        (picked, skipped)
+    }
+
+    /// (a) A frozen no-target pane is retried every debounce, so a no-target
+    /// hint must not spend a cap slot. Mutation: delete the refund in
+    /// `cap_then_pick` — the fourth hint then reads `CapReached`.
+    #[test]
+    fn no_target_hints_spend_no_migration_cap() {
+        let sid = "test/account_migration/no-target-refund";
+        let base = 1_780_000_000_000i64;
+        for i in 0..4 {
+            let (picked, _) = cap_pick(sid, base + i, None, None);
+            assert_eq!(picked, Err(HintOutcome::NoUsableTarget), "hint {i}");
+        }
+        assert_eq!(
+            cap_left(sid, base + 10),
+            3,
+            "four no-target hints left every slot"
+        );
+    }
+
+    /// The other two arms of the cap-then-pick seam: a hint that finds a
+    /// target keeps its slot for the migration about to run, and a capped hint
+    /// is reported and picks nothing — a pick records a handoff.
+    #[test]
+    fn a_picked_target_keeps_its_cap_slot_and_a_capped_hint_picks_nothing() {
+        let sid = "test/account_migration/picked";
+        let base = 1_780_000_000_000i64;
+        let (picked, skipped) = cap_pick(sid, base, None, Some("C:/b"));
+        assert_eq!(picked, Ok("C:/b".to_string()));
+        assert_eq!(skipped, None);
+        assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP - 1);
+
+        // `cap_left` spent the rest of the cap.
+        let mut skipped = None;
+        let picked = cap_then_pick(
+            sid,
+            "C:/a",
+            base + 20,
+            None,
+            || panic!("a capped hint must not pick a target"),
+            |reason| skipped = Some(reason.to_string()),
+        );
+        assert_eq!(picked, Err(HintOutcome::CapReached));
+        assert_eq!(skipped.as_deref(), Some("migration-cap-reached"));
+    }
+
+    /// (b) Mutation: flip any arm of `HintOutcome::retry`.
+    #[test]
+    fn every_hint_outcome_has_its_retry_rule() {
+        let table = [
+            (HintOutcome::NotEligible, Retry::Never),
+            (HintOutcome::Disabled, Retry::Never),
+            (HintOutcome::NotConfirmed, Retry::OncePerAppearance),
+            (HintOutcome::CapReached, Retry::Never),
+            (HintOutcome::NoUsableTarget, Retry::EveryDebounce),
+            (HintOutcome::Migrated, Retry::Never),
+            (HintOutcome::RefusedInFlight, Retry::EveryDebounce),
+            (HintOutcome::RefusedGone, Retry::Never),
+            (HintOutcome::Failed, Retry::EveryDebounce),
+            (HintOutcome::FailedAfterChild, Retry::Never),
+            (HintOutcome::RespawnDiedRolledBack, Retry::EveryDebounce),
+            (HintOutcome::RespawnDiedEnded, Retry::Never),
+            (HintOutcome::UnconfirmedRolledBack, Retry::EveryDebounce),
+            (HintOutcome::UnconfirmedKept, Retry::Never),
+            (HintOutcome::DeclinedByUser, Retry::Never),
+        ];
+        for (i, (outcome, rule)) in table.iter().enumerate() {
+            assert!(
+                table[..i].iter().all(|(earlier, _)| earlier != outcome),
+                "{outcome:?} is listed twice"
+            );
+            assert_eq!(outcome.retry(), *rule, "{outcome:?}");
+        }
+    }
+
+    /// (e) A retried hint that ends the way the terminal's previous one did is
+    /// not reported again, on both report sites. Mutation: remove the
+    /// `previous` check (`worth_reporting` always true).
+    #[test]
+    fn a_stranded_pane_reports_its_outcome_once() {
+        let base = 1_780_000_000_000i64;
+        let sid = "test/account_migration/report-once-no-target";
+        for (previous, reported) in [
+            (Some(HintOutcome::NoUsableTarget), false),
+            (None, true),
+            (Some(HintOutcome::NotConfirmed), true),
+            (Some(HintOutcome::Failed), true),
+        ] {
+            let (picked, skipped) = cap_pick(sid, base, previous, None);
+            assert_eq!(picked, Err(HintOutcome::NoUsableTarget));
+            assert_eq!(
+                skipped.as_deref(),
+                reported.then_some("no-usable-target"),
+                "no target after {previous:?}"
+            );
+        }
+
+        let sid = "test/account_migration/report-once-failed";
+        for (previous, reported) in [
+            (Some(HintOutcome::Failed), false),
+            (None, true),
+            (Some(HintOutcome::NoUsableTarget), true),
+        ] {
+            let (unrecorded, skipped, outcome) = settle(
+                sid,
+                base,
+                previous,
+                Err(MigrateError::Failed("respawn failed".to_string())),
+            );
+            assert!(unrecorded);
+            assert_eq!(outcome, HintOutcome::Failed);
+            assert_eq!(
+                skipped.as_deref(),
+                reported.then_some("migration-failed: respawn failed"),
+                "failed after {previous:?}"
+            );
         }
     }
 
