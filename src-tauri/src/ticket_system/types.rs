@@ -109,11 +109,25 @@ pub trait TicketProvider: Send + Sync {
         config: &TicketProviderConfig,
     ) -> Result<(), String>;
 
-    /// Update ticket state.
+    /// Update ticket state. Used for the completion write-back, which nothing
+    /// retries — a provider must not defer it for budget.
     async fn update_state(
         &self,
         ticket_id: &str,
         state: TicketState,
         config: &TicketProviderConfig,
     ) -> Result<(), String>;
+
+    /// Mark a ticket in progress from the serial sync loop. Unlike
+    /// [`Self::update_state`] this must never block the loop on a rate-limit
+    /// budget: a provider with one may DEFER it (return an error without
+    /// sending) rather than sleep. Defaults to `update_state(InProgress)`.
+    async fn mark_in_progress(
+        &self,
+        ticket_id: &str,
+        config: &TicketProviderConfig,
+    ) -> Result<(), String> {
+        self.update_state(ticket_id, TicketState::InProgress, config)
+            .await
+    }
 }
