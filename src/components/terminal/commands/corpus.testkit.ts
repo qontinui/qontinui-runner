@@ -454,6 +454,9 @@ export const ARG_FILL: Record<string, string | number> = {
   tenant: "acme",
   // The mocked session's own page, so the `valid` bag targets a page that exists.
   page: "page-1",
+  // The default origin, so the `valid` bag is the request every caller sent
+  // before `/layout --origin` existed.
+  origin: "operator",
 };
 
 /** Bare argument names an action declares — a `--flag` under its bare name. */

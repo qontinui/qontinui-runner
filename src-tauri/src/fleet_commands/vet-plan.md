@@ -1050,7 +1050,7 @@ construction (see above). A `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a
 foreign `IN PROGRESS` whose session left PRs (unless it is case 2b's
 gate-delegated stamp and this run is that hold gate's continuation), still
 stops there; a complete plan
-still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
+still stamped `VETTED` or `DRAFT` (including the `— partial` / `— not started` forms, or a legacy `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
 remaining MECHANICAL guard is `/implement-plan` Step 0.45 check 2 — a `git log
 origin/main -20` grep that misses anything older — though §2's claim
 verification may also notice the plan's premises are already met. It is accepted because a false *"do NOT
@@ -2010,13 +2010,14 @@ and the body. Before writing your stamp:
    declaration, it counts.
 2. Use `Edit` to **delete every existing status-adjacent blockquote** —
    even if it came from a different skill (`/verify-plan-status` writes
-   `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
+   `VETTED/DRAFT <date> — not started` / `— partial: …`, and older runs
+   left legacy `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
    `SHIPPED`; older `/vet-plan` runs may have left `Status: VETTED ...`).
    Yours replaces all of them.
 3. Then `Edit` again to insert your single new `> **Status: VETTED …`
    block.
 4. If folding in history is useful (e.g., the plan was previously
-   `NOT STARTED` per a verify pass, or had earlier verifier findings
+   not started per a verify pass, or had earlier verifier findings
    in a separate `> **Edit:` block), include the salient info in
    **one trailing line inside your new block**, prefixed `History:` or
    `Previously:`. Never as a sibling blockquote. A re-vet that lifts a hold
@@ -2049,10 +2050,10 @@ and the body. Before writing your stamp:
    longer shows.
 
 When `/vet-plan` and `/verify-plan-status` disagree on what the status
-should be (the plan is both VETTED *and* NOT STARTED — a vetted plan
+should be (the plan is both vetted *and* not started — a vetted plan
 that nobody has implemented yet), consolidate: write the lifecycle
-stage in the heading (`Status: VETTED <date> — implementation not
-started.`) and put the verifier's findings in the body. The two
+stage in the heading with the verdict appended (`Status: VETTED <date> —
+not started (verified <date>).`, `/verify-plan-status` §5's form) and put the verifier's findings in the body. The two
 skills do NOT both stamp side-by-side.
 
 #### Lifecycle states
@@ -2060,20 +2061,23 @@ skills do NOT both stamp side-by-side.
 | State | Owner skill | Means |
 |---|---|---|
 | DRAFT | author | plan written, not yet vetted |
-| VETTED | `/vet-plan` | claims audited; ready to implement |
+| VETTED | `/vet-plan` (also carried by `/verify-plan-status`) | claims audited; ready to implement |
 | IN PROGRESS | `/implement-plan` | implementation underway |
 | SHIPPED | `/implement-plan` or `/verify-plan-status` | all phases live in code |
 | SHIPPED — UNCONFIRMED (<claim ids>) | `/implement-plan` or `/verify-plan-status` | all phases live in code, and the `## Done when` claims named do NOT read `confirmed` (or the section is unparseable — `done-when-unparseable`) — landed, not yet shown to work. Normalises to `shipped` in coord (the qualifier is for the human reader) |
-| PARTIAL | `/verify-plan-status` | some phases live, some open |
-| NOT STARTED | `/verify-plan-status` | no implementation evidence |
+| VETTED/DRAFT — partial | `/verify-plan-status` (lead word carried from the replaced stamp — `VETTED` only when that stamp led with `VETTED`, else `DRAFT`; never upgraded) | some phases live, some open |
+| VETTED/DRAFT — not started | `/verify-plan-status` (lead word carried, as above) | no implementation evidence |
+| PARTIAL / NOT STARTED (legacy) | none — no writer emits them as lead words now | read as above; overwritable |
 | SUPERSEDED / OBSOLETE | any | terminal states |
 
 `/vet-plan` writes only `VETTED` (on the self path qualified as
 `VETTED (self)`, still `VETTED` first — §5). If the existing block is `SHIPPED`
 (qualified `UNCONFIRMED` or not), `SUPERSEDED`, or `OBSOLETE`, do NOT overwrite — surface to the user
 that they're vetting a closed plan and confirm they actually want this
-rewrite. (`PARTIAL` and `NOT STARTED` are fine to overwrite — your vet
-pass produces fresher information.)
+rewrite. (The partial / not-started forms — `VETTED/DRAFT <date> — partial: …`,
+`VETTED/DRAFT <date> — not started …` — and the legacy `PARTIAL` and
+`NOT STARTED` are fine to overwrite — your vet pass produces fresher
+information.)
 
 ##### `IN PROGRESS` is CONDITIONALLY overwritable — consumes Step 0.25
 
@@ -2152,7 +2156,8 @@ unidentified default below, that run should have stopped at its capture step
 without editing anything.
 
 **The arms below are scoped to a status block that reads `IN PROGRESS`.** A
-`DRAFT`, absent, `PARTIAL` or `NOT STARTED` block is governed by the paragraph
+`DRAFT`, absent, `VETTED/DRAFT — partial` / `— not started`, or legacy
+`PARTIAL` / `NOT STARTED` block is governed by the paragraph
 above this section, not by this table — do not read the "anything else" row as
 refusing a first-time vet.
 

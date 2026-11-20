@@ -72,8 +72,9 @@ use uuid::Uuid;
 
 use crate::database::pg::session_pr_ops::SessionPrStatus;
 use crate::database::pg::PgDb;
+use crate::github_budget::SpendClass;
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
-use crate::trigger_system::github_api::{has_coord_landed_label, GitHubClient};
+use crate::trigger_system::github_api::{has_coord_landed_label, GhError, GitHubClient};
 
 /// Reconcile cadence. Matches the "similar poller" cadence in the crate
 /// (min-10s pollers, 45s lifecycle poll) — 30s is responsive enough for a
@@ -791,14 +792,45 @@ async fn run_tick(
         return Ok(());
     }
 
-    let Some(token) = resolve_github_token().await else {
+    let Some((token_source, token)) = resolve_github_token_with_source().await else {
         return Err(
             "no GitHub token (env QONTINUI_RUNNER_GITHUB_TOKEN/GITHUB_TOKEN/GH_TOKEN or \
              `gh auth token`)"
                 .to_string(),
         );
     };
-    let client = GitHubClient::new(&token, "session_pr_reconciler")?;
+    // BACKGROUND spend: nobody is waiting on a reconcile, so under the
+    // credential's headroom line its reads are deferred rather than sent
+    // (plan 2026-10-30-…, D4) — the identity's interactive sessions keep the
+    // rest of the window.
+    let client = reconciler_client(&token)?;
+    let mut budget = TickBudget::default();
+
+    // The login, once per credential per process: a conditional `GET /user`.
+    // Phase 4 keys the shared bucket by it. Only a TERMINAL refusal (401/403 —
+    // a credential that cannot answer `/user`) starts the long back-off; a
+    // transport error or a 5xx is asked again next tick (at most one call per
+    // tick), and a deferral is not a failure at all.
+    if crate::github_budget::login_lookup_due(client.credential()) {
+        match budget.spend(|| client.authenticated_login()).await {
+            Some(Ok(login)) => {
+                crate::github_budget::record_login(client.credential(), &login);
+                crate::github_budget::record_identity(token_source, Some(login));
+            }
+            Some(Err(e)) if login_failure_is_terminal(&e) => {
+                crate::github_budget::record_login_failure(client.credential());
+                debug!(
+                    "session-pr-reconciler: GET /user refused (login UNKNOWN, backing off): {e}"
+                );
+            }
+            Some(Err(e)) => {
+                debug!(
+                    "session-pr-reconciler: GET /user failed (login UNKNOWN, retry next tick): {e}"
+                );
+            }
+            None => {}
+        }
+    }
 
     // Per-repo (git toplevel) resolution cached across sessions that share a
     // checkout: one `remote get-url` + one `for-each-ref` per repo per tick.
@@ -867,7 +899,16 @@ async fn run_tick(
             repos_scanned += 1;
             repo_dirs.insert(format!("{}/{}", info.owner, info.repo), toplevel.clone());
 
-            match attribute_session_in_repo(&pg_db, &client, session_id, toplevel, info).await {
+            match attribute_session_in_repo(
+                &pg_db,
+                &client,
+                &mut budget,
+                session_id,
+                toplevel,
+                info,
+            )
+            .await
+            {
                 Ok(keys) => {
                     prs_upserted += keys.len();
                     refreshed.extend(keys);
@@ -878,8 +919,15 @@ async fn run_tick(
             }
         }
 
-        if let Err(e) =
-            refresh_stored_statuses(&pg_db, &client, session_id, &refreshed, &repo_dirs).await
+        if let Err(e) = refresh_stored_statuses(
+            &pg_db,
+            &client,
+            &mut budget,
+            session_id,
+            &refreshed,
+            &repo_dirs,
+        )
+        .await
         {
             debug!("session-pr-reconciler: status refresh for {session_id} failed: {e}");
         }
@@ -888,11 +936,77 @@ async fn run_tick(
     info!(
         "session-pr-reconciler: tick done — sessions_seen={sessions_seen} \
          sessions_with_repos={sessions_with_repos} repos_scanned={repos_scanned} \
-         prs_upserted={prs_upserted} scope={}",
+         prs_upserted={prs_upserted} deferred_budget={} scope={}",
+        budget.deferred,
         tick_scope(only)
     );
 
     Ok(())
+}
+
+/// Does this `GET /user` failure mean the credential cannot answer it at all
+/// (a `401`/`403` — retrying is pointless for hours), as opposed to a transient
+/// failure (transport, `5xx`) worth asking again next tick? Pure.
+fn login_failure_is_terminal(e: &GhError) -> bool {
+    matches!(
+        e,
+        GhError::HttpStatus {
+            status: 401 | 403,
+            ..
+        }
+    )
+}
+
+/// The reconciler's GitHub client — BACKGROUND spend (plan 2026-10-30-…,
+/// D4). Nobody is waiting on a reconcile, so under the credential's headroom
+/// line its reads are deferred rather than sent, and a rate-limited refusal is
+/// never slept on: the identity's interactive sessions keep the rest of the
+/// window. The one place the reconciler's spend class is decided.
+pub(crate) fn reconciler_client(token: &str) -> Result<GitHubClient, String> {
+    Ok(GitHubClient::new(token, "session_pr_reconciler")?.with_spend_class(SpendClass::Background))
+}
+
+/// One cycle's GitHub spend state (plan 2026-10-30-…, Phase 3, D4).
+///
+/// The first budget stop — a read the headroom gate deferred, or one GitHub
+/// refused for rate — ends the cycle's spending: every later read is skipped
+/// without asking again, and counted, so the tick line's `deferred_budget` says
+/// how many reads this cycle did not make for budget — a skip that is
+/// observable rather than inferred. Free work (local repo resolution, trailer
+/// reads, stored-row bookkeeping) still runs. Every GitHub read in a tick goes
+/// through [`TickBudget::spend`].
+#[derive(Debug, Default)]
+struct TickBudget {
+    /// Reads not made this cycle for budget: the stopping read plus every
+    /// read skipped after it.
+    deferred: usize,
+    /// Set by the first budget stop; the cycle spends nothing more.
+    spent_out: bool,
+}
+
+impl TickBudget {
+    /// Make one GitHub read under this cycle's budget. `None` means the read
+    /// was not made for budget — skipped because the cycle is spent out, or
+    /// deferred / rate-limited now (which spends the cycle out) — and is
+    /// counted. A plain failure is `Some(Err)` and does not stop the cycle.
+    /// `read` is not even called once the cycle is spent out.
+    async fn spend<T, Fut>(&mut self, read: impl FnOnce() -> Fut) -> Option<Result<T, GhError>>
+    where
+        Fut: std::future::Future<Output = Result<T, GhError>>,
+    {
+        if self.spent_out {
+            self.deferred += 1;
+            return None;
+        }
+        match read().await {
+            Err(e) if e.is_budget_stop() => {
+                self.deferred += 1;
+                self.spent_out = true;
+                None
+            }
+            other => Some(other),
+        }
+    }
 }
 
 /// `scope=` field of the per-tick counters line — shared by the zero-session
@@ -915,6 +1029,7 @@ fn tick_scope(only: Option<Uuid>) -> String {
 async fn attribute_session_in_repo(
     pg_db: &PgDb,
     client: &GitHubClient,
+    budget: &mut TickBudget,
     session_id: Uuid,
     repo_dir: &str,
     info: &RepoInfo,
@@ -930,12 +1045,14 @@ async fn attribute_session_in_repo(
         .iter()
         .filter(|b| b.session_ids.iter().any(|s| s == &session_str))
     {
-        let prs = match client
-            .list_prs_for_head(&info.owner, &info.repo, &bt.branch)
+        let prs = match budget
+            .spend(|| client.list_prs_for_head(&info.owner, &info.repo, &bt.branch))
             .await
         {
-            Ok(prs) => prs,
-            Err(e) => {
+            // Not made for budget: counted in `deferred_budget`.
+            None => continue,
+            Some(Ok(prs)) => prs,
+            Some(Err(e)) => {
                 debug!(
                     "session-pr-reconciler: list_prs_for_head({repo_full}, {}) failed: {e}",
                     bt.branch
@@ -1019,6 +1136,7 @@ async fn attribute_session_in_repo(
 async fn refresh_stored_statuses(
     pg_db: &PgDb,
     client: &GitHubClient,
+    budget: &mut TickBudget,
     session_id: Uuid,
     refreshed: &HashSet<(String, i64)>,
     repo_dirs: &HashMap<String, String>,
@@ -1031,8 +1149,13 @@ async fn refresh_stored_statuses(
         let Some((owner, repo)) = row.repo.split_once('/') else {
             continue;
         };
-        match client.get_pr(owner, repo, row.pr_number as u64).await {
-            Ok(pr) => {
+        match budget
+            .spend(|| client.get_pr(owner, repo, row.pr_number as u64))
+            .await
+        {
+            // Not made for budget: the row keeps its prior status.
+            None => {}
+            Some(Ok(pr)) => {
                 // CALL SITE 2 of the land cascade. THIS is the ff-land path in
                 // practice: a landed PR's branch is usually deleted, which is
                 // exactly why the branch path above no longer reaches it.
@@ -1071,7 +1194,7 @@ async fn refresh_stored_statuses(
                     warn!("session-pr-reconciler: update_session_pr_status failed: {e}");
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 debug!(
                     "session-pr-reconciler: get_pr({}/#{}) failed (leaving prior status): {e}",
                     row.repo, row.pr_number
@@ -1703,35 +1826,44 @@ pub(crate) fn resolve_github_token_from_env() -> Option<(&'static str, String)> 
 /// `QONTINUI_RUNNER_GITHUB_TOKEN` → `GITHUB_TOKEN` → `GH_TOKEN` →
 /// `gh auth token`. `None` when no source yields a non-empty token.
 ///
-/// # Why the dedicated variable leads
+/// # What the dedicated variable does — and does not — buy
 ///
-/// The runner is a poller: it re-reads PR state every 30s — re-measured
-/// 2026-09-01 at **309 calls in 301s ≈ 3,700/hr**. Falling through to `gh auth token` bills all of that to the
-/// operator's own interactive user bucket, which is where the 2026-08-30
-/// oversubscription incident came from: a ~5,600 req/hr burn against a 5,000 cap
-/// was blamed on coord's merge train, when coord bills App *installation*
-/// buckets and it was the runner spending the sampled user token all along.
+/// GitHub meters REST calls per IDENTITY, not per token: every user-authenticated
+/// request (a PAT, the `gh` OAuth token, a GitHub-App user token) counts against
+/// that user's one 5,000/h. So a second token for the SAME user — a separate
+/// `jspinak` PAT in `QONTINUI_RUNNER_GITHUB_TOKEN`, say — separates the runner's
+/// spend in attribution only; it still draws down the bucket every interactive
+/// `gh` session on that identity is using. `QONTINUI_RUNNER_GITHUB_TOKEN`
+/// isolates the budget only when it names a DIFFERENT identity: a GitHub App
+/// installation token (its own bucket, and free) or a separate account (plan
+/// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+/// D6, correcting plan 2026-08-30's Phase 4 premise).
 ///
-/// The alternative fix — "leave a slice of the shared bucket free for the human"
-/// — is a reservation discipline, a convention that every future tool has to
-/// remember and that nothing enforces. A separate credential is an invariant the
-/// platform itself keeps: GitHub meters it as its own bucket, so the runner's
-/// spend becomes attributable in isolation, rate-limitable in isolation, and
-/// incapable of starving an interactive `gh` session no matter how hard the
-/// pollers run.
+/// Until the runner has such an identity, the bound on its spend is the
+/// background headroom gate ([`crate::github_budget::background_gate`]): the
+/// reconciler is a BACKGROUND client, and a read projected to leave the window
+/// short of the reserve is deferred — never sent, never slept on — reading
+/// GitHub's own counters for this credential, so the reserve holds for every
+/// session and box on the identity.
 ///
 /// Falling through to `gh auth token` stays fully supported — it is the current
-/// deployment on every operator box — but it is now the LAST resort rather than
-/// the design.
+/// deployment on every operator box.
 ///
 /// Whichever source wins is reported to [`crate::github_budget::record_identity`]
-/// by NAME. The token value itself is never logged, recorded, or returned
-/// anywhere but to the caller: "which bucket am I spending?" was the single
-/// unanswerable question in the incident, and answering it costs one string.
+/// by NAME, with the login once [`crate::github_budget::login_for`] knows it. The
+/// token value itself is never logged, recorded, or returned anywhere but to the
+/// caller.
 pub(crate) async fn resolve_github_token() -> Option<String> {
+    resolve_github_token_with_source()
+        .await
+        .map(|(_, token)| token)
+}
+
+/// [`resolve_github_token`], also naming the resolution step that supplied it.
+pub(crate) async fn resolve_github_token_with_source() -> Option<(&'static str, String)> {
     if let Some((source, token)) = resolve_github_token_from_env() {
-        crate::github_budget::record_identity(source, None);
-        return Some(token);
+        record_resolved_identity(source, &token);
+        return Some((source, token));
     }
     // Under a HARD timeout. `gh auth token` has been observed blocked for
     // hours on this fleet; awaited bare it does not fail the tick, it suspends
@@ -1751,14 +1883,176 @@ pub(crate) async fn resolve_github_token() -> Option<String> {
     if tok.is_empty() {
         None
     } else {
-        crate::github_budget::record_identity("gh auth token", None);
-        Some(tok)
+        record_resolved_identity("gh auth token", &tok);
+        Some(("gh auth token", tok))
     }
+}
+
+/// Record the resolution step by name, with the credential's login when this
+/// process has already resolved it — so a re-resolve every tick never blanks a
+/// known login back to UNKNOWN.
+fn record_resolved_identity(source: &str, token: &str) {
+    let key = crate::github_budget::CredentialKey::of_token(token);
+    crate::github_budget::record_identity(source, crate::github_budget::login_for(&key));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Retry-After hold, entered where the reconciler enters: a client
+    /// from `reconciler_client`, `list_prs_for_head`. GitHub refuses the first
+    /// read for rate with `Retry-After`; the reconciler's next read on that
+    /// credential is deferred with the `RetryAfter` reason — not sent (the
+    /// one-shot server is gone, so a send would be a transport failure).
+    #[tokio::test]
+    async fn a_retry_after_hold_defers_the_reconcilers_next_read() {
+        let base = crate::trigger_system::github_api::one_shot_server_for_test(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let client = reconciler_client("budget-test-reconciler-retry-after")
+            .expect("client builds")
+            .with_api_base(base);
+
+        let first = client
+            .list_prs_for_head("budget-test-hold-owner", "hold-repo", "feat/x")
+            .await
+            .expect_err("refused for rate");
+        assert!(
+            matches!(first, GhError::RateLimited { status: 429 }),
+            "{first}"
+        );
+
+        let next = client
+            .list_prs_for_head("budget-test-hold-owner", "hold-repo", "feat/y")
+            .await
+            .expect_err("held");
+        assert!(
+            matches!(
+                &next,
+                GhError::Deferred(d)
+                    if matches!(d.reason, crate::github_budget::DeferralReason::RetryAfter { .. })
+            ),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn only_a_terminal_refusal_starts_the_login_back_off() {
+        let status = |status| GhError::HttpStatus {
+            status,
+            message: String::new(),
+        };
+        assert!(login_failure_is_terminal(&status(401)));
+        assert!(login_failure_is_terminal(&status(403)));
+        assert!(!login_failure_is_terminal(&status(500)));
+        assert!(!login_failure_is_terminal(&status(502)));
+        assert!(!login_failure_is_terminal(&status(404)));
+        assert!(!login_failure_is_terminal(&GhError::Failed(
+            "transport".into()
+        )));
+        assert!(!login_failure_is_terminal(&GhError::RateLimited {
+            status: 429
+        }));
+    }
+
+    fn a_deferral() -> GhError {
+        GhError::Deferred(crate::github_budget::BudgetDeferral {
+            credential: crate::github_budget::CredentialKey::of_token("t"),
+            reason: crate::github_budget::DeferralReason::RetryAfter { not_before_unix: 0 },
+        })
+    }
+
+    /// Phase 3 (D4): the first budget stop — a deferral OR a rate-limited
+    /// refusal — ends the cycle's spending; every read the cycle then skips is
+    /// counted in `deferred_budget` and is never even attempted. A plain
+    /// failure does not stop the cycle.
+    #[tokio::test]
+    async fn a_budget_stop_ends_the_cycles_spending_and_every_skip_is_counted() {
+        for (why, stop) in [
+            ("deferred", a_deferral()),
+            ("rate-limited", GhError::RateLimited { status: 429 }),
+        ] {
+            let mut budget = TickBudget::default();
+            let got: Option<Result<u8, GhError>> = budget.spend(|| async { Ok(7) }).await;
+            assert!(matches!(got, Some(Ok(7))), "{why}: a fresh cycle spends");
+            let got: Option<Result<u8, GhError>> = budget
+                .spend(|| async { Err(GhError::Failed("boom".into())) })
+                .await;
+            assert!(matches!(got, Some(Err(GhError::Failed(_)))), "{why}");
+            assert_eq!(budget.deferred, 0, "{why}: a failure is not a budget stop");
+
+            let got: Option<Result<u8, GhError>> =
+                budget.spend(move || async move { Err(stop) }).await;
+            assert!(
+                got.is_none(),
+                "{why}: the stop is not handed back as a failure"
+            );
+            assert_eq!(budget.deferred, 1, "{why}");
+
+            let attempted = std::cell::Cell::new(0);
+            for _ in 0..2 {
+                let got: Option<Result<u8, GhError>> = budget
+                    .spend(|| {
+                        attempted.set(attempted.get() + 1);
+                        async { Ok(1) }
+                    })
+                    .await;
+                assert!(got.is_none(), "{why}: no read after a stop");
+            }
+            assert_eq!(
+                attempted.get(),
+                0,
+                "{why}: a spent-out cycle never calls the read"
+            );
+            assert_eq!(budget.deferred, 3, "{why}: each skipped read is counted");
+        }
+    }
+
+    /// The arming proof, entered where the reconciler's population enters: a
+    /// client from the reconciler's own constructor, `list_prs_for_head`, a
+    /// credential seeded short of the headroom line, a refusing port. The answer
+    /// is the typed deferral — not a transport failure — and the meter counts
+    /// exactly one `deferred` with nothing sent. Bypass the gate (or build the
+    /// reconciler's client interactive) and the request reaches port 1: red.
+    #[tokio::test]
+    async fn a_background_list_prs_for_head_under_the_headroom_line_is_never_sent() {
+        let client = reconciler_client("budget-test-reconciler-entry")
+            .expect("client builds")
+            .with_api_base("http://127.0.0.1:1");
+        crate::github_budget::seed_reading_for_test(
+            client.credential(),
+            &crate::github_budget::RateLimitObservation {
+                limit: Some(5000),
+                remaining: Some(50),
+                used: Some(4950),
+                reset_at_unix: Some(crate::trigger_system::github_api::now_unix() + 1800),
+                resource: Some("core".to_string()),
+            },
+        );
+
+        let err = client
+            .list_prs_for_head("budget-test-entry-owner", "entry-repo", "feat/x")
+            .await
+            .expect_err("a short window defers");
+        assert!(
+            matches!(&err, GhError::Deferred(d) if d.credential == *client.credential()),
+            "{err}"
+        );
+
+        let row = crate::github_budget::snapshot_top(usize::MAX)
+            .consumers
+            .into_iter()
+            .find(|r| {
+                r.consumer == "session_pr_reconciler"
+                    && r.template == "/repos/budget-test-entry-owner/entry-repo/pulls"
+            })
+            .expect("the deferral was metered");
+        assert_eq!(row.deferred, 1);
+        assert_eq!(row.transport_error, 0, "nothing was put on the wire");
+        assert_eq!(row.charged + row.not_modified + row.rate_limited, 0);
+    }
 
     #[test]
     fn parse_owner_repo_handles_ssh_https_and_token_forms() {

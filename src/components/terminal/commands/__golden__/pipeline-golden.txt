@@ -2940,7 +2940,7 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.layout [alien] do the thing	ai	terminal.layout	[["nonsense","x"]]	refused	error /layout: takes no argument named "nonsense"
 «ai» terminal.layout [bool] do the thing	ai	terminal.layout	[]	refused	error /layout: "preset" must be text or a number (got true/false)
 «ai» terminal.layout [empty] do the thing	ai	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
-«ai» terminal.layout [valid] do the thing	ai	terminal.layout	[["page","page-1"],["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
+«ai» terminal.layout [valid] do the thing	ai	terminal.layout	[["origin","operator"],["page","page-1"],["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 «ai» terminal.maximize [alien] do the thing	ai	terminal.maximize	[["nonsense","x"]]	refused	error /maximize: takes no argument named "nonsense"
 «ai» terminal.maximize [bool] do the thing	ai	terminal.maximize	[]	refused	error /maximize: "zone" must be text or a number (got true/false)
 «ai» terminal.maximize [empty] do the thing	ai	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
@@ -3108,7 +3108,7 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.layout [alien]	direct	terminal.layout	[["nonsense","x"]]	threw	error /layout: takes no argument named "nonsense"
 «direct» terminal.layout [bool]	direct	terminal.layout	[["preset",true]]	threw	error /layout: "preset" must be text or a number (got true/false)
 «direct» terminal.layout [empty]	direct	terminal.layout	[]	threw	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
-«direct» terminal.layout [valid]	direct	terminal.layout	[["page","page-1"],["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
+«direct» terminal.layout [valid]	direct	terminal.layout	[["origin","operator"],["page","page-1"],["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 «direct» terminal.maximize [alien]	direct	terminal.maximize	[["nonsense","x"]]	threw	error /maximize: takes no argument named "nonsense"
 «direct» terminal.maximize [bool]	direct	terminal.maximize	[["zone",true]]	threw	error /maximize: "zone" must be text or a number (got true/false)
 «direct» terminal.maximize [empty]	direct	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1

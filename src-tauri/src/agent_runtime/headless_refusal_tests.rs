@@ -14,6 +14,7 @@ use crate::agent_worktree::isolated_edit::IsolatedEditContext;
 use crate::agent_worktree::remove_unspawned::{
     KeepReason, RemovalReport, TreeOutcome, TreeProvenance,
 };
+use crate::agent_worktree::shared_branch_restore::{RestoreKeep, RestoreOutcome};
 
 tokio::task_local! {
     /// What the headless arm's removal reported, for the ONE test future that
@@ -65,17 +66,26 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 /// The fixture: a canonical checkout under the isolated workspace root, a
-/// real `git worktree add` of it at the allocation root for `agent_id`, a
-/// context over that tree with `provenance`, and the sticky gateway marker
-/// that makes `spawn_claude_child` refuse.
+/// real `git worktree add` of it at the allocation root for `agent_id` on
+/// agent `branch`, a context over that tree with `provenance`, and the sticky
+/// gateway marker that makes `spawn_claude_child` refuse.
 struct Fixture {
     canonical: PathBuf,
     tree: PathBuf,
+    branch: String,
     agent_id: uuid::Uuid,
     ctx: IsolatedEditContext,
 }
 
-fn fixture(sandbox: &Path, provenance: impl FnOnce(&Path) -> TreeProvenance) -> Fixture {
+/// What the fixture placed, handed to the caller's provenance closure: the
+/// canonical checkout, and the agent branch and commit its worktree sits on.
+struct Placed<'a> {
+    canonical: &'a Path,
+    branch: &'a str,
+    sha: &'a str,
+}
+
+fn fixture(sandbox: &Path, provenance: impl FnOnce(&Placed<'_>) -> TreeProvenance) -> Fixture {
     let ws = crate::workspace_paths::runner_workspace_root()
         .into_root()
         .expect("the isolated ambient workspace root");
@@ -109,11 +119,16 @@ fn fixture(sandbox: &Path, provenance: impl FnOnce(&Path) -> TreeProvenance) -> 
             &sha,
         ],
     );
+    let tree_provenance = provenance(&Placed {
+        canonical: &canonical,
+        branch: &branch,
+        sha: &sha,
+    });
     let mut ctx = IsolatedEditContext::for_test_with_agent_id(
         agent_id.to_string(),
         vec![crate::agent_worktree::MaterializedWorktree {
             repo: "canon".to_string(),
-            branch,
+            branch: branch.clone(),
             parent_sha: sha,
             worktree_path: tree.clone(),
             push_ref: String::new(),
@@ -121,7 +136,7 @@ fn fixture(sandbox: &Path, provenance: impl FnOnce(&Path) -> TreeProvenance) -> 
         }],
         Vec::new(),
     );
-    ctx.set_provenance_for_test(&tree, provenance(&canonical));
+    ctx.set_provenance_for_test(&tree, tree_provenance);
 
     // The sticky marker of a configured gateway, with no gateway in settings:
     // `model_gateway::spawn_refusal` reads that as unresolved and refuses.
@@ -139,6 +154,7 @@ fn fixture(sandbox: &Path, provenance: impl FnOnce(&Path) -> TreeProvenance) -> 
     Fixture {
         canonical,
         tree,
+        branch,
         agent_id,
         ctx,
     }
@@ -189,8 +205,8 @@ async fn refuse_headless(
 async fn a_headless_continuation_refused_by_the_gateway_removes_its_fresh_tree() {
     let amb = crate::test_env::isolated_ambient();
     let _overrides = clear_worktree_root_overrides();
-    let f = fixture(amb.dir(), |canonical| TreeProvenance::FreshWorktree {
-        canonical: canonical.to_path_buf(),
+    let f = fixture(amb.dir(), |p| TreeProvenance::FreshWorktree {
+        canonical: p.canonical.to_path_buf(),
     });
     let (canonical, tree) = (f.canonical.clone(), f.tree.clone());
     assert!(
@@ -218,13 +234,20 @@ async fn a_headless_continuation_refused_by_the_gateway_removes_its_fresh_tree()
 }
 
 /// The negative twin: the same refusal over a `SharedBranch` placement keeps
-/// the tree — still on disk, still listed — and says why (`NotFresh`).
+/// the tree — still on disk, still listed, still on its agent branch — and
+/// says why: the shared-branch arm hands it to the checkout restore, which
+/// here switched nothing back (the placement recorded no switch: `prior_ref`
+/// is the agent branch itself) and so leaves it where it is.
 #[tokio::test]
 async fn a_headless_continuation_refused_by_the_gateway_keeps_a_shared_branch_tree() {
     let amb = crate::test_env::isolated_ambient();
     let _overrides = clear_worktree_root_overrides();
-    let f = fixture(amb.dir(), |_| TreeProvenance::SharedBranch);
-    let (canonical, tree) = (f.canonical.clone(), f.tree.clone());
+    let f = fixture(amb.dir(), |p| TreeProvenance::SharedBranch {
+        branch: p.branch.to_string(),
+        prior_ref: p.branch.to_string(),
+        switched_to_sha: p.sha.to_string(),
+    });
+    let (canonical, tree, branch) = (f.canonical.clone(), f.tree.clone(), f.branch.clone());
 
     let (res, observed) = refuse_headless(f).await;
 
@@ -237,16 +260,21 @@ async fn a_headless_continuation_refused_by_the_gateway_keeps_a_shared_branch_tr
         .expect("the refusal arm reached the remover")
         .expect("the continuation held a context, so the removal reported");
     assert_eq!(report.trees.len(), 1, "{report:?}");
-    assert!(
-        matches!(
-            &report.trees[0].1,
-            TreeOutcome::Kept(KeepReason::NotFresh(_))
-        ),
+    assert_eq!(
+        report.trees[0].1,
+        TreeOutcome::Kept(KeepReason::SharedBranchCheckout(RestoreOutcome::Kept(
+            RestoreKeep::NothingSwitched
+        ))),
         "{report:?}"
     );
     assert!(tree.exists(), "a shared-branch tree is never removed");
     assert!(
         worktree_listed(&canonical, &tree),
         "the canonical still lists the kept worktree"
+    );
+    assert_eq!(
+        git(&tree, &["symbolic-ref", "--short", "HEAD"]),
+        branch,
+        "nothing was switched, so nothing is undone"
     );
 }

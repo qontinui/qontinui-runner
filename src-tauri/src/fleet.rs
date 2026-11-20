@@ -4263,6 +4263,32 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
     ".claude/worktrees/",
 ];
 
+/// The one in-process lock every `.git/info/exclude` writer holds across its
+/// read-modify-write: [`ensure_repo_info_exclude`], the shared-branch
+/// allocation block's add / remove / sweep
+/// (`agent_worktree::shared_branch_restore`), and the provisioners'
+/// per-path block (`provision_exclude::update_exclude`). In-process only —
+/// another runner process on the same box is not excluded by it, and a block
+/// such a race resurrects is reaped by the shared-branch module's stale-block
+/// sweep.
+pub(crate) fn info_exclude_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read a `.git/info/exclude` for a rewrite: an absent file is empty; any
+/// other read failure, and content that is not UTF-8, is an `Err`, so the
+/// caller never rewrites a file it could not read faithfully.
+pub(crate) fn read_info_exclude(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            String::from_utf8(bytes).map_err(|e| format!("{} is not UTF-8 ({e})", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
 /// Header line bracketing the runner-managed block in a repo's
 /// `.git/info/exclude` — lets the operator see who added the entries.
 const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts (auto-excluded)";
@@ -4280,7 +4306,14 @@ const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts
 /// walks primary trees anyway). Best-effort: any IO error is swallowed — a
 /// missed exclude just means the tree reads dirty for one more cycle, never a
 /// panic.
-fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
+///
+/// Also applied to a canonical checkout right before the runner switches it
+/// onto a `shared_branch` agent branch
+/// ([`crate::agent_worktree::shared_branch_restore::prepare_canonical_excludes`]),
+/// because the session provisioned there writes these artifacts into the
+/// canonical checkout itself, and a refused spawn's restore requires that
+/// checkout to read fully clean.
+pub(crate) fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     // `.git` as a directory == primary checkout. Skip worktree `.git` files
     // and bare/odd layouts.
     if !repo_path.join(".git").is_dir() {
@@ -4288,7 +4321,24 @@ fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     }
     let info_dir = repo_path.join(".git").join("info");
     let exclude_path = info_dir.join("exclude");
-    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    // Every writer of a `.git/info/exclude` holds this lock across its
+    // read-modify-write, so this roster heal, the shared-branch allocation
+    // block (`agent_worktree::shared_branch_restore`) and the provisioners'
+    // per-path block (`provision_exclude`) never lose each other's edit.
+    let _excl = info_exclude_lock();
+    // A file that exists but cannot be read (or is not UTF-8) is never
+    // rewritten: rewriting it from an empty string would drop the operator's
+    // own lines.
+    let existing = match read_info_exclude(&exclude_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "fleet::ensure_repo_info_exclude: {e} — left as is, so the machine-local \
+                 artifacts are NOT excluded in this repo until the file is readable UTF-8"
+            );
+            return;
+        }
+    };
 
     // Match on whole (trimmed) lines so a substring like `.mcp.json.bak` never
     // counts as already-covered.
@@ -6870,6 +6920,15 @@ pub async fn publish_tree_state() -> Result<(), String> {
             let _ = spawn_blocking_tracked(move || fetch_remote_refs_blocking(&fetch_path)).await;
         }
 
+        // Reap a shared-branch allocation's `.git/info/exclude` block that a
+        // runner exit, crash or restart left behind (only a provably dead
+        // allocation's; any unknown keeps it). Cheap when there is none.
+        crate::agent_worktree::shared_branch_restore::sweep_checkout(
+            path.clone(),
+            Some(base.clone()),
+        )
+        .await;
+
         let capture_path = path.clone();
         let mut payload = match spawn_blocking_tracked(move || {
             // Heal machine-local artifacts into `.git/info/exclude` BEFORE
@@ -7007,6 +7066,13 @@ pub fn spawn_tree_publisher() {
     crate::worker_supervisor::spawn_supervised_with_heartbeat(
         "fleet.tree_publisher",
         move |hb| async move {
+            // Startup: reap shared-branch allocation blocks a previous runner
+            // left in the canonical checkouts' `.git/info/exclude`, whether or
+            // not this box can publish (no coord base still reaps a block
+            // whose branch is gone). Re-run on a supervised restart, which is
+            // harmless: the sweep is idempotent and keeps anything live.
+            crate::agent_worktree::shared_branch_restore::sweep_workspace(connected_coord_base())
+                .await;
             let mut tick = tokio::time::interval(Duration::from_secs(secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Rebuilt with the loop on a supervised restart, so a restart
@@ -8465,6 +8531,22 @@ mod tests {",
         assert_eq!(first, second, "second call must be a no-op");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `.git/info/exclude` that is not UTF-8 is left byte-identical: the heal
+    /// used to read it with `read_to_string(..).unwrap_or_default()` and then
+    /// rewrite it from an EMPTY string, deleting every operator line.
+    #[test]
+    fn ensure_repo_info_exclude_leaves_a_non_utf8_file_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info = dir.path().join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let before = b"operator-line\n\xff not utf-8\n".to_vec();
+        std::fs::write(info.join("exclude"), &before).unwrap();
+
+        ensure_repo_info_exclude(dir.path());
+
+        assert_eq!(std::fs::read(info.join("exclude")).unwrap(), before);
     }
 
     #[test]

@@ -965,16 +965,6 @@ pub struct TerminalSessionRecord {
     /// a restart. `None` = no hook seen, or the record predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_session_start_at: Option<i64>,
-    /// Unix millis of the last liveness-poll tick that found a live Claude in
-    /// this session's terminal: the poll's `KeepAlive`, through
-    /// [`SessionLifecycleStore::touch`], its one writer. PROCESS liveness,
-    /// which `last_seen_at` is not: [`SessionLifecycleStore::record_open`]
-    /// bumps that on a re-open that proves nothing ran, and never writes this.
-    /// Read by the `launch-failed` close rule
-    /// ([`crate::terminal::launch_failure`], D3 condition 3). `None` = never
-    /// seen alive by the poll, or the record predates the field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_alive_at: Option<i64>,
     /// The `coord.gates` row this session is a continuation of — the same value
     /// injected into its PTY as `QONTINUI_GATE_ID` (plan
     /// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…`,
@@ -1827,9 +1817,6 @@ impl SessionLifecycleStore {
             restore_tier: non_empty(rec.restore_tier),
             gate_id: non_empty(rec.gate_id),
             gate_consuming_device_id: non_empty(rec.gate_consuming_device_id),
-            // Liveness is the poll's to record (`touch`), never a re-record's:
-            // a re-open proves nothing ran (the `launch-failed` rule, D3).
-            last_alive_at: None,
             ..rec
         };
         let now = Utc::now().timestamp_millis();
@@ -2843,9 +2830,7 @@ impl SessionLifecycleStore {
         held
     }
 
-    /// Bump `last_seen_at` on a present session, and stamp `last_alive_at`:
-    /// the liveness poll's `KeepAlive` is the one production caller, so a touch
-    /// is the poll having SEEN a live Claude there. No-op (no write) if absent.
+    /// Bump `last_seen_at` on a present session. No-op (no write) if absent.
     pub fn touch(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
         let mut m = match self.map.lock() {
@@ -2858,7 +2843,6 @@ impl SessionLifecycleStore {
         let touched = match m.get_mut(claude_session_id) {
             Some(rec) => {
                 rec.last_seen_at = now;
-                rec.last_alive_at = Some(now);
                 rec.clone()
             }
             None => return,
@@ -4060,7 +4044,10 @@ impl SessionLifecycleStore {
     /// rather than lose data). NOTE: no shipped adapter triggers this today (the
     /// audit refuted Claude id-rotation); it exists so a future adapter that does
     /// report a corrected id has a correct primitive and never leaves a
-    /// permanently-stale row.
+    /// permanently-stale row. Launch-failure liveness is NOT carried: it lives in
+    /// `terminal::launch_failure::registry()`, keyed by the old id, until the
+    /// poll's next KeepAlive notes the new one — a caller that wires this up
+    /// should re-note it there.
     pub fn rekey_session(&self, old_id: &str, new_id: &str) {
         if old_id == new_id {
             return;
@@ -6585,7 +6572,6 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
-        last_alive_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
@@ -6821,7 +6807,6 @@ mod tests {
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
@@ -10916,7 +10901,6 @@ mod tests {
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,

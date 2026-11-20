@@ -5365,6 +5365,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                             .clear_restore_pending(&rec.claude_session_id);
                                     }
                                     poll_lifecycle_store.touch(&rec.claude_session_id);
+                                    // The one liveness writer for the
+                                    // `launch-failed` close rule (D3
+                                    // condition 3): in memory, beside the
+                                    // evidence it negates.
+                                    terminal::launch_failure::registry().note_alive(
+                                        &rec.claude_session_id,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                 }
