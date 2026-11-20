@@ -184,6 +184,7 @@ fn the_detector_catches_a_raw_spawn_and_honours_the_marker() {
     assert_eq!(raw_git_spawns(after_helper), (vec![3], 0));
     // Neither does a test module in the middle of a file, of any
     // visibility — while its own raw spawns stay out of the scan.
+    // console-ok: the `Command::new` below is text inside a fixture string, never spawned.
     let mid_file = "#[cfg(test)]\npub(crate) mod support {\n    fn g() {\n        \
                     Command::new(\"git\");\n    }\n}\nfn prod() { Command::new(\"git\"); }\n";
     assert_eq!(raw_git_spawns(mid_file), (vec![7], 0));
