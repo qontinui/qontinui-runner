@@ -169,7 +169,7 @@ function Build-Executor {
             throw "poetry install failed with exit code $LASTEXITCODE"
         }
 
-        # Poetry's parallel install can mix or tear the files of Xlib/ and cv2/,
+        # Poetry's parallel install can mix or tear the files of cv2/,
         # which several locked distributions write, and PyInstaller would freeze
         # that damage into the executor. The repair ships with qontinui (the path
         # dependency at ../../qontinui); --lock names this project's lock. Why and
@@ -178,7 +178,7 @@ function Build-Executor {
         if (-not (Test-Path $enforce)) {
             throw "$enforce not found; update the qontinui checkout (it landed in qontinui#81)"
         }
-        Write-Host "  Enforcing the locked owners of Xlib/ and cv2/..." -ForegroundColor Yellow
+        Write-Host "  Enforcing the locked owner of cv2/..." -ForegroundColor Yellow
         poetry run python $enforce --lock poetry.lock
         if ($LASTEXITCODE -ne 0) {
             throw "enforce_package_owners.py failed with exit code $LASTEXITCODE"
