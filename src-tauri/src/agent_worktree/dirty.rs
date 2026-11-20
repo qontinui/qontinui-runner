@@ -9,6 +9,7 @@
 //! |---|---|
 //! | `.claude/` | agent scaffolding (agents, settings) materialized per session |
 //! | `.coord-mcp-status` | [`crate::coord_mcp`]'s degraded breadcrumb |
+//! | `.coord-mcp-status.tmp-*` | that breadcrumb's atomic-replace temp file, left only by a crash between its write and its rename |
 //! | `.mcp.json` | the coord-mcp proxy config written at worktree provisioning |
 //!
 //! None of those are operator work, and every one of them makes an otherwise
@@ -105,10 +106,26 @@ pub(crate) fn unquote(path: &str) -> &str {
 /// `starts_with`, so a sibling like `.mcp.json.bak` stays dirty.
 pub(crate) fn is_scaffolding_path(path: &str) -> bool {
     let p = path.replace('\\', "/");
+    // The temp file is matched BEFORE the trailing separator is trimmed: git
+    // may print a directory with one (`?? name/` for a nested repo, or any
+    // listing without `-uall`), and a directory of that name is not the
+    // runner's — `delete_scaffolding` would `remove_dir_all` it.
+    if is_breadcrumb_tmp(&p) {
+        return true;
+    }
     let p = p.trim_end_matches('/');
     RUNNER_SCAFFOLDING
         .iter()
         .any(|s| p == *s || p.starts_with(&format!("{s}/")))
+}
+
+/// The breadcrumb's crash-left temp file
+/// ([`crate::coord_mcp::breadcrumb_tmp_name`]), at the tree root only. A plain
+/// file, so nothing may follow it after a separator: a directory of that name,
+/// or one nested under a subdirectory, is not the runner's and stays dirty.
+fn is_breadcrumb_tmp(p: &str) -> bool {
+    p.strip_prefix(crate::coord_mcp::COORD_MCP_STATUS_TMP_PREFIX)
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
 }
 
 /// Can this porcelain line be ignored when deciding reclaim-dirtiness?
@@ -481,6 +498,37 @@ mod tests {
         assert!(porcelain_is_dirty("?? .claudex/thing"));
         assert!(porcelain_is_dirty("?? .coord-mcp-status-old"));
         assert!(porcelain_is_dirty("?? src/.claude/nested.txt"));
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-"));
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-1/notes.txt"));
+        assert!(porcelain_is_dirty("?? sub/.coord-mcp-status.tmp-1-x"));
+        // A DIRECTORY of the temp name (git may print it with a trailing `/`)
+        // is not the runner's plain temp file.
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-1/"));
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-1\\"));
+        assert!(!is_scaffolding_path(".coord-mcp-status.tmp-1/"));
+    }
+
+    /// A crash between the breadcrumb's temp write and its rename leaves the
+    /// temp file behind; it is runner-written and must not pin the worktree
+    /// unreclaimable. Built from the writer's own name so a renamed temp
+    /// spelling cannot drift past this predicate.
+    #[test]
+    fn crash_left_breadcrumb_tmp_is_scaffolding() {
+        let name = crate::coord_mcp::breadcrumb_tmp_name();
+        assert!(!porcelain_is_dirty(&format!("?? {name}")), "{name}");
+        assert!(!porcelain_is_dirty(&format!("?? \"{name}\"\r\n")), "{name}");
+        assert!(porcelain_is_dirty(&format!("?? {name}\n M src/main.rs")));
+        assert!(
+            porcelain_is_dirty(&format!(" M {name}")),
+            "tracked stays dirty"
+        );
+        assert!(is_scaffolding_path(&name));
+        // The prefix is the breadcrumb's own name plus `.tmp-`, so renaming
+        // the breadcrumb cannot leave the temp spelling behind.
+        assert_eq!(
+            crate::coord_mcp::COORD_MCP_STATUS_TMP_PREFIX,
+            format!("{}.tmp-", crate::coord_mcp::COORD_MCP_STATUS_FILE)
+        );
     }
 
     #[test]
