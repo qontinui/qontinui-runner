@@ -613,17 +613,10 @@ fn grace() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// True iff `dir` carries a co-authoritative cargo target marker: a
-/// `CACHEDIR.TAG` (newer cargo) OR a `.rustc_info.json` (present in every cargo
-/// target root, including the many on this machine that predate / lack the tag —
-/// e.g. `_cargo-targets/<slug>`, `_targets/<slug>`, `.wt-targets/<slug>`,
-/// `cargo-target-coord-wt-<slug>` all have `.rustc_info.json + debug/` but NO
-/// tag). Either marker positively identifies a cargo build dir; a dir with
-/// neither (a real source/data dir) is never a target root.
-fn has_cargo_marker(dir: &Path) -> bool {
-    std::fs::symlink_metadata(dir.join("CACHEDIR.TAG")).is_ok()
-        || std::fs::symlink_metadata(dir.join(".rustc_info.json")).is_ok()
-}
+// `has_cargo_marker`: true iff `dir` carries a co-authoritative cargo target
+// marker (`CACHEDIR.TAG` OR `.rustc_info.json`); the shared predicate's doc
+// comment says why either marker counts.
+use crate::cargo_target_marker::has_cargo_marker;
 
 /// A cargo target root is a non-junction dir carrying a cargo marker
 /// ([`has_cargo_marker`]). `symlink_metadata` (via `is_junction`) so we never

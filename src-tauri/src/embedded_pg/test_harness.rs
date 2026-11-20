@@ -1700,20 +1700,31 @@ fn harness_dir() -> Result<PathBuf, String> {
         .map(|target| target.join(DEFAULT_DIR_NAME))
         .ok_or_else(|| {
             format!(
-                "no ancestor of {} is a cargo target directory (none holds cargo's \
-                 CACHEDIR.TAG); set {HARNESS_DIR_ENV} to a directory the harness may use",
+                "no ancestor of {} is a cargo target directory (none holds a cargo \
+                 target marker, CACHEDIR.TAG or .rustc_info.json); set {HARNESS_DIR_ENV} \
+                 to a directory the harness may use",
                 exe.display()
             )
         })
 }
 
 /// Where a test binary's harness directory goes: the binary's nearest ancestor
-/// holding a cargo `CACHEDIR.TAG`. For `<target>/<profile>/deps/<binary>` that
-/// is `<target>`. A build with `--target <triple>` — a cross build, or the
+/// holding a cargo target marker, `CACHEDIR.TAG` or `.rustc_info.json`
+/// ([`crate::cargo_target_marker::has_cargo_marker`]). For
+/// `<target>/<profile>/deps/<binary>` that is `<target>`. The tag alone is not
+/// enough: cargo writes it only into a target directory cargo itself creates,
+/// so a target that existed before cargo first ran in it carries none. That is
+/// the shared `target-agent/` after a sweep removed it and a wrapper re-created
+/// it (cargo-guard's test-binary pin writes `<target>/.cargo-verify/pins`
+/// before cargo runs), and every harness test then failed (coord findings
+/// `dfd42d99`, `ac123aca`). Every cargo target root carries `.rustc_info.json`.
+/// A build with `--target <triple>` — a cross build, or the
 /// host's own triple named explicitly — puts the binary in
 /// `<target>/<triple>/<profile>/deps/`, and cargo tags `<target>/<triple>/` as
-/// well when it creates it, so the harness lands in
-/// `<target>/<triple>/qontinui-test-pg`. That is intended: each triple's test
+/// well when it creates it (`.rustc_info.json` stays at `<target>/`), so the
+/// nearer tagged triple directory wins and the harness lands in
+/// `<target>/<triple>/qontinui-test-pg`; an untagged triple falls back to
+/// `<target>`. That is intended: each triple's test
 /// binaries get caches of their own. The bundled PostgreSQL a cache extracts is
 /// the one `postgresql_embedded` chooses in its build script, through a
 /// build-dependency, so it follows the HOST triple, which is the target's only
@@ -1725,7 +1736,7 @@ fn harness_dir() -> Result<PathBuf, String> {
 fn cargo_target_dir_of(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
         .skip(1)
-        .find(|dir| dir.join("CACHEDIR.TAG").is_file())
+        .find(|dir| crate::cargo_target_marker::has_cargo_marker(dir))
         .map(Path::to_path_buf)
 }
 
@@ -3858,29 +3869,46 @@ mod tests {
         );
     }
 
+    /// The harness finds its target by EITHER cargo marker, nearest first.
+    /// Case (a) is the regression for coord findings `dfd42d99` / `ac123aca`:
+    /// a shared target re-created before cargo ran carries `.rustc_info.json`
+    /// and no `CACHEDIR.TAG`, and every harness test failed to boot.
     #[test]
-    fn the_target_dir_is_the_nearest_ancestor_with_cargos_tag() {
+    fn the_target_dir_is_the_nearest_ancestor_with_a_cargo_marker() {
         let scratch = tempfile::tempdir().expect("scratch directory");
-        let target = scratch.path().join("target");
-        let deps = target.join("debug").join("deps");
-        std::fs::create_dir_all(&deps).expect("deps directory");
-        std::fs::write(target.join("CACHEDIR.TAG"), b"Signature").expect("tag");
-        let exe = deps.join("qontinui_runner_lib-0123abcd");
-        assert_eq!(cargo_target_dir_of(&exe), Some(target.clone()));
-        assert_eq!(cargo_target_dir_of(scratch.path()), None);
+        let exe_under = |target: &Path| {
+            let deps = target.join("debug").join("deps");
+            std::fs::create_dir_all(&deps).expect("deps directory");
+            deps.join("qontinui_runner_lib-0123abcd")
+        };
 
-        // `--target <triple>`: the binary is under `<target>/<triple>/`, which
-        // cargo tags as well when it creates it, so the harness lives per
-        // triple. Untagged, the triple directory is passed over for `<target>`.
-        let triple = target.join("x86_64-unknown-linux-gnu");
-        let cross_exe = triple
-            .join("debug")
-            .join("deps")
-            .join("qontinui_runner_lib-0123abcd");
-        std::fs::create_dir_all(cross_exe.parent().expect("deps")).expect("cross deps");
-        assert_eq!(cargo_target_dir_of(&cross_exe), Some(target.clone()));
+        // (a) a root holding only `.rustc_info.json` resolves to that root.
+        let info_only = scratch.path().join("info-only");
+        let exe = exe_under(&info_only);
+        std::fs::write(info_only.join(".rustc_info.json"), b"{}").expect("rustc info");
+        assert_eq!(cargo_target_dir_of(&exe), Some(info_only.clone()));
+
+        // (b) a tag-only root still resolves.
+        let tag_only = scratch.path().join("tag-only");
+        let exe = exe_under(&tag_only);
+        std::fs::write(tag_only.join("CACHEDIR.TAG"), b"Signature").expect("tag");
+        assert_eq!(cargo_target_dir_of(&exe), Some(tag_only.clone()));
+
+        // (c) `--target <triple>`: an untagged triple under a
+        // `.rustc_info.json`-only root falls back to the root.
+        let triple = info_only.join("x86_64-unknown-linux-gnu");
+        let cross_exe = exe_under(&triple);
+        assert_eq!(cargo_target_dir_of(&cross_exe), Some(info_only.clone()));
+
+        // (d) a tagged triple is nearer, so it wins: each triple's test
+        // binaries get caches of their own.
         std::fs::write(triple.join("CACHEDIR.TAG"), b"Signature").expect("triple tag");
         assert_eq!(cargo_target_dir_of(&cross_exe), Some(triple));
+
+        // (e) a tree with neither marker resolves to nothing.
+        let bare = scratch.path().join("bare");
+        let exe = exe_under(&bare);
+        assert_eq!(cargo_target_dir_of(&exe), None);
     }
 
     /// The harness directory is created private, with its missing parents, and

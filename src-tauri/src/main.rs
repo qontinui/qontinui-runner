@@ -137,6 +137,9 @@ mod runner_spawn_sites;
 // path in this binary - including mcp_api.rs's /health reporting - keeps
 // resolving unchanged.
 pub(crate) use qontinui_runner_lib::embedded_pg;
+// The cargo-target marker predicate lives in the lib crate (the test harness
+// needs it there); re-bound here for the orphan-target reaper.
+pub(crate) use qontinui_runner_lib::cargo_target_marker;
 mod error;
 mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod event_system;
