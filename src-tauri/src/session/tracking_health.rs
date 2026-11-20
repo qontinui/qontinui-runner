@@ -818,23 +818,59 @@ struct UndecidedKey {
 
 impl UndecidedKey {
     fn of(undecided: &[UndecidedProcess]) -> Self {
-        let mut roots: Vec<u32> = undecided
-            .iter()
-            .filter(|u| !u.nested_under_undecided)
-            .map(|u| u.pid)
-            .collect();
-        roots.sort_unstable();
         Self {
-            roots,
+            roots: undecided_roots(undecided),
             causes: undecided.iter().map(pid_free_reason).collect(),
         }
     }
 }
 
+/// The ROOTS of an undecided population, sorted: the undecided processes no
+/// other undecided process is an ancestor of. The one roots computation, for
+/// the census log key and the periodic warn.
+fn undecided_roots(undecided: &[UndecidedProcess]) -> Vec<u32> {
+    let mut roots: Vec<u32> = undecided
+        .iter()
+        .filter(|u| !u.nested_under_undecided)
+        .map(|u| u.pid)
+        .collect();
+    roots.sort_unstable();
+    roots
+}
+
 /// `u.reason` with its own pid taken out: the witness names the pid inside
 /// the sentence, and the cause — not the pid — is what a reader acts on.
 fn pid_free_reason(u: &UndecidedProcess) -> String {
-    u.reason.replace(&u.pid.to_string(), "<pid>")
+    without_pid_token(&u.reason, u.pid)
+}
+
+/// `reason` with every `pid <pid>` TOKEN rewritten to `pid <pid>` literally:
+/// only where the word `pid` (not the tail of a longer word) is followed by
+/// exactly these digits and then a non-digit. Any other occurrence of the
+/// digits — another pid that starts with them, a `5 s` budget, a path
+/// number — is part of the cause and is left alone.
+fn without_pid_token(reason: &str, pid: u32) -> String {
+    let needle = format!("pid {pid}");
+    let mut out = String::with_capacity(reason.len());
+    let mut copied = 0;
+    for (at, _) in reason.match_indices(&needle) {
+        let end = at + needle.len();
+        let word_start = reason[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let digits_end = reason[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
+        if word_start && digits_end {
+            out.push_str(&reason[copied..at]);
+            out.push_str("pid <pid>");
+            copied = end;
+        }
+    }
+    out.push_str(&reason[copied..]);
+    out
 }
 
 /// Logs the UNDECIDED population a census blocks on — once when it appears,
@@ -913,6 +949,23 @@ impl UndecidedLog {
         *reported = Some((key, now));
         line
     }
+}
+
+/// Child -> parent, inverted from a parent -> children index. A child listed
+/// under more than one parent (a table read across a reparenting) takes the
+/// MINIMUM parent pid, so the answer never depends on the map's iteration
+/// order.
+fn child_to_min_parent(parent_map: &HashMap<u32, Vec<u32>>) -> HashMap<u32, u32> {
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+    for (&parent, kids) in parent_map {
+        for &kid in kids {
+            parent_of
+                .entry(kid)
+                .and_modify(|p| *p = (*p).min(parent))
+                .or_insert(parent);
+        }
+    }
+    parent_of
 }
 
 /// Result of one cross-reference pass.
@@ -1507,12 +1560,7 @@ pub fn evaluate(
 
     // Child -> parent, inverted once from the snapshot's parent -> children
     // index. Used only for `parent_pid` / `nested_under_claude` reporting.
-    let mut parent_of: HashMap<u32, u32> = HashMap::new();
-    for (&parent, kids) in &snapshot.parent_map {
-        for &kid in kids {
-            parent_of.entry(kid).or_insert(parent);
-        }
-    }
+    let parent_of = child_to_min_parent(&snapshot.parent_map);
 
     // A claim is only ever made on a LIVE pid: an undecided pid under a plane
     // root stays undecided (it was noted when the universe was walked, or is
@@ -1957,10 +2005,11 @@ async fn run_once(
         );
     }
     if !report.undecided.is_empty() {
-        let undecided_pids: Vec<u32> = report.undecided.iter().map(|u| u.pid).collect();
+        let roots = undecided_roots(&report.undecided);
         warn!(
-            undecided = report.undecided.len(),
-            undecided_pids = ?undecided_pids,
+            undecided_roots = ?roots,
+            undecided_total = report.undecided.len(),
+            undecided_root_count = roots.len(),
             live_claude_total = report.live_claude_total,
             "session tracking health: UNDECIDED — processes that may be a live npm-installed \
              `claude` the session registry could not settle (a restart would be refused)"
@@ -4660,6 +4709,104 @@ mod tests {
         assert_eq!(log.observe_at(&set, due), UndecidedLogLine::Silent);
     }
 
+    /// Only the exact `pid <n>` token is taken out of a cause: a longer pid
+    /// that starts with the same digits, a possessive, and the digits
+    /// anywhere else in the sentence are left alone.
+    #[test]
+    fn the_pid_token_rewrite_takes_out_only_the_exact_pid_token() {
+        assert_eq!(
+            without_pid_token("pid 50 and pid 5's record", 5),
+            "pid 50 and pid <pid>'s record"
+        );
+        assert_eq!(
+            without_pid_token("pid 50 is unknown", 5),
+            "pid 50 is unknown"
+        );
+        assert_eq!(without_pid_token("pid 5", 5), "pid <pid>");
+        assert_eq!(
+            without_pid_token("within a 5 s budget, pid 5 in /tmp/5 is unknown", 5),
+            "within a 5 s budget, pid <pid> in /tmp/5 is unknown"
+        );
+        assert_eq!(
+            without_pid_token("rapid 5 then pid 5.", 5),
+            "rapid 5 then pid <pid>."
+        );
+        // Two distinct pids with one cause are one cause.
+        let causes: std::collections::BTreeSet<String> = [undecided(5, false), undecided(7, false)]
+            .iter()
+            .map(pid_free_reason)
+            .collect();
+        assert_eq!(causes.len(), 1, "{causes:?}");
+    }
+
+    /// The roots are the sorted non-nested pids.
+    #[test]
+    fn undecided_roots_are_the_sorted_non_nested_pids() {
+        assert_eq!(
+            undecided_roots(&[
+                undecided(70, false),
+                undecided(71, true),
+                undecided(50, false)
+            ]),
+            vec![50, 70]
+        );
+        assert!(undecided_roots(&[]).is_empty());
+    }
+
+    /// Pins existing behaviour: a new cause under unchanged roots is a new
+    /// line, while the same cause with only the pids changed is silent.
+    #[test]
+    fn the_undecided_log_warns_on_a_new_cause_under_the_same_roots() {
+        let log = UndecidedLog::new("test", "test consequence");
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            log.observe_at(&[undecided(50, false), undecided(51, true)], t0),
+            UndecidedLogLine::Warned
+        );
+        let mut other_cause = undecided(51, true);
+        other_cause.reason = "a different cause".to_string();
+        assert_eq!(
+            log.observe_at(&[undecided(50, false), other_cause.clone()], t0),
+            UndecidedLogLine::Warned,
+            "same roots, a new cause"
+        );
+        let mut other_cause_new_pid = other_cause;
+        other_cause_new_pid.pid = 52;
+        assert_eq!(
+            log.observe_at(&[undecided(50, false), other_cause_new_pid], t0),
+            UndecidedLogLine::Silent,
+            "same roots and causes, only a pid changed"
+        );
+    }
+
+    /// ARMING: a census whose nested undecided pid merely churns, under an
+    /// unchanged root and cause, stays silent even when the cause sentence
+    /// carries a number that shares the pid's digits.
+    #[test]
+    fn the_census_undecided_log_is_silent_when_a_nested_pid_sharing_the_causes_digits_churns() {
+        fn row(pid: u32, nested: bool) -> UndecidedProcess {
+            UndecidedProcess {
+                pid,
+                image: Some("node".to_string()),
+                reason: format!(
+                    "Claude Code's session registry did not answer within a 5 s budget, so \
+                     whether pid {pid} in the pane is a JS-runtime claude is unknown"
+                ),
+                nested_under_undecided: nested,
+            }
+        }
+        let log = UndecidedLog::new("test", "test consequence");
+        assert_eq!(
+            log.observe(&[row(50, false), row(5, true)]),
+            UndecidedLogLine::Warned
+        );
+        assert_eq!(
+            log.observe(&[row(50, false), row(6, true)]),
+            UndecidedLogLine::Silent,
+            "only a nested pid churned; the root and the cause are unchanged"
+        );
+    }
+
     /// `evaluate` marks an undecided process under another undecided one as
     /// nested, so only the roots key the log.
     #[test]
@@ -4683,5 +4830,45 @@ mod tests {
             .map(|u| (u.pid, u.nested_under_undecided))
             .collect();
         assert_eq!(nested, vec![(50, false), (51, true)]);
+    }
+
+    /// A child listed under several parents takes the MINIMUM parent, so the
+    /// answer does not depend on iteration order: 64 fresh maps, each with
+    /// its own `RandomState`, all agree.
+    #[test]
+    fn a_child_under_several_parents_takes_the_minimum_parent() {
+        for _ in 0..64 {
+            let parent_map: HashMap<u32, Vec<u32>> = [90, 7, 300, 12]
+                .into_iter()
+                .map(|parent| (parent, vec![50]))
+                .collect();
+            assert_eq!(child_to_min_parent(&parent_map).get(&50), Some(&7));
+        }
+    }
+
+    /// The nesting walk passes through a DECIDED intermediate: shell 51
+    /// (decided by its image) between undecided `node` 50 and undecided
+    /// `node` 52 does not stop 52 being nested.
+    #[test]
+    fn evaluate_nests_an_undecided_process_through_a_decided_intermediate() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let mut snap = snap_with(
+            &[(1, &[5]), (5, &[50]), (50, &[51]), (51, &[52])],
+            &[(5, now_s), (50, now_s), (51, now_s), (52, now_s)],
+            &[(5, "bash"), (50, "node"), (51, "bash"), (52, "node")],
+        );
+        snap.stale = false;
+        let look = PaneLook::over_whole_table(
+            snap,
+            crate::terminal::graceful_exit::RegistryWitness::unreadable("test"),
+        );
+        let report = eval_npm(&look, &[], now_ms);
+        let nested: Vec<(u32, bool)> = report
+            .undecided
+            .iter()
+            .map(|u| (u.pid, u.nested_under_undecided))
+            .collect();
+        assert_eq!(nested, vec![(50, false), (52, true)]);
     }
 }
