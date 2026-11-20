@@ -3882,7 +3882,10 @@ MemAvailable:   15335424 kB
             ("fleet-pub-rt".to_string(), 3usize),
             ("<other-threads>".to_string(), 1usize),
             // One past u32::MAX: a wrapping `v as u32` would publish 0.
-            ("huge".to_string(), usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX)),
+            (
+                "huge".to_string(),
+                usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX),
+            ),
             ("edge".to_string(), u32::MAX as usize),
         ]);
         assert_eq!(
@@ -3900,7 +3903,9 @@ MemAvailable:   15335424 kB
         // through that mapping, unconditionally.
         let body = collect_host_lane_src();
         assert!(
-            body.contains("s.blocking_lanes = Some(blocking_lanes_field(tracked_blocking_by_thread()));"),
+            body.contains(
+                "s.blocking_lanes = Some(blocking_lanes_field(tracked_blocking_by_thread()));"
+            ),
             "collect_host_lane must publish the live lane table through blocking_lanes_field"
         );
         assert_eq!(
