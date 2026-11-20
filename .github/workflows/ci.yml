@@ -462,6 +462,18 @@ jobs:
           fetch-depth: 0
           filter: blob:none
 
+      # The Repo(s) parser has a Python port (the census that produces the
+      # doc-comment numbers on `extract_repos`). The Rust test
+      # `the_shared_cases_hold_for_the_rust_parse` runs the shared case file
+      # against the Rust parse; this runs it against the port, so a change to
+      # one parse and the cases cannot leave the other silently behind.
+      # No runner, no network, no build; ubuntu only; <1s -- so it sits right
+      # after checkout and reports before the long build can fail first.
+      - name: extract_repos Python port agrees on the shared cases
+        if: matrix.platform == 'ubuntu-22.04'
+        run: python3 -I src-tauri/src/plan_workunit_adapter/census/extract_repos_census.py --self-test
+        shell: bash
+
       # SELF-HOSTED ONLY (the `route` job above put the ubuntu leg on the
       # pool). Two things a hosted VM gets for free and a persistent host does
       # not:
