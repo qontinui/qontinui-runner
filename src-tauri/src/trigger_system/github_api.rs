@@ -1243,8 +1243,24 @@ mod tests {
             .expect("client builds")
             .with_api_base(base);
         let pending = tokio::spawn(async move { interactive.get_pr("o", "r", 1).await });
-        // Let the refusal land and the interactive caller start its sleep.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Wait — bounded, never a fixed guess — until the interactive refusal
+        // has landed and the credential's hold is observable.
+        let credential = CredentialKey::of_token(token);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let held = matches!(
+                github_budget::background_verdict_for_test(&credential),
+                Err(d) if matches!(d.reason, github_budget::DeferralReason::RetryAfter { .. })
+            );
+            if held {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the interactive refusal never set the credential's hold"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         let background = GitHubClient::new(token, "budget_test_interactive_hold_bg")
             .expect("client builds")

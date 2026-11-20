@@ -1493,6 +1493,18 @@ pub fn record_login_failure(credential: &CredentialKey) {
 /// Seed ONE credential's reading without touching the snapshot's global
 /// reading — so a test can put a bucket under the headroom line without racing
 /// tests that assert on the process-global snapshot.
+/// The background gate's verdict for `credential` right now, WITHOUT metering
+/// a deferral — so a test can wait for a hold to become observable.
+#[cfg(test)]
+pub(crate) fn background_verdict_for_test(
+    credential: &CredentialKey,
+) -> Result<(), BudgetDeferral> {
+    match registry().lock() {
+        Ok(reg) => reg.background_verdict(credential, now_unix(), HeadroomKnobs::from_env()),
+        Err(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn seed_reading_for_test(credential: &CredentialKey, obs: &RateLimitObservation) {
     if let Ok(mut reg) = registry().lock() {

@@ -579,10 +579,10 @@ impl TicketProvider for GitHubTicketProvider {
         let (owner, repo) = Self::parse_target(&config.target)?;
         // POST target and cached-read URL differ by the read's `?per_page`, so
         // the invalidation names the READ's url, not this one.
-        let url = format!(
+        let url = self.at_base(format!(
             "https://api.github.com/repos/{}/{}/issues/{}/comments",
             owner, repo, ticket_id
-        );
+        ));
 
         let resp = self
             .send_write(
