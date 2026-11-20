@@ -257,7 +257,13 @@ impl PgDb {
         Ok(row_id)
     }
 
-    /// Mark a workflow AI session as completed, failed, or interrupted.
+    /// Mark a workflow AI session with its terminal status.
+    ///
+    /// The only caller (the agentic phase) writes `completed` or `failed` —
+    /// see `workflow_ai_session_terminal_status` in
+    /// `unified_workflow_executor/phases/agentic.rs`. Nothing writes
+    /// `interrupted` today: a row left `running` at the start of a later
+    /// attempt is how an interrupted session is recognised.
     pub async fn complete_workflow_ai_session(
         &self,
         task_run_id: &str,
@@ -390,7 +396,10 @@ impl PgDb {
         Ok(())
     }
 
-    /// Get the most recent AI session for a task run, filtered by phase and iteration.
+    /// Get the most recent AI session for a task run, keyed exactly as
+    /// `create_workflow_ai_session` / `complete_workflow_ai_session` key it:
+    /// `(task_run_id, iteration, phase, COALESCE(stage_index, -1))`, so a row
+    /// written by another stage can never be returned.
     /// Returns (claude_cli_session_id, status) if found.
     #[expect(
         clippy::disallowed_methods,
@@ -401,21 +410,24 @@ impl PgDb {
         task_run_id: &str,
         iteration: i32,
         phase: &str,
+        stage_index: Option<i32>,
     ) -> Result<Option<(String, String)>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let coalesced_stage = stage_index.unwrap_or(-1);
 
         let row = conn
             .query_opt(
                 r#"SELECT claude_cli_session_id, status
                    FROM workflow_ai_sessions
                    WHERE task_run_id = $1 AND iteration = $2 AND phase = $3
+                     AND COALESCE(stage_index, -1) = $4
                    ORDER BY id DESC
                    LIMIT 1"#,
-                &[&task_run_id, &iteration, &phase],
+                &[&task_run_id, &iteration, &phase, &coalesced_stage],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("PG get_workflow_ai_session", &e))?;
