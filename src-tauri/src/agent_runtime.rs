@@ -2465,6 +2465,22 @@ enum SpawnDecision {
     SkipRerouted {
         target_device_id: Option<uuid::Uuid>,
     },
+    /// Claim refused (HTTP 409 `{"error":"wrong_device","target_device_id"}`)
+    /// → the continuation is `pin: "strict"` and this device is NOT its pin:
+    /// "this device or nothing", for work that is local to the pinned device
+    /// (its files, logs, scheduled tasks). SKIP the spawn, post NO outcome and
+    /// NO deferral, and RELEASE the local dispatch claim. Spawning here — what
+    /// the "any other 409" arm below does for a runner that predates this
+    /// variant — starts a session that can only report `work_misrouted`, a
+    /// RAM-holding process spawned to refuse. Coord wrote nothing and left the
+    /// row pending at its pin, so the pin's own poll still delivers it.
+    /// Carries the pin when the body names it as a UUID, for the INFO log only.
+    ///
+    /// Plan `2026-11-19-a-device-bound-continuation-holds-its-pin-and-a-misrouted-one-is-not-consumed`,
+    /// Phase 2a.
+    SkipWrongDevice {
+        target_device_id: Option<uuid::Uuid>,
+    },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
     /// (availability over consistency; the in-process dedupe still guards).
     /// Carries a human-readable cause for the WARN log.
@@ -2573,6 +2589,10 @@ fn continuation_drain_admission_for(
 ///   [`SpawnDecision::SkipRerouted`] (new target from `target_device_id`, when
 ///   it parses as a UUID). Without this arm the rerouted refusal fell into the
 ///   "any other 409" spawn-anyway branch below and double-spawned.
+/// - 409 with a JSON body whose `error == "wrong_device"` →
+///   [`SpawnDecision::SkipWrongDevice`] (the pin from `target_device_id`, when
+///   it parses as a UUID): a strict-pinned continuation claimed from a device
+///   that is not its pin.
 /// - any other status (incl. a 409 that is NONE of those shapes) →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
 ///
@@ -2611,13 +2631,24 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
                     .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 return SpawnDecision::SkipRerouted { target_device_id };
             }
+            // The strict-pin shape: `{"error":"wrong_device",
+            // "target_device_id":<uuid>}` - this device is not the pin. Without
+            // this arm it fell into the spawn-anyway branch below.
+            if v.get("error").and_then(|e| e.as_str()) == Some("wrong_device") {
+                let target_device_id = v
+                    .get("target_device_id")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                return SpawnDecision::SkipWrongDevice { target_device_id };
+            }
         }
-        // A 409 that is none of the cancelled / superseded / rerouted contracts
+        // A 409 that is none of the cancelled / superseded / rerouted /
+        // wrong_device contracts
         // (e.g. some other conflict): proceed rather than silently drop the
         // continuation.
         return SpawnDecision::SpawnDespiteClaimError {
             cause: format!(
-                "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
+                "claim returned 409 without a cancelled, superseded, rerouted or wrong_device body: {body}"
             ),
         };
     }
@@ -3138,6 +3169,10 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   proceeds on a later claim if the winner is released (spawn_failed /
 ///   work_abandoned / work_unreported). Keeping the id claimed would strand it
 ///   for the process lifetime (see [`release_gate_dispatch_attempt`]).
+/// * [`SpawnDecision::SkipWrongDevice`] → **true**. coord wrote nothing and the
+///   row stays pending at its strict pin; the id is released so a frame that
+///   later names THIS device (the operator re-pinning, or a re-registration)
+///   is not dropped at the dedupe check for the process lifetime.
 /// * [`SpawnDecision::SkipRerouted`] → **true**, a deliberate choice. The row
 ///   IS still pending on coord, but targeted at another device — coord's
 ///   reroute is one OF RECORD (`REROUTE_OF_RECORD_SQL` rewrites the persisted
@@ -3160,7 +3195,9 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 fn skip_leaves_row_pending(decision: &SpawnDecision) -> bool {
     matches!(
         decision,
-        SpawnDecision::SkipSuperseded { .. } | SpawnDecision::SkipRerouted { .. }
+        SpawnDecision::SkipSuperseded { .. }
+            | SpawnDecision::SkipRerouted { .. }
+            | SpawnDecision::SkipWrongDevice { .. }
     )
 }
 
@@ -3314,6 +3351,22 @@ fn settle_claim_decision(
             // rather than incidental). No outcome and no deferred stamp: the
             // row now belongs to the new target, and a deferral from us would
             // write this device's pressure onto a row another device owns.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipWrongDevice { target_device_id } => {
+            info!(
+                "agent_runtime: continuation is strict-pinned to another device - skipping \
+                 spawn, coord left the row pending at its pin (gate_id={gate_id} \
+                 target_device_id={})",
+                target_device_id
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "(not named)".to_string())
+            );
+            // RELEASES (`skip_leaves_row_pending`). No outcome and no deferred
+            // stamp: coord wrote nothing, and a deferral from this device would
+            // put its pressure on a row only the pin may run.
             settle_skipped_claim(decision, consume_target);
             ClaimOutcome::Skip
         }
@@ -22975,6 +23028,73 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// 409 with the strict-pin contract → SkipWrongDevice, carrying the pin
+    /// (plan `2026-11-19-a-device-bound-continuation-holds-its-pin-and-a-misrouted-one-is-not-consumed`,
+    /// Phase 2a). Before this arm the shape fell through to
+    /// `SpawnDespiteClaimError` and SPAWNED a session on the wrong device.
+    #[test]
+    fn decide_spawn_on_409_wrong_device_skips_with_the_pin() {
+        let pin = uuid::Uuid::now_v7();
+        let body = format!(r#"{{"error":"wrong_device","target_device_id":"{pin}"}}"#);
+        let decision = decide_spawn(409, &body);
+        assert_eq!(
+            decision,
+            SpawnDecision::SkipWrongDevice {
+                target_device_id: Some(pin)
+            }
+        );
+        assert!(
+            !matches!(decision, SpawnDecision::SpawnDespiteClaimError { .. }),
+            "a wrong_device refusal must never spawn"
+        );
+    }
+
+    /// A `wrong_device` body whose pin is absent or unparseable still skips (the
+    /// refusal is authoritative; the pin is only for the log), and a 5xx
+    /// carrying the same text does NOT: only a 409 is a refusal.
+    #[test]
+    fn decide_spawn_on_409_wrong_device_without_a_pin_still_skips() {
+        for body in [
+            r#"{"error":"wrong_device"}"#,
+            r#"{"error":"wrong_device","target_device_id":"not-a-uuid"}"#,
+            r#"{"error":"wrong_device","target_device_id":7}"#,
+        ] {
+            assert_eq!(
+                decide_spawn(409, body),
+                SpawnDecision::SkipWrongDevice {
+                    target_device_id: None
+                },
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            decide_spawn(500, r#"{"error":"wrong_device"}"#),
+            SpawnDecision::SpawnDespiteClaimError { .. }
+        ));
+    }
+
+    /// The settle path: a wrong_device refusal SKIPS (no spawn, no deferral) and
+    /// RELEASES the local dispatch claim, because coord left the row pending at
+    /// its pin.
+    #[test]
+    fn a_wrong_device_refusal_skips_and_releases_the_claim() {
+        let decision = decide_spawn(409, r#"{"error":"wrong_device"}"#);
+        assert!(skip_leaves_row_pending(&decision));
+        let gate = uuid::Uuid::now_v7();
+        let funnel = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(funnel));
+        assert_eq!(
+            settle_claim_decision(&decision, ConsumeTarget::Gate(funnel, 0), gate),
+            ClaimOutcome::Skip,
+            "a wrong_device claim refusal must not spawn and must not defer"
+        );
+        assert!(
+            claim_gate_dispatch(funnel),
+            "the id must be claimable again after the funnel settles it"
+        );
+        release_gate_dispatch(funnel);
     }
 
     /// 409 cancelled with no `cancel_reason` → SkipCancelled with `None` reason
