@@ -140,7 +140,12 @@ fn timed_real_stat(bin: &Path, root: &Path) {
 }
 
 fn first_stat_at(root: &Path) -> Option<SystemTime> {
-    let ns: u64 = read(&root.join("stat.times")).lines().next()?.trim().parse().ok()?;
+    let ns: u64 = read(&root.join("stat.times"))
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()?;
     Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(ns))
 }
 
@@ -268,10 +273,17 @@ fn run(scenario: &Scenario) -> Run {
     for d in [&shim_dir, &bin, &real_dir] {
         std::fs::create_dir_all(d).unwrap();
     }
-    let (marker, beacons, date_log) = (root.join("ran"), root.join("beacons"), root.join("date.log"));
+    let (marker, beacons, date_log) = (
+        root.join("ran"),
+        root.join("beacons"),
+        root.join("date.log"),
+    );
     write_exe(
         &bin.join("curl"),
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", beacons.display()),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            beacons.display()
+        ),
     );
     let real = real_dir.join("claude");
     let staged = root.join("claude.staged");
@@ -288,8 +300,22 @@ fn run(scenario: &Scenario) -> Run {
     };
     match scenario.stat {
         Stat::Absent => {}
-        Stat::Gnu => fake_stat(&bin, root, false, scenario.answers, clock.unwrap_or(FIXED_NOW), &vanish),
-        Stat::Bsd => fake_stat(&bin, root, true, scenario.answers, clock.unwrap_or(FIXED_NOW), &vanish),
+        Stat::Gnu => fake_stat(
+            &bin,
+            root,
+            false,
+            scenario.answers,
+            clock.unwrap_or(FIXED_NOW),
+            &vanish,
+        ),
+        Stat::Bsd => fake_stat(
+            &bin,
+            root,
+            true,
+            scenario.answers,
+            clock.unwrap_or(FIXED_NOW),
+            &vanish,
+        ),
         Stat::Real => timed_real_stat(&bin, root),
     }
     match scenario.claude {
@@ -376,7 +402,11 @@ fn a_settled_claude_launches_at_once_with_nothing_on_stderr() {
         "one stat, with -L: {}",
         run.stat_calls
     );
-    assert!(run.stat_calls.starts_with("-L -c %Z "), "{}", run.stat_calls);
+    assert!(
+        run.stat_calls.starts_with("-L -c %Z "),
+        "{}",
+        run.stat_calls
+    );
     assert_invoked_only(&run, "settled");
 }
 
@@ -413,9 +443,14 @@ fn a_claude_still_changing_at_the_bound_is_launched_anyway() {
         ..Scenario::default()
     });
     assert!(run.ok, "exit 0 from the fake real claude: {}", run.stderr);
-    assert!(run.ran, "the changing candidate is launched: {}", run.stderr);
     assert!(
-        run.stderr.contains("/real/claude has not settled after 1s; launching it anyway"),
+        run.ran,
+        "the changing candidate is launched: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("/real/claude has not settled after 1s; launching it anyway"),
         "{}",
         run.stderr
     );
@@ -438,7 +473,11 @@ fn an_unreadable_change_time_adds_no_wait() {
             answers,
             ..Scenario::default()
         });
-        assert!(run.ok && run.ran, "{what}: the real claude ran: {}", run.stderr);
+        assert!(
+            run.ok && run.ran,
+            "{what}: the real claude ran: {}",
+            run.stderr
+        );
         assert_eq!(run.stderr, "", "{what}: unknown counts as settled");
         assert!(
             run.elapsed < Duration::from_secs(5),
@@ -478,7 +517,11 @@ fn a_bsd_stat_is_read_through_dash_f_and_its_usage_error_never_reaches_the_pane(
         "exactly the one wait line: {}",
         run_fresh.stderr
     );
-    assert!(run_fresh.stderr.contains(WAIT_LINE_TAIL), "{}", run_fresh.stderr);
+    assert!(
+        run_fresh.stderr.contains(WAIT_LINE_TAIL),
+        "{}",
+        run_fresh.stderr
+    );
 }
 
 #[test]
@@ -518,8 +561,17 @@ fn absent_then_changing_then_settled_share_one_bound() {
     });
     assert!(run.ok && run.ran, "{}", run.stderr);
     let lines: Vec<&str> = run.stderr.lines().collect();
-    assert_eq!(lines.len(), 2, "one miss line, one settle line: {}", run.stderr);
-    assert!(lines[0].contains("claude not found on PATH"), "{}", run.stderr);
+    assert_eq!(
+        lines.len(),
+        2,
+        "one miss line, one settle line: {}",
+        run.stderr
+    );
+    assert!(
+        lines[0].contains("claude not found on PATH"),
+        "{}",
+        run.stderr
+    );
     assert!(lines[1].contains(WAIT_LINE_TAIL), "{}", run.stderr);
     assert_invoked_only(&run, "absent, changing, settled");
 }
@@ -537,8 +589,17 @@ fn a_candidate_that_vanishes_under_stat_is_a_miss_not_an_unknown() {
     });
     assert!(run.ok && run.ran, "{}", run.stderr);
     let lines: Vec<&str> = run.stderr.lines().collect();
-    assert_eq!(lines.len(), 1, "one miss line and nothing else: {}", run.stderr);
-    assert!(lines[0].contains("claude not found on PATH"), "{}", run.stderr);
+    assert_eq!(
+        lines.len(),
+        1,
+        "one miss line and nothing else: {}",
+        run.stderr
+    );
+    assert!(
+        lines[0].contains("claude not found on PATH"),
+        "{}",
+        run.stderr
+    );
     assert_eq!(
         run.stat_calls.lines().count(),
         3,
