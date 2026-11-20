@@ -32,12 +32,76 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::github_budget::{self, CacheMode};
+use crate::github_budget::{self, BudgetDeferral, CacheMode, CredentialKey, SpendClass};
 
-/// Requests left in the shared bucket at or below which a client sleeps until
-/// reset rather than issuing more. Unchanged from the per-instance counters this
-/// replaced — only the SOURCE of the reading changed.
+/// Requests left in the credential's bucket at or below which an INTERACTIVE
+/// client sleeps one chunk before sending. A background client never reaches
+/// it: the headroom gate ([`github_budget::background_gate`]) defers it first.
 const RATE_LIMIT_FLOOR: i64 = 10;
+
+/// Why a [`GitHubClient`] read produced no answer.
+///
+/// `Deferred` is NOT a failure: the request was never sent because the
+/// background headroom gate judged the credential's window short. A caller
+/// must tell the two apart — a deferral says "stop spending this cycle", a
+/// failure says "this one read went wrong".
+#[derive(Debug)]
+pub enum GhError {
+    /// Decided against before sending (background spend class only).
+    Deferred(BudgetDeferral),
+    /// Sent, and GitHub refused it for RATE (a `429`, a primary-limit `403`, or
+    /// a secondary-limit `403` with `Retry-After`) — background spend class
+    /// only, which never sleeps on it. Like a deferral it says "stop spending
+    /// this cycle", not "this one read went wrong".
+    RateLimited { status: u16 },
+    /// Sent, and GitHub answered a non-success status that is NOT a rate
+    /// refusal (a permission `401`/`403`, a `404`, a `5xx`). Carries the status
+    /// so a caller can tell a terminal refusal from a transient one.
+    HttpStatus { status: u16, message: String },
+    /// Sent (or attempted) and failed without a usable status (transport,
+    /// body read, parse).
+    Failed(String),
+}
+
+impl GhError {
+    /// True when the answer means "the budget said no" — a deferral or a
+    /// rate-limited refusal — rather than a failure of this one read.
+    pub fn is_budget_stop(&self) -> bool {
+        matches!(self, GhError::Deferred(_) | GhError::RateLimited { .. })
+    }
+}
+
+impl std::fmt::Display for GhError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GhError::Deferred(d) => write!(f, "{d}"),
+            GhError::RateLimited { status } => write!(
+                f,
+                "GitHub API rate limited ({status}); background request not slept on or retried"
+            ),
+            GhError::HttpStatus { message, .. } => f.write_str(message),
+            GhError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for GhError {
+    fn from(e: String) -> Self {
+        GhError::Failed(e)
+    }
+}
+
+impl From<&str> for GhError {
+    fn from(e: &str) -> Self {
+        GhError::Failed(e.to_string())
+    }
+}
+
+impl From<GhError> for String {
+    fn from(e: GhError) -> Self {
+        e.to_string()
+    }
+}
 
 /// Longest single back-off, in seconds. Preserved verbatim from the per-instance
 /// implementation: a GitHub reset can be an hour out, and blocking a poller for
@@ -78,10 +142,14 @@ pub(crate) fn now_unix() -> i64 {
 /// How long to sleep before the single retry of a rate-limited response, or
 /// `None` when this response must not be retried. Pure, unit-tested.
 ///
-/// The two arms are genuinely different signals and were already treated as
-/// such: a `429` carries `Retry-After`, while a `403` is a rate-limit refusal
-/// only when it also says `x-ratelimit-remaining: 0` — a permission `403` must
-/// not be slept on.
+/// `Some` exactly when [`github_budget::is_rate_limited_refusal`] — the one
+/// classifier the meter, the ticket provider and `ci_node::sibling` also ask —
+/// says GitHub refused this for rate, not for permission.
+///
+/// The wait: a `429` or a secondary-limit `403` waits its `Retry-After` (a
+/// `429` without one, a minute); a primary-limit `403`
+/// (`x-ratelimit-remaining: 0`) waits for the reset. A permission `403` carries
+/// neither signal and must not be slept on.
 pub(crate) fn retry_backoff_secs(
     status: u16,
     retry_after: Option<u64>,
@@ -89,15 +157,48 @@ pub(crate) fn retry_backoff_secs(
     reset_at_unix: Option<i64>,
     now: i64,
 ) -> Option<u64> {
-    let wait = match status {
-        429 => retry_after.unwrap_or(60),
-        403 if remaining == Some(0) => match reset_at_unix {
+    if !github_budget::is_rate_limited_refusal(status, retry_after, remaining) {
+        return None;
+    }
+    let wait = match (status, remaining, retry_after) {
+        (403, Some(0), _) => match reset_at_unix {
             Some(reset) if reset > now => (reset - now) as u64,
             _ => 60,
         },
-        _ => return None,
+        (_, _, Some(secs)) => secs,
+        _ => 60,
     };
     Some(wait.min(MAX_BACKOFF_SECS))
+}
+
+/// INTERACTIVE only: sleep one chunk when `credential`'s own bucket is at or
+/// below [`RATE_LIMIT_FLOOR`] and its window has not reset — then let the caller
+/// send. Shared by [`GitHubClient`] and the ticket provider's writes so the two
+/// cannot drift.
+///
+/// The reading is the credential's own, never another token's. No reading at
+/// all is UNKNOWN, and UNKNOWN does not sleep: a cold process must be allowed
+/// to make its first request, which is what produces the first reading.
+pub(crate) async fn interactive_floor(credential: &CredentialKey) {
+    let Some(obs) = github_budget::rate_limit_for(credential) else {
+        return;
+    };
+    let (Some(remaining), Some(reset)) = (obs.remaining, obs.reset_at_unix) else {
+        return;
+    };
+    if remaining > RATE_LIMIT_FLOOR {
+        return;
+    }
+    let now = now_unix();
+    if now >= reset {
+        return;
+    }
+    let wait = ((reset - now) as u64).min(MAX_BACKOFF_SECS);
+    warn!(
+        "GitHub API rate limit low ({} remaining, credential {}), waiting {}s",
+        remaining, credential, wait
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
 }
 
 /// A `403` that is NOT a rate-limit refusal — a permission or SSO failure. It is
@@ -323,10 +424,54 @@ pub struct HeadPr {
 pub struct GitHubClient {
     client: reqwest::Client,
     token: String,
+    /// The bucket this client spends, by token digest — never the token.
+    credential: CredentialKey,
     /// Which subsystem's spend this client's calls are attributed to in the
     /// budget histogram. Other subsystems spend the same credential through their
     /// own clients, and telling them apart is the whole point of the row key.
     consumer: &'static str,
+    /// Background requests are gated on the credential's headroom and
+    /// deferred, never slept on; interactive ones keep the floor and the
+    /// rate-limit retry. Interactive unless [`Self::with_spend_class`] says so.
+    spend_class: SpendClass,
+    /// Scheme + host every route is built against: [`GITHUB_API_BASE`] in
+    /// production. A test points it at a refusing port so a request that
+    /// escapes a gate shows up as a transport error instead of reaching GitHub.
+    api_base: &'static str,
+}
+
+/// The GitHub REST API origin every URL builder in this module spells.
+pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// `url` (built against [`GITHUB_API_BASE`]) re-rooted at `base`. The identity
+/// whenever `base` is [`GITHUB_API_BASE`], i.e. in production; a test points
+/// `base` at a loopback port so a request that escapes a gate never reaches
+/// GitHub. Shared by [`GitHubClient`] and the ticket provider.
+pub(crate) fn at_api_base(base: &str, url: String) -> String {
+    match url.strip_prefix(GITHUB_API_BASE) {
+        Some(path) if base != GITHUB_API_BASE => format!("{base}{path}"),
+        _ => url,
+    }
+}
+
+/// One canned HTTP response on a loopback port, for the rate-limit arms a
+/// refusing port cannot produce. Returns the base URL. Test-only.
+#[cfg(test)]
+pub(crate) async fn one_shot_server_for_test(response: &'static str) -> &'static str {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    Box::leak(format!("http://{addr}").into_boxed_str())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,41 +505,35 @@ impl GitHubClient {
         Ok(Self {
             client,
             token: token.to_string(),
+            credential: CredentialKey::of_token(token),
             consumer,
+            spend_class: SpendClass::Interactive,
+            api_base: GITHUB_API_BASE,
         })
     }
 
-    /// Wait if the SHARED bucket is close to empty.
-    ///
-    /// The reading comes from [`crate::github_budget`] rather than from this
-    /// instance, because the bucket is per-credential and this process spends one
-    /// credential through more than one client. An instance counter can only ever
-    /// see the fraction of the spend that went through it, so each client backed
-    /// off late by however much the others had already drawn down.
-    ///
-    /// No reading at all is UNKNOWN, and UNKNOWN does not sleep: a cold process
-    /// must be allowed to make its first request, which is what produces the
-    /// first reading.
-    async fn check_rate_limit(&self) {
-        let Some(obs) = github_budget::last_rate_limit() else {
-            return;
-        };
-        let (Some(remaining), Some(reset)) = (obs.remaining, obs.reset_at_unix) else {
-            return;
-        };
-        if remaining > RATE_LIMIT_FLOOR {
-            return;
-        }
-        let now = now_unix();
-        if now >= reset {
-            return;
-        }
-        let wait = ((reset - now) as u64).min(MAX_BACKOFF_SECS);
-        warn!(
-            "GitHub API rate limit low ({} remaining, shared bucket), waiting {}s",
-            remaining, wait
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+    /// Point every route at `base` instead of [`GITHUB_API_BASE`].
+    #[cfg(test)]
+    pub(crate) fn with_api_base(mut self, base: &'static str) -> Self {
+        self.api_base = base;
+        self
+    }
+
+    /// `url` (built against [`GITHUB_API_BASE`]) re-rooted at this client's
+    /// `api_base`. The identity in production.
+    fn at_base(&self, url: String) -> String {
+        at_api_base(self.api_base, url)
+    }
+
+    /// Set this client's spend class (default [`SpendClass::Interactive`]).
+    pub fn with_spend_class(mut self, spend_class: SpendClass) -> Self {
+        self.spend_class = spend_class;
+        self
+    }
+
+    /// The bucket this client spends.
+    pub fn credential(&self) -> &CredentialKey {
+        &self.credential
     }
 
     /// Put one request on the wire and fold it into the budget meter.
@@ -421,7 +560,14 @@ impl GitHubClient {
 
         let status = resp.status();
         let headers = resp.headers().clone();
-        github_budget::record_response(self.consumer, url, cache_mode, status.as_u16(), &headers);
+        github_budget::record_response(
+            &self.credential,
+            self.consumer,
+            url,
+            cache_mode,
+            status.as_u16(),
+            &headers,
+        );
 
         let rate = github_budget::parse_rate_limit(&headers);
         let etag = headers
@@ -454,8 +600,14 @@ impl GitHubClient {
         })
     }
 
-    /// Send a request with shared-bucket pre-check, budget metering, conditional
-    /// -request handling and a single 403/429 retry.
+    /// Send a request with a budget pre-check, budget metering, conditional
+    /// -request handling and — interactive only — a single 403/429 retry.
+    ///
+    /// The pre-check depends on the spend class. A BACKGROUND request under the
+    /// credential's headroom line ([`github_budget::background_gate`]) is never
+    /// sent and never slept on: it returns [`GhError::Deferred`], already
+    /// counted on the meter as `deferred`. An INTERACTIVE request keeps the
+    /// sleep-then-send floor ([`interactive_floor`]).
     ///
     /// `url` is passed explicitly rather than recovered from the built request:
     /// it is the ETag cache key AND the meter's template source, and a
@@ -465,8 +617,14 @@ impl GitHubClient {
         url: &str,
         cache_mode: CacheMode,
         request: reqwest::RequestBuilder,
-    ) -> Result<GhResponse, String> {
-        self.check_rate_limit().await;
+    ) -> Result<GhResponse, GhError> {
+        match self.spend_class {
+            SpendClass::Background => {
+                github_budget::background_gate(&self.credential, self.consumer, url, cache_mode)
+                    .map_err(GhError::Deferred)?;
+            }
+            SpendClass::Interactive => interactive_floor(&self.credential).await,
+        }
 
         // Kept aside BEFORE the validator goes on, for the (rare) case where the
         // validator survives in cache but the body it names does not.
@@ -488,13 +646,27 @@ impl GitHubClient {
         let retry_clone = request.try_clone();
         let mut ex = self.send_once(url, cache_mode, request).await?;
 
-        if let Some(wait) = retry_backoff_secs(
+        let backoff = retry_backoff_secs(
             ex.status.as_u16(),
             ex.retry_after,
             ex.remaining,
             ex.reset_at_unix,
             now_unix(),
-        ) {
+        );
+        if let (Some(wait), SpendClass::Background) = (backoff, self.spend_class) {
+            // A background poller is never slept on. The refusal is already on
+            // the meter as `rate_limited`; the hold keeps the next tick or
+            // nudge from re-sending inside GitHub's window; and the caller
+            // reads `RateLimited` as "stop spending this cycle".
+            github_budget::record_rate_limited_refusal(&self.credential, wait);
+            return Err(GhError::RateLimited {
+                status: ex.status.as_u16(),
+            });
+        }
+        if let Some(wait) = backoff {
+            // Hold this credential's BACKGROUND spend for the same window, so a
+            // poller does not send inside the Retry-After GitHub just gave.
+            github_budget::record_rate_limited_refusal(&self.credential, wait);
             warn!(
                 "GitHub API rate limited ({}), retrying after {}s",
                 ex.status, wait
@@ -503,12 +675,15 @@ impl GitHubClient {
             let retry = retry_clone.ok_or("Failed to clone request for potential retry")?;
             ex = self.send_once(url, cache_mode, retry).await?;
         } else if is_terminal_403(ex.status.as_u16(), ex.remaining) {
-            // A permission 403, not an empty bucket. Terminal, as before.
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                ex.status,
-                String::from_utf8_lossy(&ex.body)
-            ));
+            // A permission 403, not a rate refusal. Terminal, as before.
+            return Err(GhError::HttpStatus {
+                status: ex.status.as_u16(),
+                message: format!(
+                    "GitHub API returned {}: {}",
+                    ex.status,
+                    String::from_utf8_lossy(&ex.body)
+                ),
+            });
         }
 
         // A 304 is FREE against the bucket — the entire point of the conditional
@@ -585,8 +760,8 @@ impl GitHubClient {
     /// measured ~1,446 charged against 12 not-modified). It is wired anyway
     /// because the alternative is guessing, and the `cached` row's own ratio
     /// will say what it actually buys here.
-    pub async fn get_pr(&self, owner: &str, repo: &str, number: u64) -> Result<PrStatus, String> {
-        let url = pr_url(owner, repo, number);
+    pub async fn get_pr(&self, owner: &str, repo: &str, number: u64) -> Result<PrStatus, GhError> {
+        let url = self.at_base(pr_url(owner, repo, number));
         let resp = self
             .send_metered(
                 &url,
@@ -596,16 +771,15 @@ impl GitHubClient {
             .await?;
 
         if !resp.is_success() {
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text()
-            ));
+            return Err(GhError::HttpStatus {
+                status: resp.status().as_u16(),
+                message: format!("GitHub API returned {}: {}", resp.status(), resp.text()),
+            });
         }
 
         let body: serde_json::Value = resp
             .json()
-            .map_err(|e| format!("Failed to parse PR response: {}", e))?;
+            .map_err(|e| GhError::Failed(format!("Failed to parse PR response: {}", e)))?;
 
         Ok(PrStatus {
             state: body["state"].as_str().unwrap_or("unknown").to_string(),
@@ -629,8 +803,8 @@ impl GitHubClient {
         owner: &str,
         repo: &str,
         branch: &str,
-    ) -> Result<Vec<HeadPr>, String> {
-        let url = prs_by_head_url(owner, repo, branch);
+    ) -> Result<Vec<HeadPr>, GhError> {
+        let url = self.at_base(prs_by_head_url(owner, repo, branch));
         let resp = self
             .send_metered(
                 &url,
@@ -640,16 +814,15 @@ impl GitHubClient {
             .await?;
 
         if !resp.is_success() {
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text()
-            ));
+            return Err(GhError::HttpStatus {
+                status: resp.status().as_u16(),
+                message: format!("GitHub API returned {}: {}", resp.status(), resp.text()),
+            });
         }
 
         let body: Vec<serde_json::Value> = resp
             .json()
-            .map_err(|e| format!("Failed to parse PR list response: {}", e))?;
+            .map_err(|e| GhError::Failed(format!("Failed to parse PR list response: {}", e)))?;
 
         Ok(body
             .iter()
@@ -669,7 +842,42 @@ impl GitHubClient {
             })
             .collect())
     }
+
+    /// The login this client's token authenticates as — a conditional
+    /// `GET /user`. The caller asks once per credential per process and, on a
+    /// terminal `401`/`403` (a credential that cannot answer `/user`), backs off
+    /// ([`crate::github_budget::login_lookup_due`]) rather than re-asking every
+    /// tick. Spent under the client's own spend class, so a background client
+    /// may get [`GhError::Deferred`] here like anywhere else.
+    pub async fn authenticated_login(&self) -> Result<String, GhError> {
+        let url = self.at_base(USER_URL.to_string());
+        let resp = self
+            .send_metered(
+                &url,
+                CacheMode::Cached,
+                self.client.get(&url).headers(self.headers()),
+            )
+            .await?;
+        if !resp.is_success() {
+            return Err(GhError::HttpStatus {
+                status: resp.status().as_u16(),
+                message: format!("GitHub API returned {}: {}", resp.status(), resp.text()),
+            });
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .map_err(|e| GhError::Failed(format!("Failed to parse /user response: {}", e)))?;
+        body["login"]
+            .as_str()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| GhError::Failed("/user response carried no login".to_string()))
+    }
 }
+
+/// The authenticated-user route, for [`GitHubClient::authenticated_login`].
+const USER_URL: &str = "https://api.github.com/user";
 
 #[cfg(test)]
 mod tests {
@@ -711,6 +919,12 @@ mod tests {
             retry_backoff_secs(403, None, Some(0), None, 1_000),
             Some(60),
             "an unknown reset is not an infinite sleep"
+        );
+
+        // A SECONDARY-limit 403: budget left, but Retry-After — a rate limit.
+        assert_eq!(
+            retry_backoff_secs(403, Some(45), Some(4_000), None, 1_000),
+            Some(45)
         );
 
         // Everything else is not retried at all.
@@ -905,7 +1119,10 @@ mod tests {
             .send_metered(url, CacheMode::Fresh, client.client.get(url))
             .await
             .expect_err("connection to port 1 must fail");
-        assert!(err.contains("GitHub API request failed"), "{err}");
+        assert!(
+            matches!(&err, GhError::Failed(e) if e.contains("GitHub API request failed")),
+            "{err}"
+        );
 
         let snap = github_budget::snapshot_top(usize::MAX);
         let row = snap
@@ -918,6 +1135,238 @@ mod tests {
         assert_eq!(row.not_modified, 0);
         assert_eq!(row.rate_limited, 0);
         assert_eq!(row.template, "/probe/transport-error");
+    }
+
+    // -- Spend class: the background headroom gate (plan 2026-10-30-…, D4) --
+
+    /// A reading 1% from empty, half a window from reset: under any sane
+    /// headroom line, and above the interactive floor (50 > 10).
+    fn one_percent_left() -> github_budget::RateLimitObservation {
+        github_budget::RateLimitObservation {
+            limit: Some(5000),
+            remaining: Some(50),
+            used: Some(4950),
+            reset_at_unix: Some(now_unix() + 1800),
+            resource: Some("core".to_string()),
+        }
+    }
+
+    fn row_for(consumer: &str) -> Option<github_budget::ConsumerRow> {
+        github_budget::snapshot_top(usize::MAX)
+            .consumers
+            .into_iter()
+            .find(|r| r.consumer == consumer)
+    }
+
+    /// A background request under the headroom line is NEVER sent: against a
+    /// port that refuses every connection it records no transport error —
+    /// only a `deferred` — and comes back as a deferral, not a failure.
+    #[tokio::test]
+    async fn a_background_request_under_the_headroom_line_is_never_sent() {
+        let url = "http://127.0.0.1:1/probe/background-deferred";
+        let client = GitHubClient::new("budget-test-background-short", "budget_test_bg_short")
+            .expect("client builds")
+            .with_spend_class(SpendClass::Background);
+        github_budget::seed_reading_for_test(client.credential(), &one_percent_left());
+
+        let err = client
+            .send_metered(url, CacheMode::Cached, client.client.get(url))
+            .await
+            .expect_err("a short window defers");
+        assert!(matches!(err, GhError::Deferred(_)), "{err}");
+
+        let row = row_for("budget_test_bg_short").expect("the deferral was metered");
+        assert_eq!(row.deferred, 1);
+        assert_eq!(row.transport_error, 0, "nothing was put on the wire");
+        assert_eq!(row.charged + row.not_modified + row.rate_limited, 0);
+    }
+
+    /// The same 1%-left bucket does not touch an INTERACTIVE caller: it is
+    /// sent (and so fails on the refusing port as a transport error).
+    #[tokio::test]
+    async fn an_interactive_request_is_unaffected_at_one_percent_remaining() {
+        let url = "http://127.0.0.1:1/probe/interactive-one-percent";
+        let client = GitHubClient::new("budget-test-interactive-low", "budget_test_interactive")
+            .expect("client builds");
+        github_budget::seed_reading_for_test(client.credential(), &one_percent_left());
+
+        let err = client
+            .send_metered(url, CacheMode::Cached, client.client.get(url))
+            .await
+            .expect_err("port 1 refuses");
+        assert!(matches!(err, GhError::Failed(_)), "{err}");
+        let row = row_for("budget_test_interactive").expect("recorded");
+        assert_eq!(row.transport_error, 1, "the interactive request was sent");
+        assert_eq!(row.deferred, 0);
+    }
+
+    /// One credential's exhausted bucket never defers ANOTHER credential's
+    /// background request.
+    #[tokio::test]
+    async fn one_credentials_exhausted_bucket_never_defers_another() {
+        let exhausted = CredentialKey::of_token("budget-test-exhausted-other-token");
+        let mut empty = one_percent_left();
+        empty.remaining = Some(0);
+        // Exhaust the SHARED slot too, so a regression to reading it (rather
+        // than this credential's own bucket) defers and turns this red.
+        let _global = github_budget::global_last_lock();
+        github_budget::seed_global_last_for_test(&exhausted, &empty);
+
+        let url = "http://127.0.0.1:1/probe/background-other-credential";
+        let client = GitHubClient::new("budget-test-healthy-token", "budget_test_bg_other")
+            .expect("client builds")
+            .with_spend_class(SpendClass::Background);
+        assert_ne!(client.credential(), &exhausted);
+
+        let err = client
+            .send_metered(url, CacheMode::Cached, client.client.get(url))
+            .await
+            .expect_err("port 1 refuses");
+        assert!(matches!(err, GhError::Failed(_)), "{err}");
+        let row = row_for("budget_test_bg_other").expect("recorded");
+        assert_eq!(row.transport_error, 1, "sent on its own (unknown) bucket");
+        assert_eq!(row.deferred, 0);
+    }
+
+    /// An INTERACTIVE rate refusal holds the credential's BACKGROUND spend
+    /// for GitHub's Retry-After window: while the interactive caller sleeps
+    /// before its one retry, a background read on the same credential is
+    /// deferred, not sent.
+    #[tokio::test]
+    async fn an_interactive_rate_refusal_holds_the_credentials_background_spend() {
+        let token = "budget-test-interactive-refusal-hold";
+        let base = one_shot_server_for_test(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 3\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let interactive = GitHubClient::new(token, "budget_test_interactive_hold")
+            .expect("client builds")
+            .with_api_base(base);
+        let pending = tokio::spawn(async move { interactive.get_pr("o", "r", 1).await });
+        // Wait — bounded, never a fixed guess — until the interactive refusal
+        // has landed and the credential's hold is observable.
+        let credential = CredentialKey::of_token(token);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let held = matches!(
+                github_budget::background_verdict_for_test(&credential),
+                Err(d) if matches!(d.reason, github_budget::DeferralReason::RetryAfter { .. })
+            );
+            if held {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the interactive refusal never set the credential's hold"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let background = GitHubClient::new(token, "budget_test_interactive_hold_bg")
+            .expect("client builds")
+            .with_spend_class(SpendClass::Background)
+            .with_api_base("http://127.0.0.1:1");
+        let err = background.get_pr("o", "r", 2).await.expect_err("held");
+        assert!(
+            matches!(
+                &err,
+                GhError::Deferred(d)
+                    if matches!(d.reason, github_budget::DeferralReason::RetryAfter { .. })
+            ),
+            "{err}"
+        );
+        // The interactive retry goes to the (now closed) one-shot server.
+        let _ = pending.await;
+    }
+
+    /// On the background path a rate-limited refusal — a `429`, or a
+    /// secondary-limit `403` with budget left and `Retry-After` — is the typed
+    /// `RateLimited`, a budget stop, never a plain failure and never slept on;
+    /// it is metered `rate_limited` (not `charged`); and the credential's next
+    /// background request is deferred inside the `Retry-After` window instead
+    /// of being re-sent.
+    ///
+    /// RULE for any test whose server answers real `X-RateLimit-*` headers: it
+    /// writes the process-global `last` reading, so it holds
+    /// `github_budget::global_last_lock` for its whole body.
+    #[tokio::test]
+    async fn a_background_rate_limited_refusal_is_typed_and_not_slept_on() {
+        let _global = github_budget::global_last_lock();
+        for (why, token, consumer, response) in [
+            (
+                "429",
+                "budget-test-rate-limited-429",
+                "budget_test_rl_429",
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ),
+            (
+                "secondary-limit 403",
+                "budget-test-rate-limited-403",
+                "budget_test_rl_403",
+                "HTTP/1.1 403 Forbidden\r\nretry-after: 120\r\nx-ratelimit-remaining: 4000\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ),
+        ] {
+            let base = one_shot_server_for_test(response).await;
+            let client = GitHubClient::new(token, consumer)
+                .expect("client builds")
+                .with_spend_class(SpendClass::Background)
+                .with_api_base(base);
+            let started = std::time::Instant::now();
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                client.get_pr("o", "r", 1),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{why}: a background request was slept on"))
+            .expect_err("a refusal is an error");
+            assert!(
+                matches!(err, GhError::RateLimited { .. }) && err.is_budget_stop(),
+                "{why}: {err}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "{why}");
+
+            // Inside Retry-After the next background request is deferred — never
+            // sent (the one-shot server is gone; a send would be a transport
+            // failure).
+            let again = client.get_pr("o", "r", 2).await.expect_err("held");
+            assert!(
+                matches!(
+                    &again,
+                    GhError::Deferred(d)
+                        if matches!(d.reason, github_budget::DeferralReason::RetryAfter { .. })
+                ),
+                "{why}: {again}"
+            );
+
+            let row = row_for(consumer).expect("metered");
+            assert_eq!(row.rate_limited, 1, "{why}: a rate refusal is not charged");
+            assert_eq!(row.charged, 0, "{why}");
+            assert_eq!(row.deferred, 1, "{why}");
+            assert_eq!(row.transport_error, 0, "{why}");
+        }
+    }
+
+    #[test]
+    fn the_api_base_override_re_roots_every_route_and_is_the_identity_by_default() {
+        let prod = GitHubClient::new("t", "c").expect("builds");
+        assert_eq!(prod.at_base(pr_url("o", "r", 7)), pr_url("o", "r", 7));
+        let test = GitHubClient::new("t", "c")
+            .expect("builds")
+            .with_api_base("http://127.0.0.1:1");
+        assert_eq!(
+            test.at_base(pr_url("o", "r", 7)),
+            "http://127.0.0.1:1/repos/o/r/pulls/7"
+        );
+    }
+
+    #[test]
+    fn a_new_client_is_interactive_and_keys_its_credential_by_digest() {
+        let client = GitHubClient::new("budget-test-default-class", "c").expect("builds");
+        assert_eq!(client.spend_class, SpendClass::Interactive);
+        assert_eq!(
+            client.credential(),
+            &CredentialKey::of_token("budget-test-default-class")
+        );
     }
 
     #[test]

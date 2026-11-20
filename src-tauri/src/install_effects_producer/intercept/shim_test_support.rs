@@ -37,6 +37,17 @@ fn rendered_identity_shim(shim_dir: &Path) -> String {
     }
 }
 
+/// The literal beacon bodies the bash identity shim POSTs to
+/// `/control/shim-beacon` for a resume-shaped launch on terminal `term-launch`:
+/// asserted verbatim on what the shim SENDS (`identity_shim_launch_failure_tests`)
+/// and fed to what the runner RECORDS (`terminal::launch_failure`'s tests).
+pub(crate) const INVOKED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=true mcp_config=false pinned=true"}"#;
+pub(crate) const RESOLVE_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=true user_session_id=true"}"#;
+pub(crate) const EXEC_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"exec-failed","detail":"status=126 waited=1 settings=true user_session_id=true"}"#;
+/// The same two beacons from a shim that delivers NO SessionStart hook.
+pub(crate) const INVOKED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=false mcp_config=false pinned=true"}"#;
+pub(crate) const RESOLVE_FAILED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=false user_session_id=true"}"#;
+
 /// Held by every test that writes an executable and then forks.
 pub(crate) static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

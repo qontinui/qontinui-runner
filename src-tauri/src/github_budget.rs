@@ -276,11 +276,35 @@ pub fn parse_rate_limit(headers: &HeaderMap) -> RateLimitObservation {
     }
 }
 
-/// A `403`/`429` that GitHub refused for an exhausted bucket, as opposed to a
-/// permission `403` or a secondary-limit `429` with budget left. The discriminator
-/// is `x-ratelimit-remaining: 0` on the refusal itself.
-fn is_rate_limited(status: u16, obs: &RateLimitObservation) -> bool {
-    matches!(status, 403 | 429) && obs.remaining == Some(0)
+/// THE rate-limit classifier: did GitHub refuse this for RATE rather than for
+/// permission? Pure, and asked by every door that meters, retries or reports a
+/// refusal (`trigger_system::github_api::retry_backoff_secs`, the ticket
+/// provider, `ci_node::sibling`), so they cannot disagree.
+///
+/// - `429` — always a rate refusal (secondary limit).
+/// - `403` with `x-ratelimit-remaining: 0` — the PRIMARY bucket is empty.
+/// - `403` with `Retry-After` — a SECONDARY limit, budget left.
+///
+/// A `403` with neither is a permission/SSO refusal.
+pub fn is_rate_limited_refusal(
+    status: u16,
+    retry_after: Option<u64>,
+    remaining: Option<i64>,
+) -> bool {
+    match status {
+        429 => true,
+        403 => remaining == Some(0) || retry_after.is_some(),
+        _ => false,
+    }
+}
+
+/// `Retry-After` in whole seconds, when GitHub sent one. The HTTP-date form is
+/// not used by GitHub's REST API and reads as absent.
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -387,11 +411,276 @@ pub fn derive_cache_effectiveness(
 /// parse — is ignored, because a threshold of `0` never fires and a threshold of
 /// `1` always does, and both are worse than the default.
 pub fn low_fraction() -> f64 {
-    std::env::var(LOW_FRACTION_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
+    parse_fraction(std::env::var(LOW_FRACTION_ENV).ok(), DEFAULT_LOW_FRACTION)
+}
+
+/// Pure parse of a fraction knob: the value must parse and lie strictly inside
+/// `(0, 1)`, else `default`. Used by [`low_fraction`] and for the background
+/// reserve, where `0` and `1` are both meaningless thresholds.
+pub fn parse_fraction(raw: Option<String>, default: f64) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
-        .unwrap_or(DEFAULT_LOW_FRACTION)
+        .unwrap_or(default)
+}
+
+/// Pure parse of the background GUARD knob, matching coord's
+/// `parse_background_guard_fraction`: the CLOSED `[0, 1]` is accepted (`0`
+/// leaves only the reserve as the margin), anything else is `default`.
+pub fn parse_guard_fraction(raw: Option<String>, default: f64) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(default)
+}
+
+// ---------------------------------------------------------------------------
+// Credential key + background headroom (plan
+// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+// Phase 3, D4)
+// ---------------------------------------------------------------------------
+
+/// Names ONE credential's rate-limit bucket without carrying the credential:
+/// the first 12 hex of the token's sha256. Safe to log and to serve.
+///
+/// The bucket is per credential, and this process spends more than one (the
+/// reconciler's resolved token, a ticket provider's configured token, an
+/// anonymous sibling probe). A gate that read one shared "last reading" judged
+/// whichever credential answered last, so one credential's exhausted bucket
+/// could defer — or wave through — another's request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct CredentialKey(String);
+
+impl CredentialKey {
+    /// Key a token by digest. The token never leaves this function.
+    pub fn of_token(token: &str) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(token.trim().as_bytes());
+        let hex = hex::encode(digest);
+        Self(hex.get(..12).unwrap_or(&hex).to_string())
+    }
+
+    /// The unauthenticated (per-IP) bucket.
+    pub fn anonymous() -> Self {
+        Self("anonymous".to_string())
+    }
+
+    /// Key an optional token: `None` is the anonymous bucket.
+    pub fn of_optional_token(token: Option<&str>) -> Self {
+        token.map_or_else(Self::anonymous, Self::of_token)
+    }
+}
+
+impl std::fmt::Display for CredentialKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How many distinct credentials the registry keeps a reading (and a login)
+/// for. A runner spends a handful; the cap only stops an unbounded map if some
+/// caller keyed per request by mistake. Over it, the stalest reading is evicted.
+const CREDENTIAL_KEY_CAP: usize = 32;
+
+/// After a TERMINAL `GET /user` refusal (`401`/`403`), how long before the
+/// login is asked again. A credential that cannot answer `/user` would
+/// otherwise be re-asked every tick for the life of the process.
+const LOGIN_RETRY_AFTER_SECS: i64 = 6 * 3600;
+
+/// GitHub's rate-limit window, seconds.
+const RATELIMIT_WINDOW_SECS: f64 = 3600.0;
+
+/// The oldest reading [`github_headroom`] will judge from. Older than this and
+/// the reading is UNKNOWN, which does not defer — so a deferring background
+/// client re-probes at most once a minute with its next conditional GET (free
+/// on `304`, and it still carries the headers), and its reading never freezes
+/// near the reserve line. Same bound as coord's `HEADROOM_SNAPSHOT_MAX_AGE_SECS`.
+const HEADROOM_READING_MAX_AGE_SECS: i64 = 60;
+
+/// Floor on "seconds elapsed in this window" when projecting its burn, so the
+/// first seconds after a reset cannot project an absurd rate. Same as coord.
+const HEADROOM_MIN_ELAPSED_SECS: f64 = 60.0;
+
+/// Default reserve, as a fraction of the limit, that background spend leaves
+/// for the identity's interactive sessions at the end of the window.
+const DEFAULT_BACKGROUND_MIN_RESERVE_FRACTION: f64 = 0.20;
+
+/// Default safety margin on top of the projection, pro-rata to the seconds
+/// left (coord's `DEFAULT_BACKGROUND_GUARD_FRACTION`).
+const DEFAULT_BACKGROUND_GUARD_FRACTION: f64 = 0.10;
+
+/// Env override for [`DEFAULT_BACKGROUND_MIN_RESERVE_FRACTION`].
+const BACKGROUND_MIN_RESERVE_FRACTION_ENV: &str = "QONTINUI_GITHUB_BACKGROUND_MIN_RESERVE_FRACTION";
+
+/// Env override for [`DEFAULT_BACKGROUND_GUARD_FRACTION`].
+const BACKGROUND_GUARD_FRACTION_ENV: &str = "QONTINUI_GITHUB_BACKGROUND_GUARD_FRACTION";
+
+/// Who a request is spent for.
+///
+/// `Background` is a poller nobody is waiting on (the session-PR reconciler,
+/// ticket sync): under the headroom line it is DEFERRED — never sent, never
+/// slept on. `Interactive` is everything else and keeps the old floor (sleep
+/// one chunk near empty, retry one rate-limited refusal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpendClass {
+    #[default]
+    Interactive,
+    Background,
+}
+
+/// The two knobs of [`github_headroom`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeadroomKnobs {
+    /// Fraction of the limit the window must still hold at reset.
+    pub min_reserve_fraction: f64,
+    /// Safety margin on top, as a fraction of the limit, pro-rata to the
+    /// seconds left — which is what relaxes the rule near reset.
+    pub guard_fraction: f64,
+}
+
+impl HeadroomKnobs {
+    /// The env-configured knobs. The reserve is parsed like
+    /// `QONTINUI_GITHUB_BUDGET_LOW_FRACTION` ([`parse_fraction`], open
+    /// `(0, 1)`); the guard like coord's ([`parse_guard_fraction`], closed
+    /// `[0, 1]`).
+    pub fn from_env() -> Self {
+        Self {
+            min_reserve_fraction: parse_fraction(
+                std::env::var(BACKGROUND_MIN_RESERVE_FRACTION_ENV).ok(),
+                DEFAULT_BACKGROUND_MIN_RESERVE_FRACTION,
+            ),
+            guard_fraction: parse_guard_fraction(
+                std::env::var(BACKGROUND_GUARD_FRACTION_ENV).ok(),
+                DEFAULT_BACKGROUND_GUARD_FRACTION,
+            ),
+        }
+    }
+}
+
+impl Default for HeadroomKnobs {
+    fn default() -> Self {
+        Self {
+            min_reserve_fraction: DEFAULT_BACKGROUND_MIN_RESERVE_FRACTION,
+            guard_fraction: DEFAULT_BACKGROUND_GUARD_FRACTION,
+        }
+    }
+}
+
+/// The three answers [`github_headroom`] can give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Headroom {
+    /// GitHub's counters project the window to end above the margin.
+    Holds,
+    /// GitHub's counters project the window to end below the margin.
+    Short,
+    /// No usable, fresh, current-window reading — nothing established. Never
+    /// a reason to defer.
+    Unknown,
+}
+
+/// PURE — will this credential's window end with room to spare, projected from
+/// GitHub's OWN counters? A port of qontinui-coord's `github_headroom`
+/// (`crates/coord/src/github_app.rs`, #2635), with the floor expressed as a
+/// fraction of the limit:
+///
+/// ```text
+/// secs_to_reset = min(reset − now, 3600)
+/// elapsed       = max(3600 − (reset − now), 60)
+/// projected     = remaining − (limit − remaining) / elapsed × secs_to_reset
+/// Holds  iff  projected ≥ min_reserve × limit + guard × limit × secs_to_reset / 3600
+/// ```
+///
+/// `remaining` is GitHub's count for the whole identity, so the burn it implies
+/// covers every box and every session on it — the headroom holds fleet-wide
+/// without coordination. There is no "N minutes to reset" special case: the
+/// margin's `secs_to_reset` term already relaxes the rule near reset, and a flat
+/// percentage would ignore the burn rate.
+///
+/// UNKNOWN on an unknown `remaining`/`limit`/`reset`, a non-positive `limit`, a
+/// window that has reset (`reset ≤ now`), and a reading older than
+/// [`HEADROOM_READING_MAX_AGE_SECS`] (or stamped in the future).
+pub fn github_headroom(
+    remaining: Option<i64>,
+    limit: Option<i64>,
+    reset_at_unix: Option<i64>,
+    reading_age_secs: i64,
+    now_unix: i64,
+    knobs: HeadroomKnobs,
+) -> Headroom {
+    let (Some(remaining), Some(limit), Some(reset_at_unix)) = (remaining, limit, reset_at_unix)
+    else {
+        return Headroom::Unknown;
+    };
+    if limit <= 0
+        || reset_at_unix <= now_unix
+        || !(0..=HEADROOM_READING_MAX_AGE_SECS).contains(&reading_age_secs)
+    {
+        return Headroom::Unknown;
+    }
+    let raw_secs_to_reset = (reset_at_unix - now_unix) as f64;
+    let secs_to_reset = raw_secs_to_reset.min(RATELIMIT_WINDOW_SECS);
+    let elapsed = (RATELIMIT_WINDOW_SECS - raw_secs_to_reset).max(HEADROOM_MIN_ELAPSED_SECS);
+    let used = (limit - remaining).max(0) as f64;
+    let projected = remaining as f64 - used / elapsed * secs_to_reset;
+    let limit = limit as f64;
+    let margin = knobs.min_reserve_fraction * limit
+        + knobs.guard_fraction * limit * secs_to_reset / RATELIMIT_WINDOW_SECS;
+    if projected >= margin {
+        Headroom::Holds
+    } else {
+        Headroom::Short
+    }
+}
+
+/// A background request the headroom gate decided against. It was NOT sent:
+/// a caller must read it as "not now", never as a GitHub failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetDeferral {
+    pub credential: CredentialKey,
+    pub reason: DeferralReason,
+}
+
+/// Why the gate decided against a background request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferralReason {
+    /// The credential's own fresh reading projects the window short.
+    ProjectedShort {
+        remaining: i64,
+        limit: i64,
+        reset_at_unix: i64,
+    },
+    /// GitHub refused this credential for rate and said when to come back
+    /// (`Retry-After`, or the primary window's reset); that time has not come.
+    RetryAfter { not_before_unix: i64 },
+}
+
+impl std::fmt::Display for BudgetDeferral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.reason {
+            DeferralReason::ProjectedShort {
+                remaining,
+                limit,
+                reset_at_unix,
+            } => write!(
+                f,
+                "GitHub background request deferred (not sent): credential {} is projected \
+                 short of its reserve ({remaining}/{limit} remaining, window resets at \
+                 {reset_at_unix})",
+                self.credential
+            ),
+            DeferralReason::RetryAfter { not_before_unix } => write!(
+                f,
+                "GitHub background request deferred (not sent): credential {} was refused for \
+                 rate and may not be asked again before {not_before_unix}",
+                self.credential
+            ),
+        }
+    }
+}
+
+/// One credential's latest `X-RateLimit-*` reading and when it was taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialReading {
+    obs: RateLimitObservation,
+    observed_at_unix: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -416,11 +705,15 @@ pub struct ConsumerRow {
     /// `304 Not Modified` — **free** against the budget. This is the number the
     /// whole plan is trying to grow.
     pub not_modified: u64,
-    /// `403`/`429` refusals carrying `x-ratelimit-remaining: 0`.
+    /// Rate refusals ([`is_rate_limited_refusal`]): a `429`, or a `403` with
+    /// `x-ratelimit-remaining: 0` or `Retry-After`.
     pub rate_limited: u64,
     /// Requests that never produced a response (DNS, TLS, timeout). Counted
     /// apart from `charged` because they say nothing about the budget.
     pub transport_error: u64,
+    /// Background requests the headroom gate decided against — NEVER sent, so
+    /// counted apart from every outcome above (see [`github_headroom`]).
+    pub deferred: u64,
     /// `insufficient_data | ineffective | degraded | effective`, or `None` for a
     /// `fresh`/`uncacheable` row. See [`derive_cache_effectiveness`].
     pub cache_effectiveness: Option<&'static str>,
@@ -436,6 +729,8 @@ pub struct BudgetTotals {
     pub not_modified: u64,
     pub rate_limited: u64,
     pub transport_error: u64,
+    /// Background requests deferred by the headroom gate, never sent.
+    pub deferred: u64,
 }
 
 impl BudgetTotals {
@@ -533,6 +828,7 @@ struct RowCounts {
     not_modified: u64,
     rate_limited: u64,
     transport_error: u64,
+    deferred: u64,
 }
 
 impl RowCounts {
@@ -546,8 +842,20 @@ impl RowCounts {
 #[derive(Debug, Default)]
 pub struct Registry {
     identity: Option<CredentialIdentity>,
+    /// The latest reading from ANY credential — what the snapshot shows. Never
+    /// a gate input: a gate reads [`Self::credentials`] for the bucket it is
+    /// about to spend.
     last: Option<RateLimitObservation>,
     observed_at_unix: Option<i64>,
+    /// The latest reading per credential, keyed by token digest.
+    credentials: HashMap<CredentialKey, CredentialReading>,
+    /// The authenticated login per credential, once resolved.
+    logins: HashMap<CredentialKey, String>,
+    /// When a login lookup last FAILED, per credential (unix seconds).
+    login_failures: HashMap<CredentialKey, i64>,
+    /// Per credential, the time before which background spend must not ask
+    /// again — set by a rate refusal's `Retry-After` (unix seconds).
+    not_before: HashMap<CredentialKey, i64>,
     rows: HashMap<RowKey, RowCounts>,
     templates_dropped: u64,
     calls_dropped: u64,
@@ -584,6 +892,23 @@ impl Registry {
         obs: RateLimitObservation,
         now_unix: i64,
     ) {
+        self.record_with_retry_after(consumer, url, cache_mode, status, obs, None, now_unix);
+    }
+
+    /// [`Self::record`], also given the response's `Retry-After` — which is
+    /// what marks a SECONDARY-limit `403` (budget left) as a rate refusal
+    /// rather than a charged permission error ([`is_rate_limited_refusal`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_retry_after(
+        &mut self,
+        consumer: &str,
+        url: &str,
+        cache_mode: CacheMode,
+        status: u16,
+        obs: RateLimitObservation,
+        retry_after: Option<u64>,
+        now_unix: i64,
+    ) {
         // A response with no `X-RateLimit-*` family says nothing about the
         // budget. Keeping the previous reading beats overwriting a real one with
         // a row of `None`s.
@@ -592,11 +917,11 @@ impl Registry {
             self.observed_at_unix = Some(now_unix);
         }
 
-        let limited = is_rate_limited(status, &obs);
+        let limited = is_rate_limited_refusal(status, retry_after, obs.remaining);
         let mut delta = RowCounts::default();
         if limited {
-            // Refused because the bucket was already empty — it bought nothing
-            // and it cost nothing further, so it is neither charged nor free.
+            // Refused for rate (an empty bucket, or a secondary limit) — it
+            // bought nothing, so it is neither charged nor free.
             delta.rate_limited = 1;
         } else if status == 304 {
             delta.not_modified = 1;
@@ -624,6 +949,165 @@ impl Registry {
         );
     }
 
+    /// Record a background request the headroom gate deferred. It was never
+    /// sent, so it is neither charged, free, refused nor a transport error.
+    pub fn record_deferred(&mut self, consumer: &str, url: &str, cache_mode: CacheMode) {
+        self.apply(
+            consumer,
+            url,
+            cache_mode,
+            RowCounts {
+                deferred: 1,
+                ..RowCounts::default()
+            },
+        );
+    }
+
+    /// Keep `obs` as `credential`'s latest reading. A response with no
+    /// `X-RateLimit-*` family keeps the previous reading, as for [`Self::last`].
+    pub fn record_reading(
+        &mut self,
+        credential: &CredentialKey,
+        obs: &RateLimitObservation,
+        now_unix: i64,
+    ) {
+        if obs.is_empty() {
+            return;
+        }
+        if !self.credentials.contains_key(credential)
+            && self.credentials.len() >= CREDENTIAL_KEY_CAP
+        {
+            let stalest = self
+                .credentials
+                .iter()
+                .min_by_key(|(_, r)| r.observed_at_unix)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = stalest {
+                self.credentials.remove(&k);
+            }
+        }
+        self.credentials.insert(
+            credential.clone(),
+            CredentialReading {
+                obs: obs.clone(),
+                observed_at_unix: now_unix,
+            },
+        );
+    }
+
+    /// `credential`'s latest reading, or `None` (UNKNOWN) when it has none.
+    pub fn rate_limit_for(&self, credential: &CredentialKey) -> Option<RateLimitObservation> {
+        self.credentials.get(credential).map(|r| r.obs.clone())
+    }
+
+    /// The background gate's verdict for `credential` at `now_unix`: `Err`
+    /// only when its OWN fresh reading projects [`Headroom::Short`]. No
+    /// reading, or an UNKNOWN one, does not defer.
+    pub fn background_verdict(
+        &self,
+        credential: &CredentialKey,
+        now_unix: i64,
+        knobs: HeadroomKnobs,
+    ) -> Result<(), BudgetDeferral> {
+        if let Some(&not_before_unix) = self.not_before.get(credential) {
+            if now_unix < not_before_unix {
+                return Err(BudgetDeferral {
+                    credential: credential.clone(),
+                    reason: DeferralReason::RetryAfter { not_before_unix },
+                });
+            }
+        }
+        let Some(reading) = self.credentials.get(credential) else {
+            return Ok(());
+        };
+        let obs = &reading.obs;
+        let verdict = github_headroom(
+            obs.remaining,
+            obs.limit,
+            obs.reset_at_unix,
+            now_unix - reading.observed_at_unix,
+            now_unix,
+            knobs,
+        );
+        match (verdict, obs.remaining, obs.limit, obs.reset_at_unix) {
+            (Headroom::Short, Some(remaining), Some(limit), Some(reset_at_unix)) => {
+                Err(BudgetDeferral {
+                    credential: credential.clone(),
+                    reason: DeferralReason::ProjectedShort {
+                        remaining,
+                        limit,
+                        reset_at_unix,
+                    },
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// GitHub refused `credential` for rate: background spend on it is
+    /// deferred until `until_unix` (the later of any two such answers wins).
+    /// Interactive callers are not affected.
+    pub fn record_not_before(&mut self, credential: &CredentialKey, until_unix: i64) {
+        if !self.not_before.contains_key(credential) && self.not_before.len() >= CREDENTIAL_KEY_CAP
+        {
+            // Full: drop the hold that ends soonest (the one most likely spent).
+            let soonest = self
+                .not_before
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = soonest {
+                self.not_before.remove(&k);
+            }
+        }
+        let slot = self
+            .not_before
+            .entry(credential.clone())
+            .or_insert(until_unix);
+        *slot = (*slot).max(until_unix);
+    }
+
+    /// Remember `credential`'s authenticated login.
+    pub fn record_login(&mut self, credential: &CredentialKey, login: &str) {
+        let login = login.trim();
+        if login.is_empty() {
+            return;
+        }
+        if !self.logins.contains_key(credential) && self.logins.len() >= CREDENTIAL_KEY_CAP {
+            return;
+        }
+        self.logins.insert(credential.clone(), login.to_string());
+    }
+
+    /// `credential`'s login, once resolved.
+    pub fn login_for(&self, credential: &CredentialKey) -> Option<String> {
+        self.logins.get(credential).cloned()
+    }
+
+    /// Record that a login lookup for `credential` failed at `now_unix`. A
+    /// DEFERRED lookup is not a failure — it was never sent — so callers do
+    /// not record one.
+    pub fn record_login_failure(&mut self, credential: &CredentialKey, now_unix: i64) {
+        if !self.login_failures.contains_key(credential)
+            && self.login_failures.len() >= CREDENTIAL_KEY_CAP
+        {
+            return;
+        }
+        self.login_failures.insert(credential.clone(), now_unix);
+    }
+
+    /// Should `credential`'s login be looked up now? No once it is known, and
+    /// not within [`LOGIN_RETRY_AFTER_SECS`] of a failed lookup.
+    pub fn login_lookup_due(&self, credential: &CredentialKey, now_unix: i64) -> bool {
+        if self.logins.contains_key(credential) {
+            return false;
+        }
+        match self.login_failures.get(credential) {
+            Some(failed_at) => now_unix - failed_at >= LOGIN_RETRY_AFTER_SECS,
+            None => true,
+        }
+    }
+
     /// Fold a delta into the totals (always) and into its histogram row (if the
     /// key is admitted).
     fn apply(&mut self, consumer: &str, url: &str, cache_mode: CacheMode, delta: RowCounts) {
@@ -634,6 +1118,7 @@ impl Registry {
             .totals
             .transport_error
             .saturating_add(delta.transport_error);
+        self.totals.deferred = self.totals.deferred.saturating_add(delta.deferred);
 
         let key = RowKey {
             consumer: consumer.to_string(),
@@ -645,6 +1130,7 @@ impl Registry {
             row.not_modified = row.not_modified.saturating_add(delta.not_modified);
             row.rate_limited = row.rate_limited.saturating_add(delta.rate_limited);
             row.transport_error = row.transport_error.saturating_add(delta.transport_error);
+            row.deferred = row.deferred.saturating_add(delta.deferred);
         } else if self.rows.len() < TEMPLATE_KEY_CAP {
             self.rows.insert(key, delta);
         } else {
@@ -666,18 +1152,6 @@ impl Registry {
         } else {
             None
         }
-    }
-
-    /// The most recent `X-RateLimit-*` reading, or `None` when nothing has been
-    /// observed yet.
-    ///
-    /// This is the back-off input every GitHub client in the process shares.
-    /// Before Phase B each client carried its own `AtomicU32` pair, so four
-    /// disjoint counters each held a partial view of ONE bucket and each backed
-    /// off on a quarter of the evidence. `None` is UNKNOWN — a caller must not
-    /// read it as "the bucket is full", it simply has nothing to act on yet.
-    pub fn last_rate_limit(&self) -> Option<RateLimitObservation> {
-        self.last.clone()
     }
 
     /// `unknown | nominal | low | exhausted`.
@@ -726,6 +1200,7 @@ impl Registry {
                 not_modified: counts.not_modified,
                 rate_limited: counts.rate_limited,
                 transport_error: counts.transport_error,
+                deferred: counts.deferred,
                 cache_effectiveness: derive_cache_effectiveness(
                     key.cache_mode,
                     counts.charged,
@@ -924,7 +1399,12 @@ fn now_unix() -> i64 {
 ///
 /// A poisoned mutex is ignored rather than propagated: losing the meter must
 /// never fail the GitHub call it was measuring.
+///
+/// `credential` names the bucket the request was billed to; its reading is
+/// kept apart from every other credential's so a gate reads the bucket it is
+/// about to spend (see [`CredentialKey`]).
 pub fn record_response(
+    credential: &CredentialKey,
     consumer: &str,
     url: &str,
     cache_mode: CacheMode,
@@ -932,8 +1412,130 @@ pub fn record_response(
     headers: &HeaderMap,
 ) {
     let obs = parse_rate_limit(headers);
+    let retry_after = parse_retry_after(headers);
+    let now = now_unix();
     if let Ok(mut reg) = registry().lock() {
-        reg.record(consumer, url, cache_mode, status, obs, now_unix());
+        reg.record_reading(credential, &obs, now);
+        reg.record_with_retry_after(consumer, url, cache_mode, status, obs, retry_after, now);
+    }
+}
+
+/// A BACKGROUND request was refused for rate and told to wait `wait_secs`:
+/// defer that credential's background spend until then, so the next tick or
+/// nudge does not re-send inside the window ([`Registry::record_not_before`]).
+pub fn record_rate_limited_refusal(credential: &CredentialKey, wait_secs: u64) {
+    if let Ok(mut reg) = registry().lock() {
+        let until = now_unix().saturating_add(i64::try_from(wait_secs).unwrap_or(i64::MAX));
+        reg.record_not_before(credential, until);
+    }
+}
+
+/// The ONE background gate. `Ok` sends; `Err` is a deferral — the request must
+/// not be sent and must not be slept on — and is counted on the meter as
+/// `deferred` here, so no caller can defer without it showing.
+///
+/// Reads only `credential`'s own reading, judged by [`github_headroom`] with
+/// the env [`HeadroomKnobs`]. No reading, a stale one, or a poisoned meter is
+/// UNKNOWN and sends.
+pub fn background_gate(
+    credential: &CredentialKey,
+    consumer: &str,
+    url: &str,
+    cache_mode: CacheMode,
+) -> Result<(), BudgetDeferral> {
+    let knobs = HeadroomKnobs::from_env();
+    let Ok(mut reg) = registry().lock() else {
+        return Ok(());
+    };
+    let verdict = reg.background_verdict(credential, now_unix(), knobs);
+    if verdict.is_err() {
+        reg.record_deferred(consumer, url, cache_mode);
+    }
+    verdict
+}
+
+/// `credential`'s latest `X-RateLimit-*` reading — the input an INTERACTIVE
+/// caller's floor backs off against. `None` is UNKNOWN, never "full".
+pub fn rate_limit_for(credential: &CredentialKey) -> Option<RateLimitObservation> {
+    registry().lock().ok()?.rate_limit_for(credential)
+}
+
+/// Remember `credential`'s authenticated login (resolved once per credential
+/// per process).
+pub fn record_login(credential: &CredentialKey, login: &str) {
+    if let Ok(mut reg) = registry().lock() {
+        reg.record_login(credential, login);
+    }
+}
+
+/// `credential`'s login, once resolved; `None` is UNKNOWN.
+pub fn login_for(credential: &CredentialKey) -> Option<String> {
+    registry().lock().ok()?.login_for(credential)
+}
+
+/// Should `credential`'s login be looked up now? See
+/// [`Registry::login_lookup_due`]. A poisoned meter answers `false`: no
+/// lookup is better than one every tick.
+pub fn login_lookup_due(credential: &CredentialKey) -> bool {
+    registry()
+        .lock()
+        .map(|reg| reg.login_lookup_due(credential, now_unix()))
+        .unwrap_or(false)
+}
+
+/// Record a failed login lookup for `credential`, starting its back-off.
+pub fn record_login_failure(credential: &CredentialKey) {
+    if let Ok(mut reg) = registry().lock() {
+        reg.record_login_failure(credential, now_unix());
+    }
+}
+
+/// Seed ONE credential's reading without touching the snapshot's global
+/// reading — so a test can put a bucket under the headroom line without racing
+/// tests that assert on the process-global snapshot.
+/// The background gate's verdict for `credential` right now, WITHOUT metering
+/// a deferral — so a test can wait for a hold to become observable.
+#[cfg(test)]
+pub(crate) fn background_verdict_for_test(
+    credential: &CredentialKey,
+) -> Result<(), BudgetDeferral> {
+    match registry().lock() {
+        Ok(reg) => reg.background_verdict(credential, now_unix(), HeadroomKnobs::from_env()),
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_reading_for_test(credential: &CredentialKey, obs: &RateLimitObservation) {
+    if let Ok(mut reg) = registry().lock() {
+        reg.record_reading(credential, obs, now_unix());
+    }
+}
+
+/// Serializes the tests that write or assert the process-global `last`
+/// reading, so one test's deliberately exhausted global reading cannot leak
+/// into another's assertions.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy: its holders read env
+/// knobs (`low_fraction`, `HeadroomKnobs::from_env`) that other tests write
+/// under `env_lock`, and it is held from three files, so `hierarchy_lock`
+/// takes the env lock first and either call order nests.
+#[cfg(test)]
+pub(crate) fn global_last_lock() -> crate::test_env::TestLockGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    crate::test_env::hierarchy_lock(&LOCK)
+}
+
+/// Set the process-global `last` reading (the snapshot's slot) to `obs` as if
+/// `credential` had answered with it — the shape a regression to reading the
+/// shared slot would act on. Hold [`global_last_lock`] around it.
+#[cfg(test)]
+pub(crate) fn seed_global_last_for_test(credential: &CredentialKey, obs: &RateLimitObservation) {
+    if let Ok(mut reg) = registry().lock() {
+        let now = now_unix();
+        reg.record_reading(credential, obs, now);
+        reg.last = Some(obs.clone());
+        reg.observed_at_unix = Some(now);
     }
 }
 
@@ -980,12 +1582,6 @@ pub fn snapshot_top(top_n: usize) -> GithubBudgetSnapshot {
 pub fn low_headroom() -> Option<LowHeadroom> {
     let threshold = low_fraction();
     registry().lock().ok()?.low_headroom(threshold)
-}
-
-/// The process-wide `X-RateLimit-*` reading every GitHub client backs off
-/// against. `None` is UNKNOWN — see [`Registry::last_rate_limit`].
-pub fn last_rate_limit() -> Option<RateLimitObservation> {
-    registry().lock().ok()?.last_rate_limit()
 }
 
 /// The `If-None-Match` value to send for `url`, if one is held.
@@ -1662,14 +2258,404 @@ mod tests {
         );
     }
 
+    // -- Background headroom (plan 2026-10-30-…, Phase 3, D4) ---------------
+
+    fn knobs(min_reserve_fraction: f64, guard_fraction: f64) -> HeadroomKnobs {
+        HeadroomKnobs {
+            min_reserve_fraction,
+            guard_fraction,
+        }
+    }
+
+    /// Mirrors coord's `github_headroom_holds_exactly_down_to_the_projected_margin`.
+    #[test]
+    fn github_headroom_holds_exactly_down_to_the_projected_margin() {
+        // 1800 s to reset ⇒ 1800 s elapsed. limit 3600, remaining 2700 ⇒ used
+        // 900 at exactly 0.5/s ⇒ projected 2700 − 900 = 1800. Margin with a
+        // reserve of 0.375 (1350) and guard 0.25: 1350 + 0.25 × 3600 × 0.5 = 1800.
+        let now = 1_000_000;
+        let reset = Some(now + 1800);
+        let k = knobs(0.375, 0.25);
+        let at = |remaining| github_headroom(Some(remaining), Some(3600), reset, 0, now, k);
+        assert_eq!(at(2700), Headroom::Holds, "projected == margin holds");
+        // One point less: used 901 ⇒ projected ≈ 1798 < 1800.
+        assert_eq!(at(2699), Headroom::Short, "just under the margin");
+        // A smaller reserve gives the same state room to spare.
+        assert_eq!(
+            github_headroom(Some(2699), Some(3600), reset, 0, now, knobs(0.02, 0.25)),
+            Headroom::Holds
+        );
+    }
+
+    #[test]
+    fn github_headroom_clamps_elapsed_early_in_a_window() {
+        // 10 s after a reset (3590 s to go): elapsed clamps to 60 s, not 10.
+        // limit 5000, remaining 4940 ⇒ used 60 ⇒ 1/s ⇒ projected 4940 − 3590 =
+        // 1350; margin 0.20 × 5000 + 0.10 × 5000 × 3590/3600 ≈ 1498.6 ⇒ Short,
+        // so use a smaller reserve to isolate the clamp:
+        // 0.05 × 5000 + 498.6 ≈ 748.6 ⇒ Holds.
+        let now = 1_000_000;
+        let reset = Some(now + 3590);
+        assert_eq!(
+            github_headroom(Some(4940), Some(5000), reset, 0, now, knobs(0.05, 0.10)),
+            Headroom::Holds,
+            "clamped: 1/s projects headroom (unclamped 6/s would project < 0)"
+        );
+        // Double the early burn: 120 used ⇒ 2/s ⇒ projected 4880 − 7180 < 0.
+        assert_eq!(
+            github_headroom(Some(4880), Some(5000), reset, 0, now, knobs(0.05, 0.10)),
+            Headroom::Short
+        );
+    }
+
+    #[test]
+    fn github_headroom_refuses_a_burn_projected_to_exhaust_the_window() {
+        // Half the window gone, half the limit used ⇒ the burn alone exhausts
+        // the window exactly at reset: projected 0 < the margin.
+        let now = 1_000_000;
+        let reset = Some(now + 1800);
+        assert_eq!(
+            github_headroom(
+                Some(2500),
+                Some(5000),
+                reset,
+                0,
+                now,
+                HeadroomKnobs::default()
+            ),
+            Headroom::Short
+        );
+        // A lighter burn: 1000 used over half the window ⇒ projected 3000 at
+        // reset; margin 0.20 × 5000 + 0.10 × 5000 × 0.5 = 1250 ⇒ Holds.
+        assert_eq!(
+            github_headroom(
+                Some(4000),
+                Some(5000),
+                reset,
+                0,
+                now,
+                HeadroomKnobs::default()
+            ),
+            Headroom::Holds
+        );
+    }
+
+    #[test]
+    fn github_headroom_is_unknown_on_no_usable_fresh_current_window_reading() {
+        let now = 1_000_000;
+        let k = HeadroomKnobs::default();
+        // Each case would be Short if judged (1% remaining, half the window).
+        let cases = [
+            (None, Some(5000), Some(now + 1800), 0, "unknown remaining"),
+            (Some(50), None, Some(now + 1800), 0, "unknown limit"),
+            (Some(50), Some(0), Some(now + 1800), 0, "a zero limit"),
+            (Some(50), Some(-1), Some(now + 1800), 0, "a negative limit"),
+            (Some(50), Some(5000), None, 0, "unknown reset"),
+            (
+                Some(50),
+                Some(5000),
+                Some(now),
+                0,
+                "a window that resets now",
+            ),
+            (
+                Some(50),
+                Some(5000),
+                Some(now - 5),
+                0,
+                "a window that has reset",
+            ),
+            (
+                Some(50),
+                Some(5000),
+                Some(now + 1800),
+                61,
+                "a reading older than 60 s",
+            ),
+            (
+                Some(50),
+                Some(5000),
+                Some(now + 1800),
+                -1,
+                "a reading from the future",
+            ),
+        ];
+        for (remaining, limit, reset, age, why) in cases {
+            assert_eq!(
+                github_headroom(remaining, limit, reset, age, now, k),
+                Headroom::Unknown,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            github_headroom(Some(50), Some(5000), Some(now + 1800), 60, now, k),
+            Headroom::Short,
+            "exactly at the age bound still judges"
+        );
+    }
+
+    fn reading(limit: i64, remaining: i64, reset_at_unix: i64) -> RateLimitObservation {
+        RateLimitObservation {
+            limit: Some(limit),
+            remaining: Some(remaining),
+            used: Some(limit - remaining),
+            reset_at_unix: Some(reset_at_unix),
+            resource: Some("core".to_string()),
+        }
+    }
+
+    #[test]
+    fn background_verdict_defers_only_on_the_credentials_own_short_reading() {
+        let now = 1_000_000;
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        let b = CredentialKey::of_token("token-b");
+        let k = HeadroomKnobs::default();
+
+        // No reading at all is UNKNOWN: sends.
+        assert_eq!(reg.background_verdict(&a, now, k), Ok(()));
+
+        // A's bucket is exhausted. A defers; B — with no reading — still sends.
+        reg.record_reading(&a, &reading(5000, 0, now + 1800), now);
+        let d = reg.background_verdict(&a, now, k).expect_err("A is short");
+        assert_eq!(d.credential, a);
+        assert!(
+            matches!(
+                d.reason,
+                DeferralReason::ProjectedShort { remaining: 0, .. }
+            ),
+            "{d}"
+        );
+        assert_eq!(reg.background_verdict(&b, now, k), Ok(()));
+
+        // B's own healthy reading still sends, A's exhaustion notwithstanding.
+        reg.record_reading(&b, &reading(5000, 4900, now + 1800), now);
+        assert_eq!(reg.background_verdict(&b, now, k), Ok(()));
+        assert!(reg.background_verdict(&a, now, k).is_err());
+
+        // A's reading ages past 60 s ⇒ UNKNOWN ⇒ sends (the re-probe).
+        assert_eq!(reg.background_verdict(&a, now + 61, k), Ok(()));
+    }
+
+    #[test]
+    fn a_headerless_response_keeps_the_credentials_reading() {
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        reg.record_reading(&a, &reading(5000, 7, 2_000), 10);
+        reg.record_reading(&a, &RateLimitObservation::default(), 11);
+        assert_eq!(reg.rate_limit_for(&a).and_then(|o| o.remaining), Some(7));
+    }
+
+    #[test]
+    fn credential_key_is_a_12_hex_digest_never_the_token() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let key = CredentialKey::of_token(token);
+        assert_eq!(key.to_string().len(), 12);
+        assert!(key.to_string().bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!token.contains(&key.to_string()));
+        assert_eq!(key, CredentialKey::of_token(token), "stable");
+        assert_ne!(key, CredentialKey::of_token("ghp_other"));
+        assert_eq!(
+            CredentialKey::of_optional_token(None),
+            CredentialKey::anonymous()
+        );
+    }
+
+    #[test]
+    fn deferred_is_counted_apart_from_every_sent_outcome() {
+        let mut reg = Registry::new();
+        reg.record_deferred(
+            "session_pr_reconciler",
+            "/repos/o/r/pulls/1",
+            CacheMode::Cached,
+        );
+        let snap = reg.snapshot(TOP_CONSUMERS_N, 0.20, 1);
+        assert_eq!(snap.totals.deferred, 1);
+        assert_eq!(snap.totals.sent(), 0, "a deferred request was never sent");
+        assert_eq!(snap.totals.transport_error, 0);
+        assert_eq!(snap.consumers[0].deferred, 1);
+        let v = serde_json::to_value(&snap).expect("serializes");
+        assert_eq!(v["totals"]["deferred"], 1);
+    }
+
+    /// A rate refusal's `Retry-After` holds the credential's background spend
+    /// until it passes — even with a healthy reading — and only that
+    /// credential's.
+    #[test]
+    fn a_retry_after_defers_that_credentials_background_spend_until_it_passes() {
+        let now = 1_000_000;
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        let b = CredentialKey::of_token("token-b");
+        let k = HeadroomKnobs::default();
+        reg.record_reading(&a, &reading(5000, 4900, now + 1800), now);
+
+        reg.record_not_before(&a, now + 60);
+        let d = reg
+            .background_verdict(&a, now, k)
+            .expect_err("inside Retry-After");
+        assert_eq!(
+            d.reason,
+            DeferralReason::RetryAfter {
+                not_before_unix: now + 60
+            }
+        );
+        assert!(reg.background_verdict(&a, now + 59, k).is_err());
+        assert_eq!(reg.background_verdict(&b, now, k), Ok(()), "per credential");
+        // A shorter later answer never shortens the hold.
+        reg.record_not_before(&a, now + 10);
+        assert!(reg.background_verdict(&a, now + 30, k).is_err());
+        // Past it, the (fresh, healthy) reading decides again.
+        assert_eq!(reg.background_verdict(&a, now + 60, k), Ok(()));
+    }
+
+    /// Secondary-limit refusals are metered as `rate_limited`, not `charged`;
+    /// a permission `403` (neither signal) is charged.
+    #[test]
+    fn secondary_limit_refusals_are_rate_limited_not_charged() {
+        let mut reg = Registry::new();
+        let url = "/repos/o/r/pulls/1";
+        let budget_left = obs(5000, 4000);
+        reg.record_with_retry_after(
+            "c",
+            url,
+            CacheMode::Cached,
+            429,
+            budget_left.clone(),
+            None,
+            1,
+        );
+        reg.record_with_retry_after(
+            "c",
+            url,
+            CacheMode::Cached,
+            403,
+            budget_left.clone(),
+            Some(60),
+            2,
+        );
+        let snap = reg.snapshot(TOP_CONSUMERS_N, 0.20, 3);
+        assert_eq!(snap.totals.rate_limited, 2);
+        assert_eq!(snap.totals.charged, 0);
+
+        reg.record_with_retry_after("c", url, CacheMode::Cached, 403, budget_left, None, 4);
+        let snap = reg.snapshot(TOP_CONSUMERS_N, 0.20, 5);
+        assert_eq!(snap.totals.charged, 1, "a permission 403 is charged");
+        assert_eq!(snap.totals.rate_limited, 2);
+    }
+
+    #[test]
+    fn the_rate_limit_classifier_separates_rate_from_permission() {
+        assert!(is_rate_limited_refusal(429, None, None));
+        assert!(is_rate_limited_refusal(429, None, Some(4000)));
+        assert!(is_rate_limited_refusal(403, None, Some(0)));
+        assert!(is_rate_limited_refusal(403, Some(30), Some(4000)));
+        assert!(!is_rate_limited_refusal(403, None, Some(4000)));
+        assert!(!is_rate_limited_refusal(403, None, None));
+        assert!(!is_rate_limited_refusal(404, Some(30), Some(0)));
+    }
+
+    #[test]
+    fn the_guard_knob_accepts_the_closed_unit_interval_like_coord() {
+        assert_eq!(parse_guard_fraction(Some("0".into()), 0.10), 0.0);
+        assert_eq!(parse_guard_fraction(Some("1".into()), 0.10), 1.0);
+        assert_eq!(parse_guard_fraction(Some(" 0.25 ".into()), 0.10), 0.25);
+        for bad in ["-0.1", "1.01", "NaN", "inf", "x", ""] {
+            assert_eq!(
+                parse_guard_fraction(Some(bad.into()), 0.10),
+                0.10,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(parse_guard_fraction(None, 0.10), 0.10);
+    }
+
+    /// A credential that cannot answer `GET /user` is not re-asked every tick:
+    /// a failure backs off for [`LOGIN_RETRY_AFTER_SECS`], and a known login is
+    /// never looked up again.
+    #[test]
+    fn a_failed_login_lookup_backs_off_and_a_known_login_is_never_re_asked() {
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        let now = 1_000_000;
+        assert!(reg.login_lookup_due(&a, now), "never asked: due");
+
+        reg.record_login_failure(&a, now);
+        assert!(
+            !reg.login_lookup_due(&a, now + 30),
+            "next tick: not re-asked"
+        );
+        assert!(!reg.login_lookup_due(&a, now + LOGIN_RETRY_AFTER_SECS - 1));
+        assert!(reg.login_lookup_due(&a, now + LOGIN_RETRY_AFTER_SECS));
+
+        let b = CredentialKey::of_token("token-b");
+        assert!(reg.login_lookup_due(&b, now + 30), "per credential");
+
+        reg.record_login(&a, "jspinak");
+        assert!(!reg.login_lookup_due(&a, now + 10 * LOGIN_RETRY_AFTER_SECS));
+    }
+
+    /// The verdict reads the credential's OWN reading, never the shared slot:
+    /// with the global `last` exhausted by another credential, B still sends.
+    #[test]
+    fn the_shared_last_reading_never_defers_another_credential() {
+        let now = 1_000_000;
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        let b = CredentialKey::of_token("token-b");
+        let empty = reading(5000, 0, now + 1800);
+        reg.record_reading(&a, &empty, now);
+        reg.record(
+            "c",
+            "/repos/o/r/pulls/1",
+            CacheMode::Cached,
+            200,
+            empty,
+            now,
+        );
+        assert_eq!(
+            reg.snapshot(1, 0.2, now).remaining,
+            Some(0),
+            "shared slot exhausted"
+        );
+        assert_eq!(
+            reg.background_verdict(&b, now, HeadroomKnobs::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn fraction_knobs_parse_like_the_low_fraction() {
+        assert_eq!(parse_fraction(None, 0.2), 0.2);
+        assert_eq!(parse_fraction(Some(" 0.35 ".into()), 0.2), 0.35);
+        for bad in ["0", "1", "-0.1", "1.5", "NaN", "inf", "x", ""] {
+            assert_eq!(parse_fraction(Some(bad.into()), 0.2), 0.2, "{bad:?}");
+        }
+        assert_eq!(HeadroomKnobs::default().min_reserve_fraction, 0.20);
+        assert_eq!(HeadroomKnobs::default().guard_fraction, 0.10);
+    }
+
+    #[test]
+    fn login_is_kept_per_credential() {
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        assert_eq!(reg.login_for(&a), None);
+        reg.record_login(&a, " jspinak ");
+        assert_eq!(reg.login_for(&a).as_deref(), Some("jspinak"));
+        assert_eq!(reg.login_for(&CredentialKey::of_token("token-b")), None);
+    }
+
     // -- Global wrappers ----------------------------------------------------
 
     #[test]
     fn global_wrappers_do_not_panic_and_report_honestly() {
         // The process-global registry is shared with any other test that touches
         // it, so this asserts only shape-and-liveness invariants, never counts.
+        // The tests that seed an exhausted global reading hold the same lock.
+        let _global = global_last_lock();
         record_identity("QONTINUI_RUNNER_GITHUB_TOKEN", None);
         record_response(
+            &CredentialKey::of_token("global-wrappers-probe-token"),
             "session_pr_reconciler",
             "https://api.github.com/repos/o/r/pulls/1",
             CacheMode::Cached,

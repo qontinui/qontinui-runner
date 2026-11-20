@@ -251,12 +251,30 @@ impl Drop for IsolatedEditContext {
         // panics ("no reactor running"), and a panic during unwind aborts the
         // process (SIGABRT). Release is best-effort, so skipping it when no
         // runtime is present is the safe degrade; coord's TTL reaps the claim.
+        //
+        // Before any release: take out the `.claude/` exclude block each
+        // shared-branch allocation added to its canonical checkout
+        // (`shared_branch_restore::prepare_canonical_excludes`), under the same
+        // materialize lock the refused-spawn restore holds, so it never
+        // outlives the allocation and is gone before the `canonical_checkout`
+        // lease frees the checkout for a peer.
+        let blocks = self.shared_branch_exclude_blocks();
         let claims = std::mem::take(&mut self.active_claims);
-        if !claims.is_empty() {
+        if !claims.is_empty() || !blocks.is_empty() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let base = self.coord_http_base.clone();
                 let mid = self.device_id;
                 handle.spawn(async move {
+                    for (checkout, branch) in blocks {
+                        let lock = super::checkout_materialize_lock(&checkout);
+                        let _serialized = lock.lock().await;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            super::shared_branch_restore::remove_allocation_excludes(
+                                &checkout, &branch,
+                            )
+                        })
+                        .await;
+                    }
                     for claim in claims {
                         release_claim_best_effort(
                             &base,
@@ -268,6 +286,13 @@ impl Drop for IsolatedEditContext {
                         .await;
                     }
                 });
+            } else {
+                // No runtime (a sync test, or a Drop during unwind): no claim
+                // can be released either, but the block is local file state —
+                // remove it in place rather than leave it behind.
+                for (checkout, branch) in blocks {
+                    super::shared_branch_restore::remove_allocation_excludes(&checkout, &branch);
+                }
             }
         }
     }
@@ -452,6 +477,26 @@ impl IsolatedEditContext {
         report
     }
 
+    /// `(canonical checkout, agent branch)` for every shared-branch placement
+    /// of this context that actually switched its checkout — the ones whose
+    /// `.claude/` exclude block `Drop` removes.
+    fn shared_branch_exclude_blocks(&self) -> Vec<(PathBuf, String)> {
+        self.worktrees
+            .iter()
+            .filter_map(|w| {
+                match self
+                    .provenance
+                    .get(&super::worktree_resource_key(&w.worktree_path))
+                {
+                    Some(TreeProvenance::SharedBranch {
+                        branch, prior_ref, ..
+                    }) if prior_ref != branch => Some((w.worktree_path.clone(), branch.clone())),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Every worktree of this context as the removal judges it: its path, the
     /// `parent_sha` coord recorded for it, and how it was placed.
     pub(crate) fn unspawned_bases(&self) -> Vec<UnspawnedBase> {
@@ -571,6 +616,23 @@ impl IsolatedEditContext {
         // the worktree kind as well means a coexisting phase/file_glob claim is
         // never released here.
         let key = super::worktree_resource_key(&self.worktrees[pos].worktree_path);
+        // A shared-branch row's `.claude/` exclude block leaves with the row,
+        // before its claim does (the same order `Drop` keeps).
+        if let Some(TreeProvenance::SharedBranch {
+            branch, prior_ref, ..
+        }) = self.provenance.get(&key)
+        {
+            if prior_ref != branch {
+                let checkout = self.worktrees[pos].worktree_path.clone();
+                let branch = branch.clone();
+                let lock = super::checkout_materialize_lock(&checkout);
+                let _serialized = lock.lock().await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    super::shared_branch_restore::remove_allocation_excludes(&checkout, &branch)
+                })
+                .await;
+            }
+        }
         let found = self
             .active_claims
             .iter()
@@ -934,7 +996,15 @@ async fn materialize_repos(
             Ok((r, placed))
         }
         MaterializeOutcome::SharedBranch(sb) => {
-            let placed = vec![TreeProvenance::SharedBranch; sb.branches.len()];
+            let placed = sb
+                .branches
+                .iter()
+                .map(|b| TreeProvenance::SharedBranch {
+                    branch: b.branch.clone(),
+                    prior_ref: b.prior_ref.clone(),
+                    switched_to_sha: b.switched_to_sha.clone(),
+                })
+                .collect();
             Ok((
                 super::AllocateResult {
                     agent_id: sb.agent_id,
@@ -1838,6 +1908,12 @@ impl IsolatedEditContext {
     pub(crate) fn set_provenance_for_test(&mut self, path: &Path, provenance: TreeProvenance) {
         self.provenance
             .insert(super::worktree_resource_key(path), provenance);
+    }
+
+    /// Test-only: point `Drop`'s best-effort claim releases at a local double,
+    /// so a test can observe WHEN the release arrives.
+    pub(crate) fn set_coord_http_base_for_test(&mut self, base: String) {
+        self.coord_http_base = base;
     }
 
     /// Test-only view of the credential-install ids `Drop` will tear down:
