@@ -1224,6 +1224,15 @@ fn read_cpu_package_temp_c(sys_root: &std::path::Path) -> Option<f64> {
         .fold(None, |m, c| max_of(m, Some(c)))
 }
 
+/// The wire form of the per-spawner blocking breakdown: each lane's in-flight
+/// count, saturated into the `u32` coord stores.
+fn blocking_lanes_field(by_thread: BTreeMap<String, usize>) -> BTreeMap<String, u32> {
+    by_thread
+        .into_iter()
+        .map(|(k, v)| (k, u32::try_from(v).unwrap_or(u32::MAX)))
+        .collect()
+}
+
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
 /// callers run it on a blocking pool.
 ///
@@ -1369,12 +1378,7 @@ fn collect_host_lane() -> ResourceSample {
         memory.map(|m| m.phys_available),
     )));
 
-    s.blocking_lanes = Some(
-        tracked_blocking_by_thread()
-            .into_iter()
-            .map(|(k, v)| (k, v.min(u32::MAX as usize) as u32))
-            .collect(),
-    );
+    s.blocking_lanes = Some(blocking_lanes_field(tracked_blocking_by_thread()));
 
     // The saturation axis — the third one, and the one the 2026-08-27 incident
     // sat at 99.3% of while every field above it read healthy.
@@ -3862,73 +3866,45 @@ MemAvailable:   15335424 kB
     /// `only_the_host_lane_carries_the_spawn_pressure_pair` above guards
     /// against for `thread_count`.
     ///
-    /// Puts one tracked body in flight on a thread this fixture names, so the
-    /// expected lane key is a constant rather than whatever the test harness
-    /// happened to call the running thread — same technique
-    /// `wedge_diagnostics`'s own
-    /// `assert_a_body_is_charged_to_its_spawner` fixture uses. `spawn_blocking_tracked`
-    /// charges the GLOBAL lane table (there is no way to hand it a private
-    /// one from outside `wedge_diagnostics`), so this asserts presence and the
-    /// fixture's own count rather than an exact whole-map equality against a
-    /// second, separately-timed read — the same "asserted on presence, not
-    /// equality" call the spawn-pressure test above makes, and for the same
-    /// reason: the global table is shared with whatever else this test binary
-    /// is doing concurrently.
+    /// Asserted in two halves, neither of which reads the process-global lane
+    /// table. That table's 15 lanes are first-come and never released, and
+    /// under `cargo test` the test names that reach `spawn_blocking_tracked`
+    /// first take them — so an assertion on a named lane there is an assertion
+    /// about this binary's test population, and it reddened whenever a new
+    /// test elsewhere filled the table (see `wedge_diagnostics::LaneTable`).
+    /// The lane table's own charging is covered by `wedge_diagnostics`'s
+    /// private-table tests; what this module owns is the mapping and the wiring.
     #[test]
     fn the_host_lane_carries_the_blocking_lane_breakdown() {
-        const SPAWNER: &str = "resource-sample-blocking-fixture";
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let fixture = std::thread::Builder::new()
-            .name(SPAWNER.to_string())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .expect("runtime");
-                let _guard = rt.enter();
-                let jh = spawn_blocking_tracked(move || {
-                    let _ = entered_tx.send(());
-                    let _ = release_rx.recv();
-                });
-                rt.block_on(jh).expect("join the tracked body");
-            })
-            .expect("spawn the named fixture thread");
+        // The mapping: every lane kept, its count unchanged, an over-range
+        // count saturated rather than wrapped.
+        let by_thread = BTreeMap::from([
+            ("fleet-pub-rt".to_string(), 3usize),
+            ("<other-threads>".to_string(), 1usize),
+            ("huge".to_string(), usize::MAX),
+        ]);
+        assert_eq!(
+            blocking_lanes_field(by_thread),
+            BTreeMap::from([
+                ("fleet-pub-rt".to_string(), 3u32),
+                ("<other-threads>".to_string(), 1u32),
+                ("huge".to_string(), u32::MAX),
+            ])
+        );
+        assert!(blocking_lanes_field(BTreeMap::new()).is_empty());
 
-        entered_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the tracked body must start running");
+        // The wiring: the host collector publishes the live global table
+        // through that mapping, unconditionally.
+        let body = collect_host_lane_src();
+        assert!(
+            body.contains("s.blocking_lanes = Some(blocking_lanes_field(tracked_blocking_by_thread()));"),
+            "collect_host_lane must publish the live lane table through blocking_lanes_field"
+        );
 
-        // A non-host lane must never see this — same placement argument as
-        // `only_the_host_lane_carries_the_spawn_pressure_pair`.
+        // And it is only the host lane's: a non-host lane never carries it.
         let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
         assert_eq!(wsl.blocking_lanes, None);
-
-        let host = collect_host_lane();
-        let published = host
-            .blocking_lanes
-            .as_ref()
-            .expect("the host lane must publish a blocking_lanes map");
-        assert_eq!(
-            published.get(SPAWNER).copied(),
-            Some(1),
-            "the fixture's own in-flight body did not appear in the published \
-             breakdown: {published:?}"
-        );
-        // Cross-checks the live accessor directly, not just the wire struct —
-        // the same key this fixture's body is charged to on the source of
-        // truth `collect_host_lane` reads from.
-        assert!(
-            tracked_blocking_by_thread()
-                .get(SPAWNER)
-                .copied()
-                .is_some_and(|n| n >= 1),
-            "the fixture's body must still be tracked while it is in flight"
-        );
-
-        let _ = release_tx.send(());
-        fixture.join().expect("fixture thread");
+        assert!(collect_host_lane().blocking_lanes.is_some());
     }
 
     /// The socket census's wire names, pinned for the same reason the
