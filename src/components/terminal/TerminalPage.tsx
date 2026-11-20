@@ -85,6 +85,9 @@ import { useLiveRef } from "./useLiveRef";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
+import { LaunchFailedBanner } from "./LaunchFailedBanner";
+import { AnalyzeLaunchContext, useAnalyzeLaunch } from "./useAnalyzeLaunch";
+import type { AiLaunchCommand } from "./aiLaunchCommand";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
@@ -1300,6 +1303,43 @@ function TerminalPageInner({
     return createdTabIds;
   };
 
+  // What a typed AI launch records on its tab. Shared by the launch menu and
+  // the "Analyze launch" analyzer pane (`useAnalyzeLaunch`).
+  const recordAiLaunch = (
+    tabId: string,
+    launch: AiLaunchCommand,
+    configDir: string,
+    spawnAt: number = Date.now(),
+  ) => {
+    const { command, pinnedSessionId } = launch;
+    // The launch record the Analyze action reads (what was typed, when, under
+    // which account) — tab state, so no second store.
+    const launchFields = {
+      launchCommand: command,
+      launchedAt: Date.now(),
+      launchConfigDir: configDir,
+    };
+    if (pinnedSessionId) {
+      updateTab(tabId, {
+        claudeSessionId: pinnedSessionId,
+        claudeConfigDir: configDir,
+        ...launchFields,
+      });
+      rememberSessionId(tabId, pinnedSessionId, configDir);
+      recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
+    } else {
+      updateTab(tabId, launchFields);
+      // Custom launch command (an alias that may drop the runner's
+      // `--session-id` pin) — the id is unknown up front, so fall back to
+      // the mtime-capture poll. This is the ONE remaining last-resort caller
+      // of `startSessionIdCapture`; it binds origin "reconciled" (a
+      // freshest-mtime guess), so restore treats it as terminal-only rather
+      // than auto-resuming. Every pinned path above records authoritatively.
+      const tab = tabs.find((t) => t.id === tabId);
+      startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
+    }
+  };
+
   const handleLaunchAiSession = async (
     count: number,
     configDir: string,
@@ -1344,23 +1384,12 @@ function TerminalPageInner({
           },
         );
         if (!launch) continue;
-        const { command, pinnedSessionId } = launch;
         launchedTabIds.push(tabId);
-        writeWhenReady(tabId, `${command}\r`);
-        if (pinnedSessionId) {
-          updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
-          rememberSessionId(tabId, pinnedSessionId, configDir);
-          recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
-        } else {
-          // Custom launch command (an alias that may drop the runner's
-          // `--session-id` pin) — the id is unknown up front, so fall back to
-          // the mtime-capture poll. This is the ONE remaining last-resort caller
-          // of `startSessionIdCapture`; it binds origin "reconciled" (a
-          // freshest-mtime guess), so restore treats it as terminal-only rather
-          // than auto-resuming. Every pinned path above records authoritatively.
-          const tab = tabs.find((t) => t.id === tabId);
-          startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
-        }
+        // Phase 4 of `2026-11-20-terminal-launch-failure-analyze-button`: once
+        // the command is typed, watch for Claude's handshake and the shim's
+        // failure beacon; a launch SEEN not to start raises `LaunchFailedBanner`.
+        void writeWhenReady(tabId, `${launch.command}\r`).then(() => verifyLaunch(tabId));
+        recordAiLaunch(tabId, launch, configDir, spawnAt);
       }
       if (context && launchedTabIds.length > 0) {
         const safeContext = context.replace(/\n/g, " ");
@@ -1391,6 +1420,25 @@ function TerminalPageInner({
           sessionManager.savedConfigDirs.includes(a.config_dir),
         )
       : sessionManager.accountUsage;
+
+  // "Analyze launch" (plan 2026-11-20-terminal-launch-failure-analyze-button):
+  // the zone/overflow/banner buttons read this through `AnalyzeLaunchContext`.
+  const { api: analyzeLaunchApi, verifyLaunch } = useAnalyzeLaunch({
+    tabs,
+    updateTab,
+    createPane: (title, cwd, tenantId) => createAndAssignTerminal(title, cwd, tenantId),
+    write: (tabId, text) => writeWhenReady(tabId, text),
+    accounts: spawnAccounts,
+    launchAliases: sessionManager.launchCommands,
+    notify: workflowGen.setNotification,
+    onLaunched: (tabId, launch, configDir) => {
+      recordAiLaunch(tabId, launch, configDir);
+      verifyLaunch(tabId);
+    },
+    setActiveId,
+    zoneAssignments: zoneLayout.assignments,
+    setFocusedZone: zoneLayout.setFocusedZone,
+  });
 
   // Prompt library (plan 2026-07-24-terminal-prompt-library-command).
   // Fetched once per page mount (the Rust command holds a 45s TTL + ETag
@@ -1679,14 +1727,16 @@ function TerminalPageInner({
                 /* Every prop here is identity-stable (useZoneActions callbacks,
                  the memoized handleExit, and useMidSessionProbe's stable
                  `feed`), which is what makes ZoneGrid's React.memo hold. */
-                <ZoneGrid
-                  onZoneClick={handleZoneClick}
-                  onZoneDoubleClick={handleZoneDoubleClick}
-                  onExit={handleExit}
-                  onExportZone={handleExportZone}
-                  onUserInputLine={midSessionProbe.feed}
-                  tenantSwitcherShown={tenantSwitcherShown}
-                />
+                <AnalyzeLaunchContext.Provider value={analyzeLaunchApi}>
+                  <ZoneGrid
+                    onZoneClick={handleZoneClick}
+                    onZoneDoubleClick={handleZoneDoubleClick}
+                    onExit={handleExit}
+                    onExportZone={handleExportZone}
+                    onUserInputLine={midSessionProbe.feed}
+                    tenantSwitcherShown={tenantSwitcherShown}
+                  />
+                </AnalyzeLaunchContext.Provider>
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
                   <span className="text-sm">
@@ -1857,6 +1907,12 @@ function TerminalPageInner({
                 onRetryResume={handleRetryResume}
                 onDismissTerminalOnly={handleDismissTerminalOnly}
               />
+
+              {/* A fresh launch SEEN not to start (handshake wait ran out, or
+                the shim beaconed a failure), with its Analyze button. */}
+              <AnalyzeLaunchContext.Provider value={analyzeLaunchApi}>
+                <LaunchFailedBanner tabs={tabs} onDismiss={analyzeLaunchApi.dismissLaunchFailure} />
+              </AnalyzeLaunchContext.Provider>
 
               {/* "Since restart" (plan 2026-10-04-runner-session-roster-restore-
                 picker): once every page's restore has settled, says how many

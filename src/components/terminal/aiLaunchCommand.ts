@@ -26,6 +26,14 @@ export interface AiLaunchCommand {
   command: string;
   /** Pre-pinned Claude session id; null = capture fallback (opaque alias). */
   pinnedSessionId: string | null;
+  /**
+   * True only when the backend rendered `initialPrompt` into the command as the
+   * `-- <prompt>` positional (the composed path). An opaque per-account alias
+   * is typed verbatim and drops it, so this is false there, and false whenever
+   * no `initialPrompt` was passed or the backend did not report the field. A
+   * caller that needs the first turn delivered types it itself when false.
+   */
+  promptCarried: boolean;
 }
 
 export async function buildAiLaunchCommand(params: {
@@ -33,17 +41,29 @@ export async function buildAiLaunchCommand(params: {
   isWindows: boolean;
   /** Fresh UUIDv4 minted by the caller; pinned as `--session-id`/`{sessionId}`. */
   sessionId: string;
+  /**
+   * First message for the new session, rendered as the `-- <prompt>`
+   * positional when the account's launch is composed (see
+   * {@link AiLaunchCommand.promptCarried}). Omitted, the command is exactly
+   * what it was before this parameter existed and nothing extra is sent.
+   */
+  initialPrompt?: string;
 }): Promise<AiLaunchCommand> {
-  const { configDir, isWindows, sessionId } = params;
-  const resp = await invoke<CommandResponse<{ command: string; pinnedSessionId: string | null }>>(
-    "build_ai_launch_command",
-    { configDir, sessionId, isWindows },
-  );
+  const { configDir, isWindows, sessionId, initialPrompt } = params;
+  const args: Record<string, unknown> = { configDir, sessionId, isWindows };
+  if (initialPrompt !== undefined) args.initialPrompt = initialPrompt;
+  const resp = await invoke<
+    CommandResponse<{ command: string; pinnedSessionId: string | null; promptCarried?: boolean }>
+  >("build_ai_launch_command", args);
   const data = resp.data;
   if (!data) {
     throw new Error(resp.message ?? "build_ai_launch_command returned no data");
   }
-  return { command: data.command, pinnedSessionId: data.pinnedSessionId ?? null };
+  return {
+    command: data.command,
+    pinnedSessionId: data.pinnedSessionId ?? null,
+    promptCarried: data.promptCarried === true,
+  };
 }
 
 /**
@@ -73,7 +93,7 @@ export interface AiLaunchTabHandlers {
  */
 export async function buildAiLaunchCommandForTab(
   tabId: string,
-  params: { configDir: string; isWindows: boolean; sessionId: string },
+  params: { configDir: string; isWindows: boolean; sessionId: string; initialPrompt?: string },
   handlers: AiLaunchTabHandlers,
 ): Promise<AiLaunchCommand | null> {
   try {

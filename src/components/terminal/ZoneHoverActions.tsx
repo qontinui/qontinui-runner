@@ -58,6 +58,8 @@ import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./con
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminalWindowActions";
 import { RemoteTabEndAction } from "./RemoteSessionEndFlow";
+import { AnalyzeLaunchButton } from "./AnalyzeLaunchButton";
+import { analyzeLaunchPlacement } from "./analyzeLaunch";
 import {
   ZONE_HOVER_COLLAPSED_ONLY_CLASS,
   ZONE_HOVER_COLLAPSED_ONLY_REMOTE_CLASS,
@@ -230,6 +232,16 @@ export function ZoneHoverActions({
   // Set only for a tab mirroring a session on ANOTHER device — it gets the
   // "End on remote session" action beside close.
   const remoteTab = tabId ? tabs.find((t) => t.id === tabId && !!t.remote) : undefined;
+  // "Analyze launch" (`analyzeLaunch.ts`): beside Restart for a pane with a
+  // recorded launch or in `error`, in the overflow menu for any other local
+  // pane. The extra cluster button takes the same width budget as a remote
+  // tab's End button, so such a pane uses the wider (remote) collapse classes,
+  // and `ZoneLabel` reserves the wider span (`hoverClusterIsWide`).
+  const analyzePlacement = analyzeLaunchPlacement(
+    tabId ? tabs.find((t) => t.id === tabId) : undefined,
+    tabId ? state : undefined,
+  );
+  const wideCluster = !!remoteTab || analyzePlacement === "cluster";
 
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showLabelInput, setShowLabelInput] = useState(false);
@@ -260,9 +272,9 @@ export function ZoneHoverActions({
   // cluster never does (it is not in a zone-sized container).
   const collapsible = !inline;
   const fullOnly = collapsible
-    ? ` ${remoteTab ? ZONE_HOVER_FULL_ONLY_REMOTE_CLASS : ZONE_HOVER_FULL_ONLY_CLASS}`
+    ? ` ${wideCluster ? ZONE_HOVER_FULL_ONLY_REMOTE_CLASS : ZONE_HOVER_FULL_ONLY_CLASS}`
     : "";
-  const collapsedOnly = remoteTab
+  const collapsedOnly = wideCluster
     ? ZONE_HOVER_COLLAPSED_ONLY_REMOTE_CLASS
     : ZONE_HOVER_COLLAPSED_ONLY_CLASS;
 
@@ -617,6 +629,10 @@ export function ZoneHoverActions({
           <RefreshCw className="w-3 h-3" />
         </button>
 
+        {analyzePlacement === "cluster" && tabId && (
+          <AnalyzeLaunchButton tabId={tabId} variant="icon" className={fullOnly} />
+        )}
+
         {/* Label */}
         {labelZone !== null && (
           <button
@@ -784,6 +800,14 @@ export function ZoneHoverActions({
                 <RefreshCw className="w-3 h-3 shrink-0" aria-hidden />
                 Restart session
               </button>
+              {analyzePlacement !== "none" && tabId && (
+                <AnalyzeLaunchButton
+                  tabId={tabId}
+                  variant="menuitem"
+                  className={OVERFLOW_ITEM_CLASS}
+                  onDone={closeOverflow}
+                />
+              )}
               {labelZone !== null && (
                 <button
                   type="button"

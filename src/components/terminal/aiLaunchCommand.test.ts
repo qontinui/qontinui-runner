@@ -24,7 +24,8 @@ describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
     invokeMock.mockResolvedValue({
       success: true,
       data: {
-        command: 'CLAUDE_CONFIG_DIR="/h/.claude-x" claude --permission-mode bypassPermissions --session-id abc',
+        command:
+          'CLAUDE_CONFIG_DIR="/h/.claude-x" claude --permission-mode bypassPermissions --session-id abc',
         pinnedSessionId: "abc",
       },
     });
@@ -41,8 +42,10 @@ describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
       isWindows: false,
     });
     expect(result).toEqual({
-      command: 'CLAUDE_CONFIG_DIR="/h/.claude-x" claude --permission-mode bypassPermissions --session-id abc',
+      command:
+        'CLAUDE_CONFIG_DIR="/h/.claude-x" claude --permission-mode bypassPermissions --session-id abc',
       pinnedSessionId: "abc",
+      promptCarried: false,
     });
   });
 
@@ -58,7 +61,41 @@ describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
       sessionId: "abc",
     });
 
-    expect(result).toEqual({ command: "clh", pinnedSessionId: null });
+    expect(result).toEqual({ command: "clh", pinnedSessionId: null, promptCarried: false });
+  });
+
+  it("passes initialPrompt only when given, and surfaces promptCarried", async () => {
+    invokeMock.mockResolvedValueOnce({
+      success: true,
+      data: { command: "claude -- '/x y'", pinnedSessionId: "abc", promptCarried: true },
+    });
+    const result = await buildAiLaunchCommand({
+      configDir: "/h/.claude-x",
+      isWindows: false,
+      sessionId: "abc",
+      initialPrompt: "/x y",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("build_ai_launch_command", {
+      configDir: "/h/.claude-x",
+      sessionId: "abc",
+      isWindows: false,
+      initialPrompt: "/x y",
+    });
+    expect(result.promptCarried).toBe(true);
+  });
+
+  it("reads an absent promptCarried as false (the prompt was not delivered)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      success: true,
+      data: { command: "clh", pinnedSessionId: null },
+    });
+    const result = await buildAiLaunchCommand({
+      configDir: "/x",
+      isWindows: false,
+      sessionId: "abc",
+      initialPrompt: "/x",
+    });
+    expect(result.promptCarried).toBe(false);
   });
 
   it("throws when the command returns no data", async () => {
@@ -91,7 +128,11 @@ describe("buildAiLaunchCommandForTab (orphan cleanup on a failed build)", () => 
 
     const result = await buildAiLaunchCommandForTab("tab-1", params, { disposeTab, notify });
 
-    expect(result).toEqual({ command: "claude --session-id abc", pinnedSessionId: "abc" });
+    expect(result).toEqual({
+      command: "claude --session-id abc",
+      pinnedSessionId: "abc",
+      promptCarried: false,
+    });
     expect(disposeTab).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
   });

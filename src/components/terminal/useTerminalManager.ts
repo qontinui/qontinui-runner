@@ -47,10 +47,7 @@ export function renameTabIn(tabs: TerminalTab[], id: string, title: string): Ter
  * name is immutable — and returns the SAME array when nothing changed so
  * callers do not churn renders.
  */
-export function applySpawnNames(
-  tabs: TerminalTab[],
-  names: Record<string, string>,
-): TerminalTab[] {
+export function applySpawnNames(tabs: TerminalTab[], names: Record<string, string>): TerminalTab[] {
   let changed = false;
   const next = tabs.map((t) => {
     if (t.spawnName) return t;
@@ -142,6 +139,33 @@ export interface TerminalTab {
    * guessing.
    */
   tenantId?: string;
+  /**
+   * The exact `claude …` command the AI launch menu typed into this pane
+   * (`handleLaunchAiSession`), with {@link launchedAt} and
+   * {@link launchConfigDir}. Absent on a pane whose launch was typed by hand.
+   * Read by the "Analyze launch" action (`useAnalyzeLaunch`), which writes it
+   * into the launch-evidence file so the analyzer can retry the same launch.
+   */
+  launchCommand?: string;
+  /** Epoch ms the launch command was typed. */
+  launchedAt?: number;
+  /**
+   * The account the launch ran under. Kept apart from {@link claudeConfigDir},
+   * which a per-account alias launch never sets: the analyzer must still know
+   * which account failed so it can run on a different one.
+   */
+  launchConfigDir?: string;
+  /**
+   * Set when a fresh launch was OBSERVED not to start (`launchVerification`):
+   * the handshake wait ran out (with the wait actually spent), the shim
+   * beaconed a launch failure, or both. `LaunchFailedBanner` renders it.
+   * Never set on an unread launch, which stays UNKNOWN.
+   */
+  launchFailure?: {
+    handshakeWaitedMs?: number;
+    beaconKind?: string;
+    beaconDetail?: string;
+  };
   /** Claude Code session ID running in this tab (set on resume). */
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
@@ -1720,6 +1744,10 @@ export function useTerminalManager(
           | "isReconnecting"
           | "resumeFailed"
           | "restoreTerminalOnly"
+          | "launchCommand"
+          | "launchedAt"
+          | "launchConfigDir"
+          | "launchFailure"
         >
       >,
     ) => {
