@@ -1124,19 +1124,25 @@ impl AgenticExecutor {
                 .with_tool_policy(agentic_tool_policy);
 
         // CLI session context for restart survival.
-        // Check if there's an interrupted session we can resume via `--resume`.
-        // If so, reuse its CLI session ID; otherwise generate a fresh one.
+        // Check if there's a resumable session for this (task run, iteration,
+        // stage) we can resume via `--resume` — see `is_resumable`. If so,
+        // reuse its CLI session ID; otherwise generate a fresh one.
         let parent_task_id = get_parent_task_id(&config.execution_id);
         let (cli_session_id, is_resume) = match self
             .app_state
             .pg_db
-            .get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic")
+            .get_workflow_ai_session(
+                &parent_task_id,
+                iteration as i32,
+                "agentic",
+                config.stage_index.map(|i| i as i32),
+            )
             .await
         {
-            Ok(Some((prev_cli_id, prev_status))) if prev_status == "interrupted" => {
+            Ok(Some((prev_cli_id, prev_status))) if is_resumable(&prev_status) => {
                 info!(
-                    "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume",
-                    prev_cli_id, iteration
+                    "AGENTIC-PHASE: Found {} CLI session {} for iteration {} — will resume",
+                    prev_status, prev_cli_id, iteration
                 );
                 (prev_cli_id, true)
             }
@@ -1169,20 +1175,6 @@ impl AgenticExecutor {
             .await
         {
             warn!("PG create_workflow_ai_session failed: {}", e);
-        }
-        if let Err(e) = self
-            .app_state
-            .pg_db
-            .create_workflow_ai_session(
-                &parent_task_id,
-                iteration as i32,
-                "agentic",
-                config.stage_index.map(|i| i as i32),
-                &cli_session_id,
-            )
-            .await
-        {
-            warn!("Failed to create workflow AI session record: {}", e);
         }
 
         // Attach DB flush context for periodic output persistence
@@ -1260,23 +1252,6 @@ impl AgenticExecutor {
                 .await
             {
                 warn!("PG create fallback workflow AI session failed: {}", e);
-            }
-            if let Err(e) = self
-                .app_state
-                .pg_db
-                .create_workflow_ai_session(
-                    &parent_task_id,
-                    iteration as i32,
-                    "agentic",
-                    config.stage_index.map(|i| i as i32),
-                    &fresh_cli_id,
-                )
-                .await
-            {
-                warn!(
-                    "Failed to create fallback workflow AI session record: {}",
-                    e
-                );
             }
             // Retry with the full enhanced prompt
             let (retry_result, retry_duration) = timeout_helper::timed_result_async(
@@ -1356,6 +1331,9 @@ impl AgenticExecutor {
 
         // Record token usage for the main AI session and build LLM metrics
         let (session_input_tokens, session_output_tokens) = outcome.token_usage();
+        // Set when the budget is exceeded or the cost circuit breaker trips:
+        // the phase stops, but only after the terminal status is written below.
+        let mut budget_stop: Option<String> = None;
         let session_model = config.resolve_model_for_phase("agentic");
         let session_provider = config.resolve_provider_for_phase("agentic");
         {
@@ -1447,28 +1425,28 @@ impl AgenticExecutor {
                                 phase, overage_usd
                             );
                             tracing::error!("{}", reason);
-                            return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
+                            budget_stop = Some(reason);
                         }
                         crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                     }
 
                     // Check circuit breaker
-                    let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
-                    if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(
-                        reason,
-                    ) = &cb_result
-                    {
-                        tracing::error!("Cost circuit breaker tripped: {}", reason);
-                        return (
-                            AgenticOutcome::BudgetExceeded {
-                                reason: reason.clone(),
-                            },
-                            Vec::new(),
-                        );
+                    if budget_stop.is_none() {
+                        let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
+                        if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(
+                            reason,
+                        ) = cb_result
+                        {
+                            tracing::error!("Cost circuit breaker tripped: {}", reason);
+                            budget_stop = Some(reason);
+                        }
                     }
 
                     // Anomaly detection
-                    if let Ok(mut detector) = trackers.anomaly_detector.lock() {
+                    if budget_stop.is_some() {
+                        // Stopping for cost: skip anomaly bookkeeping, as the
+                        // early return here always did.
+                    } else if let Ok(mut detector) = trackers.anomaly_detector.lock() {
                         if let Some(anomaly) = detector.check(cost_usd) {
                             warn!(
                                 "Cost anomaly detected: ${:.4} (z-score: {:.2})",
@@ -1487,6 +1465,21 @@ impl AgenticExecutor {
                 }
             }
         }
+
+        // A phase stopped for cost still records a terminal status, so its
+        // row is never left `running` (and so never resumed — `is_resumable`).
+        if let Some(reason) = budget_stop {
+            let stop = AgenticOutcome::BudgetExceeded { reason };
+            self.record_workflow_ai_session_terminal(
+                &parent_task_id,
+                iteration,
+                config.stage_index,
+                &stop,
+            )
+            .await;
+            return (stop, Vec::new());
+        }
+
         let session_llm_metrics = build_llm_metrics(
             session_model.as_deref(),
             session_provider.as_deref(),
@@ -1494,48 +1487,14 @@ impl AgenticExecutor {
             session_output_tokens,
         );
 
-        // Mark the workflow AI session as completed/failed and clean up partial output
-        {
-            let session_status = match &outcome {
-                AgenticOutcome::Success { .. } => "completed",
-                AgenticOutcome::Failed { .. } => "failed",
-                AgenticOutcome::Error { .. } => "failed",
-                AgenticOutcome::Skipped => "completed",
-                AgenticOutcome::BudgetExceeded { .. } => "failed",
-            };
-            let output_len = outcome.output().map(|o| o.len() as i64).unwrap_or(0);
-            if let Err(e) = self
-                .app_state
-                .pg_db
-                .complete_workflow_ai_session(
-                    &parent_task_id,
-                    iteration as i32,
-                    "agentic",
-                    config.stage_index.map(|i| i as i32),
-                    session_status,
-                    output_len,
-                )
-                .await
-            {
-                warn!("PG complete_workflow_ai_session failed: {}", e);
-            }
-            if let Err(e) = self
-                .app_state
-                .pg_db
-                .complete_workflow_ai_session(
-                    &parent_task_id,
-                    iteration as i32,
-                    "agentic",
-                    config.stage_index.map(|i| i as i32),
-                    session_status,
-                    output_len,
-                )
-                .await
-            {
-                warn!("Failed to complete workflow AI session: {}", e);
-            }
-            // Partial AI output deletion removed — all persistence now via PgDb.
-        }
+        // Mark the workflow AI session as completed/failed.
+        self.record_workflow_ai_session_terminal(
+            &parent_task_id,
+            iteration,
+            config.stage_index,
+            &outcome,
+        )
+        .await;
 
         // Emit completion event so the Active Dashboard timeline shows agentic phase result
         let agentic_duration_ms = agentic_start.elapsed().as_millis() as i64;
@@ -1629,6 +1588,34 @@ impl AgenticExecutor {
     /// specialized fix agents with narrow, targeted prompts.
     ///
     /// Returns (success, output, duration_ms).
+    /// Write the agentic phase's terminal status to `workflow_ai_sessions`.
+    /// Every exit after `create_workflow_ai_session` goes through here, so a
+    /// row left `running` can only mean the process died mid-phase.
+    async fn record_workflow_ai_session_terminal(
+        &self,
+        parent_task_id: &str,
+        iteration: u32,
+        stage_index: Option<u32>,
+        outcome: &AgenticOutcome,
+    ) {
+        let output_len = outcome.output().map(|o| o.len() as i64).unwrap_or(0);
+        if let Err(e) = self
+            .app_state
+            .pg_db
+            .complete_workflow_ai_session(
+                parent_task_id,
+                iteration as i32,
+                "agentic",
+                stage_index.map(|i| i as i32),
+                workflow_ai_session_terminal_status(outcome),
+                output_len,
+            )
+            .await
+        {
+            warn!("PG complete_workflow_ai_session failed: {}", e);
+        }
+    }
+
     pub async fn run_focused_session(
         &self,
         execution_id: &str,
@@ -1723,5 +1710,96 @@ impl AgenticExecutor {
     fn get_progress_marker_context(&self, _execution_id: &str, _iteration: u32) -> Option<String> {
         // Progress marker context removed — all persistence now via PgDb.
         None
+    }
+}
+
+/// Status written to `workflow_ai_sessions` when the agentic phase exits with
+/// `outcome`. Every exit is terminal: nothing here is `running`, so a stopped
+/// phase (including one stopped for cost) is never resumed.
+pub(crate) fn workflow_ai_session_terminal_status(outcome: &AgenticOutcome) -> &'static str {
+    match outcome {
+        AgenticOutcome::Success { .. } => "completed",
+        AgenticOutcome::Failed { .. } => "failed",
+        AgenticOutcome::Error { .. } => "failed",
+        AgenticOutcome::Skipped => "completed",
+        AgenticOutcome::BudgetExceeded { .. } => "failed",
+    }
+}
+
+/// Whether a prior `workflow_ai_sessions` row for the same
+/// `(task_run_id, iteration, stage, "agentic")`, read at the START of the
+/// phase, names a CLI session to `--resume`. Every exit writes a terminal
+/// status (`workflow_ai_session_terminal_status`), so a row still `running`
+/// at phase start means the process died mid-phase; `interrupted` is kept for
+/// any writer that records it explicitly.
+pub(crate) fn is_resumable(status: &str) -> bool {
+    matches!(status, "running" | "interrupted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_resumable_running_resumes() {
+        // Fails against the old `== "interrupted"` predicate.
+        assert!(is_resumable("running"));
+    }
+
+    #[test]
+    fn is_resumable_interrupted_resumes() {
+        assert!(is_resumable("interrupted"));
+    }
+
+    #[test]
+    fn is_resumable_terminal_or_unknown_starts_fresh() {
+        for status in ["completed", "failed", "", "unknown", "RUNNING"] {
+            assert!(!is_resumable(status), "status {status:?} must not resume");
+        }
+    }
+
+    #[test]
+    fn budget_exceeded_exit_writes_failed() {
+        let outcome = AgenticOutcome::BudgetExceeded {
+            reason: "Budget exceeded in phase agentic: $0.5000 over limit".to_string(),
+        };
+        assert_eq!(workflow_ai_session_terminal_status(&outcome), "failed");
+        // And a `failed` row is never resumed.
+        assert!(!is_resumable(workflow_ai_session_terminal_status(&outcome)));
+    }
+
+    #[test]
+    fn every_exit_writes_a_non_resumable_terminal_status() {
+        let outcomes = [
+            AgenticOutcome::Success {
+                output: String::new(),
+                parsed: None,
+                input_tokens: None,
+                output_tokens: None,
+                tools_used: Vec::new(),
+                tools_rejected: Vec::new(),
+            },
+            AgenticOutcome::Failed {
+                output: String::new(),
+                error: "x".to_string(),
+                parsed: None,
+                input_tokens: None,
+                output_tokens: None,
+                tools_used: Vec::new(),
+                tools_rejected: Vec::new(),
+            },
+            AgenticOutcome::Error {
+                error: "x".to_string(),
+            },
+            AgenticOutcome::Skipped,
+            AgenticOutcome::BudgetExceeded {
+                reason: "x".to_string(),
+            },
+        ];
+        for outcome in &outcomes {
+            let status = workflow_ai_session_terminal_status(outcome);
+            assert!(matches!(status, "completed" | "failed"), "{outcome:?}");
+            assert!(!is_resumable(status), "{outcome:?} would be resumed");
+        }
     }
 }
