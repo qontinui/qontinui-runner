@@ -3905,10 +3905,15 @@ mod tests {
         std::fs::write(triple.join("CACHEDIR.TAG"), b"Signature").expect("triple tag");
         assert_eq!(cargo_target_dir_of(&cross_exe), Some(triple));
 
-        // (e) a tree with neither marker resolves to nothing.
+        // (e) a tree with neither marker resolves past itself: to whatever the
+        // scratch directory's own ancestors resolve to. That is `None` on an
+        // ordinary box. It is a marked ancestor when TMPDIR sits inside a cargo
+        // target, which must not fail this test.
+        let ambient = cargo_target_dir_of(&scratch.path().join("probe"));
         let bare = scratch.path().join("bare");
         let exe = exe_under(&bare);
-        assert_eq!(cargo_target_dir_of(&exe), None);
+        assert_eq!(cargo_target_dir_of(&exe), ambient);
+        assert_ne!(cargo_target_dir_of(&exe), Some(bare.clone()));
     }
 
     /// The harness directory is created private, with its missing parents, and
