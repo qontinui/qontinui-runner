@@ -276,11 +276,35 @@ pub fn parse_rate_limit(headers: &HeaderMap) -> RateLimitObservation {
     }
 }
 
-/// A `403`/`429` that GitHub refused for an exhausted bucket, as opposed to a
-/// permission `403` or a secondary-limit `429` with budget left. The discriminator
-/// is `x-ratelimit-remaining: 0` on the refusal itself.
-fn is_rate_limited(status: u16, obs: &RateLimitObservation) -> bool {
-    matches!(status, 403 | 429) && obs.remaining == Some(0)
+/// THE rate-limit classifier: did GitHub refuse this for RATE rather than for
+/// permission? Pure, and asked by every door that meters, retries or reports a
+/// refusal (`trigger_system::github_api::retry_backoff_secs`, the ticket
+/// provider, `ci_node::sibling`), so they cannot disagree.
+///
+/// - `429` — always a rate refusal (secondary limit).
+/// - `403` with `x-ratelimit-remaining: 0` — the PRIMARY bucket is empty.
+/// - `403` with `Retry-After` — a SECONDARY limit, budget left.
+///
+/// A `403` with neither is a permission/SSO refusal.
+pub fn is_rate_limited_refusal(
+    status: u16,
+    retry_after: Option<u64>,
+    remaining: Option<i64>,
+) -> bool {
+    match status {
+        429 => true,
+        403 => remaining == Some(0) || retry_after.is_some(),
+        _ => false,
+    }
+}
+
+/// `Retry-After` in whole seconds, when GitHub sent one. The HTTP-date form is
+/// not used by GitHub's REST API and reads as absent.
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -456,9 +480,9 @@ impl std::fmt::Display for CredentialKey {
 /// caller keyed per request by mistake. Over it, the stalest reading is evicted.
 const CREDENTIAL_KEY_CAP: usize = 32;
 
-/// After a failed `GET /user`, how long before the login is asked again. A
-/// credential that cannot answer it (an installation token answers `403`)
-/// would otherwise be re-asked every tick for the life of the process.
+/// After a TERMINAL `GET /user` refusal (`401`/`403`), how long before the
+/// login is asked again. A credential that cannot answer `/user` would
+/// otherwise be re-asked every tick for the life of the process.
 const LOGIN_RETRY_AFTER_SECS: i64 = 6 * 3600;
 
 /// GitHub's rate-limit window, seconds.
@@ -611,19 +635,44 @@ pub fn github_headroom(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetDeferral {
     pub credential: CredentialKey,
-    pub remaining: i64,
-    pub limit: i64,
-    pub reset_at_unix: i64,
+    pub reason: DeferralReason,
+}
+
+/// Why the gate decided against a background request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferralReason {
+    /// The credential's own fresh reading projects the window short.
+    ProjectedShort {
+        remaining: i64,
+        limit: i64,
+        reset_at_unix: i64,
+    },
+    /// GitHub refused this credential for rate and said when to come back
+    /// (`Retry-After`, or the primary window's reset); that time has not come.
+    RetryAfter { not_before_unix: i64 },
 }
 
 impl std::fmt::Display for BudgetDeferral {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "GitHub background request deferred (not sent): credential {} is projected short \
-             of its reserve ({}/{} remaining, window resets at {})",
-            self.credential, self.remaining, self.limit, self.reset_at_unix
-        )
+        match &self.reason {
+            DeferralReason::ProjectedShort {
+                remaining,
+                limit,
+                reset_at_unix,
+            } => write!(
+                f,
+                "GitHub background request deferred (not sent): credential {} is projected \
+                 short of its reserve ({remaining}/{limit} remaining, window resets at \
+                 {reset_at_unix})",
+                self.credential
+            ),
+            DeferralReason::RetryAfter { not_before_unix } => write!(
+                f,
+                "GitHub background request deferred (not sent): credential {} was refused for \
+                 rate and may not be asked again before {not_before_unix}",
+                self.credential
+            ),
+        }
     }
 }
 
@@ -656,7 +705,8 @@ pub struct ConsumerRow {
     /// `304 Not Modified` — **free** against the budget. This is the number the
     /// whole plan is trying to grow.
     pub not_modified: u64,
-    /// `403`/`429` refusals carrying `x-ratelimit-remaining: 0`.
+    /// Rate refusals ([`is_rate_limited_refusal`]): a `429`, or a `403` with
+    /// `x-ratelimit-remaining: 0` or `Retry-After`.
     pub rate_limited: u64,
     /// Requests that never produced a response (DNS, TLS, timeout). Counted
     /// apart from `charged` because they say nothing about the budget.
@@ -803,6 +853,9 @@ pub struct Registry {
     logins: HashMap<CredentialKey, String>,
     /// When a login lookup last FAILED, per credential (unix seconds).
     login_failures: HashMap<CredentialKey, i64>,
+    /// Per credential, the time before which background spend must not ask
+    /// again — set by a rate refusal's `Retry-After` (unix seconds).
+    not_before: HashMap<CredentialKey, i64>,
     rows: HashMap<RowKey, RowCounts>,
     templates_dropped: u64,
     calls_dropped: u64,
@@ -839,6 +892,23 @@ impl Registry {
         obs: RateLimitObservation,
         now_unix: i64,
     ) {
+        self.record_with_retry_after(consumer, url, cache_mode, status, obs, None, now_unix);
+    }
+
+    /// [`Self::record`], also given the response's `Retry-After` — which is
+    /// what marks a SECONDARY-limit `403` (budget left) as a rate refusal
+    /// rather than a charged permission error ([`is_rate_limited_refusal`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_retry_after(
+        &mut self,
+        consumer: &str,
+        url: &str,
+        cache_mode: CacheMode,
+        status: u16,
+        obs: RateLimitObservation,
+        retry_after: Option<u64>,
+        now_unix: i64,
+    ) {
         // A response with no `X-RateLimit-*` family says nothing about the
         // budget. Keeping the previous reading beats overwriting a real one with
         // a row of `None`s.
@@ -847,11 +917,11 @@ impl Registry {
             self.observed_at_unix = Some(now_unix);
         }
 
-        let limited = is_rate_limited(status, &obs);
+        let limited = is_rate_limited_refusal(status, retry_after, obs.remaining);
         let mut delta = RowCounts::default();
         if limited {
-            // Refused because the bucket was already empty — it bought nothing
-            // and it cost nothing further, so it is neither charged nor free.
+            // Refused for rate (an empty bucket, or a secondary limit) — it
+            // bought nothing, so it is neither charged nor free.
             delta.rate_limited = 1;
         } else if status == 304 {
             delta.not_modified = 1;
@@ -939,6 +1009,14 @@ impl Registry {
         now_unix: i64,
         knobs: HeadroomKnobs,
     ) -> Result<(), BudgetDeferral> {
+        if let Some(&not_before_unix) = self.not_before.get(credential) {
+            if now_unix < not_before_unix {
+                return Err(BudgetDeferral {
+                    credential: credential.clone(),
+                    reason: DeferralReason::RetryAfter { not_before_unix },
+                });
+            }
+        }
         let Some(reading) = self.credentials.get(credential) else {
             return Ok(());
         };
@@ -955,13 +1033,38 @@ impl Registry {
             (Headroom::Short, Some(remaining), Some(limit), Some(reset_at_unix)) => {
                 Err(BudgetDeferral {
                     credential: credential.clone(),
-                    remaining,
-                    limit,
-                    reset_at_unix,
+                    reason: DeferralReason::ProjectedShort {
+                        remaining,
+                        limit,
+                        reset_at_unix,
+                    },
                 })
             }
             _ => Ok(()),
         }
+    }
+
+    /// GitHub refused `credential` for rate: background spend on it is
+    /// deferred until `until_unix` (the later of any two such answers wins).
+    /// Interactive callers are not affected.
+    pub fn record_not_before(&mut self, credential: &CredentialKey, until_unix: i64) {
+        if !self.not_before.contains_key(credential) && self.not_before.len() >= CREDENTIAL_KEY_CAP
+        {
+            // Full: drop the hold that ends soonest (the one most likely spent).
+            let soonest = self
+                .not_before
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = soonest {
+                self.not_before.remove(&k);
+            }
+        }
+        let slot = self
+            .not_before
+            .entry(credential.clone())
+            .or_insert(until_unix);
+        *slot = (*slot).max(until_unix);
     }
 
     /// Remember `credential`'s authenticated login.
@@ -1309,10 +1412,21 @@ pub fn record_response(
     headers: &HeaderMap,
 ) {
     let obs = parse_rate_limit(headers);
+    let retry_after = parse_retry_after(headers);
     let now = now_unix();
     if let Ok(mut reg) = registry().lock() {
         reg.record_reading(credential, &obs, now);
-        reg.record(consumer, url, cache_mode, status, obs, now);
+        reg.record_with_retry_after(consumer, url, cache_mode, status, obs, retry_after, now);
+    }
+}
+
+/// A BACKGROUND request was refused for rate and told to wait `wait_secs`:
+/// defer that credential's background spend until then, so the next tick or
+/// nudge does not re-send inside the window ([`Registry::record_not_before`]).
+pub fn record_rate_limited_refusal(credential: &CredentialKey, wait_secs: u64) {
+    if let Ok(mut reg) = registry().lock() {
+        let until = now_unix().saturating_add(i64::try_from(wait_secs).unwrap_or(i64::MAX));
+        reg.record_not_before(credential, until);
     }
 }
 
@@ -2296,7 +2410,13 @@ mod tests {
         reg.record_reading(&a, &reading(5000, 0, now + 1800), now);
         let d = reg.background_verdict(&a, now, k).expect_err("A is short");
         assert_eq!(d.credential, a);
-        assert_eq!(d.remaining, 0);
+        assert!(
+            matches!(
+                d.reason,
+                DeferralReason::ProjectedShort { remaining: 0, .. }
+            ),
+            "{d}"
+        );
         assert_eq!(reg.background_verdict(&b, now, k), Ok(()));
 
         // B's own healthy reading still sends, A's exhaustion notwithstanding.
@@ -2347,6 +2467,83 @@ mod tests {
         assert_eq!(snap.consumers[0].deferred, 1);
         let v = serde_json::to_value(&snap).expect("serializes");
         assert_eq!(v["totals"]["deferred"], 1);
+    }
+
+    /// A rate refusal's `Retry-After` holds the credential's background spend
+    /// until it passes — even with a healthy reading — and only that
+    /// credential's.
+    #[test]
+    fn a_retry_after_defers_that_credentials_background_spend_until_it_passes() {
+        let now = 1_000_000;
+        let mut reg = Registry::new();
+        let a = CredentialKey::of_token("token-a");
+        let b = CredentialKey::of_token("token-b");
+        let k = HeadroomKnobs::default();
+        reg.record_reading(&a, &reading(5000, 4900, now + 1800), now);
+
+        reg.record_not_before(&a, now + 60);
+        let d = reg
+            .background_verdict(&a, now, k)
+            .expect_err("inside Retry-After");
+        assert_eq!(
+            d.reason,
+            DeferralReason::RetryAfter {
+                not_before_unix: now + 60
+            }
+        );
+        assert!(reg.background_verdict(&a, now + 59, k).is_err());
+        assert_eq!(reg.background_verdict(&b, now, k), Ok(()), "per credential");
+        // A shorter later answer never shortens the hold.
+        reg.record_not_before(&a, now + 10);
+        assert!(reg.background_verdict(&a, now + 30, k).is_err());
+        // Past it, the (fresh, healthy) reading decides again.
+        assert_eq!(reg.background_verdict(&a, now + 60, k), Ok(()));
+    }
+
+    /// Secondary-limit refusals are metered as `rate_limited`, not `charged`;
+    /// a permission `403` (neither signal) is charged.
+    #[test]
+    fn secondary_limit_refusals_are_rate_limited_not_charged() {
+        let mut reg = Registry::new();
+        let url = "/repos/o/r/pulls/1";
+        let budget_left = obs(5000, 4000);
+        reg.record_with_retry_after(
+            "c",
+            url,
+            CacheMode::Cached,
+            429,
+            budget_left.clone(),
+            None,
+            1,
+        );
+        reg.record_with_retry_after(
+            "c",
+            url,
+            CacheMode::Cached,
+            403,
+            budget_left.clone(),
+            Some(60),
+            2,
+        );
+        let snap = reg.snapshot(TOP_CONSUMERS_N, 0.20, 3);
+        assert_eq!(snap.totals.rate_limited, 2);
+        assert_eq!(snap.totals.charged, 0);
+
+        reg.record_with_retry_after("c", url, CacheMode::Cached, 403, budget_left, None, 4);
+        let snap = reg.snapshot(TOP_CONSUMERS_N, 0.20, 5);
+        assert_eq!(snap.totals.charged, 1, "a permission 403 is charged");
+        assert_eq!(snap.totals.rate_limited, 2);
+    }
+
+    #[test]
+    fn the_rate_limit_classifier_separates_rate_from_permission() {
+        assert!(is_rate_limited_refusal(429, None, None));
+        assert!(is_rate_limited_refusal(429, None, Some(4000)));
+        assert!(is_rate_limited_refusal(403, None, Some(0)));
+        assert!(is_rate_limited_refusal(403, Some(30), Some(4000)));
+        assert!(!is_rate_limited_refusal(403, None, Some(4000)));
+        assert!(!is_rate_limited_refusal(403, None, None));
+        assert!(!is_rate_limited_refusal(404, Some(30), Some(0)));
     }
 
     #[test]

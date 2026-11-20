@@ -6,18 +6,24 @@
 //! must remember. See [`crate::github_budget`] and the plan
 //! `2026-08-30-github-rest-budget-is-structurally-oversubscribed`.
 //!
-//! Ticket SYNC — the polled reads, `fetch_actionable` and `fetch_comments` — is
-//! BACKGROUND spend (plan
+//! Spend class follows WHO is waiting (plan
 //! `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
-//! D4): each read passes [`github_budget::background_gate`] for the configured
-//! token's own bucket, and one under the headroom line is deferred — never sent,
-//! never slept on. The next poll asks again.
+//! D4):
 //!
-//! The WRITES (`add_comment`, `update_state`) are INTERACTIVE. They are one-shot
-//! write-backs of a completed task (`ticket_system::service::on_task_completed`) that
-//! nothing retries, so deferring one would drop it for good; instead they keep
-//! the shared interactive floor ([`interactive_floor`]) and the single
-//! rate-limit retry. The provider's own copy of the old floor is gone either way.
+//! - BACKGROUND — everything the serial sync loop
+//!   (`ticket_system::service::poll_and_sync`) does: the polled reads
+//!   (`fetch_actionable`, `fetch_comments`) and the loop's own mark-in-progress
+//!   write ([`TicketProvider::mark_in_progress`]). Each passes
+//!   [`github_budget::background_gate`] for the configured token's own bucket;
+//!   under the headroom line, or inside a `Retry-After` hold, it is deferred —
+//!   never sent, never slept on — so the loop never blocks on the budget.
+//! - INTERACTIVE — the completion write-backs (`add_comment` and
+//!   `update_state`, called from the spawned
+//!   `ticket_system::service::on_task_completed`). Nothing retries them, so a
+//!   deferral would drop one for good; they keep the shared interactive floor
+//!   ([`interactive_floor`]) and the single rate-limit retry.
+//!
+//! The provider's own copy of the old floor is gone either way.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -205,8 +211,10 @@ impl GitHubTicketProvider {
             ex.reset_at_unix,
             now_unix(),
         );
-        if backoff.is_some() && spend_class == SpendClass::Background {
-            // Background spend is never slept on; the next poll asks again.
+        if let (Some(wait), SpendClass::Background) = (backoff, spend_class) {
+            // Background spend is never slept on. The hold keeps the next poll
+            // from re-sending inside GitHub's window.
+            github_budget::record_rate_limited_refusal(&credential, wait);
             return Err(GhError::RateLimited {
                 status: ex.resp.status.as_u16(),
             });
@@ -282,18 +290,13 @@ impl GitHubTicketProvider {
     async fn send_write(
         &self,
         token: &str,
+        spend_class: SpendClass,
         url: &str,
         invalidates: &[String],
         request: reqwest::RequestBuilder,
     ) -> Result<TicketResponse, GhError> {
         let resp = self
-            .send_metered(
-                token,
-                SpendClass::Interactive,
-                url,
-                CacheMode::Uncacheable,
-                request,
-            )
+            .send_metered(token, spend_class, url, CacheMode::Uncacheable, request)
             .await?;
         if resp.is_success() {
             for stale in invalidates {
@@ -558,6 +561,7 @@ impl TicketProvider for GitHubTicketProvider {
         let resp = self
             .send_write(
                 &config.api_token,
+                SpendClass::Interactive,
                 &url,
                 &[Self::issue_comments_url(owner, repo, ticket_id)],
                 self.client
@@ -583,6 +587,37 @@ impl TicketProvider for GitHubTicketProvider {
         state: TicketState,
         config: &TicketProviderConfig,
     ) -> Result<(), String> {
+        // The completion write-back: INTERACTIVE (see the module docs).
+        self.update_state_as(ticket_id, state, config, SpendClass::Interactive)
+            .await
+    }
+
+    async fn mark_in_progress(
+        &self,
+        ticket_id: &str,
+        config: &TicketProviderConfig,
+    ) -> Result<(), String> {
+        // The sync loop's own write: BACKGROUND, so the serial loop never
+        // sleeps on the budget (see the module docs).
+        self.update_state_as(
+            ticket_id,
+            TicketState::InProgress,
+            config,
+            SpendClass::Background,
+        )
+        .await
+    }
+}
+
+impl GitHubTicketProvider {
+    /// [`TicketProvider::update_state`] under an explicit spend class.
+    async fn update_state_as(
+        &self,
+        ticket_id: &str,
+        state: TicketState,
+        config: &TicketProviderConfig,
+        spend_class: SpendClass,
+    ) -> Result<(), String> {
         let (owner, repo) = Self::parse_target(&config.target)?;
         let headers = self.headers(&config.api_token);
 
@@ -607,6 +642,7 @@ impl TicketProvider for GitHubTicketProvider {
             let resp = self
                 .send_write(
                     &config.api_token,
+                    spend_class,
                     &url,
                     &[
                         Self::issues_url(owner, repo, &Self::labels_query(config)),
@@ -646,7 +682,7 @@ impl TicketProvider for GitHubTicketProvider {
                 Self::issue_url(owner, repo, ticket_id),
             ];
             match self
-                .send_write(&config.api_token, &url, &invalidates, req)
+                .send_write(&config.api_token, spend_class, &url, &invalidates, req)
                 .await
             {
                 Ok(resp) if !resp.is_success() => {
@@ -676,7 +712,7 @@ impl TicketProvider for GitHubTicketProvider {
                 Self::issue_url(owner, repo, ticket_id),
             ];
             match self
-                .send_write(&config.api_token, &url, &invalidates, req)
+                .send_write(&config.api_token, spend_class, &url, &invalidates, req)
                 .await
             {
                 Ok(resp) if !resp.is_success() && resp.status.as_u16() != 404 => {
@@ -797,7 +833,13 @@ mod tests {
         let url = "http://127.0.0.1:1/probe/ticket-write";
 
         let err = provider
-            .send_write(token, url, &[], provider.client.post(url))
+            .send_write(
+                token,
+                SpendClass::Interactive,
+                url,
+                &[],
+                provider.client.post(url),
+            )
             .await
             .err()
             .expect("port 1 refuses");
@@ -805,5 +847,43 @@ mod tests {
         let row = row_for(BUDGET_CONSUMER, "/probe/ticket-write").expect("metered");
         assert_eq!(row.deferred, 0, "a write-back is never deferred");
         assert_eq!(row.transport_error, 1, "the write was sent");
+    }
+
+    /// The sync loop's mark-in-progress is BACKGROUND: under the headroom line
+    /// its label writes are deferred — never sent, never slept on — so the
+    /// serial loop is not blocked. (It still returns `Ok`: `update_state`
+    /// already reports a failed label change as a warning, not an error.)
+    #[tokio::test]
+    async fn the_sync_loops_mark_in_progress_is_deferred_not_slept_on() {
+        let token = "ticket-system-test-token-mark-in-progress";
+        github_budget::seed_reading_for_test(&CredentialKey::of_token(token), &short_window());
+        let config: TicketProviderConfig = serde_json::from_value(serde_json::json!({
+            "source": "github",
+            "apiToken": token,
+            "target": "budget-test-mip-owner/mip-repo",
+            "workflowId": "w",
+        }))
+        .expect("config parses");
+        let provider = GitHubTicketProvider::new().expect("provider builds");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            provider.mark_in_progress("7", &config),
+        )
+        .await
+        .expect("never slept on")
+        .expect("label failures are warnings");
+
+        let row = row_for(
+            BUDGET_CONSUMER,
+            "/repos/budget-test-mip-owner/mip-repo/issues/N/labels",
+        )
+        .expect("the deferral was metered");
+        assert_eq!(row.deferred, 1);
+        assert_eq!(
+            row.charged + row.transport_error + row.rate_limited,
+            0,
+            "not sent"
+        );
     }
 }
