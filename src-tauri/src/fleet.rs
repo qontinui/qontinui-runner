@@ -6941,6 +6941,12 @@ pub async fn publish_tree_state() -> Result<(), String> {
         }
     };
 
+    // The checkouts this walk skips (no `qontinui-` prefix) still get the
+    // shared-branch stale exclude-block sweep each cycle; the walk below
+    // sweeps the `qontinui-*` ones itself.
+    crate::agent_worktree::shared_branch_restore::sweep_unpublished_checkouts(&root, base.clone())
+        .await;
+
     // Walk top-level entries; only `qontinui-*` dirs with a `.git/`
     // count. Skip `.wt/` sibling worktree dirs explicitly — those are
     // agent worktrees, not the primary tree we're publishing.
