@@ -5,7 +5,7 @@
 //!
 //! - [`crate::terminal::TerminalManager`] (PTY-backed shell sessions)
 //! - [`crate::claude_session::ClaudeSession`] (Claude CLI subprocesses)
-//! - Workflow sessions (`unified_workflow_executor` + `project.sessions`)
+//! - Workflow sessions (`unified_workflow_executor` + `task_runs`)
 //!
 //! Plan §D1 makes them one [`Session`] lifecycle with a typed
 //! [`SessionKind`] discriminator. The transport for each kind lives under
@@ -69,7 +69,6 @@ pub mod coord_sync;
 pub(crate) mod coord_sync_finish_ack; // What a coord answer to the runner's `finished` PATCH proves — finish_synced is stamped only on an observed `finished` row (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 4)
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
-pub mod dual_write;
 pub mod handoff;
 pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
 pub mod in_flight; // The ONE session-scope in-flight registry — migration, resume door and respawn receiver; held by the lifecycle poll (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
@@ -1195,23 +1194,17 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Register a coord-native mirror of an **externally-owned** session
-    /// (plan §Phase 10 dual-write). Unlike [`SessionRegistry::start`],
-    /// this does NOT spawn a transport — the real PTY / CLI subprocess is
-    /// owned and torn down by the legacy `terminal_create` /
-    /// `claude_session` path. The mirror exists purely so the dashboard
-    /// renders the session from `coord.sessions` during the dual-write
-    /// window.
+    /// Register a coord-native record of an **externally-owned** session.
+    /// Unlike [`SessionRegistry::start`], this does NOT spawn a transport —
+    /// the real PTY / CLI subprocess is owned and torn down by the
+    /// `terminal_*` / `claude_session` path. The record exists purely so the
+    /// dashboard renders the session from `coord.sessions`.
     ///
     /// Validates the intent, writes a `Started` outbox row (which the
     /// drain loop pushes to coord), and inserts a record backed by the
     /// no-op [`transport::ExternalTransport`]. Closing the mirror (by id)
     /// records a `Closed` event but never touches the operator's real
     /// terminal.
-    ///
-    /// Called only when the cutover flag is ON (see
-    /// [`coord_sync::CoordSync::mirror_legacy_session`]); with the flag
-    /// off this is never reached.
     pub fn register_external(self: &Arc<Self>, intent: Intent) -> Result<Uuid, SessionError> {
         self.register_external_with_lineage(intent, None, None)
     }

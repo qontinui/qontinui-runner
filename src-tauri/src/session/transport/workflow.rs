@@ -5,12 +5,11 @@
 //! durable record). The Session primitive's responsibility for workflow
 //! kinds is bookkeeping — register a `coord.sessions` row and an outbox
 //! entry that the executor can link by `task_run_id`. The actual workflow
-//! execution lifecycle stays in `unified_workflow_executor` for Phase 2;
-//! Phase 9 collapses the legacy session tables (`project.sessions`,
-//! `project.{agent,ai,automation,task_run,workflow_ai}_sessions`) into
-//! `coord.sessions` with a `session_kind` discriminator.
+//! execution lifecycle stays in `unified_workflow_executor`, whose durable
+//! records are `task_runs` and `project.workflow_ai_sessions` (agentic-phase
+//! restart resume); no fold of those tables into `coord.sessions` is planned.
 //!
-//! Until Phase 9, [`WorkflowTransport::start`] materializes a placeholder
+//! [`WorkflowTransport::start`] materializes a placeholder
 //! task-run id; the executor links its real id via
 //! [`crate::session::SessionRegistry::link_task_run`] once it allocates
 //! one.

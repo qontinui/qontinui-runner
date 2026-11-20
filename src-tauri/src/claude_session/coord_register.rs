@@ -54,10 +54,9 @@
 //! ## Gating (P0.3)
 //!
 //! Registration is gated on `QONTINUI_SESSION_AUTOMATION_REGISTER` (default
-//! **ON**) — **independent** of the dormant per-tenant
-//! `session_coordination_enabled` dual-write burn-in. Coupling the automation
-//! foundation to that unrelated rollout knob would make Phase 0 inert in prod
-//! (the flag is dormant). Setting the env to `0`/`false`/`off` disables
+//! **ON**) — its own kill switch, coupled to no per-tenant rollout flag (the
+//! Phase-10 cutover flag it was once contrasted with was deleted as never
+//! wired). Setting the env to `0`/`false`/`off` disables
 //! registration cleanly (a kill switch); the AI session itself is never
 //! affected — every coord write here is best-effort and swallows errors.
 
