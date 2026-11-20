@@ -36,10 +36,13 @@
 //!    Past the authority: more than one `claude` (a nested one would not
 //!    leave with `/exit`), or a `claude` with child processes attached →
 //!    `Refused`. A direct child the caller's [`ChildExemptions`] admits is not
-//!    counted: today only a [`ChildExemption::ProvenStray`] the close recorded,
+//!    counted: a [`ChildExemption::ProvenStray`] the close recorded,
 //!    re-proven stray at this probe (`stray_wait::reprove_strays`: same pid,
-//!    start ticks and argv, and a fresh verdict of the same class). It fails
-//!    closed, and the refusal names any child it left out (plan
+//!    start ticks and argv, and a fresh verdict of the same class), and a
+//!    [`ChildExemption::ShimOrPump`] child `classify_child` proves to be the
+//!    session's own MCP shim at this probe (plan
+//!    `2026-11-04-runner-finished-close-closes-nothing-on-any-box`, Phase 2b;
+//!    only the `finished_close` arm asks for it). It fails closed, and the refusal names any child it left out (plan
 //!    `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`).
 //!    Only the FIRST probe applies exemptions; it is the one whose child count
 //!    this gate reads.
@@ -1149,10 +1152,16 @@ impl PaneLook {
         }
         // A registry that cannot settle the pane leaves no children to ask
         // about; the probe below then reads `Unreadable` whatever is admitted.
-        let children = subtree_claude_pids(root_pid, &self.snapshot, &self.registry, &self.roots)
+        let claude_pids =
+            subtree_claude_pids(root_pid, &self.snapshot, &self.registry, &self.roots);
+        let top_claude = claude_pids
+            .as_ref()
+            .ok()
+            .and_then(|pids| pids.first().copied());
+        let children = claude_pids
             .map(|pids| top_claude_children(&pids, &self.snapshot))
             .unwrap_or_default();
-        let admitted = exempt.admitted(&children).await;
+        let admitted = exempt.admitted(top_claude, &children).await;
         probe_within(
             root_pid,
             &self.snapshot,
@@ -1502,9 +1511,17 @@ fn top_claude_children(claude_pids: &[u32], snapshot: &ProcessSnapshot) -> Vec<u
 /// is a claim, not an admission.
 ///
 /// Plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box` Phase 2b
-/// adds its shim / pump class here, beside the stray.
+/// put its shim / pump class here, beside the stray.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildExemption {
+    /// A child `session_lifecycle::classify_child` positively identifies as the
+    /// session's own MCP shim or message pump (served `finished-criteria`
+    /// condition 2, v11). Carries no pid: the class is re-judged AT the probe,
+    /// from two fresh process tables and the raw command lines of the child's
+    /// whole subtree ([`crate::session::classify_finished::shim_children`]),
+    /// so what is admitted is what is there now, never what an earlier census
+    /// saw. Anything the judgement cannot read is counted.
+    ShimOrPump,
     /// A stray wait loop the close recorded on its own pass
     /// ([`crate::session::stray_wait::record_strays`]). Admitted only while
     /// [`crate::session::stray_wait::reprove_strays`] keeps it.
@@ -1570,6 +1587,15 @@ impl ChildExemptions {
         Self(exemptions)
     }
 
+    /// This policy with the [`ChildExemption::ShimOrPump`] class added: the
+    /// children `classify_child` proves to be the session's own MCP shim.
+    pub fn with_shim_or_pump(mut self) -> Self {
+        if !self.0.contains(&ChildExemption::ShimOrPump) {
+            self.0.push(ChildExemption::ShimOrPump);
+        }
+        self
+    }
+
     /// One [`ChildExemption::ProvenStray`] per recorded stray.
     pub fn from_strays(strays: Vec<crate::session::stray_wait::RecordedStray>) -> Self {
         Self(
@@ -1580,16 +1606,27 @@ impl ChildExemptions {
         )
     }
 
-    /// Of `children` (the top-level `claude`'s direct children), the pids an
-    /// exemption admits NOW. A `ProvenStray` is re-proven only when its pid is
-    /// among `children`, and admitted only when the re-proof keeps it, so
+    /// Of `children` (the direct children of the top-level `claude`,
+    /// `top_claude`), the pids an exemption admits NOW. A `ProvenStray` is
+    /// re-proven only when its pid is among `children`, and admitted only when
+    /// the re-proof keeps it; a `ShimOrPump` is judged afresh for `top_claude`
+    /// and admits only a child whose whole subtree matched a measured chain. So
     /// anything unprovable (an unreadable table, a reused pid, a changed argv,
-    /// a re-proof past its budget, a non-Linux host) is counted.
-    pub async fn admitted(&self, children: &[u32]) -> BTreeSet<u32> {
+    /// a re-proof past its budget, a non-Linux host, no top-level `claude`) is
+    /// counted.
+    pub async fn admitted(&self, top_claude: Option<u32>, children: &[u32]) -> BTreeSet<u32> {
         let mut admitted = BTreeSet::new();
         let mut strays = Vec::new();
         for exemption in &self.0 {
             match exemption {
+                ChildExemption::ShimOrPump => {
+                    if let Some(claude) = top_claude {
+                        admitted.extend(
+                            crate::session::classify_finished::shim_children(claude, children)
+                                .await,
+                        );
+                    }
+                }
                 ChildExemption::ProvenStray(stray) => {
                     if children.contains(&stray.pid) {
                         strays.push(stray.clone());
@@ -2160,7 +2197,7 @@ pub(crate) mod fake_process_table {
                     BTreeSet::new()
                 } else {
                     exempt
-                        .admitted(children.as_deref().unwrap_or_default())
+                        .admitted(None, children.as_deref().unwrap_or_default())
                         .await
                 };
                 let tracked_alive = tracked
@@ -2923,8 +2960,8 @@ mod tests {
             ChildExemption::AdmitForTest(210),
             ChildExemption::AdmitForTest(999),
         ]);
-        assert_eq!(exempt.admitted(&[210, 211]).await, set(&[210]));
-        assert!(ChildExemptions::none().admitted(&[210]).await.is_empty());
+        assert_eq!(exempt.admitted(None, &[210, 211]).await, set(&[210]));
+        assert!(ChildExemptions::none().admitted(None, &[210]).await.is_empty());
         assert!(ChildExemptions::none().is_empty());
         // A recorded stray whose pid is not among the children is not
         // admitted. (This pid could not re-prove either; the live twin in
@@ -2941,8 +2978,25 @@ mod tests {
             strays,
             ChildExemptions(vec![ChildExemption::ProvenStray(stray)])
         );
-        assert!(strays.admitted(&[210, 211]).await.is_empty());
+        assert!(strays.admitted(None, &[210, 211]).await.is_empty());
         assert!(ChildExemptions::from_strays(Vec::new()).is_empty());
+    }
+
+    /// Phase 2b: the shim class is a policy, not a pid — it admits nothing it is
+    /// not asked about, and nothing at all when there is no top-level `claude`
+    /// to judge, or no real process behind the pid.
+    #[tokio::test]
+    async fn the_shim_class_admits_nothing_it_cannot_judge() {
+        let shim = ChildExemptions::none().with_shim_or_pump();
+        assert!(!shim.is_empty());
+        assert_eq!(shim, ChildExemptions(vec![ChildExemption::ShimOrPump]));
+        assert_eq!(shim.clone().with_shim_or_pump(), shim, "added once");
+        assert!(shim.admitted(None, &[210, 211]).await.is_empty());
+        assert!(shim.admitted(Some(4_000_000_005), &[210]).await.is_empty());
+        // It composes with the other classes.
+        let mixed = ChildExemptions::for_test(vec![ChildExemption::AdmitForTest(210)])
+            .with_shim_or_pump();
+        assert_eq!(mixed.admitted(None, &[210, 211]).await, set(&[210]));
     }
 
     /// A probe over the PURE exempting probe: the first call reads `first`

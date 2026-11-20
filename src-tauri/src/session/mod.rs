@@ -58,7 +58,7 @@
 
 pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
 pub mod census; // Machine-wide live Claude session census → POST /coord/session-census/:device_id (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account, Phases 2+4)
-pub mod classify_child_shadow; // `classify_child` in SHADOW beside the finished_close census: logs would-admit/refuse, decides nothing (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a)
+pub mod classify_finished; // `classify_child` ARMED for the finished_close arm: the census replaces the 60 s boot-window rule with it and the close exempts a proven shim (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2b)
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
