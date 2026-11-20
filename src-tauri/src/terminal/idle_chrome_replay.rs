@@ -45,7 +45,7 @@ pub(crate) fn replay(bytes: &[u8], cols: u16, rows: u16) -> ScreenText {
 }
 
 /// Every check the wind-down closer makes on a pane's screen, as one verdict:
-/// the idle predicate (what wind-down's `grid_busy` reads), the dialog guard,
+/// the idle predicate (reported as wind-down's `idleEvidence`), the dialog guard,
 /// and the `/exit` input-box check (cursor at the input start, nothing typed;
 /// a DIM prompt suggestion counts as nothing typed).
 fn verdict(screen: &ScreenText) -> Result<(), String> {

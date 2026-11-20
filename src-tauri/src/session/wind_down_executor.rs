@@ -104,19 +104,21 @@
 //!
 //! ## Hazard 1: the grace window is WALL-CLOCK
 //!
-//! Every clock the verdict folds is wall-clock: the sideband's `set_at_ms`, the
-//! grid tracker's `observed_at_ms` (`chrono::Utc::now()` at
-//! `terminal/session.rs`), coord's `finished_at`, and `eligibility`'s own
-//! `now_ms`. A forward step of ≥ grace — an NTP correction, a laptop resume —
-//! therefore promotes a pane to `Eligible` without it having been idle that
-//! long; a backward step freezes the tracker. Phase 1 could tolerate this
-//! because it only reported.
+//! Every clock the verdict folds is wall-clock: the transcript's last message
+//! time (stamped by Claude Code, another process), the sideband's
+//! `set_at_ms`, the screen-quiet floor's `observed_at_ms`
+//! (`chrono::Utc::now()` in `TerminalSession::observe_screen_quiet`), coord's
+//! `finished_at`, and `eligibility`'s own `now_ms`. A forward step of ≥ grace
+//! — an NTP correction, a laptop resume — therefore inflates every one of
+//! those ages at once and promotes a pane to `Eligible` without it having been
+//! idle that long; a backward step freezes the floor. Phase 1 could tolerate
+//! this because it only reported.
 //!
 //! **Chosen: DETECT AND REJECT, not a monotonic interval.** A monotonic grace
 //! interval is not available here, because two of the three clocks the window
 //! is built from are not ours to convert — coord's `finished_at` arrives as a
-//! wall-clock instant over the wire, and a pane's idle window is carried across
-//! observations as wall-clock millis. Re-basing them on `Instant` would mean
+//! wall-clock instant over the wire, and a pane's screen-quiet floor is carried
+//! across observations as wall-clock millis. Re-basing them on `Instant` would mean
 //! re-deriving instants we never measured. So the executor measures the SKEW
 //! instead ([`ClockJumpGuard`]): each tick it compares the monotonic elapsed
 //! time against the wall-clock delta, and a disagreement past
@@ -307,15 +309,20 @@ impl ClockJumpGuard {
     /// other than the shipped [`CLOCK_SKEW_TOLERANCE`].
     ///
     /// The FIRST call establishes the reference and is trustworthy, for two
-    /// separate reasons — one per clock the window is built from:
+    /// separate reasons:
     ///
-    /// * the grid-idle window is carried on a per-`TerminalSession`
-    ///   `GridIdleTracker`, and this process created every `TerminalSession` it
-    ///   can see, so that window cannot predate the process;
-    /// * coord's `finished_at` DOES routinely predate the process, arriving
-    ///   over the wire — but it only ever `.max()`es `since_ms` in
-    ///   `wind_down::eligibility`, so it can move a session towards `NotYet`
-    ///   and never towards `Eligible`. A stale one cannot authorise a close.
+    /// * the window's FLOOR is the screen-quiet time carried on a
+    ///   per-`TerminalSession` `ScreenQuietTracker`, which starts at that
+    ///   tracker's first observation; this process created every
+    ///   `TerminalSession` it can see (a handoff-adopted pane included), so the
+    ///   window cannot predate the process — a full grace must pass under this
+    ///   process's own clock before anything is eligible;
+    /// * every other clock — the transcript's last message, coord's
+    ///   `finished_at`, the sideband report — DOES routinely predate the
+    ///   process, but each only `.max()`es `since_ms` in
+    ///   `wind_down::eligibility` above that floor, so it can move a session
+    ///   towards `NotYet` and never towards `Eligible`. A stale one cannot
+    ///   authorise a close.
     ///
     /// Both of those need the guard to live for the PROCESS ([`clock_guard`]),
     /// not for one run of the loop: a per-run guard would drop a live
@@ -922,7 +929,14 @@ async fn save_stopped_by_drain(set: StoppedByDrain) {
 async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
     use tauri::Manager;
 
-    let fresh = wind_down_observer::fresh_pass(app, grace).await;
+    let fresh = wind_down_observer::fresh_pass(
+        app,
+        grace,
+        crate::session::claude_activity::RecordDepth::WindDown,
+        wind_down_observer::RecordReadLane::Executor,
+        None,
+    )
+    .await;
     let Some(pass) = fresh.pass.as_ref() else {
         debug!(
             unknowns = ?fresh.unknowns,
@@ -1215,7 +1229,14 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
     }
 
     async fn census(&self) -> Option<LiveCensus> {
-        let fresh = wind_down_observer::fresh_pass(self.app, self.grace).await;
+        let fresh = wind_down_observer::fresh_pass(
+            self.app,
+            self.grace,
+            crate::session::claude_activity::RecordDepth::WindDown,
+            wind_down_observer::RecordReadLane::Executor,
+            None,
+        )
+        .await;
         // Incomplete — no table, or a process the session registry could not
         // settle — is no census: the arm closes nothing on it.
         if !fresh.unknowns.is_empty() {
@@ -2418,6 +2439,7 @@ mod tests {
                 since: None,
                 until: None,
                 reason: None,
+                idle_evidence: None,
                 kind: SessionKind::Terminal,
                 custody: None,
             }),
@@ -2469,6 +2491,7 @@ mod tests {
             since: Some(1),
             until: None,
             reason: None,
+            idle_evidence: None,
             kind: SessionKind::Terminal,
             custody: None,
         };
@@ -2477,6 +2500,7 @@ mod tests {
             since: Some(1),
             until: Some(2),
             reason: None,
+            idle_evidence: None,
             kind: SessionKind::Terminal,
             custody: None,
         };
@@ -2630,6 +2654,7 @@ mod tests {
             since: Some(1),
             until: None,
             reason: None,
+            idle_evidence: None,
             kind: SessionKind::Terminal,
             custody: None,
         }
@@ -3581,9 +3606,17 @@ mod tests {
     // the verdict a candidate must carry before `graceful_exit` is called.
 
     use qontinui_runner_lib::wind_down::{
-        eligibility, Eligibility, EligibilityInputs, GridIdle, IneligibleReason, Sideband,
-        SidebandState, WorkStatus,
+        eligibility, Eligibility, EligibilityInputs, GridIdle, IneligibleReason, PromptScreen,
+        RecordStatus, SessionRecord, Sideband, SidebandState, WorkStatus,
     };
+
+    /// Claude Code's record says `idle`, last message at `at_ms`.
+    fn idle_record(at_ms: i64) -> SessionRecord {
+        SessionRecord {
+            status: RecordStatus::Idle,
+            last_message_ms: Some(at_ms),
+        }
+    }
 
     const GRACE: Duration = Duration::from_secs(600);
     const GRACE_MS: i64 = 600_000;
@@ -3605,6 +3638,10 @@ mod tests {
             grid: GridIdle::Idle {
                 since_ms: idle_since,
             },
+            prompt: PromptScreen::Ready,
+            screen_quiet_since_ms: Some(idle_since),
+            last_input_at_ms: None,
+            record: idle_record(idle_since),
             has_live_children: Some(false),
             finished_at_ms: None,
             grace: GRACE,
@@ -3653,6 +3690,10 @@ mod tests {
                 work_status,
                 sideband: Sideband::NeverReported,
                 grid: GridIdle::Idle { since_ms: 0 },
+                prompt: PromptScreen::Ready,
+                screen_quiet_since_ms: Some(0),
+                last_input_at_ms: None,
+                record: idle_record(0),
                 has_live_children: Some(false),
                 finished_at_ms: None,
                 grace: GRACE,
@@ -3669,6 +3710,10 @@ mod tests {
                 work_status: WorkStatus::Unknown,
                 sideband: Sideband::NeverReported,
                 grid: GridIdle::Idle { since_ms: 0 },
+                prompt: PromptScreen::Ready,
+                screen_quiet_since_ms: Some(0),
+                last_input_at_ms: None,
+                record: idle_record(0),
                 has_live_children: Some(false),
                 finished_at_ms: None,
                 grace: GRACE,
@@ -3695,6 +3740,10 @@ mod tests {
             work_status: WorkStatus::Finished,
             sideband: Sideband::NeverReported,
             grid: GridIdle::Idle { since_ms: 0 },
+            prompt: PromptScreen::Ready,
+            screen_quiet_since_ms: Some(0),
+            last_input_at_ms: None,
+            record: idle_record(0),
             has_live_children: Some(false),
             finished_at_ms: None,
             grace: GRACE,
@@ -3707,6 +3756,7 @@ mod tests {
         proc.wind_down = Some(wind_down::WindDownView::from_verdict(
             &eligibility(inputs, now_ms),
             inputs.kind,
+            inputs.grid,
         ));
         proc
     }
@@ -3732,6 +3782,7 @@ mod tests {
             since: Some(1),
             until: None,
             reason: None,
+            idle_evidence: None,
             kind: SessionKind::Looping,
             custody: None,
         };
@@ -3813,10 +3864,71 @@ mod tests {
                 },
                 past_grace,
             ),
+            // Since plan
+            // 2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner
+            // (D3) Claude Code's own record, not the grid heuristic, says
+            // whether the session is working; the screen only vetoes.
             (
-                "busy grid",
+                "record busy",
                 EligibilityInputs {
-                    grid: GridIdle::Busy,
+                    record: SessionRecord {
+                        status: RecordStatus::Busy,
+                        last_message_ms: Some(0),
+                    },
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "record waiting",
+                EligibilityInputs {
+                    record: SessionRecord {
+                        status: RecordStatus::Waiting,
+                        last_message_ms: Some(0),
+                    },
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "record shell",
+                EligibilityInputs {
+                    record: SessionRecord {
+                        status: RecordStatus::Shell,
+                        last_message_ms: Some(0),
+                    },
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "record unknown",
+                EligibilityInputs {
+                    record: SessionRecord::UNKNOWN,
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "draft or dialog on screen",
+                EligibilityInputs {
+                    prompt: PromptScreen::NotReady,
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "screen changed inside grace",
+                EligibilityInputs {
+                    screen_quiet_since_ms: Some(1),
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "input written inside grace",
+                EligibilityInputs {
+                    last_input_at_ms: Some(1),
                     ..finished_idle()
                 },
                 past_grace,

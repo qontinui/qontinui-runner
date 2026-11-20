@@ -282,7 +282,7 @@ pub fn idle_past_grace(grid: GridIdle, now_ms: i64, grace: Duration) -> bool {
         GridIdle::Idle { since_ms } => {
             now_ms.saturating_sub(since_ms) >= i64::try_from(grace.as_millis()).unwrap_or(i64::MAX)
         }
-        GridIdle::Busy | GridIdle::Unknown => false,
+        GridIdle::Busy { .. } | GridIdle::Unknown => false,
     }
 }
 
@@ -784,7 +784,17 @@ mod tests {
             RelayDecision::Hold(_)
         ));
         assert!(matches!(
-            decide(GridIdle::Busy, NR, NOW, GRACE, &done),
+            decide(
+                GridIdle::Busy {
+                    evidence: wind_down::GridBusyEvidence::Screen(
+                        qontinui_runner_lib::looping_agent::idle::IdleVeto::NoPrompt
+                    ),
+                },
+                NR,
+                NOW,
+                GRACE,
+                &done
+            ),
             RelayDecision::Hold(_)
         ));
         assert!(matches!(

@@ -94,61 +94,142 @@ pub const PROMPT_MARKER: char = '❯';
 /// 1. NO processing-indicator text anywhere on screen
 ///    ([`PROCESSING_INDICATORS`]).
 /// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted), save on
-///    the static completed-turn line ([`is_completed_turn_line`]).
+///    ONE line: the static completed-turn line ([`is_completed_turn_line`])
+///    of the turn that just ended — the LAST glyph-bearing line on screen,
+///    sitting directly above the input row with only what Claude Code puts
+///    there in between ([`is_turn_to_input_gap`]).
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible; the
 ///    bottom-most such row is the input box.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
+///
+/// There is NO draft or dialog check here. A caller that TYPES must also pass
+/// `terminal::graceful_exit`'s `exit_prompt_ready` / `input_prompt_ready` on
+/// the screen it is about to type into.
 pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
-    idle_veto(lines, cursor_row).is_none()
+    idle_verdict(lines, cursor_row).is_none()
 }
 
 /// Which of [`snapshot_looks_idle`]'s checks vetoes idle on this snapshot, as
 /// a short human-readable reason; `None` exactly when the snapshot looks idle.
 /// The same checks in the same order — the diagnostic for a pane that keeps
-/// reading busy (restart-prep's told-but-busy log line, #2569, reads it).
+/// reading busy (restart-prep's told-but-busy log line, #2569, reads it). It
+/// is [`IdleVeto::describe`] over [`idle_verdict`], so the two cannot drift.
 pub fn idle_veto(lines: &[String], cursor_row: u16) -> Option<String> {
+    idle_verdict(lines, cursor_row).map(|veto| veto.describe(lines))
+}
+
+/// Which check of [`snapshot_looks_idle`] vetoed idle — the ONE typed veto.
+/// [`idle_veto`] renders it for a log line; [`IdleVeto::wire`] renders it,
+/// as constants only, for `GET /restart-readiness`'s `windDown.idleEvidence`
+/// (plan `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+/// D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleVeto {
+    /// (1) A [`PROCESSING_INDICATORS`] constant on `row`.
+    Indicator { indicator: &'static str, row: usize },
+    /// (2) A spinner glyph on `row`, outside the exempt completed-turn line.
+    Glyph { glyph: char, row: usize },
+    /// (3) No `❯` prompt row on screen.
+    NoPrompt,
+    /// (4) The cursor above the input box's `❯` row.
+    CursorAbovePrompt { cursor_row: u16, prompt_row: usize },
+}
+
+impl IdleVeto {
+    /// The wire value: `indicator:<constant>`, `glyph:<char>`, `no_prompt` or
+    /// `cursor_above_prompt`. Constants only — never screen text, because
+    /// panes carry session content and this reaches an HTTP response.
+    pub fn wire(self) -> String {
+        match self {
+            Self::Indicator { indicator, .. } => format!("indicator:{indicator}"),
+            Self::Glyph { glyph, .. } => format!("glyph:{glyph}"),
+            Self::NoPrompt => "no_prompt".to_string(),
+            Self::CursorAbovePrompt { .. } => "cursor_above_prompt".to_string(),
+        }
+    }
+
+    /// The human-readable reason, naming the row (and, for a glyph, quoting
+    /// the line) — for a local log line, never a wire field.
+    pub fn describe(self, lines: &[String]) -> String {
+        match self {
+            Self::Indicator { indicator, row } => {
+                format!("processing indicator `{indicator}` on row {row}")
+            }
+            Self::Glyph { glyph, row } => format!(
+                "spinner glyph `{glyph}` on row {row}: {}",
+                lines.get(row).map_or("", |l| l.trim())
+            ),
+            Self::NoPrompt => "no `❯` prompt row on screen".to_string(),
+            Self::CursorAbovePrompt {
+                cursor_row,
+                prompt_row,
+            } => format!("cursor on row {cursor_row}, above the `❯` prompt row {prompt_row}"),
+        }
+    }
+}
+
+/// The typed core of [`snapshot_looks_idle`]: `None` when the snapshot looks
+/// idle, else the FIRST check that vetoed it, in the order listed there.
+pub fn idle_verdict(lines: &[String], cursor_row: u16) -> Option<IdleVeto> {
     // (1) any processing-indicator text ⇒ busy.
     for (row, line) in lines.iter().enumerate() {
         let lower = line.to_ascii_lowercase();
-        if let Some(ind) = PROCESSING_INDICATORS
+        if let Some(indicator) = PROCESSING_INDICATORS
             .iter()
             .find(|ind| indicator_outside_clear_hint(&lower, ind))
         {
-            return Some(format!("processing indicator `{ind}` on row {row}"));
+            return Some(IdleVeto::Indicator { indicator, row });
         }
     }
+
+    // The BOTTOM-most `❯` row is the input box (as `snapshot_shows_dialog`
+    // reads it): an earlier one is transcript — a `❯ <your message>` echo in
+    // scrollback — and taking it would make (4) pass for a cursor up in
+    // streaming output.
+    let prompt_row = lines.iter().rposition(|l| l.contains(PROMPT_MARKER));
 
     // (2) spinner glyphs (excluding bare `·`) ⇒ busy — except on the static
-    // completed-turn line Claude Code leaves under a finished turn.
-    for (row, line) in lines.iter().enumerate() {
-        if is_completed_turn_line(line) {
-            continue;
-        }
-        if let Some(ch) = line
-            .chars()
-            .find(|ch| *ch != '·' && SPINNER_GLYPHS.contains(ch))
-        {
-            return Some(format!(
-                "spinner glyph `{ch}` on row {row}: {}",
-                line.trim()
-            ));
-        }
+    // completed-turn line of the turn that just ended: the LAST glyph line,
+    // whose first `❯` row below is the input box, with only the rows
+    // `is_turn_to_input_gap` admits in between. A completed-turn line
+    // anywhere else (an earlier turn's, or one with output or a live spinner
+    // under it) keeps its veto: fail closed.
+    let glyph_rows: Vec<(usize, char)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| {
+            line.chars()
+                .find(|ch| *ch != '·' && SPINNER_GLYPHS.contains(ch))
+                .map(|glyph| (row, glyph))
+        })
+        .collect();
+    let exempt = |row: usize| {
+        glyph_rows.last().is_some_and(|&(last, _)| last == row)
+            && is_completed_turn_line(&lines[row])
+            && lines
+                .get(row + 1..)
+                .and_then(|below| below.iter().position(|l| l.contains(PROMPT_MARKER)))
+                .is_some_and(|gap| {
+                    Some(row + 1 + gap) == prompt_row
+                        && is_turn_to_input_gap(&lines[row + 1..row + 1 + gap])
+                })
+    };
+    if let Some(&(row, glyph)) = glyph_rows.iter().find(|(row, _)| !exempt(*row)) {
+        return Some(IdleVeto::Glyph { glyph, row });
     }
 
-    // (3) prompt marker visible — remember its row for (4). The BOTTOM-most
-    // `❯` row is the input box (as `snapshot_shows_dialog` reads it): an
-    // earlier one is transcript — a `❯ <your message>` echo in scrollback —
-    // and taking it would make (4) pass for a cursor up in streaming output.
-    // Bottom-most is never below the top-most, so this only ever vetoes more.
-    let Some(prompt_row) = lines.iter().rposition(|l| l.contains(PROMPT_MARKER)) else {
+    // (3) prompt marker visible — its row is (4)'s anchor.
+    let Some(prompt_row) = prompt_row else {
         // No visible input prompt ⇒ can't confirm ready-for-input ⇒ not idle.
-        return Some("no `❯` prompt row on screen".to_string());
+        return Some(IdleVeto::NoPrompt);
     };
 
     // (4) cursor in the input area (at/below the prompt row).
-    ((cursor_row as usize) < prompt_row)
-        .then(|| format!("cursor on row {cursor_row}, above the `❯` prompt row {prompt_row}"))
+    ((cursor_row as usize) < prompt_row).then_some(IdleVeto::CursorAbovePrompt {
+        cursor_row,
+        prompt_row,
+    })
 }
 
 /// Is `line` the static line Claude Code leaves on screen once a turn has
@@ -275,6 +356,124 @@ fn is_duration_token(w: &str) -> bool {
         }
     }
     saw_unit && digits == 0
+}
+
+/// Do `rows` — everything between a completed-turn line and the input row
+/// below it — hold only what Claude Code puts there after a turn ends?
+/// Fail closed: any other row, or a recap block that does not close, means
+/// the glyph stays busy.
+///
+/// Measured over the census's 44 finished panes (Claude Code 2.1.309, plan
+/// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`
+/// census): blank rows; the `/clear to save …` context hint (often with an
+/// update notice); the input box's top edge, which carries the session's
+/// name (`──── my-session ─`); and, on some panes, a `※ recap: …`
+/// paragraph between the turn line and the hint, usually closed by a
+/// `(… /config)` hint (not always). With this rule 40 of the census's
+/// 44 finished panes read idle (plan Phase 0). Inside an open recap its
+/// prose rows are admitted, but never a row that starts a transcript item;
+/// after a closed recap, only blank, hint and edge rows. Any other row means
+/// the turn line is not the one that just ended, and the glyph stays busy.
+fn is_turn_to_input_gap(rows: &[String]) -> bool {
+    #[derive(PartialEq)]
+    enum Recap {
+        None,
+        Open,
+        Closed,
+    }
+    let mut recap = Recap::None;
+    rows.iter().all(|row| {
+        let trimmed = row.trim();
+        if trimmed.is_empty() || is_box_edge_row(trimmed) || is_context_hint_row(trimmed) {
+            return true;
+        }
+        match recap {
+            // Before any recap only a recap may start; after a CLOSED one,
+            // nothing but blank, hint and edge rows.
+            Recap::None if trimmed.starts_with('※') => {
+                recap = if closes_recap(trimmed) {
+                    Recap::Closed
+                } else {
+                    Recap::Open
+                };
+                true
+            }
+            Recap::None | Recap::Closed => false,
+            // Inside an open recap its prose is admitted — but never a row
+            // that opens a transcript item, which is what text that is not
+            // recap prose looks like on this screen.
+            Recap::Open => {
+                if starts_transcript_item(trimmed) {
+                    return false;
+                }
+                if closes_recap(trimmed) {
+                    recap = Recap::Closed;
+                }
+                true
+            }
+        }
+    })
+}
+
+/// The leading glyphs of a transcript item: the assistant bullet in both its
+/// renderings (`●`, and `⏺` — see `terminal/transport_cost.rs`), the
+/// tool-result elbow, an echoed prompt, and the todo-list checkboxes.
+const TRANSCRIPT_ITEM_GLYPHS: &[char] = &['●', '⏺', '⎿', PROMPT_MARKER, '☐', '☒', '✔', '✓'];
+
+/// A row that begins a transcript item rather than continuing prose: one of
+/// [`TRANSCRIPT_ITEM_GLYPHS`], or a spinner.
+fn starts_transcript_item(trimmed: &str) -> bool {
+    trimmed.starts_with(TRANSCRIPT_ITEM_GLYPHS)
+        || trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c != '·' && SPINNER_GLYPHS.contains(&c))
+}
+
+/// The last row of a `※ recap` block: it ends with the parenthesised
+/// `/command` hint the block closes with — `… (disable recaps in /config)` —
+/// which on a narrow pane can wrap so that only its tail, `… /config)`, sits
+/// on this row. Matched by that shape (a `/word` closing the parenthesis), as
+/// the census measured it, not by the words inside.
+fn closes_recap(trimmed: &str) -> bool {
+    let Some(body) = trimmed.strip_suffix(')') else {
+        return false;
+    };
+    body.rsplit_once('/')
+        .is_some_and(|(_, word)| !word.is_empty() && word.chars().all(char::is_alphanumeric))
+}
+
+/// The context hint row. Recognised by its START — `new task?` and a
+/// `/clear` — not by the full `/clear to save` text: on a narrow pane the row
+/// is cut short with `…`, so the full phrase is
+/// not there to match.
+fn is_context_hint_row(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("new task?") && lower.contains("/clear")
+}
+
+/// The input box's border row, titled or not: it starts with a box-drawing
+/// corner or rule.
+fn is_box_edge_row(trimmed: &str) -> bool {
+    trimmed.starts_with(['─', '━', '╭', '╰'])
+}
+
+/// A fingerprint of what the screen shows, for the wind-down grace clock's
+/// per-process floor (`wind_down::ScreenQuietTracker`): every row's text and
+/// the cursor position, EXCEPT the context-hint row, whose update notice
+/// (`Auto-updating…` → `✔ Update installed`) changes on a pane nobody is
+/// using. Content, not the grid generation, so a status line redrawn
+/// unchanged leaves it alone. Only ever compared within one process.
+pub fn screen_fingerprint(lines: &[String], cursor_row: u16, cursor_col: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (row, line) in lines.iter().enumerate() {
+        if !is_context_hint_row(line.trim()) {
+            (row, line).hash(&mut hasher);
+        }
+    }
+    (cursor_row, cursor_col).hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Key hints Claude Code prints beneath a dialog's choices — its own CHROME,
@@ -924,6 +1123,357 @@ mod tests {
             snapshot_shows_dialog(&grid),
             Some("selected numbered choice on a `❯` row")
         );
+    }
+
+    /// [`idle_verdict`] as its wire value, so a test names the clause.
+    fn verdict(grid: &[String], cursor_row: u16) -> Option<String> {
+        idle_verdict(grid, cursor_row).map(IdleVeto::wire)
+    }
+
+    /// Rows the shape check `def4c43e8` once exempted, and that
+    /// `is_completed_turn_line` does not: work that is still running after the
+    /// turn's summary (plan
+    /// `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
+    /// discovered edge). Each must keep its glyph's veto.
+    #[test]
+    fn a_summary_shaped_row_with_work_still_running_vetoes_idle() {
+        for row in [
+            "✻ Waiting for 1 background agent to finish",
+            "✻ Cogitated for 1m 41s · done 5:09 AM · 1 shell still running",
+            "✻ Worked FOR 1m 23s",
+        ] {
+            assert_eq!(
+                verdict(&lines(&[row, "", "❯ "]), 2),
+                Some("glyph:✻".to_string()),
+                "{row}"
+            );
+        }
+    }
+
+    // ── finished-pane fixtures (plan 2026-10-23-wind-down-idle-check-
+    //    mistakes-the-completed-turn-line-for-a-spinner, Phase 1) ──────────
+    //
+    // SYNTHESIZED frames, not captures: panes carry session content. Each
+    // models the bottom of a Claude Code 2.1.309 screen (the build on the box
+    // the plan measured) as the runner's grid renders it — a finished turn
+    // above an empty boxed input, the status footer below it. A, B and C are
+    // what a finished idle session routinely shows; D and G must stay busy.
+
+    fn edge() -> String {
+        "─".repeat(75)
+    }
+
+    /// A finished turn above an empty prompt, `footer` under the box. The
+    /// cursor sits on the prompt row (row 4).
+    fn finished_frame(turn_line: &str, footer: &str) -> Vec<String> {
+        vec![
+            "● Done. The PR is open and CI is green.".to_string(),
+            String::new(),
+            turn_line.to_string(),
+            edge(),
+            "❯\u{a0}".to_string(),
+            edge(),
+            footer.to_string(),
+        ]
+    }
+
+    const PLAIN_FOOTER: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+    /// (A) CLI 2.1.309 — the completed-turn line left above the prompt.
+    #[test]
+    fn fixture_a_completed_turn_line_above_an_empty_prompt_is_idle() {
+        for turn in [
+            "✻ Cooked for 5m 33s · done 8:55 PM",
+            "✻ Cooked for 5m 33s",
+            "✶ Baked for 2s",
+            "✻ Sautéed for 1h 2m 3s · done 11:04 AM",
+            "✻ Worked for 1h 2m",
+        ] {
+            let grid = finished_frame(turn, PLAIN_FOOTER);
+            assert!(
+                snapshot_looks_idle(&grid, 4),
+                "must be idle with line: {turn}"
+            );
+        }
+    }
+
+    /// (B) CLI 2.1.309 — the context hint while the auto-updater runs.
+    #[test]
+    fn fixture_b_clear_hint_with_auto_updating_is_idle() {
+        let grid = finished_frame(
+            "● Pushed.",
+            "  new task? /clear to save 399.4k tokens · Auto-updating…",
+        );
+        assert!(snapshot_looks_idle(&grid, 4));
+    }
+
+    /// (C) CLI 2.1.309 — the context hint after the update installed.
+    #[test]
+    fn fixture_c_clear_hint_with_update_installed_is_idle() {
+        let grid = finished_frame(
+            "✻ Cooked for 5m 33s · done 8:55 PM",
+            "  new task? /clear to save 399.4k tokens · ✔ Update installed · Restart to apply",
+        );
+        assert!(snapshot_looks_idle(&grid, 4));
+    }
+
+    /// (D) CLI 2.1.309 — a WORKING spinner line. Busy by both routes: the
+    /// ellipsis/parenthesis break the completed-turn shape, and `esc to
+    /// interrupt` is an indicator.
+    #[test]
+    fn fixture_d_working_spinner_is_busy() {
+        for working in [
+            "✻ Cooking… (12s · esc to interrupt)",
+            "✻ Cooking… (5m 33s · ↑ 1.2k tokens · esc to interrupt)",
+        ] {
+            let grid = finished_frame(working, PLAIN_FOOTER);
+            assert!(
+                !snapshot_looks_idle(&grid, 4),
+                "must be busy with line: {working}"
+            );
+        }
+        // A working token footer is NOT exempted by the `/clear` rule.
+        let grid = finished_frame("● Pushed.", "  ↑ 1.2k tokens · esc to interrupt");
+        assert!(!snapshot_looks_idle(&grid, 4));
+        // A completed-turn line does not hide a live spinner elsewhere.
+        let mut grid = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
+        grid[1] = "✶ Pondering".to_string();
+        assert!(!snapshot_looks_idle(&grid, 4));
+    }
+
+    /// The completed-turn line's glyph class is exactly `SPINNER_GLYPHS` minus
+    /// the middot the glyph clause skips.
+    #[test]
+    fn completed_turn_glyph_class_is_the_spinner_set() {
+        for glyph in SPINNER_GLYPHS.iter().filter(|g| **g != '·') {
+            assert!(
+                is_completed_turn_line(&format!("{glyph} Cooked for 2s")),
+                "{glyph}"
+            );
+        }
+        assert!(!is_completed_turn_line("· Cooked for 2s"));
+        assert!(!is_completed_turn_line("● Cooked for 2s"));
+    }
+
+    /// Review L-2: only the turn that just ended is exempt — the LAST glyph
+    /// line, directly above the input area. A live spinner BELOW a
+    /// completed-turn line, or a completed-turn-shaped line higher up with
+    /// output under it, stays busy.
+    #[test]
+    fn only_the_last_glyph_line_directly_above_the_input_is_exempt() {
+        let mut below = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
+        below.insert(3, "✶ Pondering".to_string());
+        // The first non-exempt glyph line is reported: the completed-turn
+        // line itself, which is no longer the last.
+        assert_eq!(verdict(&below, 5), Some("glyph:✻".to_string()));
+
+        let stray = lines(&[
+            "✶ Baked for 2s",
+            "  ⎿ a tool result still streaming",
+            "● Working on the next step",
+            "",
+            &edge(),
+            "❯\u{a0}",
+            &edge(),
+        ]);
+        assert_eq!(verdict(&stray, 5), Some("glyph:✶".to_string()));
+
+        // The layout the census measured on real finished panes: a recap
+        // paragraph, the context hint and the box's titled top edge between
+        // the completed-turn line and the input row.
+        let measured = lines(&[
+            "● Pushed; CI is green.",
+            "✻ Cooked for 5m 33s · done 8:55 PM",
+            "",
+            "※ recap: fixed the build and opened the PR; CI is green.",
+            "  (disable recaps in /config)",
+            "  new task? /clear to save 399.4k tokens · ✔ Update installed · Restart to apply",
+            "──────────────── my-session ─",
+            "❯\u{a0}",
+            &edge(),
+        ]);
+        assert_eq!(verdict(&measured, 7), None);
+        // A narrow pane cuts the hint short; it is still the hint.
+        let mut narrow = measured.clone();
+        narrow[5] = "new task? /clear to 399.…".to_string();
+        assert_eq!(verdict(&narrow, 7), None);
+        // A recap whose closing hint wrapped onto its own row still closes.
+        let mut wrapped = measured.clone();
+        wrapped[4] = "  (disable recaps in".to_string();
+        wrapped.insert(5, "  /config)".to_string());
+        assert_eq!(verdict(&wrapped, 8), None);
+        // A recap with no closing hint is still admitted
+        // while its rows are prose...
+        let mut unclosed = measured.clone();
+        unclosed[4] = "  and more prose with no closing hint".to_string();
+        assert_eq!(verdict(&unclosed, 7), None);
+        // ...but a row inside it that starts a transcript item is not.
+        let mut item_in_recap = measured.clone();
+        item_in_recap[4] = "● Next I will run the migration.".to_string();
+        assert_eq!(verdict(&item_in_recap, 7), Some("glyph:✻".to_string()));
+        // Every transcript-item glyph ends a recap's admission.
+        for item in [
+            "⏺ Next step",
+            "☐ Run the tests",
+            "☒ Lint",
+            "✔ Build",
+            "✓ Done",
+        ] {
+            let mut grid = measured.clone();
+            grid[4] = format!("  {item}");
+            assert_eq!(verdict(&grid, 7), Some("glyph:✻".to_string()), "{item}");
+        }
+        let mut result_in_recap = measured.clone();
+        result_in_recap[4] = "  ⎿  Ran 3 tests".to_string();
+        assert_eq!(verdict(&result_in_recap, 7), Some("glyph:✻".to_string()));
+        // Arbitrary text AFTER a closed recap is not admitted either.
+        let mut after_recap = measured.clone();
+        after_recap.insert(5, "● Next I will run the migration.".to_string());
+        assert_eq!(verdict(&after_recap, 8), Some("glyph:✻".to_string()));
+        // Plain prose after a CLOSED recap is not admitted either.
+        let mut prose_after = measured.clone();
+        prose_after.insert(5, "  some more words".to_string());
+        assert_eq!(verdict(&prose_after, 8), Some("glyph:✻".to_string()));
+        // A live spinner directly above the hint row is busy.
+        let mut live = measured.clone();
+        live[4] = "✶ Pondering".to_string();
+        assert_eq!(verdict(&live, 7), Some("glyph:✻".to_string()));
+        // ...but prose that is not a recap block, in the same place, is not.
+        let mut prose = measured.clone();
+        prose[3] = "● Next I will run the migration.".to_string();
+        assert_eq!(verdict(&prose, 7), Some("glyph:✻".to_string()));
+
+        // An echoed earlier user prompt (`❯ …`) ABOVE the completed-turn line
+        // is transcript, not the input; the input row below still counts.
+        let echoed = lines(&[
+            "❯ please fix the build",
+            "● Fixed and pushed.",
+            "✻ Cooked for 5m 33s · done 8:55 PM",
+            "",
+            &edge(),
+            "❯\u{a0}",
+            &edge(),
+        ]);
+        assert_eq!(verdict(&echoed, 5), None);
+
+        // Below the prompt (or with no prompt at all) is never "above the input".
+        let after = lines(&["❯\u{a0}", "✻ Cooked for 5m 33s"]);
+        assert_eq!(verdict(&after, 0), Some("glyph:✻".to_string()));
+        assert_eq!(
+            verdict(&lines(&["✻ Cooked for 5m 33s"]), 0),
+            Some("glyph:✻".to_string())
+        );
+
+        // Two completed-turn lines on screen: an earlier turn's line still
+        // visible is not the one that just ended — fail closed (busy) until it
+        // scrolls off.
+        let mut two = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
+        two[0] = "✻ Baked for 2s".to_string();
+        assert_eq!(verdict(&two, 4), Some("glyph:✻".to_string()));
+    }
+
+    /// The grace floor's fingerprint moves with what an operator does at the
+    /// prompt, and NOT with the context hint's update notice.
+    #[test]
+    fn screen_fingerprint_ignores_only_the_context_hint() {
+        let base = finished_frame("✻ Cooked for 5m 33s · done 8:55 PM", PLAIN_FOOTER);
+        let fp = |grid: &[String], col: u16| screen_fingerprint(grid, 4, col);
+        let mut hint_a = base.clone();
+        hint_a.insert(
+            3,
+            "  new task? /clear to save 399.4k tokens · Auto-updating…".into(),
+        );
+        let mut hint_b = base.clone();
+        hint_b.insert(
+            3,
+            "  new task? /clear to save 399.4k tokens · ✔ Update installed".into(),
+        );
+        assert_eq!(fp(&hint_a, 2), fp(&hint_b, 2));
+        let mut draft = base.clone();
+        draft[4] = "❯\u{a0}d".to_string();
+        assert_ne!(fp(&base, 2), fp(&draft, 3));
+        assert_ne!(fp(&base, 2), fp(&base, 3));
+        assert_eq!(fp(&base, 2), fp(&base.clone(), 2));
+    }
+
+    /// Review L-4: the `/clear` exemption covers `tokens ·` ONLY — a working
+    /// indicator on the same line still reads busy.
+    #[test]
+    fn a_clear_hint_line_that_also_says_esc_to_interrupt_is_busy() {
+        let grid = finished_frame(
+            "● Pushed.",
+            "  new task? /clear to save 399.4k tokens · esc to interrupt",
+        );
+        assert_eq!(
+            verdict(&grid, 4),
+            Some("indicator:esc to interrupt".to_string())
+        );
+    }
+
+    /// (G) CLI 2.1.309 shape, unrecognised wording — fail closed: a glyph line
+    /// that does not match the WHOLE completed-turn shape stays busy.
+    #[test]
+    fn fixture_g_unrecognised_completed_turn_wording_is_busy() {
+        for odd in [
+            "✻ Cooked for about 5 minutes",
+            "✻ Cooked for 5 min 33 sec",
+            "✻ Cooked for 5m 33s and counting",
+            "✻ Cooked for 5m 33s · done 8:55 PM · still going",
+            "✻ Really cooked for 5m 33s",
+            "✻ Cooked for",
+            "✻ Cooked for ",
+            "● ✻ Cooked for 5m 33s",
+        ] {
+            let grid = finished_frame(odd, PLAIN_FOOTER);
+            assert!(
+                !snapshot_looks_idle(&grid, 4),
+                "must be busy with line: {odd}"
+            );
+        }
+    }
+
+    // ── idle_verdict: every value ──────────────────────────────
+
+    #[test]
+    fn verdict_names_the_first_clause_that_vetoed_idle() {
+        assert_eq!(verdict(&lines(&["cycle done.", "❯ "]), 1), None);
+        // The indicator is the matched CONSTANT, not the screen text.
+        assert_eq!(
+            verdict(&lines(&["  12.3K TOKENS · ESC TO INTERRUPT", "❯ "]), 1),
+            Some("indicator:esc to interrupt".to_string())
+        );
+        assert_eq!(
+            verdict(&lines(&["↑ 1.2k tokens · working", "❯ "]), 1),
+            Some("indicator:tokens ·".to_string())
+        );
+        // Indicators outrank glyphs (clause order).
+        assert_eq!(
+            verdict(&lines(&["✻ Thinking…", "❯ "]), 1),
+            Some("indicator:thinking…".to_string())
+        );
+        assert_eq!(
+            verdict(&lines(&["✶ Pondering", "❯ "]), 1),
+            Some("glyph:✶".to_string())
+        );
+        assert_eq!(
+            verdict(&lines(&["some output", "more output"]), 1),
+            Some("no_prompt".to_string())
+        );
+        assert_eq!(
+            verdict(&lines(&["streaming output", "more", "❯ "]), 0),
+            Some("cursor_above_prompt".to_string())
+        );
+        // The bool view agrees with the verdict.
+        for (grid, row) in [
+            (lines(&["cycle done.", "❯ "]), 1),
+            (lines(&["✶ Pondering", "❯ "]), 1),
+            (lines(&["streaming output", "❯ "]), 0),
+        ] {
+            assert_eq!(
+                snapshot_looks_idle(&grid, row),
+                verdict(&grid, row).is_none()
+            );
+        }
     }
 
     // ── snapshot_context_low ─────────────────────────────────────────────

@@ -449,6 +449,7 @@ mod tests {
             wind_down: Some(qontinui_runner_lib::wind_down::WindDownView::from_verdict(
                 &qontinui_runner_lib::wind_down::Eligibility::Eligible { since_ms: 1 },
                 SessionKind::Terminal,
+                qontinui_runner_lib::wind_down::GridIdle::Idle { since_ms: 1 },
             )),
             stray_wait_shells: 0,
         };
