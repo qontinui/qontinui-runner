@@ -53,7 +53,7 @@
 //! credential precedence). Phase C serves this on `GET /github-budget` and runs
 //! the sub-20% headroom watcher. This module deliberately edits neither.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -684,6 +684,145 @@ struct CredentialReading {
 }
 
 // ---------------------------------------------------------------------------
+// The heartbeat's user-bucket report (plan
+// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+// Phase 4)
+// ---------------------------------------------------------------------------
+
+/// The consumer whose credential the heartbeat reports: the session-PR
+/// reconciler, the runner's standing spender on the operator's USER token.
+pub const USER_BUDGET_REPORT_CONSUMER: &str = "session_pr_reconciler";
+
+/// The oldest reading the heartbeat will report. coord stamps the row with ITS
+/// ingest clock and counts it fresh for 120 s, so a reading older than that
+/// would arrive already stale yet read as current — omitted instead.
+const USER_BUDGET_REPORT_MAX_AGE_SECS: i64 = 120;
+
+/// The furthest-ahead reset the heartbeat will report. A GitHub window is at
+/// most an hour; coord refuses a reset more than ~61 min out. Kept inside
+/// coord's bound (an hour plus 30 s of clock skew) so a block the runner sends
+/// is a block coord records.
+const USER_BUDGET_REPORT_MAX_RESET_AHEAD_SECS: i64 = 3600 + 30;
+
+/// coord refuses a `limit` above this.
+const USER_BUDGET_REPORT_MAX_LIMIT: i64 = 1_000_000;
+
+/// coord keeps at most this many consumer labels (the busiest); the runner
+/// sends no more than it keeps.
+const USER_BUDGET_REPORT_MAX_CONSUMERS: usize = 64;
+
+/// A consumer label coord keeps: `[a-z0-9_:.-]{1,64}`. Every runner consumer
+/// is a `&'static str` like `session_pr_reconciler`; one that is not is
+/// dropped here rather than sent to be dropped there.
+fn is_reportable_consumer_label(label: &str) -> bool {
+    (1..=64).contains(&label.len())
+        && label.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b':' | b'.' | b'-')
+        })
+}
+
+/// The `github_user_budget` block on the device-register heartbeat — the
+/// reconciler's credential's own `X-RateLimit-*` reading, so a burn of the
+/// shared user bucket on one box is visible from every other.
+///
+/// **snake_case on the wire, by coord's contract** (`GithubUserBudgetReport`
+/// in qontinui-coord `routes_phase3.rs`). Deliberately NOT the camelCase serde
+/// of [`GithubBudgetSnapshot`]: a renamed key here is silently ignored by
+/// coord and the block never lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UserBudgetReport {
+    /// The authenticated login of the reported credential. coord stores only
+    /// its digest. Never empty — see [`build_user_budget_report`].
+    pub login: String,
+    pub limit: i64,
+    pub remaining: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used: Option<i64>,
+    /// `X-RateLimit-Reset`, unix seconds.
+    pub reset_at_unix: i64,
+    /// `X-RateLimit-Resource`, e.g. `core`.
+    pub resource: String,
+    /// Cumulative CHARGED calls per consumer since `process_started_at_unix`
+    /// (every credential this process spent, not only the reported one).
+    pub charged_by_consumer: BTreeMap<String, u64>,
+    /// When this process's meter started counting — the origin of
+    /// `charged_by_consumer`, so a reader can tell a restart from a reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_started_at_unix: Option<i64>,
+}
+
+/// PURE — the heartbeat's user-bucket block from one credential's reading, or
+/// `None` when there is nothing honest to send:
+///
+/// - no login, or a blank one — coord would file it under
+///   `user:unidentified`, and an unidentified bucket is exactly the gap this
+///   block closes, so an absent login is never sent as a guess;
+/// - an unknown `limit`/`remaining`/`reset`/`resource`, a limit outside
+///   `1..=1_000_000`, a negative or over-limit `remaining`, or a negative
+///   `used`;
+/// - a resource that is not `[a-z0-9_]{1,32}`;
+/// - a window that has already reset, or a reset implausibly far ahead;
+/// - a reading older than [`USER_BUDGET_REPORT_MAX_AGE_SECS`] or stamped in
+///   the future.
+///
+/// `charged_by_consumer` keeps only labels coord accepts, at most the 64
+/// busiest (ties by label).
+pub fn build_user_budget_report(
+    obs: &RateLimitObservation,
+    observed_at_unix: i64,
+    login: Option<&str>,
+    charged_by_consumer: BTreeMap<String, u64>,
+    process_started_at_unix: Option<i64>,
+    now_unix: i64,
+) -> Option<UserBudgetReport> {
+    let login = login.map(str::trim).filter(|l| !l.is_empty())?;
+    let limit = obs
+        .limit
+        .filter(|l| (1..=USER_BUDGET_REPORT_MAX_LIMIT).contains(l))?;
+    let remaining = obs.remaining.filter(|r| (0..=limit).contains(r))?;
+    let used = match obs.used {
+        Some(u) if u < 0 => return None,
+        u => u,
+    };
+    let reset_at_unix = obs.reset_at_unix?;
+    if reset_at_unix <= now_unix
+        || reset_at_unix - now_unix > USER_BUDGET_REPORT_MAX_RESET_AHEAD_SECS
+    {
+        return None;
+    }
+    if !(0..=USER_BUDGET_REPORT_MAX_AGE_SECS).contains(&(now_unix - observed_at_unix)) {
+        return None;
+    }
+    let resource = obs.resource.as_deref().map(str::trim).filter(|r| {
+        (1..=32).contains(&r.len())
+            && r.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    })?;
+    Some(UserBudgetReport {
+        login: login.to_string(),
+        limit,
+        remaining,
+        used,
+        reset_at_unix,
+        resource: resource.to_string(),
+        charged_by_consumer: reportable_consumers(charged_by_consumer),
+        process_started_at_unix: process_started_at_unix.filter(|t| *t > 0),
+    })
+}
+
+/// The consumer counts coord keeps: valid labels only, the
+/// [`USER_BUDGET_REPORT_MAX_CONSUMERS`] busiest (ties broken by label).
+fn reportable_consumers(all: BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    let mut ranked: Vec<(String, u64)> = all
+        .into_iter()
+        .filter(|(label, _)| is_reportable_consumer_label(label))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(USER_BUDGET_REPORT_MAX_CONSUMERS);
+    ranked.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot types
 // ---------------------------------------------------------------------------
 
@@ -851,6 +990,10 @@ pub struct Registry {
     credentials: HashMap<CredentialKey, CredentialReading>,
     /// The authenticated login per credential, once resolved.
     logins: HashMap<CredentialKey, String>,
+    /// The credential each consumer last SPENT (sent a request on) — so a
+    /// reader can ask "which bucket is the reconciler billing?" without
+    /// re-resolving its token (plan 2026-10-30-…, Phase 4).
+    consumer_credentials: HashMap<String, CredentialKey>,
     /// When a login lookup last FAILED, per credential (unix seconds).
     login_failures: HashMap<CredentialKey, i64>,
     /// Per credential, the time before which background spend must not ask
@@ -1082,6 +1225,57 @@ impl Registry {
     /// `credential`'s login, once resolved.
     pub fn login_for(&self, credential: &CredentialKey) -> Option<String> {
         self.logins.get(credential).cloned()
+    }
+
+    /// Remember that `consumer` just spent `credential`. Capped like the other
+    /// per-credential maps: a consumer label is a `&'static str` per client,
+    /// so the cap only guards a caller that minted labels per request.
+    pub fn record_consumer_credential(&mut self, consumer: &str, credential: &CredentialKey) {
+        if !self.consumer_credentials.contains_key(consumer)
+            && self.consumer_credentials.len() >= CREDENTIAL_KEY_CAP
+        {
+            return;
+        }
+        self.consumer_credentials
+            .insert(consumer.to_string(), credential.clone());
+    }
+
+    /// The credential `consumer` last spent, or `None` (UNKNOWN) before its
+    /// first request.
+    pub fn credential_for_consumer(&self, consumer: &str) -> Option<CredentialKey> {
+        self.consumer_credentials.get(consumer).cloned()
+    }
+
+    /// Cumulative CHARGED (non-`304`) calls per consumer, summed across that
+    /// consumer's histogram rows. A LOWER BOUND once the histogram has dropped
+    /// rows over its key cap (`templates_dropped`), never an over-count.
+    pub fn charged_by_consumer(&self) -> BTreeMap<String, u64> {
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        for (key, counts) in &self.rows {
+            let slot = out.entry(key.consumer.clone()).or_insert(0);
+            *slot = slot.saturating_add(counts.charged);
+        }
+        out
+    }
+
+    /// The `github_user_budget` heartbeat block for the bucket `consumer`
+    /// spends — see [`build_user_budget_report`] for when it is `None`.
+    pub fn user_budget_report(
+        &self,
+        consumer: &str,
+        meter_started_at_unix: Option<i64>,
+        now_unix: i64,
+    ) -> Option<UserBudgetReport> {
+        let credential = self.credential_for_consumer(consumer)?;
+        let reading = self.credentials.get(&credential)?;
+        build_user_budget_report(
+            &reading.obs,
+            reading.observed_at_unix,
+            self.logins.get(&credential).map(String::as_str),
+            self.charged_by_consumer(),
+            meter_started_at_unix,
+            now_unix,
+        )
     }
 
     /// Record that a login lookup for `credential` failed at `now_unix`. A
@@ -1376,8 +1570,15 @@ impl Default for EtagCache {
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 static ETAG_CACHE: OnceLock<Mutex<EtagCache>> = OnceLock::new();
 
+/// When the process-global meter started counting (unix seconds): the origin of
+/// every cumulative count it holds. Set once, with the registry.
+static METER_STARTED_AT_UNIX: OnceLock<i64> = OnceLock::new();
+
 fn registry() -> &'static Mutex<Registry> {
-    REGISTRY.get_or_init(|| Mutex::new(Registry::new()))
+    REGISTRY.get_or_init(|| {
+        METER_STARTED_AT_UNIX.get_or_init(now_unix);
+        Mutex::new(Registry::new())
+    })
 }
 
 fn etag_cache() -> &'static Mutex<EtagCache> {
@@ -1416,6 +1617,7 @@ pub fn record_response(
     let now = now_unix();
     if let Ok(mut reg) = registry().lock() {
         reg.record_reading(credential, &obs, now);
+        reg.record_consumer_credential(consumer, credential);
         reg.record_with_retry_after(consumer, url, cache_mode, status, obs, retry_after, now);
     }
 }
@@ -1428,6 +1630,20 @@ pub fn record_rate_limited_refusal(credential: &CredentialKey, wait_secs: u64) {
         let until = now_unix().saturating_add(i64::try_from(wait_secs).unwrap_or(i64::MAX));
         reg.record_not_before(credential, until);
     }
+}
+
+/// The heartbeat's `github_user_budget` block: the reading of the credential
+/// the session-PR reconciler last spent, with its login, the per-consumer
+/// charged counts and the meter's start. `None` before the reconciler's first
+/// request, while its login is unresolved, on a stale or unusable reading, or
+/// on a poisoned meter — see [`build_user_budget_report`].
+pub fn user_budget_report() -> Option<UserBudgetReport> {
+    let reg = registry().lock().ok()?;
+    reg.user_budget_report(
+        USER_BUDGET_REPORT_CONSUMER,
+        METER_STARTED_AT_UNIX.get().copied(),
+        now_unix(),
+    )
 }
 
 /// The ONE background gate. `Ok` sends; `Err` is a deferral — the request must
@@ -2643,6 +2859,275 @@ mod tests {
         reg.record_login(&a, " jspinak ");
         assert_eq!(reg.login_for(&a).as_deref(), Some("jspinak"));
         assert_eq!(reg.login_for(&CredentialKey::of_token("token-b")), None);
+    }
+
+    // -- Heartbeat user-bucket report (plan 2026-10-30-…, Phase 4) ----------
+
+    fn consumers(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn user_budget_report_serializes_coords_exact_snake_case_shape() {
+        let now = 1_763_559_000;
+        let report = build_user_budget_report(
+            &RateLimitObservation {
+                limit: Some(5000),
+                remaining: Some(4100),
+                used: Some(900),
+                reset_at_unix: Some(1_763_560_000),
+                resource: Some("core".to_string()),
+            },
+            now - 5,
+            Some("jspinak"),
+            consumers(&[("session_pr_reconciler", 4350)]),
+            Some(1_763_500_000),
+            now,
+        )
+        .expect("a fresh, complete reading with a login is reported");
+        let v = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "login": "jspinak",
+                "limit": 5000,
+                "remaining": 4100,
+                "used": 900,
+                "reset_at_unix": 1_763_560_000_i64,
+                "resource": "core",
+                "charged_by_consumer": {"session_pr_reconciler": 4350},
+                "process_started_at_unix": 1_763_500_000_i64,
+            }),
+            "the EXACT keys coord's GithubUserBudgetReport reads — never camelCase"
+        );
+    }
+
+    #[test]
+    fn user_budget_report_sends_only_consumer_labels_coord_keeps() {
+        let now = 1_000_000;
+        let good = reading(5000, 4000, now + 3600 + 30);
+        let mut all = consumers(&[
+            ("session_pr_reconciler", 10),
+            ("ci_node:sibling.probe-1", 3),
+            ("Upper", 99),
+            ("has space", 99),
+            ("", 99),
+        ]);
+        all.insert("x".repeat(65), 99);
+        let r = build_user_budget_report(&good, now, Some("jspinak"), all, None, now)
+            .expect("a reset exactly an hour + 30 s ahead is still reported");
+        assert_eq!(
+            r.charged_by_consumer,
+            consumers(&[
+                ("session_pr_reconciler", 10),
+                ("ci_node:sibling.probe-1", 3)
+            ])
+        );
+
+        // Over 64 valid labels: the 64 busiest are kept.
+        let many: BTreeMap<String, u64> = (0..70_u64).map(|i| (format!("c{i:02}"), i)).collect();
+        let r = build_user_budget_report(&good, now, Some("jspinak"), many, None, now)
+            .expect("reported");
+        assert_eq!(r.charged_by_consumer.len(), 64);
+        assert!(r.charged_by_consumer.contains_key("c69"));
+        assert!(
+            !r.charged_by_consumer.contains_key("c05"),
+            "the quietest are dropped"
+        );
+        assert!(r.charged_by_consumer.contains_key("c06"));
+    }
+
+    #[test]
+    fn user_budget_report_omits_optional_keys_it_does_not_have() {
+        let now = 1_000_000;
+        let mut obs = reading(5000, 4000, now + 600);
+        obs.used = None;
+        let report =
+            build_user_budget_report(&obs, now, Some("jspinak"), BTreeMap::new(), None, now)
+                .expect("reported");
+        let v = serde_json::to_value(&report).expect("serializes");
+        let obj = v.as_object().expect("object");
+        assert!(!obj.contains_key("used"));
+        assert!(!obj.contains_key("process_started_at_unix"));
+        assert_eq!(v["charged_by_consumer"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn user_budget_report_is_absent_when_nothing_honest_can_be_sent() {
+        let now = 1_000_000;
+        let good = reading(5000, 4000, now + 600);
+        let build = |obs: &RateLimitObservation, observed_at: i64, login: Option<&str>| {
+            build_user_budget_report(obs, observed_at, login, BTreeMap::new(), Some(1), now)
+        };
+        assert!(build(&good, now, Some("jspinak")).is_some(), "baseline");
+
+        assert_eq!(build(&good, now, None), None, "no login is never a guess");
+        assert_eq!(build(&good, now, Some("  ")), None, "a blank login");
+
+        let with = |f: &dyn Fn(&mut RateLimitObservation)| {
+            let mut o = good.clone();
+            f(&mut o);
+            o
+        };
+        let cases: Vec<(RateLimitObservation, &str)> = vec![
+            (with(&|o| o.limit = None), "unknown limit"),
+            (with(&|o| o.limit = Some(0)), "zero limit"),
+            (
+                with(&|o| o.limit = Some(1_000_001)),
+                "limit over coord's ceiling",
+            ),
+            (with(&|o| o.remaining = None), "unknown remaining"),
+            (with(&|o| o.remaining = Some(-1)), "negative remaining"),
+            (with(&|o| o.remaining = Some(5001)), "remaining over limit"),
+            (with(&|o| o.used = Some(-1)), "negative used"),
+            (with(&|o| o.reset_at_unix = None), "unknown reset"),
+            (with(&|o| o.reset_at_unix = Some(now)), "window resets now"),
+            (
+                with(&|o| o.reset_at_unix = Some(now - 1)),
+                "window has reset",
+            ),
+            (
+                with(&|o| o.reset_at_unix = Some(now + 3600 + 31)),
+                "reset implausibly far ahead",
+            ),
+            (with(&|o| o.resource = None), "unknown resource"),
+            (
+                with(&|o| o.resource = Some("Core".into())),
+                "uppercase resource",
+            ),
+            (
+                with(&|o| o.resource = Some("a".repeat(33))),
+                "33-byte resource",
+            ),
+        ];
+        for (obs, why) in cases {
+            assert_eq!(build(&obs, now, Some("jspinak")), None, "{why}");
+        }
+
+        assert!(
+            build(&good, now - 120, Some("jspinak")).is_some(),
+            "120 s old"
+        );
+        assert_eq!(build(&good, now - 121, Some("jspinak")), None, "121 s old");
+        assert_eq!(
+            build(&good, now + 1, Some("jspinak")),
+            None,
+            "from the future"
+        );
+    }
+
+    #[test]
+    fn registry_reports_the_reconcilers_own_credential_with_summed_consumers() {
+        let mut reg = Registry::new();
+        let now = now_unix();
+        let rec = CredentialKey::of_token("reconciler-token");
+        let other = CredentialKey::of_token("ticket-token");
+        let rl = |remaining: i64| {
+            let mut h = HeaderMap::new();
+            for (k, v) in [
+                ("x-ratelimit-limit", "5000".to_string()),
+                ("x-ratelimit-remaining", remaining.to_string()),
+                ("x-ratelimit-used", (5000 - remaining).to_string()),
+                ("x-ratelimit-reset", (now + 900).to_string()),
+                ("x-ratelimit-resource", "core".to_string()),
+            ] {
+                h.insert(
+                    HeaderName::from_static(k),
+                    HeaderValue::from_str(&v).expect("header"),
+                );
+            }
+            parse_rate_limit(&h)
+        };
+        let spend = |reg: &mut Registry,
+                     cred: &CredentialKey,
+                     consumer: &str,
+                     url: &str,
+                     status: u16,
+                     remaining: i64| {
+            let obs = rl(remaining);
+            reg.record_reading(cred, &obs, now);
+            reg.record_consumer_credential(consumer, cred);
+            reg.record(consumer, url, CacheMode::Cached, status, obs, now);
+        };
+
+        // Before the reconciler has spent anything: UNKNOWN, omitted.
+        assert_eq!(
+            reg.user_budget_report(USER_BUDGET_REPORT_CONSUMER, Some(1), now),
+            None
+        );
+
+        // Two templates on the reconciler (charged 2 + 1, one 304), one on a
+        // ticket consumer on ANOTHER credential, which answered last.
+        spend(
+            &mut reg,
+            &rec,
+            USER_BUDGET_REPORT_CONSUMER,
+            "https://api.github.com/repos/o/r/pulls/1",
+            200,
+            4200,
+        );
+        spend(
+            &mut reg,
+            &rec,
+            USER_BUDGET_REPORT_CONSUMER,
+            "https://api.github.com/repos/o/r/pulls/2",
+            200,
+            4199,
+        );
+        spend(
+            &mut reg,
+            &rec,
+            USER_BUDGET_REPORT_CONSUMER,
+            "https://api.github.com/repos/o/r/pulls/2",
+            304,
+            4199,
+        );
+        spend(
+            &mut reg,
+            &rec,
+            USER_BUDGET_REPORT_CONSUMER,
+            "https://api.github.com/user",
+            200,
+            4198,
+        );
+        spend(
+            &mut reg,
+            &other,
+            "ticket_sync",
+            "https://api.github.com/repos/o/r/issues",
+            200,
+            12,
+        );
+
+        // Login unresolved: omitted, never guessed.
+        assert_eq!(
+            reg.user_budget_report(USER_BUDGET_REPORT_CONSUMER, Some(1), now),
+            None
+        );
+
+        reg.record_login(&rec, "jspinak");
+        reg.record_login(&other, "someone-else");
+        let r = reg
+            .user_budget_report(USER_BUDGET_REPORT_CONSUMER, Some(1_700_000_000), now)
+            .expect("reported");
+        assert_eq!(
+            r.login, "jspinak",
+            "the reconciler's credential, not the last to answer"
+        );
+        assert_eq!(
+            r.remaining, 4198,
+            "the reconciler's credential's own latest reading"
+        );
+        assert_eq!(r.limit, 5000);
+        assert_eq!(r.used, Some(802));
+        assert_eq!(r.reset_at_unix, now + 900);
+        assert_eq!(r.resource, "core");
+        assert_eq!(r.process_started_at_unix, Some(1_700_000_000));
+        assert_eq!(
+            r.charged_by_consumer,
+            consumers(&[(USER_BUDGET_REPORT_CONSUMER, 3), ("ticket_sync", 1)]),
+            "charged summed per consumer across its templates; a 304 is not charged"
+        );
     }
 
     // -- Global wrappers ----------------------------------------------------
