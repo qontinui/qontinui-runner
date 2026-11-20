@@ -5447,7 +5447,11 @@ fn derive_and_publish_legacy_posture(
     // A runner holding no credential at all (never paired, a guest tier) has
     // nothing an outage can take away, so it is not warned about one.
     let holds_credential = matches!(read, crate::secure_storage::StoredTokenRead::Present(_));
-    record_and_announce_recovery_inventory(app, RecoveryInventory::read(auth_manager), holds_credential);
+    record_and_announce_recovery_inventory(
+        app,
+        RecoveryInventory::read(auth_manager),
+        holds_credential,
+    );
     let obs = legacy_slot_observation(read);
     if let Some(transition) =
         derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
