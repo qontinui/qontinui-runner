@@ -81,58 +81,6 @@ pub async fn checkpoint_history(
     Ok(Vec::new())
 }
 
-/// Create a new session record.
-#[tauri::command]
-pub async fn session_create(
-    app_state: State<'_, StorageCompartment>,
-    id: String,
-    session_type: String,
-    name: String,
-    workflow_name: Option<String>,
-    run_id: Option<String>,
-) -> Result<CommandResponse, String> {
-    app_state
-        .pg_db()
-        .create_session(
-            &id,
-            &session_type,
-            &name,
-            workflow_name.as_deref(),
-            run_id.as_deref(),
-        )
-        .await?;
-    Ok(CommandResponse {
-        success: true,
-        message: Some("Session created".to_string()),
-        data: None,
-    })
-}
-
-/// Update session status.
-#[tauri::command]
-pub async fn session_update_status(
-    app_state: State<'_, StorageCompartment>,
-    session_id: String,
-    status: String,
-    current_phase: Option<u32>,
-    error_message: Option<String>,
-) -> Result<CommandResponse, String> {
-    app_state
-        .pg_db()
-        .update_session_status(
-            &session_id,
-            &status,
-            current_phase,
-            error_message.as_deref(),
-        )
-        .await?;
-    Ok(CommandResponse {
-        success: true,
-        message: Some(format!("Session status updated to {}", status)),
-        data: None,
-    })
-}
-
 /// Get a setting value.
 #[tauri::command]
 pub async fn setting_get(
@@ -180,8 +128,6 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             checkpoint_list_active,
             checkpoint_status,
             checkpoint_history,
-            session_create,
-            session_update_status,
             setting_get,
             setting_set,
             settings_get_all,
