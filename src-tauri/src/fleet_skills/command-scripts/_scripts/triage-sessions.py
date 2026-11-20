@@ -2036,12 +2036,245 @@ def selftest():
         if got != want:
             print(f"FAIL tab_pages({names!r}) = {got!r}, want {want!r}")
             failures += 1
+    pin_failures, pin = selftest_doc_pin(command_doc_path("triage-sessions.md"))
+    failures += pin_failures
+    status_failures, status_cells = selftest_layout_status_words()
+    failures += status_failures
+    pin = f"{pin}, {status_cells} layout-status cells"
     print(f"selftest: {len(cases)} name cases, {len(modes)} mode cases, {len(holds)} hold cases, "
           f"{len(reads)} dial reads, {len(sessions) + 1} session holds, {steps} name-step runs, "
           f"{len(tabs)} tab cases, {close_rows} close-prediction rows, {close_argvs} close-argv parses, "
           f"{listings} listing checks (custody x2, held section, nudge x2), {watch_cells} watch cells, {reply_cells} reply/merge cells, {width_cells} prompt-width cells, "
-          f"{wait_cells} wait-option cells, {failures} failure(s)")
+          f"{wait_cells} wait-option cells, {pin}, {failures} failure(s)")
     return 1 if failures else 0
+
+
+# Every row word runner-layout.py prints for a page (plan
+# 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival, Phase 2), as literals.
+LAYOUT_ROW_WORDS = ("SET", "SKIPPED", "DRY-RUN", "FAILED")
+
+
+def doc_bullet(doc, name):
+    """The text of the `- **<name>**:` bullet in a command doc's output section,
+    up to the next top-level bullet or blank line; "" when there is none."""
+    lines = doc.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(f"- **{name}**:"):
+            out = [line]
+            for nxt in lines[i + 1:]:
+                if not nxt.strip() or nxt.startswith("- "):
+                    break
+                out.append(nxt)
+            return " ".join(x.strip() for x in out)
+    return ""
+
+
+def selftest_doc_pin(path, layout_path=None):
+    """(failures, count phrase): /triage-sessions' own doc names every row word
+    the layout step can print (LAYOUT_ROW_WORDS) in its layout bullet's row
+    list - the first parenthesised list of backticked words, `(`SET`, ...)`,
+    not merely somewhere in the bullet's prose - and `SELF` in its close and
+    nudge bullets; and LAYOUT_ROW_WORDS is every word runner-layout.py
+    (`layout_path`, default: beside this script) assigns. That comparison runs
+    first; a doc that cannot be found (a provisioned tree without commands)
+    leaves the doc checks UNKNOWN: no failure from them, and no pass."""
+    failures, checks = 0, 0
+    # The literals must be every row word runner-layout.py itself assigns, so a row word added there turns
+    # this pin red rather than going unlisted. A MISSING runner-layout.py is UNKNOWN for this one check
+    # only; one that is present but cannot be followed FAILs (below). It runs first, so a missing doc does
+    # not switch it off.
+    if layout_path is None:
+        layout_path = os.path.join(_here, "runner-layout.py")
+    printed, why = layout_status_words(layout_path)
+    unknown = ""
+    if printed is None and os.path.isfile(layout_path):
+        # runner-layout.py ships beside this script in both trees, so a file that is THERE but cannot be
+        # followed means its shape changed: a failure, never a comparison quietly switched off.
+        checks += 1
+        print(f"FAIL the layout row words could not be read from {why} - an unreadable file (fix its "
+              "permissions or encoding) or a form layout_status_words must be taught")
+        failures += 1
+    elif printed is None:
+        print(f"doc pin UNKNOWN: {why}")
+        unknown = f" (runner-layout.py comparison UNKNOWN: {why})"
+    else:
+        checks += 1
+        if printed != set(LAYOUT_ROW_WORDS):
+            print(f"FAIL LAYOUT_ROW_WORDS {sorted(LAYOUT_ROW_WORDS)} != the status words runner-layout.py assigns "
+                  f"{sorted(printed)}")
+            failures += 1
+    if path is None:
+        print("doc pin UNKNOWN: .claude/commands/triage-sessions.md not found beside this script")
+        return failures, f"{checks} doc-pin checks, doc UNKNOWN (no doc){unknown}"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = fh.read()
+    except (OSError, ValueError) as exc:  # ValueError: a non-UTF-8 file
+        print(f"doc pin UNKNOWN: {path}: {exc}")
+        return failures, f"{checks} doc-pin checks, doc UNKNOWN (unreadable){unknown}"
+    rows = re.search(r"\((`[A-Z-]+`(?:, `[A-Z-]+`)*)\)", doc_bullet(doc, "layout"))
+    listed = set(re.findall(r"`([A-Z-]+)`", rows.group(1))) if rows else set()
+    for word in LAYOUT_ROW_WORDS:
+        checks += 1
+        if word not in listed:
+            print(f"FAIL triage-sessions.md's layout bullet row list never names `{word}`, a row runner-layout.py "
+                  "prints")
+            failures += 1
+    for step in ("close", "nudge"):
+        checks += 1
+        if "`SELF` (the terminal running this command)" not in doc_bullet(doc, step):
+            print(f"FAIL triage-sessions.md's {step} bullet never names `SELF` (the terminal running this command)")
+            failures += 1
+    return failures, f"{checks} doc-pin checks{unknown}"
+
+
+def layout_status_words(path):
+    """(words, why): every string literal runner-layout.py assigns to a row's
+    `status` - a `row["status"]` target (alone, annotated or in a tuple
+    assignment, its value a literal or a conditional of literals), a `"status"`
+    key in a dict literal, or a `status=` keyword (`dict(...)`,
+    `row.update(...)`); an augmented `row["status"] +=` is non-literal. Read
+    through `ast`, so a value on a continuation line counts. A status assigned
+    from anything but a literal, a `"status"` string used any other way (a
+    `setdefault("status", ...)` argument, a variable key), or a file that
+    cannot be read or parsed, is (None, why): UNKNOWN, never a set to compare."""
+    import ast
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), path)
+    except (OSError, SyntaxError, ValueError) as exc:  # ValueError: non-UTF-8, or a null byte
+        return None, f"{path}: {exc}"
+    words, opaque = set(), []
+
+    def take(value):
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            words.add(value.value)
+        elif isinstance(value, ast.IfExp):
+            take(value.body)
+            take(value.orelse)
+        else:
+            opaque.append(f"line {value.lineno}")
+
+    def is_status(t):
+        return (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                and t.slice.value == "status")
+
+    # Every "status" string is a subscript key (a write is read below, a read is harmless), a dict-literal
+    # key, or the key of a `.get(...)` read; any other use is a write this reader cannot follow.
+    accounted = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            accounted.add(id(node.slice))
+        elif isinstance(node, ast.Dict):
+            accounted.update(id(k) for k in node.keys if k is not None)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+              and node.args):
+            accounted.add(id(node.args[0]))  # row.get("status") is a read
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "status" and id(node) not in accounted:
+            opaque.append(f"line {node.lineno}")
+    handled = set()  # the status-write targets the arms below read
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if is_status(target):
+                    handled.add(id(target))
+                    take(node.value)
+                elif (isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple)
+                      and len(target.elts) == len(node.value.elts)
+                      and not any(isinstance(x, ast.Starred) for x in target.elts + node.value.elts)):
+                    # pairs by position only when nothing is starred and the lengths agree; any other
+                    # tuple shape is left to the unhandled-Store catch-all below (UNKNOWN)
+                    for t, v in zip(target.elts, node.value.elts):
+                        if is_status(t):
+                            handled.add(id(t))
+                            take(v)
+        elif isinstance(node, ast.AnnAssign) and is_status(node.target):
+            handled.add(id(node.target))
+            if node.value is not None:
+                take(node.value)
+        elif isinstance(node, ast.keyword) and node.arg == "status":  # dict(status=...), row.update(status=...)
+            take(node.value)
+        elif isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value == "status":
+                    take(v)
+    # A status write in any other target shape (an augmented `+=`, a list target, a nested tuple, a for/with
+    # target) is one the arms above did not read: UNKNOWN, never a word silently left out.
+    opaque += [f"line {n.lineno}" for n in ast.walk(tree)
+               if is_status(n) and isinstance(n.ctx, ast.Store) and id(n) not in handled]
+    if opaque:
+        return None, f"{path}: a status used in a form this reader cannot follow ({', '.join(opaque)})"
+    return words, ""
+
+
+def selftest_layout_status_words():
+    """(failures, cells): layout_status_words on synthetic sources, one cell per
+    assignment form, so each UNKNOWN arm and each literal arm can fail."""
+    import tempfile
+    cells = [
+        ('r["status"] = "A"\n', {"A"}),
+        ('r["status"], r["why"] = ("B", x)\nr["status"] = "C" if c else "D"\n', {"B", "C", "D"}),
+        ('r["status"]: str = "W"\n', {"W"}),
+        ('r = dict(status="Q")\nr.update(status="R")\n', {"Q", "R"}),
+        ('r = {"status": "Z"}\nif r["status"] == "Z":\n    pass\n', {"Z"}),
+        ('r["status"] += "x"\n', None),
+        ('r["status"], y = f()\n', None),
+        ('r["status"] = g()\n', None),
+        ('r["status"] = "A" if c else s\n', None),
+        ('r.setdefault("status", "P")\n', None),
+        ('if r.get("status") == "A":\n    pass\nr["status"] = "A"\n', {"A"}),
+        ('k = "status"\nr[k] = "J"\n', None),
+        ('*a, r["status"] = "A", "B", "C"\n', None),
+        ('r["status"] = (\n', None),
+        ('[r["status"], y] = "A", x\n', None),
+        ('(r["status"], a), b = ("A", 1), 2\n', None),
+        ('for r["status"] in ("A",):\n    pass\n', None),
+    ]
+    failures = 0
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "layout.py")
+        for k, (src, want) in enumerate(cells):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(src)
+            got, _why = layout_status_words(path)
+            if got != want:
+                print(f"FAIL layout_status_words cell {k} ({src.strip()[:40]!r}) = {got!r}, want {want!r}")
+                failures += 1
+        # A file that is not UTF-8 is UNKNOWN, never a crash out of the selftest.
+        with open(path, "wb") as fh:
+            fh.write(b'r["status"] = "\xff"\n')
+        cells.append(("non-UTF-8", None))
+        got, _why = layout_status_words(path)
+        if got is not None:
+            print(f"FAIL layout_status_words on a non-UTF-8 file = {got!r}, want None")
+            failures += 1
+        # The doc pin's two drift detectors, driven on a synthetic runner-layout.py beside the real doc: an
+        # extra row word, and a file that is present but cannot be followed, each fail the pin exactly once.
+        # A minimal conforming doc, so these cells test only the detectors: a defect in the real doc is the
+        # doc pin's own failure, never blamed on a drift cell.
+        doc = os.path.join(d, "triage-sessions.md")
+        with open(doc, "w", encoding="utf-8") as fh:
+            fh.write("- **close**: `SELF` (the terminal running this command)\n"
+                     "- **layout**: (`SET`, `SKIPPED`, `DRY-RUN`, `FAILED`)\n"
+                     "- **nudge**: `SELF` (the terminal running this command)\n")
+        drift = [('r["status"] = "SET"\nr["status"] = "SKIPPED"\nr["status"] = "DRY-RUN"\n'
+                  'r["status"] = "FAILED"\n', 0),
+                 ('r["status"] = "SET"\nr["status"] = "SKIPPED"\nr["status"] = "DRY-RUN"\n'
+                  'r["status"] = "FAILED"\nr["status"] = "PARKED"\n', 1),
+                 ('r["status"] = (\n', 1)]
+        import contextlib
+        import io
+        for k, (src, want) in enumerate(drift):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(src)
+            with contextlib.redirect_stdout(io.StringIO()):
+                got, _phrase = selftest_doc_pin(doc, path)
+            cells.append((src, want))
+            if got != want:
+                print(f"FAIL selftest_doc_pin drift cell {k}: {got} failure(s), want {want}")
+                failures += 1
+    return failures, len(cells)
 
 
 def selftest_name_sessions():
@@ -3653,15 +3886,20 @@ def blob_shas(paths):
     return dict(zip(paths, shas)) if len(shas) == len(paths) else {x: None for x in paths}
 
 
-def next_move_path():
-    """.claude/commands/next-move.md beside this script: the repository's
+def command_doc_path(name):
+    """.claude/commands/<name> beside this script: the repository's
     (scripts/ -> .claude/commands/) or the provisioned skills tree's
     (.claude/skills/command-scripts/_scripts/ -> .claude/commands/). None when neither exists."""
     for rel in ((os.pardir, ".claude", "commands"), (os.pardir, os.pardir, os.pardir, "commands")):
-        c = os.path.normpath(os.path.join(_here, *rel, "next-move.md"))
+        c = os.path.normpath(os.path.join(_here, *rel, name))
         if os.path.isfile(c):
             return c
     return None
+
+
+def next_move_path():
+    """.claude/commands/next-move.md beside this script (command_doc_path)."""
+    return command_doc_path("next-move.md")
 
 
 def overlord_versions(runner_sha):
