@@ -1515,20 +1515,15 @@ pub(crate) fn seed_reading_for_test(credential: &CredentialKey, obs: &RateLimitO
 /// Serializes the tests that write or assert the process-global `last`
 /// reading, so one test's deliberately exhausted global reading cannot leak
 /// into another's assertions.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy: its holders read env
+/// knobs (`low_fraction`, `HeadroomKnobs::from_env`) that other tests write
+/// under `env_lock`, and it is held from three files, so `hierarchy_lock`
+/// takes the env lock first and either call order nests.
 #[cfg(test)]
-// test-lock: standalone — its four holders (github_budget, ticket_system::github, trigger_system::github_api tests) take no other test lock and never touch env
-pub(crate) async fn global_last_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
-/// Same lock, for a synchronous test.
-#[cfg(test)]
-// test-lock: standalone — its four holders (github_budget, ticket_system::github, trigger_system::github_api tests) take no other test lock and never touch env
-pub(crate) fn global_last_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
-    futures::executor::block_on(global_last_lock())
+pub(crate) fn global_last_lock() -> crate::test_env::TestLockGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    crate::test_env::hierarchy_lock(&LOCK)
 }
 
 /// Set the process-global `last` reading (the snapshot's slot) to `obs` as if
@@ -2657,7 +2652,7 @@ mod tests {
         // The process-global registry is shared with any other test that touches
         // it, so this asserts only shape-and-liveness invariants, never counts.
         // The tests that seed an exhausted global reading hold the same lock.
-        let _global = global_last_lock_blocking();
+        let _global = global_last_lock();
         record_identity("QONTINUI_RUNNER_GITHUB_TOKEN", None);
         record_response(
             &CredentialKey::of_token("global-wrappers-probe-token"),
