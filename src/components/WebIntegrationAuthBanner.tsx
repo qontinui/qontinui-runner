@@ -123,6 +123,10 @@ export function WebIntegrationAuthBanner() {
   // the signature of the one the user dismissed this session.
   const [recoveryWarning, setRecoveryWarning] = useState<RecoveryWarning | null>(null);
   const [recoveryDismissed, setRecoveryDismissed] = useState<string | null>(null);
+  // Which banner started the in-flight/last sign-in: the recovery banner shows
+  // `authorizeError` only for a sign-in it started itself, never one left over
+  // from the credential-dark or first-pair banner.
+  const [signInFromRecovery, setSignInFromRecovery] = useState(false);
 
   // Phase 4 (unified-devices migration): post-upgrade re-pair CTA state.
   //
@@ -644,6 +648,7 @@ export function WebIntegrationAuthBanner() {
             }
             type="button"
             onClick={() => {
+              setSignInFromRecovery(false);
               void handleCredentialCta(presentation.ctaAction!);
             }}
             disabled={busy}
@@ -814,7 +819,7 @@ export function WebIntegrationAuthBanner() {
           <div style={{ fontWeight: 600 }}>This runner cannot recover its credential by itself</div>
           <div style={{ fontSize: "0.8125rem", opacity: 0.85 }}>
             {warning.message}
-            {authorizeError ? (
+            {signInFromRecovery && authorizeError ? (
               <>
                 <br />
                 <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>
@@ -828,7 +833,10 @@ export function WebIntegrationAuthBanner() {
         <button
           ref={recoverySignInButtonRef}
           type="button"
-          onClick={handleAuthorize}
+          onClick={() => {
+            setSignInFromRecovery(true);
+            void handleAuthorize();
+          }}
           disabled={authorizing}
           style={{
             background: "var(--accent, #6366f1)",
@@ -914,7 +922,10 @@ export function WebIntegrationAuthBanner() {
       <button
         ref={authorizeButtonRef}
         type="button"
-        onClick={handleAuthorize}
+        onClick={() => {
+          setSignInFromRecovery(false);
+          void handleAuthorize();
+        }}
         disabled={authorizing}
         style={{
           background: "var(--accent, #6366f1)",
