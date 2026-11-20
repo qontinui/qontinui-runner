@@ -1123,6 +1123,9 @@ async fn discover_repo(
     owner: &str,
     repo: &str,
 ) {
+    // Before any request: every read this discovery makes is newer than it,
+    // which is what lets a closed-listing gap mark only EARLIER reads stale.
+    let started = Instant::now();
     let open = match budget
         .spend(|| client.list_repo_prs(owner, repo, RepoPrSlice::Open))
         .await
@@ -1139,6 +1142,12 @@ async fn discover_repo(
     };
     tally.discovery_calls += open.requests;
     let now = Instant::now();
+    if !open.overflow {
+        // Complete: an open PR it did not return is no longer open.
+        let listed: std::collections::BTreeSet<i64> =
+            open.prs.iter().map(|pr| pr.number as i64).collect();
+        memo.drop_unlisted_open(repo_full, &listed);
+    }
     for pr in open.prs {
         memo.observe(repo_full, pr, now);
     }
@@ -1171,6 +1180,11 @@ async fn discover_repo(
     let overflow = open.overflow || closed.overflow;
     if overflow {
         tally.discovery_overflow += 1;
+    }
+    if closed.overflow {
+        // The unread pages behind the cap hide changes: see `mark_closed_gap`.
+        // An open-listing overflow leaves no such gap and marks nothing.
+        memo.mark_closed_gap(repo_full, started);
     }
     let now = Instant::now();
     for pr in &closed.prs {
@@ -2059,7 +2073,7 @@ async fn branch_trailers(dir: &str) -> (Vec<BranchTrailer>, Option<String>) {
         dir,
         &[
             "for-each-ref",
-            "--format=%(objectname) %(refname) %(if)%(symref)%(then)%(symref)%(else)-%(end)              %(trailers:key=Session-Id,valueonly,separator=%x20)",
+            "--format=%(objectname) %(refname) %(if)%(symref)%(then)%(symref)%(else)-%(end) %(trailers:key=Session-Id,valueonly,separator=%x20)",
             "refs/heads/",
             "refs/remotes/origin/",
         ],
