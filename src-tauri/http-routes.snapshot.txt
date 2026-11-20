@@ -536,6 +536,7 @@ GET /terminals list_terminals_handler
 GET /terminals/transport-stats get_transport_stats_handler
 GET /terminals/{id}/buffer get_buffer_handler
 GET /terminals/{id}/coord-session get_coord_session_handler
+GET /terminals/{id}/launch-failure get_launch_failure_handler
 GET /terminals/{id}/output get_buffer_handler
 GET /terminals/{id}/ws ws_terminal_handler
 GET /test-results list_test_results
@@ -1346,6 +1347,7 @@ POST /task-runs/{id}/stop stop_task_run
 POST /task-runs/{id}/unpause unpause_task_run
 POST /terminals create_terminal_handler
 POST /terminals/transport-stats reset_transport_stats_handler
+POST /terminals/{id}/launch-evidence capture_launch_evidence_handler
 POST /terminals/{id}/move move_terminal_handler
 POST /terminals/{id}/resize resize_terminal_handler
 POST /terminals/{id}/submit-prompt submit_prompt_handler

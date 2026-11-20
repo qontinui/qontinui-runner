@@ -138,6 +138,13 @@ const ADD_TYPES: &str = include_str!("fleet_commands/add-types.md");
 /// there, then re-vendor.
 const ANALYZE_AUTOMATION: &str = include_str!("fleet_commands/analyze-automation.md");
 
+/// `/analyze-launch-failure` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/analyze-launch-failure.md` (canonical) — edit it
+/// there, then re-vendor. The runner's "Analyze launch" button opens a pane
+/// whose first turn is this command (plan
+/// `2026-11-20-terminal-launch-failure-analyze-button`, D2).
+const ANALYZE_LAUNCH_FAILURE: &str = include_str!("fleet_commands/analyze-launch-failure.md");
+
 /// `/analyze-subagent` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/analyze-subagent.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -360,6 +367,7 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("add-tests", ADD_TESTS),
     ("add-types", ADD_TYPES),
     ("analyze-automation", ANALYZE_AUTOMATION),
+    ("analyze-launch-failure", ANALYZE_LAUNCH_FAILURE),
     ("analyze-subagent", ANALYZE_SUBAGENT),
     ("ask-operator", ASK_OPERATOR),
     ("audit", AUDIT),

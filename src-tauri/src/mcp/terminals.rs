@@ -745,6 +745,75 @@ pub async fn get_buffer_handler(
     }))))
 }
 
+/// Request body for `POST /terminals/{id}/launch-evidence`. Every field is
+/// optional: an absent launch command is recorded as `UNKNOWN (typed by
+/// hand)`, never refused (plan `2026-11-20-terminal-launch-failure-analyze-button`).
+#[derive(Debug, Default, Deserialize)]
+pub struct LaunchEvidenceRequest {
+    #[serde(default, alias = "launchCommand")]
+    pub launch_command: Option<String>,
+    #[serde(default, alias = "configDir")]
+    pub config_dir: Option<String>,
+    #[serde(default, alias = "pinnedSessionId")]
+    pub pinned_session_id: Option<String>,
+}
+
+/// `POST /terminals/{id}/launch-evidence` — the HTTP twin of the
+/// `capture_launch_evidence` Tauri command: writes the pane's launch evidence
+/// file and provisions the fleet commands into its cwd. `data` is
+/// `{path, cwd, commandsProvisioned}`; an unknown terminal is a 404.
+pub async fn capture_launch_evidence_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<LaunchEvidenceRequest>>,
+) -> Result<
+    Json<ApiResponse<crate::terminal::launch_evidence::LaunchEvidence>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    use crate::terminal::launch_evidence::{capture_launch_evidence, CaptureError};
+
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    let manager = get_terminal_manager(&state);
+    let result = spawn_blocking_tracked(move || {
+        capture_launch_evidence(
+            &manager,
+            &id,
+            request.launch_command,
+            request.config_dir,
+            request.pinned_session_id,
+        )
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("launch evidence: capture task failed: {e}"))),
+        )
+    })?;
+    match result {
+        Ok(evidence) => Ok(Json(ApiResponse::success(evidence))),
+        Err(e @ CaptureError::TerminalNotFound(_)) => {
+            Err((StatusCode::NOT_FOUND, Json(api_error(e.to_string()))))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )),
+    }
+}
+
+/// `GET /terminals/{id}/launch-failure` — the shim's launch-failure record for
+/// this pane: `data` is `{"recorded": false}` or `{"recorded": true, "kind",
+/// "detail", "settings", "userChoseSession", "atMs"}`. "Not recorded" is not
+/// "launched OK". Reads an in-memory registry, so it answers for any id.
+pub async fn get_launch_failure_handler(
+    Path(id): Path<String>,
+) -> Json<ApiResponse<crate::terminal::launch_evidence::LaunchFailureView>> {
+    Json(ApiResponse::success(
+        crate::terminal::launch_evidence::read_launch_failure(&id),
+    ))
+}
+
 /// Submit a prompt to an interactive TUI running in the terminal (e.g.
 /// Claude Code). Wraps the message in ANSI bracketed-paste markers and
 /// follows it with a bare CR; see [`crate::terminal::session::TerminalSession::submit_prompt`].
@@ -1276,6 +1345,16 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         // Alias — the cheatsheet and intuition both reach for `/output`.
         // Same handler, no behavior difference.
         .route("/terminals/{id}/output", get(get_buffer_handler))
+        // Launch evidence + the shim's launch-failure record for the "Analyze
+        // launch" button (plan 2026-11-20-terminal-launch-failure-analyze-button).
+        .route(
+            "/terminals/{id}/launch-evidence",
+            post(capture_launch_evidence_handler),
+        )
+        .route(
+            "/terminals/{id}/launch-failure",
+            get(get_launch_failure_handler),
+        )
         // Late-bind lookup for the agent's own SessionStart hook — the coord
         // session id mirrored onto this terminal, or `null` when none is bound
         // yet. Read-only. Phase 2 of
@@ -1313,6 +1392,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/terminals/{id}/write"),
         ("GET", "/terminals/{id}/buffer"),
         ("GET", "/terminals/{id}/output"),
+        ("POST", "/terminals/{id}/launch-evidence"),
+        ("GET", "/terminals/{id}/launch-failure"),
         ("GET", "/terminals/{id}/coord-session"),
         ("POST", "/terminals/{id}/submit-prompt"),
         ("POST", "/terminals/{id}/resize"),

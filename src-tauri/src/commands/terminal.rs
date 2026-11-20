@@ -3381,6 +3381,44 @@ async fn poll_and_verify_pinned_session<F>(
     }
 }
 
+/// Capture launch evidence for a pane whose Claude launch failed: one local
+/// file plus fleet-command provisioning into the pane's cwd (plan
+/// `2026-11-20-terminal-launch-failure-analyze-button`, Phase 2). The HTTP twin
+/// is `POST /terminals/{id}/launch-evidence`. Run on a blocking thread because
+/// provisioning probes git and resolves the command registry.
+#[tauri::command]
+pub async fn capture_launch_evidence(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+    launch_command: Option<String>,
+    config_dir: Option<String>,
+    pinned_session_id: Option<String>,
+) -> Result<crate::terminal::launch_evidence::LaunchEvidence, String> {
+    let manager = terminal_manager.inner().clone();
+    spawn_blocking_tracked(move || {
+        crate::terminal::launch_evidence::capture_launch_evidence(
+            &manager,
+            &terminal_id,
+            launch_command,
+            config_dir,
+            pinned_session_id,
+        )
+    })
+    .await
+    .map_err(|e| format!("launch evidence: capture task failed: {e}"))?
+    .map_err(|e| e.to_string())
+}
+
+/// The shim's launch-failure record for one pane: `{recorded: false}` or
+/// `{recorded: true, kind, detail, settings, userChoseSession, atMs}`. The HTTP
+/// twin is `GET /terminals/{id}/launch-failure`.
+#[tauri::command]
+pub fn get_terminal_launch_failure(
+    terminal_id: String,
+) -> crate::terminal::launch_evidence::LaunchFailureView {
+    crate::terminal::launch_evidence::read_launch_failure(&terminal_id)
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// Non-generic because handlers accept concrete `tauri::AppHandle`.

@@ -653,8 +653,16 @@ pub fn save_claude_session_permission(
 ///   synchronously to record the tab), pinned as `--session-id`/`{sessionId}`.
 /// * `is_windows` - PowerShell (`$env:…`) vs POSIX (`VAR=…`) env-prefix + quoting.
 ///
-/// Returns `{ command, pinnedSessionId }` matching the `AiLaunchCommand` TS
-/// contract. `pinnedSessionId` is the passed `session_id` when a real `claude`
+/// * `initial_prompt` - Optional first user turn, appended as the trailing
+///   `-- <prompt>` positional ([`crate::claude_session::launch_spec::initial_prompt_args`]),
+///   so the prompt rides argv instead of being typed after a timer (plan
+///   `2026-11-20-terminal-launch-failure-analyze-button`, D1).
+///
+/// Returns `{ command, pinnedSessionId, promptCarried }` matching the
+/// `AiLaunchCommand` TS contract. `promptCarried` is true only when an
+/// `initial_prompt` was given AND the rendered command carries it — false for
+/// an opaque per-account alias, which drops every spec field (D1's vet
+/// correction), so the caller knows it must deliver the prompt another way. `pinnedSessionId` is the passed `session_id` when a real `claude`
 /// command was built; `null` when the per-account override was an opaque alias
 /// returned verbatim (no pin — the mtime-capture fallback then applies). The
 /// alias case is detected the same way the frontend did: a pinned command
@@ -664,10 +672,9 @@ pub fn build_ai_launch_command(
     config_dir: String,
     session_id: Option<String>,
     is_windows: bool,
+    initial_prompt: Option<String>,
 ) -> Result<CommandResponse, String> {
-    use crate::claude_session::launch_spec::{
-        render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
-    };
+    use crate::claude_session::launch_spec::LaunchConfig;
 
     // A declared model gateway owns the session's account: the typed
     // `CLAUDE_CONFIG_DIR` prefix names the gateway config dir, never the
@@ -684,33 +691,84 @@ pub fn build_ai_launch_command(
     )?;
     crate::claude_session::launch_spec::check_shell_safe_path(&config_dir)?;
     let cfg = LaunchConfig::from_settings(Some(&config_dir));
+    // Clear vendor env the pane's shell may hold (review N2).
+    let scrub_prefix = gateway_declared.then(|| crate::model_gateway::env_scrub_prefix(is_windows));
+    let launch = render_ai_launch(
+        config_dir,
+        session_id,
+        is_windows,
+        initial_prompt.as_deref(),
+        &cfg,
+        scrub_prefix.as_deref(),
+    )?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "command": launch.command,
+            "pinnedSessionId": launch.pinned_session_id,
+            "promptCarried": launch.prompt_carried,
+        })),
+    })
+}
+
+/// What [`build_ai_launch_command`] answers, before it is wrapped in JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AiLaunch {
+    command: String,
+    pinned_session_id: Option<String>,
+    prompt_carried: bool,
+}
+
+/// The settings-free core of [`build_ai_launch_command`]: render the typed
+/// launch for `config_dir` under `cfg`, with `initial_prompt` as the trailing
+/// positional, and report what the rendered text actually carries.
+///
+/// A blank `initial_prompt` is no prompt. Both reports read the RENDERED
+/// command: an opaque alias drops the pin and the prompt alike, and saying it
+/// carried either would make the caller skip the fallback it needs.
+fn render_ai_launch(
+    config_dir: String,
+    session_id: Option<String>,
+    is_windows: bool,
+    initial_prompt: Option<&str>,
+    cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    scrub_prefix: Option<&str>,
+) -> Result<AiLaunch, String> {
+    use crate::claude_session::launch_spec::{
+        initial_prompt_args, pty_command_carries_prompt, render_pty_command, LaunchSpec,
+        PermissionMode,
+    };
+
+    let initial_prompt = initial_prompt.filter(|p| !p.trim().is_empty());
+    let extra_required = match initial_prompt {
+        Some(prompt) => initial_prompt_args(prompt)?,
+        None => Vec::new(),
+    };
     let spec = LaunchSpec {
         config_dir: Some(config_dir),
         permission: PermissionMode::BypassPermissions,
         session_id: session_id.clone(),
+        extra_required,
         ..Default::default()
     };
-    let mut command = render_pty_command(&spec, &cfg, is_windows);
-    if gateway_declared {
-        // Clear vendor env the pane's shell may hold (review N2).
-        command = format!(
-            "{}{command}",
-            crate::model_gateway::env_scrub_prefix(is_windows)
-        );
+    let mut command = render_pty_command(&spec, cfg, is_windows);
+    if let Some(prefix) = scrub_prefix {
+        command = format!("{prefix}{command}");
     }
 
     let pinned_session_id = match &session_id {
         Some(id) if command.contains(id.as_str()) => Some(id.clone()),
         _ => None,
     };
+    let prompt_carried =
+        initial_prompt.is_some_and(|p| pty_command_carries_prompt(&command, p, is_windows));
 
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: Some(serde_json::json!({
-            "command": command,
-            "pinnedSessionId": pinned_session_id,
-        })),
+    Ok(AiLaunch {
+        command,
+        pinned_session_id,
+        prompt_carried,
     })
 }
 
@@ -1202,5 +1260,83 @@ mod resume_render_tests {
         );
         assert_eq!(resume_gate_env(Some("\"$(id)\""), Some(DEVICE), true), none);
         assert_eq!(resume_gate_env(None, None, false), none);
+    }
+}
+
+#[cfg(test)]
+mod ai_launch_prompt_tests {
+    use super::{render_ai_launch, AiLaunch};
+    use crate::claude_session::launch_spec::LaunchConfig;
+
+    const SID: &str = "230feb99-2dd7-42d7-92bc-6d36c1883089";
+    const PROMPT: &str = "/analyze-launch-failure /h/.qontinui/launch-evidence/t1-20261120T101500Z.md";
+
+    /// The composed path carries the prompt as argv and says so.
+    #[test]
+    fn ai_launch_prompt_carried_on_the_composed_path() {
+        let launch = render_ai_launch(
+            "/h/.claude-x".to_string(),
+            Some(SID.to_string()),
+            false,
+            Some(PROMPT),
+            &LaunchConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            launch,
+            AiLaunch {
+                command: format!(
+                    "CLAUDE_CONFIG_DIR=\"/h/.claude-x\" claude --permission-mode \
+                     bypassPermissions --session-id {SID} -- '{PROMPT}'"
+                ),
+                pinned_session_id: Some(SID.to_string()),
+                prompt_carried: true,
+            }
+        );
+    }
+
+    /// An opaque alias drops the prompt, and `promptCarried` says false.
+    #[test]
+    fn ai_launch_prompt_not_carried_by_an_alias_account() {
+        let cfg = LaunchConfig {
+            account_command: Some("clh".to_string()),
+            ..Default::default()
+        };
+        let launch = render_ai_launch(
+            "/h/.claude-x".to_string(),
+            Some(SID.to_string()),
+            false,
+            Some(PROMPT),
+            &cfg,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            launch,
+            AiLaunch {
+                command: "clh".to_string(),
+                pinned_session_id: None,
+                prompt_carried: false,
+            }
+        );
+    }
+
+    /// No prompt (or a blank one) is never "carried", and adds no positional.
+    #[test]
+    fn ai_launch_prompt_absent_is_not_carried() {
+        for prompt in [None, Some("  ")] {
+            let launch = render_ai_launch(
+                "/h/.claude-x".to_string(),
+                Some(SID.to_string()),
+                true,
+                prompt,
+                &LaunchConfig::default(),
+                None,
+            )
+            .unwrap();
+            assert!(!launch.prompt_carried);
+            assert!(!launch.command.contains(" -- "), "{}", launch.command);
+        }
     }
 }

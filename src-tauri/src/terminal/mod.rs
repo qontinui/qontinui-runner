@@ -29,6 +29,7 @@ pub mod holder_census;
 #[cfg(test)]
 mod idle_chrome_replay;
 pub mod interceptor;
+pub mod launch_evidence; // Launch-evidence capture + per-pane launch-failure read for the "Analyze launch" button (plan 2026-11-20-terminal-launch-failure-analyze-button, Phase 2)
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
 pub(crate) mod limit_stop; // transcript-read usage-limit stop classifier (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 1); first caller lands in Phase 2
 pub mod manager;

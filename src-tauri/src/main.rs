@@ -3614,6 +3614,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::task_sync::sync_ai_task_created,
             commands::task_sync::sync_all_pending_ai_tasks,
             commands::task_sync::sync_deferred_questions,
+            commands::terminal::capture_launch_evidence,
+            commands::terminal::get_terminal_launch_failure,
             commands::terminal::terminal_ack,
             commands::terminal::terminal_cleanup_scrollback,
             commands::terminal::terminal_close,
