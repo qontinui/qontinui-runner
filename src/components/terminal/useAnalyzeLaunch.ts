@@ -138,7 +138,7 @@ export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
         return;
       }
       // Every failure is toasted. `not-provisioned` opens no pane at all; its
-      // toast names the evidence path to run by hand. Any other failure that
+      // toast gives the `/analyze-launch-failure <evidence path>` line to run by hand. Any other failure that
       // happened after the pane was created focuses that pane (D1).
       if (outcome.analyzerTabId) focusAnalyzer(outcome.analyzerTabId);
       console.error(`[AnalyzeLaunch] ${outcome.step}: ${outcome.message}`);

@@ -3,7 +3,7 @@
  * The late launch re-check must stop when the Terminal page unmounts: the
  * hook's `tabs` ref freezes then, so nothing else would end the 5-minute loop.
  */
-import { act, createElement, useEffect } from "react";
+import { StrictMode, act, createElement, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -44,6 +44,7 @@ function args() {
 
 let container: HTMLDivElement;
 let root: Root;
+let mounted = false;
 const holder: { api: Api | null } = { api: null };
 const TAB_ARGS = args();
 
@@ -61,10 +62,15 @@ beforeEach(() => {
   holder.api = null;
   container = document.createElement("div");
   root = createRoot(container);
-  act(() => root.render(createElement(Harness)));
+  mounted = true;
+  // StrictMode mounts, unmounts and remounts effects: the guard's reset on
+  // mount is what keeps it working there, so the test runs under it.
+  act(() => root.render(createElement(StrictMode, null, createElement(Harness))));
 });
 
 afterEach(() => {
+  if (mounted) act(() => root.unmount());
+  mounted = false;
   vi.clearAllMocks();
 });
 
@@ -74,6 +80,7 @@ describe("useAnalyzeLaunch verifyLaunch", () => {
     expect(watch.isActive).not.toBeNull();
     expect(watch.isActive!()).toBe(true);
     act(() => root.unmount());
+    mounted = false;
     expect(watch.isActive!()).toBe(false);
   });
 
@@ -83,6 +90,5 @@ describe("useAnalyzeLaunch verifyLaunch", () => {
     act(() => holder.api!.verifyLaunch("t1"));
     expect(first()).toBe(false);
     expect(watch.isActive!()).toBe(true);
-    act(() => root.unmount());
   });
 });
