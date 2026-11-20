@@ -42,11 +42,18 @@
 //! - `context_watcher` fires at most once per session and re-evaluates a pure
 //!   predicate over the same text.
 //! - `usage_limit` is debounce-triggered; skipping means a limit message that
-//!   is *still frozen on screen* no longer re-fires the hint every 300 s. That
-//!   is the intended reading of the debounce (one hint per appearance), and a
-//!   genuinely new appearance is always followed by a bump of the counter that
-//!   painted it. The one screen it must not skip is a match the debounce has
-//!   just suppressed, which [`ScanGate::forget`] keeps due until it can fire.
+//!   is *still frozen on screen* does not re-fire the hint every 300 s merely
+//!   for still being there, and a genuinely new appearance is always followed
+//!   by a bump of the counter that painted it. Two screens it must not skip,
+//!   and [`ScanGate::forget`] keeps each due. One is a match the debounce has
+//!   just suppressed, until it can fire. The other is a frozen screen whose
+//!   hint did not migrate the session but might later — no usable target yet,
+//!   a failed migration that started no resumed `claude`, a concurrent
+//!   migration, or (once per appearance) an unconfirmed probe — which then
+//!   fires again each time the debounce allows (`usage_limit::after_hint`). A
+//!   migration that failed after its resumed `claude` may have started is not
+//!   kept due: it rests. So a limit screen gets one hint per appearance only
+//!   when that hint's outcome is final.
 //!
 //! Reading the counter *before* rendering is safe in both directions: a stale
 //! read (the bump lands after the load) costs one deferred scan on the next

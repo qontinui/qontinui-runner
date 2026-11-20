@@ -62,6 +62,7 @@ use futures::future::BoxFuture;
 use tracing::{info, warn};
 
 use super::account_migration::{probe_idle_prompt, IdlePromptProbe, ReadyDebounce};
+use super::spawn_refusal::SpawnFailure;
 use crate::session::session_lifecycle_store::{
     HeldClose, SessionLifecycleStore, TerminalSessionRecord, USER_CLOSE_REASON,
 };
@@ -234,8 +235,13 @@ pub(crate) trait RespawnEffects {
     /// respawn, from BEFORE the first spawn re-keys its row.
     fn claude_session_id(&self) -> &str;
     /// Spawn the next resumed pane (async binary pre-step, then the seam).
-    /// `Ok(terminal_id)`; the spawn re-keys the session's row onto it.
-    fn spawn_next(&mut self) -> impl Future<Output = Result<String, String>> + Send;
+    /// `Ok(terminal_id)`; the spawn re-keys the session's row onto it. A
+    /// failure keeps [`SpawnFailure::child_started`]: a spawn that failed
+    /// after its resumed `claude` started may have left that child running
+    /// with no pane this respawn knows, so nothing may be spawned beside it
+    /// (see [`confirm_respawn`]'s retry loop). A pre-step failure (no binary
+    /// resolved) started nothing: [`SpawnFailure::before_child`].
+    fn spawn_next(&mut self) -> impl Future<Output = Result<String, SpawnFailure>> + Send;
     /// Judge one pane ([`await_resumed_cli`] in production).
     fn await_liveness(&mut self, terminal_id: &str)
         -> impl Future<Output = LivenessVerdict> + Send;
@@ -325,8 +331,10 @@ impl PaneOps for ManagerPanes {
 /// How a respawn ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RespawnOutcome {
-    /// The FIRST spawn failed: nothing moved, no pane was created.
-    NotSpawned(String),
+    /// The FIRST spawn failed: nothing moved, no pane was created. When the
+    /// failure is [`SpawnFailure::child_started`], a resumed `claude` may
+    /// still run with no pane: see [`Self::child_may_run`].
+    NotSpawned(SpawnFailure),
     /// The resumed CLI is painting on `terminal_id`. With an old pane, it has
     /// been marked superseded and closed.
     Alive {
@@ -358,14 +366,40 @@ pub(crate) enum RespawnOutcome {
     OldPaneClosed { attempts: usize },
     /// Every attempt died (or a retry could not spawn). The last dead pane is
     /// closed; with an old pane the pre-respawn record is restored onto it.
+    /// A retry spawn that failed after its child started ends the retries at
+    /// once (`retry_spawn_error` is that failure, see [`Self::child_may_run`]).
     Died {
         exit_code: Option<i32>,
         attempts: usize,
-        retry_spawn_error: Option<String>,
+        retry_spawn_error: Option<SpawnFailure>,
+        /// `true` when the pre-respawn record was restored onto a still
+        /// running OLD pane (a migration's rollback): the session is back
+        /// where it was. `false` when there was no old pane, or it was gone,
+        /// and the session ended with its last dead pane.
+        rolled_back: bool,
     },
 }
 
 impl RespawnOutcome {
+    /// Whether a resumed `claude` this respawn started may still be running
+    /// with no pane it knows: a spawn that failed after its child started
+    /// ([`SpawnFailure::child_started`]) — the first one ([`Self::NotSpawned`])
+    /// or the retry that ended a [`Self::Died`]. A caller must not respawn the
+    /// session beside it: that could run two `claude --resume` of one session.
+    pub(crate) fn child_may_run(&self) -> bool {
+        match self {
+            Self::NotSpawned(failure) => failure.child_started,
+            Self::Died {
+                retry_spawn_error, ..
+            } => retry_spawn_error.as_ref().is_some_and(|f| f.child_started),
+            Self::Alive { .. }
+            | Self::Unconfirmed { .. }
+            | Self::UnconfirmedRolledBack { .. }
+            | Self::ClosedByUser { .. }
+            | Self::OldPaneClosed { .. } => false,
+        }
+    }
+
     /// The `respawn-died: exit <code> after <n> attempts` reason.
     pub(crate) fn died_reason(exit_code: Option<i32>, attempts: usize) -> String {
         let code = exit_code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
@@ -654,7 +688,7 @@ enum Failure {
     /// Every attempt died (or could not spawn).
     Died {
         exit_code: Option<i32>,
-        retry_spawn_error: Option<String>,
+        retry_spawn_error: Option<SpawnFailure>,
     },
     /// The user closed a pane under proof; this is their close.
     ClosedByUser(HeldClose),
@@ -687,6 +721,7 @@ fn end_failed(
         return RespawnOutcome::OldPaneClosed { attempts };
     }
     let panes = Arc::clone(&hold.panes);
+    let rolled_back = matches!((old, old_state), (Some(_), Some(OldPane::Running)));
     match (old, old_state) {
         (Some(old), Some(OldPane::Running)) => {
             // Roll back: the row, its account and every re-keyed field go back
@@ -724,6 +759,7 @@ fn end_failed(
             exit_code,
             attempts,
             retry_spawn_error,
+            rolled_back,
         },
     }
 }
@@ -951,8 +987,17 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                             continue 'proof;
                         }
                         Err(e) => {
-                            warn!(attempt = attempts, error = %e, "respawn-liveness: retry spawn failed");
+                            warn!(attempt = attempts, error = %e, child_started = e.child_started, "respawn-liveness: retry spawn failed");
+                            let child_started = e.child_started;
                             retry_spawn_error = Some(e);
+                            if child_started {
+                                // That spawn's resumed `claude` may still run,
+                                // in no pane this respawn knows. Another retry
+                                // would start a second `claude --resume` of
+                                // the session beside it: stop here, and let
+                                // the caller see it (`child_may_run`).
+                                break;
+                            }
                         }
                     }
                 }
@@ -1253,7 +1298,7 @@ mod tests {
     struct Fake<'a> {
         store: &'a SessionLifecycleStore,
         verdicts: VecDeque<LivenessVerdict>,
-        spawn_errors: VecDeque<Option<String>>,
+        spawn_errors: VecDeque<Option<SpawnFailure>>,
         spawned: Vec<String>,
         panes: Arc<FakePanes>,
         /// When set, a pane judged `Died` first delivers its exit-close — the
@@ -1340,7 +1385,7 @@ mod tests {
         fn claude_session_id(&self) -> &str {
             SID
         }
-        async fn spawn_next(&mut self) -> Result<String, String> {
+        async fn spawn_next(&mut self) -> Result<String, SpawnFailure> {
             if let Some(Some(e)) = self.spawn_errors.pop_front() {
                 if self.close_old_in_failing_retry_spawn && !self.spawned.is_empty() {
                     let o = self
@@ -1539,7 +1584,8 @@ mod tests {
             RespawnOutcome::Died {
                 exit_code: Some(1),
                 attempts: 3,
-                retry_spawn_error: None
+                retry_spawn_error: None,
+                rolled_back: true,
             }
         );
         assert_eq!(fx.spawned.len(), 3);
@@ -1580,8 +1626,8 @@ mod tests {
         // Every retry spawn fails, so the budget is spent on spawn errors.
         fx.spawn_errors = vec![
             None,
-            Some("claude_cli_unavailable:not_found".into()),
-            Some("claude_cli_unavailable:not_found".into()),
+            Some(SpawnFailure::before_child("claude_cli_unavailable:not_found")),
+            Some(SpawnFailure::before_child("claude_cli_unavailable:not_found")),
         ]
         .into();
         // Simulate `poll-dead` on the dead pane between spawn and rollback.
@@ -1590,7 +1636,7 @@ mod tests {
             fn claude_session_id(&self) -> &str {
                 SID
             }
-            async fn spawn_next(&mut self) -> Result<String, String> {
+            async fn spawn_next(&mut self) -> Result<String, SpawnFailure> {
                 self.0.spawn_next().await
             }
             async fn await_liveness(&mut self, t: &str) -> LivenessVerdict {
@@ -1706,9 +1752,13 @@ mod tests {
         let (_d, store) = fresh_store();
         let old = record("old", "/src");
         let mut fx = Fake::new(&store, vec![]);
-        fx.spawn_errors = vec![Some("boom".into())].into();
+        fx.spawn_errors = vec![Some(SpawnFailure::before_child("boom"))].into();
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::NotSpawned("boom".into()));
+        assert_eq!(
+            out,
+            RespawnOutcome::NotSpawned(SpawnFailure::before_child("boom"))
+        );
+        assert!(!out.child_may_run());
         assert!(fx.closed().is_empty());
         assert_eq!(store.get(SID).unwrap().terminal_id, "old");
     }
@@ -1966,7 +2016,7 @@ mod tests {
             fn claude_session_id(&self) -> &str {
                 SID
             }
-            async fn spawn_next(&mut self) -> Result<String, String> {
+            async fn spawn_next(&mut self) -> Result<String, SpawnFailure> {
                 self.0.record_open(record("new-1", "/dst"));
                 Ok("new-1".into())
             }
@@ -2081,7 +2131,12 @@ mod tests {
             &store,
             vec![LivenessVerdict::Died(Some(127)), LivenessVerdict::Alive],
         );
-        fx.spawn_errors = vec![None, Some("claude_cli_unavailable:not_found".into()), None].into();
+        fx.spawn_errors = vec![
+            None,
+            Some(SpawnFailure::before_child("claude_cli_unavailable:not_found")),
+            None,
+        ]
+        .into();
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
         assert_eq!(
             out,
@@ -2089,6 +2144,85 @@ mod tests {
                 terminal_id: "new-2".into(),
                 attempts: 3
             }
+        );
+    }
+
+    /// A retry spawn that failed AFTER its resumed `claude` started ends the
+    /// retries: that child may still run in no pane the respawn knows, and a
+    /// further spawn would resume the session a second time beside it. The
+    /// outcome says so (`child_may_run`). Mutation: drop the `break` on
+    /// `child_started` in the retry loop — the third attempt then spawns.
+    #[tokio::test]
+    async fn a_retry_spawn_that_failed_after_its_child_started_ends_the_retries() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127))]);
+        fx.spawn_errors = vec![
+            None,
+            Some(SpawnFailure::after_child("terminal reader wiring failed")),
+            None,
+        ]
+        .into();
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 2,
+                retry_spawn_error: Some(SpawnFailure::after_child(
+                    "terminal reader wiring failed"
+                )),
+                rolled_back: true,
+            }
+        );
+        assert!(out.child_may_run());
+        assert_eq!(fx.spawned, vec!["new-1"], "no spawn after the child started");
+        assert_eq!(store.get(SID).unwrap().terminal_id, "old");
+
+        // A retry spawn that failed BEFORE its child keeps retrying, and the
+        // outcome has no child to worry about.
+        let (_d, store) = fresh_store();
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 2]);
+        fx.spawn_errors = vec![None, Some(SpawnFailure::before_child("pty open failed")), None].into();
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert!(
+            matches!(out, RespawnOutcome::Died { attempts: 3, .. }),
+            "{out:?}"
+        );
+        assert!(!out.child_may_run());
+        assert_eq!(fx.spawned.len(), 2);
+    }
+
+    /// A first spawn that failed after its child started moves nothing, and
+    /// says a child may run.
+    #[tokio::test]
+    async fn a_first_spawn_that_failed_after_its_child_started_says_so() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![]);
+        fx.spawn_errors = vec![Some(SpawnFailure::after_child("sessions lock poisoned"))].into();
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert!(out.child_may_run(), "{out:?}");
+        assert!(fx.closed().is_empty());
+        assert_eq!(store.get(SID).unwrap().terminal_id, "old");
+    }
+
+    /// `rolled_back` tells a death the session survived (back on the running
+    /// old pane) from one it ended with.
+    #[tokio::test]
+    async fn a_died_respawn_says_whether_it_rolled_back() {
+        let (_d, store) = fresh_store();
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 3]);
+        let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
+        assert!(
+            matches!(
+                out,
+                RespawnOutcome::Died {
+                    rolled_back: false,
+                    ..
+                }
+            ),
+            "no old pane: the session ended with its last pane: {out:?}"
         );
     }
 
@@ -2103,7 +2237,7 @@ mod tests {
             fn claude_session_id(&self) -> &str {
                 SID
             }
-            async fn spawn_next(&mut self) -> Result<String, String> {
+            async fn spawn_next(&mut self) -> Result<String, SpawnFailure> {
                 let id = self.0.spawn_next().await?;
                 let mut rec = record(&id, "/dst");
                 rec.account_label = Some("dst-account".into());
@@ -2339,7 +2473,7 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127))]);
         fx.exit_close = true;
         // First spawn succeeds (no error), the second (the last retry) fails.
-        fx.spawn_errors = VecDeque::from(vec![None, Some("spawn failed".to_string())]);
+        fx.spawn_errors = VecDeque::from(vec![None, Some(SpawnFailure::before_child("spawn failed"))]);
         fx.close_old_in_failing_retry_spawn = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), 2).await;
         assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 2 });

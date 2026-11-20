@@ -1091,7 +1091,7 @@ fn proven_terminal(
             );
             Ok(terminal_id)
         }
-        RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e)),
+        RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e.into())),
         // An old-pane close is a migration's only (no old pane here).
         RespawnOutcome::ClosedByUser { .. } | RespawnOutcome::OldPaneClosed { .. } => {
             Err(RespawnError::ClosedByUser)
@@ -1138,7 +1138,9 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
         self.claude_session_id
     }
 
-    async fn spawn_next(&mut self) -> Result<String, String> {
+    async fn spawn_next(
+        &mut self,
+    ) -> Result<String, crate::terminal::spawn_refusal::SpawnFailure> {
         // The async pre-step: the ABSOLUTE binary, retried, never bare — the
         // one resolved before the cap check for the first spawn.
         let claude_bin = match self.first_bin.take() {
@@ -1147,7 +1149,8 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
                 crate::claude_cli_spawn::resolve_resume_claude_bin(
                     &crate::claude_cli_spawn::RETRY_DELAYS,
                 )
-                .await?
+                .await
+                .map_err(crate::terminal::spawn_refusal::SpawnFailure::before_child)?
             }
         };
         crate::terminal::account_migration::spawn_resumed_pane(
@@ -1710,6 +1713,7 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 retry_spawn_error: None,
+                rolled_back: false,
             },
         )
         .unwrap_err();
@@ -1724,7 +1728,9 @@ mod tests {
             "a died respawn must not claim it stays pending: {msg}"
         );
         assert!(matches!(
-            proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned("x".into())),
+            proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned(
+                    crate::terminal::spawn_refusal::SpawnFailure::before_child("x")
+                )),
             Err(RespawnError::Spawn(_))
         ));
         // A running-but-unpainted pane holds the session: reported Ok, so the
