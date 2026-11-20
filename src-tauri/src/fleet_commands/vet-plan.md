@@ -2433,13 +2433,14 @@ runs at most about 90 s, inside the Bash tool's 120 s default:
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --reason "<why>"
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "<why>"
 ```
 
 Quote its final verdict line in the §6 report (`RELEASED` is exit 0; a
-`NET_UNRETIRED`, `NET_MUTED` or `NET_FIRED` line names a net id to report, as
-does a `NET_CANCELLED` line whose mute did not land; `UNKNOWN` (2) and usage (64)
-released NOTHING, so run it again once the cause is fixed).
+`NET_UNRETIRED`, `NET_CANCELLED` or `NET_FIRED` line names a net id to report;
+`RELEASE_WITHHELD` (7), `UNKNOWN` (2) and usage (64) released NOTHING, so run it
+again once the cause is fixed, and do not stop the heartbeat loop after a 7 —
+`/implement-plan` Step 0.48 has the exit-7 remedies).
 The release MUST carry the SAME `agent_session_id` used at acquire — the owner
 token is the match key, so omitting it (or sending a different session) returns
 `"not_held"` and leaves the reservation to TTL out; the script resolves the pair

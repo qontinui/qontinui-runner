@@ -3501,9 +3501,11 @@ never recorded as finished.
 > `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
 A plan reserve this session still holds is released by the closeout that took
-it, through `scripts/plan-reserve-release.sh release`, which withdraws the plan's
-`implement→ship safety net` first (at most about 90 s); never by a hand-rolled
-`/claims/release`.
+it, through `scripts/plan-reserve-release.sh release --repo <owner/name>`, which
+withdraws the plan's `implement→ship safety net` first, under the tenant proven
+to own the repo (at most about 90 s); never by a hand-rolled `/claims/release`.
+Exit 7 `RELEASE_WITHHELD` released nothing: the net it names is still armed, so
+fix the cause and release again before finishing (`/implement-plan` Step 0.48).
 
 Run **`/finish-session`** with a reason naming the audit result, e.g.
 `--reason "unattended: 7 units, all landed"`, and enter it at **Part A** —

@@ -1133,15 +1133,31 @@ door, then `stop` the loop.** `plan-reserve-release.sh release` withdraws this
 plan's implement→ship net (Step 0.5) FIRST, then `remove`s the heartbeat row, then
 POSTs `/claims/release`: a release with the net still open clears it and dispatches
 a duplicate session. `<why>` becomes the net's reason, `implement→ship net
-retired: <why>`; drop `--net-gate` when Step 0.5 armed no net. It finds the
+retired: <why>`; drop `--net-gate` when Step 0.5 armed no net. Pass `--repo
+"<owner/name>"` for the plan's repo (its **Repo(s):** line): the script proves
+which of this device's tenants owns it and reads and writes the net under that
+tenant (served `coordination` `repo-writes-go-to-the-owning-tenant`). Without
+it, the script derives the repo from the cwd checkout's origin. It finds the
 session's ledger itself (no `--ledger`) and runs at most about 90 s, inside the
 Bash tool's 120 s default (its RUNTIME header):
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --net-gate "<net gate_id>" --reason "<why>"
+  --stem "<plan-stem>" --repo "<owner/name>" --net-gate "<net gate_id>" --reason "<why>"
+# Only after reading its final line: NOT on exit 7, 2 or 64 (below).
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh stop --ledger "$CLAIM_LEDGER"
 ```
+
+⚠️ **Exit 7 `RELEASE_WITHHELD` means NOTHING was released and the heartbeat row
+was kept** (`release=withheld heartbeat=kept`). A net could not be retired or
+read, so the script refused to clear it by releasing. Do **not** run `stop`.
+Fix the cause the `NET_UNRETIRED` line names and run the release again: a plan
+another tenant owns needs `--repo`, and an expired device JWT needs a fresh
+one. Or withdraw the net by hand
+(`coord-owner-call.sh --repo <owner/name> --call coord_withdraw_gate
+'{"gate_id":"<id>","reason":"<why>"}'`) and run it again. Only after a named
+remedy has failed, pass `--release-with-unretired-net` and report the net id as
+unretired, because a redundant session is then expected.
 
 `remove` of the last row stops the loop by itself and `stop` is idempotent
 **once the ledger is empty**, so running `stop` after the script is safe. Both are
@@ -1173,20 +1189,30 @@ that outlived KILL will NOT end by itself, so name its pid as left behind.
 "`stop` reports only what it observes".
 
 The script prints a line per net it found, then ONE final verdict line; quote
-that line in your report. `RELEASED` (exit 0) is clean. `NET_UNRETIRED <id|unknown>`
-(3): the net read or a withdraw failed, a `--net-gate` was not this plan's net, or
-the 60 s retire budget ran out, and the release ran anyway, so report the
-id (or `unknown`) as unretired and say a redundant session is expected (Step 0.5).
+that line in your report. `RELEASED` (exit 0) is clean. `RELEASE_WITHHELD
+<id|unknown>` (7): the net read or a withdraw failed, a `--net-gate` was not this
+plan's net, or the 60 s retire budget ran out, so nothing was released (above).
+`NET_UNRETIRED <id|unknown>` (3) is the same failure under
+`--release-with-unretired-net`: the release ran, so report the id (or `unknown`)
+as unretired and say a redundant session is expected (Step 0.5).
 `NET_FIRED <id>` (6): the net `--net-gate` names had already fired, so report the
 duplicate it dispatched; a consumed net it does not name is read as a predecessor's
 (`NET_INERT`) and changes nothing. `NOT_HELD` (4) and `RELEASE_UNKNOWN` (5) are the
 release half, below. `UNKNOWN` (2: no machine id, or no temp dir) and a usage
 error (64) did nothing and released NOTHING: the reserve is still held, so fix
 the cause and run it again.
-A `NET_MUTED <id>` line is the `NotRegistrant` fallback (cancel, then mute), and a
-`NET_CANCELLED <id>` line saying the mute did not land is that fallback one step
-short. Both nets stay open: name each id in your closeout (the final line's `--`
-note lists them).
+A `NET_CANCELLED <id>` line saying the withdraw was refused as not-the-registrant
+is the `NotRegistrant` fallback: the continuation is cancelled and the gate is
+never muted, so the release clears it inert. The final line's `--` note names it.
+`owner=` names the tenant whose bearer carried the gate doors. `owner=-` (no
+repo), `refuted`, and `unknown` with `owner_src=cwd` or `owner_src=-` (no
+`--repo`, and the proof could not run) mean the session's own doors carried
+them. `proven` (proven, but its bearer was only a bootstrap mint,
+or could not be read) and `unknown` with `owner_src=flag` mean NO door read the
+plan on a device bound to several tenants (or of unknown bindings): the
+session's default tenant is never asked in the owner's place, so the release is
+withheld (exit 7). On a device proven bound to ONE tenant the session's own
+doors read in both cases, since that tenant is the only possible owner.
 `holder=unknown` means the holder read failed and the script fell back to
 device-wide selection, so a net of another holder on this same device may have
 been touched: check the per-net lines before you report.
@@ -1586,14 +1612,15 @@ different device, on the same device when both sides carry differing agent ids,
 or on a NULL registrant. You see the MCP error *"only the gate's registrant may
 withdraw it; …"* or HTTP **403** — never the word `NotRegistrant` (full list:
 `_gate-registration` → "Continuation cancel + refresh", point 2). Then, and only then, fall back to two calls on the same
-gate: the cancel above, **then** the mute — `coord_mute_gate` `{gate_id}`, or its
-`/agent/` infix REST twin `POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute`
-— **and write one line naming the gate id in this session's closeout** (e.g.
-*"net `<gate_id>` muted, not withdrawn — NotRegistrant; still in the open set"*),
-because a muted net never leaves the open set on its own. That line is the
-interim until plan
-`2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds` ships
-`coord_retire_gate` (reason code `continuation_retired_and_muted`).
+gate: the cancel above, and **never the mute** (served `coordination`
+`gate-lifecycle-end`: a muted gate is skipped by the sweep and stays open for
+ever, while a gate whose continuation is cancelled still clears on its own
+predicate, inert, and dispatches nothing). **Write one line naming the gate id in
+this session's closeout** (e.g. *"net `<gate_id>` cancelled, not withdrawn —
+NotRegistrant; it clears inert"*). `plan-reserve-release.sh` takes the same
+cancel-only fallback (plan
+`2026-11-20-plan-reserve-release-routes-the-net-to-the-owning-tenant-and-withholds-an-unretired-release`
+D4).
 
 **Branch on the GATE ROW, not on an HTTP status.** Resolve the work unit for
 this plan-stem, then `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` and look
@@ -4451,7 +4478,13 @@ catches the ARTIFACT half of this drift (`contradiction_head_drift`); this
 trailer is the half coord's gate reads, and the two agree only when both are
 re-written for the same head — a re-review that re-records the artifact and
 forgets the body edit leaves a PR that corroborates locally and is refused by
-coord.
+coord. A **base-sync** corroboration is the second way to land there: when coord
+(e.g. `qontinui-merge-orchestrator[bot]`) pushes a clean merge of main onto the
+PR, Step 4.7 reads the row `corroborated` with `head_relation: base_sync`, but
+coord's `require_review` compares this trailer with the PR's current head by
+EQUALITY, so the old trailer no longer matches. Step 4.7's script does not
+rewrite the trailer; when `require_review` is on, the new head needs its own
+reviewed record.
 
 #### Step 4.5b: Open the PR in the served door order — then READ it back before anything uses its number
 
@@ -4809,14 +4842,18 @@ touched), and exits on the **worst** verdict:
 
 | exit | verdict | what it means | what you do |
 |---|---|---|---|
-| `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, the re-measured tree equals the artifact's `reviewed_tree`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
-| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`pr-body-publish.sh <owner>/<repo> <n> <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
-| `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the detail quotes the bound the door named, or says UNKNOWN-bound when the door's line names none) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared (`unknown_tree`), for example: no `--tree-root` covers the row's repo; no worktree stood at the reviewed head at the recorded time (reaped, or never offered — a same-named checkout is never a substitute); ANY candidate worktree's HEAD reflog cannot answer (logging off, an unreadable or gapped log, a gc-emptied log on a worktree standing at the reviewed head or a newer commit, a review older than the reflog expiry) or a root git could not list, which blocks the row even when the reviewed worktree is intact; the row's `measured=` time or its `reviewed_tree` line cannot be parsed; two or more worktrees were bound and now disagree; the producer refused or timed out; or a line carries the unresolved sentinel (two unresolved measurements never compare SAME). The row's detail names which | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
+| `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha` — or differs from it only by **proven base-sync steps** (`head_relation: base_sync`: clean merges of the base branch, or empty commits, after the reviewed head; counted by the verdict line's `base_sync=K` token) — the re-measured tree equals the artifact's `reviewed_tree` (or, on a `base_sync` row, advanced clean onto one of its proven steps from a tree recorded clean at the reviewed head), and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below; a `base_sync` row does NOT satisfy coord's equality-based `require_review` gate (Step 4.5's trailer paragraph) |
+| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see, and the row's `head_relation` names the measured fault: `new_commit` (a commit after the review changes the tree), `conflicted_merge` (a merge whose conflict resolution no review saw), `evil_merge` (a merge carrying content beyond the mechanical merge), `foreign_merge` (a merge of something not on the base) or `rewritten` (a force-push or rebase: the reviewed commit is not in the PR's history); `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`pr-body-publish.sh <owner>/<repo> <n> <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
+| `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the detail quotes the bound the door named, or says UNKNOWN-bound when the door's line names none) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), a head that differs could not be classified (`unknown_head_relation` — `head_relation: unmeasured` or `unrecognised`; the detail names the read that failed, e.g. no `--tree-root` whose origin names the repo, a shallow or partial-clone store, a commit absent after the bounded fetch, a git too old for the read), coord's card is **behind** the review (`unknown_card_behind_review` — its head is a strict ancestor of the reviewed one, so it cannot show what the PR carries), or the tree could not be compared (`unknown_tree`), for example: no `--tree-root` covers the row's repo; no worktree stood at the reviewed head at the recorded time (reaped, or never offered — a same-named checkout is never a substitute); ANY candidate worktree's HEAD reflog cannot answer (logging off, an unreadable or gapped log, a gc-emptied log on a worktree standing at the reviewed head or a newer commit, a review older than the reflog expiry) or a root git could not list, which blocks the row even when the reviewed worktree is intact; the row's `measured=` time or its `reviewed_tree` line cannot be parsed; two or more worktrees were bound and now disagree; the producer refused or timed out; or a line carries the unresolved sentinel (two unresolved measurements never compare SAME). The row's detail names which | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
 | `4` | **USAGE** | no artifact, no session id | the same finding Step 6 item 6 names: the review gate never wrote its record |
 | any other | **UNKNOWN** | any other exit (1, 129/130/143, …): the run did not complete — a crash, or a HUP / INT / TERM, e.g. a foreground Bash-tool timeout — and the artifact may or may not have been rewritten | report *"corroboration UNKNOWN: the run did not complete (exit <n>)"*; never corroborated |
 
 **The verdict line carries TWO halves — `heads=<n>/<m>` and `coverage=<…>` —
-and only the first decides the exit code.** The coverage read
+and only the first decides the exit code.** `heads=` counts the corroborated
+rows, base-sync ones included; when K > 0 of them corroborated only by proven
+base-sync steps, a separate ` base_sync=K` token follows it
+(`CORROBORATED heads=2/2 base_sync=1 coverage=…`), and an all-equal-head run's
+line carries no such token. The coverage read
 (`coord_pr_status(mine=true)`) requires a **session-scoped identity**, and the
 ordinary runner-provisioned session holds a device JWT: measured 2026-09-03, that
 door answers `mine=true requires a session-scoped identity (no
@@ -4831,9 +4868,13 @@ coverage=UNKNOWN` as exactly that — heads proven, coverage not established —
 carry both halves into the Step 6 report. Never write it up as "coverage
 checked".
 
-**What a corroborated row does and does not assert.** It proves the reviewed
-commit is the commit on the PR, and it records what CI concluded on that commit
-— with `coord_query_ci_state`'s own posture copied onto every row as
+**What a corroborated row does and does not assert.** For an `equal` row it
+proves the reviewed commit is the commit on the PR. For a `base_sync` row it
+proves the PR differs from the reviewed commit only by the recorded clean
+base-sync steps (`head_relation_steps`: each merge's second parent, author and
+subject), and the row's recorded `checks` ran on the PR's head — the merge —
+not on the reviewed commit. Either way it records what CI concluded on the
+card's head — with `coord_query_ci_state`'s own posture copied onto every row as
 `checks_credibility: "inherits-underlying-test"`. A green check on the reviewed
 head corroborates that CI **ran** and what it **concluded**; it never
 corroborates that the review was right. `findings_count` and `iterations` stay
@@ -5062,26 +5103,30 @@ established — a clean `gh pr checks` read is not proof of the latter.
 
    ```bash
    bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh retire-net \
-     --stem "<plan-stem>" --net-gate "<net gate_id>" --reason "SHIPPED"
+     --stem "<plan-stem>" --repo "<owner/name>" --net-gate "<net gate_id>" --reason "SHIPPED"
    ```
 
-   It withdraws the net (reason `implement→ship net retired: SHIPPED`), reads it
-   back as `withdrawn`, and takes the `NotRegistrant` fallback (cancel then mute)
-   itself. The net
+   It withdraws the net (reason `implement→ship net retired: SHIPPED`) under the
+   tenant proven to own `--repo`, reads it back as `withdrawn`, and takes the
+   `NotRegistrant` fallback (cancel only, never mute) itself. The net
    is `claim_terminal` on the plan reserve, so the release in item 5, or an outer
    `/vet-imp`'s release, would otherwise clear it and dispatch a duplicate session
    onto a shipped plan. It runs at most about 60 s. Quote its final line:
-   `RETIRED` is clean, and every `NET_UNRETIRED` (3) or `NET_MUTED` id goes in
-   the closeout, as does a `NET_CANCELLED` id whose mute did not land (the
-   final line's `--` note names each net left open). `NET_FIRED` (6): the
+   `RETIRED` is clean, and every `NET_UNRETIRED` (3) id goes in the closeout,
+   as does a `NET_CANCELLED` id the final line's `--` note names (cancelled,
+   not withdrawn; it stays open until the release, which clears it inert). A
+   `NET_UNRETIRED` here makes item 5's release WITHHOLD (exit 7), so resolve
+   it first. `NET_FIRED` (6): the
    named net had already fired, so report the duplicate it dispatched.
    `UNKNOWN` (2) and a usage error (64) did nothing: fix the cause and run it
    again before item 5. Drop `--net-gate`
    when Step 0.5 armed no net; the plan-wide read still finds a net it missed.
 
 5. **Release the plan reserve (per Step 0.48) — only if THIS run acquired it.**
-   Run Step 0.48's `plan-reserve-release.sh release` with `--reason "SHIPPED"`,
-   in the same try/finally as the phase releases. It re-checks the net first (a
+   Run Step 0.48's `plan-reserve-release.sh release` with `--repo` and
+   `--reason "SHIPPED"`, in the same try/finally as the phase releases. On exit
+   7 (`RELEASE_WITHHELD`) the reserve is still held: do not `stop` the loop
+   (item 7), and follow Step 0.48's exit-7 remedy. It re-checks the net first (a
    no-op after item 4a), then POSTs `/claims/release` with the same
    `agent_session_id` used at acquire. **Skip it if Step 0.48 returned `renewed`** — an outer `/vet-imp`
    acquired the reserve and owns the release; dropping it here would unreserve
