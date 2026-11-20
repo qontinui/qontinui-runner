@@ -24,8 +24,8 @@
 //! raw `tokio_postgres` for the small handful of queries it needs.
 //!
 //! Output format: `--format text` (default) for human-readable tables;
-//! `--format json` for `serde_json::to_string_pretty` consumption by
-//! supervisor cron / dashboards.
+//! `--format json` for `serde_json::to_string_pretty` consumption by scripts
+//! and dashboards.
 
 use clap::{Parser, Subcommand};
 use qontinui_runner_lib::profiles::runner_dsn;
@@ -682,7 +682,7 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
         drift_demoted_count,
         drift_proposals_count,
     ) = tokio::try_join!(
-        query_queue_counts(client, proposals_table),
+        query_queue_counts(client, proposals_table, app_filter),
         query_recent_events(client, events_table, app_filter),
         count_proposal_events_in_window(client, events_table, days, "promoted", app_filter),
         count_proposal_events_in_window(client, events_table, days, "scanned", app_filter),
@@ -756,10 +756,9 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
             "recent_activity": events_json,
         });
         // spec-multi-app Stream E.6: `{app_id: { ... }}` map. With `--app`
-        // the map has a single key; without it, the (currently aggregated)
-        // numbers are replicated under every app_id key — replacing the
-        // duplication with true per-app aggregates is queue-counts work
-        // that depends on Stream F backfilling app_id on spec_proposals.
+        // the map has a single key and the queue counts are that app's
+        // (`spec_proposals.app_id`); without it, the all-app aggregate is
+        // replicated under every app_id key.
         let mut grouped = serde_json::Map::new();
         for app_id in &app_sections {
             grouped.insert(app_id.clone(), per_app.clone());
@@ -816,7 +815,7 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
     println!();
     println!("  Recent activity:");
     if recent_events.is_empty() {
-        println!("    (none yet — flywheel sweep handler not running)");
+        println!("    (none — no production path writes proposal_events yet)");
     } else {
         for ev in &recent_events {
             let pid_short: String = ev.proposal_id.chars().take(8).collect();
@@ -849,17 +848,29 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
 async fn query_queue_counts(
     client: &Client,
     proposals_table_exists: bool,
+    app_filter: Option<&str>,
 ) -> Result<std::collections::HashMap<String, i64>, String> {
     if !proposals_table_exists {
         return Ok(std::collections::HashMap::new());
     }
-    let rows = client
-        .query(
-            "SELECT status, count(*)::bigint FROM atlas_managed.spec_proposals GROUP BY status",
-            &[],
-        )
-        .await
-        .map_err(|e| format!("queue-counts query failed: {}", e))?;
+    let rows = match app_filter {
+        Some(app_id) => {
+            client
+                .query(
+                    "SELECT status, count(*)::bigint FROM atlas_managed.spec_proposals \
+                     WHERE app_id = $1 GROUP BY status",
+                    &[&app_id],
+                )
+                .await
+        }
+        None => client
+            .query(
+                "SELECT status, count(*)::bigint FROM atlas_managed.spec_proposals GROUP BY status",
+                &[],
+            )
+            .await,
+    }
+    .map_err(|e| format!("queue-counts query failed: {}", e))?;
     let mut out = std::collections::HashMap::new();
     for r in &rows {
         out.insert(r.get::<_, String>(0), r.get::<_, i64>(1));

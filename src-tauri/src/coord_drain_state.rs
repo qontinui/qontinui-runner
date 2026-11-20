@@ -224,12 +224,30 @@ impl DispatchRole {
     }
 }
 
-/// Why the drain deferred a spawn: coord said `drained`, or the state is
-/// unknown. Carried on the deferral itself so every surface reporting it (a
-/// 409 body, a continuation stamp) names the class the DECISION saw, never a
-/// later re-read that may already have moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeferClass {
+/// Declares [`DeferClass`] and [`DeferClass::ALL`] from ONE list of variants,
+/// so a class cannot be added without being in `ALL`, the list
+/// [`DeferClass::from_code`] searches.
+macro_rules! defer_classes {
+    ($($(#[$attr:meta])* $variant:ident),+ $(,)?) => {
+        /// Why the drain gate deferred a spawn: coord said `drained`, the state
+        /// is unknown, or the dispatch role closes the agent lane. Carried on
+        /// the deferral itself so every surface reporting it (a 409 body, a
+        /// continuation stamp) names the class the DECISION saw, never a later
+        /// re-read that may already have moved.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum DeferClass {
+            $($(#[$attr])* $variant),+
+        }
+
+        impl DeferClass {
+            /// Every class, in declaration order.
+            pub const ALL: [DeferClass; [$(DeferClass::$variant),+].len()] =
+                [$(DeferClass::$variant),+];
+        }
+    };
+}
+
+defer_classes! {
     Drained,
     Unknown,
     /// The device's dispatch role closes the agent lane (`bench` / `ci_node`).
@@ -237,6 +255,13 @@ pub enum DeferClass {
 }
 
 impl DeferClass {
+    /// The class whose [`Self::code`] is `code` — the reading a caller of a
+    /// spawn door needs to tell the door's drain-gate deferral (a 409 whose
+    /// body carries this code) from any other refusal.
+    pub fn from_code(code: &str) -> Option<DeferClass> {
+        Self::ALL.into_iter().find(|class| class.code() == code)
+    }
+
     /// The refusal code, matching coord's own 409 vocabulary (contract C5).
     pub fn code(self) -> &'static str {
         match self {
@@ -1653,6 +1678,25 @@ pub(crate) static ROLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal body's code reads back as the class that wrote it, for every
+    /// class, and no two classes share a code. `ALL` is declared from the same
+    /// variant list as the enum (`defer_classes!`), so a new class is in it by
+    /// construction; this pins that `from_code` and `code` agree on every one.
+    #[test]
+    fn every_defer_class_round_trips_through_its_code() {
+        let codes: std::collections::HashSet<&str> =
+            DeferClass::ALL.iter().map(|class| class.code()).collect();
+        assert_eq!(
+            codes.len(),
+            DeferClass::ALL.len(),
+            "two classes share a code"
+        );
+        for class in DeferClass::ALL {
+            assert_eq!(DeferClass::from_code(class.code()), Some(class));
+        }
+        assert_eq!(DeferClass::from_code("device_busy"), None);
+    }
 
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-09-14T10:00:00Z")

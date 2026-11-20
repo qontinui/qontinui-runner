@@ -556,6 +556,7 @@ async fn flywheel_dedupes_concurrent_scans() {
     let first = db
         .insert_proposal(
             "prop_flywheel_dedupe_one",
+            "qontinui-runner",
             "fullPage",
             Some(pathname),
             None,
@@ -569,6 +570,7 @@ async fn flywheel_dedupes_concurrent_scans() {
     let second = db
         .insert_proposal(
             "prop_flywheel_dedupe_two",
+            "qontinui-runner",
             "fullPage",
             Some(pathname),
             None,

@@ -3081,6 +3081,19 @@ mod tests {
 
     use super::RUNTIME_OVERRIDE_KEYS;
 
+    /// The spec flywheel's execute starts its meta-workflow with this body.
+    /// It must parse as the run request, and ask for a fresh execution: an
+    /// execute never resumes an earlier run of the same meta-workflow.
+    #[cfg(feature = "spec-authoring")]
+    #[test]
+    fn the_spec_execute_run_body_asks_for_a_fresh_run() {
+        let request: super::RunUnifiedWorkflowRequest =
+            serde_json::from_value(crate::workflow_generation::meta_workflow_run::run_door_body())
+                .expect("the run door parses the spec execute's body");
+        assert!(request.force_fresh_start);
+        assert_eq!(request.task_run_id, None);
+    }
+
     /// An unparseable ui_bridge step in a refetched workflow is persisted as a
     /// step that FAILS at execution naming it — never dropped, never a snapshot.
     #[test]

@@ -96,10 +96,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/spec-check", post(spec_check::post_spec_check))
         .route("/spec-check/batch", post(spec_check::post_spec_check_batch));
 
-    // Stream E (Flywheel) — coverage-growth queue endpoints. Gated behind
-    // `spec-authoring` so v1.0 release builds don't expose the proposals
-    // queue surface area. Stream C re-mounts these under
-    // `/apps/:app_id/spec/proposals/*` (PLAN.md §C.2).
+    // Stream E (Flywheel) — coverage-growth queue endpoints, mounted per app
+    // under `/apps/:app_id/spec/proposals/*` (Stream C, PLAN.md §C.2). Gated
+    // behind `spec-authoring`, which `default` carries, so release builds do
+    // expose them; a build without the feature has no proposals routes.
     #[cfg(feature = "spec-authoring")]
     let r = r
         .route(

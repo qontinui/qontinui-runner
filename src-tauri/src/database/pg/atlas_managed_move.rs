@@ -78,10 +78,13 @@ pub const ATLAS_MANAGED_TABLES: [&str; 6] = [
 
 /// Columns added to a table after it first shipped, with the value a legacy
 /// row gets when its copy predates the column. `proposal_events.app_id` is the
-/// spec-multi-app Stream E.1 column; `'qontinui-runner'` is the value the
-/// app_id backfill in `verify_and_provision` gives every pre-multi-app row.
-const LEGACY_COLUMN_FILLS: &[(&str, &str, &str)] =
-    &[("proposal_events", "app_id", "'qontinui-runner'")];
+/// spec-multi-app Stream E.1 column and `spec_proposals.app_id` the per-app
+/// proposal queue's; `'qontinui-runner'` is the value the app_id backfills in
+/// `verify_and_provision` give every row that predates them.
+const LEGACY_COLUMN_FILLS: &[(&str, &str, &str)] = &[
+    ("proposal_events", "app_id", "'qontinui-runner'"),
+    ("spec_proposals", "app_id", "'qontinui-runner'"),
+];
 
 /// `pg_advisory_xact_lock` key for the move ("atlasmv" in ASCII).
 const MOVE_LOCK_KEY: i64 = 0x0061_746c_6173_6d76;
@@ -1048,6 +1051,22 @@ mod tests {
         );
     }
 
+    /// `spec_proposals.app_id` is NOT NULL with no default, so without its
+    /// fill a legacy copy that predates the per-app queue could never merge.
+    #[test]
+    fn plan_fills_app_id_for_a_legacy_spec_proposals_copy() {
+        let target = [col("id", false, false), col("app_id", false, false)];
+        let source = [col("id", false, false)];
+        let plan = plan_merge_columns("spec_proposals", &target, &source).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                ("id".to_string(), "s.\"id\"".to_string()),
+                ("app_id".to_string(), "'qontinui-runner'".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn plan_lets_defaults_and_nulls_apply_for_columns_the_legacy_copy_lacks() {
         let target = [
@@ -1189,8 +1208,10 @@ mod tests {
             }
 
             /// Create `tables` in `schema`. `legacy` builds the older shape:
-            /// columns in a different order, and `proposal_events` without
-            /// `app_id`. FKs reference the parent in the SAME schema.
+            /// columns in a different order, and `proposal_events` and
+            /// `spec_proposals` without `app_id` (and `spec_proposals` with
+            /// its dedup index on `kind` and the target alone). FKs reference
+            /// the parent in the SAME schema.
             async fn create(&self, schema: &str, legacy: bool, tables: &[&str]) {
                 let mut ddl = format!("CREATE SCHEMA IF NOT EXISTS {schema};");
                 for t in tables {
@@ -1215,8 +1236,13 @@ mod tests {
                             "id UUID PRIMARY KEY, run_id UUID NOT NULL REFERENCES \
                              {schema}.regression_runs(id) ON DELETE CASCADE, case_id TEXT NOT NULL"
                         ),
-                        "spec_proposals" => "id TEXT PRIMARY KEY, kind TEXT NOT NULL, pathname TEXT, \
+                        "spec_proposals" if legacy => {
+                            "id TEXT PRIMARY KEY, kind TEXT NOT NULL, pathname TEXT, \
                              spec_id TEXT, status TEXT NOT NULL"
+                                .to_string()
+                        }
+                        "spec_proposals" => "id TEXT PRIMARY KEY, kind TEXT NOT NULL, pathname TEXT, \
+                             spec_id TEXT, status TEXT NOT NULL, app_id TEXT NOT NULL"
                             .to_string(),
                         "proposal_events" if legacy => {
                             "id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL, event_type TEXT NOT NULL"
@@ -1229,8 +1255,9 @@ mod tests {
                     };
                     ddl.push_str(&format!("CREATE TABLE {schema}.{t} ({body});"));
                     if *t == "spec_proposals" {
+                        let key = if legacy { "" } else { "app_id, " };
                         ddl.push_str(&format!(
-                            "CREATE UNIQUE INDEX ON {schema}.spec_proposals (kind, (COALESCE(pathname, spec_id)));"
+                            "CREATE UNIQUE INDEX ON {schema}.spec_proposals ({key}kind, (COALESCE(pathname, spec_id)));"
                         ));
                     }
                 }
@@ -1260,6 +1287,7 @@ mod tests {
                         "regression_runs" => format!("INSERT INTO {schema}.regression_runs (id, suite_id, run_id) VALUES ('{run}', '{suite}', 'r');"),
                         "regression_diagnoses" => format!("INSERT INTO {schema}.regression_diagnoses (id, run_id, diagnosis_json) VALUES (gen_random_uuid(), '{run}', '{{}}');"),
                         "regression_assertion_executions" => format!("INSERT INTO {schema}.regression_assertion_executions (id, run_id, case_id) VALUES (gen_random_uuid(), '{run}', 'c');"),
+                        "spec_proposals" if with_app => format!("INSERT INTO {schema}.spec_proposals (id, kind, pathname, status, app_id) VALUES ('sp-{run}', 'fullPage', '/{run}', 'queued', 'app-x');"),
                         "spec_proposals" => format!("INSERT INTO {schema}.spec_proposals (id, kind, pathname, status) VALUES ('sp-{run}', 'fullPage', '/{run}', 'queued');"),
                         "proposal_events" if with_app => format!("INSERT INTO {schema}.proposal_events (id, proposal_id, event_type, app_id) VALUES ('pe-{run}', 'p', 'scanned', 'app-x');"),
                         "proposal_events" => format!("INSERT INTO {schema}.proposal_events (id, proposal_id, event_type) VALUES ('pe-{run}', 'p', 'scanned');"),
@@ -1379,20 +1407,19 @@ mod tests {
                 assert!(!s.exists(&src, t).await, "{t} legacy copy not dropped");
                 assert_eq!(s.count(&dst, t).await, 2, "{t} rows after merge");
             }
-            let filled: i64 = s
-                .client
-                .query_one(
-                    &format!("SELECT count(*)::bigint FROM {dst}.proposal_events WHERE app_id = 'qontinui-runner'"),
-                    &[],
-                )
-                .await
-                .unwrap()
-                .try_get(0)
-                .unwrap();
-            assert_eq!(
-                filled, 1,
-                "legacy proposal_events row gets the bootstrap app_id"
-            );
+            for t in ["proposal_events", "spec_proposals"] {
+                let filled: i64 = s
+                    .client
+                    .query_one(
+                        &format!("SELECT count(*)::bigint FROM {dst}.{t} WHERE app_id = 'qontinui-runner'"),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .try_get(0)
+                    .unwrap();
+                assert_eq!(filled, 1, "the legacy {t} row gets the bootstrap app_id");
+            }
 
             let again = s.run().await;
             assert!(!again.changed_anything(), "{again:?}");
@@ -1410,7 +1437,7 @@ mod tests {
             s.create(&dst, false, &["spec_proposals"]).await;
             s.exec(&format!(
                 "INSERT INTO {src}.spec_proposals (id, kind, pathname, status) VALUES ('legacy', 'fullPage', '/same', 'queued'), ('other', 'patch', '/x', 'queued');
-                 INSERT INTO {dst}.spec_proposals (id, kind, pathname, status) VALUES ('current', 'fullPage', '/same', 'queued');"
+                 INSERT INTO {dst}.spec_proposals (id, kind, pathname, status, app_id) VALUES ('current', 'fullPage', '/same', 'queued', 'qontinui-runner');"
             ))
             .await;
 
@@ -1449,7 +1476,7 @@ mod tests {
             s.create(&dst, false, &["spec_proposals"]).await;
             s.exec(&format!(
                 "INSERT INTO {src}.spec_proposals (id, kind, pathname, status) VALUES ('p1', 'fullPage', '/a', 'promoted');
-                 INSERT INTO {dst}.spec_proposals (id, kind, pathname, status) VALUES ('p1', 'fullPage', '/a', 'queued');"
+                 INSERT INTO {dst}.spec_proposals (id, kind, pathname, status, app_id) VALUES ('p1', 'fullPage', '/a', 'queued', 'qontinui-runner');"
             ))
             .await;
 

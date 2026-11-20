@@ -6,6 +6,13 @@
 use super::PgDb;
 use crate::database::types::*;
 
+/// Every `status` a task run ends in. The loop controller finishes a run as
+/// `complete` and the DAG driver as `completed`; either can end `failed`, and
+/// a stop writes `stopped`. `paused` and `cancelling` are not here: a run in
+/// either can still change.
+pub(crate) const FINISHED_TASK_RUN_STATUSES: [&str; 4] =
+    ["complete", "completed", "failed", "stopped"];
+
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
         None
@@ -383,6 +390,61 @@ impl PgDb {
         Ok(())
     }
 
+    /// Mark a task run `stopped` with `reason`, unless it has already finished.
+    /// `Ok(true)` means it was stopped. `Ok(false)` means its status was one of
+    /// [`FINISHED_TASK_RUN_STATUSES`] (or its row is gone), and the row was
+    /// left exactly as it was. [`Self::stop_task_run`] overwrites any status;
+    /// this one is for a caller that cannot know whether the run finished
+    /// since it last read it.
+    pub async fn stop_task_run_if_unfinished(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let finished: &[&str] = &FINISHED_TASK_RUN_STATUSES;
+        let stopped = conn
+            .execute(
+                "UPDATE task_runs SET status = 'stopped', error_message = $2, \
+                        updated_at = NOW(), completed_at = NOW() \
+                 WHERE id = $1 AND status <> ALL($3)",
+                &[&id, &reason, &finished],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG stop_task_run_if_unfinished", &e))?;
+        Ok(stopped > 0)
+    }
+
+    /// A task run's `status` and `error_message`, without its output log, or
+    /// `None` when there is no such run. For a caller that polls a run until
+    /// it finishes: [`Self::get_task_run`] reads the whole log every time.
+    pub async fn get_task_run_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT status, error_message FROM task_runs WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_status", &e))?;
+        row.map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .transpose()
+            .map_err(|e: tokio_postgres::Error| {
+                crate::database::pg::pg_err("PG get_task_run_status", &e)
+            })
+    }
+
     /// Delete a task run.
     pub async fn delete_task_run(&self, id: &str) -> Result<bool, String> {
         let conn = self
@@ -448,19 +510,24 @@ impl PgDb {
         Ok(())
     }
 
-    /// Get task run output.
+    /// Get task run output. A run with no row reads as an empty log; a caller
+    /// that must tell the two apart reads [`Self::get_task_output_opt`].
     pub async fn get_task_output(&self, id: &str) -> Result<String, String> {
+        Ok(self.get_task_output_opt(id).await?.unwrap_or_default())
+    }
+
+    /// Get task run output, or `None` when there is no such run.
+    pub async fn get_task_output_opt(&self, id: &str) -> Result<Option<String>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let output = qontinui_db::queries::task_runs::get_task_output()
+        qontinui_db::queries::task_runs::get_task_output()
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_task_output", &e))?;
-        Ok(output.unwrap_or_default())
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_output", &e))
     }
 
     /// Update task run name.
@@ -2209,6 +2276,56 @@ impl PgDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conditional stop stops a run that is still going and leaves a
+    /// finished one exactly as it was. The status read sees both, without
+    /// the output log.
+    #[cfg(feature = "pg_integration_tests")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conditional_stop_never_overwrites_a_finished_run() {
+        let db = PgDb::new_for_test().await;
+        let running = format!("stop-if-unfinished-running-{}", uuid::Uuid::new_v4());
+        let finished = format!("stop-if-unfinished-finished-{}", uuid::Uuid::new_v4());
+        for id in [&running, &finished] {
+            db.create_task_run(&CreateTaskRunInput::new(id.clone(), "conditional stop"))
+                .await
+                .expect("create_task_run");
+        }
+        db.complete_task_run(&finished).await.expect("complete");
+
+        assert!(db
+            .stop_task_run_if_unfinished(&running, "past its deadline")
+            .await
+            .expect("stop"));
+        assert_eq!(
+            db.get_task_run_status(&running).await.expect("status"),
+            Some(("stopped".to_string(), Some("past its deadline".to_string())))
+        );
+
+        assert!(
+            !db.stop_task_run_if_unfinished(&finished, "past its deadline")
+                .await
+                .expect("stop"),
+            "a finished run is not stopped"
+        );
+        assert_eq!(
+            db.get_task_run_status(&finished).await.expect("status"),
+            Some(("complete".to_string(), None)),
+            "its status and error are left as they were"
+        );
+        assert!(!db
+            .stop_task_run_if_unfinished(&running, "again")
+            .await
+            .expect("stop"));
+
+        assert_eq!(
+            db.get_task_run_status("no-such-run").await.expect("status"),
+            None
+        );
+        for id in [&running, &finished] {
+            db.delete_task_run(id).await.expect("cleanup");
+        }
+    }
 
     /// Regression test for the "error deserializing column 0" panic in the
     /// verification-results read path. `result_json` is `jsonb` (PgDb::new()'s

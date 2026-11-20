@@ -248,8 +248,8 @@ table "regression_assertion_executions" {
 // ---------------------------------------------------------------
 // atlas_managed.spec_proposals — Stream E (Flywheel) coverage-growth queue.
 // Stores `fullPage` and `patch` proposals discovered by
-// `/spec/proposals/scan`; lifecycle is driven by the supervisor cron + the
-// `/spec/proposals/{id}/execute` handler.
+// `/apps/{app_id}/spec/proposals/scan`, one app per row; the execute and
+// sweep-pending handlers drive the lifecycle.
 // ---------------------------------------------------------------
 
 table "spec_proposals" {
@@ -301,18 +301,31 @@ table "spec_proposals" {
     type    = jsonb
     default = sql("'{}'::jsonb")
   }
+  // The app whose scan queued the row. Every read the handlers make is scoped
+  // to it. The runtime self-heal in `database/pg/mod.rs` adds it to a table
+  // created before it and files legacy rows under `qontinui-runner` before
+  // flipping NOT NULL.
+  column "app_id" {
+    null = false
+    type = text
+  }
   primary_key {
     columns = [column.id]
   }
   check "spec_proposals_kind_chk" {
     expr = "kind IN ('fullPage', 'patch')"
   }
-  // Dedup: a queued/in-flight proposal for a given target identity. Uses
-  // a functional unique index over (kind, COALESCE(pathname, spec_id)) so
-  // the same pathname (kind='fullPage') or spec_id (kind='patch') cannot
-  // be queued twice. Insertions use ON CONFLICT DO NOTHING.
-  index "spec_proposals_kind_target_uniq" {
+  // Dedup: a queued/in-flight proposal for a given target identity within one
+  // app. Uses a functional unique index over (app_id, kind,
+  // COALESCE(pathname, spec_id)) so the same pathname (kind='fullPage') or
+  // spec_id (kind='patch') cannot be queued twice for the same app, while two
+  // apps may each queue the same page label. Insertions use
+  // ON CONFLICT DO NOTHING.
+  index "spec_proposals_app_kind_target_uniq" {
     unique = true
+    on {
+      column = column.app_id
+    }
     on {
       column = column.kind
     }
