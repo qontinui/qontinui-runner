@@ -41,7 +41,7 @@ import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
 import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
 import { useZoneLayout, zoneLayoutStorageKey, type ZoneAssignments } from "./useZoneLayout";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
-import { AUTO_TRIM_STORAGE_KEY, type LayoutOrigin } from "./zoneAutoTrim";
+import { AUTO_TRIM_STORAGE_KEY, predictLayoutOrigin, type LayoutOrigin } from "./zoneAutoTrim";
 import { setTabFilter, zoneFiltersFor } from "./zone-grid/zoneFilters";
 
 const PAGE = "trim-test";
@@ -536,5 +536,92 @@ describe("useZoneLayout auto-trim: metadata follows the tab (D5)", () => {
     const r = render();
     expect(r.assignments).toStrictEqual({ 0: "a", 1: "b" });
     expect(r.labels.zoneLabels).toStrictEqual({ 1: "b-label" });
+  });
+});
+
+/**
+ * `predictLayoutOrigin` is what `select-layout` and `/layout` report as the
+ * origin a request leaves. It is a prediction of THIS hook's behaviour, so it
+ * is pinned against the hook rather than against a restatement of the rule:
+ * a request auto-grow overrides was reported `operator` while the page had
+ * become the runner's (auto-grow's own request takes it), and nothing caught
+ * it because the prediction was only ever compared with itself.
+ */
+describe("predictLayoutOrigin agrees with the hook", () => {
+  const cases: Array<{
+    name: string;
+    current: string;
+    tabs: number;
+    stored?: LayoutOrigin;
+    requested: string;
+    source: LayoutOrigin;
+    settled: string;
+  }> = [
+    {
+      name: "operator request auto-grow overrides, same id as before",
+      current: "six-pack",
+      tabs: 6,
+      stored: "operator",
+      requested: "quad",
+      source: "operator",
+      settled: "six-pack",
+    },
+    {
+      name: "operator request auto-grow overrides, new id",
+      current: "full-grid",
+      tabs: 5,
+      stored: "operator",
+      requested: "quad",
+      source: "operator",
+      settled: "six-pack",
+    },
+    {
+      name: "operator request that fits",
+      current: "six-pack",
+      tabs: 3,
+      stored: "auto",
+      requested: "quad",
+      source: "operator",
+      settled: "quad",
+    },
+    {
+      name: "auto request that fits",
+      current: "six-pack",
+      tabs: 3,
+      stored: "operator",
+      requested: "quad",
+      source: "auto",
+      settled: "quad",
+    },
+    {
+      name: "auto re-assert of a legacy page",
+      current: "quad",
+      tabs: 3,
+      requested: "quad",
+      source: "auto",
+      settled: "quad",
+    },
+    {
+      name: "auto request auto-grow overrides on a legacy page",
+      current: "six-pack",
+      tabs: 6,
+      requested: "quad",
+      source: "auto",
+      settled: "six-pack",
+    },
+  ];
+  it.each(cases)("$name", ({ current, tabs, stored, requested, source, settled }) => {
+    const live = ids(tabs);
+    const render = mount(current, live, dense(live), stored ? { origin: stored } : {});
+    render().setLayoutId(requested, { source });
+    const r = render();
+    expect(r.layoutId).toBe(settled);
+    const predicted = predictLayoutOrigin(
+      { layoutId: current, layoutOrigin: stored },
+      requested,
+      source,
+      settled,
+    );
+    expect(r.layoutOrigin ?? "legacy").toBe(predicted);
   });
 });

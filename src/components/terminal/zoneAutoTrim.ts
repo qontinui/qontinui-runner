@@ -148,12 +148,22 @@ export function reportLayoutOrigin(origin: LayoutOrigin | undefined): ReportedLa
  * layout id — re-asserting the layout a page already has must not hand an
  * operator's (or a legacy) page to the trim. A request answer built from this
  * says what the page now holds, not what the caller asked for.
+ *
+ * `settledId` is the layout the grid SETTLES at (`computeAutoGrowLayoutId`).
+ * When it differs from the request, the hook's auto-grow effect re-applies it
+ * as an `auto` request that changes the id the request just set, so the page
+ * ends `auto` whoever asked — an operator's quad over six sessions is a
+ * runner-grown six-pack, and it trims when they close
+ * (`useZoneLayout.autoTrim.test.ts`, "auto-grow turns an operator page into
+ * an auto one").
  */
 export function predictLayoutOrigin(
   current: { layoutId: string; layoutOrigin?: LayoutOrigin },
   requestedId: string,
   source: LayoutOrigin,
+  settledId: string = requestedId,
 ): ReportedLayoutOrigin {
+  if (settledId !== requestedId) return "auto";
   if (source === "operator") return "operator";
   return requestedId !== current.layoutId ? "auto" : reportLayoutOrigin(current.layoutOrigin);
 }
