@@ -23,6 +23,8 @@ import {
   useState,
 } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { textArg } from "./commands";
 import { compareByUsageHeadroom } from "../settings/types";
 import { buildAiLaunchCommand, type AiLaunchCommand } from "./aiLaunchCommand";
 import {
@@ -73,6 +75,11 @@ export interface UseAnalyzeLaunchArgs {
   zoneAssignments: Readonly<Record<number, string>>;
   setFocusedZone: (zone: number) => void;
 }
+
+/** The `analyze-launch` action's argument bag, validated by `guardedHandler`. */
+const ANALYZE_LAUNCH_SCHEMA = {
+  terminalId: "string — the id of the terminal pane whose Claude launch failed",
+} as const;
 
 export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
   const argsRef = useRef(args);
@@ -220,9 +227,10 @@ export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
         // launch, post a finding or run /pvi against the operator's repositories
         // and spends account budget; closing the pane undoes none of it.
         effect: "destructive",
-        handler: async (params?: unknown) => {
-          const terminalId = (params as { terminalId?: unknown } | undefined)?.terminalId;
-          if (typeof terminalId !== "string" || terminalId.length === 0) {
+        paramSchema: ANALYZE_LAUNCH_SCHEMA,
+        handler: guardedHandler("analyze-launch", ANALYZE_LAUNCH_SCHEMA, async (args) => {
+          const terminalId = textArg(args, "terminalId");
+          if (!terminalId) {
             throw new Error("analyze-launch requires { terminalId: string }");
           }
           const run = start(terminalId);
@@ -232,7 +240,7 @@ export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
             );
           }
           return run;
-        },
+        }),
       },
     ],
   });
