@@ -3866,8 +3866,8 @@ MemAvailable:   15335424 kB
     /// `only_the_host_lane_carries_the_spawn_pressure_pair` above guards
     /// against for `thread_count`.
     ///
-    /// Asserted in two halves, neither of which reads the process-global lane
-    /// table. That table's 15 lanes are first-come and never released, and
+    /// Asserted in two halves, neither of which asserts on the contents of the
+    /// process-global lane table. That table's 15 lanes are first-come and never released, and
     /// under `cargo test` the test names that reach `spawn_blocking_tracked`
     /// first take them — so an assertion on a named lane there is an assertion
     /// about this binary's test population, and it reddened whenever a new
@@ -3881,7 +3881,9 @@ MemAvailable:   15335424 kB
         let by_thread = BTreeMap::from([
             ("fleet-pub-rt".to_string(), 3usize),
             ("<other-threads>".to_string(), 1usize),
-            ("huge".to_string(), usize::MAX),
+            // One past u32::MAX: a wrapping `v as u32` would publish 0.
+            ("huge".to_string(), usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX)),
+            ("edge".to_string(), u32::MAX as usize),
         ]);
         assert_eq!(
             blocking_lanes_field(by_thread),
@@ -3889,6 +3891,7 @@ MemAvailable:   15335424 kB
                 ("fleet-pub-rt".to_string(), 3u32),
                 ("<other-threads>".to_string(), 1u32),
                 ("huge".to_string(), u32::MAX),
+                ("edge".to_string(), u32::MAX),
             ])
         );
         assert!(blocking_lanes_field(BTreeMap::new()).is_empty());
@@ -3899,6 +3902,11 @@ MemAvailable:   15335424 kB
         assert!(
             body.contains("s.blocking_lanes = Some(blocking_lanes_field(tracked_blocking_by_thread()));"),
             "collect_host_lane must publish the live lane table through blocking_lanes_field"
+        );
+        assert_eq!(
+            body.matches("s.blocking_lanes").count(),
+            1,
+            "nothing else in collect_host_lane may overwrite or clear blocking_lanes"
         );
 
         // And it is only the host lane's: a non-host lane never carries it.
