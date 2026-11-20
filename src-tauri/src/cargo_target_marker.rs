@@ -20,6 +20,12 @@ use std::path::Path;
 /// re-created under `.cargo-verify/` after a sweep removed it) never gets one.
 /// `qontinui-claude-config/scripts/cargo-sweep-all.ps1` discovers targets by
 /// `.rustc_info.json` for the same reason.
+///
+/// Presence is read with `symlink_metadata`, so any entry of that name counts,
+/// a directory or a dangling symlink included, and a symlink is never
+/// followed. Before this predicate was shared, the test harness required
+/// `CACHEDIR.TAG` to be a regular file; the reaper's looser reading is the one
+/// kept, because no tool but cargo writes either name into a directory.
 pub fn has_cargo_marker(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join("CACHEDIR.TAG")).is_ok()
         || std::fs::symlink_metadata(dir.join(".rustc_info.json")).is_ok()
