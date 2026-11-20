@@ -3881,12 +3881,18 @@ MemAvailable:   15335424 kB
         let by_thread = BTreeMap::from([
             ("fleet-pub-rt".to_string(), 3usize),
             ("<other-threads>".to_string(), 1usize),
-            // One past u32::MAX: a wrapping `v as u32` would publish 0.
+            // One past u32::MAX: a wrapping `v as u32` would publish 0. On a
+            // 32-bit target no `usize` exceeds u32::MAX, so this entry
+            // takes `edge`'s value there and only the 64-bit run can catch a
+            // wrapping cast.
             (
                 "huge".to_string(),
                 usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX),
             ),
             ("edge".to_string(), u32::MAX as usize),
+            // Just under the boundary must pass through unchanged, which an
+            // early-saturating mapping would not.
+            ("under".to_string(), (u32::MAX - 1) as usize),
         ]);
         assert_eq!(
             blocking_lanes_field(by_thread),
@@ -3895,6 +3901,7 @@ MemAvailable:   15335424 kB
                 ("<other-threads>".to_string(), 1u32),
                 ("huge".to_string(), u32::MAX),
                 ("edge".to_string(), u32::MAX),
+                ("under".to_string(), u32::MAX - 1),
             ])
         );
         assert!(blocking_lanes_field(BTreeMap::new()).is_empty());
@@ -3911,7 +3918,8 @@ MemAvailable:   15335424 kB
         assert_eq!(
             body.matches("s.blocking_lanes").count(),
             1,
-            "nothing else in collect_host_lane may overwrite or clear blocking_lanes"
+            "nothing else in collect_host_lane may mention `s.blocking_lanes` (checked by a \
+             substring count of `s.blocking_lanes` in its source, not a parse)"
         );
 
         // And it is only the host lane's: a non-host lane never carries it.
