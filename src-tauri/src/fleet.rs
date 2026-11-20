@@ -2584,6 +2584,15 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// measured. Present even when every probe answered `Unknown`.
 pub(crate) const CRED_PROBES_MARKER: &str = "probes:cred";
 
+/// The marker a runner advertises while its LAST regional cycle read an
+/// ANSWERED catalogue and measured every token in it: no spec left unrun, no
+/// unreadable or refused row, and no `Unknown` verdict. [`CRED_PROBES_MARKER`]
+/// says only that the built-in probes ran, so without this coord cannot tell a
+/// box that probed `cred:aws-ssm:<region>` and found nothing from one whose
+/// catalogue fetch never answered (plan
+/// `2026-11-20-regional-cred-absence-is-measured-only-where-the-regional-probe-ran`).
+pub(crate) const CRED_REGIONAL_PROBES_MARKER: &str = "probes:cred-regional";
+
 /// A stored GitHub CLI login for `github.com` whose ACTIVE account answers
 /// `gh auth status --active`.
 pub(crate) const CRED_GH_CAPABILITY: &str = "cred:gh";
@@ -3170,6 +3179,9 @@ struct CredFamilyState {
     /// Keyed by the token [`cred_probe_specs::RegionalProbe::token`] rebuilt from
     /// a validated spec, so every key is D1-grammar and safe to log.
     regional: std::collections::BTreeMap<String, CredMemo>,
+    /// The last regional cycle read an answered catalogue and measured every
+    /// token in it; drives [`CRED_REGIONAL_PROBES_MARKER`].
+    regional_measured: bool,
 }
 
 impl CredFamilyState {
@@ -3178,6 +3190,7 @@ impl CredFamilyState {
             ran_at: None,
             memos: std::collections::BTreeMap::new(),
             regional: std::collections::BTreeMap::new(),
+            regional_measured: false,
         }
     }
 
@@ -3255,7 +3268,9 @@ impl CredFamilyState {
     ///   is not a removal, so a token no row names folds as `Unknown`. A token a
     ///   readable row named and failed a check on still retracts at once.
     ///
-    /// Never touches `memos` or `ran_at`.
+    /// Never touches `memos` or `ran_at`. Sets `regional_measured`, which drives
+    /// [`CRED_REGIONAL_PROBES_MARKER`]: true only when the catalogue answered and
+    /// every token it lists reached a Present/Absent verdict this cycle.
     fn apply_regional(
         &mut self,
         cycle: &cred_probe_specs::RegionalCycle,
@@ -3264,6 +3279,8 @@ impl CredFamilyState {
     ) {
         match cycle {
             cred_probe_specs::RegionalCycle::NoAnswer => {
+                // Nothing was measured this cycle.
+                self.regional_measured = false;
                 let earned: Vec<String> = self.regional.keys().cloned().collect();
                 for token in &earned {
                     self.fold_regional(token, CredState::Unknown, now, ttl);
@@ -3274,7 +3291,16 @@ impl CredFamilyState {
                 not_run,
                 unreadable_rows,
                 refused_tokens,
+                skipped_rows,
             } => {
+                // Every catalogued token reached a verdict: nothing past the run
+                // cap, no unreadable, refused or unknown-kind row, no inconclusive
+                // answer.
+                self.regional_measured = not_run.is_empty()
+                    && !*unreadable_rows
+                    && !*skipped_rows
+                    && refused_tokens.is_empty()
+                    && verdicts.iter().all(|(_, s)| *s != CredState::Unknown);
                 let unnamed: Vec<String> = self
                     .regional
                     .keys()
@@ -3303,12 +3329,17 @@ impl CredFamilyState {
 
     /// The tokens this family contributes to the heartbeat: nothing before
     /// the first run (honestly unprobed), and afterwards [`CRED_PROBES_MARKER`]
+    /// (then [`CRED_REGIONAL_PROBES_MARKER`] while the last regional cycle measured
+    /// its whole catalogue)
     /// plus every token whose memo holds a positive answer.
     fn advertised(&self) -> Vec<String> {
         if self.ran_at.is_none() {
             return Vec::new();
         }
         let mut caps = vec![CRED_PROBES_MARKER.to_string()];
+        if self.regional_measured {
+            caps.push(CRED_REGIONAL_PROBES_MARKER.to_string());
+        }
         caps.extend(
             self.memos
                 .iter()
@@ -3361,6 +3392,7 @@ fn cred_capabilities() -> Vec<String> {
 /// cycle starts no sooner than `ran_at + ttl`, so consecutive regional folds are
 /// at least `ttl` apart however long the probes took, and D2's "hold for one TTL"
 /// is one cycle rather than two.
+#[cfg(test)]
 fn run_cred_refresh_cycle(
     cache: &Mutex<CredFamilyState>,
     env: &CredProbeEnv,
@@ -3368,16 +3400,63 @@ fn run_cred_refresh_cycle(
     started: std::time::Instant,
     ttl: Duration,
 ) {
+    run_cred_refresh_cycle_scoped(cache, env, fetch_specs, started, ttl, true);
+}
+
+/// [`run_cred_refresh_cycle`] with the catalogue's tenancy. `single_tenant` is
+/// whether the device is bound to exactly ONE tenant. The catalogue is fetched
+/// under one binding's bearer, but the capability list is device-wide and coord
+/// reads it under every tenant the device is bound to, so on a multi-bound device
+/// [`CRED_REGIONAL_PROBES_MARKER`] would attest one tenant's catalogue to all of
+/// them. It is withheld there (coord then reads every regional zero as UNKNOWN);
+/// the regional tokens themselves fold exactly as before.
+fn run_cred_refresh_cycle_scoped(
+    cache: &Mutex<CredFamilyState>,
+    env: &CredProbeEnv,
+    fetch_specs: impl FnOnce() -> Result<Vec<serde_json::Value>, cred_probe_specs::SpecFetchFailure>,
+    started: std::time::Instant,
+    ttl: Duration,
+    single_tenant: bool,
+) {
     let verdicts = probe_cred_family(env);
     cache
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .apply(&verdicts, started, ttl);
     let regional = cred_probe_specs::run_regional_cycle(fetch_specs(), env);
-    cache
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .apply_regional(&regional, started, ttl);
+    let mut state = cache.lock().unwrap_or_else(|p| p.into_inner());
+    state.apply_regional(&regional, started, ttl);
+    // Under the same lock, so no heartbeat reads the marker in between.
+    state.regional_measured &= single_tenant;
+}
+
+/// Whether this device is bound to exactly ONE tenant, by BOTH reads: the local
+/// binding set (what the catalogue fetch's bearer comes from) and coord's own
+/// echoed set (`coord_bound_tenants.json`, what coord reads the capability list
+/// under). The local set alone can say one while coord binds two: the legacy-slot
+/// branch always reports one tenant, and `paired_user.json` heals only on a
+/// register response. Anything unresolved or UNKNOWN withholds the marker.
+fn heartbeat_binding_is_single_tenant() -> bool {
+    binding_is_single_tenant(
+        resolve_heartbeat_binding_set().as_ref(),
+        &qontinui_runner_lib::pair::coord_bound_tenants(),
+    )
+}
+
+/// The pure half of [`heartbeat_binding_is_single_tenant`].
+fn binding_is_single_tenant(
+    local: Option<&LocalBindingSet>,
+    coord: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+) -> bool {
+    use qontinui_runner_lib::pair::CoordBoundTenantsRead;
+    // ONE tenant, and the SAME one: a rebind with a stale local file would
+    // otherwise fetch tenant a's catalogue while coord reads the marker under b.
+    match (local, coord) {
+        (Some(set), CoordBoundTenantsRead::Known(v)) => {
+            v.len() == 1 && set.tenant_ids.as_slice() == v.as_slice()
+        }
+        _ => false,
+    }
 }
 
 /// Run the family once on a detached thread and fold it into
@@ -3409,12 +3488,14 @@ fn spawn_cred_refresh() {
             let _release = Release;
             let started = std::time::Instant::now();
             let env = CredProbeEnv::from_process();
-            run_cred_refresh_cycle(
+            let single_tenant = heartbeat_binding_is_single_tenant();
+            run_cred_refresh_cycle_scoped(
                 &CRED_FAMILY_CACHE,
                 &env,
                 cred_probe_specs::fetch_probe_specs,
                 started,
                 HOST_PROBE_TTL,
+                single_tenant,
             );
         });
     if let Err(e) = spawned {
@@ -10408,6 +10489,7 @@ mod tests {",
                 },
             ))
             .collect(),
+            regional_measured: false,
         };
         let _restore = {
             let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -10465,6 +10547,7 @@ mod tests {",
                 not_run: vec![NEVER.to_string()],
                 unreadable_rows: false,
                 refused_tokens: Vec::new(),
+                skipped_rows: false,
             };
             state.apply_regional(&cycle, std::time::Instant::now(), CRED_TEST_TTL);
             state.regional.contains_key(NEVER)
@@ -10475,6 +10558,157 @@ mod tests {",
             "control: the capture saw the fold: {logs}"
         );
         assert!(!logs.contains(NEVER), "{logs}");
+    }
+
+    /// `probes:cred-regional` says THIS box measured every token of an answered
+    /// catalogue on its last regional cycle — the evidence coord needs before it
+    /// may read a regional token's absence as measured (plan
+    /// `2026-11-20-regional-cred-absence-is-measured-only-where-the-regional-probe-ran`;
+    /// `probes:cred` attests only the built-in probes). Any cycle that left a
+    /// catalogued token unmeasured withdraws it.
+    #[test]
+    fn the_regional_marker_is_advertised_only_after_a_fully_measured_answered_cycle() {
+        const SSM: &str = "cred:aws-ssm:eu-central-1";
+        const ECS: &str = "cred:aws-ecs:eu-central-1";
+        let now = std::time::Instant::now();
+        let answered = |verdicts: Vec<(&str, CredState)>,
+                        not_run: Vec<&str>,
+                        unreadable_rows: bool,
+                        refused: Vec<&str>| {
+            super::cred_probe_specs::RegionalCycle::Answered {
+                verdicts: verdicts
+                    .into_iter()
+                    .map(|(t, s)| (t.to_string(), s))
+                    .collect(),
+                not_run: not_run.into_iter().map(str::to_string).collect(),
+                unreadable_rows,
+                refused_tokens: refused.into_iter().map(str::to_string).collect(),
+                skipped_rows: false,
+            }
+        };
+        let has_marker = |s: &CredFamilyState| {
+            s.advertised()
+                .iter()
+                .any(|c| c == CRED_REGIONAL_PROBES_MARKER)
+        };
+
+        let mut state = CredFamilyState::new();
+        // Before the family's first run nothing is advertised, marker included.
+        state.apply_regional(
+            &answered(vec![(SSM, CredState::Absent)], vec![], false, vec![]),
+            now,
+            CRED_TEST_TTL,
+        );
+        assert!(state.advertised().is_empty());
+        state.apply(&[], now, CRED_TEST_TTL);
+        // Every listed token measured (an Absent verdict is a measurement): marker.
+        assert!(has_marker(&state), "{:?}", state.advertised());
+        assert_eq!(
+            state.advertised()[..2],
+            [
+                CRED_PROBES_MARKER.to_string(),
+                CRED_REGIONAL_PROBES_MARKER.to_string()
+            ]
+        );
+        // An answered EMPTY catalogue leaves nothing unmeasured.
+        state.apply_regional(&answered(vec![], vec![], false, vec![]), now, CRED_TEST_TTL);
+        assert!(has_marker(&state));
+
+        // Each way a cycle leaves a catalogued token unmeasured withdraws it.
+        let unmeasured = [
+            (
+                "no answer",
+                super::cred_probe_specs::RegionalCycle::NoAnswer,
+            ),
+            (
+                "an inconclusive verdict",
+                answered(
+                    vec![(SSM, CredState::Present), (ECS, CredState::Unknown)],
+                    vec![],
+                    false,
+                    vec![],
+                ),
+            ),
+            (
+                "a spec past the run cap",
+                answered(vec![(SSM, CredState::Absent)], vec![ECS], false, vec![]),
+            ),
+            (
+                "an unreadable row",
+                answered(vec![(SSM, CredState::Absent)], vec![], true, vec![]),
+            ),
+            (
+                "a refused spec",
+                answered(vec![(SSM, CredState::Absent)], vec![], false, vec![ECS]),
+            ),
+            (
+                // A skipped row whose token was not kept (off-grammar) leaves no
+                // trace in the lists above; the flag still withdraws the marker.
+                "a skipped row with no kept token",
+                super::cred_probe_specs::RegionalCycle::Answered {
+                    verdicts: vec![(SSM.to_string(), CredState::Absent)],
+                    not_run: Vec::new(),
+                    unreadable_rows: false,
+                    refused_tokens: Vec::new(),
+                    skipped_rows: true,
+                },
+            ),
+        ];
+        for (why, cycle) in unmeasured {
+            state.apply_regional(
+                &answered(vec![(SSM, CredState::Absent)], vec![], false, vec![]),
+                now,
+                CRED_TEST_TTL,
+            );
+            assert!(has_marker(&state), "control before {why}");
+            state.apply_regional(&cycle, now, CRED_TEST_TTL);
+            assert!(!has_marker(&state), "{why}: {:?}", state.advertised());
+            // The built-in marker is never touched by a regional cycle.
+            assert!(
+                state.advertised().iter().any(|c| c == CRED_PROBES_MARKER),
+                "{why}"
+            );
+        }
+    }
+
+    /// Single-tenant needs BOTH reads to say exactly one tenant: a local set of one
+    /// beside a coord set of two (the legacy-slot / stale-file shape) withholds the
+    /// regional marker, and so does any unresolved or UNKNOWN read.
+    #[test]
+    fn the_regional_marker_needs_both_binding_reads_to_name_one_tenant() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as Coord;
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        let local = |ids: Vec<uuid::Uuid>| LocalBindingSet {
+            default_tenant: ids[0],
+            tenant_ids: ids,
+            source: BindingSource::LegacySlotClaim,
+        };
+        let one = local(vec![a]);
+        let two = local(vec![a, b]);
+        assert!(binding_is_single_tenant(Some(&one), &Coord::Known(vec![a])));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(vec![a, b])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&two),
+            &Coord::Known(vec![a])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Unknown("unread")
+        ));
+        assert!(!binding_is_single_tenant(None, &Coord::Known(vec![a])));
+        // One tenant each, but not the same one (a rebind with a stale local file).
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(vec![b])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(Vec::new())
+        ));
     }
 
     /// What a shim does when run.
