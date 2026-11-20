@@ -1775,6 +1775,36 @@ mod tests {
     // Transcript materialization helpers
     // -----------------------------------------------------------------------
 
+    /// Tripwire on the receiver's rest WIRING in `materialize` (the helpers
+    /// themselves have their own tests): the decisive re-check runs AFTER the
+    /// in-flight claim and before the respawn, and the outcome goes through
+    /// `proven_and_rested`, never a bare `proven_terminal`. Mutation: delete
+    /// the post-claim `refuse_resting`, or call `proven_terminal` directly.
+    #[test]
+    fn materialize_rechecks_the_rest_under_its_claim_and_rests_through_the_helper() {
+        let src = include_str!("respawn.rs");
+        let start = src.find("async fn materialize(").expect("the fn");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("the fn's end")];
+        let claim = body
+            .find("SessionInFlight::claim(&claude_session_id")
+            .expect("the claim");
+        let recheck = body[claim..]
+            .find("refuse_resting(&claude_session_id")
+            .map(|i| claim + i)
+            .expect("the rest is re-checked under the claim");
+        let respawn = body.find("confirm_respawn(").expect("the respawn");
+        assert!(recheck < respawn, "re-checked before anything spawns");
+        assert!(
+            body[respawn..].contains("proven_and_rested("),
+            "the outcome rests the session through the helper"
+        );
+        assert!(
+            !body.contains("proven_terminal("),
+            "never a bare proven_terminal"
+        );
+    }
+
     /// The rest WIRING: a child-started outcome rests the session
     /// (`proven_and_rested`), and the receiver's gate then refuses every
     /// delivery (`refuse_resting`); a session nobody rested passes. Mutation:

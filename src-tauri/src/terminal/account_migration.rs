@@ -253,6 +253,42 @@ pub(crate) fn rest_if_child_may_run<'a>(
     Some(failure)
 }
 
+/// The migration's answer to a respawn whose spawn failed after its resumed
+/// `claude` started: rest the session ([`rest_if_child_may_run`]) and build
+/// the [`MigrateError::FailedAfterChild`] it ends on, or `None` when no child
+/// may run. The ONE place the migration path (manual and automatic) records
+/// the rest; [`confirm_migration`] calls it while it still holds the
+/// session's in-flight claim.
+fn rested_failed_after_child(
+    claude_session_id: &str,
+    outcome: &super::respawn_liveness::RespawnOutcome,
+    now_ms: i64,
+) -> Option<MigrateError> {
+    use super::respawn_liveness::RespawnOutcome;
+    let failure = rest_if_child_may_run(claude_session_id, outcome, now_ms)?;
+    let ended = match outcome {
+        RespawnOutcome::NotSpawned(_) => "the first spawn failed".to_string(),
+        RespawnOutcome::Died {
+            exit_code,
+            attempts,
+            ..
+        } => RespawnOutcome::died_reason(*exit_code, *attempts),
+        RespawnOutcome::ClosedByUser { .. } => {
+            "the user closed the resumed pane after a retry spawn failed".to_string()
+        }
+        RespawnOutcome::OldPaneClosed { .. } => {
+            "the user closed the old pane after a retry spawn failed".to_string()
+        }
+        RespawnOutcome::Alive { .. }
+        | RespawnOutcome::Unconfirmed { .. }
+        | RespawnOutcome::UnconfirmedRolledBack { .. } => "the respawn ended".to_string(),
+    };
+    Some(MigrateError::FailedAfterChild(format!(
+        "{ended}; a spawn failed after its resumed claude started: {}",
+        failure.message
+    )))
+}
+
 /// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
 /// migration that never ran (no usable target, [`cap_then_pick`], or refused
 /// by [`begin_migration`], [`settle_hint_migration`]). Removes exactly
@@ -1013,6 +1049,12 @@ pub async fn handle_usage_limit_hint(
 ///   `cap_stamp` is given back ([`refund_migration_cap`]) since no migration
 ///   ran; the refund, not a pre-check, because only the guard inside
 ///   [`begin_migration`] decides a refusal race-free.
+/// - [`MigrateError::Refused`] with [`MigrationRefusal::ChildMayRun`]: the
+///   session rests after a migration or respawn that failed after its resumed
+///   `claude` started, seen under the claim ([`begin_migration`]). WARNED,
+///   since that claude may still be running orphaned, but not reported again
+///   (the failure that started the rest was); [`HintOutcome::FailedAfterChild`],
+///   and the cap slot is given back like every refusal.
 /// - [`MigrateError::Failed`]: warned and reported `migration-failed: …`,
 ///   unless the terminal's `previous` hint also failed ([`worth_reporting`]);
 ///   [`HintOutcome::Failed`].
@@ -1062,6 +1104,16 @@ pub(super) fn settle_hint_migration(
                 "session migrated"
             );
             HintOutcome::Migrated
+        }
+        Err(MigrateError::Refused(refusal @ MigrationRefusal::ChildMayRun { .. })) => {
+            warn!(
+                session = %claude_session_id,
+                %refusal,
+                "usage-limit migration not started — the session rests after a migration or respawn that failed after its resumed claude started; that claude may still be running (orphaned)"
+            );
+            unrecord_handoff();
+            refund_migration_cap(claude_session_id, cap_stamp);
+            hint_outcome_of(&MigrateError::Refused(refusal))
         }
         Err(MigrateError::Refused(refusal)) => {
             info!(
@@ -2346,32 +2398,11 @@ async fn confirm_migration(
     // beside it: `FailedAfterChild`, which the automatic path rests on
     // (`cap_then_pick`). Not reported here: the caller reports it.
     // Rested HERE, while `_in_flight` still holds the session, stamped now.
-    if let Some(failure) = rest_if_child_may_run(
+    if let Some(err) = rested_failed_after_child(
         &record.claude_session_id,
         &outcome,
         chrono::Utc::now().timestamp_millis(),
     ) {
-        let ended = match &outcome {
-            RespawnOutcome::NotSpawned(_) => "the first spawn failed".to_string(),
-            RespawnOutcome::Died {
-                exit_code,
-                attempts,
-                ..
-            } => RespawnOutcome::died_reason(*exit_code, *attempts),
-            RespawnOutcome::ClosedByUser { .. } => {
-                "the user closed the resumed pane after a retry spawn failed".to_string()
-            }
-            RespawnOutcome::OldPaneClosed { .. } => {
-                "the user closed the old pane after a retry spawn failed".to_string()
-            }
-            RespawnOutcome::Alive { .. }
-            | RespawnOutcome::Unconfirmed { .. }
-            | RespawnOutcome::UnconfirmedRolledBack { .. } => "the respawn ended".to_string(),
-        };
-        let err = MigrateError::FailedAfterChild(format!(
-            "{ended}; a spawn failed after its resumed claude started: {}",
-            failure.message
-        ));
         warn!(session = %record.claude_session_id, "{err}");
         return Err(err);
     }
@@ -3679,6 +3710,41 @@ mod tests {
         assert_eq!(skipped, None);
         assert_eq!(outcome, HintOutcome::FailedAfterChild);
         assert_eq!(cap_left(sid, stamp + 10), MIGRATION_CAP, "slot given back");
+    }
+
+    /// The migration path's ONE rest record: `rested_failed_after_child`
+    /// rests the session AND builds `FailedAfterChild` for a child-started
+    /// outcome, and does neither otherwise. Mutation: build the error from a
+    /// bare `outcome.child_may_run()` without resting.
+    #[test]
+    fn a_migration_whose_child_may_run_rests_the_session_and_fails_after_child() {
+        use super::super::respawn_liveness::RespawnOutcome;
+        let now = 1_799_800_000_000i64;
+        let sid = "test/account_migration/rested-failed-after-child";
+        let outcome = RespawnOutcome::Died {
+            exit_code: Some(127),
+            attempts: 2,
+            retry_spawn_error: Some(SpawnFailure::after_child("wiring failed")),
+            rolled_back: true,
+        };
+        let err = rested_failed_after_child(sid, &outcome, now).expect("a child may run");
+        let MigrateError::FailedAfterChild(text) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            text.starts_with("respawn-died: exit 127 after 2 attempts;"),
+            "{text}"
+        );
+        assert!(text.ends_with("wiring failed"), "{text}");
+        assert!(
+            resting_after_child_started(sid, now + 1),
+            "the migration rested the session"
+        );
+
+        let spared = "test/account_migration/rested-no-child";
+        let outcome = RespawnOutcome::NotSpawned(SpawnFailure::before_child("pty open failed"));
+        assert!(rested_failed_after_child(spared, &outcome, now).is_none());
+        assert!(!resting_after_child_started(spared, now));
     }
 
     /// Every mover rests the session through `rest_if_child_may_run`: an

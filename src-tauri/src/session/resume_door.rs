@@ -1354,6 +1354,34 @@ mod tests {
         );
     }
 
+    /// Tripwire on the door's rest WIRING in `resume_one` (the helpers
+    /// themselves have their own tests): the decisive re-check runs AFTER the
+    /// in-flight claim and before the respawn, and the outcome goes through
+    /// `proven_and_rested`, never a bare `proven_terminal`. Mutation: delete
+    /// the post-claim `skip_if_resting`, or call `proven_terminal` directly.
+    #[test]
+    fn resume_one_checks_the_rest_under_its_claim_and_rests_through_the_helper() {
+        let src = include_str!("resume_door.rs");
+        let start = src.find("async fn resume_one(").expect("the fn");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("the fn's end")];
+        let claim = body.find("claim_for_door(&cand.id").expect("the claim");
+        let recheck = body[claim..]
+            .find("skip_if_resting(&cand.id")
+            .map(|i| claim + i)
+            .expect("the rest is re-checked under the claim");
+        let respawn = body.find("confirm_respawn(").expect("the respawn");
+        assert!(recheck < respawn, "re-checked before anything spawns");
+        assert!(
+            body[respawn..].contains("proven_and_rested("),
+            "the outcome rests the session through the helper"
+        );
+        assert!(
+            !body.contains("proven_terminal("),
+            "never a bare proven_terminal"
+        );
+    }
+
     /// The rest WIRING: a child-started outcome rests the id
     /// (`proven_and_rested`), and the door then skips it up front
     /// (`skip_if_resting`); an id nobody rested is not skipped. Mutation: drop
