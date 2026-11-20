@@ -854,8 +854,44 @@ When the first read is already refused, or no door carries it, end the step
 with that row's line and send no write: it would be refused for the same
 reason.
 
-**None of these outcomes holds the finish.** Go on to Part B whatever this
-step answered. The note is visibility, not correctness, which is the same
+**Then re-tag the subproject's topics** (same step, same skip rules). Topics
+group subprojects (plan
+`2026-11-16-subproject-topics-agents-and-coord-group-subprojects-into-topics-without-the-operator`,
+D3), and the closing session is the one that knows what its work was about.
+Over the same door as the note:
+
+1. **Read** the current topics: the `topics` of the `coord_subproject_get` read
+   above when the serving build carries that field, else `coord_topic_get
+   {"slug": …}` `members` per candidate topic. Unread membership blocks
+   removal only, not adding.
+2. **Confirm or add** with one `coord_subproject_update {"topics": ["<slug>", …]}`.
+   It ADDS (attach and confirm), never replaces. Take slugs from the
+   `topic_suggestions` that `coord_declare_intent` returned this session (a
+   `topic_suggestions_status` of `unavailable:…` is UNKNOWN, not "none"), else
+   from `coord_topic_list`. Reuse a served slug; coin one only through
+   `coord_topic_upsert` first.
+3. **Remove** a topic that is wrong for this work, and only one you READ as a
+   member, with `coord_topic_member {"action": "remove", "topic": "<slug>",
+   "subproject": "<subproject.id>", "reason": "<why>"}`.
+4. **Note** your contribution. The update carries no note, so per kept topic
+   send `coord_topic_member {"action": "confirm", …, "reason": "re-tag at
+   close", "note": "<one line: what this session did for it>"}`. Then read
+   back with `coord_topic_get {"slug": …}`: this subproject in `members` with
+   `state: confirmed` per kept topic, and absent per removed one.
+
+Report one line, `topics re-tag: <n> confirmed/added, <m> removed — read back`,
+when every call answered and every read-back held. Otherwise:
+`topics re-tag: UNKNOWN (<code>)` for a tool the serving build does not carry
+(`METHOD_NOT_ALLOWED`, `unknown tool`, absent natively) or a
+`schema_migration_pending`, never "no topics": an unread vocabulary is not an
+empty one; else `topics re-tag: NOT written: <code>`, the code being a refusal
+code, `transport: <exit or no output>` (presumed LOST) or `unverified`. On a
+partial result, put the counts that held first and the code of the first
+failure after them. When the note's first read was already refused, send
+nothing and report that read's code here, in whichever of the two forms fits.
+
+**None of these outcomes holds the finish**, the re-tag's included. Go on to
+Part B whatever this step answered. The note is visibility, not correctness, which is the same
 bookkeeping rule `/unattended` Step 5 applies to its own finish write. Do not
 raise a credential escalation for it, and do not revive a door for this step
 alone. When this closeout has already revived a door for another write,
@@ -1202,8 +1238,9 @@ and its read-back is what verifies the coord half.
 Then add Part A step 4's line, exactly as that step's table gives it:
 `next_steps_note written — subproject <id>, read back`, or
 `next_steps_note NOT written: <code>`, where the code is a refusal code or an
-exit and never the note's text. A run that skipped that step (`--undo`, or
-`/unattended` invoked this command) carries no such line.
+exit and never the note's text. Then its `topics re-tag:` line. A run that
+skipped that step (`--undo`, or `/unattended` invoked this command) carries
+neither line.
 
 If no rung landed, say so and say which of Part B Step 4's shapes you hit — a
 transport floor, an authorization verdict, or the runner-hosted `own row unbound`
