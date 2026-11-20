@@ -25,7 +25,11 @@ use std::path::Path;
 /// a directory or a dangling symlink included, and a symlink is never
 /// followed. Before this predicate was shared, the test harness required
 /// `CACHEDIR.TAG` to be a regular file; the reaper's looser reading is the one
-/// kept, because no tool but cargo writes either name into a directory.
+/// kept. Only cargo writes `.rustc_info.json`. A stray `CACHEDIR.TAG` (other
+/// caches write one too: `.ruff_cache`, `.mypy_cache`, `.venv`) can at worst
+/// place the harness's `qontinui-test-pg` cache in that ancestor, which
+/// `QONTINUI_TEST_PG_DIR` overrides, and the reaper additionally requires a
+/// profile directory beside the marker.
 pub fn has_cargo_marker(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join("CACHEDIR.TAG")).is_ok()
         || std::fs::symlink_metadata(dir.join(".rustc_info.json")).is_ok()
