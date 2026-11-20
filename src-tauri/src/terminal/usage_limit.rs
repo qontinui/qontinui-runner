@@ -39,7 +39,9 @@
 //! again on the same grid ([`HintOutcome::retry`], applied by [`after_hint`]):
 //!
 //! - **Every debounce** — no usable target, a failed migration that started no
-//!   resumed `claude`, or another migration of the session in flight.
+//!   resumed `claude`, a respawn that died or never painted and was rolled back
+//!   onto the old pane (`RespawnDiedRolledBack`, `UnconfirmedRolledBack`), or
+//!   another migration of the session in flight.
 //!   The screen stays due and fires again
 //!   300s after the last hint, until a hint ends another way: the session
 //!   moves once a target frees, and failed attempts stop at the migration cap.
@@ -48,14 +50,17 @@
 //! - **Once per appearance** — the probe did not confirm exhaustion. One more
 //!   hint, 300s later, on the same grid generation: the probe's sample can be
 //!   up to 60s stale, the one cause of an unconfirmed probe that time fixes.
-//! - **Never** — migrated, the migration cap reached, auto-migration disabled,
-//!   a pane the hint cannot apply to, or a session that has already moved or
-//!   closed. The screen rests until its grid changes. A migration that failed
-//!   after its resumed `claude` may have started rests longer, for its whole
-//!   episode: that child may still be running, and a migration would resume
-//!   the session again beside it. A repaint that still shows the limit ends
-//!   the same way without migrating, until a scan finds no limit message on the
-//!   screen.
+//! - **Never** — migrated (or an unpainted resumed pane kept the session,
+//!   `UnconfirmedKept`), the migration cap reached, auto-migration disabled,
+//!   a pane the hint cannot apply to, a session that has already moved,
+//!   closed or ended with its respawn (`RespawnDiedEnded`), or a migration
+//!   the user declined by closing the resumed pane (`DeclinedByUser`). The
+//!   screen rests until its grid changes. A migration that failed after its
+//!   resumed `claude` may have started rests its SESSION longer, for the
+//!   migration cap's rolling 24h window: that child may still be running, and
+//!   a migration would resume the session again beside it. Every hint on that
+//!   session ends the same way without migrating, whatever this scanner
+//!   recorded in between.
 //!
 //! Each retry re-probes every configured account, but the probe's 60s usage
 //! cache bounds upstream traffic to at most one probe per account per minute
@@ -863,6 +868,86 @@ mod tests {
             next.previous,
             HintOutcome::NoUsableTarget
         ));
+    }
+
+    /// A migration that failed after its resumed `claude` may have started
+    /// rests its session at the scanner too: its frozen screen is not kept
+    /// due, and a later repaint on a new grid generation — even after a scan
+    /// without the limit text cleared the terminal's last outcome — fires a
+    /// hint that ends `FailedAfterChild` with no migration target picked.
+    /// Mutation: neutralise the per-session rest check in `cap_then_pick` —
+    /// the repaint's hint then picks a target.
+    #[tokio::test]
+    async fn a_repaint_after_a_child_started_failure_picks_no_target() {
+        use crate::terminal::account_migration::{
+            cap_then_pick, settle_hint_migration, MigrateError,
+        };
+        let tid = "test/usage_limit/child-started";
+        let sid = "test/usage_limit/child-started-session";
+        let stamp = 1_797_000_000_000i64;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let first = scan(tid, 1, LIMIT_SCREEN, at(0))
+            .1
+            .expect("the first appearance fires");
+        dispatch_hint(first, move |_tid, _pattern, previous| {
+            std::future::ready(settle_hint_migration(
+                sid,
+                stamp,
+                previous,
+                Err(MigrateError::FailedAfterChild(
+                    "reader wiring failed".to_string(),
+                )),
+                || {},
+                |_| {},
+            ))
+        })
+        .await;
+        assert_eq!(
+            recorded_outcome(tid),
+            Some((1, HintOutcome::FailedAfterChild))
+        );
+        assert_eq!(tick(tid, 1, at(1_500)), Tick::Rest, "not kept due");
+
+        // A scan without the limit text clears the terminal's outcome...
+        let (read, hint) = scan(tid, 2, "cargo build finished in 12s", at(10_000));
+        assert!(read && hint.is_none());
+        assert_eq!(recorded_outcome(tid), None);
+
+        // ...and the repaint on a new generation fires, with nothing behind it.
+        let repaint = scan(tid, 3, LIMIT_SCREEN, at(300_000))
+            .1
+            .expect("the repaint fires");
+        assert_eq!((repaint.generation, repaint.previous), (3, None));
+        let picked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let picked_in = Arc::clone(&picked);
+        dispatch_hint(repaint, move |_tid, _pattern, previous| {
+            let outcome = match cap_then_pick(
+                sid,
+                "C:/a",
+                stamp + 300_000,
+                previous,
+                move || {
+                    picked_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Some("C:/b".to_string())
+                },
+                |_| {},
+            ) {
+                Ok(_) => HintOutcome::Migrated,
+                Err(outcome) => outcome,
+            };
+            std::future::ready(outcome)
+        })
+        .await;
+        assert!(
+            !picked.load(std::sync::atomic::Ordering::SeqCst),
+            "no migration target is picked beside a child that may still run"
+        );
+        assert_eq!(
+            recorded_outcome(tid),
+            Some((3, HintOutcome::FailedAfterChild))
+        );
     }
 
     /// (c) A pane frozen on the limit menu whose hint found no usable target is

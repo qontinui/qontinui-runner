@@ -1138,20 +1138,16 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
         self.claude_session_id
     }
 
-    async fn spawn_next(
-        &mut self,
-    ) -> Result<String, crate::terminal::spawn_refusal::SpawnFailure> {
+    async fn spawn_next(&mut self) -> Result<String, crate::terminal::spawn_refusal::SpawnFailure> {
         // The async pre-step: the ABSOLUTE binary, retried, never bare — the
         // one resolved before the cap check for the first spawn.
         let claude_bin = match self.first_bin.take() {
             Some(bin) => bin,
-            None => {
-                crate::claude_cli_spawn::resolve_resume_claude_bin(
-                    &crate::claude_cli_spawn::RETRY_DELAYS,
-                )
-                .await
-                .map_err(crate::terminal::spawn_refusal::SpawnFailure::before_child)?
-            }
+            None => crate::claude_cli_spawn::resolve_resume_claude_bin(
+                &crate::claude_cli_spawn::RETRY_DELAYS,
+            )
+            .await
+            .map_err(crate::terminal::spawn_refusal::SpawnFailure::before_child)?,
         };
         crate::terminal::account_migration::spawn_resumed_pane(
             &self.app,
@@ -1728,9 +1724,12 @@ mod tests {
             "a died respawn must not claim it stays pending: {msg}"
         );
         assert!(matches!(
-            proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned(
+            proven_terminal(
+                Uuid::nil(),
+                RespawnOutcome::NotSpawned(
                     crate::terminal::spawn_refusal::SpawnFailure::before_child("x")
-                )),
+                )
+            ),
             Err(RespawnError::Spawn(_))
         ));
         // A running-but-unpainted pane holds the session: reported Ok, so the
@@ -1747,7 +1746,13 @@ mod tests {
             Some("t-u")
         );
         assert!(matches!(
-            proven_terminal(Uuid::nil(), RespawnOutcome::ClosedByUser { attempts: 1 }),
+            proven_terminal(
+                Uuid::nil(),
+                RespawnOutcome::ClosedByUser {
+                    attempts: 1,
+                    orphan: None
+                }
+            ),
             Err(RespawnError::ClosedByUser)
         ));
         assert_eq!(

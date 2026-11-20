@@ -805,20 +805,16 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
         &self.cand.id
     }
 
-    async fn spawn_next(
-        &mut self,
-    ) -> Result<String, crate::terminal::spawn_refusal::SpawnFailure> {
+    async fn spawn_next(&mut self) -> Result<String, crate::terminal::spawn_refusal::SpawnFailure> {
         // The async pre-step: the ABSOLUTE binary, retried, never bare — the
         // one resolved before the cap check for the first spawn.
         let claude_bin = match self.first_bin.take() {
             Some(bin) => bin,
-            None => {
-                crate::claude_cli_spawn::resolve_resume_claude_bin(
-                    &crate::claude_cli_spawn::RETRY_DELAYS,
-                )
-                .await
-                .map_err(crate::terminal::spawn_refusal::SpawnFailure::before_child)?
-            }
+            None => crate::claude_cli_spawn::resolve_resume_claude_bin(
+                &crate::claude_cli_spawn::RETRY_DELAYS,
+            )
+            .await
+            .map_err(crate::terminal::spawn_refusal::SpawnFailure::before_child)?,
         };
         let cand = &self.cand;
         // Model is sniffed off the row's transcript. The read is blocking

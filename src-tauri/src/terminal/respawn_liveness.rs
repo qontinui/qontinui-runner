@@ -354,20 +354,31 @@ pub(crate) enum RespawnOutcome {
     UnconfirmedRolledBack { terminal_id: String },
     /// The USER closed the pane being proven (an `explicit` close): nothing is
     /// retried; with an old pane still running the pre-respawn record is
-    /// restored onto it, otherwise the user's close is applied.
-    ClosedByUser { attempts: usize },
+    /// restored onto it, otherwise the user's close is applied. `orphan` is
+    /// the retry spawn that failed after its child started, when the user's
+    /// close was found after it ended the retries ([`Self::child_may_run`]).
+    ClosedByUser {
+        attempts: usize,
+        orphan: Option<SpawnFailure>,
+    },
     /// A migration's OLD pane is closed or gone: before the first spawn
     /// (`attempts: 0` — nothing moved, nothing spawned), or closed by the user
     /// mid-proof (the migration is abandoned, the pane under proof closed, and
     /// the session closed as the user asked). Never produced without an old
     /// pane. Typed apart from [`Self::ClosedByUser`] because it is the same
     /// fact as the migration's own up-front refusal of a closed session — no
-    /// failure to report.
-    OldPaneClosed { attempts: usize },
+    /// failure to report. `orphan` as for [`Self::ClosedByUser`].
+    OldPaneClosed {
+        attempts: usize,
+        orphan: Option<SpawnFailure>,
+    },
     /// Every attempt died (or a retry could not spawn). The last dead pane is
     /// closed; with an old pane the pre-respawn record is restored onto it.
     /// A retry spawn that failed after its child started ends the retries at
-    /// once (`retry_spawn_error` is that failure, see [`Self::child_may_run`]).
+    /// once (`retry_spawn_error` is that failure, see [`Self::child_may_run`]);
+    /// a user close found right after it ends the respawn as
+    /// [`Self::ClosedByUser`] / [`Self::OldPaneClosed`] instead, carrying the
+    /// same failure as `orphan`.
     Died {
         exit_code: Option<i32>,
         attempts: usize,
@@ -381,22 +392,27 @@ pub(crate) enum RespawnOutcome {
 }
 
 impl RespawnOutcome {
-    /// Whether a resumed `claude` this respawn started may still be running
-    /// with no pane it knows: a spawn that failed after its child started
-    /// ([`SpawnFailure::child_started`]) — the first one ([`Self::NotSpawned`])
-    /// or the retry that ended a [`Self::Died`]. A caller must not respawn the
-    /// session beside it: that could run two `claude --resume` of one session.
-    pub(crate) fn child_may_run(&self) -> bool {
+    /// The spawn failure that may have left a resumed `claude` running with no
+    /// pane this respawn knows, if any: a spawn that failed after its child
+    /// started ([`SpawnFailure::child_started`]) — the first one
+    /// ([`Self::NotSpawned`]), or the retry that ended the retries, whatever
+    /// the respawn then ended as ([`Self::Died`], or a user close found right
+    /// after it: [`Self::ClosedByUser`], [`Self::OldPaneClosed`]). A caller
+    /// must not respawn the session beside it: that could run two
+    /// `claude --resume` of one session. The account migration maps every
+    /// such outcome to `MigrateError::FailedAfterChild` through this.
+    pub(crate) fn child_may_run(&self) -> Option<&SpawnFailure> {
         match self {
-            Self::NotSpawned(failure) => failure.child_started,
+            Self::NotSpawned(failure) => Some(failure).filter(|f| f.child_started),
             Self::Died {
                 retry_spawn_error, ..
-            } => retry_spawn_error.as_ref().is_some_and(|f| f.child_started),
-            Self::Alive { .. }
-            | Self::Unconfirmed { .. }
-            | Self::UnconfirmedRolledBack { .. }
-            | Self::ClosedByUser { .. }
-            | Self::OldPaneClosed { .. } => false,
+            } => retry_spawn_error.as_ref().filter(|f| f.child_started),
+            Self::ClosedByUser { orphan, .. } | Self::OldPaneClosed { orphan, .. } => {
+                orphan.as_ref()
+            }
+            Self::Alive { .. } | Self::Unconfirmed { .. } | Self::UnconfirmedRolledBack { .. } => {
+                None
+            }
         }
     }
 
@@ -706,6 +722,9 @@ fn end_failed(
     current: &str,
     attempts: usize,
     failure: Failure,
+    // A retry spawn that failed after its child started, carried into the
+    // user-close outcomes so it is never dropped (`child_may_run`).
+    orphan: Option<SpawnFailure>,
 ) -> RespawnOutcome {
     // A user close of the OLD pane can land from another thread after the
     // caller's own old-pane check: it wins over the pane under proof's
@@ -718,7 +737,7 @@ fn end_failed(
     let old_state = hold.old_pane();
     if old.is_some() && old_state == Some(OldPane::ClosedByUser) {
         hold.abort_for_closed_old(current);
-        return RespawnOutcome::OldPaneClosed { attempts };
+        return RespawnOutcome::OldPaneClosed { attempts, orphan };
     }
     let panes = Arc::clone(&hold.panes);
     let rolled_back = matches!((old, old_state), (Some(_), Some(OldPane::Running)));
@@ -751,7 +770,7 @@ fn end_failed(
         }
     }
     match failure {
-        Failure::ClosedByUser(_) => RespawnOutcome::ClosedByUser { attempts },
+        Failure::ClosedByUser(_) => RespawnOutcome::ClosedByUser { attempts, orphan },
         Failure::Died {
             exit_code,
             retry_spawn_error,
@@ -794,7 +813,10 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
             .is_some_and(|r| r.state == "open" && r.terminal_id == old.terminal_id);
         if !row_still_there || !panes.alive(&old.terminal_id) {
             hold.finish_replaying_all();
-            return RespawnOutcome::OldPaneClosed { attempts: 0 };
+            return RespawnOutcome::OldPaneClosed {
+                attempts: 0,
+                orphan: None,
+            };
         }
     }
     let mut current = match effects.spawn_next().await {
@@ -812,7 +834,10 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
         // proof is started, and again after it.
         if hold.old_pane() == Some(OldPane::ClosedByUser) {
             hold.abort_for_closed_old(&current);
-            return RespawnOutcome::OldPaneClosed { attempts };
+            return RespawnOutcome::OldPaneClosed {
+                attempts,
+                orphan: None,
+            };
         }
         if let Some(c) = hold.take_user_close() {
             return end_failed(
@@ -822,6 +847,7 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                 &current,
                 attempts,
                 Failure::ClosedByUser(c),
+                None,
             );
         }
         // Judged before the probe below (an exited pane needs no probe) and
@@ -844,7 +870,10 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
         let verdict = hold.judged(&current, verdict);
         if hold.old_pane() == Some(OldPane::ClosedByUser) {
             hold.abort_for_closed_old(&current);
-            return RespawnOutcome::OldPaneClosed { attempts };
+            return RespawnOutcome::OldPaneClosed {
+                attempts,
+                orphan: None,
+            };
         }
         if let Some(c) = hold.take_user_close() {
             return end_failed(
@@ -854,6 +883,7 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                 &current,
                 attempts,
                 Failure::ClosedByUser(c),
+                None,
             );
         }
         match verdict {
@@ -982,6 +1012,7 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                                     &current,
                                     attempts,
                                     Failure::ClosedByUser(c),
+                                    None,
                                 );
                             }
                             continue 'proof;
@@ -1005,9 +1036,13 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                 // spawn, which failed: no pause follows to see it. Honour that
                 // close (the session ends `explicit`, never as the dead pane's
                 // restorable `pty-exit`) rather than report a death.
+                // Either close keeps a retry spawn that failed after its
+                // child started: that child may still run, and dropping the
+                // failure here would let the caller respawn beside it.
+                let orphan = retry_spawn_error.clone().filter(|f| f.child_started);
                 if hold.old_pane() == Some(OldPane::ClosedByUser) {
                     hold.abort_for_closed_old(&current);
-                    return RespawnOutcome::OldPaneClosed { attempts };
+                    return RespawnOutcome::OldPaneClosed { attempts, orphan };
                 }
                 let failure = match hold.take_user_close() {
                     Some(c) => Failure::ClosedByUser(c),
@@ -1016,7 +1051,7 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                         retry_spawn_error,
                     },
                 };
-                return end_failed(hold, store, old, &current, attempts, failure);
+                return end_failed(hold, store, old, &current, attempts, failure, orphan);
             }
         }
     }
@@ -1329,6 +1364,9 @@ mod tests {
         /// When set, the USER closes the OLD pane while a RETRY spawns, and
         /// that retry spawn then FAILS (a scripted spawn error).
         close_old_in_failing_retry_spawn: bool,
+        /// When set, the USER closes the dead pane being retired while a RETRY
+        /// spawns, and that retry spawn then FAILS (a scripted spawn error).
+        user_close_prev_in_failing_retry_spawn: bool,
         /// When set, the OLD pane's CLI EXITS (a `pty-exit`, not the user)
         /// while the first spawn runs; the pane itself still reads alive.
         old_exits_in_spawn: bool,
@@ -1372,6 +1410,7 @@ mod tests {
                 close_old_in_pause: false,
                 close_old_in_retry_spawn: false,
                 close_old_in_failing_retry_spawn: false,
+                user_close_prev_in_failing_retry_spawn: false,
                 old_exits_in_spawn: false,
                 old_vanishes_in_spawn: false,
                 exit_on_first_alive: false,
@@ -1387,6 +1426,12 @@ mod tests {
         }
         async fn spawn_next(&mut self) -> Result<String, SpawnFailure> {
             if let Some(Some(e)) = self.spawn_errors.pop_front() {
+                if self.user_close_prev_in_failing_retry_spawn {
+                    if let Some(prev) = self.spawned.last() {
+                        let o = self.store.record_close_checked(SID, Some(prev), "explicit");
+                        self.exit_close_outcomes.push(o);
+                    }
+                }
                 if self.close_old_in_failing_retry_spawn && !self.spawned.is_empty() {
                     let o = self
                         .store
@@ -1626,8 +1671,12 @@ mod tests {
         // Every retry spawn fails, so the budget is spent on spawn errors.
         fx.spawn_errors = vec![
             None,
-            Some(SpawnFailure::before_child("claude_cli_unavailable:not_found")),
-            Some(SpawnFailure::before_child("claude_cli_unavailable:not_found")),
+            Some(SpawnFailure::before_child(
+                "claude_cli_unavailable:not_found",
+            )),
+            Some(SpawnFailure::before_child(
+                "claude_cli_unavailable:not_found",
+            )),
         ]
         .into();
         // Simulate `poll-dead` on the dead pane between spawn and rollback.
@@ -1758,7 +1807,7 @@ mod tests {
             out,
             RespawnOutcome::NotSpawned(SpawnFailure::before_child("boom"))
         );
-        assert!(!out.child_may_run());
+        assert!(out.child_may_run().is_none());
         assert!(fx.closed().is_empty());
         assert_eq!(store.get(SID).unwrap().terminal_id, "old");
     }
@@ -2063,7 +2112,13 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(None); 3]);
         fx.user_close = true;
         let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 1 });
+        assert_eq!(
+            out,
+            RespawnOutcome::ClosedByUser {
+                attempts: 1,
+                orphan: None
+            }
+        );
         assert_eq!(
             fx.spawned.len(),
             1,
@@ -2086,7 +2141,13 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(None); 3]);
         fx.user_close = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 1 });
+        assert_eq!(
+            out,
+            RespawnOutcome::ClosedByUser {
+                attempts: 1,
+                orphan: None
+            }
+        );
         assert_eq!(fx.spawned.len(), 1);
         let row = store.get(SID).unwrap();
         assert_eq!(
@@ -2133,7 +2194,9 @@ mod tests {
         );
         fx.spawn_errors = vec![
             None,
-            Some(SpawnFailure::before_child("claude_cli_unavailable:not_found")),
+            Some(SpawnFailure::before_child(
+                "claude_cli_unavailable:not_found",
+            )),
             None,
         ]
         .into();
@@ -2169,28 +2232,80 @@ mod tests {
             RespawnOutcome::Died {
                 exit_code: Some(127),
                 attempts: 2,
-                retry_spawn_error: Some(SpawnFailure::after_child(
-                    "terminal reader wiring failed"
-                )),
+                retry_spawn_error: Some(SpawnFailure::after_child("terminal reader wiring failed")),
                 rolled_back: true,
             }
         );
-        assert!(out.child_may_run());
-        assert_eq!(fx.spawned, vec!["new-1"], "no spawn after the child started");
+        assert!(out.child_may_run().is_some());
+        assert_eq!(
+            fx.spawned,
+            vec!["new-1"],
+            "no spawn after the child started"
+        );
         assert_eq!(store.get(SID).unwrap().terminal_id, "old");
 
         // A retry spawn that failed BEFORE its child keeps retrying, and the
         // outcome has no child to worry about.
         let (_d, store) = fresh_store();
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 2]);
-        fx.spawn_errors = vec![None, Some(SpawnFailure::before_child("pty open failed")), None].into();
+        fx.spawn_errors = vec![
+            None,
+            Some(SpawnFailure::before_child("pty open failed")),
+            None,
+        ]
+        .into();
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
         assert!(
             matches!(out, RespawnOutcome::Died { attempts: 3, .. }),
             "{out:?}"
         );
-        assert!(!out.child_may_run());
+        assert!(out.child_may_run().is_none());
         assert_eq!(fx.spawned.len(), 2);
+    }
+
+    /// A user close found right after a retry spawn that failed after its
+    /// child started ends the respawn as the user asked, but keeps that
+    /// failure: the child may still run, and the caller must not respawn
+    /// beside it. Both closes: of the pane under proof (`ClosedByUser`) and of
+    /// the old pane (`OldPaneClosed`). Mutation: build either outcome with
+    /// `orphan: None` after the retry loop — `child_may_run` then reads `None`.
+    #[tokio::test]
+    async fn a_user_close_after_a_child_started_retry_failure_keeps_the_failure() {
+        let failure = SpawnFailure::after_child("terminal reader wiring failed");
+
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127))]);
+        fx.spawn_errors = VecDeque::from(vec![None, Some(failure.clone())]);
+        fx.user_close_prev_in_failing_retry_spawn = true;
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::ClosedByUser {
+                attempts: 2,
+                orphan: Some(failure.clone()),
+            }
+        );
+        assert_eq!(out.child_may_run(), Some(&failure));
+        assert_eq!(
+            fx.spawned,
+            vec!["new-1"],
+            "no spawn after the child started"
+        );
+
+        let (_d, store) = fresh_store();
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127))]);
+        fx.spawn_errors = VecDeque::from(vec![None, Some(failure.clone())]);
+        fx.close_old_in_failing_retry_spawn = true;
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 2,
+                orphan: Some(failure.clone()),
+            }
+        );
+        assert_eq!(out.child_may_run(), Some(&failure));
     }
 
     /// A first spawn that failed after its child started moves nothing, and
@@ -2202,7 +2317,7 @@ mod tests {
         let mut fx = Fake::new(&store, vec![]);
         fx.spawn_errors = vec![Some(SpawnFailure::after_child("sessions lock poisoned"))].into();
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert!(out.child_may_run(), "{out:?}");
+        assert!(out.child_may_run().is_some(), "{out:?}");
         assert!(fx.closed().is_empty());
         assert_eq!(store.get(SID).unwrap().terminal_id, "old");
     }
@@ -2282,7 +2397,13 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Alive]);
         fx.close_old_in_spawn = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 1 });
+        assert_eq!(
+            out,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 1,
+                orphan: None
+            }
+        );
         assert_eq!(fx.spawned.len(), 1);
         assert!(
             fx.closed().contains(&"new-1".to_string()),
@@ -2330,7 +2451,13 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 3]);
         fx.user_close_in_pause = true;
         let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 1 });
+        assert_eq!(
+            out,
+            RespawnOutcome::ClosedByUser {
+                attempts: 1,
+                orphan: None
+            }
+        );
         assert_eq!(
             fx.spawned.len(),
             1,
@@ -2353,7 +2480,13 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 3]);
         fx.user_close_prev_in_spawn = true;
         let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 2 });
+        assert_eq!(
+            out,
+            RespawnOutcome::ClosedByUser {
+                attempts: 2,
+                orphan: None
+            }
+        );
         assert_eq!(fx.spawned.len(), 2);
         assert_eq!(fx.closed(), vec!["new-1".to_string(), "new-2".to_string()]);
         let row = store.get(SID).unwrap();
@@ -2393,7 +2526,13 @@ mod tests {
         );
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Alive]);
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 0 });
+        assert_eq!(
+            out,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 0,
+                orphan: None
+            }
+        );
         assert!(fx.spawned.is_empty(), "no pane is spawned");
         let row = store.get(SID).unwrap();
         assert_eq!(
@@ -2408,7 +2547,13 @@ mod tests {
         let mut fx2 = Fake::new(&store2, vec![LivenessVerdict::Alive]);
         fx2.panes.gone.lock().unwrap().push("old".into());
         let out2 = confirm_respawn(&mut fx2, &store2, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out2, RespawnOutcome::OldPaneClosed { attempts: 0 });
+        assert_eq!(
+            out2,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 0,
+                orphan: None
+            }
+        );
         assert!(fx2.spawned.is_empty());
     }
 
@@ -2451,7 +2596,13 @@ mod tests {
         );
         fx.close_old_in_retry_spawn = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 2 });
+        assert_eq!(
+            out,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 2,
+                orphan: None
+            }
+        );
         assert_eq!(
             fx.awaited,
             vec!["new-1".to_string()],
@@ -2473,10 +2624,17 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127))]);
         fx.exit_close = true;
         // First spawn succeeds (no error), the second (the last retry) fails.
-        fx.spawn_errors = VecDeque::from(vec![None, Some(SpawnFailure::before_child("spawn failed"))]);
+        fx.spawn_errors =
+            VecDeque::from(vec![None, Some(SpawnFailure::before_child("spawn failed"))]);
         fx.close_old_in_failing_retry_spawn = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), 2).await;
-        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 2 });
+        assert_eq!(
+            out,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 2,
+                orphan: None
+            }
+        );
         let row = store.get(SID).unwrap();
         assert_eq!(
             (row.state.as_str(), row.close_reason.as_deref()),
@@ -2511,7 +2669,13 @@ mod tests {
         fx.close_old_in_retry_spawn = true;
         fx.user_close_prev_in_spawn = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 2 });
+        assert_eq!(
+            out,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 2,
+                orphan: None
+            }
+        );
         assert_eq!(
             fx.awaited,
             vec!["new-1".to_string()],
@@ -2536,7 +2700,13 @@ mod tests {
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 3]);
         fx.close_old_in_pause = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 1 });
+        assert_eq!(
+            out,
+            RespawnOutcome::OldPaneClosed {
+                attempts: 1,
+                orphan: None
+            }
+        );
         assert_eq!(
             fx.spawned.len(),
             1,
@@ -2576,7 +2746,13 @@ mod tests {
         fx.exit_close = true;
         fx.user_close_retired_while_proving = true;
         let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 2 });
+        assert_eq!(
+            out,
+            RespawnOutcome::ClosedByUser {
+                attempts: 2,
+                orphan: None
+            }
+        );
         assert!(fx.closed().contains(&"new-2".to_string()));
         let row = store.get(SID).unwrap();
         assert_eq!(

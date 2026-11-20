@@ -48,12 +48,15 @@
 //!   and [`ScanGate::forget`] keeps each due. One is a match the debounce has
 //!   just suppressed, until it can fire. The other is a frozen screen whose
 //!   hint did not migrate the session but might later — no usable target yet,
-//!   a failed migration that started no resumed `claude`, a concurrent
+//!   a failed migration that started no resumed `claude`, a respawn that died
+//!   or never painted and was rolled back onto the old pane
+//!   (`RespawnDiedRolledBack`, `UnconfirmedRolledBack`), a concurrent
 //!   migration, or (once per appearance) an unconfirmed probe — which then
 //!   fires again each time the debounce allows (`usage_limit::after_hint`). A
 //!   migration that failed after its resumed `claude` may have started is not
-//!   kept due: it rests. So a limit screen gets one hint per appearance only
-//!   when that hint's outcome is final.
+//!   kept due: its session rests. Neither is one the user declined by closing
+//!   the resumed pane (`DeclinedByUser`). So a limit screen gets one hint per
+//!   appearance only when that hint's outcome is final.
 //!
 //! Reading the counter *before* rendering is safe in both directions: a stale
 //! read (the bump lands after the load) costs one deferred scan on the next

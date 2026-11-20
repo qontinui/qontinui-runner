@@ -2362,6 +2362,17 @@ pub async fn terminal_migrate_session_account(
         if !e.reached_destination() {
             crate::ai_provider::unrecord_handoff(&dst);
         }
+        // A resumed claude may still run beside the old pane: the automatic
+        // path must not migrate the session again beside it either.
+        if matches!(
+            e,
+            crate::terminal::account_migration::MigrateError::FailedAfterChild(_)
+        ) {
+            crate::terminal::account_migration::rest_after_child_started(
+                &record.claude_session_id,
+                chrono::Utc::now().timestamp_millis(),
+            );
+        }
         // A refusal (already migrating / already moved / closed /
         // gone) reads as its own sentence, exactly as before the typed
         // error.
