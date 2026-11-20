@@ -2318,6 +2318,16 @@ pub async fn terminal_migrate_session_account(
     let record = store
         .get(&claude_session_id)
         .ok_or_else(|| format!("unknown session: {claude_session_id}"))?;
+    // FIRST, before a target is picked (a pick records a handoff): a session
+    // resting after a migration or respawn that failed once its resumed claude
+    // had started may still have that claude running. The click names an
+    // account; it does not prove the orphan gone.
+    if let Some(refusal) = crate::terminal::account_migration::child_started_rest_refusal(
+        &record.claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        return Err(refusal);
+    }
     let src = record
         .config_dir
         .clone()
@@ -3436,6 +3446,30 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The manual migrate command refuses a session resting after a
+    /// child-started failure BEFORE it picks a target (a pick records a
+    /// handoff) or migrates: a source read of the command's own body, since
+    /// the command needs a live Tauri app to run. The refusal itself is
+    /// `account_migration::tests::a_resting_session_refuses_a_manual_migration`.
+    /// Mutation: delete the check from the command.
+    #[test]
+    fn the_manual_migrate_command_checks_the_child_started_rest_first() {
+        let src = include_str!("terminal.rs");
+        let start = src
+            .find("pub async fn terminal_migrate_session_account(")
+            .expect("the command");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("the command's end")];
+        let check = body
+            .find("account_migration::child_started_rest_refusal(")
+            .expect("the command checks the child-started rest");
+        let pick = body.find("pick_migration_target(").expect("the pick");
+        let migrate = body
+            .find("migrate_session_off_runtime(")
+            .expect("the migration");
+        assert!(check < pick && check < migrate, "the check comes first");
+    }
 
     /// The live-session payload carries what the read could not see beside
     /// the rows — the keys `fetchLiveClaudeSessionRead`

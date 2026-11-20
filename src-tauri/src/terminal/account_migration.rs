@@ -21,10 +21,10 @@
 //!    or never painted and was rolled back onto the old pane, or another
 //!    mover of the session in flight retry every debounce, and an
 //!    unconfirmed probe retries once per appearance. A migration that failed
-//!    after its resumed `claude` may have started rests for its whole episode,
-//!    since that child may still be running: not retried, and a repaint that
-//!    still shows the limit ends the same way without migrating
-//!    ([`cap_then_pick`]), until a scan finds no limit message on the screen.
+//!    after its resumed `claude` may have started rests its SESSION for the
+//!    cap's 24 h window, since that child may still be running: not retried,
+//!    and any later hint on that session ends the same way without migrating
+//!    ([`cap_then_pick`], [`rest_after_child_started`]).
 //!    So a pane frozen on the limit menu is retried until a target frees, instead
 //!    of waiting for a repaint that never comes. Each retry re-probes every
 //!    configured account, and the probe's 60 s usage cache keeps that to at
@@ -151,10 +151,17 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     true
 }
 
-/// Per-session rest after a migration that failed after its resumed `claude`
-/// may have started ([`MigrateError::FailedAfterChild`]): when it settled
-/// (unix millis). Kept beside the cap history and aged by the same rolling
-/// [`MIGRATION_CAP_WINDOW_MS`].
+/// What every refusal and error about a child-started failure tells its
+/// reader: the migration error ([`MigrateError::FailedAfterChild`]), the
+/// manual command's refusal ([`child_started_rest_refusal`]), the respawn
+/// receiver's and the resume door's.
+pub(crate) const CHILD_MAY_RUN_WARNING: &str = "a resumed claude of this session may still be \
+     running with no pane; do not migrate or resume this session again until it is confirmed gone";
+
+/// Per-session rest after a migration (or respawn) that failed after its
+/// resumed `claude` may have started ([`MigrateError::FailedAfterChild`]):
+/// when it was recorded (unix millis). Kept beside the cap history and bounded
+/// by the same rolling [`MIGRATION_CAP_WINDOW_MS`] (24 h).
 ///
 /// Per SESSION, not per terminal: the grid scanner's per-terminal last outcome
 /// is overwritten by any later hint (`NotConfirmed`, `RefusedInFlight`, ...)
@@ -162,27 +169,61 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
 /// the rest while that child may still run, and the next hint would resume the
 /// session a second time beside it. Nothing the scanner sees proves the child
 /// gone, so only time ends the rest.
+///
+/// Two limits, stated so nobody reads more into it:
+/// - The 24 h expiry is a TIME BOUND, not proof the orphaned child is gone. A
+///   child still running after it is not seen by anything here; the bound only
+///   keeps one bad spawn from locking a session out of automation forever.
+/// - The map is IN MEMORY only: a runner restart clears it (and ends every
+///   child the old process spawned in its PTYs with it, but not one that
+///   outlived its pane).
+///
+/// Each entry is expired lazily, by its OWN reader against the reader's own
+/// stamp ([`resting_after_child_started`]); recording one never evicts
+/// another, so no stamp — however far in the future — can end another
+/// session's rest.
 static CHILD_STARTED_REST: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
 
 /// Start (or restart) `claude_session_id`'s rest at `now_ms`
-/// ([`CHILD_STARTED_REST`]).
+/// ([`CHILD_STARTED_REST`]). Touches only that session's entry.
 pub(crate) fn rest_after_child_started(claude_session_id: &str, now_ms: i64) {
     let mut rest = CHILD_STARTED_REST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = rest.get_or_insert_with(HashMap::new);
-    map.retain(|_, at| now_ms - *at <= MIGRATION_CAP_WINDOW_MS);
-    map.insert(claude_session_id.to_string(), now_ms);
+    rest.get_or_insert_with(HashMap::new)
+        .insert(claude_session_id.to_string(), now_ms);
 }
 
 /// Whether `claude_session_id` is resting at `now_ms` ([`CHILD_STARTED_REST`]).
-fn resting_after_child_started(claude_session_id: &str, now_ms: i64) -> bool {
-    let rest = CHILD_STARTED_REST
+/// An entry older than the window at `now_ms` is removed here — that entry
+/// only.
+pub(crate) fn resting_after_child_started(claude_session_id: &str, now_ms: i64) -> bool {
+    let mut rest = CHILD_STARTED_REST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    rest.as_ref()
-        .and_then(|m| m.get(claude_session_id))
-        .is_some_and(|at| now_ms - *at <= MIGRATION_CAP_WINDOW_MS)
+    let Some(map) = rest.as_mut() else {
+        return false;
+    };
+    match map.get(claude_session_id) {
+        Some(at) if now_ms - *at <= MIGRATION_CAP_WINDOW_MS => true,
+        Some(_) => {
+            map.remove(claude_session_id);
+            false
+        }
+        None => false,
+    }
+}
+
+/// The refusal for a session resting after a child-started failure, or `None`.
+/// The manual migrate command checks it first: an operator click is its own
+/// confirmation of WHICH account, not proof the orphaned `claude` is gone.
+pub(crate) fn child_started_rest_refusal(claude_session_id: &str, now_ms: i64) -> Option<String> {
+    resting_after_child_started(claude_session_id, now_ms).then(|| {
+        format!(
+            "not migrating {claude_session_id}: an earlier migration or respawn of it failed after \
+             its resumed claude started — {CHILD_MAY_RUN_WARNING}"
+        )
+    })
 }
 
 /// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
@@ -328,9 +369,7 @@ impl std::fmt::Display for MigrateError {
             ),
             Self::FailedAfterChild(e) => write!(
                 f,
-                "{e} — a resumed claude of this session may still be running with no pane; do not \
-                 migrate or resume this session again by hand until it is confirmed gone (the \
-                 automatic path rests this session for 24h)"
+                "{e} — {CHILD_MAY_RUN_WARNING} (the automatic path rests this session for 24h)"
             ),
             Self::RespawnDied {
                 exit_code,
@@ -546,8 +585,9 @@ pub(crate) enum HintOutcome {
     Failed,
     /// [`MigrateError::FailedAfterChild`]: the respawn failed after its resumed
     /// `claude` may have started, which may still be running beside the old
-    /// pane. The pane rests for the whole episode: a later hint in it ends the
-    /// same way without migrating ([`cap_then_pick`]).
+    /// pane. The SESSION rests for the cap's 24 h window
+    /// ([`rest_after_child_started`]): every later hint on it ends the same way
+    /// without migrating ([`cap_then_pick`]).
     FailedAfterChild,
     /// [`MigrateError::DeclinedByUser`]: the user closed the resumed pane mid-proof.
     DeclinedByUser,
@@ -627,8 +667,9 @@ impl HintOutcome {
             Self::DeclinedByUser => Retry::Never,
             // A resumed child may already be running: the session's row still
             // names the old pane, so a retry would migrate it again and start a
-            // second `claude --resume` beside the first. A repaint in the same
-            // episode does not migrate either ([`cap_then_pick`]).
+            // second `claude --resume` beside the first. The session rests for
+            // the cap's 24 h window, so a repaint, or any later hint on it,
+            // does not migrate either ([`cap_then_pick`]).
             Self::FailedAfterChild => Retry::Never,
         }
     }
@@ -3486,7 +3527,7 @@ mod tests {
     /// passed. Mutation: neutralise the rest check in `cap_then_pick` — the
     /// next hint then picks (and panics here).
     #[test]
-    fn a_child_started_failure_rests_for_its_whole_episode() {
+    fn a_child_started_failure_rests_its_session_for_the_cap_window() {
         let sid = "test/account_migration/rest-after-child";
         let base = 1_795_000_000_000i64;
         assert!(migration_cap_permits(sid, base), "the hint takes a slot");
@@ -3539,6 +3580,41 @@ mod tests {
         let later = base + MIGRATION_CAP_WINDOW_MS + 1;
         let (picked, _) = cap_pick(sid, later, None, Some("C:/b"));
         assert_eq!(picked, Ok("C:/b".to_string()));
+    }
+
+    /// The manual command's check: a resting session is refused with the shared
+    /// warning; another session, or this one after the window, is not.
+    /// Mutation: make `child_started_rest_refusal` always `None`.
+    #[test]
+    fn a_resting_session_refuses_a_manual_migration() {
+        let sid = "test/account_migration/manual-refused";
+        let base = 1_798_000_000_000i64;
+        assert_eq!(child_started_rest_refusal(sid, base), None);
+        rest_after_child_started(sid, base);
+        let refusal = child_started_rest_refusal(sid, base + 60_000).expect("refused");
+        assert!(refusal.contains(CHILD_MAY_RUN_WARNING), "{refusal}");
+        assert_eq!(
+            child_started_rest_refusal("test/account_migration/manual-other", base),
+            None
+        );
+        assert_eq!(
+            child_started_rest_refusal(sid, base + MIGRATION_CAP_WINDOW_MS + 1),
+            None,
+            "the time bound ends the rest"
+        );
+    }
+
+    /// Recording one session's rest never ends another's, however far apart
+    /// their stamps are (two tests sharing this process-global map once did
+    /// exactly that). Mutation: evict every stale entry on insert.
+    #[test]
+    fn recording_a_rest_never_evicts_another_sessions_rest() {
+        let early = "test/account_migration/rest-early";
+        let late = "test/account_migration/rest-late";
+        let base = 1_700_000_000_000i64;
+        rest_after_child_started(early, base);
+        rest_after_child_started(late, base + 10 * MIGRATION_CAP_WINDOW_MS);
+        assert!(resting_after_child_started(early, base + 1_000));
     }
 
     /// A user who closes the resumed pane mid-proof undid the migration: it is

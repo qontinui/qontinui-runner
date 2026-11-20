@@ -202,6 +202,16 @@ pub enum RespawnError {
         "{0} — not retried: coord counts the dead attempts as materialized; re-issue the respawn"
     )]
     Died(String),
+    /// A spawn failed AFTER its resumed `claude` started
+    /// ([`crate::terminal::respawn_liveness::RespawnOutcome::child_may_run`]),
+    /// so that child may still be running with no pane — or an earlier respawn
+    /// or migration of this Claude session did, and the session is resting
+    /// ([`crate::terminal::account_migration::rest_after_child_started`]).
+    /// NOT replayed: every later delivery of the request (push or catch-up)
+    /// is refused here before anything is spawned, for the rest's 24 h window,
+    /// since a replay would start a second `claude --resume` beside that child.
+    #[error("{0} — {warning}; not replayed", warning = crate::terminal::account_migration::CHILD_MAY_RUN_WARNING)]
+    ChildMayRun(String),
     /// The user closed the resumed pane before it painted. Not retried: a
     /// respawn behind the user's own close would reopen what they closed.
     #[error("the user closed the resumed pane before it painted — not retried")]
@@ -514,6 +524,16 @@ async fn materialize_logged(
                 source = %respawn.source_session_id,
                 terminal = %terminal_id,
                 "session respawn: resumed session is live"
+            );
+        }
+        Err(e @ RespawnError::ChildMayRun(_)) => {
+            tracing::warn!(
+                source = %respawn.source_session_id,
+                account = ?respawn.account,
+                error = %e,
+                "session respawn NOT materialized — a resumed claude of this session may still \
+                 be running; this runner refuses every delivery of the request while the \
+                 session rests, so it is not replayed beside that child"
             );
         }
         Err(e @ RespawnError::Died(_)) => {
@@ -872,6 +892,21 @@ async fn materialize(
         .ok_or(RespawnError::NoClaudeSession(respawn.source_session_id))?
         .to_string();
 
+    // 1a. A session resting after a child-started failure (this receiver's,
+    //     the resume door's or an account migration's) may still have that
+    //     `claude --resume` running: refuse every delivery of the request —
+    //     the catch-up replays a pending row on each reconnect — before any
+    //     work or budget, rather than resume it a second time beside it.
+    if crate::terminal::account_migration::resting_after_child_started(
+        &claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        return Err(RespawnError::ChildMayRun(format!(
+            "an earlier respawn or migration of Claude session {claude_session_id} failed after \
+             its resumed claude started"
+        )));
+    }
+
     // 1b. One mover per Claude session (the shared in-flight registry), held
     //     through spawn, proof and claim re-acquire.
     let _in_flight =
@@ -1021,7 +1056,18 @@ async fn materialize(
         crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
     .await;
-    let terminal_id = proven_terminal(respawn.source_session_id, outcome)?;
+    let terminal_id = match proven_terminal(respawn.source_session_id, outcome) {
+        Ok(terminal_id) => terminal_id,
+        Err(e @ RespawnError::ChildMayRun(_)) => {
+            // Rest the session, so the next delivery is refused at step 1a.
+            crate::terminal::account_migration::rest_after_child_started(
+                &claude_session_id,
+                chrono::Utc::now().timestamp_millis(),
+            );
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.
@@ -1078,6 +1124,15 @@ fn proven_terminal(
     outcome: crate::terminal::respawn_liveness::RespawnOutcome,
 ) -> Result<String, RespawnError> {
     use crate::terminal::respawn_liveness::RespawnOutcome;
+    // FIRST: a spawn that failed after its resumed `claude` started, whatever
+    // the respawn then ended as. That child may still run, so this is neither
+    // a refusal (left for retry) nor a death ("nothing running").
+    if let Some(failure) = outcome.child_may_run() {
+        return Err(RespawnError::ChildMayRun(format!(
+            "respawn spawn failed after its resumed claude started: {}",
+            failure.message
+        )));
+    }
     match outcome {
         RespawnOutcome::Alive { terminal_id, .. } => Ok(terminal_id),
         // Running but unpainted: UNKNOWN, and a process DOES hold the session —
@@ -1696,6 +1751,47 @@ mod tests {
     // -----------------------------------------------------------------------
     // Transcript materialization helpers
     // -----------------------------------------------------------------------
+
+    /// A spawn that failed after its resumed claude started is `ChildMayRun`
+    /// — not a refusal left for retry, not a death that leaves nothing
+    /// running — for every outcome that can carry it. Mutation: drop the
+    /// `child_may_run` check from `proven_terminal`.
+    #[test]
+    fn the_receiver_never_reads_a_child_started_failure_as_a_refusal_or_a_death() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        use crate::terminal::spawn_refusal::SpawnFailure;
+        let failure = SpawnFailure::after_child("terminal reader wiring failed");
+        for outcome in [
+            RespawnOutcome::NotSpawned(failure.clone()),
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 2,
+                retry_spawn_error: Some(failure.clone()),
+                rolled_back: false,
+            },
+            RespawnOutcome::ClosedByUser {
+                attempts: 2,
+                orphan: Some(failure.clone()),
+            },
+        ] {
+            let err = proven_terminal(Uuid::nil(), outcome.clone()).unwrap_err();
+            assert!(
+                matches!(err, RespawnError::ChildMayRun(_)),
+                "{outcome:?}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("may still be"), "{msg}");
+            assert!(msg.contains("not replayed"), "{msg}");
+        }
+        // A failure before any child is still a plain refusal.
+        assert!(matches!(
+            proven_terminal(
+                Uuid::nil(),
+                RespawnOutcome::NotSpawned(SpawnFailure::before_child("pty open failed"))
+            ),
+            Err(RespawnError::Spawn(_))
+        ));
+    }
 
     /// The receiver reports a respawn whose every attempt died as a failure —
     /// never success — and says it is not retried (review finding 2: coord's
