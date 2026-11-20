@@ -758,8 +758,8 @@ pub struct UserBudgetReport {
 ///   `user:unidentified`, and an unidentified bucket is exactly the gap this
 ///   block closes, so an absent login is never sent as a guess;
 /// - an unknown `limit`/`remaining`/`reset`/`resource`, a limit outside
-///   `1..=1_000_000`, a negative or over-limit `remaining`, or a negative
-///   `used`;
+///   `1..=1_000_000`, a negative or over-limit `remaining`, or a
+///   negative or over-limit `used`;
 /// - a resource that is not `[a-z0-9_]{1,32}`;
 /// - a window that has already reset, or a reset implausibly far ahead;
 /// - a reading older than [`USER_BUDGET_REPORT_MAX_AGE_SECS`] or stamped in
@@ -781,7 +781,7 @@ pub fn build_user_budget_report(
         .filter(|l| (1..=USER_BUDGET_REPORT_MAX_LIMIT).contains(l))?;
     let remaining = obs.remaining.filter(|r| (0..=limit).contains(r))?;
     let used = match obs.used {
-        Some(u) if u < 0 => return None,
+        Some(u) if !(0..=limit).contains(&u) => return None,
         u => u,
     };
     let reset_at_unix = obs.reset_at_unix?;
@@ -2979,6 +2979,7 @@ mod tests {
             (with(&|o| o.remaining = None), "unknown remaining"),
             (with(&|o| o.remaining = Some(-1)), "negative remaining"),
             (with(&|o| o.remaining = Some(5001)), "remaining over limit"),
+            (with(&|o| o.used = Some(5001)), "used over limit"),
             (with(&|o| o.used = Some(-1)), "negative used"),
             (with(&|o| o.reset_at_unix = None), "unknown reset"),
             (with(&|o| o.reset_at_unix = Some(now)), "window resets now"),
