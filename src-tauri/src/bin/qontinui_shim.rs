@@ -1944,7 +1944,11 @@ mod tests {
                 |_| sleeps += 1,
                 |n| notes.push(n),
             );
-            assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")), "{first:?}");
+            assert_eq!(
+                got,
+                Resolved::Settled(PathBuf::from("/real/claude")),
+                "{first:?}"
+            );
             assert_eq!(sleeps, 0, "{first:?}: a settled hit never waits");
             assert!(notes.is_empty(), "{first:?}: and announces nothing");
         }
@@ -1954,7 +1958,12 @@ mod tests {
     fn resolve_settled_with_wait_announces_a_changing_tool_once_then_takes_it_settled() {
         let (mut sleeps, mut notes) = (0, Vec::new());
         let got = resolve_settled_with_wait(
-            scripted(vec![changing(100), changing(350), changing(600), Some(Settle::Settled)]),
+            scripted(vec![
+                changing(100),
+                changing(350),
+                changing(600),
+                Some(Settle::Settled),
+            ]),
             Duration::from_secs(10),
             Duration::from_millis(250),
             |_| sleeps += 1,
@@ -1978,7 +1987,12 @@ mod tests {
         let got = resolve_settled_with_wait(
             || {
                 calls += 1;
-                Some((PathBuf::from("/real/claude"), Settle::Changing { age: Duration::ZERO }))
+                Some((
+                    PathBuf::from("/real/claude"),
+                    Settle::Changing {
+                        age: Duration::ZERO,
+                    },
+                ))
             },
             Duration::from_secs(1),
             Duration::from_millis(250),
@@ -1993,7 +2007,13 @@ mod tests {
     fn resolve_settled_with_wait_shares_one_bound_across_a_miss_and_a_change() {
         let (mut sleeps, mut notes) = (0, Vec::new());
         let got = resolve_settled_with_wait(
-            scripted(vec![None, None, changing(0), changing(250), Some(Settle::Settled)]),
+            scripted(vec![
+                None,
+                None,
+                changing(0),
+                changing(250),
+                Some(Settle::Settled),
+            ]),
             Duration::from_secs(2),
             Duration::from_millis(250),
             |_| sleeps += 1,
@@ -2153,8 +2173,10 @@ mod tests {
             "qontinui-shim: /npm/bin/claude changed 1s ago (an install may still be writing \
              it); waiting up to 10s for it to settle"
         );
-        assert!(wait_line("claude", &WaitNote::Missing, Duration::from_secs(10))
-            .starts_with("qontinui-shim: claude not found on PATH"));
+        assert!(
+            wait_line("claude", &WaitNote::Missing, Duration::from_secs(10))
+                .starts_with("qontinui-shim: claude not found on PATH")
+        );
     }
 
     #[test]

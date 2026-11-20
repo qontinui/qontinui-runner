@@ -139,8 +139,16 @@ mod tests {
             },
             "age 1.999 s"
         );
-        assert_eq!(judge(changed, at(1_002, 0), min), Settle::Settled, "age 2 s");
-        assert_eq!(judge(changed, at(1_003, 0), min), Settle::Settled, "age 3 s");
+        assert_eq!(
+            judge(changed, at(1_002, 0), min),
+            Settle::Settled,
+            "age 2 s"
+        );
+        assert_eq!(
+            judge(changed, at(1_003, 0), min),
+            Settle::Settled,
+            "age 3 s"
+        );
     }
 
     #[test]
