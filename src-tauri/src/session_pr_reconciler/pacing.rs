@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::trigger_system::github_api::{HeadPr, PrStatus};
+use crate::trigger_system::github_api::{HeadPr, PrStatus, RepoPrListing};
 
 /// Per-row floor for an OPEN row whose repo no fresh, complete listing governs
 /// (D1). A governed repo's rows are paced by [`DISCOVERY_INTERVAL`] instead.
@@ -217,7 +217,12 @@ pub(super) fn plan_row_refresh(i: RowInputs, now: Instant) -> RowPlan {
     if due == RefreshDue::Terminal {
         return RowPlan::SkipTerminal;
     }
-    if let Some(observed) = i.observed_at {
+    // An observation read before a closed-listing gap is never written: the
+    // row falls to `Read` (its `last_read` was filtered out above).
+    let fresh_observation = i
+        .read_at
+        .is_some_and(|r| i.stale_before.is_none_or(|s| r > s));
+    if let Some(observed) = i.observed_at.filter(|_| fresh_observation) {
         if i.applied_at.is_none_or(|applied| observed > applied) {
             return RowPlan::Apply;
         }
@@ -227,6 +232,7 @@ pub(super) fn plan_row_refresh(i: RowInputs, now: Instant) -> RowPlan {
     }
     if i.class == RowClass::ClosedMutable
         && i.governed_by_listing
+        && fresh_observation
         && i.observed_at.is_some()
         && i.applied_wall
             .is_none_or(|w| now.saturating_duration_since(w) >= CLOSED_REFRESH_EARLY)
@@ -485,6 +491,47 @@ impl ReconcileMemo {
         }
         d.last_attempt = Some(now);
         d.complete = complete;
+    }
+
+    /// Record one discovery's listings — THE wiring `discover_repo` calls, so
+    /// the overflow rules are tested where they act. Returns whether either
+    /// listing overflowed. `started` is taken before the first request, `open_at`
+    /// / `closed_at` when each listing answered; `closed` is `None` when the
+    /// closed listing was not read (deferred, or failed — the caller records
+    /// that), in which case only the open listing's free data is kept.
+    ///
+    /// - A COMPLETE open listing drops every other observation still recorded
+    ///   open ([`Self::drop_unlisted_open`]); an overflowed one drops nothing.
+    /// - Only a CLOSED-listing overflow marks a gap
+    ///   ([`Self::mark_closed_gap`]), stamped at `started`, so this discovery's
+    ///   own reads survive it; an open-listing overflow marks nothing.
+    pub(super) fn apply_discovery(
+        &mut self,
+        repo_full: &str,
+        open: RepoPrListing,
+        open_at: Instant,
+        closed: Option<(RepoPrListing, Instant)>,
+        started: Instant,
+    ) -> bool {
+        if !open.overflow {
+            let listed: BTreeSet<i64> = open.prs.iter().map(|pr| pr.number as i64).collect();
+            self.drop_unlisted_open(repo_full, &listed);
+        }
+        for pr in open.prs {
+            self.observe(repo_full, pr, open_at);
+        }
+        let Some((closed, closed_at)) = closed else {
+            return open.overflow;
+        };
+        if closed.overflow {
+            self.mark_closed_gap(repo_full, started);
+        }
+        for pr in &closed.prs {
+            self.observe(repo_full, pr.clone(), closed_at);
+        }
+        let overflow = open.overflow || closed.overflow;
+        self.finish_discovery(repo_full, &closed.prs, !overflow, closed_at);
+        overflow
     }
 
     /// A discovery that failed: retried after the interval, and meanwhile the
@@ -1150,6 +1197,102 @@ mod tests {
         memo.observe("o/r", pr(7, "open", "o:e", "2026-11-19T09:00:00Z"), t0);
         memo.mark_closed_gap("o/r", t0 + secs(1));
         assert!(memo.prs_for_branch("o/r", "o", "e").is_empty());
+    }
+
+    fn listing(prs: Vec<HeadPr>, overflow: bool) -> RepoPrListing {
+        RepoPrListing {
+            prs,
+            overflow,
+            requests: 1,
+        }
+    }
+
+    /// The overflow rules, through the wiring `discover_repo` calls, for all
+    /// four open/closed overflow combinations. A previously-seen open PR #1
+    /// absent from this open listing; a pre-discovery read of #2 (closed).
+    #[test]
+    fn apply_discovery_handles_every_overflow_combination() {
+        for (open_overflow, closed_overflow) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let why = format!("open_overflow={open_overflow} closed_overflow={closed_overflow}");
+            let t0 = Instant::now();
+            let mut memo = ReconcileMemo::default();
+            memo.observe("o/r", pr(1, "open", "o:gone", "2026-11-19T08:00:00Z"), t0);
+            memo.observe("o/r", pr(2, "closed", "o:old", "2026-11-19T08:00:00Z"), t0);
+
+            let started = t0 + secs(1);
+            let open_at = started + secs(1);
+            let closed_at = open_at + secs(1);
+            let open = listing(
+                vec![pr(3, "open", "o:new", "2026-11-19T09:00:00Z")],
+                open_overflow,
+            );
+            let closed = listing(
+                vec![pr(4, "closed", "o:shut", "2026-11-19T09:30:00Z")],
+                closed_overflow,
+            );
+            let overflowed =
+                memo.apply_discovery("o/r", open, open_at, Some((closed, closed_at)), started);
+
+            assert_eq!(overflowed, open_overflow || closed_overflow, "{why}");
+            let d = &memo.repos["o/r"];
+            assert_eq!(d.complete, !(open_overflow || closed_overflow), "{why}");
+            // Only a closed overflow marks a gap, at the discovery's start.
+            assert_eq!(d.stale_before, closed_overflow.then_some(started), "{why}");
+            // Only a complete open listing drops the unlisted open PR.
+            assert_eq!(
+                memo.prs_for_branch("o/r", "o", "gone").is_empty(),
+                !open_overflow || closed_overflow,
+                "{why}"
+            );
+            // Reads made DURING the listing survive a closed-overflow gap.
+            assert_eq!(memo.prs_for_branch("o/r", "o", "new").len(), 1, "{why}");
+            assert_eq!(memo.prs_for_branch("o/r", "o", "shut").len(), 1, "{why}");
+            // A read from BEFORE the discovery does not survive one.
+            assert_eq!(
+                memo.prs_for_branch("o/r", "o", "old").is_empty(),
+                closed_overflow,
+                "{why}"
+            );
+            assert_eq!(
+                d.closed_mark.as_deref(),
+                Some("2026-11-19T09:30:00Z"),
+                "{why}"
+            );
+        }
+    }
+
+    /// A closed listing that was not read keeps the open listing's data and
+    /// records no attempt.
+    #[test]
+    fn apply_discovery_without_a_closed_listing_records_no_attempt() {
+        let t0 = Instant::now();
+        let mut memo = ReconcileMemo::default();
+        let open = listing(vec![pr(3, "open", "o:new", "2026-11-19T09:00:00Z")], false);
+        assert!(!memo.apply_discovery("o/r", open, t0, None, t0));
+        assert_eq!(memo.prs_for_branch("o/r", "o", "new").len(), 1);
+        assert!(memo.repos["o/r"].last_attempt.is_none());
+    }
+
+    /// A pre-gap observation is never written to a row: the row is re-read.
+    #[test]
+    fn a_pre_gap_observation_is_not_applied() {
+        let t0 = Instant::now();
+        let mut memo = ReconcileMemo::default();
+        let session = Uuid::nil();
+        let key: PrKey = ("o/r".into(), 8);
+        // Observed (never applied to this session's row), then a gap.
+        memo.observe("o/r", pr(8, "closed", "o:x", "2026-11-19T09:00:00Z"), t0);
+        memo.mark_closed_gap("o/r", t0 + secs(1));
+        let now = t0 + secs(2);
+        assert_eq!(
+            plan_row_refresh(
+                memo.row_inputs(session, &key, RowClass::ClosedMutable, Some(t0), false, now),
+                now
+            ),
+            RowPlan::Read
+        );
     }
 
     /// A failed read is retried no sooner than a successful one would be.

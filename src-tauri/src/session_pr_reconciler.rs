@@ -1141,16 +1141,7 @@ async fn discover_repo(
         }
     };
     tally.discovery_calls += open.requests;
-    let now = Instant::now();
-    if !open.overflow {
-        // Complete: an open PR it did not return is no longer open.
-        let listed: std::collections::BTreeSet<i64> =
-            open.prs.iter().map(|pr| pr.number as i64).collect();
-        memo.drop_unlisted_open(repo_full, &listed);
-    }
-    for pr in open.prs {
-        memo.observe(repo_full, pr, now);
-    }
+    let open_at = Instant::now();
 
     let mark = memo
         .repos
@@ -1168,29 +1159,28 @@ async fn discover_repo(
         })
         .await
     {
-        None => return,
+        None => {
+            // Keep the open listing's free data; no attempt is recorded.
+            if memo.apply_discovery(repo_full, open, open_at, None, started) {
+                tally.discovery_overflow += 1;
+            }
+            return;
+        }
         Some(Ok(listing)) => listing,
         Some(Err(e)) => {
             debug!("session-pr-reconciler: closed-PR discovery of {repo_full} failed: {e}");
+            if memo.apply_discovery(repo_full, open, open_at, None, started) {
+                tally.discovery_overflow += 1;
+            }
             memo.discovery_failed(repo_full, Instant::now());
             return;
         }
     };
     tally.discovery_calls += closed.requests;
-    let overflow = open.overflow || closed.overflow;
-    if overflow {
+    let closed_at = Instant::now();
+    if memo.apply_discovery(repo_full, open, open_at, Some((closed, closed_at)), started) {
         tally.discovery_overflow += 1;
     }
-    if closed.overflow {
-        // The unread pages behind the cap hide changes: see `mark_closed_gap`.
-        // An open-listing overflow leaves no such gap and marks nothing.
-        memo.mark_closed_gap(repo_full, started);
-    }
-    let now = Instant::now();
-    for pr in &closed.prs {
-        memo.observe(repo_full, pr.clone(), now);
-    }
-    memo.finish_discovery(repo_full, &closed.prs, !overflow, now);
 }
 
 /// The reconciler's GitHub client — BACKGROUND spend (plan 2026-10-30-…,
