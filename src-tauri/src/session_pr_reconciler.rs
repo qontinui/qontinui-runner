@@ -1160,7 +1160,9 @@ async fn discover_repo(
         .await
     {
         None => {
-            // Keep the open listing's free data; no attempt is recorded.
+            // Keep the open listing's free data; no attempt is recorded. An
+            // overflowed open listing is still counted in
+            // `discovery_overflow` (here and on the failure arm below).
             if memo.apply_discovery(repo_full, open, open_at, None, started) {
                 tally.discovery_overflow += 1;
             }
