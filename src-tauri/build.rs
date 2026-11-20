@@ -100,7 +100,7 @@ fn main() {
     // the supervisor's spawn-test response — lets manual-test sessions assert
     // "this temp runner is the commit I'm debugging" without guessing from
     // binary mtime.
-    let git_sha_short = std::process::Command::new("git")
+    let git_sha_short = build_script_git()
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()
         .ok()
@@ -142,7 +142,7 @@ fn main() {
     // points: the gate covers supervisor-driven builds, this sentinel covers
     // manual ones the supervisor never sees.
     let git_sha_for_fallback = || {
-        std::process::Command::new("git")
+        build_script_git()
             .args(["rev-parse", "--short", "HEAD"])
             .output()
             .ok()
@@ -1074,19 +1074,43 @@ fn fold_lines(entries: &[(String, Option<String>)]) -> String {
     out
 }
 
+// The build script's git spawns — the embedded `QONTINUI_GIT_SHA`, the
+// `unstamped-<sha>` fallback build id, and every provenance stamp below —
+// inherit the environment cargo was started in. A cargo build launched from
+// inside a git hook carries that hook's GIT_DIR / GIT_INDEX_FILE, and `-C`
+// does not override an inherited GIT_DIR, so those gits would answer about
+// the hook's repository and the binary would embed ITS sha. This is the
+// crate's own list (`git_posture::REPO_LOCAL_GIT_ENV`), included rather than
+// copied so the two cannot drift (plan
+// 2026-11-16-runner-build-script-git-spawns-inherit-a-hooks-repo-local-git-env).
+include!("src/git_posture/repo_local_git_env.rs");
+
+/// The build script's ONE git constructor: `git` with every
+/// [`REPO_LOCAL_GIT_ENV`] name removed. A build script is its own crate and
+/// cannot reach `process_helpers::no_window`, so this mirrors only
+/// `git_posture::scrub_repo_local_git_env` — no prompt posture, which a
+/// local `rev-parse` / `ls-files` / `hash-object` never needs. Deliberately
+/// not named `scrubbed_git`: `process_helpers::scrubbed_git` exists and also
+/// forces the locale and the credential-prompt settings. The raw-git guard
+/// (`process_helpers::raw_git_guard`) allows exactly one marked spawn in this
+/// file — this one.
+fn build_script_git() -> std::process::Command {
+    // git-env-ok: a build script is its own crate and cannot reach process_helpers::no_window; this is build.rs's only git constructor and it scrubs git_posture's REPO_LOCAL_GIT_ENV
+    let mut cmd = std::process::Command::new("git");
+    for var in REPO_LOCAL_GIT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn git_output(
     root: &std::path::Path,
     args: &[&str],
     stdin: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
-        // A git inherited from a hook would answer about a different repository
-        // or index than `-C root` names.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_WORK_TREE")
+    use std::process::Stdio;
+    let mut child = build_script_git()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -2066,5 +2090,37 @@ mod embedded_frontend_tests {
             embedded_frontend_verdict(&vite, Some("1")),
             EmbedVerdict::Embed
         );
+    }
+}
+
+#[cfg(test)]
+mod build_script_git_tests {
+    use super::build_script_git;
+    use std::ffi::OsStr;
+
+    /// Every name on the CRATE's list is removed on the build script's git
+    /// (`get_envs` reports a removal as `None`), so a cargo build started from
+    /// inside a git hook stamps this checkout's sha, not the hook repo's.
+    /// Compared against `crate::git_posture` rather than build.rs's own
+    /// included copy, so a build.rs list that drops a crate name fails here (a
+    /// shrunken crate list fails `repo_local_git_env_covers_gits_own_list`).
+    #[test]
+    fn build_script_git_removes_every_repo_local_git_env_name() {
+        let cmd = build_script_git();
+        assert_eq!(cmd.get_program(), "git");
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = cmd.get_envs().collect();
+        let list = crate::git_posture::REPO_LOCAL_GIT_ENV;
+        assert!(
+            list.contains(&"GIT_DIR"),
+            "the crate list lost GIT_DIR: {list:?}"
+        );
+        for var in list {
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == OsStr::new(var) && v.is_none()),
+                "{var} must be removed on build_script_git so an inherited value never \
+                 reaches the build script's git; envs: {envs:?}"
+            );
+        }
     }
 }

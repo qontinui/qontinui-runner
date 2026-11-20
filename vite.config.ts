@@ -5,6 +5,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { version } from "./package.json";
 import { computeFrontendProvenance } from "./scripts/frontend-provenance.mjs";
+import { withoutRepoLocalGitEnv } from "./scripts/lib/repo-local-git-env.mjs";
 
 // Compute the runner build-id at Vite-build time. Format
 // `<git-sha-short>-<unix-ms>`. Vite is the *single source of truth* for the
@@ -23,10 +24,17 @@ import { computeFrontendProvenance } from "./scripts/frontend-provenance.mjs";
 // live binary swap — only a build-time inconsistency. The banner that made
 // that comparison was a permanent false positive and was deleted (plan
 // 2026-07-28-runner-build-id-banner-permanent-false-positive).
+//
+// The git runs WITHOUT the repo-local git environment (GIT_DIR, GIT_INDEX_FILE,
+// ...; the crate's list, read by scripts/lib/repo-local-git-env.mjs): a build
+// started from inside a git hook inherits that hook's GIT_DIR and would stamp
+// the hook repository's sha. Built outside the try, so a list the reader cannot
+// parse fails the build instead of quietly stamping "unknown".
 function computeBuildId(): string {
+  const env = withoutRepoLocalGitEnv(process.env);
   let sha = "unknown";
   try {
-    sha = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })
+    sha = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"], env })
       .toString()
       .trim();
   } catch {

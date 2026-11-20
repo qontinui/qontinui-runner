@@ -44,6 +44,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { withoutRepoLocalGitEnv } from "./lib/repo-local-git-env.mjs";
+
 export const SCHEMA_VERSION = 1;
 export const UNKNOWN = "unknown";
 
@@ -81,11 +83,11 @@ export const RUST_SRC_PATHSPECS = [
   "Cargo.lock",
 ];
 
-// A git inherited from a hook (GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE) would
-// answer about a different repository or index than `-C root` names.
-const GIT_ENV = Object.fromEntries(
-  Object.entries(process.env).filter(([k]) => !["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"].includes(k)),
-);
+// A git inherited from a hook (GIT_DIR, GIT_INDEX_FILE, ...) would answer about
+// a different repository or index than `-C root` names. The names are the
+// crate's one list, `src-tauri/src/git_posture/repo_local_git_env.rs`, read
+// through `scripts/lib/repo-local-git-env.mjs` -- the same list build.rs scrubs.
+const GIT_ENV = withoutRepoLocalGitEnv(process.env);
 
 function git(root, args, input) {
   return execFileSync("git", ["-C", root, ...args], {
