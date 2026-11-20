@@ -343,8 +343,8 @@ export async function runAnalyzeLaunch(
 
 /**
  * The operator toast for an outcome, or null for a clean open. Every failure
- * names its step, `not-provisioned` included — the pane is open there but its
- * first turn may not resolve, which must not read as "Analyzer opened" (D1).
+ * names its step. `not-provisioned` opened no pane, so its toast gives the
+ * `/analyze-launch-failure <evidence path>` line to run by hand (D1).
  */
 export function analyzeOutcomeToast(
   outcome: AnalyzeOutcome,

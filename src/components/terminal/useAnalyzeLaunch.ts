@@ -137,9 +137,9 @@ export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
         focusAnalyzer(outcome.analyzerTabId);
         return;
       }
-      // Every failure is toasted, `not-provisioned` included: the pane is open
-      // and focused, but its first turn may not resolve, so the button leaves
-      // "Analyzer opened" (D1) and the operator is told why.
+      // Every failure is toasted. `not-provisioned` opens no pane at all; its
+      // toast names the evidence path to run by hand. Any other failure that
+      // happened after the pane was created focuses that pane (D1).
       if (outcome.analyzerTabId) focusAnalyzer(outcome.analyzerTabId);
       console.error(`[AnalyzeLaunch] ${outcome.step}: ${outcome.message}`);
       const toast = analyzeOutcomeToast(outcome);
@@ -176,11 +176,22 @@ export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
    * tab, or the tab closing, ends this watch. An unread launch flags nothing.
    */
   const watchGenRef = useRef<Record<string, number>>({});
+  // Unmounting ends every watch: `argsRef.current.tabs` freezes once the page
+  // is gone, so the late re-check needs its own signal to stop.
+  const unmountedRef = useRef(false);
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, []);
   const verifyLaunch = useCallback((tabId: string) => {
     const gen = (watchGenRef.current[tabId] ?? 0) + 1;
     watchGenRef.current[tabId] = gen;
     const isActive = () =>
-      watchGenRef.current[tabId] === gen && argsRef.current.tabs.some((t) => t.id === tabId);
+      !unmountedRef.current &&
+      watchGenRef.current[tabId] === gen &&
+      argsRef.current.tabs.some((t) => t.id === tabId);
     void watchFreshLaunch(tabId, {
       readFailure: (id) => readTerminalLaunchFailure(id),
       isActive,
