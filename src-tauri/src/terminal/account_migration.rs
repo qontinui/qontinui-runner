@@ -170,18 +170,30 @@ pub(crate) const CHILD_MAY_RUN_WARNING: &str = "a resumed claude of this session
 /// session a second time beside it. Nothing the scanner sees proves the child
 /// gone, so only time ends the rest.
 ///
-/// Two limits, stated so nobody reads more into it:
-/// - The 24 h expiry is a TIME BOUND, not proof the orphaned child is gone. A
-///   child still running after it is not seen by anything here; the bound only
-///   keeps one bad spawn from locking a session out of automation forever.
-/// - The map is IN MEMORY only: a runner restart clears it (and ends every
-///   child the old process spawned in its PTYs with it, but not one that
-///   outlived its pane).
+/// Recorded by the mover itself WHILE it still holds the session's in-flight
+/// claim ([`rest_if_child_may_run`]: the account migration, the respawn
+/// receiver, the resume door), and re-checked by each of them AFTER taking the
+/// claim ([`begin_migration`], and the receiver's and the door's own gates),
+/// so no mover can slip between another's failure and its record. The checks
+/// before the claim (the hint's [`cap_then_pick`], the manual command) are
+/// fast paths only.
 ///
-/// Each entry is expired lazily, by its OWN reader against the reader's own
-/// stamp ([`resting_after_child_started`]); recording one never evicts
-/// another, so no stamp — however far in the future — can end another
-/// session's rest.
+/// The residual, stated plainly so nobody reads more into it:
+/// - The rest is honoured for 24 h. That expiry is a TIME BOUND, not proof the
+///   orphaned child is gone; a child still running after it is not seen by
+///   anything here.
+/// - The map is IN MEMORY only: a runner restart clears it.
+/// - So coord's respawn row for the session may stay pending, and after a
+///   restart or once the 24 h pass, a catch-up can replay it. Making the rest
+///   durable is follow-up plan
+///   `2026-11-20-the-frozen-limit-screen-retry-leaves-six-follow-ups-unowned`.
+///
+/// An entry is honoured for 24 h from its stamp, but REMOVED only when its own
+/// session is read again after that ([`resting_after_child_started`]);
+/// recording one never touches another, so no stamp — however far in the
+/// future — can end another session's rest. Entries are rare (one per
+/// child-started failure), so an unread expired one costs a few bytes until
+/// the process exits.
 static CHILD_STARTED_REST: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
 
 /// Start (or restart) `claude_session_id`'s rest at `now_ms`
@@ -224,6 +236,21 @@ pub(crate) fn child_started_rest_refusal(claude_session_id: &str, now_ms: i64) -
              its resumed claude started — {CHILD_MAY_RUN_WARNING}"
         )
     })
+}
+
+/// When `outcome` carries a spawn that failed after its resumed `claude`
+/// started ([`super::respawn_liveness::RespawnOutcome::child_may_run`]),
+/// record `claude_session_id`'s rest at `now_ms` and return that failure.
+/// Every mover calls it WHILE it still holds the session's in-flight claim,
+/// so the rest exists before any other mover can claim the session.
+pub(crate) fn rest_if_child_may_run<'a>(
+    claude_session_id: &str,
+    outcome: &'a super::respawn_liveness::RespawnOutcome,
+    now_ms: i64,
+) -> Option<&'a SpawnFailure> {
+    let failure = outcome.child_may_run()?;
+    rest_after_child_started(claude_session_id, now_ms);
+    Some(failure)
 }
 
 /// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
@@ -418,6 +445,11 @@ pub(crate) enum MigrationRefusal {
     AlreadyMoved { to: String },
     /// The session's lifecycle record is gone.
     Unknown { session: String },
+    /// The session is resting after a migration or respawn that failed after
+    /// its resumed `claude` started ([`CHILD_STARTED_REST`]): seen AFTER the
+    /// in-flight claim was taken, so a rest recorded between a caller's fast
+    /// path and its claim is honoured.
+    ChildMayRun { session: String },
     /// The session's lifecycle record is closed: there is no pane to migrate.
     Closed { session: String },
 }
@@ -441,6 +473,11 @@ impl std::fmt::Display for MigrationRefusal {
                     "session {session} is closed — there is no pane to migrate"
                 )
             }
+            Self::ChildMayRun { session } => write!(
+                f,
+                "not migrating {session}: an earlier migration or respawn of it failed after its \
+                 resumed claude started — {CHILD_MAY_RUN_WARNING}"
+            ),
         }
     }
 }
@@ -493,6 +530,17 @@ pub(crate) fn begin_migration(
     current_record: impl FnOnce() -> Option<TerminalSessionRecord>,
 ) -> Result<MigrationInFlight, MigrationRefusal> {
     let guard = claim_migration_slot(&caller_record.claude_session_id)?;
+    // Under the claim: a rest another mover recorded after this caller's
+    // fast-path check (and before this claim) is seen here. The guard drops
+    // with the refusal.
+    if resting_after_child_started(
+        &caller_record.claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        return Err(MigrationRefusal::ChildMayRun {
+            session: caller_record.claude_session_id.clone(),
+        });
+    }
     still_migratable(caller_record, src_config_dir, current_record())?;
     Ok(guard)
 }
@@ -693,6 +741,12 @@ pub(super) fn worth_reporting(previous: Option<HintOutcome>, outcome: HintOutcom
 fn hint_outcome_of(e: &MigrateError) -> HintOutcome {
     match e {
         MigrateError::Refused(MigrationRefusal::InFlight { .. }) => HintOutcome::RefusedInFlight,
+        // Seen under the claim; the same rest `cap_then_pick` checks first.
+        // Refused, so its cap slot is given back, as the fast path never takes
+        // one.
+        MigrateError::Refused(MigrationRefusal::ChildMayRun { .. }) => {
+            HintOutcome::FailedAfterChild
+        }
         MigrateError::Refused(
             MigrationRefusal::AlreadyMoved { .. }
             | MigrationRefusal::Unknown { .. }
@@ -964,7 +1018,8 @@ pub async fn handle_usage_limit_hint(
 ///   [`HintOutcome::Failed`].
 /// - [`MigrateError::FailedAfterChild`]: warned and reported
 ///   `migration-failed-after-child-started: …`; [`HintOutcome::FailedAfterChild`].
-///   It starts the session's rest ([`rest_after_child_started`]): no hint
+///   The migration recorded the session's rest before it released its claim
+///   ([`rest_if_child_may_run`]): no hint
 ///   migrates the session again for the cap's rolling window
 ///   ([`cap_then_pick`]), and none of those hints reports again. The cap slot
 ///   is KEPT, as for `Failed`: a child may have started, so this was a real
@@ -1026,9 +1081,6 @@ pub(super) fn settle_hint_migration(
             );
             if !e.reached_destination() {
                 unrecord_handoff();
-            }
-            if matches!(e, MigrateError::FailedAfterChild(_)) {
-                rest_after_child_started(claude_session_id, cap_stamp);
             }
             let outcome = hint_outcome_of(&e);
             if !e.reported_itself() && worth_reporting(previous, outcome) {
@@ -2293,7 +2345,12 @@ async fn confirm_migration(
     // no pane. Whatever else happened, the session must not be migrated again
     // beside it: `FailedAfterChild`, which the automatic path rests on
     // (`cap_then_pick`). Not reported here: the caller reports it.
-    if let Some(failure) = outcome.child_may_run() {
+    // Rested HERE, while `_in_flight` still holds the session, stamped now.
+    if let Some(failure) = rest_if_child_may_run(
+        &record.claude_session_id,
+        &outcome,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
         let ended = match &outcome {
             RespawnOutcome::NotSpawned(_) => "the first spawn failed".to_string(),
             RespawnOutcome::Died {
@@ -3531,6 +3588,9 @@ mod tests {
         let sid = "test/account_migration/rest-after-child";
         let base = 1_795_000_000_000i64;
         assert!(migration_cap_permits(sid, base), "the hint takes a slot");
+        // The migration rests the session under its claim
+        // (`rest_if_child_may_run`), then the hint settles.
+        rest_after_child_started(sid, base);
         let (_, _, outcome) = settle(
             sid,
             base,
@@ -3580,6 +3640,62 @@ mod tests {
         let later = base + MIGRATION_CAP_WINDOW_MS + 1;
         let (picked, _) = cap_pick(sid, later, None, Some("C:/b"));
         assert_eq!(picked, Ok("C:/b".to_string()));
+    }
+
+    /// A rest another mover records AFTER a caller's fast-path check and
+    /// BEFORE its claim is honoured under the claim: `begin_migration` refuses
+    /// (`ChildMayRun`, releasing the claim), and the hint path settles that
+    /// refusal as `FailedAfterChild`, giving its cap slot back and reporting
+    /// nothing. Mutation: drop the re-check in `begin_migration`.
+    #[test]
+    fn a_rest_recorded_after_the_fast_path_is_honoured_under_the_claim() {
+        let sid = "test/account_migration/rest-under-claim";
+        let rec = session_record(sid, "t-1", Some("C:/a"));
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            !resting_after_child_started(sid, now),
+            "the fast path passes"
+        );
+        // Another mover's child-started failure lands in between.
+        rest_after_child_started(sid, now);
+        let refusal = begin_migration(&rec, "C:/a", || Some(rec.clone())).unwrap_err();
+        assert_eq!(
+            refusal,
+            MigrationRefusal::ChildMayRun {
+                session: sid.to_string()
+            }
+        );
+        assert!(refusal.to_string().contains(CHILD_MAY_RUN_WARNING));
+        assert!(
+            !crate::session::in_flight::is_in_flight(sid),
+            "the claim is released with the refusal"
+        );
+
+        let stamp = 1_799_000_000_000i64;
+        assert!(migration_cap_permits(sid, stamp), "the hint took a slot");
+        let (unrecorded, skipped, outcome) =
+            settle(sid, stamp, None, Err(MigrateError::Refused(refusal)));
+        assert!(unrecorded);
+        assert_eq!(skipped, None);
+        assert_eq!(outcome, HintOutcome::FailedAfterChild);
+        assert_eq!(cap_left(sid, stamp + 10), MIGRATION_CAP, "slot given back");
+    }
+
+    /// Every mover rests the session through `rest_if_child_may_run`: an
+    /// outcome carrying a child-started failure rests it, one that does not
+    /// leaves it alone.
+    #[test]
+    fn only_a_child_started_outcome_rests_the_session() {
+        use super::super::respawn_liveness::RespawnOutcome;
+        let now = 1_799_500_000_000i64;
+        let rested = "test/account_migration/rest-if-child";
+        let outcome = RespawnOutcome::NotSpawned(SpawnFailure::after_child("wiring failed"));
+        assert!(rest_if_child_may_run(rested, &outcome, now).is_some());
+        assert!(resting_after_child_started(rested, now));
+        let spared = "test/account_migration/rest-if-no-child";
+        let outcome = RespawnOutcome::NotSpawned(SpawnFailure::before_child("pty open failed"));
+        assert!(rest_if_child_may_run(spared, &outcome, now).is_none());
+        assert!(!resting_after_child_started(spared, now));
     }
 
     /// The manual command's check: a resting session is refused with the shared

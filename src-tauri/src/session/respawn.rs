@@ -207,9 +207,13 @@ pub enum RespawnError {
     /// so that child may still be running with no pane — or an earlier respawn
     /// or migration of this Claude session did, and the session is resting
     /// ([`crate::terminal::account_migration::rest_after_child_started`]).
-    /// NOT replayed: every later delivery of the request (push or catch-up)
-    /// is refused here before anything is spawned, for the rest's 24 h window,
-    /// since a replay would start a second `claude --resume` beside that child.
+    /// NOT replayed by this process: every later delivery of the request (push
+    /// or catch-up) is refused here before anything is spawned, for the rest's
+    /// 24 h window, since a replay would start a second `claude --resume`
+    /// beside that child. The rest is in memory only: coord's row may stay
+    /// pending, and after a runner restart or once the 24 h pass a catch-up
+    /// can replay it (follow-up plan
+    /// `2026-11-20-the-frozen-limit-screen-retry-leaves-six-follow-ups-unowned`).
     #[error("{0} — {warning}; not replayed", warning = crate::terminal::account_migration::CHILD_MAY_RUN_WARNING)]
     ChildMayRun(String),
     /// The user closed the resumed pane before it painted. Not retried: a
@@ -896,22 +900,18 @@ async fn materialize(
     //     the resume door's or an account migration's) may still have that
     //     `claude --resume` running: refuse every delivery of the request —
     //     the catch-up replays a pending row on each reconnect — before any
-    //     work or budget, rather than resume it a second time beside it.
-    if crate::terminal::account_migration::resting_after_child_started(
-        &claude_session_id,
-        chrono::Utc::now().timestamp_millis(),
-    ) {
-        return Err(RespawnError::ChildMayRun(format!(
-            "an earlier respawn or migration of Claude session {claude_session_id} failed after \
-             its resumed claude started"
-        )));
-    }
+    //     work or budget, rather than resume it a second time beside it. A
+    //     fast path: the check that decides is the one under the claim below.
+    refuse_resting(&claude_session_id, chrono::Utc::now().timestamp_millis())?;
 
     // 1b. One mover per Claude session (the shared in-flight registry), held
     //     through spawn, proof and claim re-acquire.
     let _in_flight =
         super::in_flight::SessionInFlight::claim(&claude_session_id, "respawn-receiver")
             .map_err(RespawnError::InFlight)?;
+    // Under the claim: a rest another mover recorded after the fast path
+    // above (and before this claim) is seen here.
+    refuse_resting(&claude_session_id, chrono::Utc::now().timestamp_millis())?;
 
     // 2. 🔒 The pin. Fails loud; never degrades to rotation.
     let config_dir = resolve_target_config_dir(respawn.account.as_deref())?;
@@ -1056,18 +1056,14 @@ async fn materialize(
         crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
     .await;
-    let terminal_id = match proven_terminal(respawn.source_session_id, outcome) {
-        Ok(terminal_id) => terminal_id,
-        Err(e @ RespawnError::ChildMayRun(_)) => {
-            // Rest the session, so the next delivery is refused at step 1a.
-            crate::terminal::account_migration::rest_after_child_started(
-                &claude_session_id,
-                chrono::Utc::now().timestamp_millis(),
-            );
-            return Err(e);
-        }
-        Err(e) => return Err(e),
-    };
+    // Rested (when a child may run) while `_in_flight` still holds the
+    // session, so the next delivery is refused at step 1a / 1b.
+    let terminal_id = proven_and_rested(
+        respawn.source_session_id,
+        &claude_session_id,
+        outcome,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.
@@ -1114,6 +1110,33 @@ async fn materialize(
     // 9. NO `close_source`. The source is already closed — see the fn docstring.
 
     Ok(terminal_id)
+}
+
+/// Refuse a Claude session resting after a child-started failure
+/// ([`crate::terminal::account_migration::resting_after_child_started`]) as
+/// [`RespawnError::ChildMayRun`].
+fn refuse_resting(claude_session_id: &str, now_ms: i64) -> Result<(), RespawnError> {
+    if crate::terminal::account_migration::resting_after_child_started(claude_session_id, now_ms) {
+        return Err(RespawnError::ChildMayRun(format!(
+            "an earlier respawn or migration of Claude session {claude_session_id} failed after \
+             its resumed claude started"
+        )));
+    }
+    Ok(())
+}
+
+/// [`proven_terminal`], after resting the session when a spawn failed after
+/// its resumed claude started
+/// ([`crate::terminal::account_migration::rest_if_child_may_run`]). Called
+/// while the receiver still holds the session's in-flight claim.
+fn proven_and_rested(
+    source: Uuid,
+    claude_session_id: &str,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+    now_ms: i64,
+) -> Result<String, RespawnError> {
+    crate::terminal::account_migration::rest_if_child_may_run(claude_session_id, &outcome, now_ms);
+    proven_terminal(source, outcome)
 }
 
 /// Pure: the terminal a respawn may go on with (claims, prompt), or the error
@@ -1751,6 +1774,35 @@ mod tests {
     // -----------------------------------------------------------------------
     // Transcript materialization helpers
     // -----------------------------------------------------------------------
+
+    /// The rest WIRING: a child-started outcome rests the session
+    /// (`proven_and_rested`), and the receiver's gate then refuses every
+    /// delivery (`refuse_resting`); a session nobody rested passes. Mutation:
+    /// drop the rest from `proven_and_rested`.
+    #[test]
+    fn a_child_started_respawn_rests_the_session_and_refuses_its_replay() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        use crate::terminal::spawn_refusal::SpawnFailure;
+        let sid = "test/respawn/child-started-rest";
+        let now = 1_799_600_000_000i64;
+        assert!(refuse_resting(sid, now).is_ok());
+        let err = proven_and_rested(
+            Uuid::nil(),
+            sid,
+            RespawnOutcome::NotSpawned(SpawnFailure::after_child("wiring failed")),
+            now,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RespawnError::ChildMayRun(_)), "{err:?}");
+        assert!(
+            matches!(
+                refuse_resting(sid, now + 1),
+                Err(RespawnError::ChildMayRun(_))
+            ),
+            "the replay is refused"
+        );
+        assert!(refuse_resting("test/respawn/never-rested", now).is_ok());
+    }
 
     /// A spawn that failed after its resumed claude started is `ChildMayRun`
     /// — not a refusal left for retry, not a death that leaves nothing

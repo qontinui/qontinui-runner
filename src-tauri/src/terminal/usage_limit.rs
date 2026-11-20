@@ -892,6 +892,8 @@ mod tests {
             .1
             .expect("the first appearance fires");
         dispatch_hint(first, move |_tid, _pattern, previous| {
+            // The migration rests the session under its claim, then settles.
+            crate::terminal::account_migration::rest_after_child_started(sid, stamp);
             std::future::ready(settle_hint_migration(
                 sid,
                 stamp,

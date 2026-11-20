@@ -644,11 +644,9 @@ async fn resume_one(
     // `claude --resume` running even where the process read below cannot see
     // it (an unreadable table, a pid the read misses): skipped, not resumed
     // beside it, for the rest's 24 h window.
-    if crate::terminal::account_migration::resting_after_child_started(
-        &cand.id,
-        chrono::Utc::now().timestamp_millis(),
-    ) {
-        return ResumeRow::skipped(&cand.id, CHILD_MAY_RUN_SKIP);
+    // (Under the door's claim, taken above.)
+    if let Some(row) = skip_if_resting(&cand.id, chrono::Utc::now().timestamp_millis()) {
+        return row;
     }
     // A live claude already running this id: resuming would be a second
     // process on one transcript.
@@ -727,20 +725,13 @@ async fn resume_one(
         crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
     .await;
-    let child_may_run = outcome.child_may_run().is_some();
-    let terminal_id = match proven_terminal(&cand.id, outcome) {
-        Ok(terminal_id) => terminal_id,
-        Err(row) => {
-            if child_may_run {
-                // Rest the session, so the next call skips it up front.
-                crate::terminal::account_migration::rest_after_child_started(
-                    &cand.id,
-                    chrono::Utc::now().timestamp_millis(),
-                );
-            }
-            return *row;
-        }
-    };
+    // Rested (when a child may run) while `_in_flight` still holds the id, so
+    // the next call skips it up front.
+    let terminal_id =
+        match proven_and_rested(&cand.id, outcome, chrono::Utc::now().timestamp_millis()) {
+            Ok(terminal_id) => terminal_id,
+            Err(row) => return *row,
+        };
     match verify(tm, &cand, &terminal_id).await {
         Ok(ev) => ResumeRow::resumed(&cand.id, ev),
         Err(reason) => ResumeRow::failed(
@@ -755,6 +746,26 @@ async fn resume_one(
             }),
         ),
     }
+}
+
+/// The id's `skipped` row when it rests after a child-started failure
+/// ([`crate::terminal::account_migration::resting_after_child_started`]).
+fn skip_if_resting(id: &str, now_ms: i64) -> Option<ResumeRow> {
+    crate::terminal::account_migration::resting_after_child_started(id, now_ms)
+        .then(|| ResumeRow::skipped(id, CHILD_MAY_RUN_SKIP))
+}
+
+/// [`proven_terminal`], after resting the id when a spawn failed after its
+/// resumed claude started
+/// ([`crate::terminal::account_migration::rest_if_child_may_run`]). Called
+/// while the door still holds the id's in-flight claim.
+fn proven_and_rested(
+    id: &str,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+    now_ms: i64,
+) -> Result<String, Box<ResumeRow>> {
+    crate::terminal::account_migration::rest_if_child_may_run(id, &outcome, now_ms);
+    proven_terminal(id, outcome)
 }
 
 /// The `skipped(<reason>)` of an id resting after a child-started failure.
@@ -1341,6 +1352,30 @@ mod tests {
             .unwrap(),
             "t3"
         );
+    }
+
+    /// The rest WIRING: a child-started outcome rests the id
+    /// (`proven_and_rested`), and the door then skips it up front
+    /// (`skip_if_resting`); an id nobody rested is not skipped. Mutation: drop
+    /// the rest from `proven_and_rested`.
+    #[test]
+    fn a_child_started_resume_rests_the_id_and_skips_the_next_call() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        use crate::terminal::spawn_refusal::SpawnFailure;
+        let id = "test/resume_door/child-started-rest";
+        let now = 1_799_700_000_000i64;
+        assert!(skip_if_resting(id, now).is_none());
+        let row = proven_and_rested(
+            id,
+            RespawnOutcome::NotSpawned(SpawnFailure::after_child("wiring failed")),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(row.outcome, "failed");
+        let skipped = skip_if_resting(id, now + 1).expect("the next call is skipped");
+        assert_eq!(skipped.outcome, "skipped");
+        assert_eq!(skipped.reason.as_deref(), Some(CHILD_MAY_RUN_SKIP));
+        assert!(skip_if_resting("test/resume_door/never-rested", now).is_none());
     }
 
     /// A spawn that failed after its resumed claude started fails the id as
