@@ -17,6 +17,11 @@
 //!   [`github_budget::background_gate`] for the configured token's own bucket;
 //!   under the headroom line, or inside a `Retry-After` hold, it is deferred —
 //!   never sent, never slept on — so the loop never blocks on the budget.
+//!   Mark-in-progress is therefore BEST-EFFORT: a deferred label write is
+//!   reported as a warning (as any failed label change already is) and is not
+//!   retried, and the loop still writes the ticket→task mapping, because that
+//!   mapping is what prevents a duplicate task. A ticket can thus run without
+//!   its `in-progress` label; nothing is lost but the label.
 //! - INTERACTIVE — the completion write-backs (`add_comment` and
 //!   `update_state`, called from the spawned
 //!   `ticket_system::service::on_task_completed`). Nothing retries them, so a
@@ -37,8 +42,9 @@ use crate::ticket_system::types::{
     Ticket, TicketComment, TicketProvider, TicketProviderConfig, TicketSource, TicketState,
 };
 use crate::trigger_system::github_api::{
-    cache_action, cached_link_next, extract_next_url, interactive_floor, is_terminal_403,
-    link_cache_key, now_unix, retry_backoff_secs, CacheAction, GhError,
+    at_api_base, cache_action, cached_link_next, extract_next_url, interactive_floor,
+    is_terminal_403, link_cache_key, now_unix, retry_backoff_secs, CacheAction, GhError,
+    GITHUB_API_BASE,
 };
 
 /// Maximum total results to accumulate across paginated GitHub API calls.
@@ -81,6 +87,9 @@ struct RawExchange {
 
 pub struct GitHubTicketProvider {
     client: reqwest::Client,
+    /// Scheme + host every write is sent to: [`GITHUB_API_BASE`] in
+    /// production; a test points it at a loopback port.
+    api_base: &'static str,
 }
 
 impl GitHubTicketProvider {
@@ -89,7 +98,23 @@ impl GitHubTicketProvider {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            api_base: GITHUB_API_BASE,
+        })
+    }
+
+    /// Point every write at `base` instead of [`GITHUB_API_BASE`].
+    #[cfg(test)]
+    fn with_api_base(mut self, base: &'static str) -> Self {
+        self.api_base = base;
+        self
+    }
+
+    /// `url` re-rooted at this provider's `api_base` (the identity in
+    /// production).
+    fn at_base(&self, url: String) -> String {
+        at_api_base(self.api_base, url)
     }
 
     /// Put one request on the wire and fold it into the budget meter.
@@ -220,6 +245,8 @@ impl GitHubTicketProvider {
             });
         }
         if let Some(wait) = backoff {
+            // Hold this credential's BACKGROUND spend for the same window.
+            github_budget::record_rate_limited_refusal(&credential, wait);
             warn!(
                 "GitHub API rate limited ({}), retrying after {}s",
                 ex.resp.status, wait
@@ -228,12 +255,11 @@ impl GitHubTicketProvider {
             let retry = retry_clone.ok_or("Failed to clone request for potential retry")?;
             ex = self.send_once(&credential, url, cache_mode, retry).await?;
         } else if is_terminal_403(ex.resp.status.as_u16(), ex.remaining) {
-            // A permission 403, not an empty bucket. Terminal, as before.
-            return Err(GhError::Failed(format!(
-                "GitHub API returned {}: {}",
-                ex.resp.status,
-                ex.resp.text()
-            )));
+            // A permission 403, not a rate refusal. Terminal, as before.
+            return Err(GhError::HttpStatus {
+                status: ex.resp.status.as_u16(),
+                message: format!("GitHub API returned {}: {}", ex.resp.status, ex.resp.text()),
+            });
         }
 
         let mut effective_mode = cache_mode;
@@ -632,7 +658,7 @@ impl GitHubTicketProvider {
         // --- Issue state PATCH (only when actually changing open/closed) --------
         let needs_patch = matches!(state, TicketState::Done | TicketState::Closed);
         if needs_patch {
-            let url = Self::issue_url(owner, repo, ticket_id);
+            let url = self.at_base(Self::issue_url(owner, repo, ticket_id));
             let mut body = serde_json::json!({ "state": "closed" });
             if let Some(reason) = state_reason {
                 body["state_reason"] = serde_json::Value::String(reason.to_string());
@@ -669,7 +695,7 @@ impl GitHubTicketProvider {
         };
 
         if !add_labels.is_empty() {
-            let url = Self::issue_labels_url(owner, repo, ticket_id);
+            let url = self.at_base(Self::issue_labels_url(owner, repo, ticket_id));
             let req = self
                 .client
                 .post(&url)
@@ -702,10 +728,10 @@ impl GitHubTicketProvider {
         }
 
         for label in remove_labels {
-            let url = format!(
+            let url = self.at_base(format!(
                 "https://api.github.com/repos/{}/{}/issues/{}/labels/{}",
                 owner, repo, ticket_id, label
-            );
+            ));
             let req = self.client.delete(&url).headers(headers.clone());
             let invalidates = [
                 Self::issues_url(owner, repo, &Self::labels_query(config)),
@@ -850,9 +876,10 @@ mod tests {
     }
 
     /// The sync loop's mark-in-progress is BACKGROUND: under the headroom line
-    /// its label writes are deferred — never sent, never slept on — so the
-    /// serial loop is not blocked. (It still returns `Ok`: `update_state`
-    /// already reports a failed label change as a warning, not an error.)
+    /// its label writes are deferred — never sent (the provider is aimed at a
+    /// refusing loopback port, so a send would be a transport error), never
+    /// slept on — so the serial loop is not blocked. Best-effort: it returns
+    /// `Ok`, a deferred label change being a warning like any failed one.
     #[tokio::test]
     async fn the_sync_loops_mark_in_progress_is_deferred_not_slept_on() {
         let token = "ticket-system-test-token-mark-in-progress";
@@ -864,7 +891,9 @@ mod tests {
             "workflowId": "w",
         }))
         .expect("config parses");
-        let provider = GitHubTicketProvider::new().expect("provider builds");
+        let provider = GitHubTicketProvider::new()
+            .expect("provider builds")
+            .with_api_base("http://127.0.0.1:1");
 
         tokio::time::timeout(
             std::time::Duration::from_secs(20),
