@@ -1,19 +1,31 @@
-//! `classify_child` in SHADOW: what the `finished_close` arm WOULD admit or
-//! refuse if served `finished-criteria` condition 2's shim exemption were armed
-//! (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`, Phase 2a).
+//! `classify_child`, ARMED for the `finished_close` arm: which direct children of
+//! a FINISHED session's `claude` are its own MCP shim, and so not background work
+//! (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`, Phase 2b;
+//! served `finished-criteria` v11 condition 2).
 //!
-//! **This module decides nothing.** It runs beside the arm's census and logs:
-//! one `classify_child would admit|refuse (<classes>)` line per FINISHED
-//! terminal-hosted session whose verdict changed, and ONE `classify_child pass —
-//! N finished, A would admit, R would refuse (refuse classes: …)` tally per
-//! pass, so a verdict that never changes still leaves evidence after the log
-//! rotates. Eligibility, custody and `graceful_exit`'s any-child refusal are
-//! untouched; arming the exemption is Phase 2b, after this log has shown correct
-//! verdicts on a real runner.
+//! Phase 2a ran this beside the census in shadow, and its log on a real Linux and
+//! a real Windows runner showed correct would-admit / would-refuse verdicts
+//! (coord findings under the resource keys `phase-2a-shadow-evidence:linux` and
+//! `phase-2a-shadow-evidence:windows`). Phase 2b arms
+//! it in two places, and ONLY for the `finished_close` arm:
 //!
-//! It looks at finished sessions whatever their eligibility verdict, because
-//! the sessions the exemption exists for are exactly the ones eligibility
-//! rejects today (`live_children`, the shim's `cmd.exe` on Windows).
+//! 1. **The census** ([`judge_finished`], applied by
+//!    `TrackingHealthReport::replace_boot_window_for_finished`): for a finished
+//!    terminal-hosted session, `has_live_children` is no longer the 60 s
+//!    boot-window rule ([`crate::session::tracking_health::child_signals_work`],
+//!    which counts a late non-shell child as work and an early one as
+//!    infrastructure by its image and start time alone). It reads every direct
+//!    child: one is not work only when `classify_child` proves it the session's
+//!    own shim, or it is a recorded stray wait loop. Every other session keeps
+//!    the window rule.
+//!    There is ONE census (`wind_down_observer::fresh_pass`, shared by the
+//!    wind-down tick and `/restart-readiness` so the two cannot drift), so the
+//!    replacement shows in both; it is bounded by [`CENSUS_BUDGET`], and a pass
+//!    that does not answer in time reads every child as work.
+//! 2. **The close** ([`shim_children`], through
+//!    `ChildExemption::ShimOrPump`): `graceful_exit`'s any-child refusal, on the
+//!    `finished_close` call only, leaves out a child this judges a shim NOW,
+//!    from a fresh read. Every other `graceful_exit` caller counts every child.
 //!
 //! The reads follow the clause's binding rule: a fresh process table, then the
 //! RAW argv of every member of every finished session's child subtrees, then a
@@ -26,36 +38,33 @@
 //! creation with `/proc/<pid>/stat`'s clock ticks, not the seconds derived from
 //! them. The pure judgement is [`session_lifecycle::classify_session`].
 //!
+//! **Anything unreadable keeps the session open.** No verdict (the reads are
+//! switched off, a read stalled past its budget, the pass ran out of time) is
+//! UNKNOWN, and an UNKNOWN child is counted as work.
+//!
 //! **It touches no shared read state.** Its tables come from
 //! [`process_tree::snapshot_process_table_unshared`]: a private in-process walk
 //! on the blocking pool, bounded by [`WALK_BUDGET`], entirely outside the
 //! process-table provider every other read goes through. It leads no walk
 //! another caller could join, reads and writes no memo, never takes the single
 //! external-probe (PowerShell/WMI) fallback slot and moves no counter or
-//! circuit — so no census read, and no other caller's, can be served a shadow
-//! walk's failure, delayed by it, or lose the fallback to it, and a failed
-//! shadow walk leaves no trace. The argv read is in-process too, with no
-//! fallback. With the in-process read switched off
-//! (`QONTINUI_PROCESS_TABLE_IN_PROCESS=0`) every read the shadow could make is
-//! UNKNOWN, so no pass runs.
+//! circuit — so no census read, and no other caller's, can be served a failure
+//! of this one, delayed by it, or lose the fallback to it. The argv read is
+//! in-process too, with no fallback. With the in-process read switched off
+//! (`QONTINUI_PROCESS_TABLE_IN_PROCESS=0`) every read is UNKNOWN, so none is made.
 //!
-//! It runs on its own task, spawned from the census and never awaited by it, so
-//! the arm's candidates, custody probes and closes act on the census exactly as
-//! fresh as before. It runs only where the arm runs a census at all (`on` or
-//! `shadow`); a box with the arm `off` produces no shadow evidence.
-//!
-//! **One pass at a time, and no pass while an earlier one's reads still run.**
-//! A read's budget bounds the pass's wait, not the read: a walk or argv read
-//! past its budget keeps its blocking-pool thread until the OS-level read
-//! returns (a `/proc/<pid>/cmdline` read can block behind a process in
-//! uninterruptible sleep). Each read therefore carries a [`LiveRead`] guard
-//! INSIDE its blocking closure, dropped only when that read returns, and a
-//! census starts no pass while any is still alive — so a hung read costs at
-//! most the reads of the one pass that met it, never one more per census.
-//! A pass whose first table is not a fresh read makes no further read at all:
-//! every verdict would be UNKNOWN whatever the argv read and second walk found.
+//! **No read while an earlier one still runs.** A read's budget bounds the
+//! pass's wait, not the read: a walk or argv read past its budget keeps its
+//! blocking-pool thread until the OS-level read returns (a `/proc/<pid>/cmdline`
+//! read can block behind a process in uninterruptible sleep). Each read
+//! therefore carries a [`LiveRead`] guard INSIDE its blocking closure, dropped
+//! only when that read returns, and no pass starts while any is still alive
+//! ([`admit`]) — so a hung read costs at most the reads of the one pass that met
+//! it, never one more per census. A pass whose first table is not a fresh read
+//! makes no further read at all: every verdict would be UNKNOWN whatever the
+//! argv read and second walk found.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -76,18 +85,20 @@ const WALK_BUDGET: Duration = Duration::from_secs(4);
 /// The argv read's own bound; past it the argv read is UNKNOWN.
 const ARGV_BUDGET: Duration = Duration::from_secs(2);
 
-/// The whole shadow pass is bounded too — its three reads' budgets and a
-/// second for the judgement — so nothing in it can pin the single-flight flag
-/// and silence every later census.
-const SHADOW_BUDGET: Duration = WALK_BUDGET
+/// What the CENSUS (`tracking_health::compute`, which `/restart-readiness`
+/// shares with the wind-down tick) waits for the classification: a few walks'
+/// worth, not the whole [`PASS_BUDGET`]. Past it every child of a finished
+/// session counts as work for that census, and the next one tries again.
+const CENSUS_BUDGET: Duration = Duration::from_secs(3);
+
+/// The whole pass is bounded too — its three reads' budgets and a second for
+/// the judgement — so a census never waits longer than this on it.
+const PASS_BUDGET: Duration = WALK_BUDGET
     .saturating_mul(2)
     .saturating_add(ARGV_BUDGET)
     .saturating_add(Duration::from_secs(1));
 
-/// Set while a shadow pass runs; a census that finds it set starts none.
-static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-
-/// The shadow's blocking reads still running on the pool, by [`LiveRead`].
+/// The pass's blocking reads still running on the pool, by [`LiveRead`].
 static LIVE_READS: LiveReads = LiveReads::new();
 
 /// When the current stall was last announced at info ([`StallLog`]).
@@ -95,7 +106,7 @@ static STALL_LOG: StallLog = StallLog::new();
 
 /// How often a stall that never ends is announced at info again, so a runner
 /// whose log has rotated past the first announcement still says why it shows
-/// no shadow output.
+/// no classify_child output.
 const STALL_ANNOUNCE_EVERY: Duration = Duration::from_secs(3600);
 
 /// When live reads last kept a census from starting a pass and that was said
@@ -311,117 +322,150 @@ fn changed(
     (to_log, next)
 }
 
-/// Start a shadow pass over the finished sessions in `processes` on its own
-/// task and return at once — the caller (the arm's census) never waits on it.
-/// No pass is started while one is still running or a blocking read an
-/// earlier pass started is still on the pool ([`admit`]), nor at all while the
-/// in-process process-table read is switched off. Never fails, never acts.
-pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
+/// The finished terminal-hosted sessions in `processes` that hold a direct
+/// child, judged by [`classify_session`] over fresh private reads, keyed by the
+/// `claude` pid. `None` is UNKNOWN: nothing was judged (the in-process read is
+/// switched off, an earlier read still runs past its budget, or the pass ran
+/// out of time), and every child of every such session then counts as work. A
+/// session with no direct child is not judged — it has nothing to classify.
+///
+/// A verdict that CHANGED since the last pass is logged, and every pass logs
+/// one tally, so a verdict that never changes still leaves evidence after the
+/// log rotates.
+pub async fn judge_finished(
+    processes: &[LiveClaudeProcess],
+    snapshot: &ProcessSnapshot,
+) -> Option<HashMap<u32, SessionVerdict>> {
     if process_tree::in_process_table_read_disabled() {
-        // Every read a pass makes is in-process only, so with the switch set
-        // it could only log `unknown` — and must not reach for the shared
-        // external-probe fallback the census's own reads depend on instead.
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
             info!(
-                "finished_close shadow: the in-process process-table read is switched off \
-                 (QONTINUI_PROCESS_TABLE_IN_PROCESS=0) — no classify_child pass runs on this runner"
+                "finished_close: the in-process process-table read is switched off \
+                 (QONTINUI_PROCESS_TABLE_IN_PROCESS=0) — classify_child cannot judge a child, \
+                 so every child of a finished session counts as work on this runner"
             );
         }
-        return;
+        return None;
     }
-    let sessions = finished_sessions(processes);
+    let sessions: Vec<(String, u32)> = finished_sessions(processes)
+        .into_iter()
+        .filter(|(_, pid)| snapshot.parent_map.contains_key(pid))
+        .collect();
     if sessions.is_empty() {
         last_logged()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        return;
+        return Some(HashMap::new());
     }
-    let now = Instant::now();
-    let Some(sessions) = admit(sessions, &LIVE_READS, &IN_FLIGHT, &STALL_LOG, now) else {
-        return;
-    };
-    tokio::spawn(async move {
-        // Cleared on drop, so a pass that panics does not silence every later
-        // census.
-        struct Clear;
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                IN_FLIGHT.store(false, Ordering::Release);
-            }
-        }
-        let _clear = Clear;
-        observe(sessions).await;
-    });
+    let judged = judge_bounded(&sessions, CENSUS_BUDGET).await?;
+    log_judged(&judged);
+    Some(
+        judged
+            .into_iter()
+            .map(|(_, verdict)| (verdict.claude_pid, verdict))
+            .collect(),
+    )
 }
 
-/// The pass gate: `Some(sessions)` when a census may start a pass now, having
-/// taken the single-flight slot `in_flight`; `None` while a pass is still
-/// running, or while any blocking read counted in `live` — necessarily one an
-/// earlier pass started and abandoned at its budget — is still on the pool. A
-/// pass refused for live reads takes no slot. A stall is logged at info on its
-/// first refusal and again at most once per [`STALL_ANNOUNCE_EVERY`] while it
-/// lasts (`stall`, read at `now`), and at debug otherwise.
-fn admit(
-    sessions: Vec<(String, u32)>,
-    live: &LiveReads,
-    in_flight: &AtomicBool,
-    stall: &StallLog,
-    now: Instant,
-) -> Option<Vec<(String, u32)>> {
-    if in_flight.load(Ordering::Acquire) {
-        debug!("finished_close shadow: a classify_child pass is still running — none started");
-        return None;
+/// The children of `claude` (one of `children`, its direct children) that
+/// `classify_child` judges the session's own shim NOW: a fresh judgement, made
+/// at the close's own probe. Empty when nothing could be judged — fail closed.
+pub async fn shim_children(claude: u32, children: &[u32]) -> BTreeSet<u32> {
+    if process_tree::in_process_table_read_disabled() || children.is_empty() {
+        return BTreeSet::new();
     }
+    let Some(judged) = judge_bounded(&[(String::new(), claude)], PASS_BUDGET).await else {
+        return BTreeSet::new();
+    };
+    judged
+        .iter()
+        .flat_map(|(_, verdict)| shim_pids(verdict, children))
+        .collect()
+}
+
+/// PURE: the pids in `children` that `verdict` positively classifies
+/// [`ChildClass::ShimOrPump`]. A verdict whose `claude` could not be bound
+/// carries no child verdicts and so admits none.
+pub fn shim_pids(verdict: &SessionVerdict, children: &[u32]) -> Vec<u32> {
+    verdict
+        .children
+        .iter()
+        .filter(|c| c.class == ChildClass::ShimOrPump && children.contains(&c.pid))
+        .map(|c| c.pid)
+        .collect()
+}
+
+/// The pass gate: may a pass start now? `false` while any blocking read counted
+/// in `live` — necessarily one an earlier pass started and abandoned at its
+/// budget — is still on the pool. A stall is logged at info on its first
+/// refusal and again at most once per [`STALL_ANNOUNCE_EVERY`] while it lasts
+/// (`stall`, read at `now`), and at debug otherwise. A pass that starts ends
+/// the stall.
+fn admit(live: &LiveReads, stall: &StallLog, now: Instant) -> bool {
     let reads = live.count();
     if reads > 0 {
         if stall.announce(now) {
             info!(
                 live_reads = reads,
-                "finished_close shadow: {reads} blocking read(s) an earlier classify_child pass started are \
+                "finished_close: {reads} blocking read(s) an earlier classify_child pass started are \
                  still running past their budget — no pass starts until they return (said again at most \
                  hourly while it lasts)"
             );
         } else {
             debug!(
                 live_reads = reads,
-                "finished_close shadow: blocking reads from an earlier classify_child pass are still running — none started"
+                "finished_close: blocking reads from an earlier classify_child pass are still running — none started"
             );
         }
-        return None;
-    }
-    if in_flight.swap(true, Ordering::AcqRel) {
-        debug!("finished_close shadow: a classify_child pass is still running — none started");
-        return None;
+        return false;
     }
     stall.reset();
-    Some(sessions)
+    true
 }
 
-/// Judge `sessions`, log the verdicts that changed and the pass's tally.
-/// Bounded by [`SHADOW_BUDGET`].
-async fn observe(sessions: Vec<(String, u32)>) {
-    let judged = match tokio::time::timeout(SHADOW_BUDGET, judge(&sessions)).await {
+/// One pass at a time: passes queue here, so two callers' reads never overlap
+/// and a read one of them has running is never taken for a stalled one.
+static PASS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// [`judge`], once it is this caller's turn and [`admit`] allows a pass, all
+/// inside `budget` (waiting for the turn included). `None` when it did not
+/// finish or was not admitted — UNKNOWN.
+async fn judge_bounded(
+    sessions: &[(String, u32)],
+    budget: Duration,
+) -> Option<Vec<(String, SessionVerdict)>> {
+    let pass = async {
+        let _turn = PASS_LOCK.lock().await;
+        if !admit(&LIVE_READS, &STALL_LOG, Instant::now()) {
+            return None;
+        }
+        Some(judge(sessions).await)
+    };
+    match tokio::time::timeout(budget, pass).await {
         Ok(judged) => judged,
         Err(_) => {
             info!(
                 finished = sessions.len(),
-                budget_s = SHADOW_BUDGET.as_secs(),
-                "finished_close shadow: classify_child did not finish inside its budget — no verdict this census"
+                budget_s = budget.as_secs(),
+                "finished_close: classify_child did not finish inside its budget — no verdict this census"
             );
-            return;
+            None
         }
-    };
+    }
+}
+
+/// Log the verdicts that changed and the pass's tally.
+fn log_judged(judged: &[(String, SessionVerdict)]) {
     let mut last = last_logged().lock().unwrap_or_else(|e| e.into_inner());
-    let (to_log, next) = changed(&last, &judged);
+    let (to_log, next) = changed(&last, judged);
     for i in to_log {
         let (session_id, verdict) = &judged[i];
         info!(
             session_id = %session_id,
             claude_pid = verdict.claude_pid,
             children = %detail(verdict),
-            "finished_close shadow: classify_child {} ({})",
+            "finished_close: classify_child {} ({})",
             verdict.word(),
             verdict.classes()
         );
@@ -430,13 +474,13 @@ async fn observe(sessions: Vec<(String, u32)>) {
     drop(last);
     info!(
         finished = judged.len(),
-        "finished_close shadow: classify_child pass — {}",
-        pass_tally(&judged)
+        "finished_close: classify_child pass — {}",
+        pass_tally(judged)
     );
 }
 
 /// The reads and the pure judgement: table, argv, fresh table — each one
-/// in-process, private to the shadow, bounded, and counted in [`LIVE_READS`]
+/// in-process, private to this module, bounded, and counted in [`LIVE_READS`]
 /// until its blocking read returns.
 async fn judge(sessions: &[(String, u32)]) -> Vec<(String, SessionVerdict)> {
     judge_with(
@@ -572,6 +616,52 @@ mod tests {
         assert!(!next.contains_key("b"));
     }
 
+    fn child(pid: u32, class: ChildClass) -> ChildVerdict {
+        ChildVerdict {
+            pid,
+            class,
+            chain: None,
+            reason: String::new(),
+        }
+    }
+
+    /// The close's exemption admits exactly the children the verdict proves a
+    /// shim AND that are direct children asked about; work, unknown, a child
+    /// not asked about and an unbound `claude` admit nothing.
+    #[test]
+    fn only_a_proven_shim_among_the_asked_children_is_admitted() {
+        let verdict = SessionVerdict {
+            claude_pid: 10,
+            admit: false,
+            children: vec![
+                child(11, ChildClass::ShimOrPump),
+                child(12, ChildClass::Work),
+                child(13, ChildClass::Unknown),
+                child(14, ChildClass::ShimOrPump),
+            ],
+            refusal: None,
+        };
+        assert_eq!(shim_pids(&verdict, &[11, 12, 13]), vec![11]);
+        assert!(shim_pids(&verdict, &[12, 13]).is_empty());
+        assert!(shim_pids(&verdict, &[]).is_empty());
+        let unbound = SessionVerdict {
+            claude_pid: 10,
+            admit: false,
+            children: Vec::new(),
+            refusal: Some("claude 10 is missing from a table".to_string()),
+        };
+        assert!(shim_pids(&unbound, &[11]).is_empty());
+    }
+
+    /// With nothing to ask about, `shim_children` reads nothing and admits
+    /// nothing; so does a pid that is no process at all (no table row, so the
+    /// `claude` cannot be bound).
+    #[tokio::test]
+    async fn shim_children_fails_closed() {
+        assert!(shim_children(10, &[]).await.is_empty());
+        assert!(shim_children(4_000_000_003, &[4_000_000_004]).await.is_empty());
+    }
+
     #[test]
     fn the_pass_tally_counts_sessions_and_what_refused_them() {
         let child = |pid: u32, class: ChildClass| ChildVerdict {
@@ -630,14 +720,14 @@ mod tests {
         );
     }
 
-    /// Finding 1 of the Phase 2a review, pinned at the shadow: a census-side
-    /// memoized read that asks WHILE a shadow pass is walking, and that walk is
-    /// failing, is never handed the shadow's failure. The census leads its own
+    /// Finding 1 of the Phase 2a review, pinned at the classify pass: a census-side
+    /// memoized read that asks WHILE a classify pass is walking, and that walk is
+    /// failing, is never handed the pass's failure. The census leads its own
     /// walk on its own provider and, when that fails too, still gets the
-    /// fallback; the shadow's verdicts are UNKNOWN (stale tables); and the one
+    /// fallback; the pass's verdicts are UNKNOWN (stale tables); and the one
     /// fallback attempt the provider counts is the census's own.
     #[tokio::test]
-    async fn a_census_read_during_a_failing_shadow_pass_still_gets_its_fallback() {
+    async fn a_census_read_during_a_failing_classify_pass_still_gets_its_fallback() {
         use crate::process_capture::process_table::{
             read_unshared, read_with, Config, Provider, MEMO_TTL,
         };
@@ -664,7 +754,7 @@ mod tests {
         let sessions = vec![("s1".to_string(), 10), ("s2".to_string(), 20)];
         let pass =
             tokio::spawn(async move { judge_with(&sessions, table, |_| async { None }).await });
-        started_rx.await.expect("the shadow's walk started");
+        started_rx.await.expect("the pass's walk started");
 
         let census = read_with(
             p,
@@ -678,8 +768,8 @@ mod tests {
             "the census read was served its own fallback's table"
         );
 
-        release_tx.send(()).expect("release the shadow's walk");
-        let judged = pass.await.expect("the shadow pass joined");
+        release_tx.send(()).expect("release the pass's walk");
+        let judged = pass.await.expect("the pass joined");
         assert_eq!(judged.len(), 2);
         for (id, v) in &judged {
             assert!(!v.admit, "{id} admitted from a stale table: {v:?}");
@@ -696,7 +786,7 @@ mod tests {
     /// The same sequence on walks that succeed: the shadow judges from two
     /// fresh private tables and the argvs of the first one's members.
     #[tokio::test]
-    async fn the_shadow_judges_from_two_fresh_tables_and_the_argvs() {
+    async fn the_pass_judges_from_two_fresh_tables_and_the_argvs() {
         use crate::process_capture::process_table::read_unshared;
         let table = || {
             read_unshared(
@@ -741,7 +831,6 @@ mod tests {
     async fn a_stalled_blocking_read_keeps_the_next_pass_from_starting_until_it_returns() {
         use crate::process_capture::process_table::read_unshared;
         let live: &'static LiveReads = Box::leak(Box::new(LiveReads::new()));
-        let in_flight: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let stall = StallLog::new();
         let t0 = Instant::now();
         let sessions = vec![("s".to_string(), 10)];
@@ -763,26 +852,14 @@ mod tests {
 
         // A pass whose first walk stalls past its budget: the pass gives up
         // and ends (stale first table: nothing else is read)...
-        let first =
-            admit(sessions.clone(), live, in_flight, &stall, t0).expect("the first pass starts");
-        let judged = judge_with(&first, table, |_| async { None }).await;
-        in_flight.store(false, Ordering::Release);
+        assert!(admit(live, &stall, t0), "the first pass starts");
+        let judged = judge_with(&sessions, table, |_| async { None }).await;
         assert_eq!(judged[0].1.classes(), "claude unbound", "{judged:?}");
         // ...but its walk is still on the pool, and the next census starts none.
         assert_eq!(live.count(), 1, "the stalled walk is still counted");
         let later = t0 + Duration::from_secs(30);
-        assert_eq!(
-            admit(sessions.clone(), live, in_flight, &stall, later),
-            None
-        );
-        assert_eq!(
-            admit(sessions.clone(), live, in_flight, &stall, later),
-            None
-        );
-        assert!(
-            !in_flight.load(Ordering::Acquire),
-            "a pass refused for live reads takes no slot"
-        );
+        assert!(!admit(live, &stall, later));
+        assert!(!admit(live, &stall, later));
         assert!(
             !stall.announce(later),
             "the first refusal announced the stall; the next ones inside the interval do not"
@@ -795,14 +872,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(live.count(), 0, "the guard dropped when the walk returned");
-        assert_eq!(
-            admit(sessions.clone(), live, in_flight, &stall, later),
-            Some(sessions)
-        );
-        assert!(
-            in_flight.load(Ordering::Acquire),
-            "the admitted pass took the slot"
-        );
+        assert!(admit(live, &stall, later));
         assert!(
             stall.announce(later),
             "the admitted pass ended the stall: the next one is announced at once"
@@ -870,18 +940,18 @@ mod tests {
     /// shared read anywhere. A behavioural test cannot see that binding, so its
     /// text is pinned instead.
     #[test]
-    fn the_shadow_reads_only_through_private_doors() {
-        let src = include_str!("classify_child_shadow.rs");
+    fn the_module_reads_only_through_private_doors() {
+        let src = include_str!("classify_finished.rs");
         let production = src.split("#[cfg(test)]").next().unwrap_or_default();
         for door in [
             "snapshot_process_table_unshared(WALK_BUDGET, LIVE_READS.enter())",
             "raw_argvs_for_pids(&pids, ARGV_BUDGET, LIVE_READS.enter())",
-            "admit(sessions, &LIVE_READS, &IN_FLIGHT, &STALL_LOG, now)",
+            "admit(&LIVE_READS, &STALL_LOG, Instant::now())",
             "process_tree::in_process_table_read_disabled()",
         ] {
             assert!(
                 production.contains(door),
-                "the shadow no longer reads through `{door}`"
+                "the module no longer reads through `{door}`"
             );
         }
         for shared in [
@@ -898,7 +968,7 @@ mod tests {
         ] {
             assert!(
                 !production.contains(shared),
-                "the shadow reads through `{shared}`, a door into the process-table \
+                "the module reads through `{shared}`, a door into the process-table \
                  provider's shared state (its single flight, memo or fallback slot)"
             );
         }

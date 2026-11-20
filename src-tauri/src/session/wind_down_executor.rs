@@ -894,6 +894,19 @@ fn stray_exemptions(
     }
 }
 
+/// PURE: the child-gate policy `arm`'s close presents: `strays` (see
+/// [`stray_exemptions`]), and for the `finished_close` arm ALSO the
+/// [`ChildExemption::ShimOrPump`](crate::terminal::graceful_exit::ChildExemption::ShimOrPump)
+/// class — the session's own MCP shim, judged afresh by `classify_child` at the
+/// probe (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`,
+/// Phase 2b). The drain arm presents nothing: every one of its children counts.
+fn arm_exemptions(arm: CloseArm, strays: ChildExemptions) -> ChildExemptions {
+    match arm {
+        CloseArm::FinishedClose => strays.with_shim_or_pump(),
+        CloseArm::Drain => strays,
+    }
+}
+
 /// Exit a pane, ending the stray wait loops it leaves behind.
 ///
 /// A stray background shell leads its own session and group, so no pane exit
@@ -1504,17 +1517,10 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
             return None;
         }
         let observed = fresh.observed;
-        let census = fresh.pass.map(|pass| LiveCensus { pass, observed });
-        // SHADOW ONLY (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box,
-        // Phase 2a): log what `classify_child` would admit or refuse for every
-        // finished session, on a task of its own this census never waits on.
-        // It changes no candidate, verdict or close.
-        if let Some(census) = &census {
-            crate::session::classify_child_shadow::spawn_observe(
-                &census.pass.report.terminal_hosted,
-            );
-        }
-        census
+        // `classify_child` is judged inside the pass itself
+        // (`tracking_health::compute`), so the candidates below already read
+        // each finished session's children through it.
+        fresh.pass.map(|pass| LiveCensus { pass, observed })
     }
 
     fn census_view<'p>(
@@ -2357,7 +2363,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
                     session_id,
                     terminal_id,
                     kind,
-                    stray_exemptions(presents_strays, recorded),
+                    arm_exemptions(arm, stray_exemptions(presents_strays, recorded)),
                 )
             },
             crate::session::stray_wait::end_strays,
@@ -3401,6 +3407,44 @@ mod tests {
         );
     }
 
+    /// Phase 2b: ONLY the `finished_close` arm's close asks the child gate to
+    /// leave out a proven shim, whatever strays it also presents; the drain arm
+    /// presents nothing, so every child counts for it.
+    #[test]
+    fn only_the_finished_close_arm_presents_the_shim_exemption() {
+        let drain = arm_exemptions(CloseArm::Drain, ChildExemptions::none());
+        assert!(drain.is_empty(), "the drain arm presents no exemption");
+        let finished = arm_exemptions(CloseArm::FinishedClose, ChildExemptions::none());
+        assert_eq!(finished, ChildExemptions::none().with_shim_or_pump());
+        assert!(!finished.is_empty());
+        // Beside strays, and never twice.
+        let stray = crate::session::stray_wait::RecordedStray {
+            pid: 7,
+            start: 1,
+            argv: vec!["bash".to_string()],
+            class: "a".to_string(),
+        };
+        let both = arm_exemptions(
+            CloseArm::FinishedClose,
+            ChildExemptions::from_strays(vec![stray.clone()]),
+        );
+        assert_eq!(
+            both,
+            ChildExemptions::from_strays(vec![stray.clone()]).with_shim_or_pump()
+        );
+        assert_eq!(both.clone().with_shim_or_pump(), both);
+        assert_eq!(
+            arm_exemptions(CloseArm::Drain, ChildExemptions::from_strays(vec![stray.clone()])),
+            ChildExemptions::from_strays(vec![stray])
+        );
+        // The live impl and the one graceful_exit call pass it through.
+        let executor = executable_lines(include_str!("wind_down_executor.rs"));
+        assert!(
+            executor.contains("arm_exemptions(arm, stray_exemptions(presents_strays, recorded))"),
+            "LiveCloseEffects::wind_down_one no longer builds its policy through arm_exemptions"
+        );
+    }
+
     /// D4's tripwire: the module's ONE `graceful_exit(` call presents an
     /// authority exactly when [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] says so.
     /// Handing `wind_down_exit` an authority without flipping the constant,
@@ -3885,7 +3929,7 @@ mod tests {
                 session_id,
                 terminal_id,
                 SessionKind::Terminal,
-                stray_exemptions(records_strays(arm), &[]),
+                arm_exemptions(arm, stray_exemptions(records_strays(arm), &[])),
             )
             .await
         }
