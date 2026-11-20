@@ -6219,6 +6219,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_answer_agent_question",
     "coord_ask_question",
     "coord_attest_gate",
+    // Plan 2026-11-02-publishing-state-is-unreadable-to-agents-and-to-anchors
+    // Phase 1: the auto-publish status read (twin `GET
+    // /coord/agent-prompt-documents/auto-publish/status`), served by
+    // qontinui-coord#4238 and granted on coord's device floor. Read-only; its
+    // core refuses every non-system tenant and every anonymous mint itself.
+    "coord_auto_publish_status",
     // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
     // the per-repo tenant binding door (served by coord since qontinui-coord#3522).
     // coord authorizes it (the device user must be admin in BOTH tenants);
@@ -18359,6 +18365,32 @@ mod coord_mcp_body_gate_tests {
                 .allowed
                 .iter()
                 .filter(|t| t.as_str() == "coord_list_credential_probe_specs")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-11-02-publishing-state-is-unreadable-to-agents-and-to-anchors`
+    /// Phase 1: coord#4238 put `coord_auto_publish_status` on coord's device
+    /// floor; without this entry every runner-proxied session got `-32601`.
+    #[test]
+    fn coord_auto_publish_status_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed("coord_auto_publish_status"));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_auto_publish_status")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_auto_publish_status")
                 .count(),
             1,
             "the parser must read the entry exactly once: {:?}",
