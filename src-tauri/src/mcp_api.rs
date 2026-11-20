@@ -6441,6 +6441,17 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Plan 2026-10-17-per-repo-tenant-binding-… Phase 6: the read twin of
     // GET /coord/repos/tenants (which tenant governs a repo), previously absent.
     "coord_tenants_for_repo",
+    // Plan 2026-11-16-subproject-topics-agents-and-coord-group-subprojects-into-topics-without-the-operator
+    // Phase 3: the topic read/list and the three agent-writable topic writes
+    // (upsert, member attach/confirm/reject/remove, merge). coord serves them
+    // from a concurrent qontinui-coord PR; until it lands a call gets coord's
+    // unknown-tool refusal. `coord_topic_vectors_submit` (Phase 4) is HELD and
+    // deliberately absent.
+    "coord_topic_get",
+    "coord_topic_list",
+    "coord_topic_member",
+    "coord_topic_merge",
+    "coord_topic_upsert",
     "coord_twin_catalog",
     "coord_typecheck_file",
     // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
@@ -18539,6 +18550,50 @@ mod coord_mcp_body_gate_tests {
                 parsed.allowed
             );
         }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// The topic tools (plan
+    /// `2026-11-16-subproject-topics-agents-and-coord-group-subprojects-into-topics-without-the-operator`
+    /// Phase 3) must forward, and the held Phase 4 vectors submit must not.
+    /// The source-text parser the drift verdict runs must read each back
+    /// exactly once.
+    #[test]
+    fn topic_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_topic_get",
+            "coord_topic_list",
+            "coord_topic_member",
+            "coord_topic_merge",
+            "coord_topic_upsert",
+        ] {
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must be on the list itself, not reached by a prefix"
+            );
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert!(
+            !coord_mcp_tool_is_allowed("coord_topic_vectors_submit"),
+            "the Phase 4 vectors submit is held and must not forward yet"
+        );
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
