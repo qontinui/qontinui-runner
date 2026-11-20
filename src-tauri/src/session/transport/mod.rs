@@ -205,7 +205,7 @@ pub type DynTransport = Arc<dyn Transport>;
 /// dual-write). The underlying process — a legacy `terminal_create` PTY
 /// or `claude_session` subprocess — is owned and torn down by the legacy
 /// path; the coord-native mirror created via
-/// [`super::SessionRegistry::register_external`] is pure bookkeeping for
+/// [`super::SessionRegistry::register_external_with_lineage`] is pure bookkeeping for
 /// the dashboard. All [`Transport`] ops are no-ops: nothing to spawn,
 /// nothing to write, nothing to tear down (close is idempotent and never
 /// touches the real process — closing the mirror must not kill the
@@ -215,7 +215,7 @@ pub struct ExternalTransport;
 
 impl Transport for ExternalTransport {
     fn start(&self, _intent: &Intent) -> Result<TransportHandle, TransportError> {
-        // register_external never calls start (the real process is
+        // register_external_with_lineage never calls start (the real process is
         // already running). Defined for trait completeness; returns an
         // external handle so a misuse is observable rather than panicking.
         Ok(TransportHandle::External)

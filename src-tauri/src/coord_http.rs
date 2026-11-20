@@ -173,8 +173,7 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// SEPARATE STATICS. `DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED` (the
 /// coverage counters), `MISSING_TOKEN_WARNED`, `DEAD_LEGACY_SLOT_WARNED` and
 /// the `warn_once_per_tenant_*` sets each exist once per copy. Routing this
-/// helper through `crate::auth` puts the attach in the SAME copy as the
-/// `crate::auth::presented_tenant` call that diagnoses its refusals and as
+/// helper through `crate::auth` puts the attach in the SAME copy as
 /// the rest of this copy's `attach_device_auth*` call sites — the large
 /// majority of them, spread across three dozen modules — so the latch that
 /// says "already warned" and the counter that says "N of M authed" are the

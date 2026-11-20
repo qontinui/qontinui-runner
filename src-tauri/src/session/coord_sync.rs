@@ -9504,7 +9504,9 @@ mod tests {
             Some(RowTenant::Unobserved)
         );
         // A fresh register on the same registry: authored.
-        let fresh = registry.register_external(make_test_intent()).unwrap();
+        let fresh = registry
+            .register_external_with_lineage(make_test_intent(), None, None)
+            .unwrap();
         assert_eq!(registry.row_tenant_of(fresh), Some(RowTenant::Authored));
         // 404 fallback: the NEW row is fresh, so observed.
         rec.lock().await.patch_returns_404 = true;
@@ -9578,7 +9580,7 @@ mod tests {
     }
 
     /// `resume_external` on a GC'd row (PATCH 404) falls back to a fresh
-    /// `register_external`: a NEW id + a `Started` POST row.
+    /// `register_external_with_lineage`: a NEW id + a `Started` POST row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_external_falls_back_to_fresh_on_404() {
         let _amb = crate::test_env::isolated_ambient();
