@@ -2,9 +2,9 @@
 // `git_posture.rs` and `build.rs` pull it in with `include!` (a build script is
 // its own crate and cannot `use` the crate's code), and
 // `scripts/lib/repo-local-git-env.mjs` reads it as TEXT, taking every
-// double-quoted GIT_ literal and refusing any count but 13. So a name appears
-// in double quotes only inside the list below, and nothing above the list
-// quotes one. No inner doc here: this file is spliced into two crates.
+// double-quoted GIT_ literal and refusing any count but its EXPECTED_COUNT.
+// So a name appears in double quotes only inside the list below, and nothing
+// above the list quotes one. No inner doc here: this file is spliced into two crates.
 
 /// The REPOSITORY-LOCAL git environment variables the runner scrubs from every
 /// git child it starts: what `git rev-parse --local-env-vars` prints (git

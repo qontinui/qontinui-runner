@@ -152,7 +152,7 @@ pub fn prompt_proof_git_env() -> Vec<(String, String)> {
         .collect()
 }
 
-// `REPO_LOCAL_GIT_ENV` — the 13 repository-local git env names — lives in
+// `REPO_LOCAL_GIT_ENV` — the repository-local git env names — lives in
 // `git_posture/repo_local_git_env.rs` (its doc comment with it) so that ONE
 // copy serves every reader: this module, `build.rs` (which `include!`s the
 // same file, a build script being its own crate), and `vite.config.ts` /

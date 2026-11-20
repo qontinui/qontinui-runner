@@ -2102,8 +2102,8 @@ mod build_script_git_tests {
     /// (`get_envs` reports a removal as `None`), so a cargo build started from
     /// inside a git hook stamps this checkout's sha, not the hook repo's.
     /// Compared against `crate::git_posture` rather than build.rs's own
-    /// included copy, so swapping either `include!` for a literal list that
-    /// drifts fails here.
+    /// included copy, so a build.rs list that drops a crate name fails here (a
+    /// shrunken crate list fails `repo_local_git_env_covers_gits_own_list`).
     #[test]
     fn build_script_git_removes_every_repo_local_git_env_name() {
         let cmd = build_script_git();
