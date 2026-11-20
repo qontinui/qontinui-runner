@@ -3538,6 +3538,19 @@ struct HeartbeatPayload {
     /// additive/backward-safe contract as `git_sha`.
     #[serde(skip_serializing_if = "Option::is_none")]
     commits_behind: Option<u64>,
+    /// The session-PR reconciler's credential's own `X-RateLimit-*` reading,
+    /// with its login, the per-consumer charged counts and the meter's start
+    /// (plan
+    /// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+    /// Phase 4). coord files it under `core:user:<login digest>/device:<id>`,
+    /// so a burn of the user bucket SHARED by every box on the identity is
+    /// visible from any box. OMITTED — never sent as a guess — before the
+    /// reconciler's first request, while its login is unresolved, or when the
+    /// reading is stale or unusable ([`crate::github_budget::build_user_budget_report`]).
+    /// Additive: a coord predating the block ignores the unknown key, and a
+    /// block coord refuses is dropped without failing the register.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_user_budget: Option<crate::github_budget::UserBudgetReport>,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -3842,6 +3855,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         git_sha,
         main_sha,
         commits_behind,
+        github_user_budget: crate::github_budget::user_budget_report(),
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -9049,11 +9063,67 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
             body.get("claude_code_available").is_none(),
             "false value should be omitted from heartbeat wire"
+        );
+    }
+
+    /// Plan 2026-10-30-…, Phase 4: the user-bucket block rides the register
+    /// body under coord's key, snake_case inside, and is ABSENT (not `null`)
+    /// when there is nothing honest to report.
+    #[test]
+    fn heartbeat_payload_carries_the_github_user_budget_block_only_when_present() {
+        let payload = |github_user_budget| HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
+            github_user_budget,
+        };
+        let absent = serde_json::to_value(payload(None)).unwrap();
+        assert!(
+            absent.get("github_user_budget").is_none(),
+            "no reading/login ⇒ the key is omitted, never null or a guess"
+        );
+
+        let report = crate::github_budget::UserBudgetReport {
+            login: "jspinak".into(),
+            limit: 5000,
+            remaining: 4100,
+            used: Some(900),
+            reset_at_unix: 1_763_560_000,
+            resource: "core".into(),
+            charged_by_consumer: [("session_pr_reconciler".to_string(), 4350_u64)]
+                .into_iter()
+                .collect(),
+            process_started_at_unix: Some(1_763_500_000),
+        };
+        let body = serde_json::to_value(payload(Some(report))).unwrap();
+        assert_eq!(
+            body["github_user_budget"],
+            serde_json::json!({
+                "login": "jspinak",
+                "limit": 5000,
+                "remaining": 4100,
+                "used": 900,
+                "reset_at_unix": 1_763_560_000_i64,
+                "resource": "core",
+                "charged_by_consumer": {"session_pr_reconciler": 4350},
+                "process_started_at_unix": 1_763_500_000_i64,
+            })
         );
     }
 
@@ -9073,6 +9143,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9103,6 +9174,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9131,6 +9203,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9165,6 +9238,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9200,6 +9274,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body0 = serde_json::to_value(&p0).unwrap();
         assert!(
@@ -9274,6 +9349,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9314,6 +9390,7 @@ mod tests {",
             git_sha: Some("dc7aa9c5aaaa"),
             main_sha: Some("dc7aa9c5aaaabbbbccccddddeeeeffff00001111".into()),
             commits_behind: Some(4),
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9364,6 +9441,7 @@ mod tests {",
             git_sha,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -9534,6 +9612,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         }
     }
 

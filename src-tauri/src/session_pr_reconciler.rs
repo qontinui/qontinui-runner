@@ -963,7 +963,10 @@ fn login_failure_is_terminal(e: &GhError) -> bool {
 /// never slept on: the identity's interactive sessions keep the rest of the
 /// window. The one place the reconciler's spend class is decided.
 pub(crate) fn reconciler_client(token: &str) -> Result<GitHubClient, String> {
-    Ok(GitHubClient::new(token, "session_pr_reconciler")?.with_spend_class(SpendClass::Background))
+    Ok(
+        GitHubClient::new(token, crate::github_budget::USER_BUDGET_REPORT_CONSUMER)?
+            .with_spend_class(SpendClass::Background),
+    )
 }
 
 /// One cycle's GitHub spend state (plan 2026-10-30-…, Phase 3, D4).
