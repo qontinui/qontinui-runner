@@ -23,8 +23,11 @@ import { detectClaudeHandshake, detectResumeFailure } from "./resumeVerification
 import {
   FRESH_LAUNCH_HANDSHAKE_PATTERNS,
   describeLaunchFailure,
+  LATE_HANDSHAKE_INTERVAL_MS,
+  LATE_HANDSHAKE_MAX_MS,
   typeLaunchThenVerify,
   verifyFreshLaunch,
+  watchFreshLaunch,
   type FreshLaunchDeps,
 } from "./launchVerification";
 import type { LaunchFailureRead } from "./launchFailureApi";
@@ -150,6 +153,103 @@ describe("verifyFreshLaunch", () => {
     expect(detectClaudeHandshake("$ claude --session-id x", FRESH_LAUNCH_HANDSHAKE_PATTERNS)).toBe(
       false,
     );
+  });
+});
+
+describe("watchFreshLaunch (the banner's lifecycle)", () => {
+  /**
+   * The first wait times out over a readable scrollback (banner raised); the
+   * late probes then read `lateTails` in order, one per probe.
+   */
+  function watch(lateTails: Array<string | null>, isActive: () => boolean = () => true) {
+    const banner: Array<object | undefined> = [];
+    const sleeps: number[] = [];
+    const tails = [...lateTails];
+    let firstWaitDone = false;
+    const base = deps({ outcome: "timeout", tail: "$ claude", reads: [] });
+    const run = watchFreshLaunch("t", {
+      ...base,
+      waitHandshake: async (tabId, readTail) => {
+        const r = await base.waitHandshake!(tabId, readTail);
+        firstWaitDone = true;
+        return r;
+      },
+      readTail: async () => (firstWaitDone ? (tails.shift() ?? null) : "$ claude"),
+      sleep: async (ms) => {
+        if (firstWaitDone) sleeps.push(ms);
+      },
+      setFailure: (s) => banner.push(s),
+      isActive,
+      detectHandshake: (tail) => tail.includes("HANDSHAKE"),
+    });
+    return { run, banner, sleeps };
+  }
+
+  it("a late handshake retracts the banner", async () => {
+    const { run, banner, sleeps } = watch(["$ claude", null, "... HANDSHAKE ..."]);
+    expect(await run).toBe("retracted");
+    expect(banner).toEqual([{ handshakeWaitedMs: 15_000 }, undefined]);
+    expect(sleeps).toEqual([10_000, 10_000, 10_000]);
+  });
+
+  it("re-checks at most every 10 s for 5 min, then leaves the banner up", async () => {
+    const { run, banner, sleeps } = watch([]);
+    expect(await run).toBe("still-failed");
+    expect(banner).toEqual([{ handshakeWaitedMs: 15_000 }]);
+    expect(LATE_HANDSHAKE_INTERVAL_MS).toBe(10_000);
+    expect(LATE_HANDSHAKE_MAX_MS).toBe(300_000);
+    expect(sleeps).toHaveLength(30);
+    expect(sleeps.every((ms) => ms === LATE_HANDSHAKE_INTERVAL_MS)).toBe(true);
+  });
+
+  it("stops when the tab closes or a newer launch takes over, without touching the banner", async () => {
+    let active = true;
+    let lateProbes = 0;
+    const banner: Array<object | undefined> = [];
+    const base = deps({ outcome: "timeout", tail: "$ claude", reads: [] });
+    let firstWaitDone = false;
+    const result = await watchFreshLaunch("t", {
+      ...base,
+      waitHandshake: async (tabId, readTail) => {
+        const r = await base.waitHandshake!(tabId, readTail);
+        firstWaitDone = true;
+        return r;
+      },
+      readTail: async () => {
+        if (!firstWaitDone) return "$ claude";
+        lateProbes += 1;
+        if (lateProbes === 2) active = false; // the tab closed mid-probe
+        return lateProbes === 2 ? "HANDSHAKE" : null;
+      },
+      setFailure: (s) => banner.push(s),
+      isActive: () => active,
+      detectHandshake: (tail) => tail.includes("HANDSHAKE"),
+    });
+    expect(result).toBe("abandoned");
+    expect(lateProbes).toBe(2);
+    expect(banner).toEqual([{ handshakeWaitedMs: 15_000 }]);
+  });
+
+  it("a handshake seen in the first wait clears any earlier banner", async () => {
+    const banner: Array<object | undefined> = [];
+    const result = await watchFreshLaunch("t", {
+      ...deps({ outcome: "verified", tail: "x", reads: [] }),
+      setFailure: (s) => banner.push(s),
+      isActive: () => true,
+    });
+    expect(result).toBe("started");
+    expect(banner).toEqual([undefined]);
+  });
+
+  it("an unread launch leaves the banner alone", async () => {
+    const banner: Array<object | undefined> = [];
+    const result = await watchFreshLaunch("t", {
+      ...deps({ outcome: "timeout", tail: null, reads: [] }),
+      setFailure: (s) => banner.push(s),
+      isActive: () => true,
+    });
+    expect(result).toBe("unknown");
+    expect(banner).toEqual([]);
   });
 });
 

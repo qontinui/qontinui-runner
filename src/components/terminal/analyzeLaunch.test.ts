@@ -225,35 +225,36 @@ describe("runAnalyzeLaunch", () => {
     expect(out.ok).toBe(true);
   });
 
-  it("an unprovisioned cwd is a not-provisioned outcome on the open pane, never ok", async () => {
-    const { deps, writes } = makeDeps({
-      captureEvidence: vi.fn(async () => ({ ...EVIDENCE, commandsProvisioned: false })),
+  const notProvisionedCases: Array<[string, typeof EVIDENCE | (typeof EVIDENCE & { cwd: null })]> =
+    [
+      ["an unprovisioned cwd", { ...EVIDENCE, commandsProvisioned: false }],
+      ["no resolvable cwd", { ...EVIDENCE, cwd: null, commandsProvisioned: false }],
+      // A null cwd provisioned nothing, whatever the flag says.
+      ["no resolvable cwd (flag set)", { ...EVIDENCE, cwd: null, commandsProvisioned: true }],
+    ];
+  for (const [name, evidence] of notProvisionedCases) {
+    it(`${name}: no analyzer is created or launched, and the toast carries the evidence path`, async () => {
+      const { deps, writes } = makeDeps({ captureEvidence: vi.fn(async () => evidence) });
+      const out = await runAnalyzeLaunch(PANE, deps);
+      expect(out).toMatchObject({ ok: false, step: "not-provisioned" });
+      expect((out as { analyzerTabId?: string }).analyzerTabId).toBeUndefined();
+      expect(deps.createPane).not.toHaveBeenCalled();
+      expect(deps.buildCommand).not.toHaveBeenCalled();
+      expect(deps.onLaunched).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      const toast = analyzeOutcomeToast(out);
+      expect(toast?.type).toBe("error");
+      expect(toast?.message).toContain(
+        "the analyzer was not opened: the /analyze-launch-failure command could not be provisioned",
+      );
+      expect(toast?.message).toContain("run `/analyze-launch-failure /ev/t1.md` by hand");
+      if (evidence.cwd === null) {
+        expect(toast?.message).toContain("spawn working directory could not be resolved");
+      } else {
+        expect(toast?.message).toContain("provisioning into /work/repo");
+      }
     });
-    const out = await runAnalyzeLaunch(PANE, deps);
-    expect(out).toMatchObject({ ok: false, step: "not-provisioned", analyzerTabId: "analyzer-1" });
-    expect((out as { message: string }).message).toContain("/work/repo");
-    // The analyzer still launched; only the acknowledgement changes.
-    expect(writes).toHaveLength(1);
-    expect(analyzeOutcomeToast(out)).toEqual({
-      type: "error",
-      message: expect.stringContaining(
-        "the /analyze-launch-failure command was not provisioned into the analyzer pane's directory",
-      ),
-    });
-  });
-
-  it("no resolvable cwd: opens in the pane's workingDir and reports that nothing was provisioned", async () => {
-    const { deps } = makeDeps({
-      captureEvidence: vi.fn(async () => ({ ...EVIDENCE, cwd: null, commandsProvisioned: false })),
-    });
-    const out = await runAnalyzeLaunch(PANE, deps);
-    expect(deps.createPane).toHaveBeenCalledWith("analyze launch", "/fallback", "ten");
-    expect(out).toMatchObject({ ok: false, step: "not-provisioned", analyzerTabId: "analyzer-1" });
-    expect((out as { message: string }).message).toContain(
-      "working directory could not be resolved",
-    );
-    expect((out as { message: string }).message).toContain("/fallback");
-  });
+  }
 
   it("a clean open has no toast", async () => {
     const { deps } = makeDeps();

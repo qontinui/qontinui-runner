@@ -67,6 +67,30 @@ export async function buildAiLaunchCommand(params: {
 }
 
 /**
+ * The tab fields a typed AI launch records (`TerminalPage`'s `recordAiLaunch`):
+ * what was typed, when, under which account — and `launchFailure` CLEARED, so
+ * a banner a previous launch in this pane raised never sits over the new one.
+ * The new launch's own verification raises it again if it, too, fails.
+ */
+export function aiLaunchTabFields(
+  launch: AiLaunchCommand,
+  configDir: string,
+  now: number,
+): {
+  launchCommand: string;
+  launchedAt: number;
+  launchConfigDir: string;
+  launchFailure: undefined;
+} {
+  return {
+    launchCommand: launch.command,
+    launchedAt: now,
+    launchConfigDir: configDir,
+    launchFailure: undefined,
+  };
+}
+
+/**
  * What the failure path needs from the page. Kept as plain callbacks (no
  * React, no Tauri) so the orphan-cleanup contract is unit-testable under the
  * runner's `environment: "node"` vitest config — same precedent as

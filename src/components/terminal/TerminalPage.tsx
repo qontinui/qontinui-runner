@@ -88,7 +88,7 @@ import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { LaunchFailedBanner } from "./LaunchFailedBanner";
 import { AnalyzeLaunchContext, useAnalyzeLaunch } from "./useAnalyzeLaunch";
 import { typeLaunchThenVerify } from "./launchVerification";
-import type { AiLaunchCommand } from "./aiLaunchCommand";
+import { aiLaunchTabFields, type AiLaunchCommand } from "./aiLaunchCommand";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
@@ -1312,14 +1312,11 @@ function TerminalPageInner({
     configDir: string,
     spawnAt: number = Date.now(),
   ) => {
-    const { command, pinnedSessionId } = launch;
+    const { pinnedSessionId } = launch;
     // The launch record the Analyze action reads (what was typed, when, under
-    // which account) — tab state, so no second store.
-    const launchFields = {
-      launchCommand: command,
-      launchedAt: Date.now(),
-      launchConfigDir: configDir,
-    };
+    // which account) — tab state, so no second store. It also clears a
+    // previous launch's "Claude did not start" banner.
+    const launchFields = aiLaunchTabFields(launch, configDir, Date.now());
     if (pinnedSessionId) {
       updateTab(tabId, {
         claudeSessionId: pinnedSessionId,

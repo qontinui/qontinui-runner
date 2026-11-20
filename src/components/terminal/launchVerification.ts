@@ -23,7 +23,11 @@
  *   the registry never recorded anything. No banner, and no "started" claim.
  */
 
-import { waitForClaudeHandshake, readScrollbackTail } from "./resumeVerification";
+import {
+  detectClaudeHandshake,
+  readScrollbackTail,
+  waitForClaudeHandshake,
+} from "./resumeVerification";
 import { CLAUDE_HANDSHAKE_REGEXES, CLAUDE_TITLE_REGEXES } from "./providerAdapter";
 import type { HandshakePatterns } from "./providerAdapter";
 import type { LaunchFailureRead } from "./launchFailureApi";
@@ -178,4 +182,78 @@ export async function typeLaunchThenVerify(
   }
   verify(tabId);
   return result;
+}
+
+/** How often, and for how long, a flagged launch is re-checked for a late handshake. */
+export const LATE_HANDSHAKE_INTERVAL_MS = 10_000;
+export const LATE_HANDSHAKE_MAX_MS = 5 * 60_000;
+
+export interface LaunchWatchDeps extends FreshLaunchDeps {
+  /**
+   * Set (`signals`) or clear (`undefined`) the tab's `launchFailure`, i.e. the
+   * "Claude did not start" banner.
+   */
+  setFailure: (signals: LaunchFailureSignals | undefined) => void;
+  /**
+   * False once this watch is moot: the tab closed, or a newer launch in it
+   * started its own watch. Checked before every write and every late probe.
+   */
+  isActive: () => boolean;
+  /** The late handshake test; defaults to Claude's fresh-launch markers. */
+  detectHandshake?: (tail: string) => boolean;
+  lateIntervalMs?: number;
+  lateMaxMs?: number;
+}
+
+/** How a {@link watchFreshLaunch} ended. */
+export type LaunchWatchResult =
+  | "started" // handshake seen in the first wait; banner cleared
+  | "unknown" // nothing could be read; banner left as it was
+  | "retracted" // flagged, then a late handshake was seen; banner cleared
+  | "still-failed" // flagged, and no handshake within the late window
+  | "abandoned"; // the tab closed or a newer launch took over
+
+/**
+ * The banner's whole lifecycle for one launch: run {@link verifyFreshLaunch};
+ * on `started` clear any banner; on `failed` raise it, then keep re-reading the
+ * scrollback every `lateIntervalMs` for up to `lateMaxMs` and retract it the
+ * moment a handshake shows up (a Claude slower than the first wait, or one
+ * the operator started by hand). Stops as soon as `isActive` is false.
+ * Never throws.
+ */
+export async function watchFreshLaunch(
+  tabId: string,
+  deps: LaunchWatchDeps,
+): Promise<LaunchWatchResult> {
+  const {
+    setFailure,
+    isActive,
+    readTail = readScrollbackTail,
+    detectHandshake = (tail: string) =>
+      detectClaudeHandshake(tail, FRESH_LAUNCH_HANDSHAKE_PATTERNS),
+    lateIntervalMs = LATE_HANDSHAKE_INTERVAL_MS,
+    lateMaxMs = LATE_HANDSHAKE_MAX_MS,
+    sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+  } = deps;
+
+  const verdict = await verifyFreshLaunch(tabId, deps);
+  if (!isActive()) return "abandoned";
+  if (verdict.kind === "started") {
+    setFailure(undefined);
+    return "started";
+  }
+  if (verdict.kind === "unknown") return "unknown";
+
+  setFailure(verdict.signals);
+  for (let waited = 0; waited < lateMaxMs; waited += lateIntervalMs) {
+    await sleep(lateIntervalMs);
+    if (!isActive()) return "abandoned";
+    const tail = await readTail(tabId).catch(() => null);
+    if (!isActive()) return "abandoned";
+    if (tail !== null && detectHandshake(tail)) {
+      setFailure(undefined);
+      return "retracted";
+    }
+  }
+  return "still-failed";
 }

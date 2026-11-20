@@ -15,7 +15,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }));
 
-import { buildAiLaunchCommand, buildAiLaunchCommandForTab } from "./aiLaunchCommand";
+import {
+  aiLaunchTabFields,
+  buildAiLaunchCommand,
+  buildAiLaunchCommandForTab,
+} from "./aiLaunchCommand";
 
 describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
   beforeEach(() => invokeMock.mockReset());
@@ -191,5 +195,25 @@ describe("buildAiLaunchCommandForTab (orphan cleanup on a failed build)", () => 
     expect(disposeTab).toHaveBeenCalledWith("tab-3");
 
     consoleError.mockRestore();
+  });
+});
+
+describe("aiLaunchTabFields (recordAiLaunch)", () => {
+  it("a relaunch clears the previous launch's banner", () => {
+    const fields = aiLaunchTabFields(
+      { command: "claude --session-id s", pinnedSessionId: "s", promptCarried: false },
+      "/h/.claude-a",
+      1234,
+    );
+    expect(fields).toEqual({
+      launchCommand: "claude --session-id s",
+      launchedAt: 1234,
+      launchConfigDir: "/h/.claude-a",
+      launchFailure: undefined,
+    });
+    // An explicit key, so `updateTab`'s spread overwrites a stale banner.
+    expect(Object.prototype.hasOwnProperty.call(fields, "launchFailure")).toBe(true);
+    const tab = { id: "t", launchFailure: { handshakeWaitedMs: 15_000 } };
+    expect({ ...tab, ...fields }.launchFailure).toBeUndefined();
   });
 });

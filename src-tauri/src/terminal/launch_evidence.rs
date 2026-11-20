@@ -20,6 +20,7 @@
 //! Both are reached from a Tauri command (`commands/terminal.rs`) and an HTTP
 //! twin (`mcp/terminals.rs`).
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -169,6 +170,27 @@ fn rfc3339_ms(ms: i64) -> String {
         .unwrap_or_else(|| "UNKNOWN".to_string())
 }
 
+/// `s` with every control character escaped (`\n` → `\\n`, `\u{1b}` →
+/// `\\u{1b}`), so a value written as one markdown list line stays one line.
+/// For EVIDENCE values (the shim beacon, the spawn cwd): recorded as found,
+/// never refused. A value with no control character is returned unchanged.
+fn one_line(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if c.is_control() {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect(),
+    )
+}
+
 /// Render one evidence file. Every field is present in every file; an unknown
 /// value is written as such, never omitted.
 pub fn render_evidence(r: &EvidenceRecord<'_>) -> String {
@@ -199,9 +221,15 @@ pub fn render_evidence(r: &EvidenceRecord<'_>) -> String {
         non_blank(r.pinned_session_id).unwrap_or("none")
     ));
     out.push_str(&format!(
-        "- cwd: {}\n",
-        non_blank(r.cwd).unwrap_or("UNKNOWN (no live working directory)")
+        "- spawn_cwd: {}\n",
+        non_blank(r.cwd)
+            .map(one_line)
+            .unwrap_or(Cow::Borrowed("UNKNOWN (no spawn working directory)"))
     ));
+    out.push_str(
+        "- spawn_cwd_note: the directory the pane was spawned in; its shell may have \
+         changed directory since\n",
+    );
     out.push_str(&format!("- pane: {}\n", r.pane.render()));
     out.push_str(&format!(
         "- runner: buildId={} gitSha={}\n",
@@ -211,8 +239,8 @@ pub fn render_evidence(r: &EvidenceRecord<'_>) -> String {
     out.push_str("\n## Shim launch-failure record\n\n");
     match r.failure {
         Some(f) => {
-            out.push_str(&format!("- kind: {}\n", f.event));
-            out.push_str(&format!("- detail: {}\n", f.detail));
+            out.push_str(&format!("- kind: {}\n", one_line(&f.event)));
+            out.push_str(&format!("- detail: {}\n", one_line(&f.detail)));
             out.push_str(&format!("- settings: {}\n", f.settings));
             out.push_str(&format!("- user_chose_session: {}\n", f.user_chose_session));
             out.push_str(&format!(
@@ -357,10 +385,25 @@ pub fn prune_evidence_dir(dir: &Path, keep: usize) -> std::io::Result<usize> {
 /// typed prompt. The account is checked whatever its source: a stored one
 /// lands on the same line.
 pub fn check_caller_fields(record: &EvidenceRecord<'_>) -> Result<(), CaptureError> {
+    check_caller_values(
+        record.launch_command,
+        record.account.map(|(dir, _)| dir),
+        record.pinned_session_id,
+    )
+}
+
+/// [`check_caller_fields`] over the raw request values — run FIRST by
+/// [`capture_launch_evidence`], so a malformed request is a 400 whatever the
+/// terminal's state.
+pub fn check_caller_values(
+    launch_command: Option<&str>,
+    config_dir: Option<&str>,
+    pinned_session_id: Option<&str>,
+) -> Result<(), CaptureError> {
     let fields = [
-        ("launch_command", record.launch_command),
-        ("config_dir", record.account.map(|(dir, _)| dir)),
-        ("pinned_session_id", record.pinned_session_id),
+        ("launch_command", launch_command),
+        ("config_dir", config_dir),
+        ("pinned_session_id", pinned_session_id),
     ];
     for (field, value) in fields {
         if let Some(found) = value.and_then(|v| v.chars().find(|c| c.is_control())) {
@@ -433,6 +476,11 @@ pub fn capture_launch_evidence(
     config_dir: Option<String>,
     pinned_session_id: Option<String>,
 ) -> Result<LaunchEvidence, CaptureError> {
+    check_caller_values(
+        launch_command.as_deref(),
+        config_dir.as_deref(),
+        pinned_session_id.as_deref(),
+    )?;
     let session = terminal_manager
         .get(terminal_id)
         .ok_or_else(|| CaptureError::TerminalNotFound(terminal_id.to_string()))?;
@@ -587,7 +635,8 @@ mod tests {
              - account: /h/.claude-x\n\
              - account_source: caller\n\
              - pinned_session_id: abc\n\
-             - cwd: /work/repo\n\
+             - spawn_cwd: /work/repo\n\
+             - spawn_cwd_note: the directory the pane was spawned in; its shell may have changed directory since\n\
              - pane: alive (the pane's shell is running)\n\
              - runner: buildId=B1 gitSha=deadbeef\n\
              \n\
@@ -635,6 +684,42 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("- kind:"));
+    }
+
+    #[test]
+    fn a_newline_in_beacon_detail_or_spawn_cwd_cannot_forge_a_line() {
+        let f = LaunchFailure::from_beacon(
+            "resolve-failed",
+            "boom\n- account: /forged\r\n## Scrollback\u{1b}[2J",
+            AT_MS - 5_000,
+        )
+        .unwrap();
+        let mut rec = record(Some("claude"), Some(&f), b"");
+        rec.cwd = Some("/work/a\n- pinned_session_id: forged");
+        // Evidence, not caller input: recorded (escaped), never refused.
+        let td = tempfile::tempdir().unwrap();
+        capture_into(td.path(), &rec, |_| false).unwrap();
+        let body = render_evidence(&rec);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(!lines.contains(&"- account: /forged"), "{body}");
+        assert!(!lines.contains(&"- pinned_session_id: forged"), "{body}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("## Scrollback"))
+                .count(),
+            1
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("- detail: ")
+                && l.contains("boom\\n- account: /forged\\r\\n## Scrollback\\u{1b}[2J")),
+            "{body}"
+        );
+        assert!(
+            lines.contains(&"- spawn_cwd: /work/a\\n- pinned_session_id: forged"),
+            "{body}"
+        );
+        assert!(!body.contains('\u{1b}'), "{body}");
     }
 
     #[test]

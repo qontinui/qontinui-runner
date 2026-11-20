@@ -33,7 +33,7 @@ import {
   type AnalyzeStatus,
 } from "./analyzeLaunch";
 import { captureLaunchEvidence, readTerminalLaunchFailure } from "./launchFailureApi";
-import { FRESH_LAUNCH_HANDSHAKE_PATTERNS, verifyFreshLaunch } from "./launchVerification";
+import { FRESH_LAUNCH_HANDSHAKE_PATTERNS, watchFreshLaunch } from "./launchVerification";
 import { waitForClaudeHandshake } from "./resumeVerification";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalWriteResult } from "./terminalWriteResult";
@@ -170,19 +170,28 @@ export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
   );
 
   /**
-   * Phase 4: observe a fresh launch typed into `tabId` and flag the pane when
-   * it was SEEN not to start. An unread launch flags nothing.
+   * Phase 4: observe a fresh launch typed into `tabId`. A launch SEEN not to
+   * start raises the banner; a handshake seen at any point — in the first wait
+   * or by the bounded late re-check — clears it. A newer launch in the same
+   * tab, or the tab closing, ends this watch. An unread launch flags nothing.
    */
+  const watchGenRef = useRef<Record<string, number>>({});
   const verifyLaunch = useCallback((tabId: string) => {
-    void verifyFreshLaunch(tabId, { readFailure: (id) => readTerminalLaunchFailure(id) }).then(
-      (verdict) => {
-        if (verdict.kind === "failed") {
-          argsRef.current.updateTab(tabId, { launchFailure: verdict.signals });
-        } else if (verdict.kind === "unknown") {
-          console.warn(`[LaunchAI] launch status of ${tabId} is UNKNOWN (nothing could be read)`);
-        }
-      },
-    );
+    const gen = (watchGenRef.current[tabId] ?? 0) + 1;
+    watchGenRef.current[tabId] = gen;
+    const isActive = () =>
+      watchGenRef.current[tabId] === gen && argsRef.current.tabs.some((t) => t.id === tabId);
+    void watchFreshLaunch(tabId, {
+      readFailure: (id) => readTerminalLaunchFailure(id),
+      isActive,
+      setFailure: (signals) => argsRef.current.updateTab(tabId, { launchFailure: signals }),
+    }).then((result) => {
+      if (result === "unknown") {
+        console.warn(`[LaunchAI] launch status of ${tabId} is UNKNOWN (nothing could be read)`);
+      } else if (result === "retracted") {
+        console.warn(`[LaunchAI] ${tabId}: Claude started late; launch-failure banner retracted`);
+      }
+    });
   }, []);
 
   useUIComponent({

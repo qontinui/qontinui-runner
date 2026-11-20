@@ -15,9 +15,10 @@
  *      prompt was not carried in argv (`promptCarried: false`), the one-line
  *      invocation is typed once after the Claude handshake is seen — never
  *      after a timer — and submitted with a separate CR; a handshake that is
- *      not seen is a failure;
- *   5. reports a cwd the analyzer command was not provisioned into as a
- *      failure (`not-provisioned`), with the pane left open.
+ *      not seen is a failure.
+ *   Before any of 2–4: evidence whose cwd was not provisioned (or that has no
+ *   cwd) opens NO analyzer — `not-provisioned`, naming the evidence path so the
+ *   operator can run the command by hand somewhere it resolves (D1).
  *
  * Every step's failure is a terminal outcome naming that step, so the button
  * can never sit on "Analyzer opened" for a pane that got no first turn.
@@ -131,7 +132,7 @@ export const ANALYZE_STEP_LABEL: Record<AnalyzeStep, string> = {
   handshake: "the analyzer's Claude did not start (handshake not seen)",
   "prompt-write": "the analyzer prompt could not be typed",
   "prompt-submit": "the analyzer prompt was typed but could not be submitted",
-  "not-provisioned": `the ${ANALYZE_LAUNCH_SLASH_COMMAND} command was not provisioned into the analyzer pane's directory, so its first turn may not resolve`,
+  "not-provisioned": `the analyzer was not opened: the ${ANALYZE_LAUNCH_SLASH_COMMAND} command could not be provisioned into the failed pane's spawn working directory`,
   unexpected: "the analyzer run failed unexpectedly",
 };
 
@@ -205,15 +206,16 @@ function refused(result: TerminalWriteResult | void): string | null {
   return null;
 }
 
-/** Why the analyzer pane's directory does not carry the analyzer command. */
-function notProvisionedMessage(evidence: LaunchEvidence, openedIn: string | undefined): string {
-  if (evidence.cwd === null) {
-    return (
-      "the failed pane's working directory could not be resolved, so nothing was provisioned; " +
-      `the analyzer opened in ${openedIn ?? "the default directory"}`
-    );
-  }
-  return `provisioning into ${evidence.cwd} did not leave .claude/commands/analyze-launch-failure.md there`;
+/**
+ * Why no analyzer was opened, and what the operator can run by hand. The
+ * evidence file exists either way, so the message carries its path.
+ */
+function notProvisionedMessage(evidence: LaunchEvidence): string {
+  const why =
+    evidence.cwd === null
+      ? "the failed pane's spawn working directory could not be resolved, so the command was provisioned nowhere"
+      : `provisioning into ${evidence.cwd} did not leave .claude/commands/analyze-launch-failure.md there`;
+  return `${why}. Evidence was captured: run \`${analyzerFirstMessage(evidence.path)}\` by hand in a session where the command resolves`;
 }
 
 /** Run the analyzer open for `pane`. Never throws: every step names itself. */
@@ -237,7 +239,14 @@ export async function runAnalyzeLaunch(
     return { ok: false, step: "evidence-capture", message: describe(e) };
   }
 
-  // 2. Account.
+  // 2. D1, decided BEFORE any pane exists: an analyzer whose first turn may
+  // not resolve is never opened. No cwd means nothing was provisioned.
+  if (!evidence.commandsProvisioned || evidence.cwd === null) {
+    return { ok: false, step: "not-provisioned", message: notProvisionedMessage(evidence) };
+  }
+  const cwd = evidence.cwd;
+
+  // 3. Account.
   let account: string | null;
   try {
     account = pickAnalyzerAccount(deps.rankedAccounts(), failedConfigDir, deps.launchAliases());
@@ -248,7 +257,7 @@ export async function runAnalyzeLaunch(
     return { ok: false, step: "no-account", message: "no Claude account is configured" };
   }
 
-  // 3. Command. Built BEFORE the pane exists, so a refusal strands no shell.
+  // 4. Command. Built BEFORE the pane exists, so a refusal strands no shell.
   const prompt = analyzerFirstMessage(evidence.path);
   let launch: AiLaunchCommand;
   try {
@@ -262,10 +271,7 @@ export async function runAnalyzeLaunch(
     return { ok: false, step: "command-build", message: describe(e) };
   }
 
-  // 4. Pane. The provisioned cwd is where `/analyze-launch-failure` resolves
-  // (D2); the pane's own workingDir is only a fallback, and an unprovisioned
-  // one is reported after the launch (step "not-provisioned").
-  const cwd = evidence.cwd ?? pane.workingDir;
+  // 5. Pane, in the provisioned cwd, where `/analyze-launch-failure` resolves (D2).
   let tabId: string | null;
   try {
     tabId = await deps.createPane("analyze launch", cwd, pane.tenantId);
@@ -283,7 +289,7 @@ export async function runAnalyzeLaunch(
     analyzerTabId,
   });
 
-  // 5. One write of the launch command, then record it.
+  // 6. One write of the launch command, then record it.
   try {
     const commandRefusal = refused(await deps.write(analyzerTabId, `${launch.command}\r`));
     if (commandRefusal) return fail("write", commandRefusal);
@@ -296,7 +302,7 @@ export async function runAnalyzeLaunch(
     return fail("launch-record", describe(e));
   }
 
-  // 6. An alias dropped the positional prompt: type it once the handshake is
+  // 7. An alias dropped the positional prompt: type it once the handshake is
   // seen, then submit with a SEPARATE CR (see PROMPT_SUBMIT_DELAY_MS).
   if (!launch.promptCarried) {
     let seen: "verified" | "failed" | "timeout";
@@ -324,11 +330,6 @@ export async function runAnalyzeLaunch(
     } catch (e) {
       return fail("prompt-submit", describe(e));
     }
-  }
-
-  // 7. D1: never "Analyzer opened" on a pane whose first turn may not resolve.
-  if (!evidence.commandsProvisioned) {
-    return fail("not-provisioned", notProvisionedMessage(evidence, cwd));
   }
 
   return {
