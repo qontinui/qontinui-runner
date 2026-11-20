@@ -176,7 +176,6 @@ use uuid::Uuid;
 use crate::auth::TenantScope;
 
 use super::closeout_spool::{classify_coord_write_status, CoordWriteClass};
-use super::dual_write::DualWriteGate;
 use super::local_store::{OutboxEvent, OutboxRecord, OutboxWriter};
 use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
 
@@ -233,12 +232,6 @@ struct CoordSyncInner {
     /// itself owns the `CoordSync`, so a strong handle here would
     /// cycle.
     registry: Mutex<Option<Weak<SessionRegistry>>>,
-    /// Phase 10 cutover gate (plan
-    /// `2026-05-23-coord-native-sessions-phase-7-10.md` §Phase 10).
-    /// Caches the per-tenant `session_coordination_enabled` flag;
-    /// default dormant. The poll task ([`CoordSync::start_flag_poll_task`])
-    /// refreshes it from coord's `/tenant-policy` endpoint.
-    dual_write: DualWriteGate,
     /// Invoked with the payload's `claude_session_id` and `finished_at` when coord ACKs a
     /// `finished` record — main.rs attaches `SessionLifecycleStore::
     /// mark_finish_synced` (plan
@@ -334,7 +327,6 @@ impl CoordSync {
                 has_been_online: AtomicBool::new(false),
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
-                dual_write: DualWriteGate::new(),
                 finished_ack_observer: OnceLock::new(),
                 finished_unconfirmed_observer: OnceLock::new(),
                 outside_observer: Some(Arc::new(
@@ -369,7 +361,6 @@ impl CoordSync {
                 has_been_online: AtomicBool::new(false),
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
-                dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
                 finished_ack_observer: OnceLock::new(),
                 finished_unconfirmed_observer: OnceLock::new(),
                 // Inert by construction under test: the heartbeat harness
@@ -381,17 +372,6 @@ impl CoordSync {
                 rekeys: Arc::default(),
             }),
         }
-    }
-
-    /// Test-only: rebuild this (not yet shared) facade's dual-write gate with
-    /// a fast flag-poll cadence, so a test can watch the real poll loop
-    /// follow a pin switch in milliseconds rather than a minute.
-    #[cfg(test)]
-    pub fn with_flag_poll_interval_for_test(mut self, interval: Duration) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("call before the facade is shared")
-            .dual_write = DualWriteGate::new_for_test(None, interval);
-        self
     }
 
     /// coord's answers to harness-id re-keys — see `CoordSyncInner::rekeys`.
@@ -633,23 +613,6 @@ impl CoordSync {
         Err(failure)
     }
 
-    // -----------------------------------------------------------------
-    // Phase 10 — flag-gated dual-write (plan
-    // `2026-05-23-coord-native-sessions-phase-7-10.md` §Phase 10).
-    //
-    // DORMANT by default. The gate is closed unless the runner's tenant
-    // has flipped `coord.tenant_policies.session_coordination_enabled`.
-    // With the flag off there is ZERO production behavior change: the
-    // poll task refreshes a `false` atom and `mirror_legacy_session` is
-    // a no-op. See `super::dual_write` for the full safety argument.
-    // -----------------------------------------------------------------
-
-    /// Hot-path read of the cutover gate. `true` only when the resolved
-    /// tenant has flipped the flag. Default `false` (dormant).
-    pub fn dual_write_enabled(&self) -> bool {
-        self.inner.dual_write.enabled()
-    }
-
     /// R2 (session-lifecycle-cleanup) — probe coord to decide whether a
     /// persisted session id can be RESUMED (PATCH) or must be re-registered
     /// fresh (POST). Issues `PATCH /sessions/:id` with
@@ -748,81 +711,6 @@ impl CoordSync {
                     "coord_sync: resume probe transport error — treating as unreachable"
                 );
                 ResumeProbe::Unreachable
-            }
-        }
-    }
-
-    /// Test-only: force the cutover gate to a given value, simulating
-    /// what the poll loop does when a tenant flips the flag.
-    #[cfg(test)]
-    pub fn force_dual_write_for_test(&self, value: bool) {
-        self.inner.dual_write.apply(value);
-    }
-
-    /// Start the Phase 10 flag-refresh task. Polls coord's
-    /// `/tenant-policy?tenant_id=<id>` on a slow cadence and caches the
-    /// `session_coordination_enabled` flag into the [`DualWriteGate`].
-    ///
-    /// ALWAYS spawned, including on a machine with no `active_tenant_id`:
-    /// the loop re-reads the pin every tick ([`run_flag_poll_loop`]), so a
-    /// machine that is unpinned at boot and pinned later — by
-    /// `PUT /tenant/active`, the Tauri switcher, or a hand edit — is followed
-    /// without a restart. An unpinned tick asks coord nothing, so the idle
-    /// cost is one local file read per interval.
-    pub fn start_flag_poll_task(&self) -> JoinHandle<()> {
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(run_flag_poll_loop(inner))
-    }
-
-    /// Phase 10 dual-write entry point — called by the **legacy** session
-    /// surface (`commands/terminal.rs`, `claude_session/`) right after it
-    /// spawns its PTY / CLI subprocess. When the cutover flag is OFF
-    /// (default), returns `None` immediately without touching the
-    /// registry, the outbox, or coord — the legacy path behaves exactly
-    /// as it does today.
-    ///
-    /// When the flag is ON, mirrors the legacy session into the
-    /// coord-native primitive via [`SessionRegistry::register_external`]
-    /// so the dashboard renders the same session from `coord.sessions`.
-    /// `register_external` does NOT spawn a transport — the operator's
-    /// real PTY / CLI subprocess is owned by the legacy path, so the
-    /// mirror is pure bookkeeping (no double-spawn, no second window).
-    ///
-    /// The returned [`Uuid`] is the coord-native session id, which the
-    /// legacy caller should retain so it can close the mirror when the
-    /// legacy session ends (via `registry.close_by_id(id)`, surfaced in a
-    /// later wiring step). Errors are logged and swallowed — a mirror
-    /// failure must never break the legacy session the operator actually
-    /// wants.
-    ///
-    /// `registry` is passed in (rather than read from the weak back-
-    /// pointer) so the legacy caller, which already holds the managed
-    /// `Arc<SessionRegistry>` via `tauri::State`, drives the mirror
-    /// without this facade needing a strong upgrade.
-    pub fn mirror_legacy_session(
-        &self,
-        registry: &Arc<SessionRegistry>,
-        intent: Intent,
-    ) -> Option<Uuid> {
-        if !self.dual_write_enabled() {
-            // Dormant — the overwhelming common case. No allocation, no
-            // I/O, no behavior change.
-            return None;
-        }
-        match registry.register_external(intent) {
-            Ok(id) => {
-                tracing::info!(
-                    session = %id,
-                    "dual_write: mirrored legacy session into coord-native primitive"
-                );
-                Some(id)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "dual_write: mirror session register failed — legacy session unaffected"
-                );
-                None
             }
         }
     }
@@ -2785,7 +2673,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             );
             if let Some(tid) = scope
                 .declared_tenant()
-                .or_else(crate::session::dual_write::resolve_active_tenant_id)
+                .or_else(|| crate::session::tenant_pin::resolve_tenant_pin().pinned())
             {
                 rb = rb.header("X-Qontinui-Tenant-Id", tid.to_string());
             }
@@ -3758,7 +3646,8 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
         .or_else(|| rec.payload.get("tenant_id"))
         .cloned()
         .or_else(|| {
-            crate::session::dual_write::resolve_active_tenant_id()
+            crate::session::tenant_pin::resolve_tenant_pin()
+                .pinned()
                 .map(|u| JsonValue::String(u.to_string()))
         })
         .unwrap_or_else(|| JsonValue::String(Uuid::nil().to_string()));
@@ -4207,539 +4096,6 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 10 — flag-refresh loop
-// ---------------------------------------------------------------------------
-
-/// Poll coord's `/tenant-policy?tenant_id=<id>` and cache the
-/// `session_coordination_enabled` flag into the [`DualWriteGate`].
-///
-/// **The pin is re-read at the top of every tick** (plan
-/// `2026-10-10-remote-create-residuals-followups` Phase 3). The loop used to
-/// take the tenant `DualWriteGate::new` froze at boot, so a
-/// `PUT /tenant/active` reached this gate only at the next runner start. Now
-/// each tick resolves `machine.json`'s `active_tenant_id` and hands it to
-/// [`flag_poll_tick`], which retargets the gate when it moved. A switch
-/// therefore takes effect within about one `QONTINUI_SESSION_FLAG_POLL_SECS`
-/// interval (plus at most one fetch already in flight for the old tenant,
-/// bounded by the 30 s request timeout), whichever writer made it — neither
-/// tenant door needs a handle to this loop. It assumes ONE loop per gate:
-/// `start_flag_poll_task` is called once (main.rs), and
-/// [`DualWriteGate::retarget`] is `pub(super)` so nothing outside `session`
-/// can drive the gate's tenant from a second place.
-///
-/// Robust to coord being down: a fetch failure leaves the cached value
-/// untouched (so a transient outage never spuriously flips the gate) and the
-/// loop simply tries again next tick. The flag is a rollout knob that changes
-/// rarely, so the default 60s cadence is plenty.
-async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>) {
-    let interval = inner.dual_write.poll_interval();
-    tracing::info!(
-        ?interval,
-        "coord_sync: Phase 10 cutover-flag poll loop starting (dormant until flag flips; \
-         follows the machine pin each tick)"
-    );
-    let mut refusals = TenantPolicyAuthReporter::default();
-    loop {
-        let pin = crate::session::dual_write::resolve_active_tenant_id();
-        flag_poll_tick(&inner, &mut refusals, pin).await;
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// One pass of [`run_flag_poll_loop`] for the pin that pass read.
-///
-/// Split out so a test can drive single passes deterministically against a
-/// fake coord, with the pin rewritten between them through the real write
-/// path, instead of racing a sleeping loop.
-///
-/// Order is the contract when the pin moved: the gate is CLOSED and rebound
-/// ([`DualWriteGate::retarget`]) BEFORE the new tenant's flag is fetched, so
-/// a failed first fetch leaves the gate closed rather than holding the old
-/// tenant's answer; and the refusal reporter starts fresh, because a standing
-/// refusal about the old tenant says nothing about the new one.
-async fn flag_poll_tick(
-    inner: &Arc<CoordSyncInner>,
-    refusals: &mut TenantPolicyAuthReporter,
-    pin: Option<Uuid>,
-) {
-    if let Some(previous) = inner.dual_write.retarget(pin) {
-        *refusals = TenantPolicyAuthReporter::default();
-        tracing::info!(
-            ?previous,
-            tenant = ?pin,
-            "coord_sync: cutover-flag poll retargeted to the machine pin; the cached flag is \
-             closed until this tenant's own flag is read"
-        );
-    }
-    let Some(tenant_id) = pin else {
-        // Unpinned: nothing to ask coord about. The gate is closed (retarget
-        // closed it if a tenant was bound before) and the next tick re-reads.
-        return;
-    };
-    match fetch_session_coordination_flag(inner, tenant_id).await {
-        Ok(enabled) => {
-            if let Some(line) = refusals.clear() {
-                tracing::info!(%tenant_id, "{line}");
-            }
-            inner.dual_write.apply(enabled);
-        }
-        Err(FlagPollError::Unauthorized { status, reason }) => {
-            // Resolving the presented credential costs a local file read,
-            // so it happens HERE — on the report path the throttle has
-            // already decided to take — and not on every pass. Note what
-            // it does and does not establish: it names what this device
-            // would resolve NOW, a moment AFTER the request that was
-            // refused, not what that request carried. The two differ if
-            // the refresher lands a slot in between, which is why the
-            // line says "currently resolves" and coord's own stated
-            // `reason` travels beside it.
-            if let Some(line) = refusals.observe(status, &reason, tenant_id, || {
-                crate::auth::presented_tenant(tenant_policy_scope(tenant_id))
-            }) {
-                tracing::warn!(%tenant_id, "{line}");
-            }
-        }
-        Err(FlagPollError::Other(e)) => {
-            // Leave the cached value as-is — a coord hiccup must not
-            // flip the gate in either direction.
-            //
-            // But DO end any standing refusal: coord answering some other
-            // way is coord answering differently, and leaving the key in
-            // place silences the next genuine refusal (`403`, `403`xN,
-            // `500`, `403` — the second `403` went unreported).
-            refusals.interrupted();
-            tracing::debug!(
-                %tenant_id,
-                error = %e,
-                "coord_sync: tenant-policy fetch failed; keeping cached cutover flag"
-            );
-        }
-    }
-}
-
-/// The credential scope the tenant-policy poll presents.
-///
-/// `Owned(tenant_id)` — the tenant the poll is ASKING ABOUT, because
-/// `sessions::get_tenant_policy` requires the `?tenant_id=` query to equal the
-/// presented token's `tenant_id` claim. A request that names one tenant while
-/// carrying another's credential cannot satisfy that equality, so it is
-/// refused `403`.
-///
-/// That `403` is NOT the same refusal an unauthenticated caller gets, and an
-/// earlier revision of this comment claimed it was. Verified against
-/// `qontinui-coord` `origin/main` `de4107e2`: the mismatch arm answers
-/// `{"error":"tenant_id does not match principal"}`
-/// (`crates/coord/src/sessions.rs::get_tenant_policy`) while a caller with no
-/// principal gets `{"error":"auth_required"}`
-/// (`crates/coord/src/fleet_principal.rs::auth_required`). Same status, two
-/// machine-readable bodies — and the mismatch body NAMES this defect. What
-/// made it read for months as "not paired yet" is that the runner discarded
-/// the body and reported the status alone; [`FlagPollError::Unauthorized`]
-/// now carries it.
-///
-/// That is exactly what the plain [`crate::coord_http::coord_get`] did here:
-/// it asserts [`TenantScope::Device`], which selects the LEGACY `access_token`
-/// slot — the DEFAULT binding's JWT — regardless of the tenant in the query
-/// string. The poll was correct only while the default binding happened to be
-/// the tenant frozen into this loop at process construction.
-///
-/// **Slot-miss posture is deliberately unchanged and is the isolation
-/// guarantee**: `select_device_bearer` returns `None` for a tenant this device
-/// holds no usable slot for, the request goes out unauthenticated, and coord
-/// answers. It must never fall back to the legacy slot — presenting another
-/// tenant's credential is the bug, not the recovery.
-///
-/// A named function rather than an inline expression so the call site and the
-/// refusal diagnostic below cannot drift apart: both ask this one question.
-fn tenant_policy_scope(tenant_id: Uuid) -> TenantScope {
-    TenantScope::Owned(tenant_id)
-}
-
-/// Why one tenant-policy poll pass produced no flag.
-///
-/// Split from the old flat `String` for one reason: a `401`/`403` is a
-/// STANDING condition (this device cannot present the tenant it is asking
-/// about) while everything else is a transient, and the two want opposite
-/// reporting. Collapsing them is what produced 656 consecutive identical
-/// warnings — one per minute for the life of the process.
-#[derive(Debug)]
-enum FlagPollError {
-    /// Coord refused the credential presented. Standing until the credential
-    /// or the tenant changes.
-    ///
-    /// Carries coord's OWN stated cause, because the status alone does not
-    /// distinguish the two conditions this route answers `403` to — and the
-    /// two want different operator actions. See [`coord_refusal_reason`].
-    Unauthorized { status: u16, reason: String },
-    /// Transport, other non-2xx, decode, or a missing field — transient.
-    Other(String),
-}
-
-impl std::fmt::Display for FlagPollError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FlagPollError::Unauthorized { status, reason } => {
-                // `{reason:?}`, not `{reason}`: this string originates in a
-                // response body, and nothing downstream of a `Display` impl
-                // can un-inject a newline that reaches a log. The report path
-                // escapes it for the same reason; a second, unescaped channel
-                // is exactly how that control gets lost.
-                write!(f, "status {status}: {reason:?}")
-            }
-            FlagPollError::Other(e) => f.write_str(e),
-        }
-    }
-}
-
-/// Reduce coord's refusal body to the one field it states a cause in.
-///
-/// Coord answers every refusal on this chain as `{"error": "<static
-/// string>"}` — `auth_required` (`fleet_principal::auth_required`),
-/// `tenant_id does not match principal` (`sessions::get_tenant_policy`),
-/// `strategy_admin_required`, `tenant_not_resolved`. Verified against
-/// `qontinui-coord` `origin/main` `de4107e2`: every one is a compile-time
-/// literal, so echoing this field carries no credential material and widens
-/// no leakage. Nothing ELSE from the body is echoed, for exactly that reason
-/// — an intermediary's 403 page is not coord's contract and is not something
-/// this function may paste into a log. Such a body is reported by SHAPE
-/// instead, which still separates "coord refused" from "something in the
-/// path refused".
-///
-/// Bounded: the `error` field is truncated, so a body that claims the shape
-/// without honouring the contract cannot write an unbounded line.
-///
-/// **JSON is not enough to make a body coord's.** An intermediary answering
-/// `{"error":"invalid bearer eyJhbGciOi…"}` — a WAF or proxy reflecting the
-/// credential it just rejected — satisfies the shape exactly, and echoing it
-/// would paste the presented token into a log. So the echo is additionally
-/// gated on the ALPHABET coord's four literals are drawn from
-/// ([`is_coord_literal_shaped`]); anything else falls through to the shape
-/// line with the rest.
-///
-/// Takes a `Result` because the body may not have been read at all. A read
-/// error is NOT a measurement of the body and must not be rendered as one:
-/// `unwrap_or_default()` turned a mid-body connection reset into `""` and
-/// then reported "an unrecognized 0-byte body, so the refusal may not be
-/// coord's own", casting doubt on coord when the only established fact was a
-/// local read failure (served policy `verification-and-evidence`
-/// `unknown-must-not-render-as-a-default`).
-fn coord_refusal_reason(body: Result<&str, &str>) -> String {
-    const MAX: usize = 200;
-    let body = match body {
-        Ok(b) => b,
-        Err(e) => {
-            return format!(
-                "the refusal body could not be READ ({e}) — nothing about it was measured, so \
-                 coord's stated cause is UNKNOWN; this says nothing either way about whose \
-                 refusal it was"
-            )
-        }
-    };
-    let reason = serde_json::from_str::<JsonValue>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
-        .filter(|r| is_coord_literal_shaped(r));
-    match reason {
-        // By CHARS, not bytes: `String::truncate` panics on a non-boundary
-        // index, and a log-formatting helper must not be the thing that kills
-        // the poll loop. The charset gate above admits ASCII only, so a
-        // multi-byte cut is unreachable TODAY — the cut itself is not, and
-        // the gate is the thing a future edit widens.
-        Some(r) if r.chars().count() > MAX => r.chars().take(MAX).chain(['…']).collect(),
-        Some(r) => r,
-        None => format!(
-            "no coord `error` field — an unrecognized {}-byte body{}, so the refusal may not be \
-             coord's own",
-            body.len(),
-            if body.len() >= REFUSAL_BODY_CAP {
-                // At the cap, so the length is a floor, not a measurement of
-                // the whole body. Say which.
-                " (at the read cap — the body may be longer)"
-            } else {
-                ""
-            }
-        ),
-    }
-}
-
-/// Whether a string is drawn from the alphabet coord's own stated causes are.
-///
-/// All four are compile-time literals of lowercase ASCII words joined by
-/// spaces or underscores — `auth_required`, `tenant_id does not match
-/// principal`, `strategy_admin_required`, `tenant_not_resolved` (verified
-/// against `qontinui-coord` `origin/main` `de4107e2`). A credential cannot
-/// survive this predicate: every bearer this runner presents is a JWT or a
-/// `qontinui_runner_*` opaque token, and both carry uppercase, digits, `.`
-/// or `-`.
-///
-/// Deliberately a CHARSET test and not an allowlist of the four literals: a
-/// literal coord adds should reach the operator, and an allowlist would
-/// silently report every new one by shape.
-fn is_coord_literal_shaped(reason: &str) -> bool {
-    !reason.is_empty()
-        && reason
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c == '_' || c == ' ')
-}
-
-/// How much of a refusal body this loop will buffer.
-///
-/// The LOG LINE was bounded from the start; the READ was not. `resp.text()`
-/// buffers whatever the peer sends, the client sets a timeout and no size
-/// cap, and this runs once per poll interval for the life of the process —
-/// so a misbehaving intermediary answering `403` with a large body had an
-/// unbounded, indefinitely repeating allocation on the other end of it.
-/// Coord's own bodies are tens of bytes.
-const REFUSAL_BODY_CAP: usize = 4 * 1024;
-
-/// Read at most [`REFUSAL_BODY_CAP`] bytes of a refusal body, and say so when
-/// the read FAILED rather than substituting an empty body for one.
-async fn read_refusal_body(mut resp: reqwest::Response) -> Result<String, String> {
-    let mut buf: Vec<u8> = Vec::new();
-    while buf.len() < REFUSAL_BODY_CAP {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                let room = REFUSAL_BODY_CAP - buf.len();
-                buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
-            }
-            Ok(None) => break,
-            // A partial read is still a read failure: what was buffered so
-            // far is not the body, and reporting its length would be a
-            // measurement of a truncation.
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    // Past the cap: discard the rest unbuffered rather than drop it unread.
-    // Trade-off: the cap bounds memory; the drain still reads the rest on every poll, bounded
-    // in time by the client's 30 s timeout.
-    drain_body(resp).await;
-    // Lossy rather than fatal: a cap can land mid-codepoint, and the result
-    // is only ever JSON-parsed or counted. A body that is genuinely not UTF-8
-    // fails the parse and is reported by shape, which is the right answer.
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// Report a STANDING tenant-policy refusal once, not once per pass.
-///
-/// The measured defect this closes: the poll emitted **656 consecutive
-/// identical** `403` warnings, one per configured interval, for the life of
-/// the process — and the advice they carried ("retrying after device
-/// pairing/auth") named a flow the runner cannot reach, because pairing was
-/// never the missing thing. N identical lines are not N pieces of
-/// information.
-///
-/// What counts as "the same refusal" is the pair `(status, tenant asked
-/// about)`, and the silence is broken by any of three things: coord answering
-/// with a different status, the poll succeeding, and a pass that failed some
-/// OTHER way ([`TenantPolicyAuthReporter::interrupted`]). The second is the
-/// one that matters — a device that acquires the queried tenant's slot stops
-/// being refused, so recovery arrives as a success, not as a changed
-/// credential — and it emits one line naming how many passes were suppressed,
-/// so the quiet period is legible rather than merely absent.
-///
-/// The third arm is there because without it the silence outlived the
-/// condition it described: `403`, `403`×N, `500`, `403` reported the first
-/// `403` and nothing after, since a transient failure never touched the
-/// standing state. Coord answering `500` and then `403` again IS coord
-/// answering differently, which this type's own contract says breaks the
-/// silence. The cost is honest and bounded: a coord flapping between a
-/// refusal and a transient failure reports once per flap, at most once per
-/// poll interval, and every such line carries the accumulated suppressed
-/// count rather than resetting it — a changed answer is news, N identical
-/// ones are not.
-///
-/// The tenant is in the key for the same reason, though no caller varies it
-/// today: this loop freezes one tenant at construction, so it CANNOT vary,
-/// and a suppression key that silently spans tenants would be a defect
-/// waiting for the first caller that reuses the reporter.
-///
-/// Keying on the credential TOO was considered and rejected: it would put a
-/// local encrypted-file read on every pass of a periodic loop to detect a
-/// change that, when it is the change anyone cares about, announces itself as
-/// a success on the very next pass. The cost is per-pass and permanent; the
-/// information is duplicated.
-///
-/// Deliberately per-loop state, not a process-global `Once`: two loops polling
-/// two tenants are two independent conditions, and a `Once` would let the
-/// first silence the second forever.
-#[derive(Default)]
-struct TenantPolicyAuthReporter {
-    /// The `(status, tenant asked about, epoch)` last reported out loud, if a
-    /// refusal is standing.
-    ///
-    /// **Only [`Self::clear`] ever takes it**, which is what keeps the
-    /// invariant `reported == None` ⟹ `suppressed == 0`: the one writer that
-    /// drops a standing refusal is the one that prints its count.
-    reported: Option<(u16, Uuid, u64)>,
-    /// Passes suppressed since that report. Carried THROUGH a changed answer
-    /// rather than reset by it, so a count is only ever dropped by being
-    /// printed.
-    suppressed: u64,
-    /// Bumped by [`Self::interrupted`], and part of the suppression key.
-    ///
-    /// This is how a transient pass breaks the silence WITHOUT voiding the
-    /// standing refusal: the key stops matching, so the next identical
-    /// `401`/`403` is reported again, while `reported` stays `Some` and the
-    /// recovery line the first report promised is still owed and still
-    /// printed. Clearing `reported` instead — which an earlier revision did —
-    /// bought the first half at the cost of the second, and stranded the
-    /// suppressed count in a closed episode for some unrelated future refusal
-    /// to print.
-    epoch: u64,
-}
-
-impl TenantPolicyAuthReporter {
-    /// Record one refused pass; returns the line to warn, or `None` when this
-    /// pass repeats a refusal already reported.
-    ///
-    /// `presented` is a closure, not a value, because resolving the credential
-    /// is a local encrypted-file read and the SUPPRESSED path — which is every
-    /// pass but the first — must not pay for it. It is called only on the pass
-    /// that actually emits a line.
-    ///
-    /// **`reason` is coord's own stated cause, and the line reports it
-    /// ALONGSIDE the locally resolved credential rather than instead of it.**
-    /// The two answer different questions — coord says whether it saw no
-    /// principal or a mismatched one; the local read says which tenant this
-    /// device would have presented — and neither is derivable from the other.
-    /// What this must never do again is assert a cause it did not measure:
-    /// the line this replaced ended "stays refused until this device holds a
-    /// usable credential slot for {asked_about}", which is one of several
-    /// conditions coord answers `403` to and was never established by
-    /// anything the code read.
-    fn observe(
-        &mut self,
-        status: u16,
-        reason: &str,
-        asked_about: Uuid,
-        presented: impl FnOnce() -> crate::auth::PresentedTenant,
-    ) -> Option<String> {
-        if self.reported == Some((status, asked_about, self.epoch)) {
-            self.suppressed += 1;
-            return None;
-        }
-        self.reported = Some((status, asked_about, self.epoch));
-        let suppressed = std::mem::replace(&mut self.suppressed, 0);
-        let presented = presented();
-        let carried = if suppressed == 0 {
-            String::new()
-        } else {
-            format!(" (after {suppressed} suppressed identical refusals)")
-        };
-        Some(format!(
-            "coord_sync: tenant-policy GET refused ({status}){carried} — coord says \
-             {reason:?}; asked about tenant {asked_about}, and this device currently resolves \
-             {presented}. Coord requires the query's tenant and the presented credential's \
-             tenant_id claim to MATCH; the cached cutover flag is kept meanwhile. Identical \
-             refusals from here on are suppressed — one line will report the recovery."
-        ))
-    }
-
-    /// Record a pass that failed some OTHER way (transport, a non-auth
-    /// status, a decode error).
-    ///
-    /// It emits nothing — the loop logs those at debug — but it DOES end the
-    /// SILENCE, so the next `401`/`403` is reported rather than swallowed by
-    /// a key that outlived the answer it described.
-    ///
-    /// It ends the silence by bumping the epoch, NOT by dropping the standing
-    /// refusal, and the distinction is the whole of this method. The first
-    /// report ends *"one line will report the recovery"*, and that line is
-    /// owed across a transient blip — which is precisely the interleaving
-    /// this method exists for. Dropping `reported` voided the promise: a
-    /// `403`, `403`×N, blip, `200` sequence emitted no recovery line at all
-    /// (`clear`'s `?` returned early), and left the N suppressed passes in
-    /// the field for some unrelated later refusal to print as its own.
-    ///
-    /// The suppressed count survives either way: it belongs to the quiet
-    /// period, not to the status that opened it, and is dropped only by being
-    /// printed.
-    fn interrupted(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-    }
-
-    /// Record a pass that succeeded; returns the one recovery line when a
-    /// refusal was standing, or `None` when nothing was.
-    ///
-    /// "Succeeded" is the WHOLE fetch, parse included: a 200 whose body is
-    /// missing `session_coordination_enabled` is a [`FlagPollError::Other`]
-    /// and reaches [`Self::interrupted`] instead. Deliberate, and narrow —
-    /// such a pass is not announced as a recovery (nothing about the flag was
-    /// established), but it does end the silence, so the next refusal is
-    /// reported. Before `interrupted` existed it did neither, and a standing
-    /// `403` key survived every 200-but-unparseable pass in between.
-    ///
-    /// It reports a refusal that an [`Self::interrupted`] pass intervened in,
-    /// because that pass ended the SILENCE and not the refusal — see there.
-    /// This is the only writer that drops `reported`, and it always prints
-    /// the count as it goes, which is the invariant that keeps a closed
-    /// episode's count from surfacing on an unrelated later line.
-    fn clear(&mut self) -> Option<String> {
-        let (status, _tenant, _epoch) = self.reported.take()?;
-        let suppressed = std::mem::replace(&mut self.suppressed, 0);
-        Some(format!(
-            "coord_sync: tenant-policy GET authorized again — the standing {status} cleared \
-             after {suppressed} suppressed identical refusals"
-        ))
-    }
-}
-
-/// GET `/tenant-policy?tenant_id=<id>` and pull out
-/// `session_coordination_enabled`. Returns the bool on success; any
-/// transport / non-2xx / shape error is an `Err` the caller treats as
-/// "keep the cached value".
-///
-/// **Presents the credential for the tenant it is querying**
-/// ([`tenant_policy_scope`]), through the tenant-STATING
-/// [`crate::coord_http::coord_get_for`] seam rather than the defaulting
-/// `coord_get`. Never fatal in either direction: a tenant this device holds
-/// no usable slot for sends the request unauthenticated and coord answers,
-/// which is a retry-after-credential signal, not an error to propagate. This
-/// function no longer logs — the loop owns reporting, because only the loop
-/// can tell a standing refusal from a first one. It DOES read the refusal
-/// body ([`coord_refusal_reason`]) and hand coord's stated cause to the loop,
-/// because a `403` is the only thing the caller would otherwise have, and a
-/// status is not a cause.
-async fn fetch_session_coordination_flag(
-    inner: &Arc<CoordSyncInner>,
-    tenant_id: Uuid,
-) -> Result<bool, FlagPollError> {
-    let base = inner.coord_url.trim_end_matches('/');
-    let url = format!("{base}/tenant-policy?tenant_id={tenant_id}");
-    let resp = crate::coord_http::coord_get_for(&inner.http, &url, tenant_policy_scope(tenant_id))
-        .send()
-        .await
-        .map_err(|e| FlagPollError::Other(format!("transport: {e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let code = status.as_u16();
-        if code == 401 || code == 403 {
-            // Keep coord's OWN stated cause. The status alone cannot tell
-            // "no principal resolved" from "the principal's tenant is not
-            // the one you asked about", and those are different operator
-            // actions; coord distinguishes them in the body and the earlier
-            // revision of this function dropped it on the floor, then
-            // reconstructed a guess from a local file read.
-            let body = read_refusal_body(resp).await;
-            let reason = coord_refusal_reason(body.as_deref().map_err(String::as_str));
-            return Err(FlagPollError::Unauthorized {
-                status: code,
-                reason,
-            });
-        }
-        drain_body(resp).await;
-        return Err(FlagPollError::Other(format!("status {status}")));
-    }
-    let body: JsonValue = resp
-        .json()
-        .await
-        .map_err(|e| FlagPollError::Other(format!("decode: {e}")))?;
-    body.get("session_coordination_enabled")
-        .and_then(|v| v.as_bool())
-        .ok_or_else(|| FlagPollError::Other("missing session_coordination_enabled field".into()))
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4861,7 +4217,7 @@ mod tests {
     }
     use crate::session::{Intent, RowTenant, SessionKind, SessionRegistry, SessionTransports};
     use axum::{
-        extract::{Path as AxumPath, Query as AxumQuery, State as AxumState},
+        extract::{Path as AxumPath, State as AxumState},
         http::StatusCode as AxumStatus,
         response::IntoResponse,
         routing::{get, patch, post},
@@ -5028,22 +4384,6 @@ mod tests {
         events_status: Option<u16>,
         /// Bodies accepted by `POST /coord/sessions/operator-touch`.
         operator_touches: Vec<JsonValue>,
-        /// The `Authorization` header each `GET /tenant-policy` carried, in
-        /// order. `None` = the request went out UNAUTHENTICATED, which is
-        /// the fail-closed slot-miss posture and an observable in its own
-        /// right.
-        tenant_policy_auth: Vec<Option<String>>,
-        /// The `?tenant_id=` each `GET /tenant-policy` named, index-aligned
-        /// with `tenant_policy_auth` — the other half of the equality coord
-        /// checks.
-        tenant_policy_queries: Vec<String>,
-        /// When set, `GET /tenant-policy` answers this status carrying
-        /// coord's own mismatch body instead of 200.
-        tenant_policy_status: Option<u16>,
-        /// When set, `GET /tenant-policy` answers with this RAW body instead
-        /// of coord's own — the intermediary the refusal-body read is bounded
-        /// against.
-        tenant_policy_body: Option<String>,
     }
 
     impl CoordRecorder {
@@ -5149,19 +4489,12 @@ mod tests {
                             )
                                 .into_response();
                         }
-                        if g.poison_state_patch_ids.contains(&id) && body.get("state").is_some()
-                        {
-                            return (
-                                AxumStatus::BAD_GATEWAY,
-                                Json(json!({"error": "fake-502"})),
-                            )
+                        if g.poison_state_patch_ids.contains(&id) && body.get("state").is_some() {
+                            return (AxumStatus::BAD_GATEWAY, Json(json!({"error": "fake-502"})))
                                 .into_response();
                         }
                         if g.poison_patch_ids.contains(&id) {
-                            return (
-                                AxumStatus::BAD_GATEWAY,
-                                Json(json!({"error": "fake-502"})),
-                            )
+                            return (AxumStatus::BAD_GATEWAY, Json(json!({"error": "fake-502"})))
                                 .into_response();
                         }
                         if g.next_patch_5xx > 0 {
@@ -5302,49 +4635,6 @@ mod tests {
                             .and_then(|s| AxumStatus::from_u16(s).ok())
                             .unwrap_or(AxumStatus::CREATED);
                         (status, Json(json!({"id": id}))).into_response()
-                    },
-                ),
-            )
-            // The Phase-10 cutover-flag poll. Records the CREDENTIAL each
-            // request presented, which is the only observable that separates
-            // `coord_get_for(.., Owned(t))` from the defaulting `coord_get`:
-            // same url, same query, different bearer.
-            .route(
-                "/tenant-policy",
-                get(
-                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
-                     headers: axum::http::HeaderMap,
-                     AxumQuery(q): AxumQuery<std::collections::HashMap<String, String>>| async move {
-                        let auth = headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_string);
-                        let mut g = state.lock().await;
-                        g.tenant_policy_auth.push(auth);
-                        g.tenant_policy_queries
-                            .push(q.get("tenant_id").cloned().unwrap_or_default());
-                        match g.tenant_policy_status {
-                            // An INTERMEDIARY's body, when one is staged:
-                            // whatever it says, verbatim, as a proxy would.
-                            Some(s) if g.tenant_policy_body.is_some() => (
-                                AxumStatus::from_u16(s).unwrap_or(AxumStatus::FORBIDDEN),
-                                g.tenant_policy_body.clone().unwrap_or_default(),
-                            )
-                                .into_response(),
-                            // Coord's REAL mismatch body, verbatim from
-                            // `sessions::get_tenant_policy` — the thing the
-                            // runner used to throw away.
-                            Some(s) => (
-                                AxumStatus::from_u16(s).unwrap_or(AxumStatus::FORBIDDEN),
-                                Json(json!({"error": "tenant_id does not match principal"})),
-                            )
-                                .into_response(),
-                            None => (
-                                AxumStatus::OK,
-                                Json(json!({"session_coordination_enabled": true})),
-                            )
-                                .into_response(),
-                        }
                     },
                 ),
             )
@@ -5524,62 +4814,6 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    #[test]
-    fn dual_write_dormant_by_default() {
-        // The test CoordSync ctor pins the gate to no-tenant → permanently
-        // dormant. mirror_legacy_session must be a no-op: returns None and
-        // writes NOTHING to the outbox.
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let coord = CoordSync::new_for_test(
-            outbox.clone(),
-            "http://127.0.0.1:1".to_string(),
-            Duration::from_millis(50),
-            Duration::from_secs(10),
-        );
-        let registry = build_registry(coord.clone());
-
-        assert!(!coord.dual_write_enabled(), "gate defaults closed");
-        let mirror = coord.mirror_legacy_session(&registry, make_test_intent());
-        assert!(mirror.is_none(), "dormant gate mirrors nothing");
-        assert!(
-            outbox.pending().unwrap().is_empty(),
-            "no outbox row written when dual-write is off — zero behavior change"
-        );
-        // And no session landed in the registry either.
-        assert!(registry.snapshot().is_empty());
-    }
-
-    #[test]
-    fn dual_write_mirrors_when_flag_on() {
-        let _amb = crate::test_env::isolated_ambient();
-        // Force the gate open via the DualWriteGate's apply path (the
-        // poll loop's effect) and assert mirror_legacy_session registers
-        // an external session + writes a Started outbox row.
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let coord = CoordSync::new_for_test(
-            outbox.clone(),
-            "http://127.0.0.1:1".to_string(),
-            Duration::from_millis(50),
-            Duration::from_secs(10),
-        );
-        let registry = build_registry(coord.clone());
-
-        // Open the gate as the poll loop would on a flipped tenant.
-        coord.force_dual_write_for_test(true);
-        assert!(coord.dual_write_enabled());
-
-        let mirror = coord.mirror_legacy_session(&registry, make_test_intent());
-        let id = mirror.expect("flag on → mirror created");
-        let desc = registry.describe_by_id(id).unwrap();
-        assert_eq!(desc.transport_handle_kind, "external");
-        // A Started row is queued for the drain loop.
-        let pending = outbox.pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].event_kind, SessionEventKind::Started.as_str());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11032,604 +10266,76 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // P3 of plan
-    // `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
-    // — the tenant-policy poll presents the credential for the tenant it is
-    // querying, and reports a standing refusal once rather than once a minute.
-    // ========================================================================
-
-    /// The tenant-policy fetch's own body, isolated from the rest of this
-    /// file — the substrate both source guards below read.
+    /// The boot path starts exactly the coord-sync loops it should, and no
+    /// tenant-policy flag poll (plan
+    /// `2026-11-20-coord-native-sessions-phase-9-reverified-cleanup` Phase 2).
     ///
-    /// Two traps it exists to close, both of which bit the first cut:
+    /// `main.rs`'s `.setup()` cannot be driven from a unit test (it needs a
+    /// live Tauri app), so this reads the one `spawn` block that starts the
+    /// coord-sync loops and pins the set of `start_*` calls in it. The
+    /// deleted Phase-10 poll was started from this block; re-adding any
+    /// periodic task here — that one or another — fails until this list is
+    /// updated on purpose.
     ///
-    /// * the needle is ASSEMBLED rather than written literally, so it does not
-    ///   match this test file's own mention of the function and the
-    ///   uniqueness check below is meaningful. A plain
-    ///   `split_once("async fn fetch_session_coordination_flag")` took the
-    ///   FIRST hit, so a future `..._v2` declared above would have silently
-    ///   retargeted every guard at the wrong function while still passing;
-    /// * it asserts the declaration is UNIQUE, so that retargeting is a named
-    ///   failure rather than a silent one.
-    fn tenant_policy_fetch_body() -> &'static str {
-        let src = include_str!("coord_sync.rs");
-        // Assembled at runtime: a literal here would appear in `src` itself.
-        let needle = format!("async fn {}(", "fetch_session_coordination_flag");
+    /// Second half: nothing in `src` builds a `/tenant-policy` URL except the
+    /// cached, per-tenant transcript-sync read in `transcript_autobind.rs`,
+    /// which is not a poll. A revived 60 s poll would add a second builder.
+    #[test]
+    fn the_boot_path_registers_no_tenant_policy_flag_poll() {
+        let main_src = include_str!("../main.rs");
+        let anchor = "let loop_registry = registry.clone();";
         assert_eq!(
-            src.matches(needle.as_str()).count(),
+            main_src.matches(anchor).count(),
             1,
-            "exactly one `{needle}` declaration must exist; a second one makes every source \
-             guard in this module silently pin whichever comes first"
+            "the coord-sync loop spawn block must be unique in main.rs"
         );
-        let (_, after) = src
-            .split_once(needle.as_str())
-            .expect("the tenant-policy fetch must exist");
-        after
-            .split_once("\n}\n")
-            .expect("the fetch body must terminate")
-            .0
-    }
-
-    /// SOURCE GUARD — the call-site half of the mutation proof for this phase.
-    ///
-    /// The defect was a CALL-SITE choice, not a value: the poll built its
-    /// request with [`crate::coord_http::coord_get`], which asserts
-    /// [`TenantScope::Device`] and therefore presents the LEGACY
-    /// `access_token` slot — the DEFAULT binding's JWT — no matter which
-    /// tenant the `?tenant_id=` query names. Coord's
-    /// `sessions::get_tenant_policy` requires those two to be equal, so the
-    /// request was refused `403`.
-    ///
-    /// This guard is KEPT, but it is no longer the only proof:
-    /// [`the_poll_presents_the_queried_tenants_credential`] below asserts the
-    /// same property on an OBSERVABLE — the `Authorization` header a fake
-    /// coord actually received. A source guard alone punishes cleanup, so it
-    /// pins the two structural tokens (`coord_get_for(` and the scope call)
-    /// rather than a 99-column literal that rustfmt reflows the moment anyone
-    /// renames `url` or hoists the scope into a `let`.
-    #[test]
-    fn the_tenant_policy_poll_presents_the_tenant_it_queries() {
-        let body = tenant_policy_fetch_body();
-
-        assert!(
-            body.contains("coord_get_for(") && body.contains("tenant_policy_scope(tenant_id)"),
-            "the tenant-policy poll must present the credential for the tenant it QUERIES, via \
-             the tenant-stating `coord_get_for` seam. Body was:\n{body}"
-        );
-        assert!(
-            !body.contains("coord_http::coord_get(") && !body.contains("coord_get(&inner.http"),
-            "the tenant-policy poll must NOT use the defaulting `coord_get`: it asserts \
-             TenantScope::Device, which presents the legacy/default slot regardless of the \
-             tenant in the query string — the exact mismatch coord answers 403 to. Body \
-             was:\n{body}"
-        );
-    }
-
-    /// BEHAVIOURAL MUTATION PROOF — the credential that actually went on the
-    /// wire, asserted on an observable rather than on a substring.
-    ///
-    /// The first cut of this phase shipped only the source guard above, on the
-    /// stated grounds that "nothing about the poll's VALUES changes when the
-    /// call site regresses". That is true of the url and the query and false
-    /// of the thing that matters: the `Authorization` header. This file
-    /// already had a fake-coord harness with a request recorder, so the
-    /// observable was there all along.
-    ///
-    /// The device here is the measured situation — bound to several tenants,
-    /// legacy slot holding the DEFAULT binding's JWT, polling about a
-    /// NON-default tenant it does hold a slot for. Revert the call site to
-    /// `coord_get(..)` and the recorded bearer becomes the default binding's,
-    /// which is the cross-tenant presentation coord answers `403` to.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_poll_presents_the_queried_tenants_credential() {
-        let _amb = crate::test_env::isolated_ambient();
-        // The fixture pins QONTINUI_SECURE_STORAGE_DIR into its own tempdir
-        // and restores every ambient key on drop; the keychain is not one of
-        // the keys it steers, and a real one would put this test's tokens on
-        // the developer's box.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-
-        let queried = Uuid::now_v7();
-        let default_tenant = Uuid::now_v7();
-        let queried_jwt = device_jwt_for(&queried);
-        let default_jwt = device_jwt_for(&default_tenant);
-        assert_ne!(queried_jwt, default_jwt);
-
-        let am = crate::auth::AuthManager::new();
-        am.store_tokens(&default_jwt, "")
-            .expect("the legacy slot holds the DEFAULT binding's JWT");
-        am.store_tenant_device_jwt(&queried, &queried_jwt)
-            .expect("and this device also holds the queried tenant's own slot");
-
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let (base, rec) = spawn_fake_coord().await;
-        let coord = CoordSync::new_for_test(
-            outbox,
-            base,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        );
-
-        let enabled = fetch_session_coordination_flag(&coord.inner, queried)
-            .await
-            .expect("the fake coord answers 200");
-        assert!(enabled);
-
-        let g = rec.lock().await;
+        let (_, after) = main_src.split_once(anchor).unwrap();
+        let block = after
+            .split_once("app.manage(registry);")
+            .expect("the spawn block ends before the registry is managed")
+            .0;
+        let mut started: Vec<&str> = block
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|ident| ident.starts_with("start_"))
+            .collect();
+        started.sort_unstable();
         assert_eq!(
-            g.tenant_policy_queries,
-            vec![queried.to_string()],
-            "the poll must ask about the tenant it was given"
-        );
-        assert_eq!(
-            g.tenant_policy_auth,
-            vec![Some(format!("Bearer {queried_jwt}"))],
-            "the request must carry the QUERIED tenant's credential — the equality coord \
-             checks. Carrying the default binding's is the defect this phase closes"
-        );
-        assert!(
-            !g.tenant_policy_auth
-                .iter()
-                .flatten()
-                .any(|h| h.contains(&default_jwt)),
-            "the default binding's JWT must never travel on a poll about another tenant"
-        );
-    }
-
-    /// A machine fixture with an identity (so the tenant write path accepts
-    /// it), pinned to `pin` when given, and bound to both `a` and `b`.
-    fn two_binding_machine(
-        amb: &crate::test_env::IsolatedAmbient,
-        pin: Option<Uuid>,
-        a: Uuid,
-        b: Uuid,
-    ) {
-        let pin_field = pin
-            .map(|t| format!(r#","active_tenant_id":"{t}""#))
-            .unwrap_or_default();
-        amb.write_machine_json(&format!(
-            r#"{{"device_id":"11111111-0000-4000-8000-000000000001","hostname":"box"{pin_field}}}"#
-        ));
-        std::fs::write(
-            amb.dir().join("paired_user.json"),
-            format!(
-                r#"{{"user_id":"u","tenant_id":"{a}","default_tenant_id":"{a}",
-                    "bindings":[{{"tenant_id":"{a}","user_id":"u"}},
-                                {{"tenant_id":"{b}","user_id":"u"}}]}}"#
-            ),
-        )
-        .unwrap();
-    }
-
-    /// PLAN `2026-10-10-remote-create-residuals-followups` Phase 3 — a tenant
-    /// switch through the `PUT /tenant/active` write path retargets the
-    /// dual-write flag poll WITHOUT a restart.
-    ///
-    /// Drives single passes exactly as [`run_flag_poll_loop`] does (pin read,
-    /// then [`flag_poll_tick`]) so the order is deterministic. Three
-    /// observables, each a mutation proof:
-    /// * the next poll's `?tenant_id=` is the NEW tenant — freeze the pin at
-    ///   construction again and the second query repeats tenant A;
-    /// * the gate was CLOSED before that fetch — the post-switch fetch fails
-    ///   (500, which keeps the cached flag), so if the reset were dropped or
-    ///   moved after the fetch the gate would still hold tenant A's `true`;
-    /// * the refusal reporter restarted — A's standing `403` is not carried
-    ///   into B's episode.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_tenant_switch_retargets_the_flag_poll_without_a_restart() {
-        let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
-        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
-        two_binding_machine(&amb, Some(a), a, b);
-
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let (base, rec) = spawn_fake_coord().await;
-        let coord = CoordSync::new_for_test(
-            outbox,
-            base,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        );
-        let gate = &coord.inner.dual_write;
-        let mut refusals = TenantPolicyAuthReporter::default();
-        let pin = crate::session::dual_write::resolve_active_tenant_id;
-
-        // Tenant A, flag ON.
-        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
-        assert_eq!(gate.tenant_id(), Some(a));
-        assert!(gate.enabled(), "tenant A's flag was fetched as true");
-
-        // A standing refusal about A.
-        rec.lock().await.tenant_policy_status = Some(403);
-        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
-        assert!(refusals.reported.is_some(), "A's 403 is a standing refusal");
-        assert!(gate.enabled(), "a refusal keeps the cached flag");
-
-        // The PUT /tenant/active write path, then a pass whose fetch fails.
-        let written = crate::commands::tenant::apply_active_tenant(&b.to_string())
-            .expect("B is bound, so the switch is accepted");
-        assert_eq!(written, b.to_string());
-        rec.lock().await.tenant_policy_status = Some(500);
-        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
-
-        assert_eq!(gate.tenant_id(), Some(b), "the gate follows the new pin");
-        assert!(
-            !gate.enabled(),
-            "the gate must be closed BEFORE the new tenant's fetch: a failed first fetch must \
-             not leave tenant A's flag standing under tenant B"
-        );
-        assert!(
-            refusals.reported.is_none(),
-            "a standing refusal about tenant A says nothing about tenant B"
+            started,
+            [
+                "start_drain_task",
+                "start_heartbeat_task",
+                "start_poll_task",
+                "start_poll_task",
+                "start_receiver_task",
+            ],
+            "the boot path's coord-sync spawn block started an unexpected set of loops"
         );
 
-        // B's own flag opens it.
-        rec.lock().await.tenant_policy_status = None;
-        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
-        assert!(gate.enabled(), "tenant B's own flag is read and applied");
-
-        let g = rec.lock().await;
-        assert_eq!(
-            g.tenant_policy_queries,
-            vec![a.to_string(), a.to_string(), b.to_string(), b.to_string()],
-            "every poll after the switch must ask about the NEW tenant"
-        );
-    }
-
-    /// The poll's tenant comes from the PIN, read by the running loop — not
-    /// from whatever the gate was constructed with. The gate here is built
-    /// with no tenant (as `DualWriteGate::new` now builds it), the machine is
-    /// pinned to B, and the started task must ask coord about B. Before the
-    /// fix the task took the tenant the gate was built with and, holding none,
-    /// spawned nothing. Written against APIs that exist on both sides of the
-    /// change (the handle is ignored, no test-only cadence), so a revert fails
-    /// this by ASSERTION rather than by compilation.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_started_flag_poll_asks_coord_about_the_pinned_tenant() {
-        let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
-        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
-        two_binding_machine(&amb, Some(b), a, b);
-
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let (base, rec) = spawn_fake_coord().await;
-        let coord = CoordSync::new_for_test(
-            outbox,
-            base,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        );
-
-        // Named, not `let _ =`: the handle is a future (`let_underscore_future`).
-        // Dropping it at scope end detaches the task, exactly as ignoring it
-        // did, and the binding compiles against either return type.
-        let _poll = coord.start_flag_poll_task();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if rec
-                .lock()
-                .await
-                .tenant_policy_queries
-                .iter()
-                .any(|q| q == &b.to_string())
-            {
-                break;
+        // Assembled so this test's own source does not match.
+        let needle = format!("{}-policy?tenant_id=", "/tenant");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut builders = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && std::fs::read_to_string(&path)
+                        .map(|s| s.contains(&needle))
+                        .unwrap_or(false)
+                {
+                    let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
+                    builders.push(rel.replace('\\', "/"));
+                }
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the started flag poll never asked coord about the pinned tenant; queries: {:?}",
-                rec.lock().await.tenant_policy_queries
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
-
-    /// The task is spawned even with NO pin at boot, and the REAL loop picks
-    /// up a pin written later — the case where `start_flag_poll_task` used to
-    /// spawn nothing at all. Bounded wait on an observable (the fake coord's
-    /// recorded query), never a fixed sleep standing in for one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_flag_poll_spawns_unpinned_and_follows_a_later_pin() {
-        let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
-        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
-        two_binding_machine(&amb, None, a, b);
-
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let (base, rec) = spawn_fake_coord().await;
-        let coord = CoordSync::new_for_test(
-            outbox,
-            base,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        )
-        .with_flag_poll_interval_for_test(Duration::from_millis(20));
-
-        let handle = coord.start_flag_poll_task();
-        // Several unpinned ticks: nothing is asked of coord.
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(
-            rec.lock().await.tenant_policy_queries.is_empty(),
-            "an unpinned machine asks coord nothing"
-        );
-        assert_eq!(coord.inner.dual_write.tenant_id(), None);
-
-        crate::commands::tenant::apply_active_tenant(&b.to_string())
-            .expect("B is bound, so the switch is accepted");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if coord.inner.dual_write.enabled() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the running poll never followed the new pin; queries: {:?}",
-                rec.lock().await.tenant_policy_queries
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        handle.abort();
-        assert_eq!(coord.inner.dual_write.tenant_id(), Some(b));
-        let g = rec.lock().await;
-        assert!(
-            !g.tenant_policy_queries.is_empty()
-                && g.tenant_policy_queries.iter().all(|q| q == &b.to_string()),
-            "the loop polls the tenant the pin names now: {:?}",
-            g.tenant_policy_queries
-        );
-    }
-
-    /// The other half of the same observable: a tenant this device holds NO
-    /// usable slot for sends the request UNAUTHENTICATED and lets coord
-    /// answer. Substituting the legacy slot would be the original bug wearing
-    /// the fix's name, and unlike the scope-level assertions above this one
-    /// watches the wire.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_slot_miss_goes_out_unauthenticated_rather_than_borrowing_the_default() {
-        let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-
-        let slotless = Uuid::now_v7();
-        let default_jwt = device_jwt_for(&Uuid::now_v7());
-        let am = crate::auth::AuthManager::new();
-        am.store_tokens(&default_jwt, "").expect("legacy slot");
-
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let (base, rec) = spawn_fake_coord().await;
-        let coord = CoordSync::new_for_test(
-            outbox,
-            base,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        );
-
-        let _ = fetch_session_coordination_flag(&coord.inner, slotless).await;
-
-        let g = rec.lock().await;
+        builders.sort();
         assert_eq!(
-            g.tenant_policy_auth,
-            vec![None],
-            "a slot MISS must present nothing at all; presenting the default binding's \
-             credential is the cross-tenant substitution this scope exists to prevent"
-        );
-    }
-
-    /// Coord's refusal BODY reaches the report, because the status alone
-    /// cannot tell the two `403`s apart.
-    ///
-    /// MUTATION PROOF for that: drop the body on the refusal path (the code
-    /// this replaced did exactly that, leaving `resp` unread) and the reason
-    /// this asserts on is gone.
-    ///
-    /// The bodies are coord's real ones, verified against `qontinui-coord`
-    /// `origin/main` `de4107e2`: `sessions::get_tenant_policy` answers
-    /// `{"error":"tenant_id does not match principal"}` on a mismatch while
-    /// `fleet_principal::auth_required` answers `{"error":"auth_required"}`
-    /// when nothing authenticated at all. Two different operator actions
-    /// behind one status code.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refusal_carries_coords_own_stated_cause() {
-        let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let (base, rec) = spawn_fake_coord().await;
-        rec.lock().await.tenant_policy_status = Some(403);
-        let coord = CoordSync::new_for_test(
-            outbox,
-            base,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        );
-
-        let err = fetch_session_coordination_flag(&coord.inner, Uuid::now_v7())
-            .await
-            .expect_err("a 403 must not be read as a flag");
-        match err {
-            FlagPollError::Unauthorized { status, reason } => {
-                assert_eq!(status, 403);
-                assert_eq!(
-                    reason, "tenant_id does not match principal",
-                    "coord's stated cause must survive the refusal path — the status alone \
-                     cannot tell a tenant mismatch from an unauthenticated caller"
-                );
-            }
-            other => panic!("a 403 must be typed as Unauthorized, got {other:?}"),
-        }
-    }
-
-    /// F4(b) MUTATION PROOF — the refusal body READ is bounded, not just the
-    /// line built from it.
-    ///
-    /// `resp.text()` buffers whatever the peer sends. This loop polls once
-    /// per interval for the life of the process, so a misbehaving
-    /// intermediary answering `403` with a large body had an unbounded,
-    /// indefinitely repeating allocation behind it. Restore `resp.text()` and
-    /// the reported length becomes the whole 512 KiB instead of the cap.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_large_refusal_body_is_read_only_up_to_the_cap() {
-        let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-
-        let huge = "A".repeat(512 * 1024);
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = build_outbox(dir.path());
-        let (base, rec) = spawn_fake_coord().await;
-        {
-            let mut g = rec.lock().await;
-            g.tenant_policy_status = Some(403);
-            g.tenant_policy_body = Some(huge.clone());
-        }
-        let coord = CoordSync::new_for_test(
-            outbox,
-            base,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        );
-
-        let err = fetch_session_coordination_flag(&coord.inner, Uuid::now_v7())
-            .await
-            .expect_err("a 403 must not be read as a flag");
-        let FlagPollError::Unauthorized { reason, .. } = err else {
-            panic!("a 403 must be typed as Unauthorized, got {err:?}");
-        };
-        assert!(
-            reason.contains(&REFUSAL_BODY_CAP.to_string()) && reason.contains("read cap"),
-            "the read must stop at the cap and SAY it stopped: {reason}"
-        );
-        assert!(
-            !reason.contains(&huge.len().to_string()),
-            "the whole body must never be buffered: {reason}"
-        );
-        assert!(!reason.contains("AAAA"), "and never echoed: {reason}");
-    }
-
-    /// `{"error": …}` is the only field echoed, and it is bounded.
-    ///
-    /// Coord states every refusal on this chain as a compile-time literal in
-    /// that field, so echoing it widens no leakage. Anything else — an
-    /// intermediary's 403 page, a proxy's HTML — is reported by SHAPE, which
-    /// still separates "coord refused" from "something in the path refused"
-    /// without pasting an unknown body into a log line.
-    #[test]
-    fn only_coords_error_field_is_echoed_and_it_is_bounded() {
-        assert_eq!(
-            coord_refusal_reason(Ok(r#"{"error":"auth_required"}"#)),
-            "auth_required"
-        );
-        assert_eq!(
-            coord_refusal_reason(Ok(r#"{"error":"tenant_id does not match principal"}"#)),
-            "tenant_id does not match principal"
-        );
-
-        // A body that is not coord's contract is described, never echoed.
-        let html = "<html><body>Forbidden by corporate-proxy, token=SECRET</body></html>";
-        let described = coord_refusal_reason(Ok(html));
-        assert!(
-            !described.contains("SECRET") && !described.contains("proxy"),
-            "a non-coord body must not be pasted into a log line: {described}"
-        );
-        assert!(
-            described.contains(&html.len().to_string()),
-            "…but its shape must still be reported: {described}"
-        );
-
-        // Bounded even when the shape IS honoured.
-        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(5_000));
-        let bounded = coord_refusal_reason(Ok(&long));
-        assert!(
-            bounded.chars().count() <= 201,
-            "the echoed field must be truncated, got {} chars",
-            bounded.chars().count()
-        );
-        // Multi-byte: the charset gate rejects it before truncation ever sees
-        // it, so this now proves the gate rather than the cut — and either
-        // way a BYTE truncation at the cap would panic instead of returning.
-        let wide = format!(r#"{{"error":"{}"}}"#, "é".repeat(5_000));
-        let wide_out = coord_refusal_reason(Ok(&wide));
-        assert!(wide_out.chars().count() <= 201);
-        assert!(!wide_out.contains('é'), "{wide_out}");
-    }
-
-    /// F4(a) MUTATION PROOF — a JSON body is not a COORD body.
-    ///
-    /// The shape gate alone admits an intermediary that reflects the
-    /// credential it just rejected: a WAF answering
-    /// `{"error":"invalid bearer <jwt>"}` satisfies `error`-is-a-string
-    /// exactly, and echoing it pastes the presented token into a
-    /// `tracing::warn!`. Drop [`is_coord_literal_shaped`] from the filter and
-    /// this goes red on the token.
-    #[test]
-    fn a_json_lookalike_reflecting_the_credential_is_not_echoed() {
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ0ZW5hbnRfaWQiOiJhIn0.SiGnAtUrE";
-        let reflected = format!(r#"{{"error":"invalid bearer {jwt}"}}"#);
-        let out = coord_refusal_reason(Ok(&reflected));
-        assert!(
-            !out.contains(jwt) && !out.contains("eyJ"),
-            "a body claiming coord's SHAPE but not its alphabet must not be echoed — this one \
-             carries the credential back: {out}"
-        );
-        assert!(
-            out.contains(&reflected.len().to_string()),
-            "it is still reported by shape: {out}"
-        );
-
-        // The four coord literals themselves stay echoable — the gate is a
-        // charset, not an allowlist, so a fifth literal reaches the operator.
-        for literal in [
-            "auth_required",
-            "tenant_id does not match principal",
-            "strategy_admin_required",
-            "tenant_not_resolved",
-            "some_future_cause coord adds",
-        ] {
-            assert_eq!(
-                coord_refusal_reason(Ok(&format!(r#"{{"error":"{literal}"}}"#))),
-                literal
-            );
-        }
-    }
-
-    /// F4(c) MUTATION PROOF — a read FAILURE is not a measurement.
-    ///
-    /// `unwrap_or_default()` turned a mid-body connection reset into `""` and
-    /// then reported "an unrecognized 0-byte body, so the refusal may not be
-    /// coord's own" — a doubt about coord manufactured out of a local read
-    /// error, one layer below the defect this commit exists to remove
-    /// (served policy `verification-and-evidence`
-    /// `unknown-must-not-render-as-a-default`). Collapse the `Err` arm back
-    /// into `Ok("")` and this goes red.
-    #[test]
-    fn a_body_that_could_not_be_read_is_unknown_not_a_zero_byte_body() {
-        let unread = coord_refusal_reason(Err("connection reset by peer"));
-        assert!(
-            unread.contains("UNKNOWN") && unread.contains("connection reset by peer"),
-            "a read failure must name itself: {unread}"
-        );
-        assert!(
-            !unread.contains("0-byte"),
-            "nothing was measured, so no length may be reported: {unread}"
-        );
-
-        // …and a body that genuinely WAS empty still reports as one, because
-        // that IS a measurement.
-        let empty = coord_refusal_reason(Ok(""));
-        assert!(empty.contains("0-byte"), "{empty}");
-        assert!(!empty.contains("UNKNOWN"), "{empty}");
-        assert_ne!(
-            unread, empty,
-            "an unread body and an empty one are different facts"
+            builders,
+            ["session/transcript_autobind.rs"],
+            "only the cached transcript-sync read may build a tenant-policy URL"
         );
     }
 
@@ -11644,404 +10350,6 @@ mod tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(format!(r#"{{"tenant_id":"{tenant}","exp":{exp}}}"#).as_bytes());
         format!("{header}.{payload}.sig")
-    }
-
-    /// The scope itself: the tenant ASKED ABOUT, never the device default.
-    ///
-    /// `Device` would be a claim that this route takes no tenancy from the
-    /// bearer. `/tenant-policy` does — it compares the bearer's `tenant_id`
-    /// claim to the query — so `Device` here is not a shrug but a false
-    /// statement about the route.
-    #[test]
-    fn tenant_policy_scope_is_owned_by_the_queried_tenant() {
-        let t = Uuid::now_v7();
-        assert_eq!(tenant_policy_scope(t), TenantScope::Owned(t));
-        assert_ne!(tenant_policy_scope(t), TenantScope::Device);
-        assert_ne!(tenant_policy_scope(t), TenantScope::Unresolved);
-    }
-
-    /// A slot MISS must stay a miss. `TenantScope::Owned` routes through
-    /// `select_device_bearer`, whose documented posture is that a non-default
-    /// tenant with no usable slot yields `None` — the request goes out
-    /// unauthenticated and coord answers. Substituting the legacy slot would
-    /// be the original bug wearing the fix's name, so this pins that the scope
-    /// the poll declares is the one that carries the fail-closed rule.
-    #[test]
-    fn the_polls_scope_is_the_fail_closed_one() {
-        let queried = Uuid::now_v7();
-        match tenant_policy_scope(queried) {
-            TenantScope::Owned(t) => assert_eq!(t, queried),
-            other => panic!(
-                "the poll must declare Owned(queried tenant) — only that variant applies \
-                 select_device_bearer's no-substitution rule; got {other:?}"
-            ),
-        }
-        // And it names that tenant in the body-carrying form too, so a future
-        // reader cannot conclude the scope is decorative.
-        assert_eq!(
-            tenant_policy_scope(queried).declared_tenant(),
-            Some(queried)
-        );
-    }
-
-    /// N consecutive identical refusals produce ONE report, not N.
-    ///
-    /// The measured defect: 656 consecutive identical 403 warnings, one per
-    /// poll interval, for the life of the process.
-    #[test]
-    fn a_standing_refusal_is_reported_once_not_once_per_pass() {
-        let mut r = TenantPolicyAuthReporter::default();
-        let asked = Uuid::now_v7();
-        let presented = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-
-        let line = r
-            .observe(403, MISMATCH, asked, || presented)
-            .expect("the first refusal must be reported");
-        assert!(
-            line.contains(&asked.to_string()),
-            "the report must name the tenant asked about: {line}"
-        );
-        assert!(
-            line.contains(&presented.to_string()),
-            "the report must name the tenant its credential claims: {line}"
-        );
-        assert!(
-            line.contains(MISMATCH),
-            "the report must carry COORD's stated cause too — the half the code used to throw \
-             away and then guess at: {line}"
-        );
-        assert!(
-            !line.contains("stays refused until"),
-            "and it must not ASSERT a cause it never measured — the line this replaced named \
-             one of several conditions coord answers 403 to: {line}"
-        );
-        assert!(
-            !line.contains("pairing"),
-            "the advice must not name device pairing — pairing was never the missing thing, \
-             and naming a flow the runner cannot reach is half the defect: {line}"
-        );
-
-        for pass in 0..656 {
-            assert!(
-                r.observe(403, MISMATCH, asked, || presented).is_none(),
-                "pass {pass} repeated an already-reported refusal and must stay quiet"
-            );
-        }
-        assert_eq!(r.suppressed, 656);
-    }
-
-    /// Coord's real mismatch body, verified against `qontinui-coord`
-    /// `origin/main` `de4107e2` (`sessions::get_tenant_policy`).
-    const MISMATCH: &str = "tenant_id does not match principal";
-
-    /// MUTATION PROOF for the four-cause split, at the line an operator
-    /// actually reads: an expired slot must not be reported as a missing one.
-    ///
-    /// The device DOES hold the queried tenant's slot in that state — it
-    /// lapsed, and the refresher re-mints it with no operator action at all.
-    /// Collapse `PresentedTenant::Anonymous`'s cause back to a single value
-    /// and these lines become identical, which is what sent an operator to
-    /// re-pair a runner that needed nothing.
-    #[test]
-    fn an_expired_slot_is_not_reported_as_a_missing_one() {
-        use crate::auth::{NoCredential, PresentedTenant, SlotState};
-        let asked = Uuid::now_v7();
-
-        let line_for = |cause: NoCredential| {
-            TenantPolicyAuthReporter::default()
-                .observe(403, MISMATCH, asked, || PresentedTenant::Anonymous(cause))
-                .expect("a first refusal is always reported")
-        };
-
-        let absent = line_for(NoCredential::Slot(SlotState::Absent));
-        let dead = line_for(NoCredential::Slot(SlotState::PresentButDead));
-        let unreadable = line_for(NoCredential::Slot(SlotState::Unreadable));
-
-        assert_ne!(
-            absent, dead,
-            "a slot that LAPSED and a slot that was never issued want different actions"
-        );
-        assert_ne!(
-            absent, unreadable,
-            "an unreadable store is UNKNOWN, not an absence"
-        );
-        assert_ne!(dead, unreadable);
-        assert!(dead.contains(SlotState::PresentButDead.label()), "{dead}");
-    }
-
-    /// Coord answering differently is new information and breaks the silence;
-    /// the same answer never does.
-    #[test]
-    fn a_changed_status_breaks_the_silence() {
-        let asked = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-
-        let mut r = TenantPolicyAuthReporter::default();
-        assert!(r.observe(403, MISMATCH, asked, || cred).is_some());
-        assert!(r.observe(403, MISMATCH, asked, || cred).is_none());
-        assert!(
-            r.observe(401, "auth_required", asked, || cred).is_some(),
-            "coord answering differently is new information"
-        );
-        assert!(r.observe(401, "auth_required", asked, || cred).is_none());
-        assert!(
-            r.observe(403, MISMATCH, asked, || cred).is_some(),
-            "and so is it answering differently again"
-        );
-    }
-
-    /// A refusal that changes and changes BACK must be reported, and the
-    /// suppressed count must survive the detour.
-    ///
-    /// The measured gap this closes: suppression keyed on the status alone
-    /// and the transient arm never touched the standing state, so
-    /// `403`, `403`×N, `500`, `403` reported the FIRST 403 and then went
-    /// silent forever — while this type's own contract claimed the silence
-    /// breaks whenever "coord answers differently". A `500` is coord
-    /// answering differently.
-    #[test]
-    fn a_transient_failure_between_refusals_breaks_the_silence() {
-        let mut r = TenantPolicyAuthReporter::default();
-        let asked = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-
-        assert!(r.observe(403, MISMATCH, asked, || cred).is_some());
-        for _ in 0..5 {
-            assert!(r.observe(403, MISMATCH, asked, || cred).is_none());
-        }
-        r.interrupted();
-        let line = r
-            .observe(403, MISMATCH, asked, || cred)
-            .expect("a refusal after coord answered some other way is NEW information");
-        assert!(
-            line.contains("after 5 suppressed"),
-            "and the quiet period it followed must not be silently discarded: {line}"
-        );
-    }
-
-    /// F1 MUTATION PROOF — a transient blip must not VOID the recovery line
-    /// the standing refusal promised, nor strand its count.
-    ///
-    /// The first report ends "one line will report the recovery". Ending the
-    /// silence by clearing `reported` (rather than by bumping the epoch)
-    /// makes `clear`'s `?` return early on exactly this sequence — `403`,
-    /// `403`×5, a blip, `200` — so the promised line never arrives, and the
-    /// 5 suppressed passes sit in the field until some unrelated future
-    /// refusal prints them as its own. Both halves are asserted here:
-    /// revert [`TenantPolicyAuthReporter::interrupted`] to `self.reported =
-    /// None` and this goes red on the first `expect`.
-    #[test]
-    fn a_transient_failure_does_not_void_the_promised_recovery_line() {
-        let mut r = TenantPolicyAuthReporter::default();
-        let asked = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-
-        assert!(r.observe(403, MISMATCH, asked, || cred).is_some());
-        for _ in 0..5 {
-            assert!(r.observe(403, MISMATCH, asked, || cred).is_none());
-        }
-        r.interrupted();
-
-        let recovery = r
-            .clear()
-            .expect("the recovery line the first report PROMISED is owed across a blip");
-        assert!(
-            recovery.contains("after 5 suppressed"),
-            "and it must carry the quiet period's own count: {recovery}"
-        );
-        assert_eq!(
-            r.suppressed, 0,
-            "a count is dropped only by being PRINTED — leaving it set leaks a closed \
-             episode's 5 into an unrelated future refusal"
-        );
-        assert!(
-            r.clear().is_none(),
-            "and the recovery is reported exactly once"
-        );
-    }
-
-    /// The invariant the F1 regression broke: `reported == None` implies
-    /// `suppressed == 0`, for every interleaving of the three writers.
-    ///
-    /// `clear` is the only writer that may drop a standing refusal, and it
-    /// prints the count as it goes. `interrupted` was the first writer to
-    /// break that, and `clear` had been written assuming it.
-    #[test]
-    fn a_dropped_refusal_never_leaves_a_count_behind() {
-        let asked = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-        // Every word over {observe 403, observe 401, interrupted, clear} of
-        // length 4 — 256 interleavings, checked after every single step.
-        for word in 0..256u32 {
-            let mut r = TenantPolicyAuthReporter::default();
-            for step in 0..4 {
-                match (word >> (step * 2)) & 0b11 {
-                    0 => {
-                        r.observe(403, MISMATCH, asked, || cred);
-                    }
-                    1 => {
-                        r.observe(401, "auth_required", asked, || cred);
-                    }
-                    2 => r.interrupted(),
-                    _ => {
-                        r.clear();
-                    }
-                }
-                assert!(
-                    r.reported.is_some() || r.suppressed == 0,
-                    "word {word:08b} step {step}: a refusal dropped without printing its \
-                     count leaks that count into the next episode"
-                );
-            }
-        }
-    }
-
-    /// The suppressed count is dropped only by being PRINTED — a changed
-    /// status must carry it, not reset it.
-    ///
-    /// Before this, `403`×657 followed by a `401` reported the 401 and said
-    /// nothing about the 656 quiet passes, and the eventual recovery line
-    /// read "after 0 suppressed".
-    #[test]
-    fn a_changed_status_carries_the_suppressed_count_rather_than_dropping_it() {
-        let mut r = TenantPolicyAuthReporter::default();
-        let asked = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-
-        assert!(r.observe(403, MISMATCH, asked, || cred).is_some());
-        for _ in 0..656 {
-            assert!(r.observe(403, MISMATCH, asked, || cred).is_none());
-        }
-        let line = r
-            .observe(401, "auth_required", asked, || cred)
-            .expect("a different status is reported");
-        assert!(
-            line.contains("after 656 suppressed"),
-            "the 656 suppressed passes must be named by the line that ends them: {line}"
-        );
-        assert_eq!(r.suppressed, 0, "and only then are they cleared");
-    }
-
-    /// The tenant is part of the suppression key.
-    ///
-    /// No caller varies it today — this loop freezes one tenant at
-    /// construction — so this pins a property rather than fixing a live bug.
-    /// Keyed on the status alone, a future caller that reused one reporter
-    /// across tenants would have one tenant's refusal silence another's,
-    /// which is a cross-tenant silence and exactly the class of mistake this
-    /// phase exists to remove.
-    #[test]
-    fn the_suppression_key_includes_the_tenant() {
-        let mut r = TenantPolicyAuthReporter::default();
-        let a = Uuid::now_v7();
-        let b = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-
-        assert!(r.observe(403, MISMATCH, a, || cred).is_some());
-        assert!(r.observe(403, MISMATCH, a, || cred).is_none());
-        assert!(
-            r.observe(403, MISMATCH, b, || cred).is_some(),
-            "a refusal about a DIFFERENT tenant is a different condition"
-        );
-    }
-
-    /// Resolving the presented credential is a local encrypted-file read, so
-    /// the SUPPRESSED path — every pass but the first — must not pay for it.
-    /// That is why `observe` takes a closure rather than a value: the read
-    /// happens only on the pass that emits a line.
-    #[test]
-    fn the_suppressed_path_never_reads_the_credential() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let reads = AtomicUsize::new(0);
-        let mut r = TenantPolicyAuthReporter::default();
-        let asked = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
-        let mut read = || {
-            reads.fetch_add(1, Ordering::Relaxed);
-            cred
-        };
-
-        assert!(r.observe(403, MISMATCH, asked, &mut read).is_some());
-        assert_eq!(reads.load(Ordering::Relaxed), 1);
-        for _ in 0..100 {
-            assert!(r.observe(403, MISMATCH, asked, &mut read).is_none());
-        }
-        assert_eq!(
-            reads.load(Ordering::Relaxed),
-            1,
-            "a suppressed pass must cost no credential read at all — this loop runs for the \
-             life of the process"
-        );
-    }
-
-    /// Recovery emits exactly one line, naming how many passes were
-    /// suppressed — so the quiet period is legible rather than merely absent.
-    #[test]
-    fn recovery_reports_once_with_the_suppressed_count() {
-        let mut r = TenantPolicyAuthReporter::default();
-        let asked = Uuid::now_v7();
-        let cred = crate::auth::PresentedTenant::Anonymous(crate::auth::NoCredential::Slot(
-            crate::auth::SlotState::Absent,
-        ));
-
-        assert!(r.clear().is_none(), "nothing standing, nothing to report");
-        assert!(r.observe(403, MISMATCH, asked, || cred).is_some());
-        for _ in 0..12 {
-            assert!(r.observe(403, MISMATCH, asked, || cred).is_none());
-        }
-        let line = r
-            .clear()
-            .expect("a standing refusal that clears is reported");
-        assert!(
-            line.contains("after 12 suppressed"),
-            "the suppressed count must be named: {line}"
-        );
-        assert!(line.contains("403"), "{line}");
-        assert!(
-            r.clear().is_none(),
-            "a cleared condition must not report a second time"
-        );
-        assert!(
-            r.observe(403, MISMATCH, asked, || cred).is_some(),
-            "a refusal after a recovery is a NEW condition and is reported again"
-        );
-    }
-
-    /// A 401/403 is typed apart from every other failure, because the two want
-    /// opposite reporting: one is standing, the rest are transient. Collapsing
-    /// them into a flat string is what produced the per-minute warning.
-    #[test]
-    fn unauthorized_is_typed_apart_from_transient_failures() {
-        assert_eq!(
-            FlagPollError::Unauthorized {
-                status: 401,
-                reason: "auth_required".into()
-            }
-            .to_string(),
-            r#"status 401: "auth_required""#
-        );
-        // The reason originates in a response body, so this channel escapes
-        // it exactly as the report path does. Unescaped, a body carrying a
-        // newline forges a second log line from inside one.
-        assert_eq!(
-            FlagPollError::Unauthorized {
-                status: 403,
-                reason: "a\nforged ERROR line".into()
-            }
-            .to_string(),
-            r#"status 403: "a\nforged ERROR line""#
-        );
-        assert_eq!(
-            FlagPollError::Other("transport: x".into()).to_string(),
-            "transport: x"
-        );
-
-        let body = tenant_policy_fetch_body();
-        assert!(
-            !body.contains("tracing::warn!") && !body.contains("tracing::info!"),
-            "the fetch must not log a refusal itself — only the loop can tell a standing \
-             refusal from a first one, and a per-call warn is the defect. Body was:\n{body}"
-        );
     }
 
     // ── Plan 2026-10-23-a-hookless-resume-…: the re-key seam against coord ──
@@ -13052,19 +11360,6 @@ mod drain_tests {
             let probe = DrainProbe::spawn(status).await;
             let (coord, _dir) = coord_at(&probe.base);
             let _ = coord.probe_resume(Uuid::new_v4(), None).await;
-            probe.assert_all_drained().await;
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flag_poll_non_2xx_reads_the_body() {
-        let _amb = crate::test_env::isolated_ambient();
-        // 500: the generic arm. 403: the capped refusal read, past its cap.
-        for status in [500, 403] {
-            let probe = DrainProbe::spawn(status).await;
-            let (coord, _dir) = coord_at(&probe.base);
-            let r = fetch_session_coordination_flag(&coord.inner, Uuid::new_v4()).await;
-            assert!(r.is_err());
             probe.assert_all_drained().await;
         }
     }

@@ -141,7 +141,7 @@ pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value,
     // presenting the right bearer is the whole fix; the body needs no tenant
     // field and deliberately keeps none.
     let scope = crate::auth::TenantScope::for_device_default(
-        crate::session::dual_write::resolve_active_tenant_id(),
+        crate::session::tenant_pin::resolve_tenant_pin().pinned(),
     );
     let resp = crate::auth::attach_device_auth_for(
         client.post(&url).json(&json!({ "repo": repo })),

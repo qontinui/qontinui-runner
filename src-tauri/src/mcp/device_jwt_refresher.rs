@@ -793,7 +793,7 @@ fn slot_jwt_is_expired_or_absent(auth_manager: &crate::auth::AuthManager) -> boo
 /// the runner:
 ///   - coord base: `COORD_HTTP_URL` env → active profile (`coord_base_url`),
 ///   - device_id: `QONTINUI_MACHINE_ID` env → `machine.json::device_id`,
-///   - tenant_id: `resolve_active_tenant_id()` (machine.json::active_tenant_id),
+///   - tenant_id: `tenant_pin::resolve_tenant_pin().pinned()` (machine.json::active_tenant_id),
 ///     falling back to the outgoing device-JWT's `tenant_id` claim.
 ///
 /// A publish failure ONLY `warn!`s — it must never break the refresher loop
@@ -831,14 +831,16 @@ async fn publish_coord_credential_status(
     // the wire (coord's StatusUpsert.tenant_id is Option), but we send it
     // when known so the row is tenant-scoped — the explicit-tenant_id
     // publisher posture D2 site 16b/Phase 8 item 7 asks for.
-    let tenant_id = crate::session::dual_write::resolve_active_tenant_id().or_else(|| {
-        auth_manager
-            .get_access_token()
-            .ok()
-            .as_deref()
-            .and_then(qontinui_runner_lib::pair::tenant_id_from_oauth_claim)
-            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
-    });
+    let tenant_id = crate::session::tenant_pin::resolve_tenant_pin()
+        .pinned()
+        .or_else(|| {
+            auth_manager
+                .get_access_token()
+                .ok()
+                .as_deref()
+                .and_then(qontinui_runner_lib::pair::tenant_id_from_oauth_claim)
+                .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        });
 
     let (base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = format!("{base}/coord/status");
@@ -867,7 +869,7 @@ async fn publish_coord_credential_status(
     // Tenant-scoped: when `tenant_id` made it onto the body the status row is
     // written under that tenant, so the bearer comes from that tenant's slot.
     // Safe on this surface because the tenant IS the device default
-    // (`resolve_active_tenant_id`, falling back to the JWT's own claim), so the
+    // (`tenant_pin::resolve_tenant_pin().pinned()`, falling back to the JWT's own claim), so the
     // two agree by construction — which is exactly why the absent case is
     // `TenantScope::Device` and not `Unresolved`: nothing failed to resolve, so
     // the D2 degrade must not arm on a device-status publish. A non-default
@@ -1131,7 +1133,7 @@ pub(crate) async fn try_refresh_once(
     //      forwarding a hint ("coord is the authority on tenant_id"),
     //   3. `machine_tenant` — `~/.qontinui/machine.json::active_tenant_id`,
     //      resolved by the CALLER (the refresher loop passes
-    //      `session::dual_write::resolve_active_tenant_id()`; tests inject
+    //      `session::tenant_pin::resolve_tenant_pin().pinned()`; tests inject
     //      `Some`/`None` directly so they stay hermetic on any host).
     // Only if ALL THREE are absent/malformed do we keep the existing JWT.
     let outgoing_jwt = auth_manager.get_access_token().ok();
@@ -7449,7 +7451,7 @@ async fn refresher_loop(
                     DEAD_SLOT_SKIP_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
+                let machine_tenant = crate::session::tenant_pin::resolve_tenant_pin().pinned();
                 let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
@@ -8458,7 +8460,7 @@ mod try_refresh_once_tests {
         // device-JWT has no tenant claim, AND the caller-injected
         // `machine_tenant` is `None`. (`try_refresh_once` no longer reads
         // `~/.qontinui` itself — the prod loop passes
-        // `resolve_active_tenant_id()`, tests inject directly — so this is
+        // `tenant_pin::resolve_tenant_pin().pinned()`, tests inject directly — so this is
         // hermetic on any host.) All three sources absent → the refresher MUST
         // bail with KeptExisting: no HTTP call, JWT untouched — the same
         // warn-and-keep path as before the fallback chain.

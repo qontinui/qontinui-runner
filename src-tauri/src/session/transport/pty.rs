@@ -1,11 +1,12 @@
 //! PTY transport — delegates to [`crate::terminal::TerminalManager`].
 //!
 //! Routes [`super::Transport`] calls into the existing PTY infrastructure
-//! (`portable-pty`-backed `TerminalSession`s). Phase 9 cleanup will
-//! collapse `commands/terminal.rs` and parts of `terminal/manager.rs`
-//! into this transport; during Phase 2 we delegate so the existing PTY
-//! infra stays operable for the legacy `terminal_*` Tauri command
-//! surface that's still in use.
+//! (`portable-pty`-backed `TerminalSession`s). The delegation is the design,
+//! not a transitional step: the `terminal_*` Tauri commands that back every
+//! pane became coord-native in place (`commands/terminal/coord_wiring.rs`), so
+//! no fold of `commands/terminal.rs` into this transport is planned (plan
+//! `2026-11-20-coord-native-sessions-phase-9-reverified-cleanup`). Both surfaces
+//! share the one [`TerminalManager`].
 
 use std::sync::Arc;
 

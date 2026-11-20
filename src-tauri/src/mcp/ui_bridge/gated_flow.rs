@@ -54,7 +54,7 @@ fn unix_to_rfc3339(secs: i64) -> Option<String> {
 /// Field provenance:
 /// - `signed_in` — `crate::commands::auth::check_auth_status().authenticated`
 ///   (authoritative local-session check + best-effort `users/me` enrichment).
-/// - `tenant_id` — `crate::session::dual_write::resolve_active_tenant_id()`
+/// - `tenant_id` — `crate::session::tenant_pin::resolve_tenant_pin().pinned()`
 ///   (a UUID read from `machine.json`; non-secret).
 /// - `cognito_client_id` — the runner's fixed, non-secret Cognito app client id
 ///   (`qontinui_runner_lib::cognito::COGNITO_CLIENT_ID`), reported only when a
@@ -88,7 +88,9 @@ pub async fn ui_bridge_session_handler(
     };
 
     // tenant_id — non-secret UUID from machine.json (or null).
-    let tenant_id = crate::session::dual_write::resolve_active_tenant_id().map(|t| t.to_string());
+    let tenant_id = crate::session::tenant_pin::resolve_tenant_pin()
+        .pinned()
+        .map(|t| t.to_string());
 
     // Credential presence — derived WITHOUT reading token material or
     // triggering a refresh. A non-empty stored oauth refresh token is the same
