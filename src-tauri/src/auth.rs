@@ -2850,8 +2850,8 @@ pub(crate) fn select_scoped_bearer_lazy(
     select_scoped_bearer_lazy_result(am, scope, default_tenant, binding_count).ok()
 }
 
-/// [`select_scoped_bearer_lazy`], keeping the CAUSE of a miss — the shape
-/// [`presented_tenant`] consumes. See [`select_device_bearer_result`] for why
+/// [`select_scoped_bearer_lazy`], keeping the CAUSE of a miss ([`NoCredential`]).
+/// See [`select_device_bearer_result`] for why
 /// the cause is carried out of the decision rather than re-derived after it.
 pub(crate) fn select_scoped_bearer_lazy_result(
     am: &AuthManager,
@@ -2887,39 +2887,7 @@ pub fn device_bearer_scoped(scope: TenantScope) -> Option<String> {
     )
 }
 
-/// The one fact about a resolved credential that a diagnostic may say out
-/// loud: which tenant it claims, or that there is no credential at all.
-///
-/// Exists so a caller diagnosing a coord `401`/`403` can name the mismatch
-/// — *"asked about T, presented a credential for X"* — without ever touching
-/// the token itself. See [`presented_tenant`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresentedTenant {
-    /// No usable credential resolved, so the request goes out
-    /// UNAUTHENTICATED. On a tenant-scoped read this is the fail-closed
-    /// slot MISS — never another tenant's credential.
-    ///
-    /// Carries WHY. [`select_device_bearer`] reaches `None` from four states
-    /// it ALREADY models as [`SlotState`], and they want four different
-    /// operator actions; a bare "no credential" forces the reader to pick
-    /// one, which is how a diagnostic ends up asserting a cause it never
-    /// measured. See [`NoCredential`].
-    Anonymous(NoCredential),
-    /// A credential resolved, but it carries no `tenant_id` claim — a JWT
-    /// coord minted without it.
-    ///
-    /// An opaque `qontinui_runner_*` bearer does NOT reach this arm, though
-    /// it is the first thing a reader expects to: this function only ever
-    /// sees tokens [`select_device_bearer`] returned, both slot readers gate
-    /// on [`slot_jwt_is_usable`], and that requires a decodable `exp`. An
-    /// opaque token is therefore [`SlotRead::PresentButDead`] — a miss —
-    /// and renders as [`PresentedTenant::Anonymous`], never as this.
-    Untenanted,
-    /// A credential claiming this tenant resolved.
-    Tenant(Uuid),
-}
-
-/// Why [`presented_tenant`] resolved NO credential — the operator-action
+/// Why the credential selector resolved NO credential — the operator-action
 /// axis, kept out of the one-line collapse it would otherwise vanish into.
 ///
 /// The four `None` paths through [`select_device_bearer`] are not one
@@ -3000,55 +2968,6 @@ impl std::fmt::Display for NoCredential {
                  {bindings} bindings, so the resolver refused rather than guess"
             ),
         }
-    }
-}
-
-impl std::fmt::Display for PresentedTenant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PresentedTenant::Anonymous(why) => {
-                write!(f, "no credential (sent anonymously; {why})")
-            }
-            PresentedTenant::Untenanted => f.write_str("a credential with no tenant_id claim"),
-            PresentedTenant::Tenant(t) => write!(f, "a credential for tenant {t}"),
-        }
-    }
-}
-
-/// What [`attach_device_auth_for`] WOULD present for `scope`, reduced to
-/// [`PresentedTenant`] — a diagnostic read, not a second credential path.
-///
-/// **The token never leaves this function.** It is resolved, its `tenant_id`
-/// claim is decoded (unverified — [`jwt_tenant_claim`]), and the token is
-/// dropped; only the claim is returned. That is the whole reason this lives
-/// here rather than at the call site that wants to log the mismatch.
-///
-/// **ONE resolution, not two.** It calls the SAME resolver the request path
-/// calls, in its cause-carrying shape ([`select_scoped_bearer_lazy_result`]),
-/// and matches its `Err` straight through. It does not re-read the slots to
-/// work out why: the reads that decided the miss are the ones reported, so
-/// there is no mirror to drift, no second set of reads to pay for, and no
-/// window in which the refresher can make a slot `Usable` between the
-/// decision and its explanation. An earlier revision did re-read, and could
-/// render *"no credential (sent anonymously; slot usable)"* — a cause
-/// implying a credential was presentable, on a line whose whole subject is
-/// that none was.
-///
-/// Costs local encrypted-file reads, so call it when reporting a refusal,
-/// not on every pass of a loop.
-pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
-    let am = AuthManager::new();
-    match select_scoped_bearer_lazy_result(
-        &am,
-        scope,
-        default_binding_tenant(),
-        device_binding_count,
-    ) {
-        Ok(token) => match jwt_tenant_claim(&token) {
-            Some(t) => PresentedTenant::Tenant(t),
-            None => PresentedTenant::Untenanted,
-        },
-        Err(why) => PresentedTenant::Anonymous(why),
     }
 }
 
@@ -4971,39 +4890,6 @@ mod bearer_selection_tests {
         );
     }
 
-    /// The diagnostic the poll's refusal report is built on: it names the
-    /// tenant a credential CLAIMS, and it never yields the token.
-    #[test]
-    fn presented_tenant_reports_the_claim_and_the_absence() {
-        let t = tenant(0xD4);
-        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 3 * 60 * 60);
-        assert_eq!(jwt_tenant_claim(&jwt), Some(t));
-
-        assert_eq!(
-            PresentedTenant::Tenant(t).to_string(),
-            format!("a credential for tenant {t}")
-        );
-        assert_eq!(
-            PresentedTenant::Anonymous(NoCredential::Slot(SlotState::Absent)).to_string(),
-            "no credential (sent anonymously; slot absent)"
-        );
-        assert_eq!(
-            PresentedTenant::Untenanted.to_string(),
-            "a credential with no tenant_id claim"
-        );
-        // Whatever it renders, it must never be the token.
-        for p in [
-            PresentedTenant::Anonymous(NoCredential::Slot(SlotState::Absent)),
-            PresentedTenant::Untenanted,
-            PresentedTenant::Tenant(t),
-        ] {
-            assert!(
-                !p.to_string().contains(&jwt),
-                "a credential diagnostic must never render the token itself"
-            );
-        }
-    }
-
     // ---- `or_device_default` — D2's rule applied to a DECLARED tenant ------
     //
     // Phase 6. The only caller is a site that already puts the device default
@@ -5092,9 +4978,9 @@ mod bearer_selection_tests {
     /// conditions with four different operator actions, and the diagnostic
     /// must not collapse them.
     ///
-    /// Before this, `presented_tenant` reduced the selector to
-    /// `Option<String>` and mapped `None` to one `Anonymous` rendering "no
-    /// credential (sent anonymously)" — after which the tenant-policy
+    /// Before this, the (since deleted) tenant-policy poll's diagnostic
+    /// reduced the selector to `Option<String>` and mapped `None` to one
+    /// rendering "no credential (sent anonymously)" — after which its
     /// report asserted the FIRST of the four ("this device holds no slot
     /// for T; mint one"). On an EXPIRED slot that is wrong twice over: the
     /// device does hold T's slot, and the refresher heals it with no
@@ -5103,7 +4989,7 @@ mod bearer_selection_tests {
     /// Collapse any two of these renderings and this test goes red.
     #[test]
     fn a_credential_miss_names_which_of_the_four_causes_it_was() {
-        let rendered = |c: NoCredential| PresentedTenant::Anonymous(c).to_string();
+        let rendered = |c: NoCredential| c.to_string();
 
         let absent = rendered(NoCredential::Slot(SlotState::Absent));
         let dead = rendered(NoCredential::Slot(SlotState::PresentButDead));

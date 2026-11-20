@@ -956,7 +956,7 @@ fn stamp_session_tenant(mut intent: Intent) -> Intent {
 ///   exists to separate.
 ///
 /// The id space matters here and is not uniform. Registry ids are what
-/// `SessionRegistry::register_external` mints and what
+/// `SessionRegistry::register_external_with_lineage` mints and what
 /// `TerminalSession::coord_session_id` carries, so the auto-response reporters
 /// resolve. The claim path's `agent_session_id` is a looser space — some
 /// callers pass an orchestration `task_run_id`, some pass `None` for an
@@ -1202,16 +1202,11 @@ impl SessionRegistry {
     ///
     /// Validates the intent, writes a `Started` outbox row (which the
     /// drain loop pushes to coord), and inserts a record backed by the
-    /// no-op [`transport::ExternalTransport`]. Closing the mirror (by id)
+    /// no-op [`transport::ExternalTransport`]. Closing the record (by id)
     /// records a `Closed` event but never touches the operator's real
     /// terminal.
-    pub fn register_external(self: &Arc<Self>, intent: Intent) -> Result<Uuid, SessionError> {
-        self.register_external_with_lineage(intent, None, None)
-    }
-
-    /// [`SessionRegistry::register_external`] with an explicit lineage claim.
     ///
-    /// Two optional stamps, both `None` on the plain mirror path (so that call
+    /// Two optional lineage stamps, both `None` on the plain mirror path (so that call
     /// is byte-identical to what it was):
     ///
     /// - `parent_session_id` — the coord session this one CONTINUES. Threaded
@@ -1545,7 +1540,7 @@ impl SessionRegistry {
     ///
     /// ## Why this exists
     ///
-    /// [`Self::register_external`] always allocates a new `uuid_v7`, so a
+    /// [`Self::register_external_with_lineage`] always allocates a new `uuid_v7`, so a
     /// pane that re-launches across restarts orphans its old `coord.sessions`
     /// row and accumulates duplicates. Resuming re-activates the EXISTING
     /// row via a PATCH (`state=active` + `heartbeat`) — coord already
@@ -1563,7 +1558,7 @@ impl SessionRegistry {
     ///   return `persisted_id`. The session id is unchanged across the
     ///   restart — no duplicate.
     /// - **404 / 410** → the row was GC'd (or never existed). Fall back to a
-    ///   fresh [`Self::register_external`] (new id, `Started` POST) so the
+    ///   fresh [`Self::register_external_with_lineage`] (new id, `Started` POST) so the
     ///   pane is never left without a coord session, and return the NEW id.
     ///   The caller persists the new id over the stale one.
     /// - **transport error / 5xx** (coord temporarily unreachable) → resume
@@ -1612,7 +1607,7 @@ impl SessionRegistry {
     ) -> Result<Uuid, SessionError> {
         intent.validate()?;
         // Stamp before the probe, for the same reason `start_inner` and
-        // `register_external` stamp: the resumed record must carry a tenant, and
+        // `register_external_with_lineage` stamp: the resumed record must carry a tenant, and
         // the probe's bearer is selected from it. Unstamped, a resumed session
         // was the one session shape whose in-memory record held `tenant_id:
         // None`, which also made `record_session_tenant`'s registry arm return
@@ -1710,7 +1705,7 @@ impl SessionRegistry {
 
     /// Re-insert the in-memory mirror record for a resumed session under the
     /// persisted id, and emit a `StateChange` (→ PATCH `state=active`) so
-    /// the drain loop reconciles coord. Mirrors [`Self::register_external`]'s
+    /// the drain loop reconciles coord. Mirrors [`Self::register_external_with_lineage`]'s
     /// record shape but reuses `persisted_id` and emits `StateChange`
     /// instead of `Started`.
     fn insert_resumed_record(
@@ -2814,7 +2809,9 @@ mod tests {
         // the real process is owned by the legacy path. We assert the
         // FakeTransport's `start` counter stays at zero across a mirror.
         let (reg, _fx) = make_registry();
-        let id = reg.register_external(shell_intent()).unwrap();
+        let id = reg
+            .register_external_with_lineage(shell_intent(), None, None)
+            .unwrap();
         let desc = reg.describe(id).unwrap();
         assert_eq!(desc.kind, SessionKind::TerminalShell);
         assert_eq!(desc.state, SessionState::Active);
@@ -2827,7 +2824,9 @@ mod tests {
         // Closing the mirror records a Closed event and never errors —
         // the no-op ExternalTransport's close is a clean Ok(()).
         let (reg, _fx) = make_registry();
-        let id = reg.register_external(shell_intent()).unwrap();
+        let id = reg
+            .register_external_with_lineage(shell_intent(), None, None)
+            .unwrap();
         reg.close_by_id(id).unwrap();
         let again = reg.describe(id).unwrap();
         assert_eq!(again.state, SessionState::Closed);
@@ -2955,7 +2954,9 @@ mod tests {
         let (reg, _fx) = make_registry();
         let mut intent = shell_intent();
         intent.purpose = "x".into();
-        let err = reg.register_external(intent).unwrap_err();
+        let err = reg
+            .register_external_with_lineage(intent, None, None)
+            .unwrap_err();
         assert!(matches!(err, SessionError::Intent(_)));
     }
 
