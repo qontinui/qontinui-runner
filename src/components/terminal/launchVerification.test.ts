@@ -23,10 +23,11 @@ import { detectClaudeHandshake, detectResumeFailure } from "./resumeVerification
 import {
   FRESH_LAUNCH_HANDSHAKE_PATTERNS,
   describeLaunchFailure,
+  typeLaunchThenVerify,
   verifyFreshLaunch,
   type FreshLaunchDeps,
 } from "./launchVerification";
-import { readTerminalLaunchFailure, type LaunchFailureRead } from "./launchFailureApi";
+import type { LaunchFailureRead } from "./launchFailureApi";
 import { LaunchFailedBanner, failedLaunchTabs } from "./LaunchFailedBanner";
 import type { TerminalTab } from "./useTerminalManager";
 
@@ -152,24 +153,44 @@ describe("verifyFreshLaunch", () => {
   });
 });
 
-describe("readTerminalLaunchFailure", () => {
-  it("maps the three answers", async () => {
+describe("typeLaunchThenVerify (launch menu)", () => {
+  it("verifies after a successful write", async () => {
+    const verify = vi.fn();
+    const write = vi.fn(async () => ({ success: true as const, bytes: 7 }));
+    await typeLaunchThenVerify("t1", "claude\r", write, verify);
+    expect(write).toHaveBeenCalledWith("t1", "claude\r");
+    expect(verify).toHaveBeenCalledWith("t1");
+  });
+
+  it("does not verify a refused write, so no false 'Claude did not start' banner", async () => {
+    const verify = vi.fn();
+    const result = await typeLaunchThenVerify(
+      "t1",
+      "claude\r",
+      async () => ({
+        success: false as const,
+        code: "TERMINAL_EXITED" as const,
+        error: "TERMINAL_EXITED: gone",
+        hint: "",
+        terminalId: "t1",
+      }),
+      verify,
+    );
+    expect(verify).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ success: false });
+  });
+
+  it("does not verify a write that throws", async () => {
+    const verify = vi.fn();
     expect(
-      await readTerminalLaunchFailure("t", async () => ({ data: { recorded: false } })),
-    ).toEqual({
-      state: "not-recorded",
-    });
-    expect(
-      await readTerminalLaunchFailure("t", async () => ({
-        data: { recorded: true, kind: "resolve-failed", detail: "no claude" },
-      })),
-    ).toEqual({ state: "recorded", kind: "resolve-failed", detail: "no claude" });
-    expect(await readTerminalLaunchFailure("t", async () => ({ success: false }))).toEqual({
-      state: "unread",
-    });
-    expect(
-      await readTerminalLaunchFailure("t", async () => Promise.reject(new Error("x"))),
-    ).toEqual({ state: "unread" });
+      await typeLaunchThenVerify(
+        "t1",
+        "claude\r",
+        async () => Promise.reject(new Error("x")),
+        verify,
+      ),
+    ).toBeNull();
+    expect(verify).not.toHaveBeenCalled();
   });
 });
 

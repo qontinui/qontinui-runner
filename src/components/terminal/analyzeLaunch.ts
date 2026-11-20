@@ -14,7 +14,10 @@
  *      pane's cwd and types the command once. When the backend reports the
  *      prompt was not carried in argv (`promptCarried: false`), the one-line
  *      invocation is typed once after the Claude handshake is seen — never
- *      after a timer — and a handshake that is not seen is a failure.
+ *      after a timer — and submitted with a separate CR; a handshake that is
+ *      not seen is a failure;
+ *   5. reports a cwd the analyzer command was not provisioned into as a
+ *      failure (`not-provisioned`), with the pane left open.
  *
  * Every step's failure is a terminal outcome naming that step, so the button
  * can never sit on "Analyzer opened" for a pane that got no first turn.
@@ -111,7 +114,12 @@ export type AnalyzeStep =
   | "command-build"
   | "pane-create"
   | "write"
-  | "handshake";
+  | "launch-record"
+  | "handshake"
+  | "prompt-write"
+  | "prompt-submit"
+  | "not-provisioned"
+  | "unexpected";
 
 export const ANALYZE_STEP_LABEL: Record<AnalyzeStep, string> = {
   "evidence-capture": "evidence capture failed",
@@ -119,8 +127,24 @@ export const ANALYZE_STEP_LABEL: Record<AnalyzeStep, string> = {
   "command-build": "the launch command build was refused",
   "pane-create": "the analyzer pane could not be created",
   write: "the launch command could not be typed",
+  "launch-record": "the analyzer pane's launch could not be recorded",
   handshake: "the analyzer's Claude did not start (handshake not seen)",
+  "prompt-write": "the analyzer prompt could not be typed",
+  "prompt-submit": "the analyzer prompt was typed but could not be submitted",
+  "not-provisioned": `the ${ANALYZE_LAUNCH_SLASH_COMMAND} command was not provisioned into the analyzer pane's directory, so its first turn may not resolve`,
+  unexpected: "the analyzer run failed unexpectedly",
 };
+
+/**
+ * The pause between typing the fallback prompt and sending its submitting CR,
+ * in ms. The same 150 ms, and the same reason, as `POST_PASTE_DELAY` in
+ * `src-tauri/src/terminal/session.rs`: text and `\r` that reach Claude's TUI in
+ * one read cycle are taken as one paste and the CR is eaten as paste-tail, so
+ * the prompt sits unsubmitted. `TerminalSession::submit_prompt` writes the
+ * text, sleeps, then writes the CR separately; no Tauri command exposes that
+ * path to the frontend, so this run does the same two writes itself.
+ */
+export const PROMPT_SUBMIT_DELAY_MS = 150;
 
 export type AnalyzeOutcome =
   | {
@@ -167,6 +191,8 @@ export interface AnalyzeDeps {
   onLaunched?: (tabId: string, launch: AiLaunchCommand, configDir: string) => void;
   newSessionId: () => string;
   isWindows: boolean;
+  /** Waits {@link PROMPT_SUBMIT_DELAY_MS}; defaults to a timer. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 function describe(e: unknown): string {
@@ -179,12 +205,24 @@ function refused(result: TerminalWriteResult | void): string | null {
   return null;
 }
 
-/** Run the analyzer open for `pane`. Never throws. */
+/** Why the analyzer pane's directory does not carry the analyzer command. */
+function notProvisionedMessage(evidence: LaunchEvidence, openedIn: string | undefined): string {
+  if (evidence.cwd === null) {
+    return (
+      "the failed pane's working directory could not be resolved, so nothing was provisioned; " +
+      `the analyzer opened in ${openedIn ?? "the default directory"}`
+    );
+  }
+  return `provisioning into ${evidence.cwd} did not leave .claude/commands/analyze-launch-failure.md there`;
+}
+
+/** Run the analyzer open for `pane`. Never throws: every step names itself. */
 export async function runAnalyzeLaunch(
   pane: FailedPane,
   deps: AnalyzeDeps,
 ): Promise<AnalyzeOutcome> {
   const failedConfigDir = pane.launchConfigDir ?? pane.claudeConfigDir;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
   // 1. Evidence.
   let evidence: LaunchEvidence;
@@ -200,7 +238,12 @@ export async function runAnalyzeLaunch(
   }
 
   // 2. Account.
-  const account = pickAnalyzerAccount(deps.rankedAccounts(), failedConfigDir, deps.launchAliases());
+  let account: string | null;
+  try {
+    account = pickAnalyzerAccount(deps.rankedAccounts(), failedConfigDir, deps.launchAliases());
+  } catch (e) {
+    return { ok: false, step: "no-account", message: describe(e) };
+  }
   if (!account) {
     return { ok: false, step: "no-account", message: "no Claude account is configured" };
   }
@@ -219,7 +262,9 @@ export async function runAnalyzeLaunch(
     return { ok: false, step: "command-build", message: describe(e) };
   }
 
-  // 4. Pane + one write.
+  // 4. Pane. The provisioned cwd is where `/analyze-launch-failure` resolves
+  // (D2); the pane's own workingDir is only a fallback, and an unprovisioned
+  // one is reported after the launch (step "not-provisioned").
   const cwd = evidence.cwd ?? pane.workingDir;
   let tabId: string | null;
   try {
@@ -230,34 +275,83 @@ export async function runAnalyzeLaunch(
   if (!tabId) {
     return { ok: false, step: "pane-create", message: "the terminal was not created" };
   }
-  const commandRefusal = refused(await deps.write(tabId, `${launch.command}\r`));
-  if (commandRefusal) {
-    return { ok: false, step: "write", message: commandRefusal, analyzerTabId: tabId };
-  }
-  deps.onLaunched?.(tabId, launch, account);
+  const analyzerTabId = tabId;
+  const fail = (step: AnalyzeStep, message: string): AnalyzeOutcome => ({
+    ok: false,
+    step,
+    message,
+    analyzerTabId,
+  });
 
+  // 5. One write of the launch command, then record it.
+  try {
+    const commandRefusal = refused(await deps.write(analyzerTabId, `${launch.command}\r`));
+    if (commandRefusal) return fail("write", commandRefusal);
+  } catch (e) {
+    return fail("write", describe(e));
+  }
+  try {
+    deps.onLaunched?.(analyzerTabId, launch, account);
+  } catch (e) {
+    return fail("launch-record", describe(e));
+  }
+
+  // 6. An alias dropped the positional prompt: type it once the handshake is
+  // seen, then submit with a SEPARATE CR (see PROMPT_SUBMIT_DELAY_MS).
   if (!launch.promptCarried) {
-    const seen = await deps.waitHandshake(tabId);
+    let seen: "verified" | "failed" | "timeout";
+    try {
+      seen = await deps.waitHandshake(analyzerTabId);
+    } catch (e) {
+      return fail("handshake", `${describe(e)}; the analyzer prompt was not typed`);
+    }
     if (seen !== "verified") {
-      return {
-        ok: false,
-        step: "handshake",
-        message: `handshake ${seen === "timeout" ? "not seen before the timeout" : "failed"}; the analyzer prompt was not typed`,
-        analyzerTabId: tabId,
-      };
+      return fail(
+        "handshake",
+        `handshake ${seen === "timeout" ? "not seen before the timeout" : "failed"}; the analyzer prompt was not typed`,
+      );
     }
-    const promptRefusal = refused(await deps.write(tabId, `${prompt}\r`));
-    if (promptRefusal) {
-      return { ok: false, step: "write", message: promptRefusal, analyzerTabId: tabId };
+    try {
+      const promptRefusal = refused(await deps.write(analyzerTabId, prompt));
+      if (promptRefusal) return fail("prompt-write", promptRefusal);
+    } catch (e) {
+      return fail("prompt-write", describe(e));
     }
+    try {
+      await sleep(PROMPT_SUBMIT_DELAY_MS);
+      const submitRefusal = refused(await deps.write(analyzerTabId, "\r"));
+      if (submitRefusal) return fail("prompt-submit", submitRefusal);
+    } catch (e) {
+      return fail("prompt-submit", describe(e));
+    }
+  }
+
+  // 7. D1: never "Analyzer opened" on a pane whose first turn may not resolve.
+  if (!evidence.commandsProvisioned) {
+    return fail("not-provisioned", notProvisionedMessage(evidence, cwd));
   }
 
   return {
     ok: true,
-    analyzerTabId: tabId,
+    analyzerTabId,
     account,
     evidence,
     promptCarried: launch.promptCarried,
+  };
+}
+
+/**
+ * The operator toast for an outcome, or null for a clean open. Every failure
+ * names its step, `not-provisioned` included — the pane is open there but its
+ * first turn may not resolve, which must not read as "Analyzer opened" (D1).
+ */
+export function analyzeOutcomeToast(
+  outcome: AnalyzeOutcome,
+): { message: string; type: "error" } | null {
+  if (outcome.ok) return null;
+  return {
+    message: `Analyze launch: ${ANALYZE_STEP_LABEL[outcome.step]} — ${outcome.message}`,
+    type: "error",
   };
 }
 
@@ -286,7 +380,8 @@ export function createAnalyzeLaunchRunner(
       onStatus(pane.id, "running");
       return run(pane)
         .catch(
-          (e): AnalyzeOutcome => ({ ok: false, step: "evidence-capture", message: describe(e) }),
+          // `run` never throws; a throw here is a defect, not a step's failure.
+          (e): AnalyzeOutcome => ({ ok: false, step: "unexpected", message: describe(e) }),
         )
         .then((outcome) => {
           inFlight.delete(pane.id);

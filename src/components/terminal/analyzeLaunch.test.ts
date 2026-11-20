@@ -13,7 +13,9 @@ vi.mock("@qontinui/ui-bridge", () => ({ useUIComponent: () => {} }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import {
+  PROMPT_SUBMIT_DELAY_MS,
   analyzeLaunchPlacement,
+  analyzeOutcomeToast,
   analyzerFirstMessage,
   createAnalyzeLaunchRunner,
   hoverClusterIsWide,
@@ -144,6 +146,9 @@ function makeDeps(over: Partial<AnalyzeDeps> = {}) {
     onLaunched: vi.fn(),
     newSessionId: () => "s",
     isWindows: false,
+    sleep: vi.fn(async (ms: number) => {
+      order.push(`sleep:${ms}`);
+    }),
     ...over,
   };
   return { deps, writes, order };
@@ -187,7 +192,7 @@ describe("runAnalyzeLaunch", () => {
     expect(deps.waitHandshake).not.toHaveBeenCalled();
   });
 
-  it("promptCarried false: types the invocation once, after the handshake is seen", async () => {
+  it("promptCarried false: types the invocation after the handshake, then submits it with a separate CR after the paste delay", async () => {
     const { deps, writes, order } = makeDeps({
       buildCommand: vi.fn(async () => ({
         command: "clh",
@@ -196,20 +201,63 @@ describe("runAnalyzeLaunch", () => {
       })),
     });
     const out = await runAnalyzeLaunch(PANE, deps);
+    // Text and CR are two writes, never one: one PTY read cycle holding both
+    // is taken as a paste and the CR is eaten (session.rs POST_PASTE_DELAY).
     expect(writes).toEqual([
       ["analyzer-1", "clh\r"],
-      ["analyzer-1", "/analyze-launch-failure /ev/t1.md\r"],
+      ["analyzer-1", "/analyze-launch-failure /ev/t1.md"],
+      ["analyzer-1", "\r"],
     ]);
-    expect(order.slice(-2)).toEqual(["handshake", "write:/analyze-launch-failure /ev/t1.md\r"]);
+    expect(order.slice(-4)).toEqual([
+      "handshake",
+      "write:/analyze-launch-failure /ev/t1.md",
+      `sleep:${PROMPT_SUBMIT_DELAY_MS}`,
+      "write:\r",
+    ]);
+    expect(PROMPT_SUBMIT_DELAY_MS).toBe(150);
     expect(out.ok).toBe(true);
   });
 
-  it("uses the pane's cwd when the backend could not resolve one", async () => {
-    const { deps } = makeDeps({
-      captureEvidence: vi.fn(async () => ({ ...EVIDENCE, cwd: null })),
+  it("opens in the provisioned cwd the backend reported, not the pane's workingDir", async () => {
+    const { deps } = makeDeps();
+    const out = await runAnalyzeLaunch(PANE, deps);
+    expect(deps.createPane).toHaveBeenCalledWith("analyze launch", "/work/repo", "ten");
+    expect(out.ok).toBe(true);
+  });
+
+  it("an unprovisioned cwd is a not-provisioned outcome on the open pane, never ok", async () => {
+    const { deps, writes } = makeDeps({
+      captureEvidence: vi.fn(async () => ({ ...EVIDENCE, commandsProvisioned: false })),
     });
-    await runAnalyzeLaunch(PANE, deps);
+    const out = await runAnalyzeLaunch(PANE, deps);
+    expect(out).toMatchObject({ ok: false, step: "not-provisioned", analyzerTabId: "analyzer-1" });
+    expect((out as { message: string }).message).toContain("/work/repo");
+    // The analyzer still launched; only the acknowledgement changes.
+    expect(writes).toHaveLength(1);
+    expect(analyzeOutcomeToast(out)).toEqual({
+      type: "error",
+      message: expect.stringContaining(
+        "the /analyze-launch-failure command was not provisioned into the analyzer pane's directory",
+      ),
+    });
+  });
+
+  it("no resolvable cwd: opens in the pane's workingDir and reports that nothing was provisioned", async () => {
+    const { deps } = makeDeps({
+      captureEvidence: vi.fn(async () => ({ ...EVIDENCE, cwd: null, commandsProvisioned: false })),
+    });
+    const out = await runAnalyzeLaunch(PANE, deps);
     expect(deps.createPane).toHaveBeenCalledWith("analyze launch", "/fallback", "ten");
+    expect(out).toMatchObject({ ok: false, step: "not-provisioned", analyzerTabId: "analyzer-1" });
+    expect((out as { message: string }).message).toContain(
+      "working directory could not be resolved",
+    );
+    expect((out as { message: string }).message).toContain("/fallback");
+  });
+
+  it("a clean open has no toast", async () => {
+    const { deps } = makeDeps();
+    expect(analyzeOutcomeToast(await runAnalyzeLaunch(PANE, deps))).toBeNull();
   });
 
   const failures: Array<[string, Partial<AnalyzeDeps>, string, boolean]> = [
@@ -239,6 +287,74 @@ describe("runAnalyzeLaunch", () => {
         })),
       },
       "write",
+      true,
+    ],
+    [
+      "write that throws",
+      { write: vi.fn(async () => Promise.reject(new Error("ipc down"))) },
+      "write",
+      true,
+    ],
+    [
+      "launch record that throws",
+      {
+        onLaunched: vi.fn(() => {
+          throw new Error("record failed");
+        }),
+      },
+      "launch-record",
+      true,
+    ],
+    [
+      "handshake wait that throws",
+      {
+        buildCommand: vi.fn(async () => ({
+          command: "clh",
+          pinnedSessionId: null,
+          promptCarried: false,
+        })),
+        waitHandshake: vi.fn(async () => Promise.reject(new Error("scrollback gone"))),
+      },
+      "handshake",
+      true,
+    ],
+    [
+      "prompt write refusal",
+      {
+        buildCommand: vi.fn(async () => ({
+          command: "clh",
+          pinnedSessionId: null,
+          promptCarried: false,
+        })),
+        write: vi.fn(async (_id: string, text: string) =>
+          text === "clh\r"
+            ? { success: true as const, bytes: 4 }
+            : {
+                success: false as const,
+                code: "TERMINAL_EXITED" as const,
+                error: "TERMINAL_EXITED: gone",
+                hint: "",
+                terminalId: "analyzer-1",
+              },
+        ),
+      },
+      "prompt-write",
+      true,
+    ],
+    [
+      "prompt submit (CR) that throws",
+      {
+        buildCommand: vi.fn(async () => ({
+          command: "clh",
+          pinnedSessionId: null,
+          promptCarried: false,
+        })),
+        write: vi.fn(async (_id: string, text: string) => {
+          if (text === "\r") throw new Error("ipc down");
+          return { success: true as const, bytes: text.length };
+        }),
+      },
+      "prompt-submit",
       true,
     ],
     [
@@ -309,6 +425,36 @@ describe("createAnalyzeLaunchRunner (in-flight guard)", () => {
     await first;
     expect(statuses).toEqual(["running", "error"]);
     expect(runner.isRunning("p")).toBe(false);
+  });
+
+  it("a step that throws inside a real run keeps its own step name and the analyzer pane id", async () => {
+    const { deps } = makeDeps({ write: vi.fn(async () => Promise.reject(new Error("ipc down"))) });
+    const statuses: string[] = [];
+    const runner = createAnalyzeLaunchRunner(
+      (pane) => runAnalyzeLaunch(pane, deps),
+      (_id, s) => statuses.push(s),
+    );
+    const out = await runner.start(PANE);
+    expect(out).toEqual({
+      ok: false,
+      step: "write",
+      message: "ipc down",
+      analyzerTabId: "analyzer-1",
+    });
+    expect(statuses).toEqual(["running", "error"]);
+  });
+
+  it("an unprovisioned analyzer settles to error, never opened", async () => {
+    const { deps } = makeDeps({
+      captureEvidence: vi.fn(async () => ({ ...EVIDENCE, commandsProvisioned: false })),
+    });
+    const statuses: string[] = [];
+    const runner = createAnalyzeLaunchRunner(
+      (pane) => runAnalyzeLaunch(pane, deps),
+      (_id, s) => statuses.push(s),
+    );
+    await runner.start(PANE);
+    expect(statuses).toEqual(["running", "error"]);
   });
 
   it("settles to opened on success", async () => {

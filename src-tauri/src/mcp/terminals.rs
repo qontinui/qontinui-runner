@@ -787,13 +787,18 @@ pub async fn capture_launch_evidence_handler(
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("launch evidence: capture task failed: {e}"))),
+            Json(api_error(format!(
+                "launch evidence: capture task failed: {e}"
+            ))),
         )
     })?;
     match result {
         Ok(evidence) => Ok(Json(ApiResponse::success(evidence))),
         Err(e @ CaptureError::TerminalNotFound(_)) => {
             Err((StatusCode::NOT_FOUND, Json(api_error(e.to_string()))))
+        }
+        Err(e @ CaptureError::InvalidField { .. }) => {
+            Err((StatusCode::BAD_REQUEST, Json(api_error(e.to_string()))))
         }
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

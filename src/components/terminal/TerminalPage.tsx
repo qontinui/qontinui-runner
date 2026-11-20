@@ -87,6 +87,7 @@ import { useTerminalInitialization, runVerifiedResume } from "./useTerminalIniti
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { LaunchFailedBanner } from "./LaunchFailedBanner";
 import { AnalyzeLaunchContext, useAnalyzeLaunch } from "./useAnalyzeLaunch";
+import { typeLaunchThenVerify } from "./launchVerification";
 import type { AiLaunchCommand } from "./aiLaunchCommand";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
@@ -1388,7 +1389,8 @@ function TerminalPageInner({
         // Phase 4 of `2026-11-20-terminal-launch-failure-analyze-button`: once
         // the command is typed, watch for Claude's handshake and the shim's
         // failure beacon; a launch SEEN not to start raises `LaunchFailedBanner`.
-        void writeWhenReady(tabId, `${launch.command}\r`).then(() => verifyLaunch(tabId));
+        // A refused write typed nothing, so it is not verified (no false banner).
+        void typeLaunchThenVerify(tabId, `${launch.command}\r`, writeWhenReady, verifyLaunch);
         recordAiLaunch(tabId, launch, configDir, spawnAt);
       }
       if (context && launchedTabIds.length > 0) {

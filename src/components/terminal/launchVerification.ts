@@ -27,6 +27,7 @@ import { waitForClaudeHandshake, readScrollbackTail } from "./resumeVerification
 import { CLAUDE_HANDSHAKE_REGEXES, CLAUDE_TITLE_REGEXES } from "./providerAdapter";
 import type { HandshakePatterns } from "./providerAdapter";
 import type { LaunchFailureRead } from "./launchFailureApi";
+import type { TerminalWriteResult } from "./terminalWriteResult";
 
 /** Claude's launch success markers, with no resume-failure markers. */
 export const FRESH_LAUNCH_HANDSHAKE_PATTERNS: HandshakePatterns = {
@@ -146,4 +147,35 @@ export function describeLaunchFailure(signals: LaunchFailureSignals): string {
     );
   }
   return parts.join(" · ");
+}
+
+/**
+ * Type a launch command into `tabId`, then verify the launch — but only when
+ * the write was not refused. A refused write (`success: false`: the pane
+ * exited, the IPC failed) typed nothing, so no Claude could start there and a
+ * "Claude did not start" banner would blame a launch that never happened. A
+ * write that throws is treated the same way. Resolves the write's result, or
+ * null when it threw.
+ */
+export async function typeLaunchThenVerify(
+  tabId: string,
+  text: string,
+  write: (tabId: string, text: string) => Promise<TerminalWriteResult>,
+  verify: (tabId: string) => void,
+): Promise<TerminalWriteResult | null> {
+  let result: TerminalWriteResult;
+  try {
+    result = await write(tabId, text);
+  } catch (e) {
+    console.warn(`[LaunchAI] launch command write to ${tabId} threw; not verifying: ${e}`);
+    return null;
+  }
+  if (result.success === false) {
+    console.warn(
+      `[LaunchAI] launch command write to ${tabId} was refused (${result.error}); not verifying`,
+    );
+    return result;
+  }
+  verify(tabId);
+  return result;
 }

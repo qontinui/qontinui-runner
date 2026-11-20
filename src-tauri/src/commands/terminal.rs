@@ -3386,6 +3386,10 @@ async fn poll_and_verify_pinned_session<F>(
 /// `2026-11-20-terminal-launch-failure-analyze-button`, Phase 2). The HTTP twin
 /// is `POST /terminals/{id}/launch-evidence`. Run on a blocking thread because
 /// provisioning probes git and resolves the command registry.
+///
+/// The IPC payload is the BARE `LaunchEvidence` (no `CommandResponse`), as for
+/// `session_ledger_report`; `captureLaunchEvidence`
+/// (`src/components/terminal/launchFailureApi.ts`) reads it that way.
 #[tauri::command]
 pub async fn capture_launch_evidence(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
@@ -3411,7 +3415,8 @@ pub async fn capture_launch_evidence(
 
 /// The shim's launch-failure record for one pane: `{recorded: false}` or
 /// `{recorded: true, kind, detail, settings, userChoseSession, atMs}`. The HTTP
-/// twin is `GET /terminals/{id}/launch-failure`.
+/// twin is `GET /terminals/{id}/launch-failure`. The IPC payload is the BARE
+/// view, read that way by `readTerminalLaunchFailure` (`launchFailureApi.ts`).
 #[tauri::command]
 pub fn get_terminal_launch_failure(
     terminal_id: String,

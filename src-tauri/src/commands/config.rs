@@ -1269,7 +1269,8 @@ mod ai_launch_prompt_tests {
     use crate::claude_session::launch_spec::LaunchConfig;
 
     const SID: &str = "230feb99-2dd7-42d7-92bc-6d36c1883089";
-    const PROMPT: &str = "/analyze-launch-failure /h/.qontinui/launch-evidence/t1-20261120T101500Z.md";
+    const PROMPT: &str =
+        "/analyze-launch-failure /h/.qontinui/launch-evidence/t1-20261120T101500Z.md";
 
     /// The composed path carries the prompt as argv and says so.
     #[test]

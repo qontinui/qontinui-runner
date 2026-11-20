@@ -26,7 +26,7 @@ import { useUIComponent } from "@qontinui/ui-bridge";
 import { compareByUsageHeadroom } from "../settings/types";
 import { buildAiLaunchCommand, type AiLaunchCommand } from "./aiLaunchCommand";
 import {
-  ANALYZE_STEP_LABEL,
+  analyzeOutcomeToast,
   createAnalyzeLaunchRunner,
   runAnalyzeLaunch,
   type AnalyzeOutcome,
@@ -135,19 +135,15 @@ export function useAnalyzeLaunch(args: UseAnalyzeLaunchArgs) {
       const a = argsRef.current;
       if (outcome.ok) {
         focusAnalyzer(outcome.analyzerTabId);
-        if (!outcome.evidence.commandsProvisioned) {
-          console.warn(
-            `[AnalyzeLaunch] fleet commands were not provisioned into ${outcome.evidence.cwd ?? "the analyzer cwd"}; /analyze-launch-failure may not resolve there`,
-          );
-        }
         return;
       }
+      // Every failure is toasted, `not-provisioned` included: the pane is open
+      // and focused, but its first turn may not resolve, so the button leaves
+      // "Analyzer opened" (D1) and the operator is told why.
       if (outcome.analyzerTabId) focusAnalyzer(outcome.analyzerTabId);
       console.error(`[AnalyzeLaunch] ${outcome.step}: ${outcome.message}`);
-      a.notify({
-        message: `Analyze launch: ${ANALYZE_STEP_LABEL[outcome.step]} — ${outcome.message}`,
-        type: "error",
-      });
+      const toast = analyzeOutcomeToast(outcome);
+      if (toast) a.notify(toast);
     },
     [focusAnalyzer],
   );

@@ -63,6 +63,10 @@ pub enum CaptureError {
     TerminalNotFound(String),
     /// `~/.qontinui` could not be resolved (no home directory).
     NoEvidenceDir,
+    /// A caller-supplied field carries a control character. The three caller
+    /// fields are written into markdown list lines unfenced, so a newline
+    /// there could forge a line of the evidence file.
+    InvalidField { field: &'static str, found: char },
     /// Creating the directory or writing the file failed.
     Io(String),
 }
@@ -74,6 +78,11 @@ impl std::fmt::Display for CaptureError {
             Self::NoEvidenceDir => write!(
                 f,
                 "launch evidence: no ~/.qontinui directory resolves (no home directory)"
+            ),
+            Self::InvalidField { field, found } => write!(
+                f,
+                "launch evidence: refusing a {field} with a control character ({found:?}): \
+                 it is written into the evidence file as one markdown line"
             ),
             Self::Io(e) => write!(f, "launch evidence: write failed: {e}"),
         }
@@ -164,7 +173,10 @@ fn rfc3339_ms(ms: i64) -> String {
 /// value is written as such, never omitted.
 pub fn render_evidence(r: &EvidenceRecord<'_>) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Launch evidence: terminal {}\n\n", r.terminal_id));
+    out.push_str(&format!(
+        "# Launch evidence: terminal {}\n\n",
+        r.terminal_id
+    ));
     out.push_str(&format!(
         "- captured_at: {}\n",
         r.captured_at
@@ -203,7 +215,11 @@ pub fn render_evidence(r: &EvidenceRecord<'_>) -> String {
             out.push_str(&format!("- detail: {}\n", f.detail));
             out.push_str(&format!("- settings: {}\n", f.settings));
             out.push_str(&format!("- user_chose_session: {}\n", f.user_chose_session));
-            out.push_str(&format!("- at: {} (unix ms {})\n", rfc3339_ms(f.at_ms), f.at_ms));
+            out.push_str(&format!(
+                "- at: {} (unix ms {})\n",
+                rfc3339_ms(f.at_ms),
+                f.at_ms
+            ));
         }
         None => out.push_str("none recorded\n"),
     }
@@ -252,10 +268,32 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// Refuse an evidence directory that is a symlink. `create_dir_all` and
+/// `set_permissions` both follow one, so a planted `launch-evidence` link would
+/// have the capture chmod its target `0700` and write the scrollback there.
+/// `symlink_metadata` reads the link itself. An absent path is fine.
+fn refuse_symlinked_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "the evidence directory {} is a symlink; refusing to follow it",
+                dir.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Write `body` to `dir/file_name`, never overwriting: a second capture of the
-/// same terminal in the same second gets a `-2`, `-3`, … suffix.
+/// same terminal in the same second gets a `-2`, `-3`, … suffix. Refuses a
+/// symlinked `dir`, checked before and again after it is created.
 pub fn write_evidence_file(dir: &Path, file_name: &str, body: &str) -> std::io::Result<PathBuf> {
+    refuse_symlinked_dir(dir)?;
     std::fs::create_dir_all(dir)?;
+    refuse_symlinked_dir(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -313,6 +351,25 @@ pub fn prune_evidence_dir(dir: &Path, keep: usize) -> std::io::Result<usize> {
     Ok(deleted)
 }
 
+/// Refuse a control character (newline, CR, any other C0, DEL, C1) in the
+/// three caller-supplied fields the evidence file writes as unfenced markdown
+/// list lines — the same rule `launch_spec::initial_prompt_args` applies to a
+/// typed prompt. The account is checked whatever its source: a stored one
+/// lands on the same line.
+pub fn check_caller_fields(record: &EvidenceRecord<'_>) -> Result<(), CaptureError> {
+    let fields = [
+        ("launch_command", record.launch_command),
+        ("config_dir", record.account.map(|(dir, _)| dir)),
+        ("pinned_session_id", record.pinned_session_id),
+    ];
+    for (field, value) in fields {
+        if let Some(found) = value.and_then(|v| v.chars().find(|c| c.is_control())) {
+            return Err(CaptureError::InvalidField { field, found });
+        }
+    }
+    Ok(())
+}
+
 /// Render, write and prune into `dir`, then provision through `provision`.
 /// The settings- and app-free core of [`capture_launch_evidence`].
 pub fn capture_into(
@@ -320,6 +377,7 @@ pub fn capture_into(
     record: &EvidenceRecord<'_>,
     provision: impl FnOnce(&str) -> bool,
 ) -> Result<LaunchEvidence, CaptureError> {
+    check_caller_fields(record)?;
     let body = render_evidence(record);
     let name = evidence_file_name(record.terminal_id, record.captured_at);
     let path =
@@ -632,6 +690,63 @@ mod tests {
         assert_eq!(mode, 0o600);
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn a_control_character_in_any_caller_field_is_refused_and_writes_nothing() {
+        for bad in ["a\nb", "a\rb", "a\u{0}b", "a\u{1b}b", "a\u{7f}b"] {
+            let cases: [(&str, Box<dyn Fn(&mut EvidenceRecord<'_>)>); 3] = [
+                (
+                    "launch_command",
+                    Box::new(move |r| r.launch_command = Some(bad)),
+                ),
+                (
+                    "config_dir",
+                    Box::new(move |r| r.account = Some((bad, "caller"))),
+                ),
+                (
+                    "pinned_session_id",
+                    Box::new(move |r| r.pinned_session_id = Some(bad)),
+                ),
+            ];
+            for (field, set) in cases {
+                let td = tempfile::tempdir().unwrap();
+                let dir = td.path().join("launch-evidence");
+                let mut rec = record(Some("claude"), None, b"x");
+                set(&mut rec);
+                let err = capture_into(&dir, &rec, |_| panic!("nothing to provision")).unwrap_err();
+                assert!(
+                    matches!(err, CaptureError::InvalidField { field: f, .. } if f == field),
+                    "{field} {bad:?}: {err:?}"
+                );
+                assert!(err.to_string().contains(field), "{err}");
+                assert!(!dir.exists(), "{field}: a refused capture wrote a file");
+            }
+        }
+        // The scrollback is fenced, so a newline there stays legal.
+        let td = tempfile::tempdir().unwrap();
+        assert!(capture_into(td.path(), &record(Some("claude"), None, b"a\nb"), |_| true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_evidence_dir_is_refused_and_its_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let target = td.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = td.path().join("launch-evidence");
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+
+        let err = capture_into(&dir, &record(Some("claude"), None, b"x"), |_| true).unwrap_err();
+        assert!(
+            matches!(&err, CaptureError::Io(m) if m.contains("is a symlink")),
+            "{err:?}"
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the symlink target was chmodded");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     }
 
     #[test]
