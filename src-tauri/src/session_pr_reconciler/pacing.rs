@@ -206,22 +206,27 @@ pub(super) fn plan_row_refresh(i: RowInputs, now: Instant) -> RowPlan {
         (a, b) => a.or(b),
     }
     .filter(|r| i.stale_before.is_none_or(|s| *r > s));
+    // An observation read before a closed-listing gap — or none at all (never
+    // read, or dropped as no longer open) — is never written to a row.
+    let fresh_observation = i
+        .read_at
+        .is_some_and(|r| i.stale_before.is_none_or(|s| r > s));
+    // A listing governs a row only through an observation it can serve. With
+    // none (a failed re-read after a gap, or a dropped open PR), a failed
+    // attempt must not read as governed-fresh: the row is paced by its
+    // per-row timer, so it is re-read after that interval instead of never.
+    let governed = i.governed_by_listing && fresh_observation;
     let due = status_refresh_due(
         i.class,
         last_read,
         i.first_closed_seen,
-        i.governed_by_listing,
+        governed,
         i.nudge,
         now,
     );
     if due == RefreshDue::Terminal {
         return RowPlan::SkipTerminal;
     }
-    // An observation read before a closed-listing gap is never written: the
-    // row falls to `Read` (its `last_read` was filtered out above).
-    let fresh_observation = i
-        .read_at
-        .is_some_and(|r| i.stale_before.is_none_or(|s| r > s));
     if let Some(observed) = i.observed_at.filter(|_| fresh_observation) {
         if i.applied_at.is_none_or(|applied| observed > applied) {
             return RowPlan::Apply;
@@ -692,7 +697,9 @@ pub(super) struct TickTally {
     pub skipped_fresh: usize,
     /// Discovery requests answered (charged or `304`).
     pub discovery_calls: usize,
-    /// Discoveries whose listing hit the paging bound (incomplete).
+    /// Discoveries whose listing hit the paging bound (incomplete) — the open
+    /// or the closed listing. An overflowed open listing counts even when the
+    /// closed listing was then deferred or failed.
     pub discovery_overflow: usize,
 }
 
@@ -1273,6 +1280,36 @@ mod tests {
         assert!(!memo.apply_discovery("o/r", open, t0, None, t0));
         assert_eq!(memo.prs_for_branch("o/r", "o", "new").len(), 1);
         assert!(memo.repos["o/r"].last_attempt.is_none());
+    }
+
+    /// A pre-gap observation whose re-read FAILED, in a repo a fresh, complete
+    /// listing governs, is neither written nor left Fresh forever: it is
+    /// paced by its per-row timer and re-read after the interval.
+    #[test]
+    fn a_failed_reread_after_a_gap_is_retried_on_the_per_row_timer() {
+        let t0 = Instant::now();
+        let mut memo = ReconcileMemo::default();
+        let session = Uuid::nil();
+        let key: PrKey = ("o/r".into(), 9);
+        memo.observe("o/r", pr(9, "closed", "o:y", "2026-11-19T09:00:00Z"), t0);
+        memo.mark_closed_gap("o/r", t0 + secs(1));
+        memo.note_attempt(key.clone(), t0 + secs(2)); // the re-read failed
+        let plan = |memo: &mut ReconcileMemo, now: Instant| {
+            memo.finish_discovery("o/r", &[], true, now); // governed throughout
+            assert!(memo.repos["o/r"].governs(now));
+            plan_row_refresh(
+                memo.row_inputs(session, &key, RowClass::ClosedMutable, Some(t0), false, now),
+                now,
+            )
+        };
+        // Neither applied (stale) nor locally re-probed (stale), nor re-read
+        // before its timer.
+        assert_eq!(plan(&mut memo, t0 + secs(3)), RowPlan::SkipFresh);
+        // After the per-row interval, re-read — not Fresh forever.
+        assert_eq!(
+            plan(&mut memo, t0 + secs(2) + CLOSED_REFRESH_EARLY),
+            RowPlan::Read
+        );
     }
 
     /// A pre-gap observation is never written to a row: the row is re-read.
