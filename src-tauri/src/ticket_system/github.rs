@@ -821,7 +821,7 @@ mod tests {
     async fn ticket_sync_reads_its_own_tokens_bucket() {
         // Exhaust the SHARED slot with another token's reading, so a regression
         // to reading it (rather than this token's bucket) defers and goes red.
-        let _global = github_budget::global_last_lock().await;
+        let _global = github_budget::global_last_lock();
         let mut empty = short_window();
         empty.remaining = Some(0);
         github_budget::seed_global_last_for_test(

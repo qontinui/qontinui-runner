@@ -1209,7 +1209,7 @@ mod tests {
         empty.remaining = Some(0);
         // Exhaust the SHARED slot too, so a regression to reading it (rather
         // than this credential's own bucket) defers and turns this red.
-        let _global = github_budget::global_last_lock().await;
+        let _global = github_budget::global_last_lock();
         github_budget::seed_global_last_for_test(&exhausted, &empty);
 
         let url = "http://127.0.0.1:1/probe/background-other-credential";
@@ -1291,7 +1291,7 @@ mod tests {
     /// `github_budget::global_last_lock` for its whole body.
     #[tokio::test]
     async fn a_background_rate_limited_refusal_is_typed_and_not_slept_on() {
-        let _global = github_budget::global_last_lock().await;
+        let _global = github_budget::global_last_lock();
         for (why, token, consumer, response) in [
             (
                 "429",
