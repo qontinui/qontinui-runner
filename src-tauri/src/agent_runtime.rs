@@ -9244,9 +9244,8 @@ async fn run_condition_check_terminal(
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
-    let launch_cfg = crate::session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
     // coord's launch decision for this check (`conditions/dispatch.rs`
     // `spawn_frame` stamps the same `launch_*` keys): model via
     // `LaunchSpec.model`; effort waits on qontinui-runner#2569.

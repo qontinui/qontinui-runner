@@ -102,8 +102,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process_capture::process_tree::{
-    inclusive_subtree_pids, is_countable_ai_cli, is_countable_claude, may_be_js_runtime_claude, ProcessSnapshot,
-    PID_REUSE_SKEW_MS,
+    inclusive_subtree_pids, is_countable_ai_cli, is_countable_claude, may_be_js_runtime_claude,
+    ProcessSnapshot, PID_REUSE_SKEW_MS,
 };
 use crate::session::claude_activity::{self, LivePid, RecordDepth, RecordReading};
 use crate::terminal::close_authority::CloseAuthority;
