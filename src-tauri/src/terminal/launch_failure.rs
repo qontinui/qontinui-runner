@@ -31,8 +31,21 @@
 //! 2. no SessionStart hook stamped the row at or after the terminal's
 //!    `created_at`, which is read from an EXACT terminal-id match only;
 //! 3. the liveness poll saw no live Claude in the pane at or after the failure
-//!    (`last_alive_at`, written only by the poll's KeepAlive — a `record_open`
-//!    re-open is bookkeeping, not liveness).
+//!    (`last_alive_at`, written only by the poll's KeepAlive arm through
+//!    [`LaunchFailureRegistry::note_alive`] — a `record_open` re-open is
+//!    bookkeeping, not liveness, and `touch` bumps only `last_seen_at`).
+//!
+//! Liveness lives in this registry's memory, keyed by `claude_session_id`,
+//! not on the persisted row (plan
+//! `2026-11-10-shim-settle-wait-and-in-memory-launch-liveness`, D1). It only
+//! ever NEGATES evidence this registry holds, and that evidence is in memory
+//! too: after a runner restart there is no launch-failure entry and no prior
+//! close, so the verdict keeps the proposed reason whatever a persisted stamp
+//! would say. A stamp that negates evidence is at or after that evidence, and
+//! both age out on the same [`ENTRY_TTL_MS`], so under the TTL a stamp outlives
+//! what it negates. The two live in separate [`MAX_ENTRIES`] LRUs, so a stamp
+//! can still be evicted first once more than that many sessions are noted
+//! alive inside one TTL; the residual is a wrong but restorable `launch-failed`.
 //!
 //! The re-close rule: `record_open` clears a row's close reason when it
 //! re-opens it, so this registry also remembers, per session, when this
@@ -158,7 +171,9 @@ pub struct PriorClose<'a> {
 /// - `failure`: the row's terminal's launch-failure entry, if any;
 /// - `terminal_created_at_ms`: that terminal's spawn time, from an EXACT
 ///   terminal-id match only (`None` when no such match was made);
-/// - `last_session_start_at` / `last_alive_at`: the row's own stamps.
+/// - `last_session_start_at`: the row's own SessionStart-hook stamp;
+/// - `last_alive_at`: the poll's last KeepAlive for the row's session, read
+///   from the registry ([`LaunchFailureRegistry::note_alive`]).
 pub fn close_reason_for_launch<'a>(
     proposed: &'a str,
     prior_reason: Option<PriorClose<'_>>,
@@ -213,8 +228,9 @@ pub struct LaunchCloseVerdict<'a> {
     pub evidence: Option<String>,
 }
 
-/// The latest launch failure each terminal's shim reported, and the sessions
-/// this process closed `launch-failed`. Bounded and aged: see the module docs.
+/// The latest launch failure each terminal's shim reported, the sessions this
+/// process closed `launch-failed`, and when the liveness poll last saw each
+/// session alive. Bounded and aged: see the module docs.
 #[derive(Debug)]
 pub struct LaunchFailureRegistry {
     ttl_ms: i64,
@@ -222,6 +238,10 @@ pub struct LaunchFailureRegistry {
     /// `claude_session_id` → when this process closed that row
     /// `launch-failed`: the re-close rule's memory across a re-open.
     launch_failed_closes: Mutex<LruCache<String, i64>>,
+    /// `claude_session_id` → the poll's last KeepAlive for that session (unix
+    /// millis): D3 condition 3 and the re-close rule's liveness. Written only
+    /// by [`Self::note_alive`].
+    alive: Mutex<LruCache<String, i64>>,
 }
 
 impl Default for LaunchFailureRegistry {
@@ -236,7 +256,27 @@ impl LaunchFailureRegistry {
             ttl_ms: ENTRY_TTL_MS,
             by_terminal: Mutex::new(LruCache::new(MAX_ENTRIES)),
             launch_failed_closes: Mutex::new(LruCache::new(MAX_ENTRIES)),
+            alive: Mutex::new(LruCache::new(MAX_ENTRIES)),
         }
+    }
+
+    /// The liveness poll SAW a live Claude for `claude_session_id` at
+    /// `now_ms`. Its one production caller is the poll's `KeepAlive` arm in
+    /// `main.rs`: a re-open (`record_open`) or a `touch` proves nothing ran.
+    pub fn note_alive(&self, claude_session_id: &str, now_ms: i64) {
+        lock(&self.alive).put(claude_session_id.to_string(), now_ms);
+    }
+
+    /// The last [`Self::note_alive`] for `claude_session_id`, while it is no
+    /// older than the TTL. An expired stamp is dropped on read.
+    fn last_alive(&self, claude_session_id: &str, now_ms: i64) -> Option<i64> {
+        fresh(
+            &mut lock(&self.alive),
+            claude_session_id,
+            now_ms,
+            self.ttl_ms,
+            |at| *at,
+        )
     }
 
     /// Remember the failure a beacon reports for `terminal_id`, replacing any
@@ -269,7 +309,8 @@ impl LaunchFailureRegistry {
     }
 
     /// The verdict for one death close of `rec`: [`close_reason_for_launch`]
-    /// fed from this registry and the row's own stamps. Pure apart from the
+    /// fed from this registry (failure, prior close, liveness) and the row's
+    /// SessionStart stamp. Pure apart from the
     /// reads; [`Self::settle`] records the outcome once the close has landed.
     pub fn verdict<'a>(
         &self,
@@ -295,7 +336,7 @@ impl LaunchFailureRegistry {
             failure.as_ref(),
             terminal_created_at_ms,
             rec.last_session_start_at,
-            rec.last_alive_at,
+            self.last_alive(&rec.claude_session_id, now_ms),
         );
         let evidence = (reason != proposed).then(|| {
             let mut parts = Vec::with_capacity(2);
@@ -408,7 +449,8 @@ pub fn close_dead_row(
 
 static REGISTRY: LazyLock<LaunchFailureRegistry> = LazyLock::new(LaunchFailureRegistry::new);
 
-/// This process's registry: `/control/shim-beacon` writes it, and the two
+/// This process's registry: `/control/shim-beacon` writes its failures, the
+/// lifecycle poll's `KeepAlive` arm writes its liveness, and the two
 /// death-close writers read it.
 pub fn registry() -> &'static LaunchFailureRegistry {
     &REGISTRY
@@ -773,28 +815,149 @@ mod tests {
 
     const RESUME_FAILED: &str = "waited=10 stub=false settings=true user_session_id=true";
 
-    /// `last_alive_at` is liveness, not bookkeeping: the poll's KeepAlive
-    /// `touch` writes it, and `record_open` — a new row or a re-open — never
-    /// does.
+    /// Liveness is the poll's KeepAlive, noted in the registry, and nothing
+    /// else. A session noted alive after its pane's launch failure closes
+    /// `poll-dead`; the same row with no note closes `launch-failed`, so the
+    /// note is what decided it. Through the GLOBAL registry the store's own
+    /// writers read: `record_open` (a new row, then a re-open) and `touch` leave
+    /// a session's liveness unread, so the verdict still closes it
+    /// `launch-failed`.
     #[test]
-    fn last_alive_at_is_written_by_touch_and_never_by_record_open() {
+    fn liveness_is_noted_by_the_keepalive_and_never_by_record_open_or_touch() {
         let _amb = crate::test_env::isolated_ambient();
         let (_dir, store) = open_store();
-        store.record_open(TerminalSessionRecord {
-            last_alive_at: Some(42),
-            ..test_open_record("s")
-        });
-        assert_eq!(store.get("s").unwrap().last_alive_at, None);
-        let before = chrono::Utc::now().timestamp_millis();
-        store.touch("s");
-        let alive = store
-            .get("s")
-            .unwrap()
-            .last_alive_at
-            .expect("touch stamps liveness");
-        assert!(alive >= before);
-        store.record_open(test_open_record("s"));
-        assert_eq!(store.get("s").unwrap().last_alive_at, Some(alive));
+        let now = chrono::Utc::now().timestamp_millis();
+        let created = now - 60_000;
+        let failed = created + 9_624;
+
+        // A local registry: note_alive after the failure negates it.
+        let local = LaunchFailureRegistry::new();
+        let (alive_id, alive_term) = ("sess-noted-alive", "term-noted-alive");
+        let (quiet_id, quiet_term) = ("sess-never-noted", "term-never-noted");
+        for (id, term) in [(alive_id, alive_term), (quiet_id, quiet_term)] {
+            store.record_open(resumed_row(id, term, created - 3_600_000));
+            local.record_beacon(Some(term), "resolve-failed", RESUME_FAILED, failed);
+        }
+        local.note_alive(alive_id, failed + 1);
+        assert_eq!(local.last_alive(alive_id, now), Some(failed + 1));
+        assert_eq!(local.last_alive(alive_term, now), None, "keyed by session");
+        let alive_pane = live_terminal(alive_term, "page-1", "Claude a", "/w", created);
+        let quiet_pane = live_terminal(quiet_term, "page-1", "Claude q", "/w", created);
+        let live_by_id: HashMap<&str, &TerminalInfo> =
+            [(alive_term, &alive_pane), (quiet_term, &quiet_pane)]
+                .into_iter()
+                .collect();
+        let (reason, _) = close_dead_row(
+            &store,
+            &local,
+            &store.get(alive_id).unwrap(),
+            &live_by_id,
+            now,
+        );
+        assert_eq!(reason, "poll-dead", "seen alive after the failure");
+        let (reason, _) = close_dead_row(
+            &store,
+            &local,
+            &store.get(quiet_id).unwrap(),
+            &live_by_id,
+            now,
+        );
+        assert_eq!(reason, "launch-failed", "the same evidence with no note");
+
+        // The global registry: the store's writers never note liveness.
+        let tag = uuid::Uuid::new_v4();
+        let (id, term) = (format!("sess-global-{tag}"), format!("term-global-{tag}"));
+        registry().record_beacon(Some(&term), "resolve-failed", RESUME_FAILED, failed);
+        store.record_open(resumed_row(&id, &term, created - 3_600_000));
+        store.record_open(resumed_row(&id, &term, created - 3_600_000));
+        store.touch(&id);
+        let later = chrono::Utc::now().timestamp_millis();
+        assert_eq!(registry().last_alive(&id, later), None);
+        assert_eq!(
+            registry()
+                .verdict("poll-dead", &store.get(&id).unwrap(), Some(created), later)
+                .reason,
+            "launch-failed"
+        );
+    }
+
+    /// A liveness stamp noted after a failure is readable for as long as that
+    /// failure's entry is: both age out on the same TTL, and the stamp is the
+    /// later of the two, so it never expires before the evidence it negates.
+    #[test]
+    fn an_alive_stamp_outlives_the_failure_it_negates() {
+        let reg = LaunchFailureRegistry::new();
+        reg.record_beacon(Some("term-ttl"), "resolve-failed", RESUME_FAILED, FAILED);
+        reg.note_alive("sess-ttl", FAILED);
+        let rec = resumed_row("sess-ttl", "term-ttl", HOOK);
+        for at in [
+            FAILED,
+            FAILED + 1,
+            FAILED + ENTRY_TTL_MS - 1,
+            FAILED + ENTRY_TTL_MS,
+        ] {
+            assert!(reg.get("term-ttl", at).is_some(), "failure at {at}");
+            assert_eq!(
+                reg.last_alive("sess-ttl", at),
+                Some(FAILED),
+                "alive at {at}"
+            );
+            assert_eq!(
+                reg.verdict("poll-dead", &rec, Some(CREATED), at).reason,
+                "poll-dead",
+                "at {at}"
+            );
+        }
+        let past = FAILED + ENTRY_TTL_MS + 1;
+        assert_eq!(reg.get("term-ttl", past), None);
+        assert_eq!(reg.last_alive("sess-ttl", past), None, "dropped on read");
+    }
+
+    /// The registry's liveness has exactly one production writer: the
+    /// lifecycle poll's `KeepAlive` arm in `main.rs`. Read the way
+    /// `observation_epoch`'s census reads that loop: one `.note_alive(` call in
+    /// `main.rs`, and it sits between `PollAction::KeepAlive =>` and the next
+    /// arm, `PollAction::NeedsConfirm =>`.
+    #[test]
+    fn the_keepalive_arm_is_the_one_liveness_writer() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Every production `.note_alive(` call outside this module, across src/.
+        let mut writers: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !path.ends_with("terminal/launch_failure.rs")
+                {
+                    let body = std::fs::read_to_string(&path).unwrap();
+                    for _ in body.match_indices(".note_alive(") {
+                        writers.push(path.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            writers,
+            vec![src.join("main.rs")],
+            "exactly one note_alive call outside launch_failure.rs, in main.rs"
+        );
+        let main_rs = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        let call = main_rs.find(".note_alive(").unwrap();
+        let keep_alive = main_rs
+            .find("PollAction::KeepAlive =>")
+            .expect("the poll's KeepAlive arm");
+        let needs_confirm = keep_alive
+            + main_rs
+                .get(keep_alive..)
+                .and_then(|rest| rest.find("PollAction::NeedsConfirm =>"))
+                .expect("the arm after KeepAlive");
+        assert!(
+            keep_alive < call && call < needs_confirm,
+            "note_alive sits in the KeepAlive arm"
+        );
     }
 
     /// The incident's sequence through the calls the poll's `Close` arm makes:
@@ -838,7 +1001,11 @@ mod tests {
             (reopened.state.as_str(), reopened.close_reason.as_deref()),
             ("open", None)
         );
-        assert_eq!(reopened.last_alive_at, None, "a re-open is not liveness");
+        assert_eq!(
+            registry.last_alive(id, first_at),
+            None,
+            "a re-open is not liveness"
+        );
         let second_at = first_at + 22 * 60_000 + 35_377;
         for created_at in [Some(created), None] {
             assert_eq!(
@@ -856,6 +1023,29 @@ mod tests {
             store.get(id).unwrap().close_reason.as_deref(),
             Some("launch-failed")
         );
+    }
+
+    /// The bash identity shim's literal `resolve-failed` body, through the
+    /// route's body ([`note_shim_beacon`]): recorded against its terminal with
+    /// exactly the flags the decider reads.
+    #[cfg(unix)]
+    #[test]
+    fn the_shims_resolve_failed_body_is_recorded_with_the_deciders_flags() {
+        use crate::install_effects_producer::intercept::shim_test_support::RESOLVE_FAILED_BODY;
+        use crate::install_effects_producer::{note_shim_beacon, ShimBeaconRequest};
+
+        let req: ShimBeaconRequest = serde_json::from_str(RESOLVE_FAILED_BODY).unwrap();
+        let registry = LaunchFailureRegistry::new();
+        let noted = note_shim_beacon(&registry, &req, 1_000);
+        let expected = LaunchFailure {
+            event: "resolve-failed".to_string(),
+            detail: "waited=1 stub=false settings=true user_session_id=true".to_string(),
+            settings: true,
+            user_chose_session: true,
+            at_ms: 1_000,
+        };
+        assert_eq!(noted.as_ref(), Some(&expected));
+        assert_eq!(registry.get("term-launch", 1_000), Some(expected));
     }
 
     /// A live terminal in the poll's index, as `TerminalManager::list` reports it.

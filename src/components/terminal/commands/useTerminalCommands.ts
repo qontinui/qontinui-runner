@@ -63,6 +63,7 @@ import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
+import { parseLayoutOriginArg, predictLayoutOrigin, reportLayoutOrigin } from "../zoneAutoTrim";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import { describeThrown } from "@/lib/utils";
@@ -240,6 +241,11 @@ const SCHEMA = {
     // Declared as a FLAG so it never shifts `preset`. Absent → the page the
     // operator is viewing; present → that page, which need not be on screen.
     "--page": "string (optional terminal page id; defaults to the active page)",
+    // Who is choosing (`zoneAutoTrim.ts` `LayoutOrigin`). Absent → `operator`,
+    // a layout auto-trim never shrinks. `auto` hands the page to the runner,
+    // which then trims it when tabs close — what `/triage-sessions` sends when
+    // it trims a page that predates the origin field (`legacy`).
+    "--origin": 'string (optional; "operator" (default) or "auto")',
   },
   mode: { mode: `string (optional) — one of ${WORK_MODE_NAMES.join(", ")}; omitted toggles` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
@@ -1067,6 +1073,31 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         );
       }
       const { zoneLayout: targetLayout, tabs: targetTabs } = target;
+      // The request source. Only `operator` and `auto` are a caller's to send:
+      // `restore` is the mount path's, and keeps whatever origin is stored.
+      const originArg = readTextArg(args, "origin");
+      if (originArg.kind === "invalid") {
+        return fail("invalid-origin", '--origin needs "operator" or "auto"');
+      }
+      const source =
+        originArg.kind === "text" ? parseLayoutOriginArg(originArg.text) : ("operator" as const);
+      if (source === null) {
+        return fail(
+          "invalid-origin",
+          `origin must be "operator" or "auto" (got "${originArg.kind === "text" ? originArg.text : ""}")`,
+        );
+      }
+      // An `auto` request is a no-op in tmux mode (`useZoneLayout::setLayoutId`:
+      // only an operator request means "give me a grid"). Reporting `✓` over a
+      // page that did not move is the dishonest verdict this handler exists to
+      // avoid, so it is refused, naming the request that would work.
+      if (source === "auto" && targetLayout.workMode === "tmux") {
+        return fail(
+          "tmux-mode",
+          "the page is in tmux work mode, which an auto-origin layout request does not leave; " +
+            "send origin operator to take it back to a grid",
+        );
+      }
       // Observed pre-state, read off `layoutId` (the STATE `setLayoutId`
       // writes) rather than `layout.id` (derived, and synthesized for the
       // past-9 flow grid).
@@ -1109,15 +1140,40 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
-      targetLayout.setLayoutId(normalized, { source: "operator" });
+      // Read before the request, as the hook's rule is: an `auto` request
+      // takes the page only when it changes the layout id.
+      const originBefore = reportLayoutOrigin(targetLayout.layoutOrigin);
+      const originAfter = predictLayoutOrigin(targetLayout, normalized, source);
+      targetLayout.setLayoutId(normalized, { source });
       const layoutDetail =
         grown !== null
           ? `grew to ${grown} — ${targetTabs.length} sessions do not fit ${normalized}`
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;
-      const detail = leftTmux ? `left tmux mode — ${layoutDetail}` : layoutDetail;
-      return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
+      // Whether the runner may trim the page is a change of its own, in either
+      // direction: an `auto` request that takes the page hands it to the
+      // runner, and an operator request re-asserting an `auto` page's own
+      // layout takes it back (it never trims again). Both are named, and both
+      // count, even when the grid kept its preset. An `auto` request that
+      // re-asserts a page's own layout takes nothing, and saying
+      // "runner-owned" there would be a success that did not happen. A
+      // `legacy` page already reads as `operator` to the trim, so an operator
+      // request over one changes nothing worth naming.
+      const trimmableBefore = originBefore === "auto";
+      const trimmableAfter = originAfter === "auto";
+      const ownership =
+        source === "auto"
+          ? trimmableAfter
+            ? "; runner-owned (auto-trims)"
+            : `; origin kept (${originAfter}) — an auto request does not take a layout it leaves unchanged`
+          : trimmableBefore
+            ? "; origin operator (no longer auto-trims)"
+            : "";
+      const ownedDetail = `${layoutDetail}${ownership}`;
+      const detail = leftTmux ? `left tmux mode — ${ownedDetail}` : ownedDetail;
+      const handedOver = trimmableBefore !== trimmableAfter;
+      return ok(effect("changed", "layout", wasAlready && !handedOver ? 0 : 1, { detail }));
     },
   });
 

@@ -19,7 +19,9 @@
 //! 2. **a fresh worktree this allocation created** — it came from
 //!    `MaterializeOutcome::Worktrees` ([`TreeProvenance::FreshWorktree`]; a
 //!    `shared_branch` placement is the operator's canonical checkout and never
-//!    passes) AND it is the allocation root `<root>/<agent_id>/<repo>` that
+//!    passes — its switch is undone instead, by
+//!    [`super::shared_branch_restore`], see [`KeepReason::SharedBranchCheckout`])
+//!    AND it is the allocation root `<root>/<agent_id>/<repo>` that
 //!    [`super::canonical_paths::allocated_worktree_for_path`] names, under this
 //!    allocation's `agent_id`;
 //! 3. **a linked worktree** — [`super::census::probe_clone_rootness`] reads
@@ -59,8 +61,15 @@ pub(crate) enum TreeProvenance {
     /// cut from `canonical` — the checkout whose materialize lock guards it.
     FreshWorktree { canonical: PathBuf },
     /// coord's `shared_branch` placement: the path IS the canonical checkout,
-    /// switched onto an agent branch. Never removed.
-    SharedBranch,
+    /// switched from `prior_ref` onto agent `branch`, whose HEAD read
+    /// `switched_to_sha` right after the switch. Never removed; a refused
+    /// spawn instead puts the checkout back on `prior_ref` when the three
+    /// proofs of [`super::shared_branch_restore`] hold.
+    SharedBranch {
+        branch: String,
+        prior_ref: String,
+        switched_to_sha: String,
+    },
     /// Nothing recorded how the tree was placed (a test context, or a fresh
     /// worktree whose canonical checkout no longer resolves). Never removed.
     Unrecorded,
@@ -82,8 +91,8 @@ pub(crate) struct UnspawnedBase {
 pub(crate) enum KeepReason {
     /// The failure came after the child spawn; a live process may hold the tree.
     ChildStarted,
-    /// Not a fresh worktree of this allocation (shared-branch, unrecorded, or
-    /// not the allocation root under this agent id).
+    /// Not a fresh worktree of this allocation (unrecorded, or not the
+    /// allocation root under this agent id).
     NotFresh(String),
     /// `probe_clone_rootness` did not read `NotCloneRoot`.
     NotLinkedWorktree(CloneRootness),
@@ -104,6 +113,10 @@ pub(crate) enum KeepReason {
     /// A credential-helper install for this allocation was still running after
     /// the bounded wait and an abort; judging the tree under it is not safe.
     CredentialInstallUnsettled,
+    /// A `shared_branch` placement: the path is the canonical checkout, which
+    /// is never removed. Carries what the checkout restore did instead —
+    /// switched it back to its prior ref, or kept it and why.
+    SharedBranchCheckout(super::shared_branch_restore::RestoreOutcome),
 }
 
 /// The answer for one tree.
@@ -278,6 +291,18 @@ fn describe(why: &KeepReason) -> String {
              wait and an abort"
                 .into()
         }
+        KeepReason::SharedBranchCheckout(restore) => match restore {
+            super::shared_branch_restore::RestoreOutcome::Restored => {
+                "a shared_branch placement (the canonical checkout, never removed) — put back on \
+                 its prior ref"
+                    .into()
+            }
+            super::shared_branch_restore::RestoreOutcome::Kept(why) => format!(
+                "a shared_branch placement (the canonical checkout, never removed) — left on the \
+                 agent branch: {}",
+                why.describe()
+            ),
+        },
     }
 }
 
@@ -295,9 +320,19 @@ where
     }
     let canonical = match &base.provenance {
         TreeProvenance::FreshWorktree { canonical } => canonical.clone(),
-        TreeProvenance::SharedBranch => {
-            return TreeOutcome::Kept(KeepReason::NotFresh(
-                "a shared_branch placement — the path is the canonical checkout".into(),
+        TreeProvenance::SharedBranch {
+            branch,
+            prior_ref,
+            switched_to_sha,
+        } => {
+            return TreeOutcome::Kept(KeepReason::SharedBranchCheckout(
+                restore_shared_checkout(
+                    base.worktree_path.clone(),
+                    branch.clone(),
+                    prior_ref.clone(),
+                    switched_to_sha.clone(),
+                )
+                .await,
             ))
         }
         TreeProvenance::Unrecorded => {
@@ -331,6 +366,37 @@ where
     })
     .await
     .unwrap_or_else(|e| TreeOutcome::Kept(KeepReason::RemoveFailed(format!("task failed: {e}"))))
+}
+
+/// A `shared_branch` placement is never removed (the path IS the canonical
+/// checkout); instead the switch this allocation made is undone when
+/// [`super::shared_branch_restore`]'s proofs hold.
+///
+/// What excludes a concurrent shared-branch SWITCH of this checkout is the
+/// `canonical_checkout` lease, not a lock: `checkout_shared_branches` takes no
+/// in-process lock, and a peer's switch is refused by coord while the lease is
+/// held. The caller still holds that lease, because
+/// `IsolatedEditContext::remove_unspawned*` consume the context and its `Drop`
+/// releases the claims only after this returns. The checkout's materialize
+/// lock is held as well; it serializes this restore against the in-process
+/// work that does take it — a `git worktree add` cut from this checkout, and
+/// the exclude-block removal `Drop` and `release_repo` perform.
+async fn restore_shared_checkout(
+    checkout: PathBuf,
+    branch: String,
+    prior_ref: String,
+    switched_to_sha: String,
+) -> super::shared_branch_restore::RestoreOutcome {
+    use super::shared_branch_restore::{
+        restore_refused_shared_branch, RestoreKeep, RestoreOutcome,
+    };
+    let lock = super::checkout_materialize_lock(&checkout);
+    let _serialized = lock.lock().await;
+    tokio::task::spawn_blocking(move || {
+        restore_refused_shared_branch(&checkout, &branch, &prior_ref, &switched_to_sha)
+    })
+    .await
+    .unwrap_or_else(|e| RestoreOutcome::Kept(RestoreKeep::ReadFailed(format!("task failed: {e}"))))
 }
 
 /// The blocking body: every conjunct after provenance, then the removal.

@@ -298,27 +298,41 @@ async fn a_clone_root_is_kept() {
 /// Conjunct 2 (provenance), the vet's Why #4 shape: a `shared_branch` context
 /// whose "worktree" is the canonical checkout — here a clean LINKED worktree
 /// at `parent_sha`, laid out as an allocation root, so every OTHER conjunct
-/// passes. It is never removed.
+/// passes. It is never removed: the shared-branch arm hands it to the
+/// checkout restore instead, which here switched nothing (the checkout was
+/// already on the agent branch) and so leaves it exactly where it is.
 #[tokio::test]
 async fn a_shared_branch_context_is_kept_even_when_every_other_check_passes() {
     let fx = Fixture::new();
     let id = agent();
     let tree = fx.allocate(&id, "canon");
+    let branch = format!("agent/{id}-canon");
     let base = UnspawnedBase {
-        provenance: TreeProvenance::SharedBranch,
+        provenance: TreeProvenance::SharedBranch {
+            branch: branch.clone(),
+            prior_ref: branch.clone(),
+            switched_to_sha: fx.parent_sha.clone(),
+        },
         ..fx.fresh(&tree)
     };
 
     let report = run(&fx, &id, vec![base], false).await;
 
-    assert!(
-        matches!(
-            only_outcome(&report),
-            TreeOutcome::Kept(KeepReason::NotFresh(why)) if why.contains("shared_branch")
-        ),
+    assert_eq!(
+        only_outcome(&report),
+        &TreeOutcome::Kept(KeepReason::SharedBranchCheckout(
+            crate::agent_worktree::shared_branch_restore::RestoreOutcome::Kept(
+                crate::agent_worktree::shared_branch_restore::RestoreKeep::NothingSwitched
+            )
+        )),
         "{report:?}"
     );
     assert!(tree.exists());
+    assert_eq!(
+        git(&tree, &["symbolic-ref", "--short", "HEAD"]),
+        branch,
+        "nothing was switched, so nothing is undone"
+    );
     // Unrecorded provenance is kept the same way.
     let base = UnspawnedBase {
         provenance: TreeProvenance::Unrecorded,

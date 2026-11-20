@@ -141,8 +141,10 @@ default reached by falling through.
 A `semantic_resource` row keyed `plan:<stem>` is released only by the closeout
 that took it (`/implement-plan` Step 6 item 5, after item 4a retires the net and
 before item 7 stops the loop; or `/vet-imp` Step 5),
-through `scripts/plan-reserve-release.sh release`, which withdraws that plan's
-open `implement→ship safety net` first (at most about 90 s). Never release it by hand to get past
+through `scripts/plan-reserve-release.sh release --repo <owner/name>`, which withdraws that plan's
+open `implement→ship safety net` first (at most about 90 s), under the tenant
+proven to own the repo, and WITHHOLDS the release (exit 7 `RELEASE_WITHHELD`) when
+it cannot. Never release it by hand to get past
 this check: a `/claims/release` with the net still open clears it, and coord
 dispatches a duplicate `/implement-plan` onto finished work.
 

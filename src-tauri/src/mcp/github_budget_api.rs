@@ -692,6 +692,7 @@ mod tests {
             not_modified,
             rate_limited: 0,
             transport_error: 0,
+            deferred: 0,
             cache_effectiveness: None,
         }
     }
