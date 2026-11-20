@@ -807,18 +807,26 @@ async fn run_tick(
     let mut budget = TickBudget::default();
 
     // The login, once per credential per process: a conditional `GET /user`.
-    // Phase 4 keys the shared bucket by it. A credential that cannot answer
-    // (an installation token answers `403`) backs off rather than being
-    // re-asked every tick; a deferral is not a failure and is asked again.
+    // Phase 4 keys the shared bucket by it. Only a TERMINAL refusal (401/403 —
+    // a credential that cannot answer `/user`) starts the long back-off; a
+    // transport error or a 5xx is asked again next tick (at most one call per
+    // tick), and a deferral is not a failure at all.
     if crate::github_budget::login_lookup_due(client.credential()) {
         match budget.spend(|| client.authenticated_login()).await {
             Some(Ok(login)) => {
                 crate::github_budget::record_login(client.credential(), &login);
                 crate::github_budget::record_identity(token_source, Some(login));
             }
-            Some(Err(e)) => {
+            Some(Err(e)) if login_failure_is_terminal(&e) => {
                 crate::github_budget::record_login_failure(client.credential());
-                debug!("session-pr-reconciler: GET /user failed (login UNKNOWN, backing off): {e}");
+                debug!(
+                    "session-pr-reconciler: GET /user refused (login UNKNOWN, backing off): {e}"
+                );
+            }
+            Some(Err(e)) => {
+                debug!(
+                    "session-pr-reconciler: GET /user failed (login UNKNOWN, retry next tick): {e}"
+                );
             }
             None => {}
         }
@@ -934,6 +942,19 @@ async fn run_tick(
     );
 
     Ok(())
+}
+
+/// Does this `GET /user` failure mean the credential cannot answer it at all
+/// (a `401`/`403` — retrying is pointless for hours), as opposed to a transient
+/// failure (transport, `5xx`) worth asking again next tick? Pure.
+fn login_failure_is_terminal(e: &GhError) -> bool {
+    matches!(
+        e,
+        GhError::HttpStatus {
+            status: 401 | 403,
+            ..
+        }
+    )
 }
 
 /// The reconciler's GitHub client — BACKGROUND spend (plan 2026-10-30-…,
@@ -1882,12 +1903,29 @@ fn record_resolved_identity(source: &str, token: &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_a_terminal_refusal_starts_the_login_back_off() {
+        let status = |status| GhError::HttpStatus {
+            status,
+            message: String::new(),
+        };
+        assert!(login_failure_is_terminal(&status(401)));
+        assert!(login_failure_is_terminal(&status(403)));
+        assert!(!login_failure_is_terminal(&status(500)));
+        assert!(!login_failure_is_terminal(&status(502)));
+        assert!(!login_failure_is_terminal(&status(404)));
+        assert!(!login_failure_is_terminal(&GhError::Failed(
+            "transport".into()
+        )));
+        assert!(!login_failure_is_terminal(&GhError::RateLimited {
+            status: 429
+        }));
+    }
+
     fn a_deferral() -> GhError {
         GhError::Deferred(crate::github_budget::BudgetDeferral {
             credential: crate::github_budget::CredentialKey::of_token("t"),
-            remaining: 0,
-            limit: 5000,
-            reset_at_unix: 0,
+            reason: crate::github_budget::DeferralReason::RetryAfter { not_before_unix: 0 },
         })
     }
 
