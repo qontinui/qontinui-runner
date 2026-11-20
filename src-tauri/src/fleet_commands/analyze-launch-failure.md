@@ -61,7 +61,9 @@ the terminal id itself, use that instead.
 
 Read the file with the Read tool. It records the launch command (or
 `UNKNOWN (typed by hand)`), the account (a config dir), the pinned session id,
-the cwd, the LaunchFailureRegistry entry (or `none recorded`), the pane's
+the pane's spawn working directory (`spawn_cwd`; the shell may have changed
+directory since, so treat it as where the pane started, not where the failed
+command ran), the LaunchFailureRegistry entry (or `none recorded`), the pane's
 alive/exit state, the runner `buildId`/`gitSha`, and the last 256 KiB of
 ANSI-stripped scrollback.
 
@@ -130,7 +132,7 @@ RETRY_ACCT=$(cat <<'EOF_ACCT'
 EOF_ACCT
 )
 RETRY_CWD=$(cat <<'EOF_CWD'
-<cwd from evidence>
+<spawn_cwd from evidence, or empty when it reads UNKNOWN>
 EOF_CWD
 )
 export RETRY_CMD RETRY_ACCT RETRY_CWD
