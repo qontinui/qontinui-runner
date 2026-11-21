@@ -560,9 +560,10 @@ fn parse_component_action_target(
 
 /// The refusal for a snapshot target the runner does not serve. Only
 /// `control` and `sdk` exist: the `proxy:PORT` target addressed the runtime
-/// injection proxy, which was removed in `82d2e2174` (2026-03-14) and is
-/// served by nothing in the fleet, so a step still carrying it fails here
-/// naming the accepted targets instead of with a connection error.
+/// injection proxy, which was removed in `82d2e2174` (2026-03-14); no repo in
+/// the qontinui org serves it (searched all 53 repos' default branches,
+/// 2026-11-21), so a step still carrying it fails here naming the accepted
+/// targets instead of with a connection error.
 fn unknown_snapshot_target(target: &str) -> String {
     format!("Unknown snapshot target: '{target}'. Use 'control' or 'sdk'")
 }
@@ -1599,11 +1600,8 @@ impl UiBridgeHandler {
             .unwrap_or(serde_json::json!({}));
 
         // Fetch snapshot to find element ID matching criteria
-        let snapshot_target = step
-            .ui_bridge_snapshot_target
-            .as_deref()
-            .unwrap_or("control");
-        let snapshot_endpoint = match snapshot_endpoint(base_url, Some(snapshot_target)) {
+        let endpoint = match snapshot_endpoint(base_url, step.ui_bridge_snapshot_target.as_deref())
+        {
             Ok(e) => e,
             Err(e) => return StepHandlerResult::failure(e),
         };
@@ -1619,7 +1617,7 @@ impl UiBridgeHandler {
         };
 
         // Get snapshot and find matching element
-        let snapshot_resp = match client.get(&snapshot_endpoint).send().await {
+        let snapshot_resp = match client.get(&endpoint).send().await {
             Ok(r) => r,
             Err(e) => {
                 return StepHandlerResult::failure(format!("Failed to fetch snapshot: {}", e));
@@ -1815,11 +1813,8 @@ impl UiBridgeHandler {
             .and_then(|t| t.as_u64())
             .unwrap_or(5000);
 
-        let snapshot_target = step
-            .ui_bridge_snapshot_target
-            .as_deref()
-            .unwrap_or("control");
-        let snapshot_endpoint = match snapshot_endpoint(base_url, Some(snapshot_target)) {
+        let endpoint = match snapshot_endpoint(base_url, step.ui_bridge_snapshot_target.as_deref())
+        {
             Ok(e) => e,
             Err(e) => return StepHandlerResult::failure(e),
         };
@@ -1839,7 +1834,7 @@ impl UiBridgeHandler {
         let deadline = std::time::Duration::from_millis(timeout_ms);
 
         loop {
-            if let Ok(resp) = client.get(&snapshot_endpoint).send().await {
+            if let Ok(resp) = client.get(&endpoint).send().await {
                 if let Ok(snapshot) = resp.json::<serde_json::Value>().await {
                     let elements = snapshot
                         .get("data")
@@ -1919,11 +1914,8 @@ impl UiBridgeHandler {
         }
 
         // Fetch snapshot
-        let snapshot_target = step
-            .ui_bridge_snapshot_target
-            .as_deref()
-            .unwrap_or("control");
-        let snapshot_endpoint = match snapshot_endpoint(base_url, Some(snapshot_target)) {
+        let endpoint = match snapshot_endpoint(base_url, step.ui_bridge_snapshot_target.as_deref())
+        {
             Ok(e) => e,
             Err(e) => return StepHandlerResult::failure(e),
         };
@@ -1938,12 +1930,12 @@ impl UiBridgeHandler {
             }
         };
 
-        let snapshot_response = match client.get(&snapshot_endpoint).send().await {
+        let snapshot_response = match client.get(&endpoint).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 return StepHandlerResult::failure(format!(
                     "Failed to fetch snapshot from {}: {}",
-                    snapshot_endpoint, e
+                    endpoint, e
                 ));
             }
         };
