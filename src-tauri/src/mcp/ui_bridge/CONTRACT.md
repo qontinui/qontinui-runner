@@ -446,12 +446,17 @@ Two thread-through styles, mirroring the `tabId` split:
   disabled-state queries so the element id resolves in the right window's
   registry). Rust callers holding a label call `ui_bridge_request_sync_in_window`.
 - **Read/convenience family** — `find-by-text`, `click-by-text`,
-  `click-by-selector`, `read-value`, `type-into` (`elements.rs`) read an optional
+  `click-by-selector`, `type-into` (`elements.rs`) read an optional
   `windowLabel` **body** field and evaluate through
   `helpers::evaluate_js_expression_in_window`, which routes the IPC `page_evaluate`
   to that window (no main-window direct-eval fallback for pop-outs — that path is
   main-coupled). Omitting `windowLabel` is byte-identical to the single-window
   default. (Phase 4, plan 2026-06-07-multi-window-sdk-automation.)
+  `read-value` also reads the `windowLabel` body field, but evaluates no JS: it
+  dispatches the `read_value` IPC request (built by
+  `elements::read_value_ipc_payload`, which hoists `windowLabel` to the
+  chokepoint) to the SDK's `readValuePrimitive`. The relay
+  `/sdk/page/read-value` fallback builds its payload with the same helper.
   `type-into` is the one two-step member: it evaluates only a RESOLUTION
   expression, then dispatches the value mutation as `execute_action` `type`
   through `ui_bridge_request_sync_in_window` with the same label, so the SDK's
@@ -460,7 +465,7 @@ Two thread-through styles, mirroring the `tabId` split:
   than a 200 carrying `typed: false`, and the success payload is the SDK's
   declared `{typed, element}` plus `index` — the old `valueLength` field is
   gone; read a value back with `POST /control/page/read-value`.
-  Every member of this family (plus `POST /control/page/summary`) parses the
+  `click-by-text`, `click-by-selector` and `type-into` (plus `POST /control/page/summary`) parse the
   evaluated result through `helpers::parse_eval_result`. **An unparseable
   result is HTTP 500**, naming the route and echoing the offending text — it
   is a runner-side failure, not a result. These routes used to answer HTTP 200
@@ -468,14 +473,16 @@ Two thread-through styles, mirroring the `tabId` split:
   which told the caller the click had succeeded and named neither the route nor
   the cause. Note this arm is reachable in normal operation: the direct-WebView
   fallback in `evaluate_js_expression` returns whatever string the WebView
-  produced, including `undefined` from a swallowed exception.
+  produced, including `undefined` from a swallowed exception. `find-by-text`
+  is the exception: it still maps an unparseable result to an empty `matches`
+  array (HTTP 200, `count: 0`).
 
 > **Still open (deliberately, on this family):** a *resolved miss* —
 > `click-by-text` / `click-by-selector` finding no match — is still an HTTP 200
 > whose payload says `clicked: false`. `type-into` and `read-value` report a
 > miss as HTTP 400 (`read-value` delegates to the SDK's `readValuePrimitive`,
 > whose `ELEMENT_NOT_FOUND` the IPC envelope maps to 400). Aligning the
-> other three is a breaking change to an automation surface with cross-repo
+> other two is a breaking change to an automation surface with cross-repo
 > consumers (`@qontinui/ui-bridge`, `scripts/contract-smoke.ps1`,
 > `UI-BRIDGE-AUTOMATION.md`), so it needs its own change and a `contract-smoke`
 > run, not a drive-by.

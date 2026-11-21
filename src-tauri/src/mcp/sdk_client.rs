@@ -8495,7 +8495,11 @@ async fn handle_read_value(
             if let Some(refusal) = ipc_fallback_refusal(&e, "page/read-value") {
                 return Json(refusal);
             }
-            let payload = serde_json::json!({ "params": body });
+            // The SAME payload builder the direct `/control/page/read-value`
+            // handler uses, so both doors send one request shape: `windowLabel`
+            // hoisted to the top level (where `ui_bridge_request_sync` routes
+            // on it) and only the read params forwarded to `readValuePrimitive`.
+            let payload = crate::mcp::ui_bridge::elements::read_value_ipc_payload(&body);
             match ui_bridge_request_sync(&state, "read_value", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
