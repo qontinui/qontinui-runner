@@ -93,6 +93,36 @@ pub struct CliSessionContext {
     pub is_resume: bool,
 }
 
+/// The `(session_id, resume_id)` pair a runner-spawned `claude` CLI is
+/// launched with — EXACTLY ONE of the two is `Some`, always.
+///
+/// With a [`CliSessionContext`] the caller's id rides `--resume` or
+/// `--session-id`. Without one, this mints a fresh v4 uuid for `--session-id`
+/// rather than letting the CLI generate its own. The CLI would pick a random
+/// id either way, so nothing about the session changes — except that the id is
+/// now in the process's argv, where the fleet's session census
+/// (`session-census.sh`) reads it. An id-less runner `claude` is identified
+/// only through Claude Code's own `sessions/<pid>.json` record, and a live
+/// session can lose that record mid-life (plan
+/// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+/// Phase 2: measured on nilan, two stream-json sessions spawned through
+/// [`crate::claude_session::ClaudeSession::spawn`] with no id in argv). A row
+/// with no id is attributed to EVERY repo, so one such row makes every
+/// primary checkout look busy.
+///
+/// These spawns are not terminal panes, so no pane pin
+/// (`QONTINUI_PINNED_SESSION_ID`) exists for them: this is the only id minted
+/// for the process, not a second one.
+pub(crate) fn cli_session_pins(
+    cli_session_ctx: Option<&CliSessionContext>,
+) -> (Option<String>, Option<String>) {
+    match cli_session_ctx {
+        Some(ctx) if ctx.is_resume => (None, Some(ctx.cli_session_id.clone())),
+        Some(ctx) => (Some(ctx.cli_session_id.clone()), None),
+        None => (Some(uuid::Uuid::new_v4().to_string()), None),
+    }
+}
+
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawHandle;
 
@@ -435,24 +465,21 @@ fn run_claude_session_inline(
     }
 
     // CLI session ID for restart survival, fed to the seam as session/resume.
-    // --session-id pins a NEW session; --resume resumes a previous one.
-    let (session_id_pin, resume_id_pin) = match cli_session_ctx {
-        Some(ctx) if ctx.is_resume => {
-            info!(
-                "Resuming Claude CLI session {} for runner session {}",
-                ctx.cli_session_id, session_id
-            );
-            (None, Some(ctx.cli_session_id.clone()))
-        }
-        Some(ctx) => {
-            info!(
-                "Using Claude CLI session ID {} for runner session {}",
-                ctx.cli_session_id, session_id
-            );
-            (Some(ctx.cli_session_id.clone()), None)
-        }
-        None => (None, None),
-    };
+    // --session-id pins a NEW session; --resume resumes a previous one. With
+    // no caller context a fresh id is minted so argv always carries one
+    // (see `cli_session_pins`).
+    let (session_id_pin, resume_id_pin) = cli_session_pins(cli_session_ctx);
+    match (&session_id_pin, &resume_id_pin) {
+        (_, Some(resume)) => info!(
+            "Resuming Claude CLI session {} for runner session {}",
+            resume, session_id
+        ),
+        (Some(pin), None) => info!(
+            "Using Claude CLI session ID {} for runner session {}",
+            pin, session_id
+        ),
+        (None, None) => {}
+    }
 
     // ── Blueprint tool policy (Phase 3) ───────────────────────────────────
     // Translate the policy into CLI flags (--allowedTools/--disallowedTools)
@@ -2862,5 +2889,110 @@ mod spawn_env_tests {
             &cmd,
             "build_inline_child_command",
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_session_pin_tests {
+    //! Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    //! Phase 2: every runner-spawned stream-json `claude` carries exactly one
+    //! session id in argv. The argv is rendered through the real launch seam
+    //! and asserted as literal tokens.
+    use super::{cli_session_pins, CliSessionContext};
+    use crate::claude_session::launch_spec::{render_argv, LaunchConfig, LaunchSpec};
+
+    fn argv_for(ctx: Option<&CliSessionContext>) -> Vec<String> {
+        let (session_id, resume_id) = cli_session_pins(ctx);
+        let spec = LaunchSpec {
+            session_id,
+            resume_id,
+            extra_required: vec![
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--input-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+            ],
+            ..Default::default()
+        };
+        render_argv(&spec, &LaunchConfig::default(), "claude")
+    }
+
+    fn count(argv: &[String], flag: &str) -> usize {
+        argv.iter().filter(|a| a.as_str() == flag).count()
+    }
+
+    fn value_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let i = argv.iter().position(|a| a == flag)?;
+        argv.get(i + 1).map(String::as_str)
+    }
+
+    /// The measured nilan escape: a spawn with no CLI context used to render
+    /// neither flag. Now it carries exactly one `--session-id <uuid>`.
+    #[test]
+    fn a_spawn_without_context_carries_exactly_one_minted_session_id() {
+        let argv = argv_for(None);
+        assert_eq!(count(&argv, "--session-id"), 1, "argv: {argv:?}");
+        assert_eq!(count(&argv, "--resume"), 0, "argv: {argv:?}");
+        let id = value_after(&argv, "--session-id").expect("a value follows --session-id");
+        assert!(
+            uuid::Uuid::parse_str(id).is_ok(),
+            "the minted id must be a uuid, got {id:?}"
+        );
+        // Two spawns never share a minted id.
+        let other = argv_for(None);
+        assert_ne!(value_after(&other, "--session-id"), Some(id));
+    }
+
+    #[test]
+    fn a_new_session_context_rides_session_id_verbatim() {
+        let ctx = CliSessionContext {
+            cli_session_id: "0d476e97-7de4-429b-ad6b-e94b06a79511".to_string(),
+            is_resume: false,
+        };
+        let argv = argv_for(Some(&ctx));
+        assert_eq!(count(&argv, "--session-id"), 1, "argv: {argv:?}");
+        assert_eq!(count(&argv, "--resume"), 0, "argv: {argv:?}");
+        assert_eq!(
+            value_after(&argv, "--session-id"),
+            Some("0d476e97-7de4-429b-ad6b-e94b06a79511")
+        );
+    }
+
+    #[test]
+    fn a_resume_context_rides_resume_and_mints_nothing() {
+        let ctx = CliSessionContext {
+            cli_session_id: "52e88829-c137-421d-893a-b45feac50a00".to_string(),
+            is_resume: true,
+        };
+        let argv = argv_for(Some(&ctx));
+        assert_eq!(count(&argv, "--resume"), 1, "argv: {argv:?}");
+        assert_eq!(count(&argv, "--session-id"), 0, "argv: {argv:?}");
+        assert_eq!(
+            value_after(&argv, "--resume"),
+            Some("52e88829-c137-421d-893a-b45feac50a00")
+        );
+    }
+
+    /// Both stream-json spawn seams take their pins from `cli_session_pins`;
+    /// a seam that goes back to its own inline match can re-grow an id-less
+    /// arm and escape again.
+    #[test]
+    fn both_stream_json_spawn_seams_take_their_pins_from_the_shared_helper() {
+        for (name, src) in [
+            ("claude_session/session.rs", include_str!("session.rs")),
+            ("claude_session/runner.rs", include_str!("runner.rs")),
+        ] {
+            let code: String = src
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let needle = ["cli_session_pins", "(cli_session_ctx)"].concat();
+            assert!(
+                code.contains(&needle),
+                "{name} must derive its CLI pins through cli_session_pins"
+            );
+        }
     }
 }
