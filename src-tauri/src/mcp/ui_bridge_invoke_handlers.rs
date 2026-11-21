@@ -251,30 +251,44 @@ pub(crate) fn no_webview_rejection(
     if !server_mode {
         return None;
     }
+    let message = format!(
+        "invoke proxy: this runner was launched in server mode (QONTINUI_SERVER_MODE) \
+         and has no webview, so no frontend can answer the invoke of '{}'. This is not \
+         a timeout and will not succeed on retry.",
+        command
+    );
+    // The next action is the CLI pairing door; the detail keeps the
+    // diagnosis and the windowed-runner alternative.
+    let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+        SERVER_MODE_NO_WEBVIEW_CODE,
+        StatusCode::SERVICE_UNAVAILABLE,
+        None,
+        Some(
+            qontinui_types::refusal::NextAction::new(
+                qontinui_types::refusal::NextActionKind::RunCommand,
+            )
+            .with_target(SERVER_MODE_PAIR_COMMAND),
+        ),
+        None,
+    )
+    .with_detail(format!(
+        "{message} A server-mode runner reports frontendState \"window_missing\" at \
+         GET /health and never grows a window. For a webview-backed invoke, run a windowed \
+         runner (launch without QONTINUI_SERVER_MODE)."
+    ));
     Some((
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiResponse::<()>::error_with_code_and_suggestions(
-            format!(
-                "invoke proxy: this runner was launched in server mode (QONTINUI_SERVER_MODE) \
-                 and has no webview, so no frontend can answer the invoke of '{}'. This is not \
-                 a timeout and will not succeed on retry.",
-                command
-            ),
+        Json(ApiResponse::<()>::error_with_refusal(
+            message,
             SERVER_MODE_NO_WEBVIEW_CODE,
-            vec![
-                "Pair this runner over the CLI door instead of the UI: \
-                 `qontinui_profile device pair --pair-code <CODE>`"
-                    .to_string(),
-                "Confirm the diagnosis with `GET /health` — a server-mode runner reports \
-                 frontendState \"window_missing\" and never grows a window."
-                    .to_string(),
-                "If you need a webview-backed invoke, run a windowed runner (launch without \
-                 QONTINUI_SERVER_MODE)."
-                    .to_string(),
-            ],
+            refusal,
         )),
     ))
 }
+
+/// The CLI pairing door a server-mode runner is paired through — the
+/// refusal's `run_command` target.
+const SERVER_MODE_PAIR_COMMAND: &str = "qontinui_profile device pair --pair-code <CODE>";
 
 /// Build the in-process dispatch table and the list of names it covers from a
 /// SINGLE source.
@@ -1047,13 +1061,21 @@ mod server_mode_gate_tests {
             "the body must name the command that was refused: {error}"
         );
 
-        let suggestions = body.suggestions.expect("recovery suggestions present");
-        assert!(
-            suggestions
-                .iter()
-                .any(|s| s.contains("qontinui_profile device pair --pair-code <CODE>")),
-            "the caller must be pointed at the CLI pairing door: {suggestions:?}"
+        let refusal = body.refusal.expect("the refusal names the next action");
+        assert_eq!(
+            refusal.next_action.kind,
+            qontinui_types::refusal::NextActionKind::RunCommand
         );
+        assert_eq!(
+            refusal.next_action.target.as_deref(),
+            Some("qontinui_profile device pair --pair-code <CODE>"),
+            "the caller must be pointed at the CLI pairing door: {refusal:?}"
+        );
+        assert_eq!(
+            refusal.discriminator.as_deref(),
+            Some(SERVER_MODE_NO_WEBVIEW_CODE)
+        );
+        assert!(refusal.render().contains("qontinui_profile device pair"));
     }
 
     #[test]

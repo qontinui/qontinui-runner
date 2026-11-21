@@ -412,7 +412,7 @@ fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<Value>>) {
             error_detail: e.error_detail,
             hint: e.hint,
             code: e.code,
-            suggestions: e.suggestions,
+            refusal: e.refusal,
         }),
     )
 }

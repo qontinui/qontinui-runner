@@ -2932,7 +2932,7 @@ async fn sync_slash_commands_handler(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }))
         }
         Err(e) => {
