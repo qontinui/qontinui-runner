@@ -2465,6 +2465,36 @@ enum SpawnDecision {
     SkipRerouted {
         target_device_id: Option<uuid::Uuid>,
     },
+    /// Claim refused (HTTP 409 `{"error":"already_consumed","consumed_by",
+    /// "consumed_at","consumed_outcome"}`) → ANOTHER device already claimed
+    /// this continuation, and our claim is the loser's (typically a replayed
+    /// frame this device still held). The row is consumed on coord and belongs
+    /// to that device: SKIP the spawn, post NO outcome (coord's `consumed_by`
+    /// guard would refuse it) and NO deferral (coord stamps a deferral only on
+    /// an unconsumed row), and SEAL the local dispatch attempt exactly as the
+    /// [`SpawnDecision::Spawn`] arm does, so no replayed copy of this attempt
+    /// spawns. A legitimate re-drive arrives as a newer attempt and claims
+    /// afresh over the seal. Carries the consumer device when the body names
+    /// one as a UUID, for the INFO log only.
+    ///
+    /// Plan `2026-11-21-a-continuation-claim-from-a-second-device-is-answered-consumed-so-both-devices-spawn`,
+    /// D2.
+    SkipAlreadyConsumed { consumed_by: Option<uuid::Uuid> },
+    /// Claim refused (HTTP 409 with a JSON body whose `error` is a string this
+    /// build does not name — `expired`, `wrong_device`, or any refusal coord
+    /// adds later) → every 409 the consume route answers is a refusal by
+    /// contract, so a structured one this build cannot name is still a
+    /// refusal: SKIP the spawn, post NO outcome and NO deferral, and RELEASE
+    /// the local dispatch claim, because the row's state behind an unnamed
+    /// refusal is unknown and coord's stall watcher, not the runner, owns a row
+    /// that is refused forever. Carries the `error` string for the WARN log.
+    /// An empty or non-JSON 409 is NOT this: the runner cannot tell a refusal
+    /// from a proxy or transport artefact there, so it stays
+    /// [`SpawnDecision::SpawnDespiteClaimError`].
+    ///
+    /// Plan `2026-11-21-a-continuation-claim-from-a-second-device-is-answered-consumed-so-both-devices-spawn`,
+    /// D3.
+    SkipRefused { error: String },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
     /// (availability over consistency; the in-process dedupe still guards).
     /// Carries a human-readable cause for the WARN log.
@@ -2483,7 +2513,7 @@ enum SpawnDecision {
 /// PURE: fold the device drain into a claim decision. Only the "spawn anyway"
 /// arm changes; a clean `Spawn` (coord accepted the claim while the drain was
 /// clear enough to reach it) and every coord refusal (`SkipCancelled`,
-/// `SkipSuperseded`, `SkipRerouted`) are left alone — a refusal spawns nothing,
+/// `SkipSuperseded`, `SkipRerouted`, `SkipAlreadyConsumed`, `SkipRefused`) are left alone — a refusal spawns nothing,
 /// so there is nothing for the drain to pause.
 #[cfg(test)]
 fn apply_drain_to_claim(
@@ -2573,8 +2603,20 @@ fn continuation_drain_admission_for(
 ///   [`SpawnDecision::SkipRerouted`] (new target from `target_device_id`, when
 ///   it parses as a UUID). Without this arm the rerouted refusal fell into the
 ///   "any other 409" spawn-anyway branch below and double-spawned.
-/// - any other status (incl. a 409 that is NONE of those shapes) →
-///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
+/// - 409 with a JSON body whose `error == "already_consumed"` →
+///   [`SpawnDecision::SkipAlreadyConsumed`] (consumer from `consumed_by`, when
+///   it parses as a UUID). Another device won the first-claim-wins race.
+/// - 409 with a JSON body whose `error` is any OTHER string (`expired`,
+///   `wrong_device`, a refusal coord adds later) →
+///   [`SpawnDecision::SkipRefused`]. Every 409 on the consume route is a
+///   refusal by contract, so an unnamed structured one is still a refusal.
+/// - 409 with an empty / non-JSON body, or a JSON body with no string `error`,
+///   and any other non-2xx status → [`SpawnDecision::SpawnDespiteClaimError`]
+///   (availability over consistency: the runner cannot tell a refusal from a
+///   proxy or transport artefact there).
+///
+/// Plan `2026-11-21-a-continuation-claim-from-a-second-device-is-answered-consumed-so-both-devices-spawn`
+/// Phase 2 added the last two 409 arms.
 ///
 /// `status` is the HTTP status code; `body` is the response body text (may be
 /// empty / non-JSON — handled gracefully).
@@ -2611,10 +2653,27 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
                     .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 return SpawnDecision::SkipRerouted { target_device_id };
             }
+            // The lost-race shape: `{"error":"already_consumed","consumed_by":
+            // <uuid>,"consumed_at":<ts>,"consumed_outcome":<string>}`. Another
+            // device consumed the row first.
+            if v.get("error").and_then(|e| e.as_str()) == Some("already_consumed") {
+                let consumed_by = v
+                    .get("consumed_by")
+                    .and_then(|c| c.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                return SpawnDecision::SkipAlreadyConsumed { consumed_by };
+            }
+            // Any other structured refusal (`expired`, `wrong_device`, or one
+            // coord adds after this build): still a refusal, so skip.
+            if let Some(error) = v.get("error").and_then(|e| e.as_str()) {
+                return SpawnDecision::SkipRefused {
+                    error: error.to_string(),
+                };
+            }
         }
-        // A 409 that is none of the cancelled / superseded / rerouted contracts
-        // (e.g. some other conflict): proceed rather than silently drop the
-        // continuation.
+        // A 409 with no JSON body carrying a string `error` (empty, non-JSON,
+        // a proxy artefact): it cannot be told from a non-refusal, so proceed
+        // rather than silently drop the continuation.
         return SpawnDecision::SpawnDespiteClaimError {
             cause: format!(
                 "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
@@ -3155,12 +3214,29 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   the new target: the same availability-over-consistency trade every
 ///   claim-error path already makes, and reachable only through an in-flight
 ///   duplicate or a frame-only offline republish.
+/// * [`SpawnDecision::SkipAlreadyConsumed`] → **false**. Another device
+///   consumed the row, so it is not pending for us, and the arm SEALS the
+///   attempt rather than keeping or releasing it (see
+///   [`settle_claim_decision`]). The claim set is keyed by ATTEMPT and coord's
+///   re-drive increments it, so a legitimate re-delivery arrives as a newer
+///   attempt and claims afresh over the seal. Releasing would instead re-open
+///   this attempt to every replayed duplicate frame — the incident's own
+///   shape — and any such re-claim that then failed at transport would become
+///   [`SpawnDecision::SpawnDespiteClaimError`] and double-spawn (plan
+///   `2026-11-21-a-continuation-claim-from-a-second-device-is-answered-consumed-so-both-devices-spawn`
+///   D2).
+/// * [`SpawnDecision::SkipRefused`] → **true**. The refusal is one this build
+///   cannot name, so the row's state behind it is unknown; releasing costs at
+///   most one more claim coord refuses again, and coord's stall watcher owns a
+///   row refused forever (same plan, D3).
 ///
 /// The remaining decisions spawn or defer, so none is a skip: `false`.
 fn skip_leaves_row_pending(decision: &SpawnDecision) -> bool {
     matches!(
         decision,
-        SpawnDecision::SkipSuperseded { .. } | SpawnDecision::SkipRerouted { .. }
+        SpawnDecision::SkipSuperseded { .. }
+            | SpawnDecision::SkipRerouted { .. }
+            | SpawnDecision::SkipRefused { .. }
     )
 }
 
@@ -3314,6 +3390,42 @@ fn settle_claim_decision(
             // rather than incidental). No outcome and no deferred stamp: the
             // row now belongs to the new target, and a deferral from us would
             // write this device's pressure onto a row another device owns.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipAlreadyConsumed { consumed_by } => {
+            info!(
+                "agent_runtime: SkipAlreadyConsumed — continuation already consumed by \
+                 another device — skipping spawn, the row is not ours \
+                 (gate_id={gate_id} consumed_by={})",
+                consumed_by
+                    .as_ref()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "(not named)".to_string())
+            );
+            // SEALS, as the Spawn arm does: the row is consumed on coord, so
+            // no replayed copy of this attempt may spawn; a re-drive arrives
+            // as a newer attempt. `skip_leaves_row_pending` is false, so the
+            // settle below releases nothing — it is called so every skip arm
+            // goes through the one settle point. No outcome (the consumer's
+            // guard would refuse it) and no deferral (coord stamps one only on
+            // an unconsumed row).
+            if let ConsumeTarget::Gate(g, attempt) = consume_target {
+                seal_gate_dispatch_attempt(g, attempt);
+            }
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipRefused { error } => {
+            // WARN: an unnamed refusal means this build predates a coord
+            // contract — the skip is right, but the build is behind.
+            warn!(
+                "agent_runtime: continuation claim refused by coord with an error this \
+                 build does not name ({error}) — skipping spawn, row released locally \
+                 (gate_id={gate_id})"
+            );
+            // RELEASES: the row's state behind an unnamed refusal is unknown.
+            // No outcome and no deferral.
             settle_skipped_claim(decision, consume_target);
             ClaimOutcome::Skip
         }
@@ -6479,6 +6591,9 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// - 409 `{"error":"cancelled", cancel_reason}` → [`SpawnDecision::SkipCancelled`].
 /// - 409 `{"error":"superseded", winner_gate_id, …}` → [`SpawnDecision::SkipSuperseded`].
 /// - 409 `{"error":"rerouted", target_device_id, …}` → [`SpawnDecision::SkipRerouted`].
+/// - 409 `{"error":"already_consumed", consumed_by, …}` → [`SpawnDecision::SkipAlreadyConsumed`].
+/// - 409 with any other string `error` (`expired`, `wrong_device`, …) →
+///   [`SpawnDecision::SkipRefused`].
 /// - 5s timeout / network failure / any other non-2xx →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency —
 ///   preserves the pre-restructure behavior; the in-process dedupe still guards).
@@ -20225,7 +20340,7 @@ mod tests {
         // …and the WIRING: `settle_claim_decision` is the whole of step 2's
         // decision handling, so this drives the fn `run_gate_continuation_inner`
         // actually calls rather than a copy of a match arm. Outcome AND claim
-        // state, for all SIX variants — the superseded release is no longer a
+        // state, for all EIGHT variants — the superseded release is no longer a
         // deletable statement at an untested call site.
         let gate = uuid::Uuid::now_v7();
 
@@ -20292,6 +20407,82 @@ mod tests {
             "the rerouted id must be claimable again after the funnel settles it"
         );
         release_gate_dispatch(funnel_rerouted);
+
+        // The lost-race refusal (plan
+        // `2026-11-21-a-continuation-claim-from-a-second-device-is-answered-consumed-so-both-devices-spawn`
+        // D2): another device consumed the row. It must SKIP, and it SEALS the
+        // attempt like an accepted claim — a replayed copy of the SAME attempt
+        // is not re-claimable, while a re-drive at attempt+1 is.
+        let consumer = uuid::Uuid::now_v7();
+        let already_consumed = decide_spawn(
+            409,
+            &format!(r#"{{"error":"already_consumed","consumed_by":"{consumer}"}}"#),
+        );
+        assert_eq!(
+            already_consumed,
+            SpawnDecision::SkipAlreadyConsumed {
+                consumed_by: Some(consumer)
+            }
+        );
+        assert!(
+            !skip_leaves_row_pending(&already_consumed),
+            "an already-consumed row is not pending for this device"
+        );
+        let funnel_consumed = uuid::Uuid::now_v7();
+        const K: u32 = 3;
+        assert!(claim_gate_dispatch_attempt(funnel_consumed, K));
+        assert_eq!(
+            settle_claim_decision(
+                &already_consumed,
+                ConsumeTarget::Gate(funnel_consumed, K),
+                gate
+            ),
+            ClaimOutcome::Skip,
+            "an already-consumed claim refusal must not spawn"
+        );
+        // A later error-path release must not re-open a seal.
+        release_gate_dispatch_attempt(funnel_consumed, K);
+        assert_eq!(
+            try_claim_gate_dispatch_attempt(funnel_consumed, K),
+            GateClaimAttempt::Lost {
+                held_attempt: K,
+                held_state: GateClaimState::Sealed,
+                after_listing: false,
+            },
+            "a replayed frame of the SAME attempt must not re-claim after already_consumed \
+             — the attempt is sealed, not released"
+        );
+        assert!(
+            claim_gate_dispatch_attempt(funnel_consumed, K + 1),
+            "a coord re-drive (attempt+1) claims afresh over the seal"
+        );
+        release_gate_dispatch_attempt(funnel_consumed, K + 1);
+
+        // The unnamed structured refusal (same plan, D3): skips and RELEASES,
+        // because the row's state behind it is unknown.
+        let refused = decide_spawn(409, r#"{"error":"expired","expired_reason":"stale"}"#);
+        assert_eq!(
+            refused,
+            SpawnDecision::SkipRefused {
+                error: "expired".into()
+            }
+        );
+        assert!(
+            skip_leaves_row_pending(&refused),
+            "an unnamed refusal releases: the row's state is unknown"
+        );
+        let funnel_refused = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(funnel_refused));
+        assert_eq!(
+            settle_claim_decision(&refused, ConsumeTarget::Gate(funnel_refused, 0), gate),
+            ClaimOutcome::Skip,
+            "a structured refusal must not spawn"
+        );
+        assert!(
+            claim_gate_dispatch(funnel_refused),
+            "the refused id must be claimable again after the funnel settles it"
+        );
+        release_gate_dispatch(funnel_refused);
 
         // The two decisions that are not skips: both reach the spawn, and
         // neither releases — the claim they hold is the dedupe for the spawn
@@ -23004,13 +23195,73 @@ mod tests {
         );
     }
 
-    /// 409 that is NOT the cancelled contract (e.g. `already_consumed`) →
-    /// proceed rather than silently drop (availability over consistency).
+    /// 409 `already_consumed` → SkipAlreadyConsumed. Another device won the
+    /// first-claim-wins race; spawning here (what the old catch-all did, and
+    /// what this test used to pin) is the double spawn of gate `3450eb08`.
+    /// The consumer is carried only when it parses as a UUID — the refusal is
+    /// authoritative either way (plan
+    /// `2026-11-21-a-continuation-claim-from-a-second-device-is-answered-consumed-so-both-devices-spawn`).
     #[test]
-    fn decide_spawn_on_409_non_cancelled_proceeds() {
-        match decide_spawn(409, r#"{"error":"already_consumed"}"#) {
-            SpawnDecision::SpawnDespiteClaimError { .. } => {}
-            other => panic!("expected SpawnDespiteClaimError, got {other:?}"),
+    fn decide_spawn_on_409_already_consumed_skips() {
+        let winner = uuid::Uuid::now_v7();
+        assert_eq!(
+            decide_spawn(
+                409,
+                &format!(
+                    r#"{{"error":"already_consumed","consumed_by":"{winner}","consumed_at":"2026-11-21T00:53:43Z","consumed_outcome":"spawned"}}"#
+                )
+            ),
+            SpawnDecision::SkipAlreadyConsumed {
+                consumed_by: Some(winner)
+            }
+        );
+        for body in [
+            r#"{"error":"already_consumed"}"#,
+            r#"{"error":"already_consumed","consumed_by":42}"#,
+            r#"{"error":"already_consumed","consumed_by":null}"#,
+            r#"{"error":"already_consumed","consumed_by":"not-a-uuid"}"#,
+        ] {
+            assert_eq!(
+                decide_spawn(409, body),
+                SpawnDecision::SkipAlreadyConsumed { consumed_by: None },
+                "{body}"
+            );
+        }
+    }
+
+    /// 409 with a structured refusal this build does not name → SkipRefused,
+    /// with the `error` string preserved. Every 409 on the consume route is a
+    /// refusal by contract, so `expired` (which double-spawned before this
+    /// arm), plan 11-19's `wrong_device`, and any later refusal all skip.
+    #[test]
+    fn decide_spawn_on_409_structured_unknown_refusal_skips() {
+        for (body, error) in [
+            (
+                r#"{"error":"expired","expired_reason":"stale","target_device_id":null}"#,
+                "expired",
+            ),
+            (r#"{"error":"wrong_device"}"#, "wrong_device"),
+            (r#"{"error":"some_future_refusal"}"#, "some_future_refusal"),
+        ] {
+            assert_eq!(
+                decide_spawn(409, body),
+                SpawnDecision::SkipRefused {
+                    error: error.to_string()
+                },
+                "{body}"
+            );
+        }
+    }
+
+    /// 409 whose JSON body carries no STRING `error` → proceed: it cannot be
+    /// told from a non-refusal artefact, so availability over consistency.
+    #[test]
+    fn decide_spawn_on_409_json_without_string_error_proceeds() {
+        for body in [r#"{"error":42}"#, "{}", r#"{"error":null}"#, "[]"] {
+            match decide_spawn(409, body) {
+                SpawnDecision::SpawnDespiteClaimError { .. } => {}
+                other => panic!("{body}: expected SpawnDespiteClaimError, got {other:?}"),
+            }
         }
     }
 
@@ -23918,6 +24169,17 @@ mod drain_claim_tests {
                 apply_drain_to_claim(decide_spawn(409, r#"{"error":"rerouted"}"#), &state),
                 SpawnDecision::SkipRerouted {
                     target_device_id: None
+                }
+            );
+            // Nor the lost-race or unnamed refusals: both spawn nothing.
+            assert_eq!(
+                apply_drain_to_claim(decide_spawn(409, r#"{"error":"already_consumed"}"#), &state),
+                SpawnDecision::SkipAlreadyConsumed { consumed_by: None }
+            );
+            assert_eq!(
+                apply_drain_to_claim(decide_spawn(409, r#"{"error":"expired"}"#), &state),
+                SpawnDecision::SkipRefused {
+                    error: "expired".into()
                 }
             );
         }
