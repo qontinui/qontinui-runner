@@ -498,48 +498,29 @@ pub(crate) fn score_options_via_cli(
 // scorer above (shared `build_print_command` / `run_print_child`).
 
 /// The tool set a structured one-shot may use.
+///
+/// Neither mode includes `Bash`, or any other tool that runs a command. A shell
+/// allow-list was tried and dropped: Claude Code matches rules against the raw
+/// command string, so shell quoting (`--"output"=…`) gets past deny rules, and
+/// "read-only" git still reads files outside the checkout (`diff --no-index`)
+/// and runs programs named in repo config (`diff.external`, textconv,
+/// `core.fsmonitor`). Git facts a verdict needs are gathered by the RUNNER
+/// before the run, with hardened config, and handed to the model as prompt
+/// data (`agent_worktree::maintenance_executor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OneshotTools {
-    /// Repository inspection: `Read`, `Grep`, `Glob` (confined to the working
-    /// directory by `--restricted`) and the git subcommands in
-    /// [`READONLY_GIT_BASH_PATTERNS`] through `Bash`, minus the write forms
-    /// [`READONLY_GIT_DENY_PATTERNS`] refuses. Anything not pre-approved is
-    /// denied by `--permission-mode dontAsk`.
-    ReadonlyGit,
+    /// File inspection only: `Read`, `Grep`, `Glob`. `--restricted` confines
+    /// them to the working directory (the checkout root), and they are the only
+    /// tools that exist (`--tools`) and the only ones pre-approved
+    /// (`--allowedTools`) under `--permission-mode dontAsk`.
+    ReadonlyRepo,
     /// No tools at all (`--tools ""`): a pure text-in, text-out call.
     None,
 }
 
-/// The git `Bash` patterns [`OneshotTools::ReadonlyGit`] pre-approves.
-///
-/// What is and is not true of them: `--restricted` does NOT confine `Bash`,
-/// so these patterns are the whole write barrier for shell commands. Each
-/// approved subcommand is read-only EXCEPT for the `--output=<file>` option of
-/// `log`/`diff`/`show`, which writes an arbitrary path — that form is refused
-/// by [`READONLY_GIT_DENY_PATTERNS`] (deny rules win over allow rules).
-/// `git branch` is deliberately absent (`-D`/`-f`/`-m` mutate); branch
-/// listing goes through `for-each-ref`, which has no write mode.
-/// `git status` may refresh the index's stat cache, which changes no content.
-const READONLY_GIT_BASH_PATTERNS: &[&str] = &[
-    "Bash(git log:*)",
-    "Bash(git status:*)",
-    "Bash(git diff:*)",
-    "Bash(git show:*)",
-    "Bash(git for-each-ref:*)",
-    "Bash(git rev-parse:*)",
-    "Bash(git merge-base:*)",
-];
-
-/// Deny rules rendered as `--disallowedTools` for
-/// [`OneshotTools::ReadonlyGit`]. `--ou` rather than `--output` because git
-/// accepts any unambiguous abbreviation of a long option (`--outp=…`); the
-/// mid-pattern `*` also catches the option anywhere after the subcommand.
-/// Refusing the harmless `--ours`/`--output-indicator-*` too is accepted.
-const READONLY_GIT_DENY_PATTERNS: &[&str] = &[
-    "Bash(git log *--ou*)",
-    "Bash(git diff *--ou*)",
-    "Bash(git show *--ou*)",
-];
+/// The only tools [`OneshotTools::ReadonlyRepo`] provides — none of them runs a
+/// command or writes.
+const READONLY_REPO_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 
 /// Why a structured one-shot produced no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -577,18 +558,18 @@ impl std::fmt::Display for OneshotError {
 ///   final text ([`final_text_from_cli_output`]).
 /// - `--max-turns`: bounds the tool loop.
 /// - `--restricted`: user/project/local settings files are ignored, so an
-///   operator's broad allow rules cannot widen the set below; code-running
-///   tools exist only when `--tools` names them; the file tools are confined
-///   to the working directory. It does NOT confine `Bash` — the allow/deny
-///   patterns do that.
+///   operator's allow rules cannot add tools; command-running tools exist only
+///   if `--tools` names them (it never does here); the file tools are confined
+///   to the working directory.
 /// - `--strict-mcp-config` with no `--mcp-config`: no MCP servers at all.
 /// - `--permission-mode dontAsk`: anything not pre-approved is denied (never
 ///   prompts — nobody is at the keyboard).
-/// - `--tools`: the built-in tools that EXIST (`""` = none).
-/// - `--disallowedTools` then `--allowedTools`: deny rules, then what is
-///   pre-approved. Both flags are variadic, so they come LAST and every value
-///   is a `Tool(...)` pattern — none starts with `-`, so neither can swallow a
-///   flag, and each list ends at the next `--` flag.
+/// - `--tools`: the built-in tools that EXIST — `Read,Grep,Glob`, or `""`
+///   for none.
+/// - `--allowedTools`: the same three, pre-approved; rendered last because the
+///   flag is variadic.
+///
+/// No `Bash` token appears in either mode — see [`OneshotTools`].
 pub(crate) fn oneshot_cli_args(tools: OneshotTools, max_turns: u32) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--output-format".into(),
@@ -603,13 +584,10 @@ pub(crate) fn oneshot_cli_args(tools: OneshotTools, max_turns: u32) -> Vec<Strin
     ];
     match tools {
         OneshotTools::None => args.push(String::new()),
-        OneshotTools::ReadonlyGit => {
-            args.push("Read,Grep,Glob,Bash".into());
-            args.push("--disallowedTools".into());
-            args.extend(READONLY_GIT_DENY_PATTERNS.iter().map(|s| s.to_string()));
+        OneshotTools::ReadonlyRepo => {
+            args.push(READONLY_REPO_TOOLS.join(","));
             args.push("--allowedTools".into());
-            args.extend(["Read", "Grep", "Glob"].iter().map(|s| s.to_string()));
-            args.extend(READONLY_GIT_BASH_PATTERNS.iter().map(|s| s.to_string()));
+            args.extend(READONLY_REPO_TOOLS.iter().map(|s| s.to_string()));
         }
     }
     args
@@ -893,8 +871,8 @@ mod tests {
     }
 
     #[test]
-    fn oneshot_args_readonly_git_pin_the_exact_tool_set() {
-        let args = oneshot_cli_args(OneshotTools::ReadonlyGit, 8);
+    fn oneshot_args_readonly_repo_pin_the_exact_tool_set() {
+        let args = oneshot_cli_args(OneshotTools::ReadonlyRepo, 8);
         assert_eq!(
             strs(&args),
             vec![
@@ -907,113 +885,51 @@ mod tests {
                 "--permission-mode",
                 "dontAsk",
                 "--tools",
-                "Read,Grep,Glob,Bash",
-                "--disallowedTools",
-                "Bash(git log *--ou*)",
-                "Bash(git diff *--ou*)",
-                "Bash(git show *--ou*)",
+                "Read,Grep,Glob",
                 "--allowedTools",
                 "Read",
                 "Grep",
                 "Glob",
-                "Bash(git log:*)",
-                "Bash(git status:*)",
-                "Bash(git diff:*)",
-                "Bash(git show:*)",
-                "Bash(git for-each-ref:*)",
-                "Bash(git rev-parse:*)",
-                "Bash(git merge-base:*)",
             ]
         );
-        // Both permission flags are variadic: nothing after `--disallowedTools`
-        // may be a non-flag value of another option, and no rule value may look
-        // like a flag (or it would end its list early / be swallowed).
-        let deny = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        // `--allowedTools` is variadic: it is the last flag, and no value after
+        // it looks like a flag.
         let allow = args.iter().position(|a| a == "--allowedTools").unwrap();
-        assert!(deny < allow);
-        for v in args[deny + 1..].iter().filter(|a| *a != "--allowedTools") {
-            assert!(!v.starts_with('-'), "rule value {v:?} looks like a flag");
-        }
-        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(args[allow + 1..].iter().all(|a| !a.starts_with('-')));
     }
 
-    /// Claude Code's Bash rule matching, as far as these rules use it: a
-    /// legacy `prefix:*` is a prefix match; otherwise `*` matches any run of
-    /// characters (including none) and the rest is literal.
-    fn rule_matches(rule: &str, command: &str) -> bool {
-        let Some(inner) = rule.strip_prefix("Bash(").and_then(|r| r.strip_suffix(')')) else {
-            return false;
-        };
-        if let Some(prefix) = inner.strip_suffix(":*") {
-            return command == prefix || command.starts_with(&format!("{prefix} "));
-        }
-        fn glob(p: &[u8], s: &[u8]) -> bool {
-            match p.split_first() {
-                None => s.is_empty(),
-                Some((b'*', rest)) => (0..=s.len()).any(|i| glob(rest, &s[i..])),
-                Some((c, rest)) => s.first() == Some(c) && glob(rest, &s[1..]),
-            }
-        }
-        glob(inner.as_bytes(), command.as_bytes())
-    }
-
-    fn admitted(args: &[String], command: &str) -> bool {
-        let deny = args.iter().position(|a| a == "--disallowedTools");
-        let allow = args.iter().position(|a| a == "--allowedTools");
-        let (Some(d), Some(a)) = (deny, allow) else {
-            return false;
-        };
-        let denied = args[d + 1..a].iter().any(|r| rule_matches(r, command));
-        let allowed = args[a + 1..].iter().any(|r| rule_matches(r, command));
-        allowed && !denied
-    }
-
-    /// Review CRITICAL: no allow rule may admit a known mutating git form,
-    /// and the deny rules for `--output` must be present.
+    /// Design decision after review: the one-shot gets NO shell. No token in
+    /// either mode's argv may name `Bash` (or any rule over it), and no
+    /// permission-widening flag may appear.
     #[test]
-    fn readonly_git_rules_admit_no_mutating_form() {
-        let args = oneshot_cli_args(OneshotTools::ReadonlyGit, 4);
-        for rule in [
-            "Bash(git log *--ou*)",
-            "Bash(git diff *--ou*)",
-            "Bash(git show *--ou*)",
-        ] {
-            assert!(args.iter().any(|a| a == rule), "deny rule {rule} missing");
-        }
-        for mutating in [
-            "git branch -D main",
-            "git branch -f main HEAD~1",
-            "git branch -m old new",
-            "git branch --delete main",
-            "git log --output=/tmp/x",
-            "git log -p --output=/tmp/x",
-            "git log --outp=/tmp/x",
-            "git diff --output=/tmp/x HEAD",
-            "git diff HEAD --output /tmp/x",
-            "git show --output=/tmp/x",
-            "git show HEAD --outpu=x",
-            "git push origin main",
-            "git checkout main",
-            "git reset --hard",
-            "git commit -m x",
-            "rm -rf /",
-        ] {
-            assert!(
-                !admitted(&args, mutating),
-                "{mutating:?} must not be admitted"
-            );
-        }
-        // And the read forms still are — the rules are not vacuous.
-        for read in [
-            "git log --oneline -5",
-            "git status --porcelain",
-            "git diff HEAD~1",
-            "git show HEAD",
-            "git for-each-ref refs/heads",
-            "git rev-parse HEAD",
-            "git merge-base --is-ancestor a b",
-        ] {
-            assert!(admitted(&args, read), "{read:?} should be admitted");
+    fn no_bash_token_in_either_mode() {
+        for tools in [OneshotTools::ReadonlyRepo, OneshotTools::None] {
+            let args = oneshot_cli_args(tools, 4);
+            for a in &args {
+                assert!(
+                    !a.to_ascii_lowercase().contains("bash"),
+                    "{tools:?}: argv token {a:?} names Bash"
+                );
+            }
+            for forbidden in [
+                "--disallowedTools",
+                "--disallowed-tools",
+                "--dangerously-skip-permissions",
+                "--add-dir",
+                "--mcp-config",
+                "--settings",
+            ] {
+                assert!(
+                    !args.iter().any(|a| a == forbidden),
+                    "{tools:?}: unexpected {forbidden}"
+                );
+            }
+            for required in ["--restricted", "--strict-mcp-config", "dontAsk"] {
+                assert!(
+                    args.iter().any(|a| a == required),
+                    "{tools:?}: missing {required}"
+                );
+            }
         }
     }
 
@@ -1054,7 +970,7 @@ mod tests {
         let cmd = build_print_command(
             "claude",
             Some("/tmp/claude-config"),
-            &oneshot_cli_args(OneshotTools::ReadonlyGit, 4),
+            &oneshot_cli_args(OneshotTools::ReadonlyRepo, 4),
         );
         crate::terminal::assert_credentials_scrubbed_std(&cmd, "build_print_command");
         crate::credential_helper::assert_non_interactive_git_posture_std(
@@ -1067,7 +983,7 @@ mod tests {
             .collect();
         let print = args.iter().position(|a| a == "--print").unwrap();
         assert_eq!(args[print + 1], "--output-format");
-        assert!(args.iter().any(|a| a == "Bash(git merge-base:*)"));
+        assert!(args.iter().any(|a| a == "Read,Grep,Glob"));
     }
 
     #[test]
@@ -1185,7 +1101,7 @@ mod tests {
             None,
             "the prompt",
             Some(dir.path()),
-            OneshotTools::ReadonlyGit,
+            OneshotTools::ReadonlyRepo,
             4,
             Duration::from_secs(30),
         )
@@ -1223,20 +1139,43 @@ mod tests {
         }
     }
 
-    /// The deadline returns promptly AND the child's tree is dead: the script
-    /// would write `finished` after its sleep, and that file never appears.
+    /// The deadline returns promptly AND the child's whole TREE is dead.
+    ///
+    /// The fake `claude` launches a GRANDCHILD (a backgrounded `sh -c` on Unix,
+    /// `start /b cmd /c` on Windows) that writes `started` at once and
+    /// `finished` after a sleep longer than the timeout, while the child itself
+    /// just waits. A kill that reached only the direct child (`child.kill()`)
+    /// would leave the grandchild running, and `finished` would appear — so
+    /// this test fails unless the tree reaper (process group / job object)
+    /// fires. `started` must exist, so the test cannot pass vacuously because
+    /// the grandchild never ran.
     #[test]
     fn spawn_timeout_kills_the_child_tree() {
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("finished");
-        let m = marker.to_string_lossy().to_string();
+        let started = dir.path().join("started");
+        let finished = dir.path().join("finished");
+        let (s, f) = (
+            started.to_string_lossy().to_string(),
+            finished.to_string_lossy().to_string(),
+        );
+        let grand = dir.path().join("grandchild.cmd");
+        if cfg!(windows) {
+            std::fs::write(
+                &grand,
+                format!(
+                    "@echo off\r\necho s> \"{s}\"\r\nping -n 7 127.0.0.1 >nul\r\necho d> \"{f}\"\r\n"
+                ),
+            )
+            .unwrap();
+        }
+        let g = grand.to_string_lossy().to_string();
         let prog = fake_claude(
             dir.path(),
-            &format!("ping -n 5 127.0.0.1 >nul\necho done> \"{m}\""),
-            &format!("sleep 4\necho done > '{m}'"),
+            &format!("start \"\" /b cmd /c \"{g}\"\nping -n 15 127.0.0.1 >nul"),
+            &format!("sh -c \"echo s > '{s}'; sleep 6; echo d > '{f}'\" &\nwait"),
         );
-        let started = Instant::now();
+        let t0 = Instant::now();
         let r = run_structured_oneshot_with(
             &prog,
             None,
@@ -1244,19 +1183,27 @@ mod tests {
             Some(dir.path()),
             OneshotTools::None,
             1,
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         );
-        let elapsed = started.elapsed();
+        let elapsed = t0.elapsed();
         assert!(
             matches!(&r, Err(e) if e.is_timeout()),
             "expected a timeout, got {r:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(6),
             "deadline not honoured: {elapsed:?}"
         );
-        std::thread::sleep(Duration::from_secs(6));
-        assert!(!marker.exists(), "the killed child's tree kept running");
+        assert!(
+            started.exists(),
+            "the grandchild never started — the test would prove nothing"
+        );
+        // Past the grandchild's own finish time (6s after it started).
+        std::thread::sleep(Duration::from_secs(7));
+        assert!(
+            !finished.exists(),
+            "the grandchild survived the timeout kill — only the direct child died"
+        );
     }
 
     #[test]
@@ -1291,11 +1238,10 @@ mod tests {
         }
     }
 
-    /// The permission flags reach the child intact through the real builder —
-    /// on Windows through `cmd /c`: the empty `--tools ""` and the
-    /// space-and-paren-bearing `Bash(git log:*)` arrive as their own quoted
-    /// tokens on the child's command line (which is what the shim forwards to
-    /// the CLI's argv parser).
+    /// The tool flags reach the child intact through the real builder — on
+    /// Windows through `cmd /c`: the empty `--tools ""` arrives as its own
+    /// quoted token, `Read,Grep,Glob` as one token, and nothing naming `Bash`
+    /// is on the child's command line.
     #[test]
     fn spawn_permission_flags_reach_the_child_intact() {
         let _amb = crate::test_env::isolated_ambient();
@@ -1307,16 +1253,21 @@ mod tests {
         );
         let none = build_print_command(&prog, None, &oneshot_cli_args(OneshotTools::None, 1));
         let out_none = run_print_child(none, "", Duration::from_secs(30)).unwrap();
-        let git = build_print_command(&prog, None, &oneshot_cli_args(OneshotTools::ReadonlyGit, 2));
-        let out_git = run_print_child(git, "", Duration::from_secs(30)).unwrap();
+        let repo = build_print_command(
+            &prog,
+            None,
+            &oneshot_cli_args(OneshotTools::ReadonlyRepo, 2),
+        );
+        let out_repo = run_print_child(repo, "", Duration::from_secs(30)).unwrap();
         if cfg!(windows) {
             assert!(out_none.ends_with("--tools \"\""), "{out_none}");
-            assert!(out_git.contains(" \"Bash(git log:*)\" "), "{out_git}");
-            assert!(out_git.contains(" \"Bash(git log *--ou*)\" "), "{out_git}");
+            assert!(out_repo.contains(" --tools Read,Grep,Glob "), "{out_repo}");
         } else {
             assert!(out_none.ends_with("[--tools][]"), "{out_none}");
-            assert!(out_git.contains("[Bash(git log:*)]"), "{out_git}");
-            assert!(out_git.contains("[Bash(git log *--ou*)]"), "{out_git}");
+            assert!(out_repo.contains("[--tools][Read,Grep,Glob]"), "{out_repo}");
+        }
+        for out in [&out_none, &out_repo] {
+            assert!(!out.to_ascii_lowercase().contains("bash"), "{out}");
         }
     }
 }
