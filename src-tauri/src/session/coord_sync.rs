@@ -177,7 +177,7 @@ use crate::auth::TenantScope;
 
 use super::closeout_spool::{classify_coord_write_status, CoordWriteClass};
 use super::local_store::{OutboxEvent, OutboxRecord, OutboxWriter};
-use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
+use super::{SessionEventKind, SessionRegistry, SessionState};
 
 // ---------------------------------------------------------------------------
 // Env tunables
@@ -10310,7 +10310,7 @@ mod tests {
         );
 
         // Assembled so this test's own source does not match.
-        let needle = format!("{}-policy?tenant_id=", "/tenant");
+        let needle = format!("{}-policy", "/tenant");
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut builders = Vec::new();
         let mut stack = vec![root.clone()];
