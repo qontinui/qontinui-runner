@@ -529,6 +529,22 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                         other_units.push(unit);
                     }
                 }
+                // A template's `--continue` / `-c` is a third session choice —
+                // "the most recent conversation in this cwd" — and it cannot
+                // stand beside the spec's own `--session-id` / `--resume`: the
+                // session would no longer be the one the runner pinned (plan
+                // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+                // Phase 2). When the spec owns the session, it is dropped. A
+                // template that positions the id itself through `{sessionId}`
+                // owns the session layout, so its `--continue` is kept beside
+                // that id, as the `--session-id` arm above keeps the flag.
+                "--continue" | "-c" if pin.is_some() && !had_placeholder => {
+                    tracing::warn!(
+                        flag = %flag_name_only(&unit.name),
+                        "launch template flag dropped: the spec pins the session, so the \
+                         template cannot continue a different one"
+                    );
+                }
                 // The append prompt flags are one mutually-exclusive group: when
                 // the caller supplies either (the runner's spawn-time carrier),
                 // drop both from the template, whatever the spelling. Loudly —
@@ -1299,6 +1315,50 @@ mod tests {
         s.permission = PermissionMode::DangerouslySkip;
         let argv = render_argv(&s, &LaunchConfig::default(), "claude");
         assert_eq!(argv, vec!["claude", "--dangerously-skip-permissions"]);
+    }
+
+    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    /// Phase 2: when the spec pins the session (new or resumed), an operator
+    /// template's `--continue` / `-c` is dropped, so argv carries exactly one
+    /// session choice — the spec's id.
+    #[test]
+    fn spec_owned_session_drops_a_template_continue() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        for template in ["claude --continue --verbose", "claude -c --verbose"] {
+            let mut new_session = spec();
+            new_session.session_id = Some(ID.to_string());
+            let argv = render_argv(&new_session, &tmpl(template), "claude");
+            assert!(
+                !argv.iter().any(|a| a == "--continue" || a == "-c"),
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--session-id"), Some(ID));
+            // The template's other flags still layer in.
+            assert!(argv.iter().any(|a| a == "--verbose"), "{template}: {argv:?}");
+
+            let mut resumed = spec();
+            resumed.resume_id = Some(ID.to_string());
+            let argv = render_argv(&resumed, &tmpl(template), "claude");
+            assert!(
+                !argv.iter().any(|a| a == "--continue" || a == "-c"),
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--resume").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--resume"), Some(ID));
+        }
+
+        // With no spec session the operator's own choice is left alone.
+        let argv = render_argv(&spec(), &tmpl("claude --continue"), "claude");
+        assert!(argv.iter().any(|a| a == "--continue"), "{argv:?}");
     }
 
     #[test]
