@@ -4145,7 +4145,8 @@ pub async fn ui_bridge_find_by_text_handler(
     let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let payload = text_action_ipc_payload(&body, &["text", "tag", "exact"]);
-    let Json(resp) = wrap_ipc_result(ui_bridge_request_sync(&state, "find_by_text", payload).await)?;
+    let Json(resp) =
+        wrap_ipc_result(ui_bridge_request_sync(&state, "find_by_text", payload).await)?;
     let matches = resp.data.unwrap_or(serde_json::Value::Array(vec![]));
     let count = matches.as_array().map(|a| a.len()).unwrap_or(0);
     Ok(Json(ApiResponse::success(serde_json::json!({
