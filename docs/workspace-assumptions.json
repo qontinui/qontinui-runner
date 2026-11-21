@@ -1951,29 +1951,32 @@
     {
       "class": "repo_layout",
       "file": "src/slash_commands.rs",
-      "symbol": "find_commands_directory_reported",
+      "symbol": "commands_directory_in",
       "excerpt": "\"<workspace-root>/qontinui-claude-config/.claude/commands\",",
       "count": 1,
-      "disposition": "unreviewed",
-      "capability": "slash_commands"
+      "disposition": "fallback_correct",
+      "capability": "slash_commands",
+      "note": "The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856)."
     },
     {
       "class": "repo_layout",
       "file": "src/slash_commands.rs",
-      "symbol": "find_commands_directory_reported",
+      "symbol": "commands_directory_in",
       "excerpt": "\"this device has no qontinui-claude-config checkout, and this import has \\",
       "count": 1,
-      "disposition": "unreviewed",
-      "capability": "slash_commands"
+      "disposition": "fallback_correct",
+      "capability": "slash_commands",
+      "note": "The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856)."
     },
     {
       "class": "repo_layout",
       "file": "src/slash_commands.rs",
-      "symbol": "find_commands_directory_reported",
-      "excerpt": ".join(\"qontinui-claude-config\")",
+      "symbol": "const COMMANDS_SIBLING",
+      "excerpt": "const COMMANDS_SIBLING: &str = \"qontinui-claude-config\";",
       "count": 1,
-      "disposition": "unreviewed",
-      "capability": "slash_commands"
+      "disposition": "fallback_correct",
+      "capability": "slash_commands",
+      "note": "The sibling checkout name the slash-command import reads from and names in its sibling_checkout_absent refusal; its absence is handled by commands_directory_in's typed refusal (runner#3129)."
     },
     {
       "class": "repo_layout",
