@@ -2825,7 +2825,9 @@ mod action_outcome_tests {
     fn a_batch_verdict_is_failed_then_indeterminate_then_succeeded() {
         use ActionOutcome::*;
         let fold = |steps: Vec<ActionOutcome>| {
-            steps.into_iter().fold(Succeeded, ActionOutcome::and_then_step)
+            steps
+                .into_iter()
+                .fold(Succeeded, ActionOutcome::and_then_step)
         };
         assert_eq!(fold(vec![]), Succeeded);
         assert_eq!(fold(vec![Succeeded, Succeeded]), Succeeded);

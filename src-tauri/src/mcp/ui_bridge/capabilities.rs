@@ -1523,9 +1523,12 @@ pub async fn ui_bridge_control_batch_handler(
             .unwrap_or_default(),
     );
     let mut verdict = super::request::ActionOutcome::Succeeded;
-    let result =
-        ui_bridge_control_batch_handler_dispatch(State(Arc::clone(&state)), Json(body), &mut verdict)
-            .await;
+    let result = ui_bridge_control_batch_handler_dispatch(
+        State(Arc::clone(&state)),
+        Json(body),
+        &mut verdict,
+    )
+    .await;
     // An empty batch acted on nothing: no edge (N7).
     if let Some(action) = action {
         crate::journey::capture::record_control_verdict(

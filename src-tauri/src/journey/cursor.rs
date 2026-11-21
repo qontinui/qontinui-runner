@@ -855,11 +855,21 @@ mod tests {
         // D1: an unstated verdict wins over the comparison, `no_change`
         // included (a self-loop with an equal digest), and over `changed`.
         assert_eq!(
-            outcome_of(&a, Some("d"), Some(&same), Some(EdgeOutcome::VerdictUnknown)),
+            outcome_of(
+                &a,
+                Some("d"),
+                Some(&same),
+                Some(EdgeOutcome::VerdictUnknown)
+            ),
             EdgeOutcome::VerdictUnknown
         );
         assert_eq!(
-            outcome_of(&a, Some("d"), Some(&other), Some(EdgeOutcome::VerdictUnknown)),
+            outcome_of(
+                &a,
+                Some("d"),
+                Some(&other),
+                Some(EdgeOutcome::VerdictUnknown)
+            ),
             EdgeOutcome::VerdictUnknown
         );
         // ...but never over an unobserved destination, which the CHECK pins.

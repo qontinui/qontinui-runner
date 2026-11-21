@@ -51,14 +51,14 @@ use crate::database::pg::PgDb;
 use super::cursor::{
     verdict_hint, ActionSpec, CursorKey, Cursors, EdgeDraft, Observed, Provenance,
 };
-use crate::mcp::ui_bridge::request::ActionOutcome;
-use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
 use super::frontier;
 use super::health;
 use super::node::{
     affordance_digest, build_node, extract_affordances, page_identity, present_state_ids,
     AffordanceIndex, SpecLookup,
 };
+use crate::mcp::ui_bridge::request::ActionOutcome;
+use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
 
 // ---------------------------------------------------------------------------
 // Provenance
@@ -206,7 +206,9 @@ fn post_dispatch_action_failure(detail: &crate::mcp::ui_bridge::UiBridgeError) -
     let Some(context) = detail.context.as_ref().and_then(|c| c.as_object()) else {
         return false;
     };
-    context.get("requested_action").is_some_and(|v| v.is_string())
+    context
+        .get("requested_action")
+        .is_some_and(|v| v.is_string())
         || context.get("code").is_some_and(|v| v.is_string())
 }
 
@@ -315,12 +317,14 @@ pub(crate) fn sdk_action_verdict(response: &serde_json::Value) -> Option<ActionO
     if sdk_refusal(response) {
         return None;
     }
-    Some(match crate::mcp::ui_bridge::request::action_outcome(response) {
-        ActionOutcome::Failed(err) if indeterminate_marker(err.as_deref()) => {
-            ActionOutcome::Indeterminate
-        }
-        other => other,
-    })
+    Some(
+        match crate::mcp::ui_bridge::request::action_outcome(response) {
+            ActionOutcome::Failed(err) if indeterminate_marker(err.as_deref()) => {
+                ActionOutcome::Indeterminate
+            }
+            other => other,
+        },
+    )
 }
 
 /// The verdict of a `/ui-bridge/sdk/ai/recovery/attempt` answer for the
@@ -1802,9 +1806,8 @@ mod tests {
             Some(ActionOutcome::Failed(Some("nope".to_string())))
         );
         // A body normalise_action_result rewrote: its `false` is a marker.
-        let (normalised, _) = crate::mcp::ui_bridge::request::normalize_action_result(
-            json!({ "elementId": "x" }),
-        );
+        let (normalised, _) =
+            crate::mcp::ui_bridge::request::normalize_action_result(json!({ "elementId": "x" }));
         assert_eq!(
             sdk_action_verdict(&normalised),
             Some(ActionOutcome::Indeterminate)

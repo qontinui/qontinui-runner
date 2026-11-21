@@ -29,8 +29,8 @@ use tracing::{debug, info, warn};
 use super::app_dispatch::{AppDispatcher, ArmPayloads, DispatchError};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
-use super::ui_bridge::ui_bridge_request_sync;
 use super::ui_bridge::request::ActionOutcome;
+use super::ui_bridge::ui_bridge_request_sync;
 
 // =============================================================================
 // Types
@@ -762,7 +762,9 @@ fn dispatch_stage(err: &DispatchError) -> DispatchStage {
             DispatchStage::BeforeSend
         }
         DispatchError::AppAnswered { .. }
-        | DispatchError::WebSocket(CommandRelayError::WrapperError(_)) => DispatchStage::AppAnswered,
+        | DispatchError::WebSocket(CommandRelayError::WrapperError(_)) => {
+            DispatchStage::AppAnswered
+        }
         DispatchError::HttpSend { .. }
         | DispatchError::HttpStatus { .. }
         | DispatchError::InvalidJson(_)
@@ -6354,9 +6356,7 @@ fn sdk_batch_verdict(
         }
         verdict.absorb(action_outcome(step));
     }
-    if data.get("success").and_then(|v| v.as_bool()) == Some(false)
-        && verdict.succeeded()
-    {
+    if data.get("success").and_then(|v| v.as_bool()) == Some(false) && verdict.succeeded() {
         let error = data
             .get("error")
             .and_then(|e| e.as_str())
@@ -7362,9 +7362,9 @@ fn recovery_attempt_answer(
                     *retryable,
                     data.clone(),
                 ),
-                DispatchError::WebSocket(super::command_relay::CommandRelayError::WrapperError(
-                    failure,
-                )) => (
+                DispatchError::WebSocket(
+                    super::command_relay::CommandRelayError::WrapperError(failure),
+                ) => (
                     StatusCode::BAD_GATEWAY,
                     failure.code.clone(),
                     failure.retryable,
@@ -9996,7 +9996,10 @@ mod element_action_result_tests {
     #[test]
     fn ws_arm_absent_success_is_failure_and_body_says_so() {
         let (body, ok, err) = ws_element_action_result(json!({ "elementId": "x" }));
-        assert!(!ok.succeeded(), "a success-less WS body must not read as success");
+        assert!(
+            !ok.succeeded(),
+            "a success-less WS body must not read as success"
+        );
         assert_eq!(
             ok,
             ActionOutcome::Indeterminate,
@@ -10029,7 +10032,10 @@ mod element_action_result_tests {
 
         let bad = json!({ "success": false, "error": "Element x not found" });
         let (body, ok, err) = ws_element_action_result(bad.clone());
-        assert_eq!(ok, ActionOutcome::Failed(Some("Element x not found".into())));
+        assert_eq!(
+            ok,
+            ActionOutcome::Failed(Some("Element x not found".into()))
+        );
         assert_eq!(err.as_deref(), Some("Element x not found"));
         assert_eq!(body, bad);
     }
@@ -11719,9 +11725,9 @@ mod recovery_attempt_twin_tests {
     //! Phase 3: `/ui-bridge/sdk/ai/recovery/attempt` keeps what the app
     //! stated, carries a typed code, and answers a dispatch that may have acted
     //! as UNKNOWN — and the journey verdict read off each answer agrees.
-    use crate::mcp::command_relay::{CommandRelayError, WrapperFailure};
     use super::*;
     use crate::journey::capture::sdk_recovery_verdict;
+    use crate::mcp::command_relay::{CommandRelayError, WrapperFailure};
     use axum::http::StatusCode;
     use serde_json::json;
 
@@ -11782,7 +11788,9 @@ mod recovery_attempt_twin_tests {
     #[test]
     fn a_dispatch_error_after_send_is_verdict_unknown() {
         for err in [
-            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(30))),
+            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(
+                30,
+            ))),
             DispatchError::WebSocket(CommandRelayError::Disconnected),
             DispatchError::WebSocket(CommandRelayError::Displaced("new tab".into())),
             DispatchError::WebSocket(CommandRelayError::UnreadableResponse("garbage".into())),
@@ -11866,7 +11874,11 @@ mod recovery_attempt_twin_tests {
             "httpStatus": 500,
         });
         let (status, _) = recovery_attempt_answer(Ok(recovered.clone()));
-        assert_eq!(status, StatusCode::OK, "a hint on a success envelope is ignored");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a hint on a success envelope is ignored"
+        );
         assert_eq!(
             sdk_recovery_verdict(status.as_u16(), &recovered),
             Some(ActionOutcome::Succeeded)
@@ -12024,7 +12036,11 @@ mod sdk_journey_verdict_tests {
         ] {
             let outcome = element_action_dispatch_outcome(&before);
             assert_eq!(
-                element_action_journey_verdict(&answer(&before), outcome.clone(), outcome.is_some()),
+                element_action_journey_verdict(
+                    &answer(&before),
+                    outcome.clone(),
+                    outcome.is_some()
+                ),
                 None,
                 "{before:?}"
             );
@@ -12092,7 +12108,9 @@ mod sdk_journey_verdict_tests {
     #[test]
     fn an_element_action_dispatch_error_after_send_is_verdict_unknown() {
         for err in [
-            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(30))),
+            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(
+                30,
+            ))),
             DispatchError::WebSocket(CommandRelayError::Disconnected),
             DispatchError::WebSocket(CommandRelayError::Displaced("new tab".into())),
             DispatchError::WebSocket(CommandRelayError::UnreadableResponse("garbage".into())),
@@ -12103,7 +12121,8 @@ mod sdk_journey_verdict_tests {
                 "{err:?}"
             );
             // The route's answer keeps its shape: a transport refusal.
-            let refusal = ipc_fallback_refusal(&err, "element action").expect("an app was targeted");
+            let refusal =
+                ipc_fallback_refusal(&err, "element action").expect("an app was targeted");
             assert_eq!(refusal["failure_origin"], json!("transport"));
             assert_eq!(refusal["success"], json!(false));
         }
@@ -12118,7 +12137,8 @@ mod sdk_journey_verdict_tests {
             },
         ] {
             assert_eq!(element_action_dispatch_outcome(&err), None, "{err:?}");
-            let refusal = ipc_fallback_refusal(&err, "element action").expect("an app was targeted");
+            let refusal =
+                ipc_fallback_refusal(&err, "element action").expect("an app was targeted");
             assert!(crate::journey::capture::sdk_refusal(&refusal), "{err:?}");
         }
     }
