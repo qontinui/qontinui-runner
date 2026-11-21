@@ -1052,13 +1052,30 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
 /// probe that could not read the disk has not made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockState {
-    /// A `.cargo-lock` is held — a write-open failed the way a live cargo's
-    /// sharing violation does.
+    /// A `.cargo-lock` is held — on Windows a write-open failed the way a live
+    /// cargo's sharing violation does; on Linux `/proc/locks` carries a row for it.
     Held,
     /// Every profile dir was enumerated and no lock is held.
     Free,
     /// A read the probe depends on FAILED, so whether a lock is held is unknown.
     Unknown,
+}
+
+/// Whether a `.cargo-lock` under any profile dir of `target_root` is held by a
+/// live cargo invocation, on Linux: read from `/proc/locks`
+/// ([`super::cargo_locks::target_lock_state`]). The Windows probe below calls a
+/// lock held when a write-open FAILS, which on Linux — where cargo's lock is an
+/// advisory `flock` — never happens, so a live build there read `Free` (plan
+/// `2026-11-19-coord-prices-every-building-linux-agent-worktree-as-a-dedicated-target`).
+/// A failed read is [`LockState::Unknown`], exactly as below.
+#[cfg(target_os = "linux")]
+fn cargo_lock_held(target_root: &Path) -> LockState {
+    use super::cargo_locks::{target_lock_state, TargetLockState};
+    match target_lock_state(target_root) {
+        TargetLockState::Held => LockState::Held,
+        TargetLockState::Free => LockState::Free,
+        TargetLockState::Unknown => LockState::Unknown,
+    }
 }
 
 /// Whether a `.cargo-lock` under any profile dir of `target_root` is held by a
@@ -1077,6 +1094,7 @@ enum LockState {
 /// the same `ErrorKind` a permissions denial would, so the two are not
 /// separable here — and a lock file that exists and cannot be opened for write
 /// is the positive signal this function is built around.
+#[cfg(not(target_os = "linux"))]
 fn cargo_lock_held(target_root: &Path) -> LockState {
     let mut profile_dirs: Vec<PathBuf> =
         vec![target_root.join("debug"), target_root.join("release")];
@@ -4545,6 +4563,36 @@ mod tests {",
             LockState::Held,
             "an exclusively-held lock reads as building"
         );
+    }
+
+    // ---- Linux: the live-build lock guard reads cargo's flock ----
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_lock_held_detects_a_linux_flock() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let tgt = tmp.path().join("t");
+        mk_target_root(&tgt);
+        let lock = tgt.join("debug/.cargo-lock");
+        fs::write(&lock, b"").unwrap();
+        assert_eq!(cargo_lock_held(&tgt), LockState::Free);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        // SAFETY: valid fd owned by `f` for the duration of the calls.
+        assert_eq!(
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(
+            cargo_lock_held(&tgt),
+            LockState::Held,
+            "a flock-held lock reads as building"
+        );
+        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert_eq!(cargo_lock_held(&tgt), LockState::Free);
     }
 
     /// **R-2 — a `.cargo-lock` probe that could not READ must not report a build.**
