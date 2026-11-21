@@ -504,15 +504,17 @@ pub(crate) fn score_options_via_cli(
 /// command string, so shell quoting (`--"output"=…`) gets past deny rules, and
 /// "read-only" git still reads files outside the checkout (`diff --no-index`)
 /// and runs programs named in repo config (`diff.external`, textconv,
-/// `core.fsmonitor`). Git facts a verdict needs are gathered by the RUNNER
-/// before the run, with hardened config, and handed to the model as prompt
-/// data (`agent_worktree::maintenance_executor`).
+/// `core.fsmonitor`, clean filters, `gpg.program`). Git facts a verdict needs
+/// are gathered by the RUNNER before the run through libgit2 (never the git
+/// CLI) and appended to the prompt as delimited data
+/// (`agent_worktree::maintenance_executor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OneshotTools {
     /// File inspection only: `Read`, `Grep`, `Glob`. `--restricted` confines
     /// them to the working directory (the checkout root), and they are the only
     /// tools that exist (`--tools`) and the only ones pre-approved
-    /// (`--allowedTools`) under `--permission-mode dontAsk`.
+    /// (`--allowedTools`) under `--permission-mode dontAsk`. Reads under any
+    /// `.git/` are denied ([`READONLY_REPO_DENY`]).
     ReadonlyRepo,
     /// No tools at all (`--tools ""`): a pure text-in, text-out call.
     None,
@@ -521,6 +523,19 @@ pub(crate) enum OneshotTools {
 /// The only tools [`OneshotTools::ReadonlyRepo`] provides — none of them runs a
 /// command or writes.
 const READONLY_REPO_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
+/// Deny rules (`--disallowedTools`) for [`OneshotTools::ReadonlyRepo`]: no
+/// reads under the checkout's `.git/` (config, objects, hooks, credentials in
+/// remotes). Claude Code's path rules: `./x` is relative to the working
+/// directory, and a gitignore-style `**/.git/**` matches at the root and at
+/// any depth (nested repos, submodules). Deny beats allow, so
+/// `--allowedTools Read` cannot re-open these.
+///
+/// What is true about Grep and Glob: the CLI has NO `Grep(path)` / `Glob(path)`
+/// specifier. Its docs state that `Read(path)` deny rules are applied to the
+/// file-reading tools Grep and Glob on a best-effort basis, so these rules are
+/// the only lever for them too.
+const READONLY_REPO_DENY: &[&str] = &["Read(./.git/**)", "Read(**/.git/**)"];
 
 /// Why a structured one-shot produced no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,10 +581,13 @@ impl std::fmt::Display for OneshotError {
 ///   prompts — nobody is at the keyboard).
 /// - `--tools`: the built-in tools that EXIST — `Read,Grep,Glob`, or `""`
 ///   for none.
-/// - `--allowedTools`: the same three, pre-approved; rendered last because the
-///   flag is variadic.
+/// - `--disallowedTools`: the `.git/` read denials ([`READONLY_REPO_DENY`]).
+/// - `--allowedTools`: the three tools, pre-approved.
 ///
-/// No `Bash` token appears in either mode — see [`OneshotTools`].
+/// Both permission flags are variadic, so they come last and every value is a
+/// `Tool(...)` rule or a tool name — none starts with `-`, so each list ends at
+/// the next `--` flag. No `Bash` token appears in either mode — see
+/// [`OneshotTools`].
 pub(crate) fn oneshot_cli_args(tools: OneshotTools, max_turns: u32) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--output-format".into(),
@@ -586,6 +604,8 @@ pub(crate) fn oneshot_cli_args(tools: OneshotTools, max_turns: u32) -> Vec<Strin
         OneshotTools::None => args.push(String::new()),
         OneshotTools::ReadonlyRepo => {
             args.push(READONLY_REPO_TOOLS.join(","));
+            args.push("--disallowedTools".into());
+            args.extend(READONLY_REPO_DENY.iter().map(|s| s.to_string()));
             args.push("--allowedTools".into());
             args.extend(READONLY_REPO_TOOLS.iter().map(|s| s.to_string()));
         }
@@ -863,7 +883,7 @@ mod tests {
 
     use super::{
         build_print_command, extract_first_json_object, final_text_from_cli_output,
-        oneshot_cli_args, strip_code_fences, OneshotError, OneshotTools,
+        oneshot_cli_args, strip_code_fences, OneshotError, OneshotTools, READONLY_REPO_DENY,
     };
 
     fn strs(v: &[String]) -> Vec<&str> {
@@ -886,16 +906,23 @@ mod tests {
                 "dontAsk",
                 "--tools",
                 "Read,Grep,Glob",
+                "--disallowedTools",
+                "Read(./.git/**)",
+                "Read(**/.git/**)",
                 "--allowedTools",
                 "Read",
                 "Grep",
                 "Glob",
             ]
         );
-        // `--allowedTools` is variadic: it is the last flag, and no value after
-        // it looks like a flag.
+        // Both permission flags are variadic: deny comes before allow, and no
+        // value after either looks like a flag.
+        let deny = args.iter().position(|a| a == "--disallowedTools").unwrap();
         let allow = args.iter().position(|a| a == "--allowedTools").unwrap();
-        assert!(args[allow + 1..].iter().all(|a| !a.starts_with('-')));
+        assert!(deny < allow);
+        for v in args[deny + 1..].iter().filter(|a| *a != "--allowedTools") {
+            assert!(!v.starts_with('-'), "rule value {v:?} looks like a flag");
+        }
     }
 
     /// Design decision after review: the one-shot gets NO shell. No token in
@@ -912,7 +939,6 @@ mod tests {
                 );
             }
             for forbidden in [
-                "--disallowedTools",
                 "--disallowed-tools",
                 "--dangerously-skip-permissions",
                 "--add-dir",
@@ -929,6 +955,12 @@ mod tests {
                     args.iter().any(|a| a == required),
                     "{tools:?}: missing {required}"
                 );
+            }
+            // The only deny rules are the `.git/` read denials.
+            if let Some(d) = args.iter().position(|a| a == "--disallowedTools") {
+                assert_eq!(tools, OneshotTools::ReadonlyRepo);
+                let allow = args.iter().position(|a| a == "--allowedTools").unwrap();
+                assert_eq!(&args[d + 1..allow], READONLY_REPO_DENY);
             }
         }
     }
@@ -1262,9 +1294,21 @@ mod tests {
         if cfg!(windows) {
             assert!(out_none.ends_with("--tools \"\""), "{out_none}");
             assert!(out_repo.contains(" --tools Read,Grep,Glob "), "{out_repo}");
+            assert!(
+                out_repo.contains(
+                    " --disallowedTools Read(./.git/**) Read(**/.git/**) --allowedTools "
+                ),
+                "{out_repo}"
+            );
         } else {
             assert!(out_none.ends_with("[--tools][]"), "{out_none}");
             assert!(out_repo.contains("[--tools][Read,Grep,Glob]"), "{out_repo}");
+            assert!(
+                out_repo.contains(
+                    "[--disallowedTools][Read(./.git/**)][Read(**/.git/**)][--allowedTools]"
+                ),
+                "{out_repo}"
+            );
         }
         for out in [&out_none, &out_repo] {
             assert!(!out.to_ascii_lowercase().contains("bash"), "{out}");
