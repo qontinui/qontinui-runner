@@ -224,6 +224,9 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
+      // A superseded effect run's listener must not bump the shared counter
+      // and invalidate the current run's in-flight read.
+      if (cancelled) return;
       const seq = ++backendStatusReadSeq.current;
       const isLatest = () => !cancelled && seq === backendStatusReadSeq.current;
       try {

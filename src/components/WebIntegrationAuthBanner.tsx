@@ -75,6 +75,10 @@ import {
 /** Session-storage key used for dismissal persistence across re-renders. */
 const DISMISS_STORAGE_KEY = "qontinui:web-integration-auth-banner:dismissed-signature";
 
+/** Shown when sign-in is paused because the saved backend settings are unknown. */
+const SIGN_IN_TARGET_UNKNOWN =
+  "Could not read the saved backend settings, so sign-in is paused until the next successful read.";
+
 function readDismissedSignature(): string | null {
   try {
     return sessionStorage.getItem(DISMISS_STORAGE_KEY);
@@ -103,13 +107,14 @@ export function WebIntegrationAuthBanner() {
 
   // The same `get_web_integration_status` read feeds the banner AND decides
   // the Authorize button's sign-in target (savedBackendUrl.ts, "operator"
-  // surface); `null` (not loaded / read failed) targets production.
+  // surface).
   const [status, setStatus] = useState<(AuthBannerStatus & SavedBackendStatus) | null>(null);
   // True while the LATEST status read failed. The banner keeps showing from
   // the previous `status` (a failed re-read must not hide or flash it), but
-  // Authorize must not take its sign-in target from that stale read — the
-  // same rule AccountSettings applies by clearing its status on a failed
-  // re-read. A stale read targets production, like `null`.
+  // Authorize is DISABLED while the target is unknown (no read yet, or the
+  // latest failed) — the same rule AccountSettings applies. Guessing
+  // production instead would let `finalize_signed_in` write production over a
+  // saved custom backend.
   const [statusReadFailed, setStatusReadFailed] = useState(false);
   // Issue order of status reads; a read that is no longer the latest drops its result.
   const statusReadSeq = useRef(0);
@@ -402,7 +407,15 @@ export function WebIntegrationAuthBanner() {
     }
   }, []);
 
+  // The saved backend settings are unknown: no read has landed, or the latest
+  // one failed. Sign-in waits rather than guessing a target.
+  const signInTargetUnknown = status === null || statusReadFailed;
+
   const handleAuthorize = useCallback(async () => {
+    if (signInTargetUnknown) {
+      setAuthorizeError(SIGN_IN_TARGET_UNKNOWN);
+      return;
+    }
     setAuthorizing(true);
     setAuthorizeError(null);
     try {
@@ -412,7 +425,7 @@ export function WebIntegrationAuthBanner() {
       // `web-integration-changed`, which refreshes the status + device-JWT
       // probe above and hides the banner.
       await invoke<void>("cognito_sign_in", {
-        backendUrl: signInBackendUrlFrom(statusReadFailed ? null : status, "operator"),
+        backendUrl: signInBackendUrlFrom(status, "operator"),
       });
       // A retry's "did not recover" is answered by this sign-in.
       setRetryRefresh(null);
@@ -423,7 +436,7 @@ export function WebIntegrationAuthBanner() {
     } finally {
       setAuthorizing(false);
     }
-  }, [status, statusReadFailed]);
+  }, [status, signInTargetUnknown]);
 
   // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
   // future sessions only — running sessions keep their tenant), close the
@@ -515,7 +528,8 @@ export function WebIntegrationAuthBanner() {
   // CAUSE rather than one generic sentence.
   if (credentialDark?.dark) {
     const presentation = credentialDarkPresentation(credentialDark, undefined, showSwitcher);
-    const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
+    const busy =
+      presentation.ctaAction === "cognito_sign_in" ? authorizing || signInTargetUnknown : reKicking;
     const ctaError =
       (presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError) ??
       retryRefreshError ??
@@ -786,7 +800,8 @@ export function WebIntegrationAuthBanner() {
         ref={authorizeButtonRef}
         type="button"
         onClick={handleAuthorize}
-        disabled={authorizing}
+        disabled={authorizing || signInTargetUnknown}
+        title={signInTargetUnknown ? SIGN_IN_TARGET_UNKNOWN : undefined}
         style={{
           background: "var(--accent, #6366f1)",
           color: "#fff",
@@ -795,8 +810,8 @@ export function WebIntegrationAuthBanner() {
           padding: "4px 10px",
           fontSize: "0.8125rem",
           fontWeight: 600,
-          cursor: authorizing ? "wait" : "pointer",
-          opacity: authorizing ? 0.7 : 1,
+          cursor: authorizing ? "wait" : signInTargetUnknown ? "not-allowed" : "pointer",
+          opacity: authorizing || signInTargetUnknown ? 0.7 : 1,
           whiteSpace: "nowrap",
         }}
       >

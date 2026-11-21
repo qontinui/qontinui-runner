@@ -111,6 +111,21 @@ async function mount() {
   await act(async () => {});
 }
 
+/** Authorize is disabled and a click starts no sign-in: the target is unknown. */
+async function expectAuthorizePaused(): Promise<void> {
+  const button = Array.from(host.querySelectorAll("button")).find(
+    (b) => b.textContent === "Authorize",
+  );
+  expect(button).toBeDefined();
+  expect(button!.disabled).toBe(true);
+  const before = invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in").length;
+  await act(async () => {
+    button!.click();
+  });
+  await act(async () => {});
+  expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in").length).toBe(before);
+}
+
 async function clickAuthorize(): Promise<string | undefined> {
   const button = Array.from(host.querySelectorAll("button")).find(
     (b) => b.textContent === "Authorize",
@@ -138,7 +153,7 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     expect(await clickAuthorize()).toBe("https://api.qontinui.io");
   });
 
-  it("signs in against production after a failed status re-read, though the banner still shows from the earlier read", async () => {
+  it("pauses Authorize after a failed status re-read instead of guessing production, though the banner still shows", async () => {
     statusReply = DEBUG_LOOPBACK;
     await mount();
     statusReply = new Error("get_web_integration_status failed");
@@ -146,7 +161,7 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
       emit("web-integration-changed");
     });
     await act(async () => {});
-    expect(await clickAuthorize()).toBe("https://api.qontinui.io");
+    await expectAuthorizePaused();
   });
 
   it("ignores an older failed re-read that settles after a newer successful one", async () => {
@@ -188,7 +203,7 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
       resolveOlder(DEBUG_LOOPBACK);
     });
     await act(async () => {});
-    expect(await clickAuthorize()).toBe("https://api.qontinui.io");
+    await expectAuthorizePaused();
   });
 
   it("targets the saved loopback backend again once a later re-read succeeds", async () => {
@@ -200,7 +215,7 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     });
     await act(async () => {});
     // The failing re-read has taken effect before the next one is issued.
-    expect(await clickAuthorize()).toBe("https://api.qontinui.io");
+    await expectAuthorizePaused();
     statusReply = DEBUG_LOOPBACK;
     await act(async () => {
       emit("web-integration-changed");
