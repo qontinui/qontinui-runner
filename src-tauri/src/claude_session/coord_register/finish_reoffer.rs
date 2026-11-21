@@ -56,6 +56,40 @@
 //! second re-reads the mark naming R. The mark reads synced again only on R's
 //! observed ACK, which also stamps `finish_coord_session_id = R`.
 //!
+//! **One re-address target, two triggers.** The finish heal
+//! (`session::finish_heal`, plan
+//! `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+//! Phase 4) also moves a mark onto another row, when coord's work-status
+//! names an active, NULL row that predates the finish. Both write the ONE
+//! stored target, `finish_coord_session_id`, under `finish_forward`, and the
+//! registrar's unsynced-mark routing reaches each trigger's row:
+//!
+//! - the heal's through `finish_coord_readdressed`, which makes
+//!   `forward_finish_change` send to the stored row rather than the
+//!   in-process resolution;
+//! - this re-offer's through the registrar's own `reverse` index, which names
+//!   R by construction — a re-offer runs only once a mover has put X on R.
+//!
+//! **Precedence, so the two never ping-pong:** a mark carrying
+//! `finish_coord_readdressed` is never re-offered here (checked before the
+//! door and again inside it). The heal acts on coord's OBSERVATION of the
+//! session's live row; this re-offer acts on a local inference from pane
+//! ownership. When the two disagree the observation stands, and since the heal
+//! only ever moves a mark TOWARD the row coord names, and this re-offer never
+//! moves one away from a row the heal chose, neither can bounce the finish
+//! back. A later re-offer of the same mark is the only re-offer that may
+//! replace an earlier one, and the heal may replace either.
+//!
+//! **Why this re-offer does not set `finish_coord_readdressed` itself.** That
+//! flag overrides the in-process routing for as long as the mark is unsynced.
+//! Set by a re-offer, it would pin every later forward of the mark to R even
+//! after a later mover put X on R2 (a respawn after the re-offer), so a
+//! restamp or a retry would go to a row the session no longer runs on; and
+//! the precedence check above would then make every later re-offer defer to
+//! the first one, so a re-offer whose row never confirmed would hold the mark
+//! there for good. The re-offer needs no override: its row IS the in-process
+//! resolution. The flag stays the heal's evidence that coord observed the row.
+//!
 //! **Who calls it.** The live-pane adoption
 //! (`bind_transcript_session_on_live_pane`) and the seam (`note_pane_row`) on
 //! `Moved`, and the seam on every tick whose entry already names R
@@ -102,6 +136,10 @@ pub(crate) enum ReofferOutcome {
     /// The mark's row already IS the pane row (read before the door, or
     /// re-read inside it after a concurrent re-offer won).
     AlreadyOnRow,
+    /// The finish heal re-addressed the mark to the row coord OBSERVED as the
+    /// session's live one (`finish_coord_readdressed`): that outranks this
+    /// local inference, so the re-offer stands aside.
+    HealReaddressed,
     /// X's ownership of the row has no known instant (fail safe).
     OwnershipUnknown,
     /// X's ownership of the row began at or after the mark's `finished_at`:
@@ -174,6 +212,16 @@ impl AiCoordRegistrar {
             Some(r) if r == row => return ReofferOutcome::AlreadyOnRow,
             Some(r) => r,
         };
+        // The heal's re-address outranks this one (see the module docs, "One
+        // re-address target"). Re-checked inside the door as well.
+        if rec.finish_coord_readdressed {
+            debug!(
+                "ai_coord_register: not re-offering {}'s finish to pane row {} — the finish \
+                 heal re-addressed it to coord session {}, which coord observed as live",
+                claude_session_id, row, from
+            );
+            return ReofferOutcome::HealReaddressed;
+        }
         // The revival guard. An unknown ownership instant is never read as
         // "before the finish": a finish pushed onto a session revived on this
         // row would close live work. (A refusal is not retried elsewhere — see
@@ -232,6 +280,7 @@ impl AiCoordRegistrar {
         let outcome = match outcome {
             RedirectFinish::MarkChanged => ReofferOutcome::MarkChanged,
             RedirectFinish::AlreadyOnRow => ReofferOutcome::AlreadyOnRow,
+            RedirectFinish::HealReaddressed => ReofferOutcome::HealReaddressed,
             RedirectFinish::Ran(o) => o,
         };
         if let ReofferOutcome::Reoffered { from: acked_by } = outcome {

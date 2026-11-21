@@ -6753,6 +6753,124 @@ mod tests {
         );
     }
 
+    /// One re-address target, two triggers (D5 beside the finish heal's
+    /// re-address, plan `2026-11-07-...` Phase 4): a mark the heal
+    /// re-addressed to the row coord OBSERVED as live is never re-offered to
+    /// the pane row — not while the heal's re-send is in flight, and not after
+    /// that row confirms — so the two cannot ping-pong. The registrar's
+    /// unsynced routing keeps sending it to the heal's row.
+    #[test]
+    fn a_heal_readdressed_finish_is_never_re_offered_to_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        // The heal re-addresses the synced mark to C, coord's live row.
+        let c = Uuid::new_v4();
+        assert!(rig.store.note_finish_readdressed(x, at, c, true));
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(
+            finished_rows(&rig.reg).is_empty(),
+            "nothing re-offered to R"
+        );
+        assert_eq!(rig.mark(x), (false, Some(c)));
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::HealReaddressed
+        );
+
+        // The retry door (a reason-less re-finish of the unsynced mark) sends
+        // to the heal's row, although the registrar's entry is on R.
+        assert_eq!(
+            rig.store.set_finished(x, true, None).unwrap().coord,
+            FinishSync::Queued {
+                coord_session_id: c
+            }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(c, x.to_string())]);
+
+        // C confirms. Later ticks still leave the heal's row alone.
+        rig.ack(x, at, c);
+        assert_eq!(rig.mark(x), (true, Some(c)));
+        for _ in 0..2 {
+            assert_eq!(
+                rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+                MoveOutcome::Unchanged
+            );
+        }
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x), (true, Some(c)));
+    }
+
+    /// A heal re-address that lands between the re-offer's decision and its
+    /// door wins: the door re-reads the flag under `finish_forward`.
+    #[test]
+    fn a_heal_readdress_racing_the_re_offer_wins() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-race-x";
+        let (_stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let c = Uuid::new_v4();
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            assert!(store.note_finish_readdressed(x, at, c, true));
+        });
+
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::HealReaddressed
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x), (false, Some(c)));
+    }
+
+    /// The other direction: after a re-offer moved the mark onto R, the
+    /// registrar's unsynced routing (the retry door) sends to R through the
+    /// in-process resolution — the re-offer sets no override flag — and a
+    /// later heal re-address to coord's row replaces it, after which the
+    /// re-offer stands aside.
+    #[test]
+    fn a_re_offered_finish_routes_to_the_pane_row_until_the_heal_names_another() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-then-heal-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(!rig.store.get(x).unwrap().finish_coord_readdressed);
+        assert_eq!(
+            rig.store.set_finished(x, true, None).unwrap().coord,
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+
+        // The heal later finds coord naming C as the live row.
+        let c = Uuid::new_v4();
+        assert!(rig.store.note_finish_readdressed(x, at, c, false));
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(rig.mark(x), (false, Some(c)), "the heal's row stands");
+        assert!(finished_rows(&rig.reg).iter().all(|(row, _)| *row == r));
+    }
+
     /// D5 through the finish-time repair: the operator re-states X's finish
     /// (a restamp) after R′ ACKed it. The repair moves X onto R inside the
     /// finish observer, the forward itself is the one `Finished` to R, and
