@@ -66,6 +66,11 @@ import {
   PendingSignInNotice,
   isSignInCancelled,
 } from "@/components/PendingSignInNotice";
+import {
+  signInBackendUrlFrom,
+  signInTargetExplanation,
+  type SavedBackendStatus,
+} from "@/lib/savedBackendUrl";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
@@ -100,14 +105,15 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
   const [loggingOut, setLoggingOut] = useState(false);
 
   // --- Cognito Hosted-UI sign-in (RFC 8252 PKCE) ----------------------------
-  // Backend URL the Cognito-bound device JWT is minted against. It is the
-  // SAVED value from the Backend Connection tab (`get_web_integration_status`),
-  // shown read-only here: a local copy used to silently ignore a custom URL
-  // saved there. `null` = not loaded yet (or the read failed): sign-in is
-  // disabled rather than guessing the default. The legacy email/password
-  // pairing was removed (web backend is Cognito-only); Cognito sign-in (and
-  // browser SSO) are the only sign-in paths.
-  const [savedBackendUrl, setSavedBackendUrl] = useState<string | null>(null);
+  // The `get_web_integration_status` read the sign-in target is decided from.
+  // The target is the SAVED Backend Connection URL when the one sign-in rule
+  // honours it on this "operator" surface (savedBackendUrl.ts), else
+  // production; the panel shows the EFFECTIVE target and, when it differs from
+  // the saved URL, why. `null` = not loaded yet (or the read failed): sign-in
+  // is disabled rather than guessing. The legacy email/password pairing was
+  // removed (web backend is Cognito-only); Cognito sign-in (and browser SSO)
+  // are the only sign-in paths.
+  const [backendStatus, setBackendStatus] = useState<SavedBackendStatus | null>(null);
   const [backendUrlLoadFailed, setBackendUrlLoadFailed] = useState(false);
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
 
@@ -215,13 +221,16 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
     let cancelled = false;
     const load = async () => {
       try {
-        const st = await invoke<{ backendUrl: string }>("get_web_integration_status");
+        const st = await invoke<SavedBackendStatus>("get_web_integration_status");
         if (!cancelled) {
-          setSavedBackendUrl(st.backendUrl);
+          setBackendStatus(st);
           setBackendUrlLoadFailed(false);
         }
       } catch (err) {
         if (!cancelled) {
+          // A failed re-read drops the earlier status: the target is not
+          // decided from a stale read.
+          setBackendStatus(null);
           setBackendUrlLoadFailed(true);
           onLog("error", `Failed to load saved backend URL: ${err}`);
         }
@@ -236,11 +245,9 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
   }, [onLog]);
 
   const handleCognitoSignIn = useCallback(async () => {
-    const backendUrl = savedBackendUrl?.trim() ?? "";
-    if (!backendUrl) {
-      setFlowError("Backend URL is not set. Set it on the Backend Connection tab.");
-      return;
-    }
+    // Disabled until the status read lands (SignedOutPanel), so a null here is
+    // a race only; the rule still answers it (production).
+    const backendUrl = signInBackendUrlFrom(backendStatus, "operator");
     setCognitoState("signing-in");
     setFlowError(null);
     onLog("info", "Opening browser for Qontinui (Cognito) sign-in — complete the flow there");
@@ -271,7 +278,7 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
     } finally {
       setCognitoState("idle");
     }
-  }, [savedBackendUrl, onLog, refreshTier]);
+  }, [backendStatus, onLog, refreshTier]);
 
   const handleSignOut = useCallback(async () => {
     setSigningOut(true);
@@ -538,7 +545,10 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
         <SignedOutPanel
           cognitoSigningIn={cognitoState === "signing-in"}
           onCognitoSignIn={handleCognitoSignIn}
-          backendUrl={savedBackendUrl}
+          signInTarget={backendStatus ? signInBackendUrlFrom(backendStatus, "operator") : null}
+          signInTargetReason={
+            backendStatus ? signInTargetExplanation(backendStatus, "operator") : null
+          }
           backendUrlLoadFailed={backendUrlLoadFailed}
           onOpenBackendConnection={onOpenBackendConnection}
         />
@@ -639,8 +649,11 @@ function SignedInPanel({
 interface SignedOutPanelProps {
   cognitoSigningIn: boolean;
   onCognitoSignIn: () => void;
-  /** Saved backend URL; `null` while unknown. */
-  backendUrl: string | null;
+  /** The EFFECTIVE sign-in target (never the raw saved URL unless the rule
+   *  honours it); `null` while the status read has not landed or failed. */
+  signInTarget: string | null;
+  /** Why the target is not the saved URL; `null` when it is. */
+  signInTargetReason: string | null;
   backendUrlLoadFailed: boolean;
   onOpenBackendConnection: () => void;
 }
@@ -648,11 +661,14 @@ interface SignedOutPanelProps {
 function SignedOutPanel({
   cognitoSigningIn,
   onCognitoSignIn,
-  backendUrl,
+  signInTarget,
+  signInTargetReason,
   backendUrlLoadFailed,
   onOpenBackendConnection,
 }: SignedOutPanelProps) {
-  const cognitoDisabled = cognitoSigningIn || !backendUrl || backendUrl.trim().length === 0;
+  // Disabled while the status read has failed or not landed (#3049): the
+  // target is not guessed.
+  const cognitoDisabled = cognitoSigningIn || signInTarget === null;
 
   return (
     <div className="space-y-5">
@@ -670,9 +686,9 @@ function SignedOutPanel({
         </div>
 
         <div className="text-xs">
-          <span className="font-medium">Backend: </span>
+          <span className="font-medium">Signs in to </span>
           <span id="account-saved-backend" className="font-mono break-all">
-            {backendUrl ??
+            {signInTarget ??
               (backendUrlLoadFailed ? "Could not read the saved backend URL" : "loading…")}
           </span>{" "}
           <button
@@ -682,6 +698,11 @@ function SignedOutPanel({
           >
             Change on Backend Connection
           </button>
+          {signInTargetReason && (
+            <div id="account-sign-in-target-reason" className="mt-1 text-muted-foreground">
+              {signInTargetReason}
+            </div>
+          )}
         </div>
 
         <button

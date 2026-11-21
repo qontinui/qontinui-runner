@@ -163,6 +163,27 @@ pub struct GetWebIntegrationStatusResponse {
     /// PLACEHOLDER, not the user's saved configuration — the UI must say so
     /// rather than rendering a runner that looks disabled/signed-out.
     pub settings_fault: Option<crate::settings::SettingsFault>,
+    /// Is `backend_url` *machine-local* (loopback or bind-all `0.0.0.0`/`::`)?
+    /// `crate::api_config::is_machine_local_backend_url` — the URL's class,
+    /// independent of build. Served so the frontend never re-implements the
+    /// host classes. Serialized as `backendUrlMachineLocal`.
+    pub backend_url_machine_local: bool,
+    /// Would THIS build refuse to dial `backend_url`?
+    /// `crate::api_config::persisted_backend_url_refused(backend_url,
+    /// cfg!(debug_assertions))` — true only for a machine-local URL on a
+    /// release build. The frontend must not sign in to a URL with this set.
+    /// Serialized as `backendUrlRefused`.
+    pub backend_url_refused: bool,
+}
+
+/// The two backend-URL verdicts served by [`get_web_integration_status`]:
+/// `(machine_local, refused)`. Pure — `is_debug` is a parameter so both build
+/// settings are unit-testable; the command passes `cfg!(debug_assertions)`.
+fn backend_url_verdicts(raw: &str, is_debug: bool) -> (bool, bool) {
+    (
+        crate::api_config::is_machine_local_backend_url(raw),
+        crate::api_config::persisted_backend_url_refused(raw, is_debug),
+    )
 }
 
 /// The web-FRONTEND origin the runner GUI opens qontinui-web pages on
@@ -215,6 +236,10 @@ pub async fn get_web_integration_status(
         None => (None, None, None, false),
     };
 
+    // Computed BEFORE `persisted.backend_url` is moved into the response.
+    let (backend_url_machine_local, backend_url_refused) =
+        backend_url_verdicts(&persisted.backend_url, cfg!(debug_assertions));
+
     Ok(GetWebIntegrationStatusResponse {
         enabled: persisted.enabled,
         backend_url: persisted.backend_url,
@@ -225,6 +250,8 @@ pub async fn get_web_integration_status(
         registration_error,
         ws_connected,
         settings_fault,
+        backend_url_machine_local,
+        backend_url_refused,
     })
 }
 
@@ -1143,6 +1170,8 @@ mod ipc_wire_contract_tests {
             registration_error: None,
             ws_connected: false,
             settings_fault: None,
+            backend_url_machine_local: true,
+            backend_url_refused: false,
         })
         .expect("status response must serialize");
 
@@ -1155,6 +1184,36 @@ mod ipc_wire_contract_tests {
             );
         }
         assert_eq!(json["webBaseUrl"], "http://localhost:3001");
+
+        // The two backend-URL verdicts the sign-in helper keys off. A missing
+        // key reads as UNKNOWN on the TS side and silently takes production.
+        assert_eq!(json["backendUrlMachineLocal"], true);
+        assert_eq!(json["backendUrlRefused"], false);
+    }
+
+    #[test]
+    fn backend_url_verdicts_refuse_machine_local_only_in_release() {
+        // Loopback: machine-local at both settings; refused ONLY in release.
+        assert_eq!(
+            super::backend_url_verdicts("http://127.0.0.1:8000", false),
+            (true, true)
+        );
+        assert_eq!(
+            super::backend_url_verdicts("http://127.0.0.1:8000", true),
+            (true, false)
+        );
+        // Bind-all is the same class.
+        assert_eq!(
+            super::backend_url_verdicts("http://[::]:8000", false),
+            (true, true)
+        );
+        // Remote: never machine-local, never refused.
+        for is_debug in [false, true] {
+            assert_eq!(
+                super::backend_url_verdicts("https://api.example.com", is_debug),
+                (false, false)
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,8 @@
  *     access, and a dismissed banner is a silent runner again.
  *
  * The Authorize button invokes the `cognito_sign_in` Tauri command — the
- * canonical one-click connect path. It opens the system browser for Cognito
+ * canonical one-click connect path. Its target is decided by the one sign-in
+ * rule in `@/lib/savedBackendUrl` for an "operator" surface. It opens the system browser for Cognito
  * Hosted-UI sign-in (RFC 8252 PKCE), then pairs this device server-side
  * (minting a device JWT) and promotes the runner to Tier 2. On success it
  * emits `web-integration-changed`, which refreshes the status + device-JWT
@@ -40,6 +41,7 @@ import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useTenant } from "@/contexts/TenantContext";
+import { signInBackendUrlFrom, type SavedBackendStatus } from "@/lib/savedBackendUrl";
 import {
   NO_BROWSER_HINT,
   PendingSignInNotice,
@@ -73,9 +75,6 @@ import {
 /** Session-storage key used for dismissal persistence across re-renders. */
 const DISMISS_STORAGE_KEY = "qontinui:web-integration-auth-banner:dismissed-signature";
 
-/** Fallback backend URL when status hasn't loaded yet. */
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
-
 function readDismissedSignature(): string | null {
   try {
     return sessionStorage.getItem(DISMISS_STORAGE_KEY);
@@ -102,12 +101,10 @@ export function WebIntegrationAuthBanner() {
   // account" prompt for them.
   const { tier } = useRunnerTier();
 
-  const [status, setStatus] = useState<AuthBannerStatus | null>(null);
-  // Backend URL the Cognito-bound device JWT is minted against. Captured from
-  // the same `get_web_integration_status` fetch that feeds the banner; falls
-  // back to the production API host when the status hasn't loaded or carries no
-  // backendUrl (the Rust command then derives the web origin itself).
-  const [backendUrl, setBackendUrl] = useState<string>(DEFAULT_BACKEND_URL);
+  // The same `get_web_integration_status` read feeds the banner AND decides
+  // the Authorize button's sign-in target (savedBackendUrl.ts, "operator"
+  // surface); `null` (not loaded / read failed) targets production.
+  const [status, setStatus] = useState<(AuthBannerStatus & SavedBackendStatus) | null>(null);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );
@@ -212,12 +209,10 @@ export function WebIntegrationAuthBanner() {
     let cancelled = false;
 
     const fetchStatus = () => {
-      invoke<AuthBannerStatus & { backendUrl?: string }>("get_web_integration_status")
+      invoke<AuthBannerStatus & SavedBackendStatus>("get_web_integration_status")
         .then((next) => {
           if (cancelled) return;
           setStatus(next);
-          const url = next.backendUrl?.trim();
-          if (url) setBackendUrl(url);
         })
         .catch(() => {
           // If the command isn't available (e.g. older runner build), keep
@@ -399,7 +394,9 @@ export function WebIntegrationAuthBanner() {
       // device JWT) and promotes the runner to Tier 2, then emits
       // `web-integration-changed`, which refreshes the status + device-JWT
       // probe above and hides the banner.
-      await invoke<void>("cognito_sign_in", { backendUrl });
+      await invoke<void>("cognito_sign_in", {
+        backendUrl: signInBackendUrlFrom(status, "operator"),
+      });
       // A retry's "did not recover" is answered by this sign-in.
       setRetryRefresh(null);
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
@@ -409,7 +406,7 @@ export function WebIntegrationAuthBanner() {
     } finally {
       setAuthorizing(false);
     }
-  }, [backendUrl]);
+  }, [status]);
 
   // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
   // future sessions only — running sessions keep their tenant), close the
