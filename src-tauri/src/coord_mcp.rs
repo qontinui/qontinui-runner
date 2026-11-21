@@ -25786,14 +25786,25 @@ mod runner_credential_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut saw_probe_write = false;
         while std::time::Instant::now() < deadline {
-            let text =
-                std::fs::read_to_string(&crumb).expect("breadcrumb is written SYNCHRONOUSLY");
+            // The file exists from the synchronous write onward, but the probe
+            // replaces it by rename; on Windows a read that lands inside that
+            // replace can fail (access denied) or see nothing. That is the
+            // reader racing the writer, not a defect, so a failed read is
+            // retried. A read that SUCCEEDS must still hold the credential
+            // verdict.
+            let Ok(text) = std::fs::read_to_string(&crumb) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             assert!(
                 text.contains(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
                 "the breadcrumb must never become a stale-nonce story: {text}"
             );
             let line2 = text.lines().nth(1).unwrap_or_default();
-            let stamp: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
+            let Ok(stamp) = serde_json::from_str::<serde_json::Value>(line2.trim()) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             if stamp["port"].as_u64() == Some(port as u64) {
                 saw_probe_write = true;
                 break;
