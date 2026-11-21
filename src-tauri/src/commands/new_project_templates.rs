@@ -532,7 +532,7 @@ mod tests {
         ] {
             reddens(
                 mutate("package.json", &|c| {
-                    c.replace("github:qontinui/qontinui-design-kit#v0.1.0", bad)
+                    c.replace("github:qontinui/qontinui-design-kit#v0.1.1", bad)
                 }),
                 "not a git ref in tag form",
             );
@@ -569,11 +569,12 @@ mod tests {
             "lacks `vite build`",
         );
         reddens(
+            // Version-agnostic: put a caret in front of whatever the pin is,
+            // so a ui-bridge bump cannot turn this seed into a no-op.
             mutate("package.json", &|c| {
-                c.replace(
-                    "\"@qontinui/ui-bridge\": \"0.53.0\"",
-                    "\"@qontinui/ui-bridge\": \"^0.53.0\"",
-                )
+                let key = "\"@qontinui/ui-bridge\": \"";
+                let at = c.find(key).unwrap() + key.len();
+                format!("{}^{}", &c[..at], &c[at..])
             }),
             "is not an exact version",
         );

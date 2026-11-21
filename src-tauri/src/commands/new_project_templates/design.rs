@@ -31,8 +31,9 @@
 //! finding.
 
 /// `@qontinui/ui-bridge` is pinned exactly to the version the runner itself
-/// ships with (the floor of the repo-root `package.json` range, and the version
-/// the kit's tool directory pins), so a scaffold built without a lockfile
+/// ships with (the floor of the repo-root `package.json` range; it must also be
+/// the exact `@qontinui/ui-bridge` peer of the design-kit tag below), so a
+/// scaffold built without a lockfile
 /// cannot drift onto a newer contract; the template's tests assert it is not
 /// below the runner's pin. `@qontinui/design-kit` is installed by git tag (no
 /// registry credential; `prepare` builds `dist/`).

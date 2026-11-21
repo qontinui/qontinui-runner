@@ -2579,10 +2579,15 @@ jobs:
         with:
           persist-credentials: false
 
+      # No package-manager cache: this job installs nothing through the app's
+      # pnpm tree, and setup-node v5 otherwise caches on its own because
+      # package.json names a `packageManager`, which fails here with
+      # "Unable to locate executable file: pnpm" (pnpm is never set up).
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+          package-manager-cache: false
 
       # The kit is installed OUTSIDE the app from design/kit/package-lock.json
       # (the git tag v0.1.0 resolved to its commit, plus the EXACT ui-bridge
