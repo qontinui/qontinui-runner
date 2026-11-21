@@ -523,6 +523,8 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "hooks/ui-bridge-events/recoveryScope.ts",
   "hooks/ui-bridge-events/useAISearchEvents.ts",
   "hooks/ui-bridge-events/useControlEvents.ts",
+  "hooks/ui-bridge-events/useDesignEvents.test.ts",
+  "hooks/ui-bridge-events/useDesignEvents.ts",
   "hooks/ui-bridge-events/utils.ts",
   "hooks/useArchitecture.ts",
   "hooks/useTutorialKeyboard.ts",

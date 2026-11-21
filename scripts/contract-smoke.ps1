@@ -388,7 +388,10 @@ $BODY_FIXTURES = @{
     "POST /control/error-baselines/capture"   = '{"name":"smoke"}'
     "POST /control/error-baselines/compare"   = '{"name":"smoke"}'
     "POST /design/element/:id/state-styles"   = '{"states":[]}'
-    "POST /design/responsive"                 = '{"viewports":[]}'
+    # `{}` takes the default viewports. An empty `viewports` list is refused by
+    # ui-bridge's shared design runtime with INVALID_REQUEST (HTTP 400), so it
+    # would probe only the refusal.
+    "POST /design/responsive"                 = '{}'
     "POST /control/viewport-constraints"      = '{"width":1024,"height":768}'
     "POST /design/style-guide/load"           = '{"guide":{}}'
     "POST /control/fill"                      = '{"fields":{}}'

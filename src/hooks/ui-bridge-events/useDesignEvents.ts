@@ -1,59 +1,30 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import {
-  getElementDesignData,
-  captureResponsiveSnapshots,
+  captureQualityBaseline,
   captureStateVariations,
-  runStyleAudit,
+  DesignRequestError,
+  designAuditOf,
+  designFailureCode,
+  designSnapshotOf,
+  diffQualityBaseline,
+  elementStylesOf,
+  evaluateRegisteredQuality,
+  qualityFailureCode,
+  responsiveSnapshotsOf,
+  viewportConstraintsOf,
 } from "@qontinui/ui-bridge";
-import type {
-  ElementDesignData,
-  DesignRegistryLike,
-  InteractionStateName,
-  StyleGuideConfig,
-} from "@qontinui/ui-bridge";
+import type { InteractionStateName, SnapshotBaseline, StyleGuideConfig } from "@qontinui/ui-bridge";
+import { describeThrown } from "@/lib/utils";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
-import type { RegisteredElement } from "./types";
-import { createLogger } from "@/lib/logger";
-
-const logger = createLogger("UIBridgeDesignEvents");
 
 /**
- * Iterates over bridge elements, resolves their DOM nodes, and collects
- * design data for each one. Shared by design_get_snapshot, design_evaluate,
- * design_evaluate_baseline, design_evaluate_diff, and design_run_audit.
+ * Body of a request routed through the Rust `{params: body}` wrapping. Every
+ * design route this hook answers through the shared runtime sends its HTTP
+ * body as `params` (`mcp/ui_bridge/design.rs`, `design_eval.rs`, `page.rs`),
+ * so `params` is the ONE place a field is read from.
  */
-function collectDesignData(
-  elements: readonly RegisteredElement[],
-  options?: {
-    targetIds?: string[];
-    includePseudoElements?: boolean;
-  },
-): ElementDesignData[] {
-  const filtered = options?.targetIds
-    ? elements.filter((el) => options.targetIds!.includes(el.id))
-    : elements;
-
-  const result: ElementDesignData[] = [];
-  for (const el of filtered) {
-    let domEl: HTMLElement | null = el.element instanceof HTMLElement ? el.element : null;
-    if (!domEl) {
-      const selector = el.getIdentifier?.()?.selector;
-      if (selector) {
-        domEl = document.querySelector<HTMLElement>(selector);
-      }
-    }
-    if (domEl) {
-      result.push(
-        getElementDesignData(domEl, {
-          elementId: el.id,
-          label: el.label,
-          type: el.type,
-          includePseudoElements: options?.includePseudoElements,
-        }),
-      );
-    }
-  }
-  return result;
+function paramsOf(payload: UIBridgeRequestPayload): Record<string, unknown> {
+  return payload.params ?? {};
 }
 
 /**
@@ -61,97 +32,87 @@ function collectDesignData(
  *          design_get_responsive, design_run_audit, design_load_style_guide,
  *          design_get_style_guide, design_clear_style_guide,
  *          design_evaluate, design_evaluate_baseline, design_evaluate_contexts,
- *          design_evaluate_diff
+ *          design_evaluate_diff, set_viewport_constraints
+ *
+ * The design-inspection, quality-evaluation and viewport-constraint requests
+ * run through ui-bridge's shared request runtime (`specs/design-request`,
+ * `specs/quality-request`) — the same functions the SDK's own server handlers
+ * and in-page command dispatcher call — so the runner window answers with one
+ * model whichever transport reached it: bounded and reported selections, the
+ * real quality diff, and viewport constraints serialized with responsive
+ * captures under the root-width lock. A request the runtime refuses answers
+ * `{success:false, error, code}` with the runtime's own failure code, which
+ * `wrap_ipc_result` maps onto a typed HTTP error (`TYPED_FRONTEND_CODES`).
+ *
+ * `design_get_state_styles` and `design_evaluate_contexts` stay inline: the
+ * SDK has no shared request function for either.
  */
 export function useDesignEvents(
   context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse" | "loadedStyleGuideRef">,
 ) {
   const { bridgeRef, sendResponse, loadedStyleGuideRef } = context;
+  // The baseline `design_evaluate_diff` compares against, as the SDK's server
+  // keeps its `savedBaseline`: captured by `design_evaluate_baseline`, held
+  // for the life of the window.
+  const qualityBaselineRef = useRef<SnapshotBaseline | null>(null);
 
   return useCallback(
     async (payload: UIBridgeRequestPayload): Promise<boolean> => {
       const { requestId, type } = payload;
       const currentBridge = bridgeRef.current;
 
-      switch (type) {
-        case "design_get_snapshot": {
-          const allElements = currentBridge.elements;
-          const targetIds = payload.elementIds as string[] | undefined;
-
-          if (allElements.length === 0) {
-            logger.debug("design_get_snapshot: no registered elements in bridge");
-          }
-
-          const designData = collectDesignData(allElements, {
-            targetIds,
-            includePseudoElements: payload.includePseudoElements,
-          });
-
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: { elements: designData, timestamp: Date.now() },
-            timestamp: Date.now(),
-          });
-          return true;
+      /**
+       * Answer with what `run` returns, or — when it throws — with the error's
+       * message and the failure code `failureCode` assigns it. The response is
+       * sent outside the `try`, so a failed send is never re-reported as a
+       * request failure.
+       */
+      const answer = async (
+        run: () => unknown,
+        failureCode: (err: unknown) => string,
+      ): Promise<boolean> => {
+        let outcome: { ok: true; data: unknown } | { ok: false; error: string; code: string };
+        try {
+          outcome = { ok: true, data: await run() };
+        } catch (err) {
+          outcome = {
+            ok: false,
+            error: describeThrown(err, `${type} failed`),
+            code: failureCode(err),
+          };
         }
+        await sendResponse(
+          outcome.ok
+            ? { requestId, type, success: true, data: outcome.data, timestamp: Date.now() }
+            : {
+                requestId,
+                type,
+                success: false,
+                error: outcome.error,
+                code: outcome.code,
+                timestamp: Date.now(),
+              },
+        );
+        return true;
+      };
+      const design = (routeCode: string) => (err: unknown) => designFailureCode(err, routeCode);
+      const quality = (routeCode: string) => (err: unknown) => qualityFailureCode(err, routeCode);
+
+      switch (type) {
+        case "design_get_snapshot":
+          return answer(
+            () => designSnapshotOf(currentBridge.elements, payload.params),
+            design("DESIGN_SNAPSHOT_ERROR"),
+          );
 
         case "design_get_element_styles": {
-          const { elementId: styleElementId } = payload;
-          if (!styleElementId) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error: "elementId is required",
-              timestamp: Date.now(),
-            });
-            return true;
-          }
-
-          const styleElement = currentBridge.getElement(styleElementId);
-          let styleDomEl: HTMLElement | null = null;
-          if (styleElement) {
-            styleDomEl = styleElement.element instanceof HTMLElement ? styleElement.element : null;
-            if (!styleDomEl) {
-              const sel = styleElement.getIdentifier?.()?.selector;
-              if (sel) {
-                styleDomEl = document.querySelector<HTMLElement>(sel);
-              }
+          const id = paramsOf(payload).elementId;
+          return answer(() => {
+            if (typeof id !== "string" || id === "") {
+              throw new DesignRequestError("elementId is required", "INVALID_REQUEST");
             }
-          }
-          if (!styleDomEl) {
-            // Try finding element by data-testid as last resort
-            styleDomEl = document.querySelector<HTMLElement>(`[data-testid="${styleElementId}"]`);
-          }
-
-          if (!styleDomEl) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error: `Element not found in DOM: ${styleElementId}`,
-              timestamp: Date.now(),
-            });
-            return true;
-          }
-
-          const elementDesignData = getElementDesignData(styleDomEl, {
-            elementId: styleElementId,
-            label: styleElement?.label,
-            type: styleElement?.type,
-            includePseudoElements: true,
-          });
-
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: elementDesignData,
-            timestamp: Date.now(),
-          });
-          return true;
+            return elementStylesOf(id, currentBridge.getElement(id));
+          }, design("DESIGN_STYLES_ERROR"));
         }
 
         case "design_get_state_styles": {
@@ -210,69 +171,22 @@ export function useDesignEvents(
           return true;
         }
 
-        case "design_get_responsive": {
-          const registry = {
-            getAllElements: () => currentBridge.elements,
-          };
-          const viewports = (payload.viewports ??
-            payload.params?.viewports ?? { mobile: 375, tablet: 768, desktop: 1280 }) as Record<
-            string,
-            number
-          >;
-          const snapshots = await captureResponsiveSnapshots(
-            registry as DesignRegistryLike,
-            viewports,
+        case "design_get_responsive":
+          // The registry is read inside the root-width lock, once this
+          // capture's turn comes — not when the request arrived.
+          return answer(
+            () => responsiveSnapshotsOf(() => bridgeRef.current.elements, payload.params),
+            design("RESPONSIVE_SNAPSHOT_ERROR"),
           );
 
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: snapshots,
-            timestamp: Date.now(),
-          });
-          return true;
-        }
-
-        case "design_run_audit": {
-          const auditElements = currentBridge.elements;
-          const auditTargetIds =
-            payload.elementIds ?? (payload.params?.elementIds as string[] | undefined);
-
-          if (auditElements.length === 0) {
-            logger.debug("design_run_audit: no registered elements in bridge");
-          }
-
-          const auditDesignData = collectDesignData(auditElements, {
-            targetIds: auditTargetIds,
-          });
-
-          const guide =
-            payload.guide ??
-            (payload.params?.guide as StyleGuideConfig | undefined) ??
-            loadedStyleGuideRef.current;
-          if (!guide) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error:
-                "No style guide provided or loaded. Load one with design_load_style_guide first, or pass a guide in the request.",
-              timestamp: Date.now(),
-            });
-            return true;
-          }
-
-          const report = runStyleAudit(auditDesignData, guide);
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: report,
-            timestamp: Date.now(),
-          });
-          return true;
-        }
+        case "design_run_audit":
+          // The request's own `guide` wins inside `designAuditOf`; the loaded
+          // one is the fallback, and with neither the heuristics run.
+          return answer(
+            () =>
+              designAuditOf(currentBridge.elements, payload.params, loadedStyleGuideRef.current),
+            design("DESIGN_AUDIT_ERROR"),
+          );
 
         case "design_load_style_guide": {
           const guideToLoad =
@@ -326,57 +240,21 @@ export function useDesignEvents(
         // ==================================================================
 
         case "design_evaluate": {
-          const evalParams = payload.params ?? payload.body ?? {};
-          const evalTargetIds = evalParams.elementIds as string[] | undefined;
-
-          const evalDesignData = collectDesignData(currentBridge.elements, {
-            targetIds: evalTargetIds,
-            includePseudoElements: true,
-          });
-
-          const evalGuide =
-            (evalParams.guide as StyleGuideConfig | undefined) ?? loadedStyleGuideRef.current;
-          const evalReport = evalGuide ? runStyleAudit(evalDesignData, evalGuide) : null;
-
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: {
-              elements: evalDesignData,
-              audit: evalReport,
-              criteria: evalParams.criteria ?? null,
-              timestamp: Date.now(),
-            },
-            timestamp: Date.now(),
-          });
-          return true;
+          const guide =
+            (paramsOf(payload).guide as StyleGuideConfig | undefined) ??
+            loadedStyleGuideRef.current;
+          return answer(
+            () => evaluateRegisteredQuality(currentBridge.elements, payload.params, guide),
+            quality("QUALITY_EVALUATION_ERROR"),
+          );
         }
 
-        case "design_evaluate_baseline": {
-          const baselineParams = payload.params ?? payload.body ?? {};
-
-          const baselineDesignData = collectDesignData(currentBridge.elements, {
-            includePseudoElements: true,
-          });
-
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: {
-              baseline: {
-                elements: baselineDesignData,
-                capturedAt: Date.now(),
-                url: window.location.href,
-                title: document.title,
-                label: baselineParams.label ?? "baseline",
-              },
-            },
-            timestamp: Date.now(),
-          });
-          return true;
-        }
+        case "design_evaluate_baseline":
+          return answer(() => {
+            const baseline = captureQualityBaseline(currentBridge.elements, payload.params);
+            qualityBaselineRef.current = baseline;
+            return { saved: true, elementCount: baseline.elements.length };
+          }, quality("SAVE_BASELINE_ERROR"));
 
         case "design_evaluate_contexts": {
           // Return current design evaluation contexts (viewport, theme, etc.)
@@ -408,76 +286,31 @@ export function useDesignEvents(
         }
 
         case "design_evaluate_diff": {
-          const diffParams = payload.params ?? payload.body ?? {};
-          const baselineData = diffParams.baseline as
-            | { elements?: ElementDesignData[] }
-            | undefined;
-
-          // Capture current design data
-          const currentDesignData = collectDesignData(currentBridge.elements, {
-            includePseudoElements: true,
-          });
-
-          // Simple diff: compare element counts and IDs
-          const baselineIds = new Set((baselineData?.elements ?? []).map((e) => e.elementId));
-          const currentIds = new Set(currentDesignData.map((e) => e.elementId));
-          const added = currentDesignData.filter((e) => !baselineIds.has(e.elementId));
-          const removed = (baselineData?.elements ?? []).filter(
-            (e) => !currentIds.has(e.elementId),
-          );
-          const shared = currentDesignData.filter((e) => baselineIds.has(e.elementId));
-
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: {
-              added: added.length,
-              removed: removed.length,
-              unchanged: shared.length,
-              addedElements: added.map((e) => e.elementId),
-              removedElements: removed.map((e) => e.elementId),
-              current: { elementCount: currentDesignData.length },
-              baseline: { elementCount: baselineData?.elements?.length ?? 0 },
+          const baseline = qualityBaselineRef.current;
+          if (!baseline) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "No baseline saved. Call design_evaluate_baseline first.",
+              code: "NO_BASELINE",
               timestamp: Date.now(),
-            },
-            timestamp: Date.now(),
-          });
-          return true;
-        }
-
-        case "set_viewport_constraints": {
-          const { width, restore } = (payload.params || {}) as {
-            width?: number;
-            restore?: boolean;
-          };
-          const docEl = document.documentElement;
-          if (restore) {
-            docEl.style.removeProperty("width");
-            docEl.style.removeProperty("min-width");
-            docEl.style.removeProperty("max-width");
-            docEl.style.removeProperty("overflow");
-          } else if (typeof width === "number") {
-            docEl.style.width = `${width}px`;
-            docEl.style.minWidth = `${width}px`;
-            docEl.style.maxWidth = `${width}px`;
-            docEl.style.overflow = "hidden";
+            });
+            return true;
           }
-          void docEl.offsetHeight;
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: {
-              success: true,
-              viewportWidth: window.innerWidth,
-              constrainedWidth: width ?? window.innerWidth,
-              timestamp: Date.now(),
-            },
-            timestamp: Date.now(),
-          });
-          return true;
+          return answer(
+            () => diffQualityBaseline(baseline, currentBridge.elements, payload.params),
+            quality("DIFF_BASELINE_ERROR"),
+          );
         }
+
+        case "set_viewport_constraints":
+          // Serialized with responsive captures under the root-width lock, and
+          // narrows the root exactly as they do; `constrainedWidth` is measured.
+          return answer(
+            () => viewportConstraintsOf(payload.params),
+            design("VIEWPORT_CONSTRAINTS_ERROR"),
+          );
 
         default:
           return false;

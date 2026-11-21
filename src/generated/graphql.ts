@@ -880,6 +880,21 @@ export const UiBridgeErrorCode = {
    * consistent envelope on both pre-IPC and post-recovery rejection.
    */
   ActionNotSupported: "ACTION_NOT_SUPPORTED",
+  /**
+   * The frontend refused the action before running it — ui-bridge's
+   * canonical `UB-ACTION-REJECTED`, today a root-width mutation asked for
+   * while another runs synchronously. The request was well formed and the
+   * page is in a conflicting state, hence 409.
+   */
+  ActionRejected: "ACTION_REJECTED",
+  /**
+   * The frontend gave up waiting for a condition before it could act —
+   * ui-bridge's canonical `UB-ACTION-TIMEOUT`, today the root-width lock a
+   * responsive capture or a viewport constraint waits on (`budgetMs`) while
+   * another capture holds it. Nothing was changed; the wait is retryable,
+   * which is why the inner-failure status is 503, not 400.
+   */
+  ActionTimeout: "ACTION_TIMEOUT",
   AssertionFailed: "ASSERTION_FAILED",
   CircuitBreakerOpen: "CIRCUIT_BREAKER_OPEN",
   ConcurrencyLimitReached: "CONCURRENCY_LIMIT_REACHED",
@@ -948,6 +963,13 @@ export const UiBridgeErrorCode = {
    * LLM fallback.
    */
   MissingParam: "MISSING_PARAM",
+  /**
+   * The element is registered but has no DOM node to read — ui-bridge's
+   * shared design runtime (`DesignRequestError`, code `NO_DOM_REFERENCE`)
+   * refuses to answer design data for it rather than reading nothing. The
+   * registry is out of step with the page, so the remedy is to resnapshot.
+   */
+  NoDomReference: "NO_DOM_REFERENCE",
   /** `pasteText`'s `text` was not a string. */
   PasteTextInvalid: "PASTE_TEXT_INVALID",
   /** `getScrollback`'s `maxLines` was not a positive integer. */

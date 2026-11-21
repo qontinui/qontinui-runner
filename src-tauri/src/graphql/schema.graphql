@@ -928,7 +928,29 @@ enum UiBridgeErrorCode {
 	ELEMENT_NOT_VISIBLE
 	ELEMENT_NOT_ENABLED
 	ELEMENT_STALE
+	"""
+	The element is registered but has no DOM node to read — ui-bridge's
+	shared design runtime (`DesignRequestError`, code `NO_DOM_REFERENCE`)
+	refuses to answer design data for it rather than reading nothing. The
+	registry is out of step with the page, so the remedy is to resnapshot.
+	"""
+	NO_DOM_REFERENCE
 	ACTION_FAILED
+	"""
+	The frontend gave up waiting for a condition before it could act —
+	ui-bridge's canonical `UB-ACTION-TIMEOUT`, today the root-width lock a
+	responsive capture or a viewport constraint waits on (`budgetMs`) while
+	another capture holds it. Nothing was changed; the wait is retryable,
+	which is why the inner-failure status is 503, not 400.
+	"""
+	ACTION_TIMEOUT
+	"""
+	The frontend refused the action before running it — ui-bridge's
+	canonical `UB-ACTION-REJECTED`, today a root-width mutation asked for
+	while another runs synchronously. The request was well formed and the
+	page is in a conflicting state, hence 409.
+	"""
+	ACTION_REJECTED
 	"""
 	The requested action name is not in the element's advertised
 	`actions` list. Issued pre-IPC by `ui_bridge_execute_action_handler`
