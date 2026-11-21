@@ -37,6 +37,12 @@ export const RECOVERY_TARGET_MISSING = "RECOVERY_TARGET_MISSING";
  *  did not recover it. Not a refusal — an honest negative result — but still a
  *  failure, so it must never reach the caller as an HTTP 200 success. */
 export const RECOVERY_FAILED = "RECOVERY_FAILED";
+/** Machine-readable refusal: the executor answered without dispatching any
+ *  action to the bridge (the instruction did not parse, matched nothing on the
+ *  addressed element, or fell below the confidence threshold). Nothing ran, so
+ *  it is a refusal before dispatch — never `RECOVERY_FAILED`, which says the
+ *  original action ran and failed. */
+export const RECOVERY_NOT_DISPATCHED = "RECOVERY_NOT_DISPATCHED";
 
 /**
  * Actions that MUTATE input state. The LIST is not declared here: it is the
@@ -95,12 +101,35 @@ export function assertRecoveryDispatchAllowed(
 }
 
 /**
+ * What the scoped executor actually did, filled in by
+ * {@link scopeRecoveryExecutor}. `NLActionExecutor.execute` catches every
+ * failure — a parse miss, no matching element, low confidence, and this
+ * module's own {@link RecoveryRefusedError} — and RETURNS a failure response,
+ * so its answer alone cannot say whether anything reached the bridge. This
+ * can: `dispatched` turns true only once a call has passed the guard and been
+ * handed to the bridge, and `refusal` keeps the guard's own refusal.
+ */
+export interface RecoveryDispatchRecord {
+  dispatched: boolean;
+  refusal: RecoveryRefusedError | null;
+}
+
+export function newRecoveryDispatchRecord(): RecoveryDispatchRecord {
+  return { dispatched: false, refusal: null };
+}
+
+/**
  * Wrap a UI Bridge instance so every action it dispatches during recovery is
  * checked by {@link assertRecoveryDispatchAllowed} first. Component actions
  * and form fills are refused outright — neither is element-scoped, so neither
- * can be constrained to the addressed element.
+ * can be constrained to the addressed element. When `record` is given, it is
+ * told whether any call got past the guard (see {@link RecoveryDispatchRecord}).
  */
-export function scopeRecoveryExecutor<T extends object>(bridge: T, targetElementId: string): T {
+export function scopeRecoveryExecutor<T extends object>(
+  bridge: T,
+  targetElementId: string,
+  record?: RecoveryDispatchRecord,
+): T {
   return new Proxy(bridge, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
@@ -113,7 +142,15 @@ export function scopeRecoveryExecutor<T extends object>(bridge: T, targetElement
           action: { action?: string } | undefined,
           ...rest: unknown[]
         ) => {
-          assertRecoveryDispatchAllowed(targetElementId, elementId, action?.action ?? "");
+          try {
+            assertRecoveryDispatchAllowed(targetElementId, elementId, action?.action ?? "");
+          } catch (err) {
+            if (record && err instanceof RecoveryRefusedError) record.refusal = err;
+            throw err;
+          }
+          // Set BEFORE the call: a call that throws mid-action may have partly
+          // applied, so from here on the action counts as dispatched.
+          if (record) record.dispatched = true;
           return (value as (...a: unknown[]) => unknown).call(target, elementId, action, ...rest);
         };
       }
@@ -122,10 +159,12 @@ export function scopeRecoveryExecutor<T extends object>(bridge: T, targetElement
         typeof value === "function"
       ) {
         return async () => {
-          throw new RecoveryRefusedError(
+          const refusal = new RecoveryRefusedError(
             RECOVERY_OUT_OF_SCOPE,
             `${RECOVERY_OUT_OF_SCOPE}: '${String(prop)}' is not element-scoped; recovery is limited to '${targetElementId}'.`,
           );
+          if (record) record.refusal = refusal;
+          throw refusal;
         };
       }
       return typeof value === "function"
@@ -250,4 +289,21 @@ export function originalActionFacts(
     return {};
   }
   return { originalActionAttempted: true, originalActionPerformed: attemptSucceeded };
+}
+
+/**
+ * The typed refusal for a FAILED scoped attempt that dispatched nothing, or
+ * `null` when something was dispatched (then the answer is `RECOVERY_FAILED`).
+ * The guard's own refusal wins; otherwise the executor missed before acting.
+ */
+export function undispatchedRefusal(
+  record: RecoveryDispatchRecord,
+  reason: string | null,
+): { code: string; error: string } | null {
+  if (record.dispatched) return null;
+  if (record.refusal) return { code: record.refusal.code, error: record.refusal.message };
+  return {
+    code: RECOVERY_NOT_DISPATCHED,
+    error: `${RECOVERY_NOT_DISPATCHED}: ${reason ?? "the recovery executor dispatched no action"}`,
+  };
 }

@@ -101,6 +101,11 @@ fn recovery_error_code(code: &str) -> UiBridgeErrorCode {
         // The addressed element is not in the tree — the very condition the
         // element routes already report as `ELEMENT_NOT_FOUND`.
         "RECOVERY_TARGET_MISSING" => UiBridgeErrorCode::ElementNotFound,
+        // The executor answered without dispatching anything to the bridge
+        // (parse miss, no match on the addressed element, low confidence):
+        // nothing ran, so this is a refusal before dispatch, not an action
+        // failure — the journey ledger records no edge for it.
+        "RECOVERY_NOT_DISPATCHED" => UiBridgeErrorCode::InvalidRequest,
         // The reply stated no verdict, so whether the attempt acted is
         // UNKNOWN. This arm keeps the token out of the fallthrough below,
         // which says the attempt RAN. Under envelope rule 2a this code becomes
@@ -415,9 +420,19 @@ pub(crate) fn as_recovery_failure(result: BridgeResult) -> BridgeResult {
                 // same rule `as_action_failure` applies — because a detail the
                 // classifier genuinely recognised is a better answer than the
                 // token's coarse mapping.
+                //
+                // A context-less `ActionFailed` is ALSO unclassified: it is the
+                // classifier matching prose ("RECOVERY_FAILED: Click action
+                // failed" contains "action failed"), not a recognised code, and
+                // left unstamped the journey ledger cannot tell it from a
+                // pre-dispatch refusal (`journey::capture::post_dispatch_action_failure`).
                 let unclassified = match &body.error_detail {
                     None => true,
-                    Some(d) => matches!(d.code, UiBridgeErrorCode::InternalError),
+                    Some(d) => {
+                        matches!(d.code, UiBridgeErrorCode::InternalError)
+                            || (matches!(d.code, UiBridgeErrorCode::ActionFailed)
+                                && d.context.is_none())
+                    }
                 };
                 if unclassified {
                     let prior = body.error_detail.take();
@@ -1072,6 +1087,7 @@ mod recovery_failure_tests {
         for (token, expected) in [
             ("RECOVERY_UNSCOPED", "INVALID_REQUEST"),
             ("RECOVERY_TARGET_MISSING", "ELEMENT_NOT_FOUND"),
+            ("RECOVERY_NOT_DISPATCHED", "INVALID_REQUEST"),
             ("RECOVERY_FAILED", "ACTION_FAILED"),
         ] {
             let message = format!("{token}: refused");

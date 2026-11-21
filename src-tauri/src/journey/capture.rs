@@ -1643,6 +1643,61 @@ mod tests {
         ));
     }
 
+    /// The LIVE `/ai/recovery/attempt` path: `wrap_ipc_result` flattened the
+    /// frontend's `RECOVERY_FAILED: <message>` into a 400 and the prose
+    /// classifier read "action failed" in it as a context-less
+    /// `ACTION_FAILED`. `as_recovery_failure`'s Err arm must still stamp the
+    /// recovery token, so the attempt that RAN records an `error` edge.
+    #[test]
+    fn a_recovery_failed_400_on_the_err_arm_is_an_error_edge() {
+        use crate::mcp::types::ApiResponse;
+        use crate::mcp::ui_bridge::types::classify_transport_error;
+        use axum::http::StatusCode;
+        use axum::Json;
+        let msg = "RECOVERY_FAILED: Click action failed";
+        let detail = classify_transport_error(msg);
+        assert!(matches!(detail.code, UiBridgeErrorCode::ActionFailed));
+        assert!(detail.context.is_none());
+        let result = crate::mcp::ui_bridge::ai_analyze::as_recovery_failure(Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error_detailed(msg.to_string(), detail)),
+        )));
+        let (status, Json(body)) = result.as_ref().expect_err("still a 400");
+        assert_eq!(*status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.error_detail
+                .as_ref()
+                .and_then(|d| d.context.as_ref())
+                .and_then(|c| c.get("code"))
+                .and_then(|c| c.as_str()),
+            Some("RECOVERY_FAILED")
+        );
+        assert!(matches!(
+            control_action_verdict(&result),
+            Some(ActionOutcome::Failed(_))
+        ));
+        // A recovery REFUSAL on the same arm still records nothing — including
+        // an attempt whose executor dispatched nothing (its message carries
+        // the executor's own "action failed" prose, which the classifier
+        // matches).
+        for refused in [
+            "RECOVERY_UNSCOPED: requires elementId; Operation failed",
+            "RECOVERY_NOT_DISPATCHED: UB-ACTION-FAILED: Click action failed",
+            "RECOVERY_WRITE_REFUSED: recovery may not 'type'",
+            // The executor's catch arm, a throw before any dispatch.
+            "RECOVERY_NOT_DISPATCHED: network error",
+        ] {
+            let result = crate::mcp::ui_bridge::ai_analyze::as_recovery_failure(Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::error_detailed(
+                    refused.to_string(),
+                    classify_transport_error(refused),
+                )),
+            )));
+            assert_eq!(control_action_verdict(&result), None, "{refused}");
+        }
+    }
+
     /// Any other 4xx is still the runner refusing the request: no edge, even
     /// with a typed detail.
     #[test]
@@ -1902,21 +1957,6 @@ mod tests {
         // The branches that DO act name their outcomes explicitly.
         assert!(EDGE_WRITE_SQL.contains("$12 IN ('changed', 'no_change', 'settle_timeout')"));
         assert!(EDGE_WRITE_SQL.contains("WHERE $12 = 'error'"));
-    }
-
-    /// An action recorded with an unstated verdict carries the
-    /// `verdict_unknown` hint into the cursor.
-    #[test]
-    fn record_action_maps_the_three_states_to_hints() {
-        assert_eq!(verdict_hint(&ActionOutcome::Succeeded), None);
-        assert_eq!(
-            verdict_hint(&ActionOutcome::Failed(None)),
-            Some(EdgeOutcome::Error)
-        );
-        assert_eq!(
-            verdict_hint(&ActionOutcome::Indeterminate),
-            Some(EdgeOutcome::VerdictUnknown)
-        );
     }
 
     // ---- N2 / N3: where an SDK action landed ---------------------------------

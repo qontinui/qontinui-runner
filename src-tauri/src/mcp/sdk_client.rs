@@ -739,7 +739,10 @@ enum DispatchStage {
     AppAnswered,
 }
 
-/// Classify a dispatch error by [`DispatchStage`]. Where one variant covers
+/// Classify a dispatch error by [`DispatchStage`]. Any `HttpStatus` other than
+/// 404/405 (including a 4xx from a server that is not ui-bridge's) is
+/// deliberately [`DispatchStage::AfterSend`]: conservative, an unknown verdict
+/// rather than "did not act". Where one variant covers
 /// both sides of the send (a WebSocket `Disconnected` is both a send failure
 /// and a socket closed in flight), it is [`DispatchStage::AfterSend`]: reading
 /// "may have acted" as "did not act" is what licenses a second execution.
@@ -781,6 +784,29 @@ fn dispatch_stage(err: &DispatchError) -> DispatchStage {
 /// nothing, an app-answered failure is an `error` edge).
 fn element_action_dispatch_outcome(err: &DispatchError) -> Option<ActionOutcome> {
     (dispatch_stage(err) == DispatchStage::AfterSend).then_some(ActionOutcome::Indeterminate)
+}
+
+/// The journey verdict `handle_element_action` records, from its answer
+/// `(body, success, error)`, the three-state verdict an arm read (if any), and
+/// whether the dispatch failed after the send. An after-send dispatch error
+/// records its verdict (unknown) even though its body is a transport refusal;
+/// otherwise a refusal ([`crate::journey::capture::sdk_refusal`]) records
+/// nothing, and any other answer records the arm's verdict, else its boolean.
+fn element_action_journey_verdict(
+    result: &(Json<serde_json::Value>, bool, Option<String>),
+    journey_outcome: Option<ActionOutcome>,
+    dispatch_verdict_unknown: bool,
+) -> Option<ActionOutcome> {
+    if !dispatch_verdict_unknown && crate::journey::capture::sdk_refusal(&result.0) {
+        return None;
+    }
+    Some(journey_outcome.unwrap_or_else(|| {
+        if result.1 {
+            ActionOutcome::Succeeded
+        } else {
+            ActionOutcome::Failed(result.2.clone())
+        }
+    }))
 }
 
 /// The app's own machine-readable code, from a JSON error body that has one
@@ -2692,14 +2718,9 @@ async fn handle_element_action(
             None,
         ),
     };
-    if dispatch_verdict_unknown || !crate::journey::capture::sdk_refusal(&result.0) {
-        let outcome = journey_outcome.unwrap_or_else(|| {
-            if result.1 {
-                ActionOutcome::Succeeded
-            } else {
-                ActionOutcome::Failed(result.2.clone())
-            }
-        });
+    if let Some(outcome) =
+        element_action_journey_verdict(&result, journey_outcome, dispatch_verdict_unknown)
+    {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
             crate::journey::cursor::CursorKey::new(journey_app, scope),
@@ -6240,11 +6261,14 @@ fn record_sdk_component_action(
 /// edge. `action_steps` are the steps that act on an element; an empty batch
 /// acted on nothing and records nothing; `sdk_action_target` decides where
 /// the rest landed (a refusal or no SDK app: nowhere — this route has no
-/// IPC fallback, C1). The verdict is [`sdk_batch_verdict`]'s.
+/// IPC fallback, C1). The verdict is [`sdk_batch_verdict`]'s; `request_steps`
+/// is the request's FULL step list when it mixes action and non-action steps
+/// (`/control/batch`), `None` when every step acts (`/control/batch-action`).
 fn record_sdk_batch(
     state: &Arc<ApiState>,
     active_app: Option<(String, Option<String>)>,
     action_steps: &[serde_json::Value],
+    request_steps: Option<&[serde_json::Value]>,
     response: &serde_json::Value,
 ) {
     let Some(action) = crate::journey::cursor::ActionSpec::batch(action_steps) else {
@@ -6256,7 +6280,7 @@ fn record_sdk_batch(
         None,
         false,
         response,
-        sdk_batch_verdict(response),
+        sdk_batch_verdict(response, request_steps),
         action,
     );
 }
@@ -6272,13 +6296,18 @@ fn record_sdk_batch(
 /// - each `data.results[]` step: its `response.success` when it carries a
 ///   `response` (`/control/batch-action`), else its own `success`
 ///   (`/control/batch`), read strictly — absent is
-///   [`ActionOutcome::Indeterminate`];
+///   [`ActionOutcome::Indeterminate`]. With `request_steps` given, only a
+///   result whose request step (by its `index`, else its position) is
+///   `type: "action"` is folded: a `wait` / `snapshot` step acts on no UI;
 /// - `data.success: false` is a failure when the steps do not already account
 ///   for it: with no readable step, or every step succeeded. Beside an
 ///   indeterminate step it adds nothing (the app's own aggregate counts an
 ///   absent `success` as a failure, so it cannot sharpen an unknown);
 /// - a `data` stating neither keeps the envelope's verdict.
-fn sdk_batch_verdict(response: &serde_json::Value) -> Option<ActionOutcome> {
+fn sdk_batch_verdict(
+    response: &serde_json::Value,
+    request_steps: Option<&[serde_json::Value]>,
+) -> Option<ActionOutcome> {
     use crate::mcp::ui_bridge::request::action_outcome;
     let outer = crate::journey::capture::sdk_action_verdict(response)?;
     if !outer.succeeded() {
@@ -6289,12 +6318,41 @@ fn sdk_batch_verdict(response: &serde_json::Value) -> Option<ActionOutcome> {
     };
     let steps = data.get("results").and_then(|r| r.as_array());
     let mut verdict = ActionOutcome::Succeeded;
-    for step in steps.into_iter().flatten() {
-        let read = step
-            .get("response")
-            .filter(|r| r.is_object())
-            .unwrap_or(step);
-        verdict.absorb(action_outcome(read));
+    let acts = |position: usize, step: &serde_json::Value| -> bool {
+        let Some(requests) = request_steps else {
+            return true;
+        };
+        let index = step
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .and_then(|i| usize::try_from(i).ok())
+            .unwrap_or(position);
+        requests
+            .get(index)
+            .is_some_and(|r| r.get("type").and_then(|t| t.as_str()) == Some("action"))
+    };
+    for (position, step) in steps.into_iter().flatten().enumerate() {
+        if !acts(position, step) {
+            continue;
+        }
+        if let Some(response) = step.get("response").filter(|r| r.is_object()) {
+            verdict.absorb(action_outcome(response));
+            continue;
+        }
+        // `/control/batch`: the server stamps a step `success: true` for ANY
+        // action result whose own `success` is not `false` — including one
+        // that states nothing — and keeps that raw result in `data`. So a
+        // stamped success is read through `data`, strictly: an action result
+        // with no `success` (or none at all) is unknown, not a success.
+        let stamped_success = step.get("success").and_then(|v| v.as_bool()) == Some(true);
+        if request_steps.is_some() && stamped_success {
+            verdict.absorb(match step.get("data").filter(|d| d.is_object()) {
+                Some(result) => action_outcome(result),
+                None => ActionOutcome::Indeterminate,
+            });
+            continue;
+        }
+        verdict.absorb(action_outcome(step));
     }
     if data.get("success").and_then(|v| v.as_bool()) == Some(false)
         && verdict.succeeded()
@@ -6388,7 +6446,7 @@ async fn handle_execute_batch_action(
         Ok(data) => data,
         Err(e) => serde_json::json!({ "success": false, "error": e }),
     };
-    record_sdk_batch(&state, active_app, &steps, &response);
+    record_sdk_batch(&state, active_app, &steps, None, &response);
     Json(response)
 }
 
@@ -6410,6 +6468,11 @@ async fn handle_control_batch(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let steps = control_batch_action_steps(&body);
+    let request_steps = body
+        .get("actions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     let response = match dispatch_app_request(
@@ -6425,7 +6488,7 @@ async fn handle_control_batch(
         Ok(data) => data,
         Err(e) => serde_json::json!({ "success": false, "error": e }),
     };
-    record_sdk_batch(&state, active_app, &steps, &response);
+    record_sdk_batch(&state, active_app, &steps, Some(&request_steps), &response);
     Json(response)
 }
 
@@ -11748,11 +11811,23 @@ mod recovery_attempt_twin_tests {
             DispatchError::NotRegistered("app".into()),
             DispatchError::NotResponsive("no tab".into()),
             DispatchError::WebSocket(CommandRelayError::NotConnected("app".into())),
+            // The route is absent on an older app server.
+            DispatchError::HttpStatus {
+                url: "u".into(),
+                status: 404,
+                body: "Not Found".into(),
+            },
+            DispatchError::HttpStatus {
+                url: "u".into(),
+                status: 405,
+                body: "Method Not Allowed".into(),
+            },
         ] {
             assert_eq!(dispatch_stage(&err), DispatchStage::BeforeSend, "{err:?}");
             let (status, body) = recovery_attempt_answer(Err(err));
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["code"], json!(SDK_DISPATCH_FAILED));
+            assert_eq!(body["failure_origin"], json!("transport"));
             assert_eq!(sdk_recovery_verdict(status.as_u16(), &body), None);
         }
     }
@@ -11832,13 +11907,13 @@ mod sdk_journey_verdict_tests {
             },
         });
         assert_eq!(
-            sdk_batch_verdict(&failed),
+            sdk_batch_verdict(&failed, None),
             Some(ActionOutcome::Failed(Some("not clickable".to_string())))
         );
         // `data.success: false` with no step to read is still a failure.
         let bare = json!({ "success": true, "data": { "success": false } });
         assert!(matches!(
-            sdk_batch_verdict(&bare),
+            sdk_batch_verdict(&bare, None),
             Some(ActionOutcome::Failed(_))
         ));
         // `/control/batch`: steps carry their own `success`.
@@ -11849,9 +11924,131 @@ mod sdk_journey_verdict_tests {
                 { "index": 1, "success": false, "error": "Action failed" },
             ] },
         });
+        let control_request = [
+            json!({ "type": "action", "element_id": "a", "action": "click" }),
+            json!({ "type": "action", "element_id": "b", "action": "click" }),
+        ];
         assert_eq!(
-            sdk_batch_verdict(&control),
+            sdk_batch_verdict(&control, Some(&control_request)),
             Some(ActionOutcome::Failed(Some("Action failed".to_string())))
+        );
+    }
+
+    /// `/control/batch`: only ACTION steps are folded. A failed `snapshot` or
+    /// an unknown-type step acted on no UI and cannot turn an all-success
+    /// action batch into an `error` edge.
+    #[test]
+    fn a_control_batch_folds_only_its_action_steps() {
+        let request = [
+            json!({ "type": "action", "element_id": "a", "action": "click" }),
+            json!({ "type": "snapshot" }),
+            json!({ "type": "wait", "ms": 10 }),
+            json!({ "type": "bogus" }),
+            json!({ "type": "action", "element_id": "b", "action": "click" }),
+        ];
+        let response = json!({
+            "success": true,
+            "data": { "results": [
+                { "index": 0, "success": true, "data": { "success": true } },
+                { "index": 1, "success": false, "error": "Snapshot failed" },
+                { "index": 2, "success": true, "data": { "waited_ms": 10 } },
+                { "index": 3, "success": false, "error": "Unknown step type: bogus" },
+                { "index": 4, "success": true, "data": { "success": true } },
+            ] },
+        });
+        assert_eq!(
+            sdk_batch_verdict(&response, Some(&request)),
+            Some(ActionOutcome::Succeeded)
+        );
+        // Read without the request (every step treated as an action) the
+        // snapshot failure would decide it: the filter is what prevents that.
+        assert!(matches!(
+            sdk_batch_verdict(&response, None),
+            Some(ActionOutcome::Failed(_))
+        ));
+        // A failing ACTION step is still a failure.
+        let failed_action = json!({
+            "success": true,
+            "data": { "results": [
+                { "index": 0, "success": false, "error": "not clickable" },
+                { "index": 1, "success": true, "data": { "success": true } },
+            ] },
+        });
+        assert_eq!(
+            sdk_batch_verdict(&failed_action, Some(&request)),
+            Some(ActionOutcome::Failed(Some("not clickable".to_string())))
+        );
+        // The server stamps `success: true` on an action step whose result
+        // stated nothing: read through `data`, that step is unknown.
+        for unstated in [json!({}), json!(null)] {
+            let response = json!({
+                "success": true,
+                "data": { "results": [
+                    { "index": 0, "success": true, "data": unstated.clone() },
+                    { "index": 4, "success": true, "data": { "success": true } },
+                ] },
+            });
+            assert_eq!(
+                sdk_batch_verdict(&response, Some(&request)),
+                Some(ActionOutcome::Indeterminate),
+                "step data = {unstated}"
+            );
+        }
+    }
+
+    /// The element-action handler's ledger gate: an after-send dispatch error
+    /// records `verdict_unknown` although its answer is a transport refusal;
+    /// a before-send one records nothing.
+    #[test]
+    fn the_element_action_gate_records_after_send_and_skips_before_send() {
+        let answer = |err: &DispatchError| {
+            let refusal = ipc_fallback_refusal(err, "element action").expect("an app was targeted");
+            let message = refusal["error"].as_str().map(String::from);
+            (Json(refusal), false, message)
+        };
+        let after = DispatchError::WebSocket(CommandRelayError::Timeout(
+            std::time::Duration::from_secs(30),
+        ));
+        let outcome = element_action_dispatch_outcome(&after);
+        assert_eq!(
+            element_action_journey_verdict(&answer(&after), outcome.clone(), outcome.is_some()),
+            Some(ActionOutcome::Indeterminate)
+        );
+        for before in [
+            DispatchError::NotRegistered("app".into()),
+            DispatchError::HttpStatus {
+                url: "u".into(),
+                status: 405,
+                body: "".into(),
+            },
+        ] {
+            let outcome = element_action_dispatch_outcome(&before);
+            assert_eq!(
+                element_action_journey_verdict(&answer(&before), outcome.clone(), outcome.is_some()),
+                None,
+                "{before:?}"
+            );
+        }
+        // An app-origin failure is an `error` edge; an answered success records.
+        let app = DispatchError::AppAnswered {
+            url: "u".into(),
+            status: 400,
+            error: "not clickable".into(),
+            code: None,
+            retryable: None,
+            data: None,
+        };
+        assert!(matches!(
+            element_action_journey_verdict(&answer(&app), None, false),
+            Some(ActionOutcome::Failed(_))
+        ));
+        assert_eq!(
+            element_action_journey_verdict(
+                &(Json(json!({ "success": true })), true, None),
+                Some(ActionOutcome::Succeeded),
+                false
+            ),
+            Some(ActionOutcome::Succeeded)
         );
     }
 
@@ -11869,7 +12066,7 @@ mod sdk_journey_verdict_tests {
                 },
             });
             assert_eq!(
-                sdk_batch_verdict(&unknown),
+                sdk_batch_verdict(&unknown, None),
                 Some(ActionOutcome::Indeterminate),
                 "data.success = {data_success}"
             );
@@ -11880,14 +12077,14 @@ mod sdk_journey_verdict_tests {
                 { "index": 0, "elementId": "a", "response": { "success": true } },
             ] },
         });
-        assert_eq!(sdk_batch_verdict(&ok), Some(ActionOutcome::Succeeded));
+        assert_eq!(sdk_batch_verdict(&ok, None), Some(ActionOutcome::Succeeded));
         // The envelope's own failure and a relay refusal are unchanged.
         assert!(matches!(
-            sdk_batch_verdict(&json!({ "success": false, "error": "e" })),
+            sdk_batch_verdict(&json!({ "success": false, "error": "e" }), None),
             Some(ActionOutcome::Failed(_))
         ));
         assert_eq!(
-            sdk_batch_verdict(&json!({ "success": false, "code": "TAB_STALE" })),
+            sdk_batch_verdict(&json!({ "success": false, "code": "TAB_STALE" }), None),
             None
         );
     }

@@ -3,13 +3,16 @@ import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
 import {
   RECOVERY_FAILED,
+  RECOVERY_NOT_DISPATCHED,
   RECOVERY_TARGET_MISSING,
   RECOVERY_UNSCOPED,
   RecoveryRefusedError,
+  newRecoveryDispatchRecord,
   originalActionFacts,
   recoveryFailureData,
   recoveryVerdict,
   scopeRecoveryExecutor,
+  undispatchedRefusal,
 } from "./recoveryScope";
 import { describeThrown } from "@/lib/utils";
 
@@ -1128,9 +1131,14 @@ export function useAISearchEvents(
             });
             return true;
           }
-          // Whether `executor.execute` was reached: from then on the original
-          // instruction ran, whatever it answered (see `originalActionFacts`).
-          let executeStarted = false;
+          // Whether any action got past the scope guard to the bridge. NOT
+          // "was `execute` reached": the executor returns (never throws) a
+          // failure for a parse miss, no match, low confidence and the guard's
+          // own refusal, all of which dispatched nothing.
+          const dispatch = newRecoveryDispatchRecord();
+          // Set once a response has been sent, so a later throw (from
+          // `sendResponse` itself) never sends a second, contradicting one.
+          let responded = false;
           try {
             const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
             const discovered = await currentBridge.discover({ includeHidden: true });
@@ -1158,19 +1166,42 @@ export function useAISearchEvents(
             // Delegate DOM actions to the bridge (UseUIBridgeReturn is
             // API-compatible), through the scope/write guard.
             executor.setActionExecutor(
-              scopeRecoveryExecutor(currentBridge as object, targetElementId) as never,
+              scopeRecoveryExecutor(currentBridge as object, targetElementId, dispatch) as never,
             );
-            executeStarted = true;
             const result = await executor.execute({
               instruction: instruction || "recover from error state",
             });
             const verdict = recoveryVerdict(result);
+            const refused = verdict.attemptSucceeded
+              ? null
+              : undispatchedRefusal(dispatch, verdict.reason);
+            if (refused) {
+              // Nothing reached the bridge: a refusal before dispatch, so the
+              // original did not run. `RECOVERY_FAILED` would tell the runner
+              // (and its journey ledger) that it ran and failed.
+              responded = true;
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: refused.error,
+                code: refused.code,
+                data: recoveryFailureData(refused.code, {
+                  elementId: targetElementId,
+                  result,
+                  ...originalActionFacts(false, instruction !== "", false),
+                }),
+                timestamp: Date.now(),
+              });
+              return true;
+            }
             const attempted = {
               elementId: targetElementId,
               result,
               ...originalActionFacts(true, instruction !== "", verdict.attemptSucceeded),
               timestamp: Date.now(),
             };
+            responded = true;
             await sendResponse({
               requestId,
               type,
@@ -1190,17 +1221,32 @@ export function useAISearchEvents(
               timestamp: Date.now(),
             });
           } catch (err) {
+            if (responded) {
+              // The answer already went out (or its send threw): a second
+              // response would contradict it.
+              console.error("[ai_recovery_attempt] failed after responding", err);
+              return true;
+            }
             const thrown = describeThrown(err, "recovery threw");
-            const code = err instanceof RecoveryRefusedError ? err.code : RECOVERY_FAILED;
+            const code =
+              err instanceof RecoveryRefusedError
+                ? err.code
+                : dispatch.dispatched
+                  ? RECOVERY_FAILED
+                  : RECOVERY_NOT_DISPATCHED;
             await sendResponse({
               requestId,
               type,
               success: false,
-              error: thrown,
+              // Prefixed with its token: the runner's route reads the code off
+              // the message prefix (it drops `data` before re-coding), so an
+              // unprefixed throw would fall back to RECOVERY_FAILED — "ran and
+              // failed" — for an attempt that dispatched nothing.
+              error: thrown.startsWith(`${code}:`) ? thrown : `${code}: ${thrown}`,
               code,
               data: recoveryFailureData(code, {
                 elementId: targetElementId,
-                ...originalActionFacts(executeStarted, instruction !== "", false),
+                ...originalActionFacts(dispatch.dispatched, instruction !== "", false),
               }),
               timestamp: Date.now(),
             });
