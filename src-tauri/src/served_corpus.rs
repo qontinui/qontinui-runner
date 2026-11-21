@@ -403,10 +403,13 @@ pub(crate) struct PassSummary {
 pub(crate) struct Provisioned {
     commands: Probe<PassSummary>,
     skills: Probe<PassSummary>,
+    /// The agent-definitions pass (ledger capability `agent_definitions`). It
+    /// alone can skip a unit as `operator-authored` or `served-in-place`.
+    agents: Probe<PassSummary>,
 }
 
 impl Provisioned {
-    /// `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills …`.
+    /// `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills …; agents …`.
     fn render(&self) -> String {
         let one = |label: &str, p: &Probe<PassSummary>| match p {
             Probe::Measured(s) => {
@@ -420,9 +423,10 @@ impl Provisioned {
             Probe::Unknown(r) => format!("{label} {}", unknown_text(r)),
         };
         format!(
-            "{}; {}",
+            "{}; {}; {}",
             one("commands", &self.commands),
-            one("skills", &self.skills)
+            one("skills", &self.skills),
+            one("agents", &self.agents)
         )
     }
 }
@@ -468,6 +472,7 @@ fn provisioned_for(workdir: &Path) -> Probe<Provisioned> {
     Probe::Measured(Provisioned {
         commands: latest("fleet_commands"),
         skills: latest("fleet_skills"),
+        agents: latest("agent_definitions"),
     })
 }
 
@@ -1915,6 +1920,10 @@ mod tests {
                 "; skills written=0/{s_n} skipped-git-tracked={s_n} as-of="
             )),
             "{line}"
+        );
+        assert!(
+            line.contains("; agents UNKNOWN (no pass recorded)"),
+            "an agent-definitions pass nobody recorded is UNKNOWN, not absent: {line}"
         );
         assert_eq!(
             c_n + s_n,
