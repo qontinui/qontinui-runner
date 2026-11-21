@@ -44,7 +44,8 @@
 //! `build_id` here is ALWAYS a string — this binary's `RUNNER_BUILD_ID`, the
 //! same value `/health` serves as `buildId` (an unstamped build says so as
 //! `unstamped-<sha>`) — never `null`, so there is no `build_id_unknown_reason`
-//! field; and the echoed `discriminator` is truncated to 128 characters, where
+//! field; the echoed `discriminator` is truncated to 128 characters and then
+//! marked with a trailing `…` (the `detail` states the original length), where
 //! coord echoes the id unbounded; and the 404's `detail` text lists the ids
 //! this version defines.
 //!
@@ -62,20 +63,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use qontinui_types::glossary::{
     lookup, GlossaryEntry, GlossaryTerm, GLOSSARY, GLOSSARY_CONTENT_SHA256, GLOSSARY_VERSION,
 };
 use qontinui_types::refusal::{NextAction, NextActionKind, Refusal, RefusalCode, RefusalSource};
 
-use crate::mcp::types::ApiState;
-
 /// The only `source` this runner serves: the table compiled into the binary.
 pub const SOURCE_EMBEDDED: &str = "embedded";
 
 /// How much of an unknown id the 404 echoes back.
 const MAX_ECHOED_ID_CHARS: usize = 128;
+
+/// Appended to an echoed id that was cut at [`MAX_ECHOED_ID_CHARS`], so a
+/// truncated echo is never mistaken for the id that was sent.
+const TRUNCATION_MARK: char = '…';
 
 /// Query for `GET /glossary`.
 ///
@@ -146,10 +149,22 @@ pub fn unknown_term_refusal(id: &str, observed_at: String) -> GlossaryTermUnknow
     // cannot bloat the body), the empty or blank string included — coord's
     // 404 carries it the same way, so a reader never special-cases which door
     // answered. A blank id (`id.trim().is_empty()`, coord's test too) gets a
-    // detail that says plainly it was empty.
-    let shown: String = id.chars().take(MAX_ECHOED_ID_CHARS).collect();
+    // detail that says plainly it was empty. An id longer than the bound is
+    // echoed as its first MAX_ECHOED_ID_CHARS characters plus TRUNCATION_MARK,
+    // and the detail states the original length.
+    let id_chars = id.chars().count();
+    let mut shown: String = id.chars().take(MAX_ECHOED_ID_CHARS).collect();
+    let truncated = id_chars > MAX_ECHOED_ID_CHARS;
+    if truncated {
+        shown.push(TRUNCATION_MARK);
+    }
     let detail = if id.trim().is_empty() {
         format!("the term id was empty; glossary version {GLOSSARY_VERSION} defines: {known}")
+    } else if truncated {
+        format!(
+            "{shown:?} (truncated from {id_chars} characters) is not defined by glossary \
+             version {GLOSSARY_VERSION}; defined ids: {known}"
+        )
     } else {
         format!(
             "{shown:?} is not defined by glossary version {GLOSSARY_VERSION}; defined ids: {known}"
@@ -209,7 +224,11 @@ pub async fn glossary_handler(Query(q): Query<GlossaryQuery>) -> Response {
     answer(q.term.as_deref())
 }
 
-pub fn routes() -> Router<Arc<ApiState>> {
+/// The glossary family. Generic over the router state because the handler
+/// reads none: `mcp_api` merges it into its `Router<Arc<ApiState>>`, and the
+/// tests here and in `origin_guard::tests` mount this same function on a
+/// stateless router, so what they exercise is the registration itself.
+pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new().route("/glossary", get(glossary_handler))
 }
 
@@ -228,12 +247,11 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
+    /// The family exactly as `mcp_api` mounts it, under the envelope layer.
     fn app() -> Router {
-        Router::new()
-            .route("/glossary", get(glossary_handler))
-            .layer(axum::middleware::from_fn(
-                crate::mcp::envelope::envelope_rewrite_middleware,
-            ))
+        routes().layer(axum::middleware::from_fn(
+            crate::mcp::envelope::envelope_rewrite_middleware,
+        ))
     }
 
     async fn get_path(path: &str) -> (StatusCode, Value) {
@@ -325,9 +343,11 @@ mod tests {
         assert!(body.get("terms").is_none(), "{body}");
         // The extractor's rejection went through the envelope layer.
         assert_eq!(body["success"], false, "{body}");
-        // `code_for_status(400)` is the historical `INVALID_JSON` for every 400.
-        assert_eq!(body["code"], "INVALID_JSON", "{body}");
-        assert!(body["error"].as_str().unwrap().contains("terms"), "{body}");
+        // The error names both the key that was sent and the one accepted, so
+        // the caller can correct the request without reading this source.
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("`terms`"), "{body}");
+        assert!(error.contains("expected `term`"), "{body}");
     }
 
     /// The echoed id is quoted, so a stray space in it is visible.
@@ -345,14 +365,33 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_id_is_echoed_bounded() {
+    fn an_oversized_id_is_echoed_bounded_and_marked() {
         let long = "x".repeat(10_000);
         let body = unknown_term_refusal(&long, "2026-10-01T00:00:00Z".to_string());
         let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(
-            v["discriminator"].as_str().unwrap().chars().count(),
-            MAX_ECHOED_ID_CHARS
+        let echoed = v["discriminator"].as_str().unwrap();
+        assert_eq!(echoed.chars().count(), MAX_ECHOED_ID_CHARS + 1);
+        assert!(echoed.ends_with(TRUNCATION_MARK), "{echoed}");
+        assert!(
+            v["detail"]
+                .as_str()
+                .unwrap()
+                .contains("(truncated from 10000 characters)"),
+            "{v}"
         );
+    }
+
+    /// An id exactly at the bound is echoed whole and unmarked.
+    #[test]
+    fn an_id_at_the_bound_is_not_marked() {
+        let at = "y".repeat(MAX_ECHOED_ID_CHARS);
+        let v = serde_json::to_value(unknown_term_refusal(
+            &at,
+            "2026-10-01T00:00:00Z".to_string(),
+        ))
+        .unwrap();
+        assert_eq!(v["discriminator"], at.as_str());
+        assert!(!v["detail"].as_str().unwrap().contains("truncated"), "{v}");
     }
 
     /// The exact `200` and `404` key sets — the keys a coord reader decodes

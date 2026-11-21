@@ -70,6 +70,7 @@ const PROBES: &[(&str, &str, &str)] = &[
     ("GET", "/ui-bridge/control/elements", "elements"),
     ("POST", "/shell-commands/{id}/run", "shell_run"),
     ("POST", "/settings/ai/api-key", "ai_api_key"),
+    ("GET", "/glossary", "glossary"),
 ];
 
 fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>) -> Harness {
@@ -125,6 +126,20 @@ fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>
                     }
                 }),
             ),
+            // The REAL glossary family (`mcp::glossary::routes()`, the function
+            // `mcp_api` merges), not a stand-in: what the guard admits here is
+            // what a caller reaches. The layer only counts the call.
+            ("GET", "/glossary") => router.merge(crate::mcp::glossary::routes().layer(
+                axum::middleware::from_fn(
+                    move |r: axum::extract::Request, next: axum::middleware::Next| {
+                        let c = c.clone();
+                        async move {
+                            c.hit(key);
+                            next.run(r).await
+                        }
+                    },
+                ),
+            )),
             ("GET", "/files/read") => router.route(
                 pattern,
                 get(move || {
@@ -596,6 +611,61 @@ async fn p1_14_webview_preflight_admitted_with_exact_origin() {
 // ---------------------------------------------------------------------------
 // Phase 2 acceptance tests
 // ---------------------------------------------------------------------------
+
+/// Plan `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`
+/// Phase C2: `GET /glossary` is public product vocabulary on
+/// `FOREIGN_ROUTES`, so every origin class reaches the real handler under
+/// every route policy — a foreign page, an extension, the web frontend and a
+/// non-browser caller alike — and gets the compiled-in glossary.
+#[tokio::test]
+async fn glossary_is_admitted_from_every_origin_class() {
+    for (class, path) in [
+        (OriginClass::Foreign, "/glossary"),
+        (OriginClass::Extension, "/glossary"),
+        (OriginClass::Trusted, "/glossary"),
+        (OriginClass::NonBrowser, "/glossary"),
+    ] {
+        assert!(route_allowed(class, "GET", path), "{class:?}");
+    }
+    for policy in [
+        "enforce",
+        "enforce-foreign",
+        "enforce-doors",
+        "shadow",
+        "off",
+    ] {
+        let h = harness(policy);
+        let mut expected_calls = 0;
+        for origin in [
+            Some("https://example.test"),
+            Some(EVIL),
+            Some("chrome-extension://abcdefghijklmnop"),
+            Some(WEB),
+            None,
+        ] {
+            let host = host(&h);
+            let mut headers = vec![("host", host.as_str())];
+            if let Some(o) = origin {
+                headers.push(("origin", o));
+            }
+            let (status, _, body) = send(&h, req("GET", "/glossary?term=gate", &headers, "")).await;
+            assert_eq!(status, StatusCode::OK, "{policy} {origin:?}: {body}");
+            let v: Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(
+                v["version"],
+                qontinui_types::glossary::GLOSSARY_VERSION,
+                "{policy} {origin:?}: {body}"
+            );
+            assert_eq!(v["terms"][0]["id"], "gate", "{policy} {origin:?}: {body}");
+            expected_calls += 1;
+            assert_eq!(
+                h.calls.get("glossary"),
+                expected_calls,
+                "{policy} {origin:?}"
+            );
+        }
+    }
+}
 
 /// P2-1: a foreign origin on an ordinary route is refused, with no CORS.
 #[tokio::test]
