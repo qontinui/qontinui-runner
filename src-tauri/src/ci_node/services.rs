@@ -217,6 +217,17 @@ const LOG_TAIL_LINES: &str = "50";
 /// Label every container carries, so survivors of a killed runner are
 /// identifiable. See the module docs on what this does and does not buy.
 pub(crate) const DISPATCH_LABEL: &str = "qontinui.ci.dispatch";
+/// The fleet's TEST-container marker (`qontinui.ephemeral=1`), the same key
+/// `ephemeral-db.sh` stamps. One label namespace for every harness that starts
+/// a throwaway database, so a sweeper reads one contract rather than one per
+/// harness. It marks the container as test-shaped; it authorises nothing.
+pub(crate) const EPHEMERAL_LABEL: &str = "qontinui.ephemeral";
+/// Which harness owns an ephemeral container, and therefore which liveness
+/// rule applies to it. A dispatch service's owner is this lane; its lifetime
+/// is the dispatch's, enforced by [`ServiceStack::teardown`] and the drop-reaper.
+pub(crate) const EPHEMERAL_OWNER_LABEL: &str = "qontinui.ephemeral.owner";
+/// The value this module writes under [`EPHEMERAL_OWNER_LABEL`].
+pub(crate) const EPHEMERAL_OWNER: &str = "runner-ci-node";
 /// Host address services are published on, and the address the exported env
 /// spells. IPv4 loopback explicitly — never `localhost`.
 const LOOPBACK: &str = "127.0.0.1";
@@ -503,6 +514,14 @@ pub(crate) fn run_argv(
         name.to_string(),
         "--label".to_string(),
         format!("{DISPATCH_LABEL}={dispatch_id}"),
+        // The fleet-wide ephemeral contract, beside the dispatch label: marks
+        // this as a TEST container and names this lane as its owner, so a
+        // fleet sweeper delegates it to the dispatch's own teardown instead of
+        // judging it by some other harness's liveness rule.
+        "--label".to_string(),
+        format!("{EPHEMERAL_LABEL}=1"),
+        "--label".to_string(),
+        format!("{EPHEMERAL_OWNER_LABEL}={EPHEMERAL_OWNER}"),
         // Loopback ONLY. `-p 5432:5432` would publish on every interface.
         "-p".to_string(),
         format!("{LOOPBACK}:{host_port}:{}", spec.container_port),
@@ -1486,6 +1505,24 @@ mod tests {
         assert_eq!(publish, "127.0.0.1:51999:5432");
         assert!(!publish.starts_with("0.0.0.0"));
         assert!(argv.contains(&format!("{DISPATCH_LABEL}=d-123")));
+        // The fleet's ephemeral label contract rides beside the dispatch label.
+        assert!(argv.contains(&"qontinui.ephemeral=1".to_string()));
+        assert!(argv.contains(&"qontinui.ephemeral.owner=runner-ci-node".to_string()));
+        let labels: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && argv[i - 1] == "--label")
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "qontinui.ci.dispatch=d-123",
+                "qontinui.ephemeral=1",
+                "qontinui.ephemeral.owner=runner-ci-node",
+            ],
+            "every label must be passed as its own --label value"
+        );
         for banned in ["-v", "--volume", "--mount", "--privileged", "--network"] {
             assert!(
                 !argv.iter().any(|a| a == banned),
