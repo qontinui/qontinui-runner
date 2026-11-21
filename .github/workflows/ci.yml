@@ -2554,6 +2554,121 @@ jobs:
           fi
           echo "Debug test-fixtures seam gate OK — all three cfg anchors intact."
 
+  # The generated style guide (plan
+  # 2026-11-19-the-visual-system-is-prose-no-build-step-compiles-and-the-project-template-ships-no-design
+  # Phase 8). src/design-system/qontinui-runner.styleguide.uibridge.json and
+  # its siblings (tokens.css, tokens.ts, theme.css, compile-report.json,
+  # design-budgets.json, visual-system.thresholds.json) are `design-kit
+  # compile` output of design/language.dtcg.json; until this job the guide was
+  # hand-written and evaluated by nothing. Mirrors qontinui-web frontend-ci.yml
+  # job `design-guide` (qontinui-web#2302).
+  design-guide:
+    name: Generated style guide (compile --check + validate-guide)
+    # HOSTED only, deliberately: it needs Chromium and its system libraries
+    # (installed with apt), which no light self-hosted pool here is known to
+    # provision, and its installs (a git dependency whose `prepare` builds the
+    # kit, a clone + build of @qontinui/design-tokens at the source's ref,
+    # Chromium) are network-bound. Public repo: hosted minutes cost nothing.
+    # Duration UNMEASURED; cap 15 min until measured.
+    # coord-pools: [ubuntu-latest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      # The kit is installed OUTSIDE the app from design/kit/package-lock.json
+      # (the git tag v0.1.0 resolved to its commit, plus the EXACT ui-bridge
+      # peers validate-guide drives), never through the app's pnpm tree:
+      # `--root` points validate-guide at the tool directory, where it finds
+      # its own wrapper.
+      - name: Install design-kit (pinned by design/kit/package-lock.json)
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          kit="$RUNNER_TEMP/design-kit"
+          mkdir -p "$kit"
+          cp design/kit/package.json design/kit/package-lock.json "$kit"/
+          npm ci --prefix "$kit" --no-audit --no-fund
+          echo "DESIGN_KIT_DIR=$kit" >> "$GITHUB_ENV"
+
+      # APT half and CDN half split, so an apt hang is never misread as a CDN
+      # or a validation failure. The Playwright version that matters is the kit
+      # tool directory's.
+      - name: Install Chromium system deps for validate-guide (apt)
+        timeout-minutes: 5
+        working-directory: ${{ runner.temp }}/design-kit
+        run: npx playwright install-deps chromium
+
+      - name: Install Chromium for validate-guide (CDN)
+        timeout-minutes: 3
+        working-directory: ${{ runner.temp }}/design-kit
+        run: npx playwright install chromium
+
+      # 1. The committed outputs are a fresh compile of the source (a hand edit
+      #    to the guide, or a source edit without a recompile, is red). The
+      #    compile builds @qontinui/design-tokens at the ref the source names.
+      # 2. validate-guide over the conforming fixture must pass (exit 0).
+      # 3. validate-guide over the seeded off-scale fixture must exit 1 AND name
+      #    each of the four seeded violations: the negative control, so a guide
+      #    whose rules stop catching one of them cannot pass vacuously.
+      # Exit 3 (UNKNOWN: the instrument could not measure) is red everywhere.
+      # Every expected non-zero exit is captured with `|| rc=$?` so errexit
+      # cannot cut the step short. The fixtures link `tokens.css` beside them;
+      # they are staged with the COMPILED src/design-system/tokens.css because
+      # validate-guide serves a file from its own directory.
+      - name: Generated style guide is current and its rules bite
+        timeout-minutes: 8
+        shell: bash
+        env:
+          DESIGN_KIT_CACHE: ${{ runner.temp }}/design-kit-cache
+        run: |
+          set -uo pipefail
+          dk="$DESIGN_KIT_DIR/node_modules/.bin/design-kit"
+          guide="$PWD/src/design-system/qontinui-runner.styleguide.uibridge.json"
+          rc=0
+          "$dk" compile --root . --out src/design-system --check || rc=$?
+          case "$rc" in
+            0) ;;
+            1) echo "::error file=design/language.dtcg.json::src/design-system/ is not a fresh compile of design/language.dtcg.json. Install the kit as design/kit/package-lock.json pins it, run 'design-kit compile --root . --out src/design-system' at the repo root and commit the result; never edit the generated files by hand."; exit 1 ;;
+            2) echo "::error file=design/language.dtcg.json::design-kit compile exited 2: the source was refused, or the tool failed (for example building @qontinui/design-tokens at the source's ref). Read the lines above; this is not a drift verdict."; exit 1 ;;
+            *) echo "::error file=design/language.dtcg.json::design-kit compile exited $rc (3 = UNKNOWN). No drift verdict was reached."; exit 1 ;;
+          esac
+          stage="$RUNNER_TEMP/guide-fixtures"
+          mkdir -p "$stage"
+          cp design/fixtures/conforming.html design/fixtures/off-scale.html src/design-system/tokens.css "$stage"/
+          rc=0
+          "$dk" validate-guide --root "$DESIGN_KIT_DIR" "$guide" "$stage/conforming.html" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error file=src/design-system/qontinui-runner.styleguide.uibridge.json::validate-guide exited $rc on the conforming fixture (1 = a rule failed, 3 = UNKNOWN: the instrument could not measure)."
+            exit 1
+          fi
+          out="$RUNNER_TEMP/off-scale.out"
+          rc=0
+          "$dk" validate-guide --root "$DESIGN_KIT_DIR" "$guide" "$stage/off-scale.html" > "$out" 2>&1 || rc=$?
+          cat "$out"
+          if [ "$rc" -ne 1 ]; then
+            echo "::error file=design/fixtures/off-scale.html::validate-guide exited $rc on the seeded off-scale fixture; the negative control needs exit 1 (rules failed). 0 means no error rule failed; 3 means UNKNOWN."
+            exit 1
+          fi
+          missing=""
+          for r in palette-color palette-background-color font-size-on-scale border-radius-on-scale; do
+            grep -qE "^ERROR [^ ]*seeded-violation[^ ]* $r:" "$out" || missing="$missing $r"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error file=design/fixtures/off-scale.html::the seeded element no longer fails:$missing. The guide stopped catching that seeded violation."
+            exit 1
+          fi
+          echo "validate-guide: conforming fixture passes; the seeded fixture fails each of its four rules, as it must."
+
   security:
     # Light self-hosted lane (RUNNER_CI_LIGHT_LANE, override RUNNER_CI_LANE_CI).
     # `cargo install cargo-audit` writes into $CARGO_HOME, which on a nawa org
