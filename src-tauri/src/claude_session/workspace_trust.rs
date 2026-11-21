@@ -79,9 +79,11 @@
 //!   landing inside our read→rename window loses everything that write
 //!   contained. `stat`-based change detection immediately before the rename
 //!   narrows the window but cannot close it.
-//! - **Key ORDER is not preserved.** `serde_json::Value` is backed by a
-//!   `BTreeMap` here, so the rewritten document is alphabetized. Values survive
-//!   verbatim; layout and ordering do not.
+//! - **Layout is not preserved; key order is.** serde_json's `preserve_order`
+//!   is on for this build (pulled in by `agent-client-protocol`), so a
+//!   `serde_json::Value` keeps the document's key order. Values and order
+//!   survive; whitespace and layout do not. (Before that dependency the
+//!   rewritten document was alphabetized.)
 //!
 //! The exposure is bounded by writing only the account a spawn actually
 //! resolved wherever that is known ([`TrustTargets::Account`]), and by the

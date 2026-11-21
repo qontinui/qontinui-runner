@@ -992,7 +992,12 @@ pub fn export_all_schemas() -> Value {
     // single reference site. (1) ──
     add!("ImageSlotSpec", qis::ImageSlotSpec);
 
-    Value::Object(m)
+    // Sorted recursively: schemars stores a schema as a `serde_json::Value`,
+    // and with `preserve_order` on (pulled in by `agent-client-protocol`)
+    // properties and `$defs` would follow declaration order, rewriting every
+    // generated TS/Python file in qontinui-schemas. Sorting restores the
+    // alphabetical order the checked-in generated types were built from.
+    crate::util::json_canon::sort_keys(Value::Object(m))
 }
 
 #[cfg(test)]
@@ -1204,5 +1209,33 @@ mod tests {
             schema_str.contains("ExecutorEvent") || schema_str.contains("event_type"),
             "AppEvent schema should reference its variants"
         );
+    }
+
+    /// Every object in the export iterates in sorted key order, whatever
+    /// serde_json's `preserve_order` says. The checked-in generated TS/Python
+    /// types in qontinui-schemas are built from this output, so a key order
+    /// that followed field declaration order would rewrite nearly every file.
+    #[test]
+    fn test_export_keys_are_sorted_recursively() {
+        fn assert_sorted(v: &Value, path: &str) {
+            match v {
+                Value::Object(m) => {
+                    let keys: Vec<&String> = m.keys().collect();
+                    let mut sorted = keys.clone();
+                    sorted.sort();
+                    assert_eq!(keys, sorted, "unsorted keys at {path}");
+                    for (k, child) in m {
+                        assert_sorted(child, &format!("{path}/{k}"));
+                    }
+                }
+                Value::Array(a) => {
+                    for (i, child) in a.iter().enumerate() {
+                        assert_sorted(child, &format!("{path}[{i}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_sorted(&export_all_schemas(), "");
     }
 }
