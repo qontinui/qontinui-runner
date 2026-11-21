@@ -721,7 +721,7 @@ mod run_assertions_tests {
     //! against what the real route accepts.
 
     use super::{assertion_result_from_response, RunnerClient};
-    use crate::mcp::ui_bridge::capabilities::StructuredAssertRequest;
+    use crate::mcp::ui_bridge::structured_assert::StructuredAssertRequest;
     use axum::{routing::post, Json, Router};
     use serde_json::json;
 
