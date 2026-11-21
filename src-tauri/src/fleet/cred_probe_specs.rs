@@ -1941,6 +1941,43 @@ mod tests {
         assert!(multi.contains(&CRED_PROBES_MARKER.to_string()), "{multi:?}");
     }
 
+    /// A cycle that panics after the built-in half refreshed `ran_at` (here, in
+    /// the catalogue fetch) must not leave the PREVIOUS cycle's regional marker
+    /// advertised beside that fresh `ran_at`: the marker is withdrawn on unwind.
+    /// The built-in marker and the earned regional tokens keep their memos.
+    #[test]
+    fn a_cycle_that_panics_withdraws_the_regional_marker() {
+        let (tmp, bin) = tmp_with_bin();
+        let mut env = shim_env(tmp.path());
+        env.aws = Some(write_cred_shim(&bin, "aws", Shim::Exit(0)));
+        let cache = Mutex::new(CredFamilyState::new());
+        let t0 = Instant::now();
+        let before = cycle(&cache, &env, Ok(vec![ssm_spec("eu-central-1")]), t0);
+        assert!(
+            before.contains(&REGIONAL_MARKER.to_string()),
+            "control: a fully measured cycle advertises the marker: {before:?}"
+        );
+
+        let t1 = t0 + CRED_TEST_TTL;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_cred_refresh_cycle(
+                &cache,
+                &env,
+                || panic!("catalogue fetch blew up"),
+                t1,
+                CRED_TEST_TTL,
+            );
+        }));
+        assert!(outcome.is_err(), "control: the cycle did panic");
+
+        let g = cache.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(g.ran_at, Some(t1), "control: the built-in half did run");
+        let after = cred_payload_capabilities(&g).0;
+        assert!(!after.contains(&REGIONAL_MARKER.to_string()), "{after:?}");
+        assert!(after.contains(&CRED_PROBES_MARKER.to_string()), "{after:?}");
+        assert!(after.contains(&SSM_EU.to_string()), "{after:?}");
+    }
+
     /// D2 per token: an Absent retracts on the next payload, an Unknown (the SSM
     /// canary's 254) holds for one TTL and then drops, and the built-in keeps its
     /// own answer through both.
