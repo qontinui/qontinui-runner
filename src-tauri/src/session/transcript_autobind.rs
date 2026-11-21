@@ -1134,6 +1134,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: provider.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             awaiting_account_since: None,

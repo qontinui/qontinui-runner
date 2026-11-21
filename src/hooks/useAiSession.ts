@@ -45,7 +45,7 @@ export interface UseAiSessionOptions {
    * Attach to an EXISTING session by task run id instead of owning the
    * operator's "active AI session" slot. Set by views that observe a session
    * somebody else created — a Conductor worker's grid cell
-   * (`WorkerSessionCell`) — where the session id is a fact of the tab, not a
+   * (`StructuredSessionCell`) — where the session id is a fact of the tab, not a
    * choice to remember. When set, the hook never reads or writes the
    * `qontinui-ai-active-session` storage key (so many cells can coexist
    * without fighting over it), and switches to the id on mount and whenever

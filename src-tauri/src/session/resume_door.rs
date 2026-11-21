@@ -464,7 +464,7 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
         .names
         .keys()
         .copied()
-        .filter(|p| pt::is_countable_claude(*p, &snap))
+        .filter(|p| pt::is_countable_ai_cli(*p, &snap))
         .collect();
     holder_from_command_lines(pt::command_lines_for_pids(&pids).await, id)
 }
@@ -1077,6 +1077,7 @@ mod tests {
             closed_at: Some(5),
             close_reason: None,
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            lane: super::super::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             awaiting_account_since: None,

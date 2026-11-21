@@ -1,0 +1,7 @@
+╭───────────────────────────────────────────────────╮
+│ This session is large. How do you want to resume? │
+│                                                   │
+│ ❯ 1. Resume from summary (recommended)            │
+│   2. Resume full session as-is                    │
+│   3. Don't ask me again                           │
+╰───────────────────────────────────────────────────╯

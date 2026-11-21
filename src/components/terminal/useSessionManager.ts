@@ -233,6 +233,11 @@ export interface ProbeConflictsRequest {
   hinted_files?: string[];
 }
 
+/** The provider of a session the transcript scan found: the scan reads
+ * Claude Code transcripts (`find_transcript_config_dirs` over the Claude
+ * profile), so every row it yields is a Claude session. */
+const TRANSCRIPT_SCAN_PROVIDER = "claude";
+
 /**
  * Fields every session-manager row carries, whichever source produced it.
  * {@link UnifiedSession} adds the `source` discriminant and `_transcript`.
@@ -243,6 +248,12 @@ export interface UnifiedSessionFields {
    * a tab-sourced row (which has no transcript, and possibly no session id).
    */
   sessionId: string;
+  /**
+   * The served CLI profile id of the session: its tab's launch provider when it
+   * is open in one, else Claude — this list is built from the transcript scan,
+   * which reads Claude Code transcripts only.
+   */
+  provider: string;
   accountLabel: string;
   configDir: string;
   projectPath: string;
@@ -940,6 +951,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           return {
             source: "transcript",
             sessionId: s.session_id,
+            provider: TRANSCRIPT_SCAN_PROVIDER,
             accountLabel: extractAccountLabel(s.config_dir),
             configDir: s.config_dir,
             projectPath: s.project_path,
@@ -1006,6 +1018,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         return {
           source: "transcript",
           sessionId: s.session_id,
+          provider: tab?.sessionProvider ?? TRANSCRIPT_SCAN_PROVIDER,
           accountLabel: extractAccountLabel(s.config_dir),
           configDir: s.config_dir,
           projectPath: s.project_path,

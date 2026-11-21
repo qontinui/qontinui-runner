@@ -919,7 +919,9 @@ impl Reporter {
         let built = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
             use super::transcript_last_turn::{last_turn_ms, retain_paths, ReadBudget};
             let dir = SessionDirectory::cached();
-            let homes = crate::terminal::transcript::find_claude_config_dirs();
+            let homes = crate::terminal::transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE,
+            );
             let live = read_live_rows(&homes, &live_pids, &|pid: u32| claude_hosts.contains(&pid))?;
             let mut budget = ReadBudget::Limited(TAIL_READS_PER_PASS);
             let candidates = build_candidates(&dir, &live, &mut |c| {

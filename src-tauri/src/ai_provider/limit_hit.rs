@@ -108,7 +108,10 @@ pub fn classify_limit_tail(tail: &str) -> Option<LimitHit> {
 /// did its work.
 pub fn classify_limit_tail_at(tail: &str, now: DateTime<Utc>) -> Option<LimitHit> {
     let ending = final_lines(tail, LIMIT_BANNER_LINES);
-    let pattern = crate::terminal::usage_limit::window_indicates_usage_limit(&ending)?;
+    let pattern = crate::terminal::usage_limit::window_indicates_usage_limit(
+        &ending,
+        &qontinui_runner_lib::cli_profile::claude::PROFILE.usage_limit_phrases,
+    )?;
     Some(LimitHit {
         pattern,
         banner_reset: parse_banner_reset(&ending, now),

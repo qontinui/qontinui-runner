@@ -102,6 +102,12 @@ impl SessionStateTracker {
         }
     }
 
+    /// Whether `other` is a clone of this tracker — the same session
+    /// instance. A restart under the same session id gets a new tracker.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     /// Get the current state.
     pub fn get(&self) -> SessionState {
         *self.state.lock().unwrap_or_else(|e| e.into_inner())
