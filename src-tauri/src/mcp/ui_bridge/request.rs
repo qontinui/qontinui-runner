@@ -1310,7 +1310,7 @@ pub(crate) fn wrap_ipc_result(
                 error_detail: body.error_detail,
                 hint: body.hint,
                 code: body.code,
-                suggestions: body.suggestions,
+                refusal: body.refusal,
             }),
         )
     })

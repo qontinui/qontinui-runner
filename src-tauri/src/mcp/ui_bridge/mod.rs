@@ -185,8 +185,8 @@ pub use screenshots::{
     ui_bridge_page_health_handler, PageHealthRequest,
 };
 pub use types::{
-    classify_assertion_failure, classify_transport_error, recovery_hint_for, ClipboardWriteRequest,
-    DiscoverStatesRequest, RecoveryHint, StartUIBridgeExplorationRequest, UIBridgeActionRequest,
+    classify_assertion_failure, classify_transport_error, next_action_for, ClipboardWriteRequest,
+    DiscoverStatesRequest, StartUIBridgeExplorationRequest, UIBridgeActionRequest,
     UIBridgeComponentActionRequest, UIBridgeDiscoveryRequest, UIBridgeExplorationStatusRequest,
     UiBridgeError, UiBridgeErrorCode,
 };

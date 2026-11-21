@@ -611,7 +611,9 @@ fn terminal_exited_response(id: &str, message: &str, bytes_dropped: usize) -> Ap
         crate::mcp::ui_bridge::UiBridgeError {
             code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::ActionFailed,
             message: message.to_string(),
-            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+            recovery: Some(qontinui_types::refusal::NextAction::new(
+                qontinui_types::refusal::NextActionKind::NoneTerminal,
+            )),
             context: Some(serde_json::json!({
                 "terminal_id": id,
                 "reason": crate::terminal::session::TERMINAL_EXITED,
