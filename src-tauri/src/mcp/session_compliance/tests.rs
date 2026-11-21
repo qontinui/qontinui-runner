@@ -37,8 +37,7 @@ fn extracts_a_fenced_block() {
 
 #[test]
 fn extracts_an_unfenced_block() {
-    let text =
-        "<!-- POLICY_COMPLIANCE v1 -->\n{\"schema\":\"policy-compliance/1\",\"items\":[]}";
+    let text = "<!-- POLICY_COMPLIANCE v1 -->\n{\"schema\":\"policy-compliance/1\",\"items\":[]}";
     assert!(extract_compliance_block(text).is_some());
 }
 
@@ -77,8 +76,7 @@ fn a_stray_brace_in_the_opener_does_not_lose_the_block() {
 
 #[test]
 fn malformed_json_is_not_a_pass() {
-    let text =
-        "<!-- POLICY_COMPLIANCE v1 -->\n```json\n{ \"schema\": \"policy-compliance/1\", \
+    let text = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n{ \"schema\": \"policy-compliance/1\", \
                     \"items\": [ {\"ref\": }\n```";
     assert!(extract_compliance_block(text).is_none());
 }
@@ -1007,12 +1005,14 @@ async fn an_unknown_tenant_on_a_multi_bound_device_posts_nothing_and_is_counted(
         "session_id": "22222222-2222-2222-2222-222222222222",
         "transcript_path": "/definitely/not/here.jsonl"
     });
-    assert!(observe_turn_end(&hook, &tenant).await.is_none());
-    // And the gate it goes through counts the withhold — read off its own
-    // return, not off the process-global counter other tests also bump.
-    let Err(Withheld { total }) = compliance_target(&tenant, "turn_end", "s") else {
-        panic!("an UNKNOWN tenant is withheld");
+    // The turn end itself reports the withhold — read off its own return, not
+    // off the process-global counter other tests also bump — and the public
+    // entry point turns it into "no nudge".
+    let outcome = observe_turn_end_outcome(&hook, &tenant).await;
+    let Err(Withheld { total }) = outcome else {
+        panic!("an UNKNOWN tenant's turn end is withheld, got {outcome:?}");
     };
+    assert!(observe_turn_end(&hook, &tenant).await.is_none());
     assert!(
         total >= 1,
         "compliance_withheld_tenant_unknown counted it: {total}"

@@ -436,8 +436,8 @@ async fn must_not_poll<T>(what: &'static str) -> T {
 /// inside `STOP_TENANT_BUDGET`. The clock is paused, so the budget elapses
 /// without waiting for it.
 #[tokio::test(start_paused = true)]
-async fn an_unsettled_read_within_the_stop_budget_is_unknown_on_multi_bound_and_default_on_single(
-) {
+async fn an_unsettled_read_within_the_stop_budget_is_unknown_on_multi_bound_and_default_on_single()
+{
     let a = tenant(0xA1);
     let started = tokio::time::Instant::now();
     let multi = decide_target_within(
@@ -554,6 +554,50 @@ fn the_stop_budget_is_below_the_sessionstart_budget() {
     assert!(DECISION_RESERVE < STOP_TENANT_BUDGET / 2);
 }
 
+// ── live_read_then_recorded: only the live leg is bounded (review round 2 A3) ──
+
+/// A live read that never answers must not hide the record's durable tenant:
+/// the live leg times out on its own (leaving the fallback room inside the
+/// decision budget), the recorded tenant with a usable credential decides
+/// `Owned`, and the binding count is never read.
+#[tokio::test(start_paused = true)]
+async fn a_pending_live_read_still_lets_the_recorded_tenant_decide() {
+    let t = tenant(0x7C);
+    let decided = decide_target_within(
+        ROUTE_TENANT_BUDGET,
+        live_read_then_recorded(
+            ROUTE_TENANT_BUDGET.saturating_sub(DECISION_RESERVE * 2),
+            std::future::pending(),
+            Some(t),
+            |_| async { true },
+        ),
+        must_not_poll("the binding count"),
+        must_not_poll("the default credential"),
+    )
+    .await;
+    assert_eq!(
+        decided,
+        Ok(PolicyTarget {
+            scope: TenantScope::Owned(t),
+            tenant: Some(t),
+        })
+    );
+    // Without a usable credential the same record is UNKNOWN.
+    let decided = decide_target_within(
+        ROUTE_TENANT_BUDGET,
+        live_read_then_recorded(
+            ROUTE_TENANT_BUDGET.saturating_sub(DECISION_RESERVE * 2),
+            std::future::pending(),
+            Some(t),
+            |_| async { false },
+        ),
+        must_not_poll("the binding count"),
+        must_not_poll("the default credential"),
+    )
+    .await;
+    assert!(decided.is_err(), "{decided:?}");
+}
+
 // ── recorded_fallback_tenant: the record's durable tenant (review A5) ──
 
 /// After a runner restart the registry knows nothing about a session the
@@ -650,8 +694,7 @@ fn the_target_label_names_the_tenant_and_carries_the_cause_apart() {
         target_label(&fetch_target(PolicyTenantDecision::Owned(b), || None)),
         (b.to_string(), None)
     );
-    let (tenant, reason) =
-        target_label(&fetch_target(PolicyTenantDecision::DefaultSlot, || None));
+    let (tenant, reason) = target_label(&fetch_target(PolicyTenantDecision::DefaultSlot, || None));
     assert_eq!(tenant, "default-slot");
     assert!(reason.is_some());
     assert_eq!(

@@ -57,7 +57,7 @@
 //!
 //! - **session status** — the device-authed bulk work-axis door
 //!   `GET {coord}/coord/sessions/work-status?claude_code_session_ids=<id>`
-//!   ([`crate::mcp::session_work_status::fetch_one`]), keyed by the Claude
+//!   ([`crate::mcp::session_work_status::fetch_one_for`]), keyed by the Claude
 //!   session id the Stop payload carries. This read USED to go to the
 //!   session-identity resolver card (`/coord/agent-sessions/{key}`), which is
 //!   operator-gated: measured 2026-10-28 it answered 401 to the runner's
@@ -769,16 +769,23 @@ fn build_rules_get(
 /// resolution (`session_work_status::CREDENTIAL_TIMEOUT`) and the GET
 /// (`session_work_status::FETCH_TIMEOUT`) together. A read that has not
 /// answered is UNKNOWN, which allows.
-const STATUS_READ_BUDGET: Duration = Duration::from_secs(3);
+const STATUS_READ_BUDGET: Duration = Duration::from_millis(2500);
 
 /// The Stop path's bound on the continuation-rules GET, tighter than the
 /// shared [`http_client`]'s 4 s: it runs last, after everything else the hook
-/// waits for. A slow fetch falls back to the built-in default.
-const RULES_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+/// waits for, and after its own credential build
+/// ([`policy_tenant::CREDENTIAL_BUILD_TIMEOUT`]). A slow fetch falls back to the
+/// built-in default.
+const RULES_FETCH_TIMEOUT: Duration = Duration::from_millis(1500);
 
 async fn fetch_continuation_rules_uncached(base: &str, target: PolicyTarget) -> Option<RulesDoc> {
     let client = http_client().ok()?;
-    let request = match build_rules_get(&client, base, target) {
+    let (build_client, build_base) = (client.clone(), base.to_string());
+    let built = policy_tenant::build_off_runtime(move || {
+        build_rules_get(&build_client, &build_base, target)
+    })
+    .await;
+    let request = match built {
         Ok(request) => request,
         Err(reason) => {
             debug!(
@@ -955,15 +962,18 @@ fn deliver_compliance_nudge(
 /// session id)` ([`TenantCacheKey`]): a session's tenant does not move between
 /// its turns, and the decision costs the proxy's read plus secure-storage
 /// reads on every Stop otherwise. An UNKNOWN decision is never cached, so the
-/// next Stop asks again.
+/// next Stop asks again — and neither is a decision for a payload naming no
+/// harness session, because the route id alone cannot tell the pane's
+/// successive sessions apart.
 async fn stop_tenant(
     route_id: &str,
     session_key: &str,
     hook_input: &Value,
 ) -> Result<PolicyTarget, String> {
-    let key: TenantCacheKey = (route_id.to_string(), session_id_from(hook_input));
+    let key: Option<TenantCacheKey> =
+        session_id_from(hook_input).map(|sid| (route_id.to_string(), sid));
     let now = Instant::now();
-    if let Some(target) = tenant_cache_lookup(&key, now) {
+    if let Some(target) = key.as_ref().and_then(|k| tenant_cache_lookup(k, now)) {
         return Ok(target);
     }
     let payload_cwd = hook_input.get("cwd").and_then(Value::as_str);
@@ -974,14 +984,16 @@ async fn stop_tenant(
         policy_tenant::STOP_TENANT_BUDGET,
     )
     .await;
-    tenant_cache_remember(key, now, &decided);
+    if let Some(key) = key {
+        tenant_cache_remember(key, now, &decided);
+    }
     decided
 }
 
 /// One tenant-decision cache slot: the route's path id (the terminal) and the
 /// harness session id the Stop payload names — a pane hosts sessions in
 /// sequence, so the terminal alone would hand one session's tenant to the next.
-type TenantCacheKey = (String, Option<String>);
+type TenantCacheKey = (String, String);
 
 static TENANT_CACHE: OnceLock<Mutex<HashMap<TenantCacheKey, (Instant, PolicyTarget)>>> =
     OnceLock::new();

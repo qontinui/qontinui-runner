@@ -559,11 +559,11 @@ fn an_answered_tenant_decision_is_cached_per_route_and_session_and_unknown_is_no
         tenant: Some(b),
     };
     let now = Instant::now();
-    let key: TenantCacheKey = ("cv-term-1".to_string(), Some("sess-1".to_string()));
+    let key: TenantCacheKey = ("cv-term-1".to_string(), "sess-1".to_string());
     tenant_cache_remember(key.clone(), now, &Ok(target));
     assert_eq!(tenant_cache_lookup(&key, now), Some(target));
     assert_eq!(
-        tenant_cache_lookup(&("cv-term-1".to_string(), Some("sess-2".to_string())), now),
+        tenant_cache_lookup(&("cv-term-1".to_string(), "sess-2".to_string()), now),
         None,
         "the pane's next session asks again"
     );
@@ -572,7 +572,7 @@ fn an_answered_tenant_decision_is_cached_per_route_and_session_and_unknown_is_no
         None
     );
 
-    let unknown_key: TenantCacheKey = ("cv-term-2".to_string(), None);
+    let unknown_key: TenantCacheKey = ("cv-term-2".to_string(), "sess-3".to_string());
     tenant_cache_remember(unknown_key.clone(), now, &Err("unknown".to_string()));
     assert_eq!(tenant_cache_lookup(&unknown_key, now), None);
 }
@@ -592,6 +592,7 @@ fn the_stop_paths_worst_case_fits_the_hooks_curl_max_time() {
     let worst = policy_tenant::STOP_TENANT_BUDGET
         + crate::mcp::session_compliance::TURN_END_BUDGET
         + STATUS_READ_BUDGET
+        + policy_tenant::CREDENTIAL_BUILD_TIMEOUT
         + RULES_FETCH_TIMEOUT;
     assert!(
         worst < Duration::from_secs(max_time),

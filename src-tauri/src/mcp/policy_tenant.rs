@@ -312,6 +312,28 @@ pub(crate) fn check_presented(target: Option<Uuid>, presented: Option<Uuid>) -> 
     }
 }
 
+/// How long building one tenant-stating request may take. Building it resolves
+/// the credential (`coord_get_for` / `coord_post_for` read the slot store, and
+/// may reach the OS keychain), which is synchronous — so it runs off the async
+/// runtime under this bound ([`build_off_runtime`]). Normally milliseconds.
+pub(crate) const CREDENTIAL_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Run `build` — a closure returning a [`build_checked`] request — on a
+/// blocking thread under [`CREDENTIAL_BUILD_TIMEOUT`], so a slow secure-storage
+/// or keychain read never stalls an async worker or outlives a caller's budget.
+pub(crate) async fn build_off_runtime<T: Send + 'static>(
+    build: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    match tokio::time::timeout(CREDENTIAL_BUILD_TIMEOUT, tokio::task::spawn_blocking(build)).await {
+        Ok(Ok(built)) => built,
+        Ok(Err(e)) => Err(format!("credential resolution failed ({e})")),
+        Err(_) => Err(format!(
+            "credential resolution did not finish within {} ms, so the coord request was not sent",
+            CREDENTIAL_BUILD_TIMEOUT.as_millis()
+        )),
+    }
+}
+
 /// Build `rb` — a request from `coord_http::coord_get_for` /
 /// `coord_post_for` under `target.scope` — and refuse it BEFORE it can be sent
 /// unless its bearer claims `target.tenant` ([`check_presented`]) and, for a
@@ -650,20 +672,18 @@ pub(crate) async fn closed_session_policy_target(
         recorded_row,
         live_row,
     );
-    let read = async {
-        let live =
-            read_session_policy_tenant(terminal_id, workdir.as_deref(), registry_session).await;
-        let Some(tenant) = recorded_fallback_tenant(&live, recorded_tenant) else {
-            return live;
-        };
-        let credential =
+    let read = live_read_then_recorded(
+        budget.saturating_sub(DECISION_RESERVE * 2),
+        read_session_policy_tenant(terminal_id, workdir.as_deref(), registry_session),
+        recorded_tenant,
+        |tenant| async move {
             qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
                 crate::auth::device_holds_usable_binding(&tenant)
             })
             .await
-            .unwrap_or(false);
-        PolicyTenantRead::Registry { tenant, credential }
-    };
+            .unwrap_or(false)
+        },
+    );
     decide_target_within(
         budget,
         read,
@@ -671,6 +691,32 @@ pub(crate) async fn closed_session_policy_target(
         default_slot_tenant_off_runtime(),
     )
     .await
+}
+
+/// A closed session's read: the LIVE leg bounded by `live_budget` on its own,
+/// then the record's durable tenant when the live leg named none (or did not
+/// answer in time — a timed-out live leg is `Unnamed`). Bounding only the live
+/// leg is the point: a slow proxy or registry read must not hide the record's
+/// answer by eating the whole decision budget. `credential` says whether this
+/// runner holds a usable credential for the recorded tenant.
+pub(crate) async fn live_read_then_recorded<C, F>(
+    live_budget: Duration,
+    live: impl Future<Output = PolicyTenantRead>,
+    recorded: Option<Uuid>,
+    credential: C,
+) -> PolicyTenantRead
+where
+    C: FnOnce(Uuid) -> F,
+    F: Future<Output = bool>,
+{
+    let live = read_within(live_budget, live).await;
+    match recorded_fallback_tenant(&live, recorded) {
+        Some(tenant) => PolicyTenantRead::Registry {
+            tenant,
+            credential: credential(tenant).await,
+        },
+        None => live,
+    }
 }
 
 /// The lifecycle record's durable tenant, when the live read named none
