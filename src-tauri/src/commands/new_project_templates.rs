@@ -318,6 +318,7 @@ mod tests {
         let build = pkg["scripts"]["build"].as_str().unwrap_or("");
         for step in [
             "design-kit compile --check",
+            "design-kit specimen --check",
             "design-kit index --check",
             "design-kit lint-classes src",
             "tsc --noEmit",
@@ -506,6 +507,12 @@ mod tests {
         );
         reddens(
             mutate("package.json", &|c| {
+                c.replace("design-kit specimen --check && ", "")
+            }),
+            "lacks `design-kit specimen --check`",
+        );
+        reddens(
+            mutate("package.json", &|c| {
                 c.replace("design-kit lint-classes src && ", "")
             }),
             "lacks `design-kit lint-classes src`",
@@ -565,32 +572,45 @@ mod tests {
         );
         reddens(
             mutate("CLAUDE.md", &|c| {
-                c.replace(INDEX_START, INDEX_END)
+                c.replace(INDEX_START, "\0")
                     .replace(INDEX_END, INDEX_START)
+                    .replace('\0', INDEX_END)
             }),
             "lacks the index markers",
         );
-        for (needle, replacement) in [
-            ("- run: npm install", "- run: npm ci"),
+        // Each ci.yml mutation must redden the rule it seeds, named.
+        for (needle, replacement, expected) in [
+            (
+                "- run: npm install",
+                "- run: npm ci",
+                "ci.yml contains `npm ci`",
+            ),
             (
                 "node-version: '24'",
                 "node-version: '24'\n          cache: npm",
+                "ci.yml contains `cache:`",
             ),
             (
                 "- run: npm run build",
                 "- run: npm run build\n      - run: git diff --exit-code",
+                "ci.yml contains `git diff`",
             ),
             (
                 "- run: npm run build",
                 "- run: npm run build\n      - run: echo ${{ github.sha }}",
+                "ci.yml contains `${{`",
+            ),
+            (
+                "- run: npm run build",
+                "- run: npm test",
+                "ci.yml must run npm run build",
             ),
         ] {
-            let v = mutate(".github/workflows/ci.yml", &|c| {
-                c.replace(needle, replacement)
-            });
-            assert!(
-                !v.is_empty(),
-                "ci.yml mutation `{replacement}` stayed green"
+            reddens(
+                mutate(".github/workflows/ci.yml", &|c| {
+                    c.replace(needle, replacement)
+                }),
+                expected,
             );
         }
     }

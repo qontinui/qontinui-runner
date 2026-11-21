@@ -22,17 +22,19 @@
 //!   here cannot ship green.
 //!
 //! The source's identity groups (colour, typeface, imagery style) are
-//! `undeclared`: they are the product owner's to declare, and the compiler
-//! refuses an agent-authored value there. Its structural groups (type scale,
+//! `undeclared`: they are the product owner's to declare, and the template's
+//! tests refuse an agent-authored value there. Its structural groups (type scale,
 //! spacing, radius, layout, motion, budgets, thresholds) are authored defaults,
 //! each recorded as `authored(<notification_ref>)`; the reference is the coord
 //! finding that covers the template's authored defaults and their licence, and
 //! a product's own session replaces them with its own authored values and
 //! finding.
 
-/// `@qontinui/ui-bridge` is pinned to the caret range the runner itself ships
-/// with (the repo-root `package.json`), and the template's tests assert it is
-/// not below that pin. `@qontinui/design-kit` is installed by git tag (no
+/// `@qontinui/ui-bridge` is pinned exactly to the version the runner itself
+/// ships with (the floor of the repo-root `package.json` range, and the version
+/// the kit's tool directory pins), so a scaffold built without a lockfile
+/// cannot drift onto a newer contract; the template's tests assert it is not
+/// below the runner's pin. `@qontinui/design-kit` is installed by git tag (no
 /// registry credential; `prepare` builds `dist/`).
 pub(super) const PACKAGE_JSON: &str = include_str!("react-ui-bridge/package.json.tmpl");
 pub(super) const VITE_CONFIG: &str = include_str!("react-ui-bridge/vite.config.ts.tmpl");
