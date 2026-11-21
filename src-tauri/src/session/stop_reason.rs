@@ -39,14 +39,21 @@
 //!
 //! Where the conversation can be continued, the action is to resume it — but
 //! only when the record shows a provider actually STARTED there
-//! (`confirmed_at`), its transcript is on disk (the caller probes it with
+//! (`confirmed_at`), its transcript is on disk ([`probe_resume`] uses
 //! `past_sessions::resolve_transcript_path`, the same test the previous-sessions
 //! listing uses for "restorable"), and the work axis does not already say it is
 //! finished (`finished_at`). A finished session's stop needs nothing
 //! (`none_terminal`); an unconfirmed one, or one without a transcript, has no
-//! conversation to resume. The resume command prefers the launcher recorded at
-//! spawn (`account_wrapper`) and otherwise falls back to the previous-sessions
-//! derivation from the config dir.
+//! conversation to resume.
+//!
+//! The command line is never built here. It is
+//! `session_ledger::resume_command_for` — the one resume-line builder, shared
+//! with the ledger report and Previous sessions — fed the resolved account and
+//! resume directory exactly as Previous sessions feeds it
+//! (`past_sessions::resume_command_for_record`). That builder yields NO line
+//! for an unknown account (a `--resume` under the wrong account finds nothing)
+//! or an unsafe token; the answer is then the Previous sessions page, never a
+//! guessed line.
 //!
 //! # What this does NOT cover
 //!
@@ -61,7 +68,6 @@ use serde::Serialize;
 use qontinui_types::glossary::GlossaryTerm;
 use qontinui_types::refusal::{NextAction, NextActionKind};
 
-use crate::session::past_sessions::account_from_config_dir;
 use crate::session::session_lifecycle_store::{
     TerminalSessionRecord, CLOSE_REASON_EXPLICIT, CLOSE_REASON_LAUNCH_FAILED,
     CLOSE_REASON_NEVER_STARTED, CLOSE_REASON_NO_TERMINAL, CLOSE_REASON_POLL_DEAD,
@@ -271,22 +277,62 @@ fn iso(ms: i64) -> Option<String> {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|t| t.to_rfc3339())
 }
 
+/// What the disk says about resuming one record: is its transcript there, and
+/// the copy-able resume line `session_ledger::resume_command_for` built for it
+/// (`None` when that builder refuses — an unknown account, an unsafe token —
+/// or for a provider whose layout it does not know).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeProbe {
+    pub transcript_exists: bool,
+    pub resume_command: Option<String>,
+}
+
+/// Probe the disk for [`stop_reason`]'s resume offer. Only a closed,
+/// confirmed, unfinished record can be offered one, so nothing else touches
+/// the filesystem. A provider other than Claude is reported as present with
+/// no command, so the answer points at the Previous sessions page (which
+/// judges restorability itself) instead of claiming nothing is owed.
+pub fn probe_resume(rec: &TerminalSessionRecord) -> ResumeProbe {
+    if rec.state != "closed" || rec.confirmed_at.is_none() || rec.finished_at.is_some() {
+        return ResumeProbe::default();
+    }
+    if rec.provider != DEFAULT_PROVIDER {
+        return ResumeProbe {
+            transcript_exists: true,
+            resume_command: None,
+        };
+    }
+    let transcript_exists = crate::session::past_sessions::resolve_transcript_path(
+        rec.config_dir.as_deref(),
+        rec.working_dir.as_deref(),
+        &rec.claude_session_id,
+    )
+    .is_some();
+    if !transcript_exists {
+        return ResumeProbe::default();
+    }
+    ResumeProbe {
+        transcript_exists,
+        resume_command: crate::session::past_sessions::resume_command_for_record(
+            rec.config_dir.as_deref(),
+            rec.working_dir.as_deref(),
+            &rec.claude_session_id,
+        ),
+    }
+}
+
 /// Resume the conversation, when the record shows there is one to resume (a
 /// confirmed provider start and a transcript on disk) and its work is not
-/// already finished; otherwise nothing is owed.
-fn resume_or_nothing(rec: &TerminalSessionRecord, transcript_exists: bool) -> NextAction {
-    if rec.finished_at.is_some() || rec.confirmed_at.is_none() || !transcript_exists {
+/// already finished; otherwise nothing is owed. The command is the probe's
+/// `resume_command_for` line; with none, the Previous sessions page — never a
+/// line built here.
+fn resume_or_nothing(rec: &TerminalSessionRecord, probe: &ResumeProbe) -> NextAction {
+    if rec.finished_at.is_some() || rec.confirmed_at.is_none() || !probe.transcript_exists {
         return NextAction::new(NextActionKind::NoneTerminal);
     }
-    if rec.provider == DEFAULT_PROVIDER {
-        let launcher = rec
-            .account_wrapper
-            .clone()
-            .unwrap_or_else(|| account_from_config_dir(rec.config_dir.as_deref()).wrapper);
-        NextAction::new(NextActionKind::RunCommand)
-            .with_target(format!("{launcher} --resume {}", rec.claude_session_id))
-    } else {
-        NextAction::new(NextActionKind::OpenPage).with_target(PREVIOUS_SESSIONS_PAGE)
+    match (&probe.resume_command, rec.provider == DEFAULT_PROVIDER) {
+        (Some(line), true) => NextAction::new(NextActionKind::RunCommand).with_target(line.clone()),
+        _ => NextAction::new(NextActionKind::OpenPage).with_target(PREVIOUS_SESSIONS_PAGE),
     }
 }
 
@@ -308,9 +354,9 @@ pub fn code_for_close_reason(reason: &str) -> Option<StopCode> {
     })
 }
 
-/// Derive the stop reason for one record. Pure: `transcript_exists` is the
-/// caller's probe of the session's transcript on disk.
-pub fn stop_reason(rec: &TerminalSessionRecord, transcript_exists: bool) -> StopReason {
+/// Derive the stop reason for one record. Pure: `probe` is the caller's
+/// [`probe_resume`] of the record.
+pub fn stop_reason(rec: &TerminalSessionRecord, probe: &ResumeProbe) -> StopReason {
     // `wind_down_outcome` is cleared when a closed record re-opens
     // (`record_open`) but survives an un-finish, so it is the stop only while
     // it is still CURRENT: the record is closed and its work is still marked
@@ -381,7 +427,7 @@ pub fn stop_reason(rec: &TerminalSessionRecord, transcript_exists: bool) -> Stop
                             // Nothing ran, so the conversation is exactly as
                             // it was; resuming is also how a reader meets the
                             // launch failure in their own shell.
-                            | StopCode::LaunchFailed => resume_or_nothing(rec, transcript_exists),
+                            | StopCode::LaunchFailed => resume_or_nothing(rec, probe),
                             StopCode::WorkerBindFailed => {
                                 NextAction::new(NextActionKind::ReportDefect)
                             }
@@ -491,11 +537,21 @@ mod tests {
 
     /// The common case: a transcript is on disk.
     fn sr(r: &TerminalSessionRecord) -> StopReason {
-        stop_reason(r, true)
+        stop_reason(r, &probe())
+    }
+
+    /// A line as `session_ledger::resume_command_for` renders one.
+    const RESUME_LINE: &str = "cd \"/repo\" && CLAUDE_CONFIG_DIR=\"/cfg\" claude --resume sess-1";
+
+    fn probe() -> ResumeProbe {
+        ResumeProbe {
+            transcript_exists: true,
+            resume_command: Some(RESUME_LINE.to_string()),
+        }
     }
 
     fn resume() -> NextAction {
-        NextAction::new(NextActionKind::RunCommand).with_target("clg --resume sess-1")
+        NextAction::new(NextActionKind::RunCommand).with_target(RESUME_LINE)
     }
 
     fn none() -> NextAction {
@@ -736,7 +792,7 @@ mod tests {
     #[test]
     fn a_session_without_a_transcript_is_never_offered_a_resume() {
         let r = rec("closed", Some(CLOSE_REASON_PTY_EXIT));
-        assert_eq!(stop_reason(&r, false).next_action, none());
+        assert_eq!(stop_reason(&r, &ResumeProbe::default()).next_action, none());
     }
 
     /// The wind-down marker is sticky; once the session is open again (resumed
@@ -754,14 +810,67 @@ mod tests {
         assert_eq!(sr(&r).code, StopCode::ProcessExited);
     }
 
+    /// When `resume_command_for` yields no line (an unknown account, an
+    /// unsafe token), the answer is the Previous sessions page — never a line
+    /// assembled here, and never the account's CLI wrapper.
     #[test]
-    fn resume_falls_back_to_the_config_dir_launcher() {
+    fn no_resume_line_points_at_the_previous_sessions_page() {
         let mut r = rec("closed", Some(CLOSE_REASON_EXPLICIT));
-        r.account_wrapper = None;
-        r.config_dir = None;
+        r.account_wrapper = Some("clg".to_string());
+        let s = stop_reason(
+            &r,
+            &ResumeProbe {
+                transcript_exists: true,
+                resume_command: None,
+            },
+        );
         assert_eq!(
-            sr(&r).next_action.target.as_deref(),
-            Some("claude --resume sess-1")
+            s.next_action,
+            NextAction::new(NextActionKind::OpenPage).with_target(PREVIOUS_SESSIONS_PAGE)
+        );
+        assert!(!s.next_action_text.contains("--resume"));
+    }
+
+    /// The probe answers without touching the filesystem for a record that
+    /// can never be offered a resume, defers to the Previous sessions page for
+    /// a provider whose transcript layout it does not know, and for an
+    /// unknown account (no recorded config dir, no transcript found) offers
+    /// nothing rather than a guessed line.
+    #[test]
+    fn the_resume_probe_is_scoped_and_never_guesses() {
+        // The transcript scan reads the account roster; keep it off the
+        // operator's real config.
+        let _amb = crate::test_env::isolated_ambient();
+        let mut r = rec("closed", Some(CLOSE_REASON_PTY_EXIT));
+        r.provider = "gemini".to_string();
+        assert_eq!(
+            probe_resume(&r),
+            ResumeProbe {
+                transcript_exists: true,
+                resume_command: None
+            }
+        );
+        r.state = "open".to_string();
+        assert_eq!(probe_resume(&r), ResumeProbe::default());
+        r.state = "closed".to_string();
+        r.finished_at = Some(1);
+        assert_eq!(probe_resume(&r), ResumeProbe::default());
+        r.finished_at = None;
+        r.confirmed_at = None;
+        assert_eq!(probe_resume(&r), ResumeProbe::default());
+        // A Claude session whose transcript is nowhere on disk.
+        let mut r = rec("closed", Some(CLOSE_REASON_PTY_EXIT));
+        r.claude_session_id = "c5-no-such-session-0b0e9a40-6b1f-4c3e".to_string();
+        r.config_dir = None;
+        assert_eq!(probe_resume(&r), ResumeProbe::default());
+        // The shared builder itself: no account → no line.
+        assert_eq!(
+            crate::session::past_sessions::resume_command_for_record(
+                None,
+                Some("/repo"),
+                "c5-no-such-session-0b0e9a40-6b1f-4c3e",
+            ),
+            None
         );
     }
 
@@ -857,7 +966,7 @@ mod tests {
             serde_json::json!(["agent_session", "session_status"])
         );
         assert_eq!(v["next_action"]["kind"], "run_command");
-        assert_eq!(v["next_action"]["target"], "clg --resume sess-1");
+        assert_eq!(v["next_action"]["target"], RESUME_LINE);
         assert_eq!(v["source"], SOURCE_LIFECYCLE_REGISTRY);
         assert_eq!(v["recorded"]["state"], "closed");
         assert!(v["observed_at"].as_str().unwrap().starts_with("2026-"));
