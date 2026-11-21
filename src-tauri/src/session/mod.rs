@@ -2803,10 +2803,11 @@ mod tests {
     }
 
     #[test]
-    fn register_external_does_not_spawn_transport() {
-        // Phase 10 dual-write: the mirror must NOT start a transport —
-        // the real process is owned by the legacy path. We assert the
-        // FakeTransport's `start` counter stays at zero across a mirror.
+    fn register_external_with_lineage_does_not_spawn_transport() {
+        // An externally-owned session must NOT start a transport — the real
+        // process is owned by the `terminal_*` / `claude_session` path. We
+        // assert the FakeTransport's `start` counter stays at zero across
+        // the registration.
         let (reg, _fx) = make_registry();
         let id = reg
             .register_external_with_lineage(shell_intent(), None, None)
