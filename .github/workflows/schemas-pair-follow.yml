@@ -39,6 +39,12 @@ name: schemas pair-follow
 #            still answering 5xx / 429 / a timeout after the script's retries) is
 #            a WARNING, not red: the next 30-min tick re-scans from scratch, and
 #            a lone 502 had turned main red twice in ~30h (finding ed052f9c).
+#            The compute and push legs name the same case MODE=TRANSIENT /
+#            RESULT=TRANSIENT (a warning annotation, exit 0), always before
+#            either has changed anything, so it is not a failed leg either.
+#            The verdict does not see it (matrix legs carry no per-item output):
+#            the plan table still says FOLLOW — what was DECIDED — and the
+#            leg's own warning annotation is where the no-op is reported.
 #
 # KILL SWITCH: repository variable SCHEMAS_PAIR_FOLLOW=off. Unset = on.
 
@@ -323,7 +329,8 @@ jobs:
           bash main/scripts/schemas-pair-follow.sh push "$RUNNER_TEMP/plan-item.json" "$RUNNER_TEMP/out" "$RUNNER_TEMP/verify"
 
       # No bundle means the compute leg skipped (merge conflict, already
-      # contained) or failed. Its own log names which; the verdict job reds on a
+      # contained, or MODE=TRANSIENT: a GitHub read still failing after retries)
+      # or failed. Its own log names which; the verdict job reds on a
       # failed compute leg.
       - name: No bundle for this PR
         if: steps.dl.outcome != 'success'
