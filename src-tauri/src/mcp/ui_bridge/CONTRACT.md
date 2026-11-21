@@ -641,17 +641,20 @@ The direct-eval fallback emits the same shape plus `source: "direct_eval"`.
 Behavior of the in-page bridge (qontinui/ui-bridge#418, plan
 `2026-11-19-ui-bridge-scroll-actions-must-not-report-success-without-scrolling`).
 The runner adds no code for it: `/control/page/scroll` is forwarded to the page
-as an untargeted element action (`misc.rs::ui_bridge_scroll_page_handler`), so
-the body, the result and the failure envelope pass through unchanged. A runner
+as the raw JSON body over the `scroll_page` IPC dispatch
+(`misc.rs::ui_bridge_scroll_page_handler`; `untargeted_element("scroll")` is only
+its journey-ledger classification), so the body and the result pass through
+unchanged. A runner
 build serves the new behavior once it bundles a ui-bridge containing #418.
 
 - **`NO_SCROLL_EFFECT`.** Element `scrollIntoView` and element `scroll` return
   `success:false` with code `NO_SCROLL_EFFECT` (top-level `code` and
   `failureDetails.errorCode`; `scroll` carries `scrollInfo` before/after in
-  `failureDetails.context`) when the scroll position did not change. For
-  `scrollIntoView` the failure also requires that the element is still not
-  visible; at a boundary with the element visible it succeeds. The success is
-  measured after the native call settles, not assumed.
+  `failureDetails.context`). `scrollIntoView` fails when the element is not
+  visible after the call (an ancestor that moved but left it hidden still
+  fails); an already-visible element returns `alreadyVisible:true` without a
+  native call. Plain element `scroll` fails when the position did not change,
+  including at a boundary. Success is measured after the scroll settles.
 - **`alreadyVisible` semantics.** `scrollIntoView` reports `alreadyVisible:true`
   (and calls nothing) only when the element is inside the window AND inside the
   clip box of every clipping ancestor (`overflow` auto/scroll, or hidden/clip
@@ -662,11 +665,13 @@ build serves the new behavior once it bundles a ui-bridge containing #418.
   `elementId` (alongside `top`/`left`/`smooth`) naming the container to scroll;
   `elementId` is looked up in the registry first. A missing container fails
   `ELEMENT_NOT_FOUND`; a named container that does not move fails
-  `NO_SCROLL_EFFECT`. With neither field the historical shape is kept: the
+  `NO_SCROLL_EFFECT`. These two carry a top-level `code` and `error` only (plus
+  `container`/`before`/`after`/`changed:false` for `NO_SCROLL_EFFECT`), no
+  `failureDetails`. With neither field the historical shape is kept: the
   page's own scroll container, `success:true`, `changed:false` when it cannot
   move. `container` in the result is `viewport`, `body` or `element`.
 - **`click` on a `<details>`.** The element-action `click` is retargeted to the
-  element's first `<summary>`; a `<details>` with no `<summary>` is refused with
+  element's first direct-child `<summary>`; a `<details>` with no `<summary>` is refused with
   an error naming the `toggle` action as the route.
 
 ## Contract test surface

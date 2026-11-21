@@ -180,7 +180,7 @@ All 17 SDK standard actions are supported. Common examples:
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "click"}'
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "doubleClick"}'
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "rightClick"}'
-# click on a <details> is retargeted to its first <summary> (a native click on <details> toggles
+# click on a <details> is retargeted to its first direct-child <summary> (a native click on <details> toggles
 # nothing); a <details> with no <summary> is refused with an error naming the `toggle` action.
 
 # Type text (with optional clear-first and keystroke delay)
@@ -202,11 +202,12 @@ curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/
 # Select dropdown option
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "select", "params": {"value": "option1"}}'
 
-# Scroll. scroll / scrollIntoView report success only when something moved or the element is
-# visible. A scroll that moved nothing, with the element still not visible, FAILS with code
-# NO_SCROLL_EFFECT (success:false), so a green answer means the page actually moved.
-# scrollIntoView's alreadyVisible:true means the element is inside the window AND inside the
-# clip box of every scrollable ancestor (an inner overflow:auto container counts), not just the window.
+# Scroll. scrollIntoView succeeds only when the element is visible afterwards (or already was:
+# alreadyVisible:true, nothing is called); otherwise it FAILS with code NO_SCROLL_EFFECT
+# (success:false), even if some ancestor moved but left the element hidden. Plain element
+# scroll fails NO_SCROLL_EFFECT when the scroll position did not change (e.g. at a boundary).
+# alreadyVisible:true means the element is inside the window AND inside the clip box of every
+# clipping ancestor (overflow auto/scroll, or hidden/clip with overflowing content), not just the window.
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "scroll", "params": {"direction": "down", "amount": 300}}'
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "scrollIntoView"}'
 # Page scroll of an inner container (content that lives in an overflow:auto pane, not the window):
