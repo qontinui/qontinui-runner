@@ -9,6 +9,7 @@ pub mod ios; // Plan 2: iOS device transport (pymobiledevice3 sidecar)
 pub mod lan;
 pub mod pairing;
 pub mod usb;
+pub mod usb_scanner;
 // Cloud transport is a future phase — module declared but empty for now
 pub mod cloud;
 
