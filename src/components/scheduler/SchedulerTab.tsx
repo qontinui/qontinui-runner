@@ -79,6 +79,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
     loading,
     error,
     createTask,
+    createTasks,
     updateTask,
     deleteTask,
     runTaskNow,
@@ -104,11 +105,14 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
     }
   };
 
-  const handleAiSubmit = async (requests: CreateScheduledTaskRequest[]) => {
-    for (const request of requests) {
-      await createTask(request);
-    }
-    setIsAiBuilding(false);
+  // Returns what was not created, so the builder can keep it on screen and a retry
+  // cannot duplicate what was.
+  const handleAiSubmit = async (
+    requests: CreateScheduledTaskRequest[],
+  ): Promise<CreateScheduledTaskRequest[]> => {
+    const refused = await createTasks(requests);
+    if (refused.length === 0) setIsAiBuilding(false);
+    return refused;
   };
 
   const handleAiEditManually = (request: CreateScheduledTaskRequest) => {
