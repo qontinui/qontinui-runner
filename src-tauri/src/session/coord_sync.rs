@@ -10272,9 +10272,10 @@ mod tests {
     /// (plan `2026-11-20-coord-native-sessions-phase-9-reverified-cleanup`
     /// Phase 2). `.setup()` cannot be driven from a unit test (it needs a live
     /// Tauri app), so this reads source text and fails on either of two
-    /// edits: any `start_*` call in that block beyond the pinned set, or a
-    /// second builder of the `/tenant-policy?tenant_id=` URL anywhere in
-    /// `src` besides `transcript_autobind.rs`.
+    /// edits: any change to the pinned set of `start_*` calls in that block,
+    /// or a second builder of a tenant-policy URL anywhere in `src` besides
+    /// `transcript_autobind.rs`. Comment lines are skipped in both scans, so
+    /// prose that names a loop or spells the URL cannot trip (or satisfy) it.
     #[test]
     fn the_boot_path_registers_no_tenant_policy_flag_poll() {
         let main_src = include_str!("../main.rs");
@@ -10290,7 +10291,9 @@ mod tests {
             .expect("the spawn block ends before the registry is managed")
             .0;
         let mut started: Vec<&str> = block
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
             .filter(|ident| ident.starts_with("start_"))
             .collect();
         started.sort_unstable();
@@ -10318,7 +10321,11 @@ mod tests {
                     stack.push(path);
                 } else if path.extension().is_some_and(|e| e == "rs")
                     && std::fs::read_to_string(&path)
-                        .map(|s| s.contains(&needle))
+                        .map(|s| {
+                            s.lines().any(|line| {
+                                !line.trim_start().starts_with("//") && line.contains(&needle)
+                            })
+                        })
                         .unwrap_or(false)
                 {
                     let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
