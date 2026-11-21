@@ -61,10 +61,24 @@
 //! failure to resolve or to read/write the exclude file is logged at `warn!` and
 //! swallowed — a missed exclude only means the tree reads dirty, which is the
 //! state before this module existed.
+//!
+//! **Workdir artifacts** ([`exclude_workdir_artifacts`]) are the second entry
+//! point, under their own marker ([`WORKDIR_ARTIFACT_EXCLUDE_MARKER`]): the
+//! fixed runner-owned files `coord_mcp` writes at a session workdir's root —
+//! the `.coord-mcp-status` breadcrumb, its atomic-replace temp file, and
+//! `.mcp.json`. `fleet::ensure_repo_info_exclude` already lists them for the
+//! primary checkouts the tree publisher walks, but that walk skips every repo
+//! whose name does not start with `qontinui-` and every linked worktree, so a
+//! breadcrumb there read as untracked and a session's closeout answered
+//! `NOT_CLOSEABLE uncommitted` on a tree holding no session work. Excluding the
+//! names where they are WRITTEN reaches every repository the runner writes
+//! into. Those lines are never pruned (the names are fixed, so none goes
+//! stale), and outside a work tree this entry point is silent: a breadcrumb in a
+//! non-repo directory is normal, so it logs at `debug!` and writes nothing.
 
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::provision_guard::TrackedPaths;
 
@@ -73,6 +87,15 @@ use crate::provision_guard::TrackedPaths;
 /// `fleet::MANAGED_EXCLUDE_MARKER`, which brackets the fixed machine-local roster.
 pub(crate) const PROVISIONED_EXCLUDE_MARKER: &str =
     "# qontinui-runner: provisioned .claude commands/skills (auto-excluded, per path)";
+
+/// Header line written once above the runner-owned workdir artifacts
+/// [`exclude_workdir_artifacts`] excludes (the coord-mcp breadcrumb, its temp
+/// file, `.mcp.json`). Distinct from [`PROVISIONED_EXCLUDE_MARKER`], whose
+/// blocks a provisioning pass prunes, so that prune can never reach these
+/// lines; and from `fleet::MANAGED_EXCLUDE_MARKER`, which brackets the
+/// unanchored roster the tree publisher writes into the primaries it walks.
+pub(crate) const WORKDIR_ARTIFACT_EXCLUDE_MARKER: &str =
+    "# qontinui-runner: coord-mcp workdir artifacts (auto-excluded where written)";
 
 /// Compute the exclude entries for one provisioning pass, relative to the
 /// provisioned root (`.claude/commands` or `.claude/skills`). A trailing `/`
@@ -248,16 +271,16 @@ fn resolve_exclude(base: &Path) -> Option<(PathBuf, String)> {
     Some((exclude, prefix.to_string()))
 }
 
-/// The trimmed, non-comment lines INSIDE this module's blocks: from each
-/// [`PROVISIONED_EXCLUDE_MARKER`] to the next comment line. Only these are
-/// candidates for pruning, so a person's own line naming the same path, and
-/// another writer's block, are never removed.
-fn block_lines(existing: &str) -> impl Iterator<Item = &str> {
+/// The trimmed, non-comment lines INSIDE `marker`'s blocks: from each
+/// `marker` line to the next comment line. Only these are candidates for
+/// pruning, so a person's own line naming the same path, and another writer's
+/// block (including this module's other marker), are never removed.
+fn block_lines<'a>(existing: &'a str, marker: &'a str) -> impl Iterator<Item = &'a str> + 'a {
     let mut in_block = false;
     existing.lines().filter_map(move |line| {
         let t = line.trim();
         if t.starts_with('#') {
-            in_block = t == PROVISIONED_EXCLUDE_MARKER;
+            in_block = t == marker;
             None
         } else if in_block {
             Some(t)
@@ -267,9 +290,12 @@ fn block_lines(existing: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Bring `exclude_path` up to date: drop every line `stale` flags, and append
-/// every pattern of `patterns` not already present as a whole (trimmed) line,
-/// under [`PROVISIONED_EXCLUDE_MARKER`]. Returns `(appended, pruned)`.
+/// Bring `exclude_path` up to date: drop every line `stale` flags inside
+/// `marker`'s blocks, and append every pattern of `patterns` not already
+/// present as a whole (trimmed) line, under `marker`. Returns
+/// `(appended, pruned)`. `marker` is [`PROVISIONED_EXCLUDE_MARKER`] for the
+/// provisioners and [`WORKDIR_ARTIFACT_EXCLUDE_MARKER`] for the workdir
+/// artifacts; each pass prunes only inside its own marker's blocks.
 ///
 /// Holds [`crate::fleet::info_exclude_lock`] across the whole
 /// read-modify-write, like every other in-process writer of an
@@ -288,13 +314,14 @@ fn block_lines(existing: &str) -> impl Iterator<Item = &str> {
 /// pass judges it.
 fn update_exclude(
     exclude_path: &Path,
+    marker: &str,
     patterns: &[String],
     stale: impl Fn(&str) -> bool,
 ) -> std::io::Result<(usize, usize)> {
     let judged_stale: std::collections::HashSet<String> = {
         let unlocked =
             crate::fleet::read_info_exclude(exclude_path).map_err(std::io::Error::other)?;
-        block_lines(&unlocked)
+        block_lines(&unlocked, marker)
             .filter(|t| stale(t))
             .map(str::to_string)
             .collect()
@@ -307,7 +334,7 @@ fn update_exclude(
     for line in existing.lines() {
         let t = line.trim();
         if t.starts_with('#') {
-            in_block = t == PROVISIONED_EXCLUDE_MARKER;
+            in_block = t == marker;
         } else if in_block && judged_stale.contains(t) && stale(t) {
             pruned += 1;
             continue;
@@ -332,8 +359,8 @@ fn update_exclude(
         .rev()
         .map(|l| l.trim())
         .find(|t| t.starts_with('#'));
-    if last_header != Some(PROVISIONED_EXCLUDE_MARKER) && !missing.is_empty() {
-        chunk.push_str(PROVISIONED_EXCLUDE_MARKER);
+    if last_header != Some(marker) && !missing.is_empty() {
+        chunk.push_str(marker);
         chunk.push('\n');
     }
     for p in &missing {
@@ -355,7 +382,7 @@ fn update_exclude(
         // pruned) is dropped too, so repeated prunes do not pile up headers.
         let mut lines: Vec<&str> = Vec::with_capacity(kept.len());
         for (i, line) in kept.iter().enumerate() {
-            let is_empty_marker = line.trim() == PROVISIONED_EXCLUDE_MARKER
+            let is_empty_marker = line.trim() == marker
                 && kept[i + 1..]
                     .iter()
                     .map(|l| l.trim())
@@ -375,11 +402,8 @@ fn update_exclude(
             .rev()
             .map(|l| l.trim())
             .find(|t| t.starts_with('#'));
-        if !missing.is_empty()
-            && last_header != Some(PROVISIONED_EXCLUDE_MARKER)
-            && !chunk.starts_with(PROVISIONED_EXCLUDE_MARKER)
-        {
-            out.push_str(PROVISIONED_EXCLUDE_MARKER);
+        if !missing.is_empty() && last_header != Some(marker) && !chunk.starts_with(marker) {
+            out.push_str(marker);
             out.push('\n');
         }
         out.push_str(&chunk);
@@ -451,9 +475,12 @@ pub(crate) fn exclude_written_paths(
     // Trimmed, because `update_exclude` asks about trimmed lines; a pattern
     // ending in an escaped space would otherwise never match itself.
     let current: std::collections::HashSet<&str> = patterns.iter().map(|p| p.trim()).collect();
-    match update_exclude(&exclude_path, &patterns, |line| {
-        is_stale(line, &root_pattern, &current, base, tracked)
-    }) {
+    match update_exclude(
+        &exclude_path,
+        PROVISIONED_EXCLUDE_MARKER,
+        &patterns,
+        |line| is_stale(line, &root_pattern, &current, base, tracked),
+    ) {
         Ok((0, 0)) => {}
         Ok((added, pruned)) => info!(
             "{provisioner}: excluded {added} provisioned path(s) from git status, pruned \
@@ -468,8 +495,216 @@ pub(crate) fn exclude_written_paths(
     }
 }
 
+/// True iff `pattern` holds a gitignore glob metacharacter.
+fn is_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
+/// May `name` be written raw after the anchor as one exclude line naming an
+/// entry at the workdir root? Not empty, one path component, no escape
+/// character, no line break, and no trailing space (git strips one).
+fn is_root_entry_pattern(name: &str) -> bool {
+    !name.is_empty() && !name.ends_with(' ') && !name.contains(['/', '\\', '\n', '\r'])
+}
+
+/// Exclude the runner-owned files `writer` puts at `workdir`'s root from the
+/// enclosing repository's `git status`.
+///
+/// `patterns` are entry names at `workdir`'s root, written RAW after the
+/// anchor: a literal file name (`.coord-mcp-status`, `.mcp.json`), or a glob
+/// companion of one (`.coord-mcp-status.tmp-*`). A glob's BASE is the longest
+/// literal in the same call that it starts with, and the glob follows that
+/// base's tracked answer; a glob with no base in the call gets no line, since
+/// nothing says whether what it matches is tracked.
+///
+/// In order:
+///
+/// 1. **Tracked check, path-limited.** One bounded
+///    `git --literal-pathspecs ls-files -z -- <literals>` under `workdir`. It
+///    costs only as much as the names asked about, rather than listing the
+///    whole index as [`TrackedPaths::probe`] does, because it runs on every
+///    breadcrumb write and every 5-minute breadcrumb refresh. If git does not
+///    answer — `workdir` is in no work tree, or git timed out — nothing is
+///    written and the miss is logged at `debug!`, never `warn!`: a breadcrumb
+///    in a non-repo directory is normal, and would otherwise warn every refresh.
+///    A name git tracks (or tracks anything beneath) gets no line.
+/// 2. **Resolve** the exclude file and prefix ([`resolve_exclude`]): a linked
+///    worktree writes its COMMON dir's `info/exclude`. An empty prefix is
+///    allowed here, unlike [`exclude_written_paths`]: these files sit at the
+///    session cwd by construction, which is often the work-tree root.
+/// 3. **Anchor without escaping the pattern.** Only the prefix goes through
+///    [`escape_pattern`] (`/` for an empty prefix); the pattern is appended
+///    raw, because escaping `.coord-mcp-status.tmp-*` would write a line that
+///    matches no temp file.
+/// 4. **Append** under [`WORKDIR_ARTIFACT_EXCLUDE_MARKER`] with no prune: these
+///    are fixed runner names, so no line of this block ever goes stale.
+///
+/// Best-effort: never panics, never propagates, never fails its caller.
+pub(crate) fn exclude_workdir_artifacts(writer: &str, workdir: &Path, patterns: &[&str]) {
+    // `git -C ""` would run in the RUNNER's own working directory.
+    if workdir.as_os_str().is_empty() {
+        return;
+    }
+    let usable: Vec<&str> = patterns
+        .iter()
+        .copied()
+        .filter(|p| is_root_entry_pattern(p))
+        .collect();
+    let literals: Vec<&str> = usable.iter().copied().filter(|p| !is_glob(p)).collect();
+    if literals.is_empty() {
+        return;
+    }
+    let mut args = vec!["--literal-pathspecs", "ls-files", "-z", "--"];
+    args.extend(literals.iter().copied());
+    let listed = match crate::provision_guard::run_bounded_git(workdir, &args) {
+        Ok(stdout) => stdout,
+        Err(cause) => {
+            debug!(
+                workdir = %workdir.display(),
+                %cause,
+                "{writer}: git did not answer which workdir artifacts are tracked \
+                 (no work tree here, or git timed out); nothing excluded"
+            );
+            return;
+        }
+    };
+    let listed = String::from_utf8_lossy(&listed);
+    let tracked: Vec<&str> = listed.split('\0').filter(|e| !e.is_empty()).collect();
+    let is_tracked = |name: &str| {
+        tracked
+            .iter()
+            .any(|e| *e == name || e.strip_prefix(name).is_some_and(|r| r.starts_with('/')))
+    };
+    let base_of = |glob: &str| {
+        literals
+            .iter()
+            .copied()
+            .filter(|l| glob.len() > l.len() && glob.starts_with(l))
+            .max_by_key(|l| l.len())
+    };
+    let wanted: Vec<&str> = usable
+        .iter()
+        .copied()
+        .filter(|p| {
+            if is_glob(p) {
+                base_of(p).is_some_and(|base| !is_tracked(base))
+            } else {
+                !is_tracked(p)
+            }
+        })
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let Some((exclude_path, prefix)) = resolve_exclude(workdir) else {
+        return;
+    };
+    let Some(anchor) = escape_pattern(&prefix) else {
+        return;
+    };
+    let lines: Vec<String> = wanted.iter().map(|p| format!("{anchor}{p}")).collect();
+    match update_exclude(
+        &exclude_path,
+        WORKDIR_ARTIFACT_EXCLUDE_MARKER,
+        &lines,
+        |_| false,
+    ) {
+        Ok((0, _)) => {}
+        Ok((added, _)) => info!(
+            "{writer}: excluded {added} runner-written workdir artifact(s) from git status \
+             in {}",
+            exclude_path.display()
+        ),
+        Err(e) => warn!(
+            "{writer}: could not record runner-written workdir artifacts in {} ({e}) — \
+             continuing; the checkout may read dirty with them",
+            exclude_path.display()
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Linked-worktree fixtures shared by this module's tests and by the tests
+    //! that enter through `coord_mcp`'s writers, so both build the same shape.
+
+    use std::path::{Path, PathBuf};
+
+    use crate::provision_guard::test_support::{git_add, git_commit, git_init};
+
+    /// `<root>/main`, a repo with one commit, and `<root>/wt`, a detached
+    /// linked worktree of it whose `.git` is a FILE. Returns `(main, wt)`.
+    pub(crate) fn linked_worktree(root: &Path) -> (PathBuf, PathBuf) {
+        let main = root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git_init(&main);
+        let readme = main.join("README");
+        std::fs::write(&readme, "x\n").unwrap();
+        git_add(&main, &readme);
+        git_commit(&main, "init");
+        let wt = root.join("wt");
+        let ok = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&wt)
+            .output()
+            .expect("run git worktree add")
+            .status
+            .success();
+        assert!(ok, "git worktree add should succeed");
+        assert!(
+            wt.join(".git").is_file(),
+            "a linked worktree's .git is a file"
+        );
+        (main, wt)
+    }
+
+    /// `git status --porcelain --untracked-files=all` in `dir`.
+    pub(crate) fn porcelain(dir: &Path) -> String {
+        let out = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("run git status");
+        assert!(
+            out.status.success(),
+            "git status failed in {}",
+            dir.display()
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The lines of `repo`'s own `.git/info/exclude` (the common dir's, for a
+    /// primary checkout), or none when it does not exist.
+    pub(crate) fn exclude_lines(repo: &Path) -> Vec<String> {
+        std::fs::read_to_string(repo.join(".git").join("info").join("exclude"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The entries of the `marker` blocks among `lines`: every line after a
+    /// `marker` line up to the next comment line.
+    pub(crate) fn block_entries(lines: &[String], marker: &str) -> Vec<String> {
+        let mut in_block = false;
+        let mut out = Vec::new();
+        for l in lines {
+            if l.starts_with('#') {
+                in_block = l == marker;
+            } else if in_block {
+                out.push(l.clone());
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{block_entries, linked_worktree};
     use super::*;
     use crate::provision_guard::test_support::{assert_not_in_any_repo, git_add, git_init};
 
@@ -489,7 +724,7 @@ mod tests {
     }
 
     fn untracked(dir: &Path) -> String {
-        git(dir, &["status", "--porcelain", "--untracked-files=all"])
+        super::test_support::porcelain(dir)
     }
 
     fn write(path: &Path, body: &str) {
@@ -498,11 +733,7 @@ mod tests {
     }
 
     fn exclude_lines(repo: &Path) -> Vec<String> {
-        std::fs::read_to_string(repo.join(".git").join("info").join("exclude"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        super::test_support::exclude_lines(repo)
     }
 
     /// Provision-shaped fixture: write `files` (relative to `base`), probe as
@@ -754,23 +985,7 @@ mod tests {
     #[test]
     fn a_linked_worktree_writes_the_common_exclude() {
         let tmp = tempfile::tempdir().unwrap();
-        let main = tmp.path().join("main");
-        std::fs::create_dir_all(&main).unwrap();
-        git_init(&main);
-        write(&main.join("README"), "x\n");
-        git(&main, &["add", "README"]);
-        git(&main, &["commit", "--quiet", "-m", "init"]);
-        let wt = tmp.path().join("wt");
-        git(
-            &main,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "--detach",
-                wt.to_str().unwrap(),
-            ],
-        );
+        let (main, wt) = linked_worktree(tmp.path());
 
         let commands = wt.join(".claude").join("commands");
         std::fs::create_dir_all(&commands).unwrap();
@@ -852,7 +1067,9 @@ mod tests {
             let exclude = exclude.clone();
             std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                update_exclude(&exclude, &[], |line| line == "/gone")
+                update_exclude(&exclude, PROVISIONED_EXCLUDE_MARKER, &[], |line| {
+                    line == "/gone"
+                })
             })
         };
         started_rx.recv().unwrap();
@@ -902,9 +1119,12 @@ mod tests {
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
         let bytes = b"# mine\n/keep\xff\n".to_vec();
         std::fs::write(&exclude, &bytes).unwrap();
-        let res = update_exclude(&exclude, &["/.claude/commands/gate.md".to_string()], |_| {
-            true
-        });
+        let res = update_exclude(
+            &exclude,
+            PROVISIONED_EXCLUDE_MARKER,
+            &["/.claude/commands/gate.md".to_string()],
+            |_| true,
+        );
         assert!(res.is_err(), "{res:?}");
         assert_eq!(std::fs::read(&exclude).unwrap(), bytes);
     }
@@ -920,7 +1140,7 @@ mod tests {
         write(&exclude, &seeded);
         // Stale at the unlocked judgement, present again by the locked one.
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let res = update_exclude(&exclude, &[], |line| {
+        let res = update_exclude(&exclude, PROVISIONED_EXCLUDE_MARKER, &[], |line| {
             line == "/back" && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
         });
         assert_eq!(res.unwrap(), (0, 0));
@@ -998,6 +1218,152 @@ mod tests {
                 PROVISIONED_EXCLUDE_MARKER.to_string(),
                 "/.claude/commands/a.md".to_string(),
             ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `exclude_workdir_artifacts`: the coord-mcp files at a workdir's root.
+    // The call-site tests (the breadcrumb and `.mcp.json` writers) live in
+    // `coord_mcp::workdir_artifact_exclude_tests`, entered through those
+    // writers; these pin the helper's own rules.
+    // -----------------------------------------------------------------------
+
+    const CRUMB: &str = crate::coord_mcp::COORD_MCP_STATUS_FILE;
+    const CRUMB_TMP: &str = crate::coord_mcp::COORD_MCP_STATUS_TMP_GLOB;
+    const MCP_JSON: &str = crate::coord_mcp::MCP_JSON_FILE;
+
+    /// The glob is written RAW after the anchor, and is a line git actually
+    /// matches a crash-left temp file with. Escaping it (as `escape_pattern`
+    /// would) writes `/.coord-mcp-status.tmp-\*`, which matches nothing.
+    #[test]
+    fn a_workdir_glob_is_anchored_raw_and_matches_a_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        write(&tmp.path().join(CRUMB), "x\n");
+        write(&tmp.path().join(".coord-mcp-status.tmp-1-x"), "x\n");
+
+        exclude_workdir_artifacts("test", tmp.path(), &[CRUMB, CRUMB_TMP]);
+
+        let lines = exclude_lines(tmp.path());
+        assert_eq!(
+            block_entries(&lines, WORKDIR_ARTIFACT_EXCLUDE_MARKER),
+            vec![
+                "/.coord-mcp-status".to_string(),
+                "/.coord-mcp-status.tmp-*".to_string()
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(untracked(tmp.path()), "");
+    }
+
+    /// Plan test 4: a name the repository TRACKS gets no line, and the temp
+    /// glob follows its base file's answer, so a tracked breadcrumb takes its
+    /// glob with it. An untracked sibling name in the same call is still
+    /// excluded, and a glob with no base in the call is never written.
+    #[test]
+    fn a_tracked_workdir_name_gets_no_line_and_its_glob_follows_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let tracked = tmp.path().join(MCP_JSON);
+        write(&tracked, "{}\n");
+        git_add(tmp.path(), &tracked);
+        exclude_workdir_artifacts("test", tmp.path(), &[MCP_JSON, CRUMB, CRUMB_TMP]);
+        let lines = exclude_lines(tmp.path());
+        assert!(!lines.iter().any(|l| l.contains(MCP_JSON)), "{lines:?}");
+        assert_eq!(
+            block_entries(&lines, WORKDIR_ARTIFACT_EXCLUDE_MARKER),
+            vec![format!("/{CRUMB}"), format!("/{CRUMB_TMP}")]
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        git_init(other.path());
+        let crumb = other.path().join(CRUMB);
+        write(&crumb, "x\n");
+        git_add(other.path(), &crumb);
+        exclude_workdir_artifacts("test", other.path(), &[CRUMB, CRUMB_TMP]);
+        assert!(
+            exclude_lines(other.path())
+                .iter()
+                .all(|l| !l.contains(CRUMB)),
+            "a tracked breadcrumb takes its temp glob with it: {:?}",
+            exclude_lines(other.path())
+        );
+        // A glob alone has no base to follow: no line, and no exclude file.
+        exclude_workdir_artifacts("test", other.path(), &["orphan.tmp-*"]);
+        assert!(exclude_lines(other.path()).is_empty());
+    }
+
+    /// Plan test 5: a workdir in a subdirectory of the work tree anchors its
+    /// lines under that prefix, with the prefix escaped and the pattern raw.
+    #[test]
+    fn a_subdirectory_workdir_anchors_under_its_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let sub = tmp.path().join("sub dir[1]");
+        std::fs::create_dir_all(&sub).unwrap();
+        write(&sub.join(CRUMB), "x\n");
+        write(&sub.join(".coord-mcp-status.tmp-9-y"), "x\n");
+        exclude_workdir_artifacts("test", &sub, &[CRUMB, CRUMB_TMP]);
+        assert_eq!(
+            block_entries(&exclude_lines(tmp.path()), WORKDIR_ARTIFACT_EXCLUDE_MARKER),
+            vec![
+                "/sub dir\\[1]/.coord-mcp-status".to_string(),
+                "/sub dir\\[1]/.coord-mcp-status.tmp-*".to_string()
+            ]
+        );
+        assert_eq!(untracked(tmp.path()), "");
+    }
+
+    /// A non-repo workdir writes nothing and creates nothing git-shaped.
+    #[test]
+    fn a_non_repo_workdir_excludes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_not_in_any_repo(tmp.path());
+        exclude_workdir_artifacts("test", tmp.path(), &[CRUMB, CRUMB_TMP, MCP_JSON]);
+        assert!(!tmp.path().join(".git").exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        // An empty workdir would be `git -C ""`, the runner's own cwd: refused.
+        exclude_workdir_artifacts("test", Path::new(""), &[CRUMB]);
+    }
+
+    /// Plan test 7: the two marker blocks do not interact. A pruning
+    /// provisioning pass removes its own stale line and leaves the workdir
+    /// block whole, and a later workdir call appends nothing.
+    #[test]
+    fn a_provisioning_prune_never_touches_the_workdir_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        write(
+            &exclude,
+            &format!("{PROVISIONED_EXCLUDE_MARKER}\n/.claude/skills/gone/\n"),
+        );
+        exclude_workdir_artifacts("test", tmp.path(), &[CRUMB, CRUMB_TMP]);
+        let skills = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        provision(&skills, &["keep/SKILL.md"]);
+
+        let lines = exclude_lines(tmp.path());
+        assert!(
+            !lines.contains(&"/.claude/skills/gone/".to_string()),
+            "the stale provisioned line is pruned: {lines:?}"
+        );
+        assert_eq!(
+            block_entries(&lines, PROVISIONED_EXCLUDE_MARKER),
+            vec!["/.claude/skills/keep/".to_string()],
+            "{lines:?}"
+        );
+        assert_eq!(
+            block_entries(&lines, WORKDIR_ARTIFACT_EXCLUDE_MARKER),
+            vec![format!("/{CRUMB}"), format!("/{CRUMB_TMP}")],
+            "the workdir block survives the prune rewrite whole: {lines:?}"
+        );
+        let before = std::fs::read_to_string(&exclude).unwrap();
+        exclude_workdir_artifacts("test", tmp.path(), &[CRUMB, CRUMB_TMP]);
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            before,
+            "a second workdir call appends nothing"
         );
     }
 }

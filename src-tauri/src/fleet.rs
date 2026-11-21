@@ -4412,14 +4412,20 @@ const MAX_DIRTY_FILES_REPORTED: usize = 50;
 /// `.claude/commands/*`, so they report the nested path individually and the
 /// exclude applies; a scratch fixture does not, and must commit a placeholder
 /// under the parent to reproduce the real shape (see the roster test).
+///
+/// The three coord-mcp names are `coord_mcp`'s own constants, not retyped
+/// literals: `coord_mcp` writes those files and also excludes them where it
+/// writes them (`provision_exclude::exclude_workdir_artifacts`, for the repos
+/// and linked worktrees this publisher-cycle heal never reaches), so the two
+/// rosters cannot drift apart.
 const MANAGED_REPO_EXCLUDES: &[&str] = &[
-    ".mcp.json",
+    crate::coord_mcp::MCP_JSON_FILE,
     "agent-worktrees/",
     ".agent-worktrees/",
-    ".coord-mcp-status",
+    crate::coord_mcp::COORD_MCP_STATUS_FILE,
     // The breadcrumb's atomic-replace temp file (`coord_mcp::replace_breadcrumb`),
     // which a crash between its write and its rename would leave behind.
-    ".coord-mcp-status.tmp-*",
+    crate::coord_mcp::COORD_MCP_STATUS_TMP_GLOB,
     ".claude/worktrees/",
 ];
 
