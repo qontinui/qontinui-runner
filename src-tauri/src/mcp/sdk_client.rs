@@ -10,7 +10,7 @@
 //! This is faster and more reliable for apps that have the UI Bridge SDK embedded.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::StatusCode,
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -5968,40 +5968,86 @@ pub(crate) async fn handle_render_log_path(
 // =============================================================================
 
 /// GET /ui-bridge/sdk/element/:id/state — Get element state
+///
+/// Forwards the request-scoped `?properties=` / `?attributes=` projection
+/// (repeats preserved, SDK validates the grammar) on the WS, HTTP and IPC arms.
+/// With no projection the dispatch is byte-identical to the legacy one. A
+/// projection over the defensive cap is refused whole with HTTP 400.
 async fn handle_element_state(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Json<serde_json::Value> {
+    RawQuery(raw): RawQuery,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use super::element_state_projection::{ipc_args_for, StateProjection};
     let id = id.trim().to_string();
+    let projection = match StateProjection::from_raw_query(raw.as_deref()) {
+        Ok(p) => p,
+        Err(refusal) => return (StatusCode::BAD_REQUEST, Json(refusal.to_json())),
+    };
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    let path = format!("/control/element/{}/state", id);
-    match dispatch_app_request_typed(
-        &state,
-        "getElementReactState",
-        serde_json::json!({ "id": id }),
-        Method::GET,
-        &path,
-        None,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
+    let result = match &projection {
+        // Projection-aware tab action (`getReactState` ignores a projection).
+        Some(p) => {
+            dispatch_app_request_typed(
+                &state,
+                "getElementState",
+                p.ws_payload(&id),
+                Method::GET,
+                &p.http_path(&id),
+                None,
+            )
+            .await
+        }
+        None => {
+            let path = format!("/control/element/{}/state", id);
+            dispatch_app_request_typed(
+                &state,
+                "getElementReactState",
+                serde_json::json!({ "id": id }),
+                Method::GET,
+                &path,
+                None,
+            )
+            .await
+        }
+    };
+    match result {
+        Ok(data) => (StatusCode::OK, Json(data)),
         Err(sdk_err) => {
             // An app WAS the target and failed, a phone refusing an unpaired runner
             // among them: say so. The runner's own UI is not that app's.
             if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "element state") {
-                return Json(refusal);
+                return (StatusCode::OK, Json(refusal));
             }
-            // Fall back to IPC — get element details which include state
-            match ui_bridge_request_sync(
-                &state,
-                "get_element",
-                serde_json::json!({ "elementId": id }),
-            )
-            .await
-            {
-                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
-                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            // Fall back to IPC. With a projection the page-side `get_element_state`
+            // case answers it; without one, keep the legacy `get_element` call.
+            let ipc = match &projection {
+                Some(_) => {
+                    ui_bridge_request_sync(
+                        &state,
+                        "get_element_state",
+                        ipc_args_for(projection.as_ref(), &id),
+                    )
+                    .await
+                }
+                None => {
+                    ui_bridge_request_sync(
+                        &state,
+                        "get_element",
+                        serde_json::json!({ "elementId": id }),
+                    )
+                    .await
+                }
+            };
+            match ipc {
+                Ok(data) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "data": data })),
+                ),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": false, "error": e })),
+                ),
             }
         }
     }
@@ -9434,6 +9480,50 @@ mod tests {
                 "{handler} must ask the gate BEFORE falling back to IPC"
             );
         }
+    }
+
+    /// `handle_element_state` forwards the projection on the projection-aware
+    /// action and keeps the legacy action for an absent projection, as two
+    /// literal call sites (so `validate-ws-actions.mjs` still matches both);
+    /// `state-generic` is left alone.
+    #[test]
+    fn element_state_branches_on_projection_with_literal_actions() {
+        let src = include_str!("sdk_client.rs");
+        let body_of = |name: &str| -> String {
+            src.split(
+                format!(
+                    "
+async fn {name}("
+                )
+                .as_str(),
+            )
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} not found"))
+            .split(
+                "
+async fn ",
+            )
+            .next()
+            .unwrap_or_default()
+            .to_string()
+        };
+        let state = body_of("handle_element_state");
+        assert!(state.contains("\"getElementState\""), "projection arm lost");
+        assert!(
+            state.contains("\"getElementReactState\""),
+            "legacy no-projection arm lost"
+        );
+        assert!(state.contains("RawQuery(raw)"), "query is no longer read");
+        assert!(
+            state.contains("StatusCode::BAD_REQUEST"),
+            "refusal must be 400"
+        );
+        let generic = body_of("handle_element_state_generic");
+        assert!(
+            !generic.contains("RawQuery"),
+            "state-generic must stay unchanged"
+        );
+        assert!(!generic.contains("element_state_projection"));
     }
 
     /// Every production `async fn` that both dispatches to the app and falls
