@@ -435,3 +435,98 @@ impl PgDb {
         Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 }
+
+#[cfg(test)]
+mod workflow_ai_session_tests {
+    //! `workflow_ai_sessions` keying, against a FRESH database from
+    //! `PgDb::new_for_test()` (the bundled PostgreSQL harness).
+
+    use super::*;
+
+    const TASK: &str = "task-run-ai-session-keying";
+    const PHASE: &str = "agentic";
+
+    /// `workflow_ai_sessions.task_run_id` is FK'd to `task_runs(id)`.
+    async fn fresh_db_with_task_run() -> std::sync::Arc<PgDb> {
+        let pg = PgDb::new_for_test().await;
+        let conn = pg.pool().get().await.expect("PG pool");
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name) VALUES ($1, $2)",
+            &[&TASK, &"workflow_ai_sessions keying test"],
+        )
+        .await
+        .expect("insert task_run fixture");
+        pg
+    }
+
+    /// Two stages of one (task run, iteration, phase): the lookup for stage 0
+    /// returns stage 0's row even though stage 1's row is newer. The old
+    /// `ORDER BY id DESC` query with no stage predicate returned stage 1's.
+    #[tokio::test]
+    async fn get_workflow_ai_session_is_keyed_on_stage() {
+        let pg = fresh_db_with_task_run().await;
+        pg.create_workflow_ai_session(TASK, 1, PHASE, Some(0), "cli-stage-0")
+            .await
+            .expect("create stage 0");
+        pg.create_workflow_ai_session(TASK, 1, PHASE, Some(1), "cli-stage-1")
+            .await
+            .expect("create stage 1");
+
+        let got = pg
+            .get_workflow_ai_session(TASK, 1, PHASE, Some(0))
+            .await
+            .expect("get stage 0");
+        assert_eq!(got, Some(("cli-stage-0".to_string(), "running".to_string())));
+
+        let got = pg
+            .get_workflow_ai_session(TASK, 1, PHASE, Some(1))
+            .await
+            .expect("get stage 1");
+        assert_eq!(got, Some(("cli-stage-1".to_string(), "running".to_string())));
+    }
+
+    /// A stageless row (`None`, stored NULL, keyed as -1) is not shadowed by a
+    /// newer staged row, and `None` and `Some(-1)` name the same key, exactly
+    /// as `create_workflow_ai_session` / `complete_workflow_ai_session` use it.
+    #[tokio::test]
+    async fn get_workflow_ai_session_stageless_key_is_minus_one() {
+        let pg = fresh_db_with_task_run().await;
+        pg.create_workflow_ai_session(TASK, 2, PHASE, None, "cli-stageless")
+            .await
+            .expect("create stageless");
+        pg.create_workflow_ai_session(TASK, 2, PHASE, Some(0), "cli-stage-0")
+            .await
+            .expect("create stage 0");
+
+        let expected = Some(("cli-stageless".to_string(), "running".to_string()));
+        let got = pg
+            .get_workflow_ai_session(TASK, 2, PHASE, None)
+            .await
+            .expect("get None");
+        assert_eq!(got, expected);
+        let got = pg
+            .get_workflow_ai_session(TASK, 2, PHASE, Some(-1))
+            .await
+            .expect("get Some(-1)");
+        assert_eq!(got, expected);
+    }
+
+    /// A terminal status written by `complete_workflow_ai_session` is what the
+    /// next phase-start lookup reads back.
+    #[tokio::test]
+    async fn complete_then_get_reads_back_failed() {
+        let pg = fresh_db_with_task_run().await;
+        pg.create_workflow_ai_session(TASK, 3, PHASE, Some(2), "cli-budget-stop")
+            .await
+            .expect("create");
+        pg.complete_workflow_ai_session(TASK, 3, PHASE, Some(2), "failed", 0)
+            .await
+            .expect("complete");
+
+        let got = pg
+            .get_workflow_ai_session(TASK, 3, PHASE, Some(2))
+            .await
+            .expect("get");
+        assert_eq!(got, Some(("cli-budget-stop".to_string(), "failed".to_string())));
+    }
+}
