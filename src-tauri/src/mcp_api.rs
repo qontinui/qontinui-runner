@@ -21370,8 +21370,10 @@ mod coord_provision_session_gate_tests {
             .join("\n");
         let emit = "\"visionFrameSources\": crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES";
         assert_eq!(region.matches(emit).count(), 2, "{region}");
-        assert!(crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES
-            .contains(&"websocket_relay"));
+        assert!(
+            crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES
+                .contains(&"websocket_relay")
+        );
     }
 
     /// Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`

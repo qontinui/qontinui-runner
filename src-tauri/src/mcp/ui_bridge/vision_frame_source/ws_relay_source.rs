@@ -55,35 +55,57 @@ impl FrameProvider for WsRelayScreenshotSource {
 /// dispatcher and registry rather than an `ApiState` so it is testable
 /// against a real served relay (no `tauri::AppHandle` needed).
 ///
-/// A registration that turned HTTP between resolution and dispatch
-/// ([`DispatchError::NotWebsocket`]) is re-resolved ONCE: an HTTP row is
-/// fetched over HTTP, a WebSocket row (re-checked for the capability) is sent
-/// the command once more, and any further flip is [`FrameSourceError::Unreachable`].
+/// The row is READ AGAIN right before every dispatch, and the
+/// [`SCREENSHOT_CAPABILITY`] re-checked on it: a capability-less client that
+/// re-registered under the same id after resolution is refused (422), never
+/// sent `getScreenshot` blind. A registration that turned HTTP is fetched over
+/// HTTP. A flip to HTTP between that read and the dispatch
+/// ([`DispatchError::NotWebsocket`]) is re-resolved ONCE; a second flip is
+/// [`FrameSourceError::Unreachable`]. A row that is gone was live when the
+/// capture was routed, so that is `Unreachable` (502, retryable), not an
+/// unknown target.
 pub(crate) async fn capture_over_relay(
     dispatcher: &AppDispatcher,
     registry: &AppRegistry,
     app_id: &str,
 ) -> Result<Frame, FrameSourceError> {
-    match dispatcher
-        .dispatch_websocket(app_id, SCREENSHOT_ACTION, json!({}))
-        .await
-    {
-        Err(DispatchError::NotWebsocket(_)) => {}
-        result => return decode(app_id, result),
-    }
-    let entry = registry
-        .get_live(app_id)
-        .await
-        .ok_or_else(|| FrameSourceError::UnknownTarget(app_id.to_string()))?;
-    match entry.transport {
-        AppTransport::Http => DeviceScreenshotSource::for_app(app_id, &entry).fetch().await,
-        AppTransport::Websocket => {
-            require_screenshot_capability(app_id, &entry)?;
-            let result = dispatcher
-                .dispatch_websocket(app_id, SCREENSHOT_ACTION, json!({}))
-                .await;
-            decode(app_id, result)
+    for attempt in 0..2 {
+        let entry = registry
+            .get_live(app_id)
+            .await
+            .ok_or_else(|| no_longer_registered(app_id))?;
+        match entry.transport {
+            AppTransport::Http => {
+                return DeviceScreenshotSource::for_app(app_id, &entry)
+                    .fetch()
+                    .await
+            }
+            AppTransport::Websocket => {
+                require_screenshot_capability(app_id, &entry)?;
+                match dispatcher
+                    .dispatch_websocket(app_id, SCREENSHOT_ACTION, json!({}))
+                    .await
+                {
+                    Err(DispatchError::NotWebsocket(_)) if attempt == 0 => continue,
+                    result => return decode(app_id, result),
+                }
+            }
         }
+    }
+    Err(from_dispatch_error(
+        app_id,
+        DispatchError::NotWebsocket(app_id.to_string()),
+    ))
+}
+
+/// The app's row vanished after the capture was routed to it.
+fn no_longer_registered(app_id: &str) -> FrameSourceError {
+    FrameSourceError::Unreachable {
+        message: format!(
+            "app '{app_id}' is no longer registered (it was live when its capture was routed)"
+        ),
+        code: CODE_APP_UNREACHABLE,
+        retryable: Some(true),
     }
 }
 
@@ -108,7 +130,9 @@ pub(crate) fn from_dispatch_error(app_id: &str, err: DispatchError) -> FrameSour
         retryable,
     };
     match err {
-        DispatchError::NotRegistered(id) => FrameSourceError::UnknownTarget(id),
+        // The target was live at resolve time (only a live row is routed
+        // here), so its disappearance is the transport's, not an unknown id.
+        DispatchError::NotRegistered(id) => no_longer_registered(&id),
         DispatchError::NotWebsocket(id) => unreachable(
             format!(
                 "app '{id}' changed transport while its capture was being routed, \
@@ -140,9 +164,10 @@ pub(crate) fn from_dispatch_error(app_id: &str, err: DispatchError) -> FrameSour
             ),
             e @ (CommandRelayError::NotConnected(_)
             | CommandRelayError::Disconnected
-            | CommandRelayError::Displaced(_)) => {
-                unreachable(format!("app '{app_id}' over /ui-bridge/ws: {e}"), Some(true))
-            }
+            | CommandRelayError::Displaced(_)) => unreachable(
+                format!("app '{app_id}' over /ui-bridge/ws: {e}"),
+                Some(true),
+            ),
             e @ CommandRelayError::EncodeFailed(_) => {
                 FrameSourceError::RunnerCapture(format!("app '{app_id}': {e}"))
             }
@@ -222,9 +247,8 @@ mod tests {
     async fn a_capable_client_reply_decodes_into_a_frame() {
         let (dispatcher, registry, relay, conn_id, mut rx) =
             ws_app("wapp", &[SCREENSHOT_CAPABILITY], Duration::from_secs(5)).await;
-        let pending = tokio::spawn(async move {
-            capture_over_relay(&dispatcher, &registry, "wapp").await
-        });
+        let pending =
+            tokio::spawn(async move { capture_over_relay(&dispatcher, &registry, "wapp").await });
         let command_id = screenshot_command(&mut rx).await;
         relay
             .resolve(
@@ -249,9 +273,8 @@ mod tests {
     async fn a_client_failure_with_a_code_maps_to_capture_failed_carrying_it() {
         let (dispatcher, registry, relay, conn_id, mut rx) =
             ws_app("wapp", &[SCREENSHOT_CAPABILITY], Duration::from_secs(5)).await;
-        let pending = tokio::spawn(async move {
-            capture_over_relay(&dispatcher, &registry, "wapp").await
-        });
+        let pending =
+            tokio::spawn(async move { capture_over_relay(&dispatcher, &registry, "wapp").await });
         let command_id = screenshot_command(&mut rx).await;
         relay
             .resolve(
@@ -294,9 +317,8 @@ mod tests {
     async fn a_relay_timeout_maps_to_unreachable_naming_the_timeout() {
         let (dispatcher, registry, _relay, _conn_id, mut rx) =
             ws_app("wapp", &[SCREENSHOT_CAPABILITY], Duration::from_millis(150)).await;
-        let pending = tokio::spawn(async move {
-            capture_over_relay(&dispatcher, &registry, "wapp").await
-        });
+        let pending =
+            tokio::spawn(async move { capture_over_relay(&dispatcher, &registry, "wapp").await });
         let _ = screenshot_command(&mut rx).await;
         let err = tokio::time::timeout(Duration::from_secs(5), pending)
             .await
@@ -311,7 +333,10 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
         assert!(err.to_string().contains("150ms"), "{err}");
         let (_, body) = err.to_json_err();
-        assert_eq!(body.0.hint.clone().expect("hint")["failure_origin"], "transport");
+        assert_eq!(
+            body.0.hint.clone().expect("hint")["failure_origin"],
+            "transport"
+        );
     }
 
     /// A reply with no `screenshot` is the app's failed capture, not a
@@ -324,8 +349,8 @@ mod tests {
         let cases = [
             (
                 DispatchError::NotRegistered("wapp".into()),
-                StatusCode::BAD_REQUEST,
-                "UNKNOWN_VISION_TARGET",
+                StatusCode::BAD_GATEWAY,
+                CODE_APP_UNREACHABLE,
             ),
             (
                 DispatchError::NotWebsocket("wapp".into()),
@@ -373,5 +398,36 @@ mod tests {
             assert_eq!(mapped.status(), status, "{label} → {mapped:?}");
             assert_eq!(mapped.code(), code, "{label} → {mapped:?}");
         }
+    }
+
+    /// A3: a capability-less client that re-registered under the same id after
+    /// resolution is refused at dispatch time (422) and sent no frame.
+    #[tokio::test]
+    async fn a_capability_less_re_registration_is_refused_not_sent_blind() {
+        let (dispatcher, registry, _relay, _conn_id, mut rx) =
+            ws_app("wapp", &["control"], Duration::from_secs(5)).await;
+        let err = capture_over_relay(&dispatcher, &registry, "wapp")
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY, "{err:?}");
+        assert_eq!(err.code(), "FRAME_SOURCE_UNSUPPORTED");
+        assert!(rx.try_recv().is_err(), "no getScreenshot may be sent blind");
+    }
+
+    /// A4: a row that vanished after routing is 502 APP_UNREACHABLE, retryable.
+    #[tokio::test]
+    async fn a_row_gone_after_routing_is_unreachable_not_unknown() {
+        let registry = AppRegistry::new();
+        let relay = CommandRelay::with_timeout(WsConnectionManager::new(), Duration::from_secs(1));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay);
+        let err = capture_over_relay(&dispatcher, &registry, "gone")
+            .await
+            .expect_err("must fail");
+        assert!(
+            matches!(&err, FrameSourceError::Unreachable { code, retryable: Some(true), .. }
+                if *code == CODE_APP_UNREACHABLE),
+            "{err:?}"
+        );
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
     }
 }

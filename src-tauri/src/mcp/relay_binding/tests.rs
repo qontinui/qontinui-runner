@@ -2792,7 +2792,10 @@ async fn a_capable_websocket_client_answers_a_4_mib_screenshot_over_the_socket()
         .await
         .expect("live row");
     assert!(
-        row.app.capabilities.iter().any(|c| c == SCREENSHOT_CAPABILITY),
+        row.app
+            .capabilities
+            .iter()
+            .any(|c| c == SCREENSHOT_CAPABILITY),
         "the register frame's capability reaches the registry: {:?}",
         row.app.capabilities
     );
@@ -2803,13 +2806,19 @@ async fn a_capable_websocket_client_answers_a_4_mib_screenshot_over_the_socket()
         tokio::spawn(async move { capture_over_relay(&dispatcher, &registry, "shot-app").await });
 
     let command = loop {
-        let frame = wrapper.recv().await.expect("the wrapper receives the command");
+        let frame = wrapper
+            .recv()
+            .await
+            .expect("the wrapper receives the command");
         if frame["type"] == "command" {
             break frame;
         }
     };
     assert_eq!(command["action"], SCREENSHOT_ACTION, "{command}");
-    let command_id = command["commandId"].as_str().expect("commandId").to_string();
+    let command_id = command["commandId"]
+        .as_str()
+        .expect("commandId")
+        .to_string();
     // Reported CSS width is half the PNG's: a 2× HiDPI frame.
     wrapper
         .respond(
