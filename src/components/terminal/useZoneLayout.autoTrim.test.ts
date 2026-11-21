@@ -556,6 +556,8 @@ describe("predictLayoutOrigin agrees with the hook", () => {
     requested: string;
     source: LayoutOrigin;
     settled: string;
+    /** Enter tmux before the request: an operator request exits it. */
+    fromTmux?: boolean;
   }> = [
     {
       name: "operator request auto-grow overrides, same id as before",
@@ -609,15 +611,44 @@ describe("predictLayoutOrigin agrees with the hook", () => {
       source: "auto",
       settled: "six-pack",
     },
+    {
+      name: "operator request out of tmux that fits",
+      current: "six-pack",
+      tabs: 3,
+      stored: "auto",
+      requested: "quad",
+      source: "operator",
+      settled: "quad",
+      fromTmux: true,
+    },
+    {
+      name: "operator request out of tmux auto-grow overrides",
+      current: "six-pack",
+      tabs: 6,
+      stored: "operator",
+      requested: "quad",
+      source: "operator",
+      settled: "six-pack",
+      fromTmux: true,
+    },
   ];
-  it.each(cases)("$name", ({ current, tabs, stored, requested, source, settled }) => {
+  it.each(cases)("$name", ({ current, tabs, stored, requested, source, settled, fromTmux }) => {
     const live = ids(tabs);
     const render = mount(current, live, dense(live), stored ? { origin: stored } : {});
-    render().setLayoutId(requested, { source });
+    if (fromTmux) render().enterTmuxMode();
+    // What the callers hand the prediction: the page as read BEFORE the
+    // request (in tmux, its pinned `single`), not the mounted preset. Only an
+    // operator request exits tmux, and the prediction never reads the page
+    // for one, so the tmux rows pin the exit and its grow, not this input.
+    const before = render();
+    if (fromTmux) expect(before.workMode).toBe("tmux");
+    const pageBefore = { layoutId: before.layoutId, layoutOrigin: before.layoutOrigin };
+    before.setLayoutId(requested, { source });
     const r = render();
+    expect(r.workMode).toBe("grid");
     expect(r.layoutId).toBe(settled);
     const predicted = predictLayoutOrigin(
-      { layoutId: current, layoutOrigin: stored },
+      pageBefore,
       requested,
       source,
       settled,
