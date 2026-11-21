@@ -1543,7 +1543,9 @@ mod tests {
     /// Once a poll was UNDECIDED, an unreadable table on another poll does
     /// not erase it, in either order; only unreadable polls stay unreadable,
     /// and one readable poll is still "looked and found nothing".
-    #[tokio::test]
+    // A paused clock: the 40 ms window is virtual time, so a scheduler stall
+    // cannot end it before the scripted polls run.
+    #[tokio::test(start_paused = true)]
     async fn resume_door_verify_keeps_registry_undecided_over_an_unreadable_table() {
         assert_eq!(
             verify_scripted(&[Some(REGISTRY_UNDECIDED), Some(PROCESS_TABLE_UNREADABLE)]).await,
@@ -1574,7 +1576,9 @@ mod tests {
 
     /// ARMING: a resume whose first poll was undecided and every later poll
     /// unreadable reports `registry_undecided`, not `process_table_unreadable`.
-    #[tokio::test]
+    // A paused clock: the 40 ms window is virtual time, so a scheduler stall
+    // cannot end it before the scripted polls run.
+    #[tokio::test(start_paused = true)]
     async fn resume_door_verify_reports_undecided_then_unreadable_as_registry_undecided() {
         let mut polls = 0;
         let verdict = verify_with(

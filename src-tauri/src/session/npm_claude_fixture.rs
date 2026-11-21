@@ -52,7 +52,9 @@ pub(crate) static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 const SPAWN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How long the child sleeps — far longer than any test; it is killed on drop.
-const SLEEP_SECS: &str = "600";
+/// Kept short because `Drop` does not run when the test binary is SIGKILLed
+/// (a harness timeout), and an orphaned `node` then lives this long.
+const SLEEP_SECS: &str = "120";
 
 /// Who is the fixture's parent.
 enum Host {
