@@ -894,9 +894,13 @@ fn reserialize(value: &serde_json::Value) -> StampOutcome {
 /// is passed through deliberately), not errors.
 #[derive(Debug)]
 enum StampOutcome {
-    /// Rules 2a / 4 / 5 — the envelope was reconciled; carries the new body.
+    /// Rules 2a / 4 / 5 / 6 — the envelope was reconciled (or, under rule 6
+    /// alone, only given its refusal); carries the new body. Since rule 6, a
+    /// body with agreeing codes but no `refusal` is counted here, not under
+    /// `AlreadyTyped`.
     Stamped(Vec<u8>),
-    /// Rule 2 — both code fields were present and agreed. Already correct.
+    /// Rule 2 — both code fields were present and agreed AND a `refusal` was
+    /// already attached. Already correct.
     AlreadyTyped,
     /// Rule 1 — not an `ApiResponse` failure body, so not ours to edit.
     Foreign,
@@ -2284,7 +2288,7 @@ mod json_error_code_reconciliation_tests {
                        "error":"SEND_KEYS_INVALID: 'modifiers' for key 'c' must be an object",
                        "error_detail":{"code":"SEND_KEYS_INVALID",
                                        "message":"SEND_KEYS_INVALID: …",
-                                       "recovery":"FIX_REQUEST"}}"#;
+                                       "recovery":{"kind":"fix_request"}}}"#;
         let out = stamp(body.as_bytes(), StatusCode::BAD_REQUEST).expect("rule 4 promotes");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["code"], serde_json::json!("SEND_KEYS_INVALID"));

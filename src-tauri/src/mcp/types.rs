@@ -418,8 +418,9 @@ pub struct ApiResponse<T: Serialize> {
     /// The shared refusal envelope (`qontinui_types::refusal::Refusal`):
     /// the refusal class, the runner code as its discriminator, the typed
     /// next action and the diagnostic detail — under the same top-level
-    /// `refusal` key qontinui-web nests it in. ADDITIVE: `code` and
-    /// `error_detail` are kept beside it. A constructor that knows more than
+    /// `refusal` key qontinui-web nests it in. Additive: `code` and
+    /// `error_detail` are kept beside it (only `error_detail.recovery`
+    /// changed shape, to the same `NextAction` object). A constructor that knows more than
     /// the code (a typed workspace-root miss, a request type's shape hints)
     /// sets it; every other error has it stamped by the envelope middleware
     /// (`crate::mcp::refusal_envelope`), so no enveloped error leaves the
