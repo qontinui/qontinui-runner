@@ -103,9 +103,11 @@ impl From<GhError> for String {
     }
 }
 
-/// Longest single back-off, in seconds. Preserved verbatim from the per-instance
-/// implementation: a GitHub reset can be an hour out, and blocking a poller for
-/// an hour is indistinguishable from the poller being dead.
+/// Longest single back-off GitHub's own wait is capped at, in seconds, BEFORE
+/// the resume jitter ([`github_budget::resume_after`]) adds up to
+/// [`github_budget::RESUME_JITTER_SECS`]. Preserved verbatim from the
+/// per-instance implementation: a GitHub reset can be an hour out, and blocking
+/// a poller for an hour is indistinguishable from the poller being dead.
 const MAX_BACKOFF_SECS: u64 = 300;
 
 /// Cache key under which a page's `Link: rel="next"` is stored beside its body.
@@ -171,6 +173,22 @@ pub(crate) fn retry_backoff_secs(
     Some(wait.min(MAX_BACKOFF_SECS))
 }
 
+/// How long [`interactive_floor`] sleeps BEFORE jitter, or `None` when it does
+/// not sleep: the bucket is above [`RATE_LIMIT_FLOOR`], the reset is unknown,
+/// or the window has already reset. Capped at [`MAX_BACKOFF_SECS`]. Pure,
+/// unit-tested.
+pub(crate) fn interactive_floor_wait_secs(
+    remaining: i64,
+    reset_at_unix: Option<i64>,
+    now: i64,
+) -> Option<u64> {
+    let reset = reset_at_unix?;
+    if remaining > RATE_LIMIT_FLOOR || now >= reset {
+        return None;
+    }
+    Some(((reset - now) as u64).min(MAX_BACKOFF_SECS))
+}
+
 /// INTERACTIVE only: sleep one chunk when `credential`'s own bucket is at or
 /// below [`RATE_LIMIT_FLOOR`] and its window has not reset — then let the caller
 /// send. Shared by [`GitHubClient`] and the ticket provider's writes so the two
@@ -183,17 +201,15 @@ pub(crate) async fn interactive_floor(credential: &CredentialKey) {
     let Some(obs) = github_budget::rate_limit_for(credential) else {
         return;
     };
-    let (Some(remaining), Some(reset)) = (obs.remaining, obs.reset_at_unix) else {
+    let Some(remaining) = obs.remaining else {
         return;
     };
-    if remaining > RATE_LIMIT_FLOOR {
+    let Some(wait) = interactive_floor_wait_secs(remaining, obs.reset_at_unix, now_unix()) else {
         return;
-    }
-    let now = now_unix();
-    if now >= reset {
-        return;
-    }
-    let wait = ((reset - now) as u64).min(MAX_BACKOFF_SECS);
+    };
+    // Jittered past the reset: every runner sharing the bucket computed the
+    // same reset, and resuming exactly there is the synchronized burst.
+    let wait = github_budget::resume_after(wait);
     warn!(
         "GitHub API rate limit low ({} remaining, credential {}), waiting {}s",
         remaining, credential, wait
@@ -747,6 +763,9 @@ impl GitHubClient {
             ex.reset_at_unix,
             now_unix(),
         );
+        // Every runner sharing this bucket computed the same wait; each adds its
+        // own jitter so they do not all re-send in the second the window opens.
+        let backoff = backoff.map(github_budget::resume_after);
         if let (Some(wait), SpendClass::Background) = (backoff, self.spend_class) {
             // A background poller is never slept on. The refusal is already on
             // the meter as `rate_limited`; the hold keeps the next tick or
@@ -1079,6 +1098,33 @@ mod tests {
             }
             assert_eq!(retry_backoff_secs(status, Some(5), None, None, 1), None);
         }
+    }
+
+    #[test]
+    fn interactive_floor_sleeps_only_at_or_below_the_floor_before_the_reset() {
+        assert_eq!(
+            interactive_floor_wait_secs(RATE_LIMIT_FLOOR + 1, Some(1_120), 1_000),
+            None
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(RATE_LIMIT_FLOOR, Some(1_120), 1_000),
+            Some(120)
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(0, Some(1_000), 1_000),
+            None,
+            "already reset"
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(0, None, 1_000),
+            None,
+            "unknown reset is UNKNOWN"
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(0, Some(1_000 + 3_600), 1_000),
+            Some(MAX_BACKOFF_SECS),
+            "an hour-out reset is capped"
+        );
     }
 
     #[test]
@@ -1419,8 +1465,10 @@ mod tests {
             ),
             "{err}"
         );
-        // The interactive retry goes to the (now closed) one-shot server.
-        let _ = pending.await;
+        // The interactive retry would go to the (now closed) one-shot server
+        // after a JITTERED sleep of up to `RESUME_JITTER_SECS` past the
+        // `Retry-After`; its outcome is not under test, so do not wait for it.
+        pending.abort();
     }
 
     /// On the background path a rate-limited refusal — a `429`, or a
