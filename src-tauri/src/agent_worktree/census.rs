@@ -1114,6 +1114,13 @@ pub struct WorktreeCensus {
     /// OFF — the passive prove-out feed for arming reclaim.
     /// `Some(_)` is the live probe result; old runners omit the field and
     /// coord reads NULL (honest unknown).
+    ///
+    /// The census reports [`super::reclaim::probe_building_for_census`], the
+    /// lock-only half. On Linux that is a confirmed `.cargo-lock` flock holder
+    /// building this worktree (its cwd, moved by `-C` / `--manifest-path`);
+    /// `None` when `/proc/locks` could not be read or a build process could not
+    /// be attributed. When it is `Some(true)`, `build_target_dir` names the
+    /// target root that build locks.
     pub building: Option<bool>,
 
     /// Ξ_Worktree Phase 7.3 — canonical-checkout state, the input coord
@@ -1711,6 +1718,12 @@ fn build_slot_for(target_dir: &Path) -> Option<String> {
 /// DOES export it before launching the runner, every row on that device will
 /// report that one dir, which is honest about what the process can observe
 /// but is machine-scoped rather than worktree-scoped.
+///
+/// This is the PREDICTED dir. On Linux, a row whose build is observed in
+/// flight reports the target root that build locks instead
+/// ([`observed_build_target`]), because a wrapper build in a linked worktree
+/// (cargo-guard, cargo-verify) sets its own `CARGO_TARGET_DIR` to the
+/// primary's shared target and leaves no trace this prediction can read.
 pub(crate) fn resolve_build_target(worktree: &Path, env_target_dir: Option<&str>) -> BuildTarget {
     let Some(invocation_dir) = cargo_invocation_dir_for(worktree) else {
         // Not a cargo project — there is no build target to attribute.
@@ -1731,6 +1744,16 @@ pub(crate) fn resolve_build_target(worktree: &Path, env_target_dir: Option<&str>
     BuildTarget {
         dir: Some(normalize_path_str(&dir)),
         slot: build_slot_for(&dir),
+    }
+}
+
+/// The `(build_target_dir, build_slot)` of a target root an in-flight build
+/// was OBSERVED to lock (Linux, [`super::reclaim::probe_building_for_census`]).
+/// It overrides [`resolve_build_target`]'s prediction for that row.
+fn observed_build_target(target_root: &Path) -> BuildTarget {
+    BuildTarget {
+        dir: Some(normalize_path_str(target_root)),
+        slot: build_slot_for(target_root),
     }
 }
 
@@ -2469,10 +2492,29 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
     let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
 
+    // G6 shadow-mode: held-cargo-lock-only build probe for the FLEET census
+    // (NOT the reclaim executor's `probe_building`, which also counts recent
+    // file activity — editor saves / git ops are not builds and over-reported
+    // coord's build-concurrency gauge). Phase 2 of
+    // `plans/2026-06-08-coord-build-slot-budget-saturation-fix.md`. On Linux it
+    // OBSERVES the build: a confirmed `.cargo-lock` holder running in this
+    // worktree, and the target root it locks.
+    let census_build = super::reclaim::probe_building_for_census(worktree);
+    let building = census_build.building;
+
     // Run provenance: WHICH dir this worktree's builds write to, and whether
-    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
-    // `is_file` probes plus at most one small TOML parse) — no git spawn.
-    let build_target = resolve_build_target_live(worktree);
+    // that dir is a shared pool slot. An observed in-flight build reports the
+    // target it actually locks (plan
+    // `2026-11-19-coord-prices-every-building-linux-agent-worktree-as-a-dedicated-target`
+    // D1): a wrapper build in a linked worktree locks the primary's shared
+    // target, and coord prices a `build_target_dir` inside the worktree as a
+    // whole dedicated target. Otherwise the predicted dir — filesystem-only +
+    // cheap (a couple of `is_file` probes plus at most one small TOML parse),
+    // no git spawn.
+    let build_target = match census_build.target_dir.as_deref() {
+        Some(observed) => observed_build_target(observed),
+        None => resolve_build_target_live(worktree),
+    };
 
     // WIP custody (Phase 3). Two bounded FILE READS on the hit path, ONE on
     // the miss path, and no subprocess at any point — `$GIT_DIR` comes from
@@ -2495,13 +2537,6 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // G2: ancestry/patch-id "landed in the repo's trunk" — local git only,
     // None when undeterminable (unresolvable trunk, git failure).
     let landed_in_main = compute_landed_in_main(worktree);
-
-    // G6 shadow-mode: held-cargo-lock-only build probe for the FLEET census
-    // (NOT the reclaim executor's `probe_building`, which also counts recent
-    // file activity — editor saves / git ops are not builds and over-reported
-    // coord's build-concurrency gauge). Phase 2 of
-    // `plans/2026-06-08-coord-build-slot-budget-saturation-fix.md`.
-    let building = Some(super::reclaim::probe_building_for_census(worktree));
 
     // Ξ_Worktree P7.3 — canonical-checkout state (per-REPO, not per-worktree;
     // it's fine that every worktree row of a repo carries the same values —
@@ -6152,6 +6187,89 @@ mod tests {",
         // (The dropped root-mtime-recency heuristic is what over-reported the
         // fleet `count_building` gauge — see this plan's Phase 2.)
         assert_eq!(row.building, Some(false));
+    }
+
+    /// The census reuses one build snapshot for 10 s; a fresh reading
+    /// replaces it (an older one never does), so a test makes the reading it
+    /// asserts on current — the production path, not a test twin.
+    #[cfg(target_os = "linux")]
+    fn refresh_build_snapshot() {
+        let _ = super::super::cargo_locks::build_snapshot(Duration::ZERO);
+    }
+
+    /// A linked worktree (`.git` FILE, a `Cargo.toml`) and a `.cargo-lock`
+    /// in its own `target` (`in_tree`) or the primary's shared `target-agent`.
+    /// Returns `(worktree, target root, lock file)`.
+    #[cfg(target_os = "linux")]
+    fn linux_build_fixture(tmp: &Path, in_tree: bool) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::fs::canonicalize(tmp).unwrap();
+        let wt = base
+            .join("agent-worktrees")
+            .join("a1")
+            .join("qontinui-runner");
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /nonexistent/admin/dir\n").unwrap();
+        std::fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = if in_tree {
+            wt.join("target")
+        } else {
+            base.join("qontinui-runner").join("target-agent")
+        };
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let lock = target.join("debug").join(".cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+        (wt, target, lock)
+    }
+
+    /// (a) A wrapper build in a linked worktree locks the PRIMARY's shared
+    /// `target-agent`. The census row must say the worktree is building and
+    /// that its build lands in `target-agent` — before this, Linux rows were
+    /// never `building` and always reported the lexical `<wt>/target`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_wrapper_build_is_reported_building_in_the_shared_target_it_locks() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, target, lock) = linux_build_fixture(tmp.path(), false);
+
+        let fake = super::super::cargo_locks::tests::spawn_fake_build(&lock, &wt.join("src-tauri"));
+        refresh_build_snapshot();
+        let row = capture_worktree("qontinui-runner", &wt);
+        drop(fake);
+        refresh_build_snapshot();
+
+        assert_eq!(row.building, Some(true), "{row:?}");
+        assert_eq!(
+            row.build_target_dir.as_deref(),
+            Some(normalize_path_str(&target).as_str())
+        );
+        assert_eq!(row.build_slot, None);
+
+        // Released → idle again, and the row falls back to the predicted dir.
+        let idle = capture_worktree("qontinui-runner", &wt);
+        assert_eq!(idle.building, Some(false));
+        assert_eq!(idle.build_target_dir, resolve_build_target_live(&wt).dir);
+        assert_ne!(idle.build_target_dir, row.build_target_dir);
+    }
+
+    /// (b) A genuine in-tree build keeps `<wt>/target` (priced dedicated).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_in_tree_build_is_reported_building_in_its_own_target() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, target, lock) = linux_build_fixture(tmp.path(), true);
+
+        let fake = super::super::cargo_locks::tests::spawn_fake_build(&lock, &wt);
+        refresh_build_snapshot();
+        let row = capture_worktree("qontinui-runner", &wt);
+        drop(fake);
+
+        assert_eq!(row.building, Some(true), "{row:?}");
+        assert_eq!(
+            row.build_target_dir.as_deref(),
+            Some(normalize_path_str(&target).as_str())
+        );
     }
 
     const LANDED_TARGET_ENV: &str = "QONTINUI_TEST_LANDED_TARGET";

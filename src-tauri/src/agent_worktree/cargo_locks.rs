@@ -406,8 +406,18 @@ pub fn classify_holder(chain: &[Vec<String>]) -> HolderKind {
         .first()
         .and_then(|a| a.first())
         .map_or("", |s| s.as_str());
-    let base = basename(argv0);
-    let base = base.strip_suffix(".exe").unwrap_or(base);
+    if is_build_tool(argv0) {
+        HolderKind::Build
+    } else {
+        HolderKind::Unknown
+    }
+}
+
+/// True iff `argv0`'s basename (`.exe` stripped) is a cargo / rustc / clippy /
+/// rustdoc / nextest binary — the half of [`classify_holder`] that needs no
+/// ancestor walk, so a caller can drop every other process before paying for
+/// one.
+pub fn is_build_tool(argv0: &str) -> bool {
     const BUILD_TOOLS: &[&str] = &[
         "cargo",
         "rustc",
@@ -417,11 +427,9 @@ pub fn classify_holder(chain: &[Vec<String>]) -> HolderKind {
         "cargo-nextest",
         "cargo-test",
     ];
-    if BUILD_TOOLS.contains(&base) {
-        HolderKind::Build
-    } else {
-        HolderKind::Unknown
-    }
+    let base = basename(argv0);
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    BUILD_TOOLS.contains(&base)
 }
 
 // ---------------------------------------------------------------------------
@@ -863,8 +871,450 @@ impl ProcReader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-target and per-build flock observation — the census row's `building` /
+// `build_target_dir` and the G6 guards of the reclaim executor and the orphan
+// target reaper.
+//
+// Plan `2026-11-19-coord-prices-every-building-linux-agent-worktree-as-a-dedicated-target`.
+// The G6 probes called a `.cargo-lock` held when a write-open of it FAILED —
+// the premise of the Windows probe. On Linux cargo's lock is an advisory
+// `flock`, the open always succeeds, and the probe was false by construction:
+// measured 2026-11-19 on device eb2155ed, 0 of 3626 census rows read
+// `building` while at least three cargo builds held locks. The functions below
+// read the same `/proc/locks` and fdinfo state the `cargo_locks` item above is
+// built from.
+// ---------------------------------------------------------------------------
+
+/// Whether the `.cargo-lock` files of one target root are held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetLockState {
+    /// A lock file has a granted (or waited-on) row in `/proc/locks`.
+    Held,
+    /// Every lock file was matched against a readable `/proc/locks` and none is
+    /// held — or the target root holds no lock file at all.
+    Free,
+    /// A read the answer depends on failed, or a lock file could only be
+    /// matched by inode (an overlay/btrfs device mismatch, see [`lookup_lock`])
+    /// and that match was unconfirmed or ambiguous. Never a finding in either
+    /// direction.
+    Unknown,
+}
+
+/// The `.cargo-lock` files that exist under `target_root`: in `debug`,
+/// `release`, and every first-level child dir (custom profiles, per-triple
+/// dirs) — the same set the Windows probes look at.
+///
+/// A target root that does not exist holds no lock (`Ok(vec![])`). Any other
+/// failed read is `Err`: the enumeration is incomplete, so a held lock could
+/// be in the part not read.
+pub fn target_lock_files(target_root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let entries = match std::fs::read_dir(target_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut dirs = vec![target_root.join("debug"), target_root.join("release")];
+    for entry in entries {
+        let p = entry?.path();
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    let mut files = Vec::new();
+    for dir in dirs {
+        let lock = dir.join(LOCK_FILE_NAME);
+        match std::fs::symlink_metadata(&lock) {
+            Ok(_) => files.push(lock),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(files)
+}
+
+/// Pure: the state of the lock files whose identities are `keys`, against a
+/// parsed `/proc/locks`.
+///
+/// An exact-device match with any holder — or any waiter, since a process
+/// blocked on a lock means someone holds it — is [`TargetLockState::Held`].
+/// For an anonymous-device file (major `0`) with no exact row, an inode that
+/// appears under ANY other key is [`TargetLockState::Unknown`]: it may be this
+/// file's lock printed under the superblock device, or another file's on
+/// another filesystem, and [`lookup_lock`] answers `None` for both a miss and
+/// an inode shared by two keys, so that answer alone cannot be read as free.
+/// Confirming such a match by path is the published `cargo_locks` item's job,
+/// not a G6 guard's.
+pub fn lock_state_of(locks: &HashMap<LockKey, LockEntry>, keys: &[LockKey]) -> TargetLockState {
+    let mut unconfirmed = false;
+    for key in keys {
+        if let Some(e) = locks.get(key) {
+            if !e.holders.is_empty() || !e.waiters.is_empty() {
+                return TargetLockState::Held;
+            }
+            continue;
+        }
+        if key.major == 0 && locks.keys().any(|k| k.ino == key.ino) {
+            unconfirmed = true;
+        }
+    }
+    if unconfirmed {
+        TargetLockState::Unknown
+    } else {
+        TargetLockState::Free
+    }
+}
+
+/// Whether any `.cargo-lock` of `target_root` is held, read from
+/// `/proc/locks` (Linux).
+///
+/// **Residue, stated so nobody reads `Free` as proof:** a lock whose taker has
+/// exited while a child keeps the fd (the sweeper's `flock(1)` shape) has no
+/// `/proc/locks` row when `/proc` is mounted outside the kernel's initial pid
+/// namespace (a WSL distro, a container) — see the module docs. That reads
+/// `Free` here. A cargo build takes its own lock and stays alive while holding
+/// it, so it always has a row; the orphan reaper's artifact-age grace is the
+/// backstop for any other holder.
+#[cfg(target_os = "linux")]
+pub fn target_lock_state(target_root: &Path) -> TargetLockState {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(files) = target_lock_files(target_root) else {
+        return TargetLockState::Unknown;
+    };
+    if files.is_empty() {
+        return TargetLockState::Free;
+    }
+    let mut keys = Vec::with_capacity(files.len());
+    for file in &files {
+        match std::fs::metadata(file) {
+            Ok(md) => {
+                let (major, minor) = dev_major_minor(md.dev());
+                keys.push(LockKey {
+                    major,
+                    minor,
+                    ino: md.ino(),
+                });
+            }
+            // Removed between the listing and the stat: no lock there now.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return TargetLockState::Unknown,
+        }
+    }
+    let Ok(text) = std::fs::read_to_string("/proc/locks") else {
+        return TargetLockState::Unknown;
+    };
+    lock_state_of(&parse_proc_locks(&text), &keys)
+}
+
+/// One build process with a `/proc/locks` row — as a holder or as a waiter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildProc {
+    pub pid: u32,
+    /// The directory the build builds: `/proc/<pid>/cwd`, moved by the
+    /// process's own `-C <dir>` and `--manifest-path <file>` arguments
+    /// ([`effective_build_dir`]). `None` when the cwd could not be read.
+    pub build_dir: Option<PathBuf>,
+    /// True for a granted-lock row, false for a process blocked on one.
+    pub holder: bool,
+    /// For a holder: the target roots of the `.cargo-lock` files it holds a
+    /// granted lock on through its own fds ([`outermost_roots`]; empty when it
+    /// holds some other lock, e.g. cargo's package cache). `None` when its fds
+    /// could not be read. Always `Some(vec![])` for a waiter.
+    pub held_roots: Option<Vec<PathBuf>>,
+}
+
+/// Every build process with a `/proc/locks` row, at one instant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildSnapshot {
+    pub procs: Vec<BuildProc>,
+}
+
+/// The target root a `.cargo-lock` file locks: the parent of its profile dir.
+pub fn target_root_of_lock(lock: &Path) -> Option<PathBuf> {
+    lock.parent()?.parent().map(Path::to_path_buf)
+}
+
+/// Drop every root that lies inside another root of the set. A
+/// `cargo build --target <triple>` locks both `<t>/debug/.cargo-lock` and
+/// `<t>/<triple>/debug/.cargo-lock`; its target root is `<t>`.
+pub fn outermost_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort();
+    roots.dedup();
+    let all = roots.clone();
+    roots.retain(|r| !all.iter().any(|o| o != r && r.starts_with(o)));
+    roots
+}
+
+/// True iff fdinfo text carries a GRANTED `lock:` line (any key): the open
+/// file description behind that fd holds a lock.
+pub fn fdinfo_holds_any_lock(fdinfo: &str) -> bool {
+    fdinfo.lines().any(|line| {
+        line.strip_prefix("lock:")
+            .and_then(parse_proc_locks_line)
+            .is_some_and(|(_, _, waiting)| !waiting)
+    })
+}
+
+/// A `/proc/<pid>/fd/*` link target naming a `.cargo-lock` file, with the
+/// kernel's ` (deleted)` suffix removed — a build whose target dir was removed
+/// under it still holds the lock. `None` for any other file.
+pub fn cargo_lock_link_target(link: &Path) -> Option<PathBuf> {
+    let s = link.to_str()?;
+    let s = s.strip_suffix(" (deleted)").unwrap_or(s);
+    let p = PathBuf::from(s);
+    (p.file_name() == Some(std::ffi::OsStr::new(LOCK_FILE_NAME))).then_some(p)
+}
+
+/// Pure: the directory a cargo invocation builds, from its cwd and argv.
+/// `-C <dir>` (and `-C<dir>`) moves the base first, then `--manifest-path
+/// <file>` (and `--manifest-path=<file>`) names the manifest whose directory
+/// is built; relative values resolve against the base, as cargo does.
+/// Arguments after `--` belong to the program under test and are not read.
+/// Only a `cargo` argv is parsed: rustc, which takes flocks on its incremental
+/// dirs, spells codegen options `-C opt-level=3`, which is not a directory.
+/// Lexical only — the caller canonicalises.
+pub fn effective_build_dir(cwd: &Path, argv: &[String]) -> PathBuf {
+    let is_cargo = argv.first().is_some_and(|a0| {
+        let base = basename(a0);
+        base.strip_suffix(".exe").unwrap_or(base) == "cargo"
+    });
+    if !is_cargo {
+        return cwd.to_path_buf();
+    }
+    let mut base = cwd.to_path_buf();
+    let mut manifest: Option<PathBuf> = None;
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--" => break,
+            "-C" => {
+                if let Some(dir) = args.next() {
+                    base = base.join(dir);
+                }
+            }
+            "--manifest-path" => {
+                if let Some(m) = args.next() {
+                    manifest = Some(PathBuf::from(m));
+                }
+            }
+            a => {
+                if let Some(m) = a.strip_prefix("--manifest-path=") {
+                    manifest = Some(PathBuf::from(m));
+                } else if let Some(dir) = a.strip_prefix("-C").filter(|d| !d.is_empty()) {
+                    base = base.join(dir);
+                }
+            }
+        }
+    }
+    match manifest {
+        Some(m) => {
+            let m = base.join(m);
+            m.parent().map_or(m.clone(), Path::to_path_buf)
+        }
+        None => base,
+    }
+}
+
+/// A read-time-stamped cache of one value — [`build_snapshot`]'s, kept apart
+/// so its hit, expiry and ordering are testable with explicit instants.
+#[derive(Debug)]
+pub struct SnapshotCache<T> {
+    entry: Option<(std::time::Instant, Option<std::sync::Arc<T>>)>,
+}
+
+impl<T> Default for SnapshotCache<T> {
+    fn default() -> Self {
+        Self { entry: None }
+    }
+}
+
+impl<T> SnapshotCache<T> {
+    /// The cached value when it was READ less than `max_age` before `now`
+    /// (`Some(None)` is a cached UNKNOWN). `None` = miss; a zero `max_age`
+    /// always misses.
+    pub fn get(
+        &self,
+        max_age: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<Option<std::sync::Arc<T>>> {
+        let (read_at, value) = self.entry.as_ref()?;
+        (now.saturating_duration_since(*read_at) < max_age).then(|| value.clone())
+    }
+
+    /// Store a value read at `read_at` — unless the cache already holds one
+    /// read LATER. Two callers can read `/proc` concurrently and finish in
+    /// either order; the older reading must never overwrite the newer, or a
+    /// build that has just ended could be served for another `max_age`.
+    pub fn store(&mut self, read_at: std::time::Instant, value: Option<std::sync::Arc<T>>) {
+        if self.entry.as_ref().is_some_and(|(t, _)| *t > read_at) {
+            return;
+        }
+        self.entry = Some((read_at, value));
+    }
+}
+
+/// [`build_snapshot_now`], reused while it was read less than `max_age` ago.
+///
+/// The census calls this once per worktree row and a walk visits ~1250 rows,
+/// so it reads `/proc` once per `max_age` rather than once per row. The reclaim
+/// executor, which deletes on the answer, passes `Duration::ZERO`: it always
+/// reads fresh, and its fresher reading also refreshes the census's.
+#[cfg(target_os = "linux")]
+pub fn build_snapshot(max_age: std::time::Duration) -> Option<std::sync::Arc<BuildSnapshot>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Instant;
+    static CACHE: OnceLock<Mutex<SnapshotCache<BuildSnapshot>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(SnapshotCache::default()));
+    if let Some(hit) = cell
+        .lock()
+        .ok()
+        .and_then(|c| c.get(max_age, Instant::now()))
+    {
+        return hit;
+    }
+    let read_at = Instant::now();
+    let fresh = build_snapshot_now().map(Arc::new);
+    if let Ok(mut cache) = cell.lock() {
+        cache.store(read_at, fresh.clone());
+    }
+    fresh
+}
+
+/// Every build process with a `/proc/locks` row right now (Linux). `None` when
+/// `/proc/locks` cannot be read — UNKNOWN, never "no builds".
+///
+/// Candidates are the positive pids of `/proc/locks`, holders AND waiters (a
+/// cargo queued on a shared target is live work in its checkout). Only a
+/// process whose argv0 is a build tool ([`is_build_tool`]) has its ancestors
+/// read, and it is kept when [`classify_holder`] says `Build` (a sweep-driven
+/// cargo is not an agent build). A holder's locked target roots come from its
+/// OWN fds, confirmed by a granted fdinfo `lock:` line, so a printed pid is
+/// never trusted on its own (module docs, "The pid in `/proc/locks` is the
+/// lock's TAKER").
+///
+/// **Residue — another uid's build is not seen by a non-root runner.** Its
+/// `/proc/<pid>/cwd` and `fd/` both need ptrace read access, so a non-root
+/// runner can read neither, and such a process is dropped: keeping it as
+/// unattributable would make every worktree UNKNOWN for as long as it ran. A
+/// runner that CAN read the cwd (root) keeps it and reads its fds like any
+/// other.
+///
+/// A process that exited after its argv was read — gone, or a zombie not yet
+/// reaped — is dropped too: it is no build at all.
+#[cfg(target_os = "linux")]
+pub fn build_snapshot_now() -> Option<BuildSnapshot> {
+    use std::os::unix::fs::MetadataExt;
+    let text = std::fs::read_to_string("/proc/locks").ok()?;
+    let locks = parse_proc_locks(&text);
+    let mut rows: Vec<(u32, bool)> = Vec::new();
+    for e in locks.values() {
+        for (pids, holder) in [(&e.holders, true), (&e.waiters, false)] {
+            for p in pids.iter().filter_map(|p| u32::try_from(*p).ok()) {
+                if p > 0 {
+                    rows.push((p, holder));
+                }
+            }
+        }
+    }
+    // One entry per pid; a pid that holds any lock is a holder.
+    rows.sort_unstable_by_key(|(p, holder)| (*p, !*holder));
+    rows.dedup_by_key(|(p, _)| *p);
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let my_uid = unsafe { libc::geteuid() };
+    let mut procs = ProcReader::new();
+    let mut out = Vec::new();
+    for (pid, holder) in rows {
+        let argv = procs.argv(pid);
+        if !argv.first().is_some_and(|a0| is_build_tool(a0)) {
+            continue;
+        }
+        let same_uid = std::fs::metadata(format!("/proc/{pid}"))
+            .map(|m| m.uid() == my_uid)
+            .unwrap_or(true);
+        let mut chain = vec![argv.clone()];
+        chain.extend(procs.ancestor_argvs(pid));
+        if classify_holder(&chain) != HolderKind::Build {
+            continue;
+        }
+        let read_build_dir = || {
+            std::fs::read_link(format!("/proc/{pid}/cwd"))
+                .ok()
+                .map(|cwd| {
+                    let dir = effective_build_dir(&cwd, &argv);
+                    std::fs::canonicalize(&dir).unwrap_or(dir)
+                })
+        };
+        // One re-read before a live process's dir counts as unreadable: a
+        // single transient failure would otherwise blank every row of the walk.
+        let build_dir = read_build_dir().or_else(read_build_dir);
+        if !same_uid && build_dir.is_none() {
+            continue;
+        }
+        let held_roots = if holder {
+            held_cargo_lock_roots(pid).map(outermost_roots)
+        } else {
+            Some(Vec::new())
+        };
+        // A read that failed because the process EXITED since `/proc/locks`
+        // was read is not an unattributable build: it is no build at all.
+        let unread = build_dir.is_none() || held_roots.is_none();
+        if unread && has_exited(pid) {
+            continue;
+        }
+        out.push(BuildProc {
+            pid,
+            build_dir,
+            holder,
+            held_roots,
+        });
+    }
+    Some(BuildSnapshot { procs: out })
+}
+
+/// True when `pid` is gone or a zombie (`/proc/<pid>/stat` state `Z`): it
+/// exited, and its unreadable cwd or fds say nothing about a build.
+#[cfg(target_os = "linux")]
+fn has_exited(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat_state_is_zombie(&stat),
+        Err(_) => !Path::new(&format!("/proc/{pid}")).exists(),
+    }
+}
+
+/// `/proc/<pid>/stat` text → whether its state (field 3) is `Z` (zombie).
+pub fn stat_state_is_zombie(stat: &str) -> bool {
+    stat_tail_fields(stat).and_then(|f| f.first().copied()) == Some("Z")
+}
+
+/// Target roots of the `.cargo-lock` files `pid` holds a granted lock on,
+/// through its own fds. `None` when its fd directory cannot be read.
+#[cfg(target_os = "linux")]
+fn held_cargo_lock_roots(pid: u32) -> Option<Vec<PathBuf>> {
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    let mut roots = Vec::new();
+    for fd in fds.flatten() {
+        let Some(lock) = std::fs::read_link(fd.path())
+            .ok()
+            .and_then(|t| cargo_lock_link_target(&t))
+        else {
+            continue;
+        };
+        let fdinfo_path = format!("/proc/{pid}/fdinfo/{}", fd.file_name().to_string_lossy());
+        let held = std::fs::read_to_string(fdinfo_path).is_ok_and(|t| fdinfo_holds_any_lock(&t));
+        if !held {
+            continue;
+        }
+        if let Some(root) = target_root_of_lock(&lock) {
+            roots.push(root);
+        }
+    }
+    Some(roots)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Modeled on the 2026-09-29 sample on merytshost (coord's
@@ -1423,6 +1873,346 @@ lock:\t1: FLOCK  ADVISORY  WRITE 1351229 08:01:16669579 0 EOF\n";
         assert!(
             !printed.contains(&i32::try_from(sh_pid).unwrap_or(-1)),
             "/proc/locks should have printed flock(1)'s pid, not sh's"
+        );
+    }
+
+    // ---- per-target / per-build flock observation ----
+
+    fn ext4_key(ino: u64) -> LockKey {
+        key(8, 1, ino)
+    }
+
+    #[test]
+    fn lock_state_is_held_only_on_an_exact_row() {
+        let map = parse_proc_locks(PROC_LOCKS_FIXTURE);
+        // 16669579 is the fixture's held coord lock.
+        assert_eq!(
+            lock_state_of(&map, &[ext4_key(1), ext4_key(16669579)]),
+            TargetLockState::Held
+        );
+        // A lock file with no row is free.
+        assert_eq!(
+            lock_state_of(&map, &[ext4_key(1), ext4_key(2)]),
+            TargetLockState::Free
+        );
+        assert_eq!(lock_state_of(&map, &[]), TargetLockState::Free);
+        // A waiter-only row still means someone holds the lock.
+        let waiters_only = parse_proc_locks("3: -> FLOCK  ADVISORY  WRITE 77 08:01:42 0 EOF\n");
+        assert_eq!(
+            lock_state_of(&waiters_only, &[ext4_key(42)]),
+            TargetLockState::Held
+        );
+    }
+
+    /// An anonymous-device file (btrfs subvolume, overlayfs) with no exact
+    /// row is UNKNOWN whenever its inode appears under any other key — one
+    /// key or several. The several-keys case is the one [`lookup_lock`]
+    /// answers `None` for, exactly like a miss; it must not read `Free`.
+    #[test]
+    fn an_inode_only_or_ambiguous_match_is_unknown_never_free() {
+        let anon = key(0, 51, 16669579);
+        let one = parse_proc_locks(PROC_LOCKS_FIXTURE);
+        assert_eq!(lock_state_of(&one, &[anon]), TargetLockState::Unknown);
+        let two = parse_proc_locks(
+            "1: FLOCK  ADVISORY  WRITE 5 08:01:16669579 0 EOF\n\
+             2: FLOCK  ADVISORY  WRITE 6 08:02:16669579 0 EOF\n",
+        );
+        assert!(lookup_lock(&two, anon).is_none(), "ambiguous: no match");
+        assert_eq!(lock_state_of(&two, &[anon]), TargetLockState::Unknown);
+        // An anonymous-device inode nobody prints is a real miss: free.
+        assert_eq!(lock_state_of(&two, &[key(0, 51, 7)]), TargetLockState::Free);
+    }
+
+    #[test]
+    fn target_lock_files_lists_existing_locks_and_treats_a_missing_root_as_lockless() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("target");
+        assert_eq!(target_lock_files(&root).unwrap(), Vec::<PathBuf>::new());
+        for d in ["debug", "release", "x86_64-unknown-linux-gnu", "custom"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("debug").join(".cargo-lock"), b"").unwrap();
+        std::fs::write(root.join("custom").join(".cargo-lock"), b"").unwrap();
+        let files = target_lock_files(&root).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                root.join("custom").join(".cargo-lock"),
+                root.join("debug").join(".cargo-lock")
+            ]
+        );
+        // A root that is not a directory cannot be enumerated.
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, b"").unwrap();
+        assert!(target_lock_files(&file).is_err());
+    }
+
+    #[test]
+    fn target_root_is_the_parent_of_the_profile_dir_and_triples_fold_into_it() {
+        let lock = Path::new("/w/qontinui-runner/target-agent/debug/.cargo-lock");
+        assert_eq!(
+            target_root_of_lock(lock),
+            Some(PathBuf::from("/w/qontinui-runner/target-agent"))
+        );
+        let roots = outermost_roots(vec![
+            PathBuf::from("/w/r/target/x86_64-unknown-linux-gnu"),
+            PathBuf::from("/w/r/target"),
+            PathBuf::from("/w/r/target"),
+            PathBuf::from("/w/r/target-agent"),
+        ]);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/w/r/target"),
+                PathBuf::from("/w/r/target-agent")
+            ]
+        );
+    }
+
+    #[test]
+    fn fdinfo_any_lock_ignores_waiting_and_lockless_fds() {
+        assert!(fdinfo_holds_any_lock(
+            "pos:\t0\nflags:\t02100000\nlock:\t1: FLOCK  ADVISORY  WRITE 5 08:01:9 0 EOF\n"
+        ));
+        assert!(!fdinfo_holds_any_lock("pos:\t0\nflags:\t02100000\n"));
+        assert!(!fdinfo_holds_any_lock(
+            "lock:\t1: -> FLOCK  ADVISORY  WRITE 5 08:01:9 0 EOF\n"
+        ));
+    }
+
+    #[test]
+    fn a_deleted_cargo_lock_is_still_a_cargo_lock() {
+        assert_eq!(
+            cargo_lock_link_target(Path::new("/w/r/target/debug/.cargo-lock (deleted)")),
+            Some(PathBuf::from("/w/r/target/debug/.cargo-lock"))
+        );
+        assert_eq!(
+            cargo_lock_link_target(Path::new("/w/r/target/debug/.cargo-lock")),
+            Some(PathBuf::from("/w/r/target/debug/.cargo-lock"))
+        );
+        assert_eq!(cargo_lock_link_target(Path::new("/w/r/Cargo.lock")), None);
+        assert!(is_build_tool("/home/u/.rustup/toolchains/x/bin/cargo"));
+        assert!(!is_build_tool("flock"));
+    }
+
+    #[test]
+    fn the_build_dir_follows_manifest_path_and_dash_c() {
+        let argv = |a: &[&str]| -> Vec<String> { a.iter().map(|s| s.to_string()).collect() };
+        let cwd = Path::new("/w");
+        assert_eq!(
+            effective_build_dir(cwd, &argv(&["cargo", "test"])),
+            PathBuf::from("/w")
+        );
+        assert_eq!(
+            effective_build_dir(
+                cwd,
+                &argv(&[
+                    "cargo",
+                    "test",
+                    "--manifest-path",
+                    "agent/1/r/src-tauri/Cargo.toml"
+                ])
+            ),
+            PathBuf::from("/w/agent/1/r/src-tauri")
+        );
+        assert_eq!(
+            effective_build_dir(
+                cwd,
+                &argv(&["cargo", "check", "--manifest-path=/abs/r/Cargo.toml"])
+            ),
+            PathBuf::from("/abs/r")
+        );
+        assert_eq!(
+            effective_build_dir(cwd, &argv(&["cargo", "-C", "agent/1/r", "build"])),
+            PathBuf::from("/w/agent/1/r")
+        );
+        assert_eq!(
+            effective_build_dir(
+                cwd,
+                &argv(&[
+                    "cargo",
+                    "-Cagent/1/r",
+                    "build",
+                    "--manifest-path",
+                    "src-tauri/Cargo.toml"
+                ])
+            ),
+            PathBuf::from("/w/agent/1/r/src-tauri")
+        );
+        // rustc's `-C` is a codegen option, not a directory.
+        assert_eq!(
+            effective_build_dir(
+                cwd,
+                &argv(&["rustc", "-C", "opt-level=3", "--crate-name", "x"])
+            ),
+            PathBuf::from("/w")
+        );
+        // Arguments after `--` belong to the test binary.
+        assert_eq!(
+            effective_build_dir(
+                cwd,
+                &argv(&["cargo", "test", "--", "--manifest-path", "/x/Cargo.toml"])
+            ),
+            PathBuf::from("/w")
+        );
+    }
+
+    #[test]
+    fn the_snapshot_cache_serves_young_readings_and_never_goes_backwards() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ten = Duration::from_secs(10);
+        let mut cache: SnapshotCache<u32> = SnapshotCache::default();
+        assert!(cache.get(ten, t0).is_none(), "empty → miss");
+        cache.store(t0, Some(Arc::new(1)));
+        assert_eq!(
+            cache.get(ten, t0 + Duration::from_secs(9)),
+            Some(Some(Arc::new(1)))
+        );
+        assert!(cache.get(ten, t0 + ten).is_none(), "expired → miss");
+        assert!(cache.get(Duration::ZERO, t0).is_none(), "zero age → miss");
+        // An older reading that finishes later never overwrites a newer one.
+        cache.store(t0 + Duration::from_secs(5), Some(Arc::new(2)));
+        cache.store(t0 + Duration::from_secs(3), Some(Arc::new(3)));
+        assert_eq!(
+            cache.get(ten, t0 + Duration::from_secs(6)),
+            Some(Some(Arc::new(2)))
+        );
+        // A cached UNKNOWN is served as UNKNOWN, not as a miss.
+        cache.store(t0 + Duration::from_secs(7), None);
+        assert_eq!(cache.get(ten, t0 + Duration::from_secs(8)), Some(None));
+    }
+
+    #[test]
+    fn a_zombie_is_recognised_from_its_stat_line() {
+        assert!(stat_state_is_zombie("4242 (cargo) Z 1 4242 4242 0 -1"));
+        assert!(stat_state_is_zombie("4242 (a (weird) name) Z 1 4242"));
+        assert!(!stat_state_is_zombie("4242 (cargo) S 1 4242 4242 0 -1"));
+        assert!(!stat_state_is_zombie("garbage"));
+    }
+
+    /// `cargo_lock_held`'s Linux substrate: an in-process `flock` on a target's
+    /// `.cargo-lock` reads `Held`, and `Free` once released.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_lock_state_follows_a_real_flock() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("target");
+        std::fs::create_dir_all(root.join("debug")).unwrap();
+        let lock = root.join("debug").join(".cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert_eq!(target_lock_state(&root), TargetLockState::Free);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        // SAFETY: valid fd owned by `f` for the duration of the calls.
+        assert_eq!(
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(target_lock_state(&root), TargetLockState::Held);
+        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert_eq!(target_lock_state(&root), TargetLockState::Free);
+    }
+
+    /// A `flock(1)` named `cargo` (argv[0]) holding `lock` in `cwd` — a stand-in
+    /// for a cargo build: it takes the lock itself and stays alive while its
+    /// child waits on stdin. Returns once [`build_snapshot_now`] sees it hold a
+    /// `.cargo-lock`. Panics where `flock(1)` is missing: a skipped test proves
+    /// nothing.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spawn_fake_build(lock: &Path, cwd: &Path) -> FakeBuild {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let child = Command::new("flock")
+            .arg0("cargo")
+            .arg("-x")
+            .arg(lock)
+            .arg("sh")
+            .arg("-c")
+            .arg("read _x")
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("flock(1) (util-linux) is required by this test");
+        let fake = FakeBuild(child);
+        let pid = fake.pid();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let held = build_snapshot_now().is_some_and(|s| {
+                s.procs
+                    .iter()
+                    .any(|p| p.pid == pid && p.held_roots.as_ref().is_some_and(|r| !r.is_empty()))
+            });
+            if held {
+                return fake;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("fake build pid {pid} never appeared as a build holder of {lock:?}");
+    }
+
+    /// Releases the fake build's lock on drop.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct FakeBuild(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl FakeBuild {
+        pub(crate) fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FakeBuild {
+        fn drop(&mut self) {
+            use std::io::Write;
+            if let Some(mut stdin) = self.0.stdin.take() {
+                let _ = stdin.write_all(b"\n");
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_snapshot_names_a_live_build_its_dir_and_its_target_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let target = base.join("primary").join("target-agent");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let lock = target.join("debug").join(".cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+        let cwd = base.join("wt").join("src-tauri");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let fake = spawn_fake_build(&lock, &cwd);
+        let pid = fake.pid();
+        let snap = build_snapshot_now().expect("/proc/locks readable");
+        let mine: Vec<&BuildProc> = snap.procs.iter().filter(|p| p.pid == pid).collect();
+        assert_eq!(
+            mine,
+            vec![&BuildProc {
+                pid,
+                build_dir: Some(cwd.clone()),
+                holder: true,
+                held_roots: Some(vec![target.clone()]),
+            }]
+        );
+        drop(fake);
+        let after = build_snapshot_now().expect("/proc/locks readable");
+        assert!(
+            after
+                .procs
+                .iter()
+                .all(|p| p.pid != pid || p.held_roots.as_ref().is_some_and(|r| r.is_empty())),
+            "released: {after:?}"
         );
     }
 }
