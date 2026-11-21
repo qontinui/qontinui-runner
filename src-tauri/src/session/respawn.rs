@@ -2213,4 +2213,53 @@ mod tests {
         }
         assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
+
+    /// #3053: `materialize` waits out a runner-owned CLI install before its
+    /// step-0 drain check and every step after it. A respawn with no Claude
+    /// session id would otherwise be refused at step 1 at once (or deferred at
+    /// step 0 by a drain); with the global in-progress flag held it is still
+    /// pending, and once the install "ends" it returns that refusal. Deleting
+    /// the `await_cli_update_quiescent().await` line at the top of
+    /// [`materialize`] makes the first assertion fail.
+    #[tokio::test]
+    async fn materialize_waits_out_a_running_cli_install_before_step_zero() {
+        let fx = crate::commands::terminal::coord_wiring::test_support::registry();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        let http = reqwest::Client::new();
+        let pending = PendingRespawn {
+            source_session_id: Uuid::new_v4(),
+            target_device_id: Uuid::new_v4(),
+            tenant_id: None,
+            session_kind: None,
+            source_device_id: None,
+            source_state: Some("closed".to_string()),
+            claude_code_session_id: None,
+            account: None,
+            initial_prompt: None,
+        };
+
+        let mut install = crate::claude_cli_update::hold_global_flag_for_test().await;
+        let run = materialize(&fx.registry, &store, &http, "http://127.0.0.1:1", &pending);
+        tokio::pin!(run);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut run)
+                .await
+                .is_err(),
+            "materialize ran its steps while a runner CLI install was running"
+        );
+        install.release();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(30), &mut run)
+            .await
+            .expect("materialize completes once the install ends");
+        assert!(
+            matches!(
+                res,
+                Err(RespawnError::NoClaudeSession(_)) | Err(RespawnError::DeferredByDrain(_))
+            ),
+            "{res:?}"
+        );
+    }
 }

@@ -635,4 +635,32 @@ mod tests {
         let mut child = child.expect("spawned on the retry");
         assert!(child.wait().await.unwrap().success());
     }
+
+    /// #3053: the `--resume` resolver waits out a runner-owned CLI install
+    /// BEFORE its first resolve. With the global in-progress flag held, the
+    /// resolve is still pending well past the time a single PATH resolve
+    /// takes; once the install "ends" it completes. Deleting the
+    /// `await_cli_update_quiescent().await` line in
+    /// [`resolve_resume_claude_bin`] makes the first assertion fail. The
+    /// resolve's own verdict (hit or `not_found`) depends on this box's PATH
+    /// and is not what this pins.
+    #[tokio::test]
+    async fn resume_bin_resolve_waits_out_a_running_cli_install() {
+        let mut install = crate::claude_cli_update::hold_global_flag_for_test().await;
+        let resolve = resolve_resume_claude_bin(&[]);
+        tokio::pin!(resolve);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut resolve)
+                .await
+                .is_err(),
+            "the --resume resolve returned while a runner CLI install was running"
+        );
+        install.release();
+        let verdict = tokio::time::timeout(Duration::from_secs(30), &mut resolve)
+            .await
+            .expect("the resolve completes once the install ends");
+        if let Err(e) = verdict {
+            assert!(e.starts_with(CLI_UNAVAILABLE_HEAD), "{e}");
+        }
+    }
 }
