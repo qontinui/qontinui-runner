@@ -206,3 +206,48 @@ export function recoveryFailureData(
 ): Record<string, unknown> {
   return { ...extra, code, attemptSucceeded: false };
 }
+
+/**
+ * Whether the ORIGINAL action ran inside one `ai_recovery_attempt`, stated
+ * the way the ui-bridge TS SDK server's `attemptRecovery` states it
+ * (`originalActionAttempted` / `originalActionPerformed`), so a client reading
+ * either server decides the same way (plan
+ * `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`,
+ * Phase 3).
+ *
+ * The route's `instruction` IS the original instruction (the same contract as
+ * the TS server's `request.instruction`), and this executor runs it directly on
+ * the addressed element. So:
+ *
+ * - `started: false` — the executor was never reached (an unscoped request, a
+ *   missing target, a throw before `execute`): nothing ran, so both are
+ *   `false`. Same default as the TS server's refusal arm.
+ * - `started: true` with an instruction — the original ran (once).
+ *   `originalActionAttempted` is `true` even when it reported failure or threw,
+ *   because a failed action may have partly applied (the TS server sets its
+ *   `ranOriginal` before the call for the same reason), and
+ *   `originalActionPerformed` is `true` only when the executor reported success.
+ * - `started: true` with NO instruction — the executor ran a generic
+ *   "recover from error state" step, and the request named no original to
+ *   compare it with. Both fields are OMITTED: an absent field is UNKNOWN to
+ *   the ui-bridge Python client (`read_recovery_attempt`), which then never
+ *   re-executes. Stating `false` would license a retry nothing established.
+ */
+export type OriginalActionFacts = {
+  originalActionAttempted?: boolean;
+  originalActionPerformed?: boolean;
+};
+
+export function originalActionFacts(
+  started: boolean,
+  instructionGiven: boolean,
+  attemptSucceeded: boolean,
+): OriginalActionFacts {
+  if (!started) {
+    return { originalActionAttempted: false, originalActionPerformed: false };
+  }
+  if (!instructionGiven) {
+    return {};
+  }
+  return { originalActionAttempted: true, originalActionPerformed: attemptSucceeded };
+}

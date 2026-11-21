@@ -6,6 +6,7 @@ import {
   RECOVERY_TARGET_MISSING,
   RECOVERY_UNSCOPED,
   RecoveryRefusedError,
+  originalActionFacts,
   recoveryFailureData,
   recoveryVerdict,
   scopeRecoveryExecutor,
@@ -1119,11 +1120,17 @@ export function useAISearchEvents(
               // `success`/`error` are NOT repeated here: `extract_response_data`
               // in the runner stamps the envelope's verdict onto `data` for
               // every handler. `data` carries only what the envelope cannot.
-              data: recoveryFailureData(RECOVERY_UNSCOPED),
+              data: recoveryFailureData(
+                RECOVERY_UNSCOPED,
+                originalActionFacts(false, instruction !== "", false),
+              ),
               timestamp: Date.now(),
             });
             return true;
           }
+          // Whether `executor.execute` was reached: from then on the original
+          // instruction ran, whatever it answered (see `originalActionFacts`).
+          let executeStarted = false;
           try {
             const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
             const discovered = await currentBridge.discover({ includeHidden: true });
@@ -1138,6 +1145,7 @@ export function useAISearchEvents(
                 code: RECOVERY_TARGET_MISSING,
                 data: recoveryFailureData(RECOVERY_TARGET_MISSING, {
                   elementId: targetElementId,
+                  ...originalActionFacts(false, instruction !== "", false),
                 }),
                 timestamp: Date.now(),
               });
@@ -1152,6 +1160,7 @@ export function useAISearchEvents(
             executor.setActionExecutor(
               scopeRecoveryExecutor(currentBridge as object, targetElementId) as never,
             );
+            executeStarted = true;
             const result = await executor.execute({
               instruction: instruction || "recover from error state",
             });
@@ -1159,6 +1168,7 @@ export function useAISearchEvents(
             const attempted = {
               elementId: targetElementId,
               result,
+              ...originalActionFacts(true, instruction !== "", verdict.attemptSucceeded),
               timestamp: Date.now(),
             };
             await sendResponse({
@@ -1188,7 +1198,10 @@ export function useAISearchEvents(
               success: false,
               error: thrown,
               code,
-              data: recoveryFailureData(code, { elementId: targetElementId }),
+              data: recoveryFailureData(code, {
+                elementId: targetElementId,
+                ...originalActionFacts(executeStarted, instruction !== "", false),
+              }),
               timestamp: Date.now(),
             });
           }

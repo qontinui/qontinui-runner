@@ -8,6 +8,7 @@ import {
   RecoveryRefusedError,
   assertRecoveryDispatchAllowed,
   isWriteAction,
+  originalActionFacts,
   recoveryFailureData,
   recoveryVerdict,
   scopeRecoveryExecutor,
@@ -181,5 +182,49 @@ describe("recoveryFailureData (item 4)", () => {
     for (const code of [RECOVERY_UNSCOPED, RECOVERY_TARGET_MISSING, RECOVERY_FAILED]) {
       expect(recoveryFailureData(code).attemptSucceeded).toBe(false);
     }
+  });
+});
+
+describe("originalActionFacts (plan 2026-11-18 Phase 3)", () => {
+  it("states nothing ran when the executor was never reached", () => {
+    expect(originalActionFacts(false, true, false)).toEqual({
+      originalActionAttempted: false,
+      originalActionPerformed: false,
+    });
+    expect(originalActionFacts(false, false, false)).toEqual({
+      originalActionAttempted: false,
+      originalActionPerformed: false,
+    });
+  });
+
+  it("states the original ran and was performed when the executor succeeded", () => {
+    expect(originalActionFacts(true, true, true)).toEqual({
+      originalActionAttempted: true,
+      originalActionPerformed: true,
+    });
+  });
+
+  it("states the original was ATTEMPTED, not performed, when it failed or threw", () => {
+    expect(originalActionFacts(true, true, false)).toEqual({
+      originalActionAttempted: true,
+      originalActionPerformed: false,
+    });
+  });
+
+  it("omits both (UNKNOWN) when no original instruction was named", () => {
+    const facts = originalActionFacts(true, false, true);
+    expect(facts).toEqual({});
+    expect("originalActionAttempted" in facts).toBe(false);
+    expect("originalActionPerformed" in facts).toBe(false);
+  });
+
+  it("rides a failure payload without touching its verdict", () => {
+    const data = recoveryFailureData(RECOVERY_FAILED, originalActionFacts(true, true, false));
+    expect(data).toEqual({
+      originalActionAttempted: true,
+      originalActionPerformed: false,
+      code: RECOVERY_FAILED,
+      attemptSucceeded: false,
+    });
   });
 });
