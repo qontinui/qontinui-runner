@@ -208,7 +208,6 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("mcp/device_jwt_refresher.rs", "bootstrap", 1),
     ("mcp/device_jwt_refresher.rs", "not-coord", 1),
     ("mcp/device_jwt_refresher.rs", "self-refresh", 2),
-    ("mcp/session_compliance.rs", "device-jwt-required", 1),
     ("mcp/session_message_poller.rs", "device-jwt-required", 2),
     // 3 -> 4 on 2026-09-13: the Phase-2 drift-finding POST in
     // `post_coord_mcp_drift_finding` (plan

@@ -81,6 +81,26 @@
 //! status fetch short-circuits to that value (`absent` ⇒ reachable-but-no-
 //! status) without touching coord, so the block path is live-verifiable
 //! before the coord read surface exists. It is logged loudly on every use.
+//!
+//! ## Whose tenant — the SESSION's, decided once per Stop
+//!
+//! Plan `2026-11-13-runner-stop-hook-continuation-rules-and-compliance-use-the-device-default-tenant`.
+//! On a device bound to several tenants, both reads above — and the
+//! compliance config read and POST [`crate::mcp::session_compliance`] makes on
+//! the same Stop — used to present the device DEFAULT credential, so a session
+//! working another tenant's repo had its work axis read where it has no row
+//! (`unknown` ⇒ allow: the continuation arm never fired for it) and was handed
+//! the default tenant's rules. Now [`continuation_verdict`] decides the
+//! session's tenant ONCE ([`crate::mcp::policy_tenant::route_policy_decision`]
+//! under [`crate::mcp::policy_tenant::STOP_TENANT_BUDGET`]) and hands that one
+//! target to every reader, which presents that tenant's credential through
+//! `coord_http::coord_get_for` / `coord_post_for` and refuses to send anything
+//! whose bearer does not claim it ([`crate::mcp::policy_tenant::build_checked`]).
+//! An UNKNOWN tenant (multi-bound, unresolvable) reads nothing: the status is
+//! UNKNOWN (allow) and the rules are the built-in default. The caches are keyed
+//! on the tenant as well, and an UNKNOWN decision reads and writes none of them.
+//! The verdict names the tenant and the rules version it used
+//! ([`VerdictResponse::tenant`], [`VerdictResponse::rules_version`]).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -89,6 +109,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use crate::mcp::policy_tenant::{self, PolicyTarget};
 
 // ===========================================================================
 // Flag + constants
@@ -412,7 +435,10 @@ pub fn session_id_from(input: &Value) -> Option<String> {
 /// `task_run_id`, and a session homed in another tenant answers `unknown` too.
 /// So `NoRow` is `Unreachable` like every other unsettled read, and allows
 /// (fail-open) — never a default rendered as "absent" (served
-/// `verification-and-evidence` `unknown-must-not-render-as-a-default`).
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default`). That
+/// second shape is why the read presents the SESSION's tenant's credential
+/// ([`crate::mcp::session_work_status::fetch_one_for`]): under the device
+/// default, every session homed elsewhere answered `unknown`.
 pub fn status_fetch_from_one(one: crate::mcp::session_work_status::OneStatus) -> StatusFetch {
     use crate::mcp::session_work_status::OneStatus;
     match one {
@@ -424,27 +450,58 @@ pub fn status_fetch_from_one(one: crate::mcp::session_work_status::OneStatus) ->
     }
 }
 
-/// Pull the rules text out of a policy-document response. Accepts the
-/// document object directly (`{"handle":…,"body":…}`) or wrapped
+/// The continuation-rules document a block prompt is taken from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulesDoc {
+    /// The prompt text.
+    pub text: String,
+    /// The row's `current_version` — which revision of the tenant's document
+    /// the session was told. `None` for the built-in default, and for a row
+    /// that carries none.
+    pub version: Option<i64>,
+}
+
+impl RulesDoc {
+    /// [`DEFAULT_CONTINUATION_RULES`], versionless.
+    fn built_in_default() -> Self {
+        RulesDoc {
+            text: DEFAULT_CONTINUATION_RULES.to_string(),
+            version: None,
+        }
+    }
+}
+
+/// Pull the rules text and version out of a policy-document response. Accepts
+/// the document object directly (`{"handle":…,"body":…}`) or wrapped
 /// (`{"document":{…}}`). Empty/whitespace bodies read as absent.
-pub fn rules_from_doc_body(body: &Value) -> Option<String> {
+pub fn rules_from_doc_body(body: &Value) -> Option<RulesDoc> {
     let doc = if body.get("document").is_some() {
         body.get("document")?
     } else {
         body
     };
-    doc.get("body")
+    let text = doc
+        .get("body")
         .and_then(Value::as_str)
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty())?;
+    Some(RulesDoc {
+        text,
+        version: doc.get("current_version").and_then(Value::as_i64),
+    })
 }
 
 // ===========================================================================
 // Process-global TTL caches (fleet_policy_poller posture — NOT ETag)
 // ===========================================================================
 
+/// One status-cache slot: the tenant whose credential read the work axis
+/// ([`PolicyTarget::tenant`]) and the harness session id it was read for. A
+/// reading under one tenant is never served for a read under another.
+type StatusKey = (Option<Uuid>, String);
+
 struct StatusCache {
-    inner: Mutex<HashMap<String, (Instant, StatusFetch)>>,
+    inner: Mutex<HashMap<StatusKey, (Instant, StatusFetch)>>,
 }
 
 static STATUS_CACHE: OnceLock<StatusCache> = OnceLock::new();
@@ -455,21 +512,58 @@ fn status_cache() -> &'static StatusCache {
     })
 }
 
-static RULES_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+/// One rules-cache slot: the coord base and the tenant whose credential fetched
+/// the document ([`PolicyTarget::tenant`]).
+///
+/// It used to be ONE slot keyed by nothing, so whichever tenant's rules were
+/// fetched last were served to every session on the box for the TTL. Keyed per
+/// `(base, tenant)` — the same key `policy_context`'s cache uses — two sessions
+/// of two tenants each get their own tenant's document.
+type RulesKey = (String, Option<Uuid>);
 
-fn rules_cache() -> &'static Mutex<Option<(Instant, String)>> {
-    RULES_CACHE.get_or_init(|| Mutex::new(None))
+static RULES_CACHE: OnceLock<Mutex<HashMap<RulesKey, (Instant, RulesDoc)>>> = OnceLock::new();
+
+fn rules_cache() -> &'static Mutex<HashMap<RulesKey, (Instant, RulesDoc)>> {
+    RULES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The rules cached for `(base, tenant)`, while within [`CACHE_TTL`] of `now`.
+fn rules_cache_lookup(base: &str, tenant: Option<Uuid>, now: Instant) -> Option<RulesDoc> {
+    let g = rules_cache().lock().ok()?;
+    let (at, doc) = g.get(&(base.to_string(), tenant))?;
+    (now.duration_since(*at) < CACHE_TTL).then(|| doc.clone())
+}
+
+/// Cache `doc` as `(base, tenant)`'s rules, fetched at `at`.
+fn rules_cache_store(base: &str, tenant: Option<Uuid>, at: Instant, doc: RulesDoc) {
+    if let Ok(mut g) = rules_cache().lock() {
+        g.insert((base.to_string(), tenant), (at, doc));
+    }
 }
 
 // ===========================================================================
 // Coord fetchers (every failure ⇒ Unreachable / default — fail-open)
 // ===========================================================================
 
-/// Device JWT + coord base, the exact accessor pair `fleet_policy_poller`
-/// uses. `Err` = cannot consult coord (⇒ Unreachable ⇒ allow).
+/// The resolved coord base URL, without a trailing `/`.
+pub(crate) fn coord_base() -> String {
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    base.trim_end_matches('/').to_string()
+}
+
+/// The DEVICE's default JWT + coord base, the exact accessor pair
+/// `fleet_policy_poller` uses. `Err` = unpaired.
 ///
-/// Shared with [`crate::mcp::session_compliance`], which rides the same Stop
-/// hook and must present the same credential against the same coord base.
+/// NOT for a session-scoped read or write: on a multi-bound device the
+/// default credential names the default tenant, which need not be the
+/// session's. Every Stop-hook reader in this module and in
+/// [`crate::mcp::session_compliance`] presents the session's tenant instead.
+/// The callers that remain are device-scoped by construction:
+/// `policy_context` (the coord base and the "is this runner paired at all"
+/// gate, asked before any session is read; its fetch credential is the
+/// session's), `session_work_status`'s bulk census (`/restart-readiness`, the
+/// wind-down observer, the finish heal, transcript autobind) and the
+/// continuation-finish relay's device tick.
 pub(crate) fn coord_client_parts() -> Result<(String, String), String> {
     let jwt = crate::auth::AuthManager::new()
         .get_access_token()
@@ -477,8 +571,7 @@ pub(crate) fn coord_client_parts() -> Result<(String, String), String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| "no device JWT (unpaired)".to_string())?;
-    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
-    Ok((base.trim_end_matches('/').to_string(), jwt))
+    Ok((coord_base(), jwt))
 }
 
 /// Short-timeout HTTP client for turn-end coord reads. Shared with
@@ -491,30 +584,25 @@ pub(crate) fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("client build: {e}"))
 }
 
-/// Fetch (uncached) the session's coord status. See module docs for the
-/// route choice + the honest posture on today's auth gating.
-async fn fetch_session_status_uncached(session_key: &str) -> StatusFetch {
-    // Dev/E2E override — deterministic local status source, logged loudly.
-    if let Ok(ov) = std::env::var(STATUS_OVERRIDE_ENV) {
-        let ov = ov.trim().to_string();
-        if !ov.is_empty() {
-            warn!(
-                session = %session_key,
-                override_value = %ov,
-                "continuation-verdict: {STATUS_OVERRIDE_ENV} is SET — status source overridden (dev/E2E lever)"
-            );
-            return if ov.eq_ignore_ascii_case("absent") {
-                StatusFetch::Reachable(None)
-            } else {
-                StatusFetch::Reachable(Some(ov))
-            };
-        }
+/// The dev/E2E status override ([`STATUS_OVERRIDE_ENV`]), when set — a
+/// deterministic local status source that touches no coord and no tenant,
+/// logged loudly on every use.
+fn status_override(status_key: &str) -> Option<StatusFetch> {
+    let ov = std::env::var(STATUS_OVERRIDE_ENV).ok()?;
+    let ov = ov.trim().to_string();
+    if ov.is_empty() {
+        return None;
     }
-
-    // The device-authed work-axis door (see module docs for why not the
-    // resolver card). Its credential, timeouts and decode path are shared with
-    // `/restart-readiness`, so the two reads cannot disagree about the door.
-    status_fetch_from_one(crate::mcp::session_work_status::fetch_one(session_key).await)
+    warn!(
+        session = %status_key,
+        override_value = %ov,
+        "continuation-verdict: {STATUS_OVERRIDE_ENV} is SET — status source overridden (dev/E2E lever)"
+    );
+    Some(if ov.eq_ignore_ascii_case("absent") {
+        StatusFetch::Reachable(None)
+    } else {
+        StatusFetch::Reachable(Some(ov))
+    })
 }
 
 /// Whether `status` is a reading [`decide`] may block on (`working` or absent).
@@ -526,17 +614,43 @@ fn is_block_eligible(status: &StatusFetch) -> bool {
     }
 }
 
-/// TTL-cached session-status read.
-async fn fetch_session_status(session_key: &str) -> StatusFetch {
+/// The session's work axis, read under the Stop's tenant and TTL-cached per
+/// `(tenant, harness session id)`.
+///
+/// The read is the device-authed work-axis door (see module docs for why not
+/// the resolver card), through
+/// [`crate::mcp::session_work_status::fetch_one_for`] — the same door, decode
+/// path and timeouts `/restart-readiness` uses, under the SESSION's tenant's
+/// credential. An UNKNOWN tenant reads nothing and caches nothing: the status is
+/// UNKNOWN (`Unreachable`, so the stop is allowed), never a reading taken under
+/// the default tenant.
+async fn fetch_session_status(
+    status_key: &str,
+    tenant: &Result<PolicyTarget, String>,
+) -> StatusFetch {
+    if let Some(over) = status_override(status_key) {
+        return over;
+    }
+    let target = match tenant {
+        Ok(target) => *target,
+        Err(reason) => {
+            return StatusFetch::Unreachable(format!(
+                "the session's tenant is unknown, so no tenant's work axis was read ({reason})"
+            ))
+        }
+    };
+    let key: StatusKey = (target.tenant, status_key.to_string());
     let now = Instant::now();
     if let Ok(g) = status_cache().inner.lock() {
-        if let Some((at, cached)) = g.get(session_key) {
+        if let Some((at, cached)) = g.get(&key) {
             if now.duration_since(*at) < CACHE_TTL {
                 return cached.clone();
             }
         }
     }
-    let fresh = fetch_session_status_uncached(session_key).await;
+    let fresh = status_fetch_from_one(
+        crate::mcp::session_work_status::fetch_one_for(status_key, target).await,
+    );
     if let Ok(mut g) = status_cache().inner.lock() {
         // Opportunistic prune so the map can't grow unboundedly across many
         // short-lived sessions.
@@ -545,36 +659,43 @@ async fn fetch_session_status(session_key: &str) -> StatusFetch {
         // `absent`/`working` that then records `finished` must be allowed on
         // its very next stop, not re-blocked off a 45 s-old answer.
         if is_block_eligible(&fresh) {
-            g.remove(session_key);
+            g.remove(&key);
         } else {
-            g.insert(session_key.to_string(), (now, fresh.clone()));
+            g.insert(key, (now, fresh.clone()));
         }
     }
     fresh
 }
 
-/// TTL-cached continuation-rules text; NEVER fails (falls back to the
-/// built-in default umbrella prompt).
-async fn fetch_continuation_rules() -> String {
-    let now = Instant::now();
-    if let Ok(g) = rules_cache().lock() {
-        if let Some((at, cached)) = g.as_ref() {
-            if now.duration_since(*at) < CACHE_TTL {
-                return cached.clone();
-            }
+/// The continuation rules for the Stop's tenant, TTL-cached per
+/// `(base, tenant)`; NEVER fails (falls back to the built-in default umbrella
+/// prompt). An UNKNOWN tenant reads no tenant's document and touches no cache
+/// entry: it gets the built-in default, versionless.
+async fn fetch_continuation_rules(tenant: &Result<PolicyTarget, String>) -> RulesDoc {
+    let target = match tenant {
+        Ok(target) => *target,
+        Err(reason) => {
+            debug!(
+                reason = %reason,
+                "continuation-verdict: session tenant unknown — no tenant's rules were read; \
+                 using the built-in default"
+            );
+            return RulesDoc::built_in_default();
         }
+    };
+    let base = coord_base();
+    let now = Instant::now();
+    if let Some(cached) = rules_cache_lookup(&base, target.tenant, now) {
+        return cached;
     }
-    let fetched = fetch_continuation_rules_uncached().await;
-    match fetched {
-        Some(text) => {
-            if let Ok(mut g) = rules_cache().lock() {
-                *g = Some((now, text.clone()));
-            }
-            text
+    match fetch_continuation_rules_uncached(&base, target).await {
+        Some(doc) => {
+            rules_cache_store(&base, target.tenant, now, doc.clone());
+            doc
         }
         // Do NOT cache the fallback: a transient coord blip should not pin
         // the default for a TTL when the real document is one retry away.
-        None => DEFAULT_CONTINUATION_RULES.to_string(),
+        None => RulesDoc::built_in_default(),
     }
 }
 
@@ -610,17 +731,34 @@ fn continuation_rules_url(base: &str) -> String {
     format!("{base}/coord/agent-prompt-documents/{RULES_DOC_KIND}/{RULES_DOC_NAME}")
 }
 
-async fn fetch_continuation_rules_uncached() -> Option<String> {
-    let (base, jwt) = match coord_client_parts() {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("continuation-verdict: rules fetch skipped ({e}) — using built-in default");
+/// The rules GET under `target`'s credential (`coord_http::coord_get_for`),
+/// refused before it can be sent unless its bearer claims `target.tenant`
+/// ([`crate::mcp::policy_tenant::build_checked`]).
+fn build_rules_get(
+    client: &reqwest::Client,
+    base: &str,
+    target: PolicyTarget,
+) -> Result<reqwest::Request, String> {
+    policy_tenant::build_checked(
+        crate::coord_http::coord_get_for(client, continuation_rules_url(base), target.scope),
+        target,
+    )
+    .map(|(request, _presented)| request)
+}
+
+async fn fetch_continuation_rules_uncached(base: &str, target: PolicyTarget) -> Option<RulesDoc> {
+    let client = http_client().ok()?;
+    let request = match build_rules_get(&client, base, target) {
+        Ok(request) => request,
+        Err(reason) => {
+            debug!(
+                reason = %reason,
+                "continuation-verdict: rules fetch not sent — using built-in default"
+            );
             return None;
         }
     };
-    let client = http_client().ok()?;
-    let url = continuation_rules_url(&base);
-    let resp = client.get(&url).bearer_auth(&jwt).send().await.ok()?;
+    let resp = client.execute(request).await.ok()?;
     if !resp.status().is_success() {
         debug!(
             status = resp.status().as_u16(),
@@ -658,6 +796,22 @@ pub struct VerdictResponse {
     /// legitimate response and anything asserting "flag off ⇒ never blocks"
     /// must discriminate on THIS field, not on `mode`.
     pub source: &'static str,
+    /// The tenant every Stop-hook read behind this verdict acted under — the
+    /// work-status read, the rules fetch and the compliance config/POST: a
+    /// uuid, a default-slot marker when the default credential claims no
+    /// tenant, or `unknown: <cause>` when the session's tenant could not be
+    /// decided and nothing was read ([`policy_tenant::target_label`]).
+    pub tenant: String,
+    /// The continuation-rules document's `current_version` the prompt was
+    /// taken from. `None` when no rules were fetched (the verdict did not
+    /// block on continuation), when the built-in default was used (coord
+    /// unreadable, or the tenant unknown), or when the row carries none.
+    pub rules_version: Option<i64>,
+}
+
+/// How a rules version reads on the verdict log line.
+fn rules_version_label(version: Option<i64>) -> String {
+    version.map_or_else(|| "none".to_string(), |v| v.to_string())
 }
 
 /// Deliver a session-compliance nudge as a `block` verdict, subject to the
@@ -675,6 +829,7 @@ fn deliver_compliance_nudge(
     session_key: &str,
     nudge: Option<crate::mcp::session_compliance::ComplianceNudge>,
     mode: Mode,
+    tenant: &str,
 ) -> Option<VerdictResponse> {
     let nudge = nudge?;
     let now = Instant::now();
@@ -733,6 +888,8 @@ fn deliver_compliance_nudge(
         stop_hook_active = false,
         claude_session = %nudge.session_id,
         reason = %reason,
+        tenant = %tenant,
+        rules_version = "none",
         "continuation-verdict"
     );
     Some(VerdictResponse {
@@ -744,17 +901,51 @@ fn deliver_compliance_nudge(
         session: session_key.to_string(),
         status_seen: "compliance".to_string(),
         source: "compliance",
+        tenant: tenant.to_string(),
+        rules_version: None,
     })
+}
+
+/// The Stop's ONE tenant decision (Design §1/§4), handed to every Stop-hook
+/// reader: the session behind the route — terminal `route_id` (its cwd, else
+/// the payload's `cwd`; its coord row, else `session_key`) — through
+/// [`policy_tenant::route_policy_decision`] under
+/// [`policy_tenant::STOP_TENANT_BUDGET`], as a fetch target. `Err` is the
+/// UNKNOWN cause: no reader makes a request for it.
+async fn stop_tenant(
+    route_id: &str,
+    session_key: &str,
+    hook_input: &Value,
+) -> Result<PolicyTarget, String> {
+    let payload_cwd = hook_input.get("cwd").and_then(Value::as_str);
+    let decision = policy_tenant::route_policy_decision(
+        route_id,
+        session_key,
+        payload_cwd,
+        policy_tenant::STOP_TENANT_BUDGET,
+    )
+    .await;
+    policy_tenant::fetch_target(decision, policy_tenant::default_slot_tenant)
 }
 
 /// Compute the continuation verdict for `session_key` given the raw Stop-hook
 /// input payload, under `mode` (the route resolves it with
-/// [`mode_for_terminal`]). Fail-open end to end; never panics the caller.
+/// [`mode_for_terminal`]). `route_id` is the route's path id (the runner
+/// TERMINAL id the hook sends) — with `session_key`, what names the session
+/// whose tenant every read below acts under. Fail-open end to end; never
+/// panics the caller.
 pub async fn continuation_verdict(
+    route_id: &str,
     session_key: &str,
     hook_input: &Value,
     mode: Mode,
 ) -> VerdictResponse {
+    // The session's tenant, decided ONCE for this Stop and handed to every
+    // reader: the compliance config read and POST, the work-status read and
+    // the rules fetch. Never the device default on a multi-bound device.
+    let tenant = stop_tenant(route_id, session_key, hook_input).await;
+    let tenant_label = policy_tenant::target_label(&tenant);
+
     // Session compliance-report detection + verdict emit (plan
     // `2026-07-30-session-compliance-report-enforcement.md` §A1). Runs on
     // EVERY Stop, independent of [`FLAG_ENV`]: that flag governs the
@@ -762,16 +953,17 @@ pub async fn continuation_verdict(
     // coord's per-tenant config and nothing else (there is deliberately no
     // second local flag). Fail-open — every error path yields `None`, and the
     // whole call is inert until coord serves the config route.
-    let compliance = crate::mcp::session_compliance::observe_turn_end(hook_input).await;
+    let compliance = crate::mcp::session_compliance::observe_turn_end(hook_input, &tenant).await;
 
     // Fast path: dark flag ⇒ allow with ZERO continuation coord traffic (the
     // hook is provisioned fleet-wide, so this is the hot path until the ramp).
     if mode == Mode::Off {
-        if let Some(v) = deliver_compliance_nudge(session_key, compliance, mode) {
+        if let Some(v) = deliver_compliance_nudge(session_key, compliance, mode, &tenant_label) {
             return v;
         }
         debug!(
             session = %session_key,
+            tenant = %tenant_label,
             "continuation-verdict: flag off — allow"
         );
         return VerdictResponse {
@@ -783,6 +975,8 @@ pub async fn continuation_verdict(
             session: session_key.to_string(),
             status_seen: "unconsulted".to_string(),
             source: "continuation",
+            tenant: tenant_label,
+            rules_version: None,
         };
     }
 
@@ -796,7 +990,7 @@ pub async fn continuation_verdict(
         // id (an AI task run the registrar maps), which that door does not key
         // on — so a payload without one is UNKNOWN, never a guessed key.
         match session_id_from(hook_input) {
-            Some(status_key) => fetch_session_status(&status_key).await,
+            Some(status_key) => fetch_session_status(&status_key, &tenant).await,
             None => StatusFetch::Unreachable(
                 "the Stop payload carries no session_id to read the work axis by".to_string(),
             ),
@@ -813,7 +1007,7 @@ pub async fn continuation_verdict(
     // second one onto the same turn. The compliance nudge is offered only
     // when the continuation arm allows the stop.
     if verdict.decision != "block" {
-        if let Some(v) = deliver_compliance_nudge(session_key, compliance, mode) {
+        if let Some(v) = deliver_compliance_nudge(session_key, compliance, mode, &tenant_label) {
             return v;
         }
     }
@@ -824,11 +1018,12 @@ pub async fn continuation_verdict(
         StatusFetch::Unreachable(_) => "unreachable".to_string(),
     };
 
-    let prompt = if verdict.decision == "block" {
+    let (prompt, rules_version) = if verdict.decision == "block" {
         cap_registry().record(session_key, now);
-        Some(fetch_continuation_rules().await)
+        let rules = fetch_continuation_rules(&tenant).await;
+        (Some(rules.text), rules.version)
     } else {
-        None
+        (None, None)
     };
 
     // The verdict log — one line per Stop, the observe-soak read surface.
@@ -840,6 +1035,8 @@ pub async fn continuation_verdict(
         would_block = verdict.would_block,
         stop_hook_active,
         reason = %verdict.reason,
+        tenant = %tenant_label,
+        rules_version = %rules_version_label(rules_version),
         "continuation-verdict"
     );
 
@@ -852,6 +1049,8 @@ pub async fn continuation_verdict(
         session: session_key.to_string(),
         status_seen,
         source: "continuation",
+        tenant: tenant_label,
+        rules_version,
     }
 }
 
@@ -1197,9 +1396,14 @@ mod tests {
             "updated_by": "josh@qontinui.io",
             "updated_at": "2026-07-17T12:00:00Z"
         });
+        // The version rides out with the text: it is what says WHICH revision
+        // of the tenant's document a session was told (Design §7).
         assert_eq!(
             rules_from_doc_body(&coord_doc),
-            Some("Operator-edited: finish the follow-ups, then clean up.".to_string())
+            Some(RulesDoc {
+                text: "Operator-edited: finish the follow-ups, then clean up.".to_string(),
+                version: Some(2),
+            })
         );
     }
 
@@ -1208,12 +1412,18 @@ mod tests {
         let direct = json!({"name": "session-continuation", "body": "Do the follow-ups."});
         assert_eq!(
             rules_from_doc_body(&direct),
-            Some("Do the follow-ups.".to_string())
+            Some(RulesDoc {
+                text: "Do the follow-ups.".to_string(),
+                version: None,
+            })
         );
-        let wrapped = json!({"document": {"body": "Wrapped text"}});
+        let wrapped = json!({"document": {"body": "Wrapped text", "current_version": 7}});
         assert_eq!(
             rules_from_doc_body(&wrapped),
-            Some("Wrapped text".to_string())
+            Some(RulesDoc {
+                text: "Wrapped text".to_string(),
+                version: Some(7),
+            })
         );
         assert_eq!(rules_from_doc_body(&json!({"body": "  "})), None);
         assert_eq!(rules_from_doc_body(&json!({})), None);
@@ -1223,6 +1433,145 @@ mod tests {
     fn default_rules_text_is_the_umbrella_prompt() {
         assert!(DEFAULT_CONTINUATION_RULES.contains("follow-ups"));
         assert!(DEFAULT_CONTINUATION_RULES.contains("finished"));
+        assert_eq!(RulesDoc::built_in_default().version, None);
+    }
+
+    // ── The session's tenant (plan 2026-11-13-runner-stop-hook-…) ───────
+
+    fn tenant_n(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    /// Tests bullet 1. The device's default credential claims A; the session
+    /// is B. The decision targets B's own scope without reading the default,
+    /// and the rules are cached under (base, B) — a lookup for (base, A) never
+    /// sees them. Under the old single-slot cache the last fetch was served to
+    /// every tenant.
+    #[test]
+    fn tenant_bs_rules_are_fetched_under_bs_scope_and_cached_under_base_b_not_base_a() {
+        use crate::mcp::policy_tenant::{fetch_target, policy_tenant_decision, PolicyTenantRead};
+        let (a, b) = (tenant_n(0xA1), tenant_n(0xB2));
+        let target = fetch_target(
+            policy_tenant_decision(
+                PolicyTenantRead::ProxyOwned {
+                    tenant: b,
+                    credential: true,
+                },
+                true,
+            ),
+            || panic!("an Owned decision never reads the default credential's tenant (A)"),
+        )
+        .expect("B resolved with a usable credential is a target");
+        assert_eq!(target.scope, crate::auth::TenantScope::Owned(b));
+        assert_eq!(target.tenant, Some(b));
+
+        let base = "https://rules-cache-b-not-a.example";
+        let now = Instant::now();
+        let b_doc = RulesDoc {
+            text: "B's rules".to_string(),
+            version: Some(4),
+        };
+        rules_cache_store(base, target.tenant, now, b_doc.clone());
+        assert_eq!(rules_cache_lookup(base, Some(b), now), Some(b_doc));
+        assert_eq!(
+            rules_cache_lookup(base, Some(a), now),
+            None,
+            "B's rules are never served to a session of tenant A"
+        );
+        assert_eq!(rules_cache_lookup(base, None, now), None);
+        assert_eq!(
+            rules_cache_lookup("https://another-base.example", Some(b), now),
+            None
+        );
+        // And the TTL still applies per slot.
+        assert_eq!(
+            rules_cache_lookup(base, Some(b), now + CACHE_TTL + Duration::from_secs(1)),
+            None
+        );
+    }
+
+    /// Tests bullet 4 for the rules GET: no usable slot for the target tenant
+    /// means the request is refused before it can be sent — never sent
+    /// unauthenticated, never under the default credential.
+    #[test]
+    fn no_rules_request_is_built_for_a_tenant_with_no_usable_credential() {
+        let t = Uuid::new_v4();
+        let target = PolicyTarget {
+            scope: crate::auth::TenantScope::Owned(t),
+            tenant: Some(t),
+        };
+        let refused = build_rules_get(&reqwest::Client::new(), "https://coord.example.com", target)
+            .expect_err("an unauthenticated rules read for tenant t must never be built");
+        assert!(
+            refused.contains(&format!("no usable credential claiming tenant {t}")),
+            "{refused}"
+        );
+    }
+
+    /// Design §3/§6. An UNKNOWN tenant reads no tenant's rules and no work
+    /// axis, and touches no cache entry: the rules are the built-in default
+    /// (versionless) and the status is UNKNOWN, which allows.
+    #[tokio::test]
+    async fn an_unknown_tenant_reads_nothing_and_caches_nothing() {
+        let unknown: Result<PolicyTarget, String> = Err("no tenant settled".to_string());
+        assert_eq!(
+            fetch_continuation_rules(&unknown).await,
+            RulesDoc::built_in_default()
+        );
+        // Every other test caches under an `example` base, so an entry under
+        // the live coord base could only have been written by this call.
+        let base = coord_base();
+        assert!(
+            !rules_cache()
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(b, _)| *b == base),
+            "an UNKNOWN decision writes no rules entry"
+        );
+
+        let status_key = "cv-unknown-tenant-status";
+        let status = fetch_session_status(status_key, &unknown).await;
+        let StatusFetch::Unreachable(why) = &status else {
+            panic!("an unknown tenant's work axis is UNKNOWN, got {status:?}");
+        };
+        assert!(why.contains("no tenant settled"), "{why}");
+        assert!(
+            !status_cache()
+                .inner
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(_, sid)| sid == status_key),
+            "an UNKNOWN decision writes no status entry"
+        );
+        assert_eq!(
+            decide(Mode::On, false, &status, false).decision,
+            "allow",
+            "the existing degraded path: an unknown tenant never blocks"
+        );
+    }
+
+    /// Design §7. The verdict response names the tenant and the rules version.
+    #[test]
+    fn the_verdict_response_carries_the_tenant_and_the_rules_version() {
+        let v = VerdictResponse {
+            decision: "block",
+            prompt: Some("B's rules".to_string()),
+            mode: "on",
+            reason: "r".to_string(),
+            would_block: true,
+            session: "s".to_string(),
+            status_seen: "absent".to_string(),
+            source: "continuation",
+            tenant: tenant_n(0xB2).to_string(),
+            rules_version: Some(4),
+        };
+        let wire = serde_json::to_value(&v).unwrap();
+        assert_eq!(wire["tenant"], json!(tenant_n(0xB2).to_string()));
+        assert_eq!(wire["rules_version"], json!(4));
+        assert_eq!(rules_version_label(Some(4)), "4");
+        assert_eq!(rules_version_label(None), "none");
     }
 
     // ── Session-compliance nudge delivery ────────────────────────────────
@@ -1233,6 +1582,9 @@ mod tests {
     // real delivery.
 
     use crate::mcp::session_compliance::{ComplianceNudge, NudgeClass};
+
+    /// The tenant label the delivery tests stamp on the verdict.
+    const TEST_TENANT: &str = "unknown: test";
 
     fn nudge_for(session: &str) -> ComplianceNudge {
         nudge_of(session, NudgeClass::Report)
@@ -1251,7 +1603,7 @@ mod tests {
 
     #[test]
     fn no_candidate_means_no_block() {
-        assert!(deliver_compliance_nudge("cv-none", None, Mode::On).is_none());
+        assert!(deliver_compliance_nudge("cv-none", None, Mode::On, TEST_TENANT).is_none());
     }
 
     /// Compliance must not spend the continuation arm's hourly budget.
@@ -1276,7 +1628,7 @@ mod tests {
 
         // Compliance still delivers — different key, untouched budget.
         assert!(
-            deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_some(),
+            deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On, TEST_TENANT).is_some(),
             "a drained continuation budget must not suppress the compliance nudge"
         );
     }
@@ -1286,7 +1638,7 @@ mod tests {
         // The compliance feature is switched by coord's per-tenant config, NOT
         // by FLAG_ENV — a dark continuation ramp must not disable it.
         let key = "cv-off-mode-still-blocks";
-        let v = deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::Off)
+        let v = deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::Off, TEST_TENANT)
             .expect("compliance blocks under Mode::Off");
         assert_eq!(v.decision, "block");
         assert_eq!(v.source, "compliance");
@@ -1310,7 +1662,9 @@ mod tests {
         for _ in 0..effective_cap() {
             cap_registry().record(&format!("compliance:{key}"), now);
         }
-        assert!(deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_none());
+        assert!(
+            deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On, TEST_TENANT).is_none()
+        );
         // The per-session claim must NOT have been burned by a nudge the
         // cap swallowed — a later turn is still allowed to deliver it.
         assert!(
@@ -1327,7 +1681,9 @@ mod tests {
             NudgeClass::Report,
             1
         ));
-        assert!(deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_none());
+        assert!(
+            deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On, TEST_TENANT).is_none()
+        );
     }
 
     /// THE regression this phase exists to prevent, asserted at the DELIVERY
@@ -1341,9 +1697,13 @@ mod tests {
     fn one_exhausted_nudge_class_does_not_suppress_the_other() {
         let key = "cv-class-independence";
 
-        let first =
-            deliver_compliance_nudge(key, Some(nudge_of(key, NudgeClass::Report)), Mode::On)
-                .expect("the report nudge delivers");
+        let first = deliver_compliance_nudge(
+            key,
+            Some(nudge_of(key, NudgeClass::Report)),
+            Mode::On,
+            TEST_TENANT,
+        )
+        .expect("the report nudge delivers");
         assert!(
             first.reason.contains("report nudge 1 of 1"),
             "{}",
@@ -1352,15 +1712,24 @@ mod tests {
 
         // That class is now spent...
         assert!(
-            deliver_compliance_nudge(key, Some(nudge_of(key, NudgeClass::Report)), Mode::On)
-                .is_none(),
+            deliver_compliance_nudge(
+                key,
+                Some(nudge_of(key, NudgeClass::Report)),
+                Mode::On,
+                TEST_TENANT
+            )
+            .is_none(),
             "the report class is capped at 1"
         );
 
         // ...and the OTHER class is untouched.
-        let second =
-            deliver_compliance_nudge(key, Some(nudge_of(key, NudgeClass::PolicyPull)), Mode::On)
-                .expect("the policy-pull nudge must still deliver");
+        let second = deliver_compliance_nudge(
+            key,
+            Some(nudge_of(key, NudgeClass::PolicyPull)),
+            Mode::On,
+            TEST_TENANT,
+        )
+        .expect("the policy-pull nudge must still deliver");
         assert_eq!(second.decision, "block");
         assert!(
             second.reason.contains("policy_pull nudge 1 of 1"),
