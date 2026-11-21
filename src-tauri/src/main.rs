@@ -2347,8 +2347,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // dodge build-lock contention. Those match no worktree pattern,
                 // so the reaper never sees them — they filled D: to 1.3% free
                 // (2026-07-23, ~1.35 TB recovered by hand). This poller reaps
-                // that population: out-of-tree cargo target roots (CACHEDIR.TAG)
-                // that are not building (no held .cargo-lock, deepest artifact
+                // that population: out-of-tree cargo target roots (a
+                // `CACHEDIR.TAG` or `.rustc_info.json` marker —
+                // `cargo_target_marker::has_cargo_marker`) that are not building (no held .cargo-lock, deepest artifact
                 // mtime past the grace) and not reparse points, junction-safe.
                 // DRY-RUN by default (logs "would reap"); armed via
                 // COORD_ORPHAN_TARGET_REAP_ENABLED. Default 900s cadence
