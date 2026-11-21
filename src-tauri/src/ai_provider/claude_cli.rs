@@ -360,14 +360,13 @@ pub(crate) fn build_scorer_command(
 /// Why a single `claude --print` child produced no usable stdout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrintRunError {
-    /// The child could not be spawned (missing binary, bad cwd, …).
+    /// The child could not be spawned (missing binary, bad cwd, no thread for
+    /// the stdin writer, …).
     Spawn(String),
-    /// Writing the prompt to the child's stdin failed.
-    StdinWrite(String),
-    /// The child did not exit within the budget; it was killed.
+    /// The child did not exit within the budget; its process tree was killed.
     Timeout,
-    /// Polling or collecting the child failed.
-    Wait(String),
+    /// The child exited but its captured stdout/stderr is incomplete.
+    Truncated(String),
     /// The child exited nonzero.
     NonZeroExit {
         code: Option<i32>,
@@ -379,9 +378,8 @@ impl std::fmt::Display for PrintRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(e) => write!(f, "failed to spawn claude CLI: {e}"),
-            Self::StdinWrite(e) => write!(f, "writing prompt to claude stdin failed: {e}"),
             Self::Timeout => write!(f, "claude CLI timed out"),
-            Self::Wait(e) => write!(f, "waiting on claude CLI failed: {e}"),
+            Self::Truncated(why) => write!(f, "claude CLI output incomplete: {why}"),
             Self::NonZeroExit {
                 code,
                 stderr_excerpt,
@@ -390,55 +388,31 @@ impl std::fmt::Display for PrintRunError {
     }
 }
 
-/// Spawn `cmd`, pipe `prompt` to its stdin (then EOF), and wait at most
-/// `timeout` for it to exit — killing it on the deadline. Returns the child's
-/// TRIMMED stdout on a zero exit. Every failure is an `Err` so the callers
-/// fail closed.
+/// Spawn `cmd`, feed `prompt` on its stdin (then EOF), and wait at most
+/// `timeout` for it to exit. Returns the child's TRIMMED stdout on a zero
+/// exit. Every failure is an `Err` so the callers fail closed.
 ///
-/// The prompt is a few KB, well under the OS pipe buffer, so a single blocking
-/// write-before-read can't deadlock against the child filling its stdout pipe.
+/// Routed through [`crate::process_helpers::run_with_timeout_input`]: every
+/// wait is on a hard clock (no unbounded `wait_with_output`), the prompt is
+/// written by a detached thread so a child that never reads stdin cannot block
+/// us, and on expiry the whole process TREE is killed — on Windows the real
+/// `claude` is a grandchild of `cmd /c`, which a plain `child.kill()` leaves
+/// running.
 fn run_print_child(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     prompt: &str,
     timeout: Duration,
 ) -> Result<String, PrintRunError> {
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| PrintRunError::Spawn(e.to_string()))?;
+    use crate::process_helpers::TimedOutput;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        if let Err(e) = stdin.write_all(prompt.as_bytes()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(PrintRunError::StdinWrite(e.to_string()));
-        }
-        // Drop closes stdin (EOF).
-    }
+    let run =
+        crate::process_helpers::run_with_timeout_input(cmd, timeout, prompt.as_bytes().to_vec())
+            .map_err(|e| PrintRunError::Spawn(e.to_string()))?;
 
-    // Bounded wait: poll for exit up to `timeout`, then kill + fail closed.
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(PrintRunError::Timeout);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(PrintRunError::Wait(e.to_string()));
-            }
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| PrintRunError::Wait(format!("collecting output: {e}")))?;
+    let output = match run.outcome {
+        TimedOutput::Completed(o) => o,
+        TimedOutput::TimedOut { .. } => return Err(PrintRunError::Timeout),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -446,6 +420,9 @@ fn run_print_child(
             code: output.status.code(),
             stderr_excerpt: truncate_str(&stderr, 300).to_string(),
         });
+    }
+    if let Some(t) = run.truncation {
+        return Err(PrintRunError::Truncated(format!("{t:?}")));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -721,9 +698,8 @@ pub(crate) fn run_structured_oneshot(
 
     let stdout = run_print_child(cmd, prompt, timeout).map_err(OneshotError::Run)?;
     let text = final_text_from_cli_output(&stdout)?;
-    extract_first_json_object(&text).ok_or_else(|| {
-        OneshotError::Unparseable(truncate_str(text.trim(), 160).to_string())
-    })
+    extract_first_json_object(&text)
+        .ok_or_else(|| OneshotError::Unparseable(truncate_str(text.trim(), 160).to_string()))
 }
 
 /// Process CLI output into AiResponse
