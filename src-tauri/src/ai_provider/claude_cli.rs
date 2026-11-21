@@ -294,8 +294,9 @@ fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
 /// env-prepared. Shared by the option scorer ([`build_scorer_command`], no
 /// extra args) and the structured one-shot ([`run_structured_oneshot`]).
 ///
-/// On Windows route through cmd.exe `/c` (so a `.cmd`/`.ps1` shim on PATH
-/// resolves), elsewhere invoke the program directly. The prompt is piped over
+/// On Windows route through `cmd.exe /d /s /c` ([`cmd_s_c_line`], so a
+/// `.cmd`/`.ps1` shim on PATH resolves and a quoted program path survives),
+/// elsewhere invoke the program directly. The prompt is piped over
 /// STDIN by the caller (not passed as a `-p` argv) — prompts here are long,
 /// multi-line and JSON-heavy, and cmd.exe corrupts special chars
 /// (`"`, `%`, `^`, `&`, `|`, `<`, `>`) in arguments (the exact reason
@@ -317,16 +318,20 @@ pub(crate) fn build_print_command(
     config_dir: Option<&str>,
     extra_args: &[String],
 ) -> std::process::Command {
-    let mut cmd = if std::env::consts::OS == "windows" {
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
         let mut c = crate::process_helpers::cmd_no_window();
-        c.args(["/c", program, "--print"]);
-        c
-    } else {
-        let mut c = crate::process_helpers::no_window(program);
-        c.arg("--print");
+        c.raw_arg(cmd_s_c_line(program, extra_args));
         c
     };
-    cmd.args(extra_args);
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = crate::process_helpers::no_window(program);
+        c.arg("--print");
+        c.args(extra_args);
+        c
+    };
     if let Some(dir) = config_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
@@ -346,6 +351,60 @@ pub(crate) fn build_print_command(
     crate::terminal::scrub_credential_env_std(&mut cmd);
 
     cmd
+}
+
+/// `arg` quoted for the MSVC / `CommandLineToArgvW` rules (what node and the
+/// claude CLI's shim use to split a Windows command line): left bare when it is
+/// non-empty and holds no whitespace, quote or cmd.exe operator; otherwise
+/// wrapped in quotes with backslashes before a quote — and trailing ones —
+/// doubled.
+fn msvc_quote(arg: &str) -> String {
+    let needs = arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| matches!(c, ' ' | '\t' | '"' | '&' | '|' | '<' | '>' | '^'));
+    if !needs {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            c => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// The `cmd.exe` arguments that run `<program> --print <args…>` on Windows:
+/// `/d /s /c "<quoted program> --print <quoted args…>"`.
+///
+/// Plain `/c` strips the first and the last quote of the line whenever the line
+/// starts with a quote — so a program path that needs quoting (spaces) together
+/// with a quoted argument such as the empty `--tools ""` came out mangled. With
+/// `/s` cmd strips exactly the outer pair added here and runs the rest as
+/// written. `/d` skips AutoRun commands. What cmd still does inside the line:
+/// expand `%VAR%` — no argument this module passes contains `%`.
+pub(crate) fn cmd_s_c_line(program: &str, args: &[String]) -> String {
+    let mut line = msvc_quote(program);
+    line.push_str(" --print");
+    for a in args {
+        line.push(' ');
+        line.push_str(&msvc_quote(a));
+    }
+    format!("/d /s /c \"{line}\"")
 }
 
 /// Build the one-shot scorer's `claude --print` command (no extra flags).
@@ -499,6 +558,12 @@ pub(crate) fn score_options_via_cli(
 
 /// The tool set a structured one-shot may use.
 ///
+/// Both modes run under `--safe-mode`: no CLAUDE.md (so none of its
+/// `@`-imports), no auto memory, skills, hooks, plugins or MCP servers load —
+/// from the checkout or any parent directory — while authentication, built-in
+/// tools and permissions work normally (the CLI's `--help` and the CLI
+/// reference both say so).
+///
 /// Neither mode includes `Bash`, or any other tool that runs a command. A shell
 /// allow-list was tried and dropped: Claude Code matches rules against the raw
 /// command string, so shell quoting (`--"output"=…`) gets past deny rules, and
@@ -572,6 +637,8 @@ impl std::fmt::Display for OneshotError {
 /// - `--output-format json`: one JSON envelope whose `result` is the model's
 ///   final text ([`final_text_from_cli_output`]).
 /// - `--max-turns`: bounds the tool loop.
+/// - `--safe-mode`: no CLAUDE.md / @-imports / auto memory / skills / hooks /
+///   plugins / MCP; auth, built-in tools and permissions unaffected.
 /// - `--restricted`: user/project/local settings files are ignored, so an
 ///   operator's allow rules cannot add tools; command-running tools exist only
 ///   if `--tools` names them (it never does here); the file tools are confined
@@ -594,6 +661,7 @@ pub(crate) fn oneshot_cli_args(tools: OneshotTools, max_turns: u32) -> Vec<Strin
         "json".into(),
         "--max-turns".into(),
         max_turns.max(1).to_string(),
+        "--safe-mode".into(),
         "--restricted".into(),
         "--strict-mcp-config".into(),
         "--permission-mode".into(),
@@ -900,6 +968,7 @@ mod tests {
                 "json",
                 "--max-turns",
                 "8",
+                "--safe-mode",
                 "--restricted",
                 "--strict-mcp-config",
                 "--permission-mode",
@@ -950,7 +1019,12 @@ mod tests {
                     "{tools:?}: unexpected {forbidden}"
                 );
             }
-            for required in ["--restricted", "--strict-mcp-config", "dontAsk"] {
+            for required in [
+                "--safe-mode",
+                "--restricted",
+                "--strict-mcp-config",
+                "dontAsk",
+            ] {
                 assert!(
                     args.iter().any(|a| a == required),
                     "{tools:?}: missing {required}"
@@ -975,6 +1049,7 @@ mod tests {
                 "json",
                 "--max-turns",
                 "1",
+                "--safe-mode",
                 "--restricted",
                 "--strict-mcp-config",
                 "--permission-mode",
@@ -1013,9 +1088,41 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        let print = args.iter().position(|a| a == "--print").unwrap();
-        assert_eq!(args[print + 1], "--output-format");
-        assert!(args.iter().any(|a| a == "Read,Grep,Glob"));
+        if cfg!(windows) {
+            assert_eq!(args.len(), 1, "one raw cmd.exe argument: {args:?}");
+            assert!(
+                args[0].starts_with("/d /s /c \"claude --print --output-format json "),
+                "{args:?}"
+            );
+            assert!(args[0].contains(" --safe-mode --restricted "), "{args:?}");
+            assert!(args[0].contains(" --tools Read,Grep,Glob "), "{args:?}");
+        } else {
+            let print = args.iter().position(|a| a == "--print").unwrap();
+            assert_eq!(args[print + 1], "--output-format");
+            assert!(args.iter().any(|a| a == "Read,Grep,Glob"));
+        }
+    }
+
+    /// A10: the cmd.exe line quotes a program path with spaces, keeps an empty
+    /// argument as `""`, escapes inner quotes and trailing backslashes, and
+    /// wraps the whole line in the one quote pair `/s` strips.
+    #[test]
+    fn cmd_s_c_line_quotes_program_and_empty_args() {
+        let line = super::cmd_s_c_line(
+            r"C:\Program Files\claude\claude.cmd",
+            &[
+                "--tools".to_string(),
+                String::new(),
+                "Read(./.git/**)".to_string(),
+                r#"a"b"#.to_string(),
+                r"x y\".to_string(),
+                "a&b".to_string(),
+            ],
+        );
+        assert_eq!(
+            line,
+            r#"/d /s /c ""C:\Program Files\claude\claude.cmd" --print --tools "" Read(./.git/**) "a\"b" "x y\\" "a&b"""#
+        );
     }
 
     #[test]
@@ -1277,9 +1384,14 @@ mod tests {
     #[test]
     fn spawn_permission_flags_reach_the_child_intact() {
         let _amb = crate::test_env::isolated_ambient();
-        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // A10: a program path that needs quoting — the case plain `cmd /c`
+        // mangled together with the empty `--tools ""`.
+        let spaced = tmp.path().join("dir with space");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let dir = &spaced;
         let prog = fake_claude(
-            dir.path(),
+            dir,
             "echo ARGV: %*",
             "printf 'ARGV:'\nfor a in \"$@\"; do printf '[%s]' \"$a\"; done\necho",
         );
@@ -1293,6 +1405,10 @@ mod tests {
         let out_repo = run_print_child(repo, "", Duration::from_secs(30)).unwrap();
         if cfg!(windows) {
             assert!(out_none.ends_with("--tools \"\""), "{out_none}");
+            assert!(
+                out_none.contains(" --safe-mode --restricted "),
+                "{out_none}"
+            );
             assert!(out_repo.contains(" --tools Read,Grep,Glob "), "{out_repo}");
             assert!(
                 out_repo.contains(
@@ -1302,6 +1418,10 @@ mod tests {
             );
         } else {
             assert!(out_none.ends_with("[--tools][]"), "{out_none}");
+            assert!(
+                out_none.contains("[--safe-mode][--restricted]"),
+                "{out_none}"
+            );
             assert!(out_repo.contains("[--tools][Read,Grep,Glob]"), "{out_repo}");
             assert!(
                 out_repo.contains(
