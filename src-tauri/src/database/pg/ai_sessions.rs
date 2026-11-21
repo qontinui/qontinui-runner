@@ -301,18 +301,22 @@ impl PgDb {
         Ok(())
     }
 
-    /// Mark a workflow AI session `failed` ONLY while it is still `running`,
-    /// on the same `(task_run_id, iteration, phase, COALESCE(stage_index, -1))`
-    /// key `complete_workflow_ai_session` uses. The abandoned-phase write: it
+    /// Write the abandoned status `status` ONLY while the row is still
+    /// `running` AND still owned by `claude_cli_session_id`, on the same
+    /// `(task_run_id, iteration, phase, COALESCE(stage_index, -1))` key
+    /// `complete_workflow_ai_session` uses. The abandoned-phase write: it
     /// never overwrites a terminal status already committed (an abort that
-    /// lands after the terminal write), nor a later attempt's row once that
-    /// attempt has finished. Returns the number of rows changed.
+    /// lands after the terminal write), nor a later attempt's row -- finished
+    /// or still running -- since a re-create stamps that attempt's own CLI
+    /// session id. Returns the number of rows changed.
     pub async fn fail_workflow_ai_session_if_running(
         &self,
         task_run_id: &str,
         iteration: i32,
         phase: &str,
         stage_index: Option<i32>,
+        claude_cli_session_id: &str,
+        status: &str,
     ) -> Result<u64, String> {
         let conn = self
             .pool
@@ -322,11 +326,19 @@ impl PgDb {
         let coalesced_stage = stage_index.unwrap_or(-1);
         conn.execute(
             r#"UPDATE workflow_ai_sessions
-               SET status = 'failed', session_completed_at = NOW()
-               WHERE task_run_id = $1 AND iteration = $2 AND phase = $3
-                 AND COALESCE(stage_index, -1) = $4
+               SET status = $1, session_completed_at = NOW()
+               WHERE task_run_id = $2 AND iteration = $3 AND phase = $4
+                 AND COALESCE(stage_index, -1) = $5
+                 AND claude_cli_session_id = $6
                  AND status = 'running'"#,
-            &[&task_run_id, &iteration, &phase, &coalesced_stage],
+            &[
+                &status,
+                &task_run_id,
+                &iteration,
+                &phase,
+                &coalesced_stage,
+                &claude_cli_session_id,
+            ],
         )
         .await
         .map_err(|e| crate::database::pg::pg_err("PG fail_workflow_ai_session_if_running", &e))
@@ -548,8 +560,9 @@ mod workflow_ai_session_tests {
         assert_eq!(got, expected);
     }
 
-    /// The abandoned-phase write changes a `running` row to `failed` and
-    /// leaves a row that already holds a terminal status alone.
+    /// The abandoned-phase write changes a `running` row it owns to `failed`,
+    /// and leaves alone a row that already holds a terminal status and a
+    /// running row now owned by a later attempt's CLI session.
     #[tokio::test]
     async fn fail_if_running_only_touches_a_running_row() {
         let pg = fresh_db_with_task_run().await;
@@ -564,7 +577,7 @@ mod workflow_ai_session_tests {
             .expect("create live");
 
         let changed = pg
-            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(0))
+            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(0), "cli-done", "failed")
             .await
             .expect("fail done");
         assert_eq!(changed, 0, "a completed row must not be overwritten");
@@ -577,8 +590,24 @@ mod workflow_ai_session_tests {
             Some(("cli-done".to_string(), "completed".to_string()))
         );
 
+        // A drop from an EARLIER attempt on the same key: the live row now
+        // belongs to "cli-live", so nothing changes.
         let changed = pg
-            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(1))
+            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(1), "cli-stale", "failed")
+            .await
+            .expect("fail stale");
+        assert_eq!(
+            changed, 0,
+            "a later attempt's running row must not be failed"
+        );
+        let live = pg
+            .get_workflow_ai_session(TASK, 4, PHASE, Some(1))
+            .await
+            .expect("get live");
+        assert_eq!(live, Some(("cli-live".to_string(), "running".to_string())));
+
+        let changed = pg
+            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(1), "cli-live", "failed")
             .await
             .expect("fail live");
         assert_eq!(changed, 1);
