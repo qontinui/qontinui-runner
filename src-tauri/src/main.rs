@@ -5802,7 +5802,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     automation_stack::run_periodic().await;
                 });
 
-                // Plan §Phase 3/7/10 — start the coord-sync background loops
+                // Plan §Phase 3/7 — start the coord-sync background loops
                 // (drain, heartbeat, Phase 7 handoff receiver, remote attach
                 // and create polls). `.setup()` runs synchronously with no
                 // ambient Tokio reactor, so these helpers' internal

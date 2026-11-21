@@ -201,10 +201,10 @@ where
 /// lifecycle.
 pub type DynTransport = Arc<dyn Transport>;
 
-/// No-op transport for **externally-owned** sessions (plan §Phase 10
-/// dual-write). The underlying process — a legacy `terminal_create` PTY
-/// or `claude_session` subprocess — is owned and torn down by the legacy
-/// path; the coord-native mirror created via
+/// No-op transport for **externally-owned** sessions. The underlying
+/// process — a `terminal_create` PTY or `claude_session` subprocess — is
+/// owned and torn down by that path (coord-native by design, see
+/// `transport/pty.rs`); the coord-native record created via
 /// [`super::SessionRegistry::register_external_with_lineage`] is pure bookkeeping for
 /// the dashboard. All [`Transport`] ops are no-ops: nothing to spawn,
 /// nothing to write, nothing to tear down (close is idempotent and never

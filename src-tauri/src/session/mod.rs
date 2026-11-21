@@ -1210,8 +1210,7 @@ impl SessionRegistry {
     /// records a `Closed` event but never touches the operator's real
     /// terminal.
     ///
-    /// Two optional lineage stamps, both `None` on the plain mirror path (so that call
-    /// is byte-identical to what it was):
+    /// Two optional lineage stamps; pass `None` for either to keep the default:
     ///
     /// - `parent_session_id` — the coord session this one CONTINUES. Threaded
     ///   into the `Started` outbox payload, which the drain loop's
