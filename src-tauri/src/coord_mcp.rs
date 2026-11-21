@@ -11429,15 +11429,21 @@ pub(crate) fn probe_and_breadcrumb_proxy_with_policy(
 ///
 /// KEPT deliberately (credential-hygiene Task 9 review, 2026-07-17): the
 /// app-data `--mcp-config` delivery (`provision_coord_mcp_config_file`) is the
-/// newer shape, but the in-workdir file has a hard consumer that cannot take
-/// `--mcp-config`: **`qontinui-pr`** (`src/bin/qontinui_cli.rs`,
-/// `find_session_mcp_config`) discovers the per-session proxy nonce + issuing
-/// runner port EXCLUSIVELY by a `.mcp.json` walk-up from cwd — it is a
-/// standalone CLI invoked ad hoc inside the session, with no launch seam to
-/// hand it a config path (only the PORT has an env override,
-/// `QONTINUI_RUNNER_API_PORT`; the nonce deliberately travels with the port in
-/// the same file so they can never cross runners). Headless agent spawns and
-/// the boot root/session reconcile also provision through this writer. The
+/// newer shape, and **`qontinui-pr`** (`src/bin/qontinui_cli.rs`,
+/// `discover_session_mcp_config`) now reads it FIRST: a session whose spawn
+/// exported [`MCP_CONFIG_ENV`] (`QONTINUI_MCP_CONFIG`) authenticates with the
+/// nonce + issuing-runner port from that file, and a set-but-missing or
+/// credential-less file is an error rather than a fall-through. The CLI falls
+/// back to a `.mcp.json` walk-up from cwd (`find_session_mcp_config`) ONLY when
+/// the variable is unset or empty — so this in-workdir file is still what
+/// `qontinui-pr` finds in a session spawned WITHOUT that export, which is why
+/// it is not deleted yet. Its remaining consumers are those sessions, headless
+/// agent spawns and the boot root/session reconcile, which also provision
+/// through this writer (plan
+/// `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
+/// Phase 2 moves the direct-exec paths onto the env delivery). The nonce
+/// travels with the port in the same file on both arms, so they can never
+/// cross runners; `QONTINUI_RUNNER_API_PORT` overrides only the port. The
 /// compensating hardening: the write is owner-only (Task 6), so a leftover
 /// file is at least never world-readable.
 ///
