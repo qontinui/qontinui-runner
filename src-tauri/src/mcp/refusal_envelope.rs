@@ -8,7 +8,10 @@
 //! envelope, which `ApiResponse` serves ADDITIVELY under the top-level
 //! `refusal` key — the same nesting qontinui-web uses (`REFUSAL_KEY =
 //! "refusal"`). `error_detail.code` / `error_detail.context` stay: the
-//! ui-bridge SDKs read them.
+//! ui-bridge SDKs read them. `error_detail.recovery` is NOT unchanged: it was
+//! the runner-only `RecoveryHint` string (`"RESNAPSHOT"`,
+//! `{"RETRY_AFTER_MS":1000}`) and is now the shared `NextAction` object
+//! (`{"kind":"resnapshot"}`, `{"kind":"retry_later","retry_after_s":1}`).
 //!
 //! The projection:
 //!
@@ -43,8 +46,10 @@ pub fn refusal_code_for_ui_bridge(code: UiBridgeErrorCode) -> RefusalCode {
         C::CircuitBreakerOpen
         | C::FrontendUnresponsive
         | C::FrontendNotReady
-        | C::EventLoopUnresponsive
-        | C::WindowNotFound => RefusalCode::ServiceUnavailable,
+        | C::EventLoopUnresponsive => RefusalCode::ServiceUnavailable,
+        // No main webview at all: not a transient outage (its next action is
+        // `none_terminal`), so not `ServiceUnavailable`'s "right now".
+        C::WindowNotFound => RefusalCode::InternalError,
         C::ConcurrencyLimitReached => RefusalCode::RateLimited,
         C::ElementNotFound => RefusalCode::NotFound,
         // The element exists but the page's current state refuses the action.
@@ -155,9 +160,14 @@ pub fn refusal_for_envelope(
         (None, Some(c)) => c,
         (None, None) => refusal_code_for_status(status),
     };
-    let next_action = recovery
+    let mut next_action = recovery
         .or_else(|| ui_code.map(|c| next_action_for(&c)))
         .unwrap_or_else(|| default_next_action(refusal_code, status, retry_after_s));
+    // A `Retry-After` the response actually carried is a measured delay; it
+    // beats a table default on any `retry_later`.
+    if next_action.kind == NextActionKind::RetryLater && retry_after_s.is_some() {
+        next_action.retry_after_s = retry_after_s;
+    }
     let mut refusal = Refusal::new(
         refusal_code,
         next_action,
@@ -340,6 +350,19 @@ mod tests {
         assert_eq!(r.code, RefusalCode::WorkspaceRootUnresolved);
         assert_eq!(r.discriminator, None);
         assert_eq!(r.next_action.kind, NextActionKind::SetSetting);
+    }
+
+    /// A measured `Retry-After` beats a UI Bridge table delay.
+    #[test]
+    fn retry_after_header_beats_the_table_delay() {
+        let r = refusal_for_envelope(
+            "CONCURRENCY_LIMIT_REACHED",
+            StatusCode::TOO_MANY_REQUESTS,
+            None,
+            None,
+            Some(9),
+        );
+        assert_eq!(r.next_action, NextAction::retry_later(Some(9)));
     }
 
     /// `Retry-After` reaches a `retry_later` the producer did not time.
