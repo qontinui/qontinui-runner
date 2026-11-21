@@ -14,8 +14,10 @@ import {
   Repeat,
   AlertTriangle,
   StopCircle,
+  HelpCircle,
 } from "lucide-react";
 import { formatDuration } from "@/lib/formatting";
+import { loopVerdict, NOTHING_VERIFIED_LABEL } from "@/lib/loop-result-verdict";
 import type { LoopResult } from "@/types/aiData";
 
 interface StatusBannerProps {
@@ -50,22 +52,28 @@ export function StatusBanner({
 
   // Determine status based on loop result if available
   if (loopResult) {
-    if (loopResult.was_stopped) {
+    const verdict = loopVerdict(loopResult);
+    if (verdict === "stopped") {
       bgColor = "bg-amber-500/10";
       textColor = "text-amber-500";
       icon = <StopCircle className="w-5 h-5" />;
       label = "Run Stopped";
-    } else if (loopResult.critical_failure) {
+    } else if (verdict === "critical_failure") {
       bgColor = "bg-red-500/10";
       textColor = "text-red-500";
       icon = <AlertTriangle className="w-5 h-5" />;
       label = "Critical Failure";
-    } else if (loopResult.verification_passed) {
+    } else if (verdict === "passed") {
       bgColor = "bg-green-500/10";
       textColor = "text-green-500";
       icon = <CheckCircle2 className="w-5 h-5" />;
       label = goalAchieved ? "Goal Achieved" : "Verification Passed";
-    } else if (loopResult.max_iterations_reached) {
+    } else if (verdict === "nothing_verified") {
+      // Nothing was checked: unknown, rendered neutrally — never the green
+      // "Run Completed" the status fallback below would otherwise show.
+      icon = <HelpCircle className="w-5 h-5" />;
+      label = NOTHING_VERIFIED_LABEL;
+    } else if (verdict === "max_iterations") {
       bgColor = "bg-amber-500/10";
       textColor = "text-amber-500";
       icon = <AlertTriangle className="w-5 h-5" />;

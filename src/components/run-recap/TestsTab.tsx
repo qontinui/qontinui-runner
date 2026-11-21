@@ -31,7 +31,9 @@ import {
   FileWarning,
   Wrench,
   Globe,
+  HelpCircle,
 } from "lucide-react";
+import { loopVerdict, NOTHING_VERIFIED_LABEL } from "@/lib/loop-result-verdict";
 import { useTaskRunPlaywrightResults, useTaskRunVerificationResults } from "@/hooks/useAiData";
 import { formatDuration } from "@/lib/formatting";
 import type {
@@ -216,42 +218,46 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
   const hasVerificationResults = iterationResults.length > 0;
   const hasPlaywrightResults = playwrightTests.length > 0;
 
+  const verdict = loopResult ? loopVerdict(loopResult) : null;
+
   return (
     <div className="space-y-4">
       {/* Loop Result Summary (if available) */}
       {loopResult && (
         <div
           className={`rounded-lg p-4 ${
-            loopResult.verification_passed
+            verdict === "passed"
               ? "bg-green-500/10 text-green-500"
-              : loopResult.critical_failure
+              : verdict === "critical_failure"
                 ? "bg-red-500/10 text-red-500"
-                : loopResult.was_stopped
-                  ? "bg-amber-500/10 text-amber-500"
+                : verdict === "nothing_verified"
+                  ? "bg-muted text-muted-foreground"
                   : "bg-amber-500/10 text-amber-500"
           }`}
         >
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
-              {loopResult.verification_passed ? (
-                <CheckCircle2 className="w-5 h-5" />
-              ) : loopResult.critical_failure ? (
-                <AlertTriangle className="w-5 h-5" />
-              ) : loopResult.was_stopped ? (
-                <StopCircle className="w-5 h-5" />
-              ) : (
-                <XCircle className="w-5 h-5" />
-              )}
+              {
+                {
+                  passed: <CheckCircle2 className="w-5 h-5" />,
+                  critical_failure: <AlertTriangle className="w-5 h-5" />,
+                  stopped: <StopCircle className="w-5 h-5" />,
+                  nothing_verified: <HelpCircle className="w-5 h-5" />,
+                  max_iterations: <XCircle className="w-5 h-5" />,
+                  failed: <XCircle className="w-5 h-5" />,
+                }[loopVerdict(loopResult)]
+              }
               <span className="font-medium">
-                {loopResult.verification_passed
-                  ? "Verification Passed"
-                  : loopResult.critical_failure
-                    ? "Critical Failure"
-                    : loopResult.was_stopped
-                      ? "Run Stopped"
-                      : loopResult.max_iterations_reached
-                        ? "Max Iterations Reached"
-                        : "Verification Failed"}
+                {
+                  {
+                    passed: "Verification Passed",
+                    critical_failure: "Critical Failure",
+                    stopped: "Run Stopped",
+                    nothing_verified: NOTHING_VERIFIED_LABEL,
+                    max_iterations: "Max Iterations Reached",
+                    failed: "Verification Failed",
+                  }[loopVerdict(loopResult)]
+                }
               </span>
             </div>
             <div className="flex items-center gap-1 text-sm">

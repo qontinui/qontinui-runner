@@ -15,8 +15,10 @@ import {
   StopCircle,
   Users,
   FileText,
+  HelpCircle,
 } from "lucide-react";
 import { formatDuration } from "@/lib/formatting";
+import { loopVerdict, NOTHING_VERIFIED_LABEL } from "@/lib/loop-result-verdict";
 import type { LoopResult } from "@/types/aiData";
 
 interface CompactStatusStripProps {
@@ -48,22 +50,28 @@ export function CompactStatusStrip({
   let label = "Unknown";
 
   if (loopResult) {
-    if (loopResult.was_stopped) {
+    const verdict = loopVerdict(loopResult);
+    if (verdict === "stopped") {
       statusBg = "bg-amber-500/15";
       statusText = "text-amber-400";
       StatusIcon = StopCircle;
       label = "Stopped";
-    } else if (loopResult.critical_failure) {
+    } else if (verdict === "critical_failure") {
       statusBg = "bg-red-500/15";
       statusText = "text-red-400";
       StatusIcon = AlertTriangle;
       label = "Critical Failure";
-    } else if (loopResult.verification_passed) {
+    } else if (verdict === "passed") {
       statusBg = "bg-green-500/15";
       statusText = "text-green-400";
       StatusIcon = CheckCircle2;
       label = "Passed";
-    } else if (loopResult.max_iterations_reached) {
+    } else if (verdict === "nothing_verified") {
+      // Nothing was checked: unknown, rendered neutrally — never the green
+      // "Completed" the status fallback below would otherwise show.
+      StatusIcon = HelpCircle;
+      label = NOTHING_VERIFIED_LABEL;
+    } else if (verdict === "max_iterations") {
       statusBg = "bg-amber-500/15";
       statusText = "text-amber-400";
       StatusIcon = AlertTriangle;
