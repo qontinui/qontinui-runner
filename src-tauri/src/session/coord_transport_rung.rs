@@ -359,6 +359,9 @@ const READ_TOOLS: &[&str] = &[
     "coord_agent_registry_effective",
     "coord_alert_queue",
     "coord_am_i_clear",
+    // The auto-publisher's status (direction, settles_at, held, the kill
+    // switch; qontinui-coord#4238). No read prefix covers it.
+    "coord_auto_publish_status",
     "coord_blockers",
     "coord_build_info",
     "coord_can",
@@ -374,6 +377,9 @@ const READ_TOOLS: &[&str] = &[
     "coord_conflict_check",
     "coord_diagnose",
     "coord_diff_impact",
+    // The read-back of an expedited-land request; its write twin is
+    // `coord_request_expedited_land`. No read prefix covers it.
+    "coord_expedited_land_status",
     // No `coord_fleet_` prefix covers it, so without this it reads as a write.
     "coord_fleet_dispatch_roles",
     "coord_fleet_drain_status",
@@ -1015,6 +1021,8 @@ mod tests {
         }
         for tool in [
             "coord_alert_queue",
+            "coord_auto_publish_status",
+            "coord_expedited_land_status",
             "coord_fleet_dispatch_roles",
             "coord_fleet_drain_status",
             "coord_next_step_settings_effective",
