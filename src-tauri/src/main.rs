@@ -1403,7 +1403,7 @@ static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::On
 /// ## Why 16, and why not 2-4
 ///
 /// This is not an auxiliary runtime. `fleet-pub-rt` (1 worker) and `mcp-api-rt`
-/// ([`mcp_api::API_RUNTIME_WORKER_THREADS`] = 4) each serve one subsystem and
+/// (`mcp_api::serve::API_RUNTIME_WORKER_THREADS` = 4) each serve one subsystem and
 /// are sized for it. This one serves every Tauri IPC command and every
 /// `tauri::async_runtime::spawn` in the process — and `serve_on_dedicated_runtime`
 /// exists precisely BECAUSE this runtime has a history of being wedged by a
@@ -1603,7 +1603,7 @@ mod app_runtime_tests {
 /// `process::exit`, and would otherwise pay for a runtime they discard.
 ///
 /// Fail-open in both directions, the same posture
-/// `mcp_api::serve_on_dedicated_runtime` takes for the same reason — a
+/// `mcp_api::serve::serve_on_dedicated_runtime` takes for the same reason — a
 /// degraded runtime is strictly better than no runner:
 /// - a runtime we cannot BUILD leaves Tauri to build its own (today's behaviour);
 /// - a slot that is already TAKEN is caught rather than fatal, and the runtime
