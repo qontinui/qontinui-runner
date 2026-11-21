@@ -70,7 +70,9 @@
 # MAINTENANCE. Enforced in part by
 # src-tauri/tests/ci_targets_map_covers_every_gating_job.rs: every gating
 # job has a target, every target names a gating job, every literal path
-# exists. Re-scoping is not mechanical. This map must be updated in the
+# exists, and every file a trigger-level `paths:` / `paths-ignore:` filter
+# fires on is observed by that job's target. The rest of re-scoping is not mechanical.
+# This map must be updated in the
 # same PR whenever a CI job is added, removed or re-scoped (a new workflow,
 # a changed `paths:` filter, a new compile-time, import or test-time read
 # outside the compiling package).

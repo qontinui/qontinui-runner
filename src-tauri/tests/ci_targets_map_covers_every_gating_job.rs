@@ -31,9 +31,21 @@
 //! and the new path matches only some other target. That is the one unsound
 //! direction the map header names.
 //!
-//! **Re-scoped** (a job that starts reading a new file) is not mechanical. It
-//! would need the build-graph extractor the map says was never run. This test
-//! does not pretend to check it.
+//! **Re-scoped** has one mechanical half, and it is pinned: a changed
+//! trigger-level `paths:` / `paths-ignore:` filter. Every file such a trigger
+//! fires on today must be observed by each of its jobs' targets (or by
+//! `global`), and a filter entry that matches no file must be spelled in the
+//! target as written. The map says each path-filtered target mirrors its
+//! workflow's filter as its roots, so a filter widened without the map leaves
+//! a file that starts the job listed only under some other target, which is
+//! the unsound direction. Filters are matched with `glob_match` after
+//! [`github_glob`] rewrites GitHub's `**.ext` shape, which `glob_match` would
+//! otherwise read as root-only. GitHub's `+` quantifier is not modelled; no
+//! filter uses it.
+//!
+//! The other half (a job that starts reading a new file through its build or
+//! its tests) is not mechanical. It would need the build-graph extractor the
+//! map says was never run. This test does not pretend to check it.
 //!
 //! # Target naming (the convention the map already uses)
 //!
@@ -385,8 +397,18 @@ fn runs_on(
     runs
 }
 
-/// workflow stem -> the ids of its jobs that run on at least one gating event.
-fn gating_jobs(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
+/// The ids of the jobs in `jobs` that run on `event`.
+fn jobs_running_on(jobs: &serde_yaml::Mapping, event: &str) -> BTreeSet<String> {
+    let mut memo = BTreeMap::new();
+    jobs.keys()
+        .map(|id| id.as_str().expect("job id").to_string())
+        .filter(|id| runs_on(jobs, id, event, &mut memo))
+        .collect()
+}
+
+/// Every workflow under `.github/workflows`, as (stem, parsed document),
+/// sorted by file name.
+fn load_workflows(root: &Path) -> Vec<(String, Value)> {
     let dir = root.join(".github").join("workflows");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
@@ -395,39 +417,226 @@ fn gating_jobs(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
         .collect();
     files.sort();
     assert!(!files.is_empty(), "no workflows under {}", dir.display());
+    files
+        .into_iter()
+        .map(|file| {
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("utf-8 workflow name")
+                .to_string();
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+            let doc: Value = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", file.display()));
+            (stem, doc)
+        })
+        .collect()
+}
 
+fn workflow_jobs<'a>(stem: &str, doc: &'a Value) -> &'a serde_yaml::Mapping {
+    doc.get("jobs")
+        .and_then(Value::as_mapping)
+        .unwrap_or_else(|| panic!("{stem}: no `jobs:` mapping"))
+}
+
+/// workflow stem -> the ids of its jobs that run on at least one gating event.
+fn gating_jobs(workflows: &[(String, Value)]) -> BTreeMap<String, BTreeSet<String>> {
     let mut out = BTreeMap::new();
-    for file in files {
-        let stem = file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .expect("utf-8 workflow name")
-            .to_string();
-        let text = std::fs::read_to_string(&file)
-            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        let doc: Value =
-            serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", file.display()));
-        let events = gating_events(&on_events(&doc));
+    for (stem, doc) in workflows {
+        let events = gating_events(&on_events(doc));
         if events.is_empty() {
             continue;
         }
-        let jobs = doc
-            .get("jobs")
-            .and_then(Value::as_mapping)
-            .unwrap_or_else(|| panic!("{stem}: no `jobs:` mapping"));
-        let mut gating = BTreeSet::new();
-        for event in &events {
-            let mut memo = BTreeMap::new();
-            for id in jobs.keys() {
-                let id = id.as_str().expect("job id");
-                if runs_on(jobs, id, event, &mut memo) {
-                    gating.insert(id.to_string());
+        let jobs = workflow_jobs(stem, doc);
+        let gating = events
+            .iter()
+            .flat_map(|event| jobs_running_on(jobs, event))
+            .collect();
+        out.insert(stem.clone(), gating);
+    }
+    out
+}
+
+/// One gating trigger that carries a trigger-level path filter.
+struct PathFilteredTrigger {
+    stem: String,
+    event: &'static str,
+    /// The jobs that run on this event.
+    jobs: BTreeSet<String>,
+    /// `paths:` entries, negations (`!x`) dropped, in [`github_glob`] form.
+    paths: Option<Vec<String>>,
+    /// `paths-ignore:` entries in [`github_glob`] form.
+    paths_ignore: Option<Vec<String>>,
+}
+
+/// Every gating trigger with a `paths:` or `paths-ignore:` filter.
+///
+/// A `!` entry inside `paths:` can only REMOVE files from the trigger set, so
+/// dropping it widens the set this check demands coverage for. That is the
+/// conservative direction. A `!` inside `paths-ignore:` would re-include
+/// files, and dropping it would narrow the set, so it is refused, as a negated
+/// branch pattern is.
+fn path_filtered_triggers(workflows: &[(String, Value)]) -> Vec<PathFilteredTrigger> {
+    let mut out = Vec::new();
+    for (stem, doc) in workflows {
+        let on = on_events(doc);
+        for event in gating_events(&on) {
+            let config = &on[event];
+            let paths = string_list(config, "paths").map(|ps| {
+                ps.iter()
+                    .filter(|p| !p.starts_with('!'))
+                    .map(|p| github_glob(p))
+                    .collect()
+            });
+            let paths_ignore = string_list(config, "paths-ignore").map(|ps| {
+                ps.iter()
+                    .map(|p| {
+                        assert!(
+                            !p.starts_with('!'),
+                            "{stem}.yml: negated `paths-ignore` entry `{p}`: this check does \
+                             not model GitHub's positional negation; extend it"
+                        );
+                        github_glob(p)
+                    })
+                    .collect()
+            });
+            if paths.is_none() && paths_ignore.is_none() {
+                continue;
+            }
+            out.push(PathFilteredTrigger {
+                stem: stem.clone(),
+                event,
+                jobs: jobs_running_on(workflow_jobs(stem, doc), event),
+                paths,
+                paths_ignore,
+            });
+        }
+    }
+    out
+}
+
+/// A GitHub filter pattern in the form `glob_match` reads the same way.
+///
+/// GitHub's `**` matches any characters, `/` included, wherever it appears.
+/// `glob_match` treats `**` as a globstar only as a whole path segment, so
+/// `**.ps1` would match `a.ps1` and never `scripts/a.ps1`. A `**` followed by
+/// anything but `/` is rewritten to `**/*` (`**.ps1` -> `**/*.ps1`), which
+/// matches the same files when the `**` starts a path segment. A `**` in the
+/// middle of a segment (`test**.sh`) has no such equivalent and is refused.
+fn github_glob(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 2);
+    let mut rest = pattern;
+    while let Some(at) = rest.find("**") {
+        let starts_segment = (out.is_empty() && at == 0)
+            || rest[..at].ends_with('/')
+            || (at == 0 && out.ends_with('/'));
+        let ends_pattern = rest.len() == at + 2;
+        assert!(
+            starts_segment || ends_pattern || rest[at + 2..].starts_with('/'),
+            "filter pattern `{pattern}` has a `**` inside a path segment, which this check \
+             cannot translate for glob_match; extend `github_glob`"
+        );
+        out.push_str(&rest[..at]);
+        out.push_str("**");
+        rest = &rest[at + 2..];
+        if !rest.is_empty() && !rest.starts_with('/') {
+            out.push_str("/*");
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The targets that cover job `job` of workflow `stem` (naming convention in
+/// the module docs).
+fn covering_targets<'a>(map: &'a TargetMap, stem: &str, job: &str) -> Vec<&'a Target> {
+    let scoped = format!("{stem}:{job}");
+    map.targets
+        .iter()
+        .filter(|t| {
+            t.name == stem || t.name == scoped || (stem == BARE_JOB_WORKFLOW && t.name == job)
+        })
+        .collect()
+}
+
+/// Every file a path-filtered trigger fires on must be observed by each job's
+/// target (or by `global`). Otherwise a file that starts the job is listed
+/// only under some other target, or under none, and the first case is the
+/// one unsound direction the map header names.
+fn path_filter_violations(
+    map: &TargetMap,
+    triggers: &[PathFilteredTrigger],
+    files: &[String],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for trigger in triggers {
+        let stem = &trigger.stem;
+        let fires: Vec<&String> = files
+            .iter()
+            .filter(|f| {
+                let included = trigger
+                    .paths
+                    .as_ref()
+                    .is_none_or(|ps| ps.iter().any(|p| glob_match::glob_match(p, f)));
+                let ignored = trigger
+                    .paths_ignore
+                    .as_ref()
+                    .is_some_and(|ps| ps.iter().any(|p| glob_match::glob_match(p, f)));
+                included && !ignored
+            })
+            .collect();
+        for job in &trigger.jobs {
+            let targets = covering_targets(map, stem, job);
+            if targets.is_empty() {
+                // Reported as an uncovered gating job by the main test.
+                continue;
+            }
+            let observes: Vec<&str> = targets
+                .iter()
+                .flat_map(|t| t.observes.iter())
+                .chain(map.global.iter())
+                .map(String::as_str)
+                .collect();
+            let target_names = targets
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join("`, `");
+            let uncovered: Vec<&str> = fires
+                .iter()
+                .filter(|f| !observes.iter().any(|o| glob_match::glob_match(o, f)))
+                .map(|f| f.as_str())
+                .collect();
+            if !uncovered.is_empty() {
+                let shown = uncovered.iter().take(5).copied().collect::<Vec<_>>();
+                violations.push(format!(
+                    "job `{job}` in .github/workflows/{stem}.yml fires on {} for {} file(s) \
+                     target `{target_names}` does not observe (e.g. {}) — add its `paths:` \
+                     filter to the target's `observes`",
+                    trigger.event,
+                    uncovered.len(),
+                    shown.join(", ")
+                ));
+            }
+            // A filter entry that matches nothing today cannot be checked file
+            // by file, so it must be spelled in the target (in github_glob
+            // form, which is how the map spells it).
+            for pattern in trigger.paths.iter().flatten() {
+                let matches_nothing = !files.iter().any(|f| glob_match::glob_match(pattern, f));
+                if matches_nothing
+                    && !observes.contains(&pattern.as_str())
+                    && !observes.contains(&"**")
+                {
+                    violations.push(format!(
+                        "job `{job}` in .github/workflows/{stem}.yml filters on `{pattern}`, \
+                         which matches no file and is not listed in target `{target_names}`"
+                    ));
                 }
             }
         }
-        out.insert(stem, gating);
     }
-    out
+    violations
 }
 
 /// Globs the map keeps on purpose although nothing matches them today.
@@ -483,7 +692,8 @@ fn ci_targets_map_names_every_gating_job_and_only_gating_jobs() {
         map.version, 1,
         "a new map version needs this test (and coord's reader) taught it"
     );
-    let gating = gating_jobs(&root);
+    let workflows = load_workflows(&root);
+    let gating = gating_jobs(&workflows);
 
     // The sweep must find something. An empty one passes vacuously, and that
     // is the failure this test exists to catch.
@@ -571,6 +781,13 @@ fn ci_targets_map_names_every_gating_job_and_only_gating_jobs() {
             violations.push(format!("`{owner}` lists `{path}`, which matches no file"));
         }
     }
+
+    // A changed `paths:` filter is the mechanical half of a re-scope.
+    violations.extend(path_filter_violations(
+        &map,
+        &path_filtered_triggers(&workflows),
+        &files,
+    ));
 
     assert!(
         violations.is_empty(),
@@ -693,4 +910,152 @@ fn trigger_reader_refuses_a_negated_branch_pattern() {
 #[should_panic(expected = "unclassified trigger `merge_group`")]
 fn trigger_reader_refuses_an_unclassified_trigger() {
     events_of("on:\n  merge_group: {}");
+}
+
+#[test]
+fn path_filter_check_flags_a_filter_the_target_does_not_observe() {
+    let workflows: Vec<(String, Value)> = [
+        (
+            "lint",
+            "on:\n  pull_request:\n    paths: ['scripts/**', '!scripts/skip.sh', 'gone/**']\n\
+             jobs:\n  check: {}\n  scheduled: {if: \"github.event_name == 'schedule'\"}\n",
+        ),
+        (
+            "docs",
+            "on:\n  pull_request:\n    paths-ignore: ['src/**']\njobs:\n  build: {}\n",
+        ),
+        ("plain", "on: [pull_request]\njobs:\n  run: {}\n"),
+    ]
+    .into_iter()
+    .map(|(stem, yaml)| {
+        (
+            stem.to_string(),
+            serde_yaml::from_str(yaml).expect("fixture parses"),
+        )
+    })
+    .collect();
+    let files: Vec<String> = [
+        "scripts/a.sh",
+        "scripts/skip.sh",
+        "src/main.rs",
+        "README.md",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let triggers = path_filtered_triggers(&workflows);
+    // `plain` has no path filter; `scheduled` never runs on a pull request.
+    assert_eq!(triggers.len(), 2);
+    let lint = triggers.iter().find(|t| t.stem == "lint").expect("lint");
+    assert_eq!(lint.jobs, BTreeSet::from(["check".to_string()]));
+    assert_eq!(
+        lint.paths.as_deref(),
+        Some(&["scripts/**".to_string(), "gone/**".to_string()][..]),
+        "a `!` entry only narrows, so it is dropped"
+    );
+
+    let map = |lint: &[&str], docs: &[&str]| TargetMap {
+        version: 1,
+        global: vec!["README.md".into()],
+        targets: vec![
+            Target {
+                name: "lint".into(),
+                observes: lint.iter().map(|s| s.to_string()).collect(),
+            },
+            Target {
+                name: "docs:build".into(),
+                observes: docs.iter().map(|s| s.to_string()).collect(),
+            },
+        ],
+    };
+
+    // Mirrored filters: clean. README.md is covered through `global`.
+    let ok = map(&["scripts/**", "gone/**"], &["**"]);
+    assert_eq!(
+        path_filter_violations(&ok, &triggers, &files),
+        Vec::<String>::new()
+    );
+
+    // A file the filter fires on, listed nowhere in the target, is flagged.
+    // So is the dropped negation's file: `!` is ignored, which is conservative.
+    let narrow = map(&["scripts/a.sh", "gone/**"], &["**"]);
+    let v = path_filter_violations(&narrow, &triggers, &files);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("scripts/skip.sh"), "{v:?}");
+
+    // A filter entry that matches no file must be spelled in the target.
+    let unspelled = map(&["scripts/**"], &["**"]);
+    let v = path_filter_violations(&unspelled, &triggers, &files);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("`gone/**`"), "{v:?}");
+
+    // `paths-ignore`: every file NOT ignored fires the job.
+    let docs_narrow = map(&["scripts/**", "gone/**"], &["scripts/**"]);
+    let v = path_filter_violations(&docs_narrow, &triggers, &files);
+    assert_eq!(v.len(), 0, "README.md is global, src/** is ignored: {v:?}");
+    let docs_blind = map(&["scripts/**", "gone/**"], &["nothing/**"]);
+    let v = path_filter_violations(&docs_blind, &triggers, &files);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("`docs:build`"), "{v:?}");
+}
+
+#[test]
+fn github_glob_matches_nested_files_for_a_double_star_extension() {
+    assert_eq!(github_glob("**.ps1"), "**/*.ps1");
+    assert_eq!(github_glob("docs/**.md"), "docs/**/*.md");
+    assert_eq!(github_glob("scripts/**"), "scripts/**");
+    assert_eq!(github_glob("**/*.ps1"), "**/*.ps1");
+    assert_eq!(github_glob("a.yml"), "a.yml");
+    assert_eq!(github_glob("src/**/x/**.ts"), "src/**/x/**/*.ts");
+    // The shape glob_match alone gets wrong, and the one this fixes.
+    assert!(!glob_match::glob_match("**.ps1", "scripts/a.ps1"));
+    assert!(glob_match::glob_match(
+        &github_glob("**.ps1"),
+        "scripts/a.ps1"
+    ));
+    assert!(glob_match::glob_match(&github_glob("**.ps1"), "a.ps1"));
+
+    // End to end: a `**.ps1` filter fires on a nested script, so a target
+    // that observes only the root cannot pass.
+    let workflows: Vec<(String, Value)> = vec![(
+        "ps".to_string(),
+        serde_yaml::from_str("on:\n  pull_request:\n    paths: ['**.ps1']\njobs:\n  parse: {}\n")
+            .expect("fixture parses"),
+    )];
+    let files = vec!["tools/deep/x.ps1".to_string()];
+    let triggers = path_filtered_triggers(&workflows);
+    let map = |observes: &[&str]| TargetMap {
+        version: 1,
+        global: vec![],
+        targets: vec![Target {
+            name: "ps".into(),
+            observes: observes.iter().map(|s| s.to_string()).collect(),
+        }],
+    };
+    assert_eq!(
+        path_filter_violations(&map(&["**/*.ps1"]), &triggers, &files),
+        Vec::<String>::new()
+    );
+    let v = path_filter_violations(&map(&["*.ps1"]), &triggers, &files);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("tools/deep/x.ps1"), "{v:?}");
+}
+
+#[test]
+#[should_panic(expected = "negated `paths-ignore` entry")]
+fn path_filter_reader_refuses_a_negated_paths_ignore_entry() {
+    let workflows: Vec<(String, Value)> = vec![(
+        "w".to_string(),
+        serde_yaml::from_str(
+            "on:\n  pull_request:\n    paths-ignore: ['!docs/**']\njobs:\n  j: {}\n",
+        )
+        .expect("fixture parses"),
+    )];
+    path_filtered_triggers(&workflows);
+}
+
+#[test]
+#[should_panic(expected = "inside a path segment")]
+fn github_glob_refuses_a_double_star_inside_a_segment() {
+    github_glob("scripts/test**.sh");
 }
