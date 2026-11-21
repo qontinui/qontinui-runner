@@ -71,6 +71,33 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
     )
 }
 
+/// Did a `claude` argv (everything after the program) already choose a
+/// session? Then nothing may add a second one. Exact token match,
+/// case-insensitive: `--session-id`, `--resume`, `-r`, the `resume`
+/// subcommand, `--continue`, `-c`, plus the `--session-id=…` / `--resume=…`
+/// inline forms. A merely-prefixed token (`--session-id-ish`) does NOT match,
+/// and neither does anything after a `--`, which is positional.
+///
+/// The ONE spelling of that set: the identity shim (`bin/qontinui_shim.rs`)
+/// decides from it whether to append `--session-id $QONTINUI_PINNED_SESSION_ID`,
+/// and the runner's terminal seam decides from it whether a pane started
+/// without that shim lost its pin (plan
+/// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+/// Phase 2). Two copies would drift.
+pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
+    args.iter()
+        .map(AsRef::as_ref)
+        .take_while(|a| *a != "--")
+        .any(|a| {
+            let t = a.to_ascii_lowercase();
+            matches!(
+                t.as_str(),
+                "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
+            ) || t.starts_with("--session-id=")
+                || t.starts_with("--resume=")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

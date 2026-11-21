@@ -287,16 +287,11 @@ pub fn detect_identity_tool(argv0: Option<&str>) -> Option<IdentityTool> {
 /// `identity_shim.cmd`; plus the `--session-id=…`/`--resume=…` inline forms the
 /// bash identity shim also honors. A merely-prefixed token
 /// (`--session-id-ish`) does NOT match, and neither does anything after a `--`,
-/// which is positional.
+/// which is positional. The token set itself is
+/// `qontinui_runner_lib::claude_env::claude_argv_chooses_session`, shared with
+/// the runner's terminal seam.
 pub fn user_chose_session(args: &[String]) -> bool {
-    args.iter().take_while(|a| *a != "--").any(|a| {
-        let t = a.to_ascii_lowercase();
-        matches!(
-            t.as_str(),
-            "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
-        ) || t.starts_with("--session-id=")
-            || t.starts_with("--resume=")
-    })
+    qontinui_runner_lib::claude_env::claude_argv_chooses_session(args)
 }
 
 /// The claude SessionStart-hook `--settings` args: tool==claude AND the env
