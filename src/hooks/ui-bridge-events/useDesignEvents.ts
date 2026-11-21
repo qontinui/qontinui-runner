@@ -6,11 +6,14 @@ import {
   designAuditOf,
   designFailureCode,
   designSnapshotOf,
+  diffRegisteredDesignTokens,
   diffQualityBaseline,
   elementStylesOf,
   evaluateRegisteredQuality,
+  inferRegisteredStyleGuide,
   qualityFailureCode,
   responsiveSnapshotsOf,
+  styleInferenceFailureCode,
   viewportConstraintsOf,
 } from "@qontinui/ui-bridge";
 import type { InteractionStateName, SnapshotBaseline, StyleGuideConfig } from "@qontinui/ui-bridge";
@@ -31,6 +34,7 @@ function paramsOf(payload: UIBridgeRequestPayload): Record<string, unknown> {
  * Handles: design_get_snapshot, design_get_element_styles, design_get_state_styles,
  *          design_get_responsive, design_run_audit, design_load_style_guide,
  *          design_get_style_guide, design_clear_style_guide,
+ *          design_infer_style_guide, design_diff_tokens,
  *          design_evaluate, design_evaluate_baseline, design_evaluate_contexts,
  *          design_evaluate_diff, set_viewport_constraints
  *
@@ -96,6 +100,8 @@ export function useDesignEvents(
         return true;
       };
       const design = (routeCode: string) => (err: unknown) => designFailureCode(err, routeCode);
+      const inference = (routeCode: string) => (err: unknown) =>
+        styleInferenceFailureCode(err, routeCode);
       const quality = (routeCode: string) => (err: unknown) => qualityFailureCode(err, routeCode);
 
       switch (type) {
@@ -234,6 +240,24 @@ export function useDesignEvents(
           });
           return true;
         }
+
+        case "design_infer_style_guide":
+          return answer(
+            () => inferRegisteredStyleGuide(currentBridge.elements, payload.params),
+            inference("STYLE_INFERENCE_ERROR"),
+          );
+
+        case "design_diff_tokens":
+          // `loadedStyleGuideRef` backs the request's `loadedStyleGuide` source.
+          return answer(
+            () =>
+              diffRegisteredDesignTokens(
+                currentBridge.elements,
+                payload.params,
+                loadedStyleGuideRef.current,
+              ),
+            inference("TOKEN_DRIFT_ERROR"),
+          );
 
         // ==================================================================
         // Design Evaluation

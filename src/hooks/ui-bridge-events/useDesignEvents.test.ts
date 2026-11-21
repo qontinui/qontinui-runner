@@ -258,3 +258,44 @@ describe("useDesignEvents — style guide fallback", () => {
     expect(vi.mocked(evaluateRegisteredQuality).mock.calls[1][2]).toBe(requestGuide);
   });
 });
+
+describe("useDesignEvents — style inference and drift", () => {
+  it("design_infer_style_guide answers a draft guide with a capture report", async () => {
+    const { send } = setup([registered("save")]);
+
+    const response = await send("design_infer_style_guide", {});
+
+    expect(response.success).toBe(true);
+    const data = response.data as { capture: { elementsSampled: number } };
+    expect(data.capture.elementsSampled).toBe(1);
+  });
+
+  it("design_infer_style_guide refuses a malformed body with the runtime's own code", async () => {
+    const { send } = setup([registered("save")]);
+
+    const response = await send("design_infer_style_guide", { maxElements: -1 });
+
+    expect(response.success).toBe(false);
+    expect(typeof response.code).toBe("string");
+    expect(response.code).not.toBe("STYLE_INFERENCE_ERROR");
+  });
+
+  it("design_diff_tokens reads the declared tokens from the request", async () => {
+    const { send } = setup([registered("save")]);
+
+    const response = await send("design_diff_tokens", {
+      customProperties: { "--smoke": "1px" },
+    });
+
+    expect(response.success).toBe(true);
+    expect((response.data as { declaredSource: string }).declaredSource).toBe("customProperties");
+  });
+
+  it("design_diff_tokens with no declared source and no loaded guide is refused", async () => {
+    const { send } = setup([registered("save")], null);
+
+    const response = await send("design_diff_tokens", {});
+
+    expect(response.success).toBe(false);
+  });
+});

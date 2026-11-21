@@ -150,6 +150,35 @@ pub async fn ui_bridge_design_clear_style_guide_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "design_clear_style_guide", payload).await)
 }
 
+/// Infer a draft style guide and a ranked token inventory from the computed
+/// styles of the registered elements (SDK action `inferStyleGuide`,
+/// `POST /design/style-guide/infer`). A relay: the inference is ui-bridge's
+/// shared request runtime, run in the webview (`design_infer_style_guide`).
+pub async fn ui_bridge_design_infer_style_guide_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - infer style guide");
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "design_infer_style_guide", params_payload(body)).await,
+    )
+}
+
+/// Report drift between the values the registered elements use and the
+/// declared design tokens (SDK action `diffDesignTokens`,
+/// `POST /design/tokens/drift`). Same relay shape as the infer route.
+pub async fn ui_bridge_design_tokens_drift_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - diff design tokens");
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "design_diff_tokens", params_payload(body)).await,
+    )
+}
+
 /// Manual design-review routes (does not include the macro-generated
 /// `design/evaluate*` family — those stay in `mod.rs`).
 pub fn routes() -> axum::Router<Arc<ApiState>> {
@@ -216,6 +245,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_design_audit_handler),
         )
         .route(
+            "/ui-bridge/design/style-guide/infer",
+            post(ui_bridge_design_infer_style_guide_handler),
+        )
+        .route(
+            "/ui-bridge/design/tokens/drift",
+            post(ui_bridge_design_tokens_drift_handler),
+        )
+        .route(
             "/ui-bridge/design/style-guide/load",
             post(ui_bridge_design_load_style_guide_handler),
         )
@@ -249,6 +286,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/design/snapshot"),
         ("POST", "/ui-bridge/design/responsive"),
         ("POST", "/ui-bridge/design/audit"),
+        ("POST", "/ui-bridge/design/style-guide/infer"),
+        ("POST", "/ui-bridge/design/tokens/drift"),
         ("POST", "/ui-bridge/design/style-guide/load"),
         ("GET", "/ui-bridge/design/style-guide"),
         ("DELETE", "/ui-bridge/design/style-guide"),

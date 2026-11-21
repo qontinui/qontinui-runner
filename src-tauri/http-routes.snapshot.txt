@@ -1537,7 +1537,9 @@ POST /ui-bridge/design/evaluate/baseline ui_bridge_design_evaluate_baseline_hand
 POST /ui-bridge/design/evaluate/diff ui_bridge_design_evaluate_diff_handler
 POST /ui-bridge/design/responsive ui_bridge_design_responsive_handler
 POST /ui-bridge/design/snapshot ui_bridge_design_snapshot_handler
+POST /ui-bridge/design/style-guide/infer ui_bridge_design_infer_style_guide_handler
 POST /ui-bridge/design/style-guide/load ui_bridge_design_load_style_guide_handler
+POST /ui-bridge/design/tokens/drift ui_bridge_design_tokens_drift_handler
 POST /ui-bridge/devices/register-lan register_lan_device
 POST /ui-bridge/devices/{id}/connect connect_device
 POST /ui-bridge/devices/{id}/disconnect disconnect_device
@@ -1664,7 +1666,9 @@ POST /ui-bridge/sdk/design/evaluate/baseline handle_save_baseline
 POST /ui-bridge/sdk/design/evaluate/diff handle_diff_baseline
 POST /ui-bridge/sdk/design/responsive handle_design_responsive
 POST /ui-bridge/sdk/design/snapshot handle_design_snapshot
+POST /ui-bridge/sdk/design/style-guide/infer handle_design_infer_style_guide
 POST /ui-bridge/sdk/design/style-guide/load handle_design_load_style_guide
+POST /ui-bridge/sdk/design/tokens/drift handle_design_tokens_drift
 POST /ui-bridge/sdk/diagnose-stuck handle_diagnose_stuck
 POST /ui-bridge/sdk/disconnect handle_disconnect
 POST /ui-bridge/sdk/discover handle_discover
