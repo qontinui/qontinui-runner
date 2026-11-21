@@ -6768,7 +6768,9 @@ mod tests {
         let (stale, at) = rig.finished_on_stale(x);
         // The heal re-addresses the synced mark to C, coord's live row.
         let c = Uuid::new_v4();
-        assert!(rig.store.note_finish_readdressed(x, at, c, true));
+        assert!(rig
+            .store
+            .note_finish_readdressed(x, at, c, true, Some(stale)));
         let r = Uuid::new_v4();
         rig.show_pane(x, r, 1_000);
 
@@ -6817,13 +6819,13 @@ mod tests {
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let rig = reoffer_rig();
         let x = "reoffer-heal-race-x";
-        let (_stale, at) = rig.finished_on_stale(x);
+        let (stale, at) = rig.finished_on_stale(x);
         let r = Uuid::new_v4();
         rig.show_pane(x, r, 1_000);
         let c = Uuid::new_v4();
         let store = rig.store.clone();
         race_after_decision(move || {
-            assert!(store.note_finish_readdressed(x, at, c, true));
+            assert!(store.note_finish_readdressed(x, at, c, true, Some(stale)));
         });
 
         assert_eq!(
@@ -6832,6 +6834,95 @@ mod tests {
         );
         assert!(finished_rows(&rig.reg).is_empty());
         assert_eq!(rig.mark(x), (false, Some(c)));
+    }
+
+    /// Round-3 review: the boot sweep's UNSYNCED path. The heal reads the mark
+    /// (its own row the stale R′, a drop left it unsynced) and decides to
+    /// re-address it to H, the row coord names; before its re-address lands,
+    /// the pane-row re-offer queues the finish to R. The heal's compare-and-
+    /// set on the row it read refuses (`MarkChanged`): nothing is sent to H,
+    /// the mark keeps R, and no `Finished` is left pending to two rows.
+    #[test]
+    fn a_heal_re_address_over_a_mark_the_re_offer_moved_is_refused() {
+        use crate::session::finish_heal::{apply_heal_observed, HealOutcome, Observations};
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-interleave-x";
+        open_on(&rig.store, x, "term-pane", None);
+        let stale = Uuid::new_v4();
+        rig.reg
+            .bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = rig
+            .store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        // The drain delivered it, coord's row never read `finished`: the
+        // unconfirmed drop records R′ as the sent row and leaves it unsynced.
+        let keys: Vec<(Uuid, i64)> = rig
+            .reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.session_id, o.seq))
+            .collect();
+        rig.reg.inner.outbox.ack(&keys).unwrap();
+        rig.store.note_finish_sent_row(x, Some(at), stale);
+        assert_eq!(rig.mark(x), (false, Some(stale)));
+
+        // 1. The boot sweep reads the mark.
+        let snapshot = rig.store.get(x).unwrap();
+
+        // 2. The pane-row re-offer moves it onto R and queues the finish.
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+
+        // 3. The heal, over its earlier snapshot, finds coord naming H —
+        // active, NULL, registered before the finish — and re-addresses.
+        let h = Uuid::new_v4();
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at - 60_000)
+            .unwrap()
+            .to_rfc3339();
+        let fetch = crate::mcp::session_work_status::fetch_from_body_for_test(
+            json!({
+                "statuses": {x: {"session_status": null, "since": null,
+                                 "coord_session_id": h.to_string(), "state": "active",
+                                 "started_at": before}},
+                "unknown": [], "invalid": [], "input_truncated": false,
+                "sessionBridgeColumnPresent": true
+            }),
+            1,
+        );
+        let ids = vec![x.to_string()];
+        let port: &dyn crate::session::finish_heal::HealPort = rig.reg.as_ref();
+        let out = apply_heal_observed(
+            &rig.store,
+            Some(port),
+            std::slice::from_ref(&snapshot),
+            &Observations::from_fetch(&ids, &fetch),
+            at + 1_000,
+            true,
+        );
+        assert_eq!(out, vec![(x.to_string(), HealOutcome::MarkChanged)]);
+
+        // 4. Nothing went to H; the mark keeps R, and is not flagged.
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        assert!(!rig.store.get(x).unwrap().finish_coord_readdressed);
+        // A heal that read the CURRENT target would still be allowed.
+        assert!(rig.store.note_finish_readdressed(x, at, h, false, Some(r)));
     }
 
     /// The other direction: after a re-offer moved the mark onto R, the
@@ -6862,7 +6953,7 @@ mod tests {
 
         // The heal later finds coord naming C as the live row.
         let c = Uuid::new_v4();
-        assert!(rig.store.note_finish_readdressed(x, at, c, false));
+        assert!(rig.store.note_finish_readdressed(x, at, c, false, Some(r)));
         assert_eq!(
             rig.reg.note_pane_row(r, x, RekeySource::Rung2),
             MoveOutcome::Unchanged
