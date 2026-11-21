@@ -1,0 +1,5 @@
+[
+  { "query": "Transitions", "queryType": "text", "assertion": "isVisible" },
+  { "query": "[role=row]", "assertion": "count", "expected": 3 },
+  { "query": ".status", "assertion": "hasText", "expected": "Ready" }
+]

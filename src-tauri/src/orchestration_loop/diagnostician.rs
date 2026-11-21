@@ -9,6 +9,10 @@ use super::remote_client::RunnerClient;
 use super::types::{DiagnosePhaseConfig, DiagnosticResult, RootCauseCategory};
 use crate::ai_provider::routing::run_prompt_with_model_override;
 use crate::ai_router::TaskContext;
+use crate::mcp::ui_bridge::screenshots::PageHealthSummary;
+use crate::mcp::ui_bridge::structured_assert::{
+    build_structured_assert_expression, StructuredAssertRequest,
+};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Run the full diagnostic evaluation: capture state, run assertions, triage if failed.
@@ -22,39 +26,46 @@ pub async fn run_diagnostic(
     diagnostic_history: &[DiagnosticResult],
     iteration: u32,
 ) -> Result<DiagnosticResult, String> {
-    // 1. Capture page health
+    // 1. Capture page health. A read that produced no report is recorded as
+    // such (no `summary`), so the pass predicate cannot read it as healthy.
     let page_health = runner.get_page_health().await.unwrap_or_else(|e| {
         warn!("Failed to get page health: {}", e);
-        serde_json::json!({ "status": "error", "error": e })
+        serde_json::json!({ "error": e })
     });
+    if page_health_summary(&page_health).is_none() {
+        warn!(
+            "page health has no recognised `summary` (OK|WARNING|CRITICAL): {}",
+            page_health
+        );
+    }
 
-    // 2. Run assertions
+    // 2. Run assertions — one entry per configured element, each a verdict
+    // or a no-verdict entry (`evaluated: false`, no `passed`).
     let assertion_results = if !config.assertions.is_empty() {
-        runner
-            .run_assertions(&config.assertions)
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Failed to run assertions: {}", e);
-                vec![serde_json::json!({ "error": e })]
-            })
+        runner.run_assertions(&config.assertions).await
     } else {
         vec![]
     };
+    for (i, entry) in assertion_results.iter().enumerate() {
+        if is_no_verdict(entry) {
+            warn!(
+                "diagnose assertion {} produced no verdict (status {}): {}",
+                i,
+                entry
+                    .get("status")
+                    .filter(|s| !s.is_null())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                entry
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("no error message")
+            );
+        }
+    }
 
     // 3. Check if everything passed
-    // The page-health route answers `summary: OK|WARNING|CRITICAL`; it emits
-    // no `status` key (the error stub above does, as "error").
-    let health_ok = page_health
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .map(|s| s == "OK")
-        .unwrap_or(false);
-
-    let all_assertions_passed = assertion_results
-        .iter()
-        .all(|r| r.get("passed").and_then(|v| v.as_bool()).unwrap_or(false));
-
-    let passed = health_ok && (config.assertions.is_empty() || all_assertions_passed);
+    let passed = diagnostic_passed(&page_health, &assertion_results, config.assertions.len());
 
     if passed {
         info!("Diagnostic evaluation PASSED at iteration {}", iteration);
@@ -157,6 +168,59 @@ pub async fn run_diagnostic(
     })
 }
 
+/// The page-health report's `summary`, when it is one the producer writes.
+fn page_health_summary(page_health: &serde_json::Value) -> Option<PageHealthSummary> {
+    page_health
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .and_then(PageHealthSummary::parse)
+}
+
+/// An assertion entry the route answered without a verdict: `evaluated:
+/// false`, or any entry with no boolean `passed`.
+fn is_no_verdict(entry: &serde_json::Value) -> bool {
+    entry.get("evaluated").and_then(|v| v.as_bool()) == Some(false)
+        || !entry.get("passed").is_some_and(|p| p.is_boolean())
+}
+
+/// The diagnose phase's pass predicate: the page-health `summary` is `OK`,
+/// and — when assertions are configured — every configured assertion has an
+/// entry carrying `passed: true`. A missing or unrecognised `summary`, a
+/// no-verdict entry and a missing entry are all NOT a pass: an unknown is
+/// never rendered as a verdict either way.
+pub(crate) fn diagnostic_passed(
+    page_health: &serde_json::Value,
+    assertion_results: &[serde_json::Value],
+    configured: usize,
+) -> bool {
+    let health_ok = page_health_summary(page_health) == Some(PageHealthSummary::Ok);
+    let assertions_ok = assertion_results.len() == configured
+        && assertion_results
+            .iter()
+            .all(|r| r.get("passed").and_then(|v| v.as_bool()).unwrap_or(false));
+    health_ok && assertions_ok
+}
+
+/// Refuse a diagnose config whose assertions the route would reject: each
+/// element must deserialize as the route's `StructuredAssertRequest` and
+/// build into a script. The message names the element's index and the error.
+/// Called by `start_loop` and `start_multi_loop` before anything runs, so a
+/// malformed config costs no iteration, rebuild or AI triage call.
+pub(crate) fn validate_diagnose_assertions(assertions: &[serde_json::Value]) -> Result<(), String> {
+    for (i, element) in assertions.iter().enumerate() {
+        let request: StructuredAssertRequest =
+            serde_json::from_value(element.clone()).map_err(|e| {
+                format!(
+                    "pipeline.diagnose.assertions[{i}] is not an assertion the route accepts: {e}"
+                )
+            })?;
+        build_structured_assert_expression(&request).map_err(|e| {
+            format!("pipeline.diagnose.assertions[{i}] is not an assertion the route accepts: {e}")
+        })?;
+    }
+    Ok(())
+}
+
 /// Build the AI triage prompt from diagnostic evidence.
 fn build_triage_prompt(
     page_health: &serde_json::Value,
@@ -172,6 +236,28 @@ fn build_triage_prompt(
     );
 
     prompt.push_str(&format!("## Iteration: {}\n\n", iteration));
+
+    // What the instruments could not establish is stated, not left for the
+    // model to read as a UI failure.
+    if page_health_summary(page_health).is_none() {
+        prompt.push_str(
+            "Page health produced no recognised `summary` (OK|WARNING|CRITICAL): the \
+             health instrument did not report, so the page's health is UNKNOWN, not bad.\n\n",
+        );
+    }
+    let no_verdict = assertion_results
+        .iter()
+        .filter(|r| is_no_verdict(r))
+        .count();
+    if no_verdict > 0 {
+        prompt.push_str(&format!(
+            "{} of {} assertions produced no verdict (the assertion was refused or \
+             could not be evaluated); those entries say nothing about the UI and point \
+             at the verification steps or the infrastructure, not the rendering.\n\n",
+            no_verdict,
+            assertion_results.len()
+        ));
+    }
 
     prompt.push_str("## Page Health\n```json\n");
     prompt.push_str(&serde_json::to_string_pretty(page_health).unwrap_or_default());
@@ -418,5 +504,148 @@ mod tests {
     fn test_extract_json_block_raw() {
         let text = "prefix {\"a\": 1} suffix";
         assert_eq!(extract_json_block(text), "{\"a\": 1}");
+    }
+}
+
+#[cfg(test)]
+mod diagnose_verdict_tests {
+    //! The diagnose phase's pass predicate, its triage disclosure and its
+    //! start-time refusal (plan
+    //! 2026-11-12-structured-assert-arms-never-pass-and-diagnose-assertions-never-reach-the-route,
+    //! Phase 2). A no-verdict entry and an unrecognised health `summary` are
+    //! UNKNOWN: never a pass, and named to triage as unknown rather than bad.
+
+    use super::{build_triage_prompt, diagnostic_passed, validate_diagnose_assertions};
+    use serde_json::json;
+
+    /// The example the panel's placeholder and the tutorial both render.
+    const PANEL_EXAMPLE: &str =
+        include_str!("../../../src/components/orchestration-loop/diagnose-assertions-example.json");
+
+    #[test]
+    fn diagnostic_passed_reads_the_health_summary_and_every_verdict() {
+        let ok = json!({ "summary": "OK" });
+        let pass = json!({ "passed": true });
+        let fail = json!({ "passed": false });
+        let no_verdict = json!({ "evaluated": false, "error": "refused", "status": 400 });
+        let rows: Vec<(&str, serde_json::Value, Vec<serde_json::Value>, usize, bool)> = vec![
+            ("OK + passing", ok.clone(), vec![pass.clone()], 1, true),
+            ("OK + no assertions", ok.clone(), vec![], 0, true),
+            (
+                "WARNING",
+                json!({ "summary": "WARNING" }),
+                vec![pass.clone()],
+                1,
+                false,
+            ),
+            (
+                "CRITICAL",
+                json!({ "summary": "CRITICAL" }),
+                vec![],
+                0,
+                false,
+            ),
+            (
+                "no summary",
+                json!({ "error": "page health unavailable" }),
+                vec![],
+                0,
+                false,
+            ),
+            (
+                "legacy status key",
+                json!({ "status": "healthy" }),
+                vec![],
+                0,
+                false,
+            ),
+            ("lowercase ok", json!({ "summary": "ok" }), vec![], 0, false),
+            (
+                "OK + failing",
+                ok.clone(),
+                vec![pass.clone(), fail],
+                2,
+                false,
+            ),
+            (
+                "OK + verdict beside no-verdict",
+                ok.clone(),
+                vec![pass.clone(), no_verdict],
+                2,
+                false,
+            ),
+            (
+                "OK + missing entry",
+                ok.clone(),
+                vec![pass.clone()],
+                2,
+                false,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, health, results, configured, want) in rows {
+            let got = diagnostic_passed(&health, &results, configured);
+            if got != want {
+                failures.push(format!("{name}: want {want}, got {got}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn the_triage_prompt_names_assertions_with_no_verdict() {
+        let results = vec![
+            json!({ "passed": true }),
+            json!({ "evaluated": false, "error": "refused", "status": 422 }),
+            json!({ "evaluated": false, "error": "unreachable", "status": null }),
+        ];
+        let prompt = build_triage_prompt(&json!({ "summary": "OK" }), &results, None, &[], 1);
+        assert!(
+            prompt.contains("2 of 3 assertions produced no verdict"),
+            "{prompt}"
+        );
+        let clean = build_triage_prompt(&json!({ "summary": "OK" }), &results[..1], None, &[], 1);
+        assert!(!clean.contains("produced no verdict"), "{clean}");
+    }
+
+    #[test]
+    fn the_triage_prompt_names_an_unrecognised_health_summary() {
+        let prompt = build_triage_prompt(&json!({ "error": "HTTP 503" }), &[], None, &[], 1);
+        assert!(
+            prompt.contains("Page health produced no recognised `summary`"),
+            "{prompt}"
+        );
+        let known = build_triage_prompt(&json!({ "summary": "WARNING" }), &[], None, &[], 1);
+        assert!(!known.contains("no recognised `summary`"), "{known}");
+    }
+
+    /// T7: the example the authoring surfaces teach is one the route accepts.
+    #[test]
+    fn the_panels_example_is_accepted_by_the_route() {
+        let example: Vec<serde_json::Value> =
+            serde_json::from_str(PANEL_EXAMPLE).expect("the panel example is a JSON array");
+        assert!(
+            !example.is_empty(),
+            "the example teaches at least one assertion"
+        );
+        validate_diagnose_assertions(&example).expect("every example element is accepted");
+    }
+
+    #[test]
+    fn validate_diagnose_assertions_names_the_element_and_the_field() {
+        let err = validate_diagnose_assertions(&[json!({ "type": "visible", "role": "tab" })])
+            .expect_err("the old placeholder shape is refused");
+        assert!(err.contains("assertions[0]"), "{err}");
+        assert!(
+            err.contains("unknown field `role`"),
+            "names the field: {err}"
+        );
+        let err = validate_diagnose_assertions(&[
+            json!({ "query": "p", "assertion": "exists" }),
+            json!({ "query": "p", "assertion": "hasText", "expected": "" }),
+        ])
+        .expect_err("an empty hasText expected is refused");
+        assert!(err.contains("assertions[1]"), "{err}");
+        assert!(err.contains("`expected`"), "{err}");
     }
 }

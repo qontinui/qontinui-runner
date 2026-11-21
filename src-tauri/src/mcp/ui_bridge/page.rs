@@ -2072,7 +2072,10 @@ fn compile_js_regex_source(source: &str) -> Result<regex::Regex, String> {
 /// first gate pattern `expression` matches, in the gate's own order, or `None`
 /// when the gate would let it run. `allow_network_requests` lifts the network
 /// patterns and nothing else, as it does there.
-fn evaluate_gate_match(expression: &str, allow_network_requests: bool) -> Option<&'static str> {
+pub(super) fn evaluate_gate_match(
+    expression: &str,
+    allow_network_requests: bool,
+) -> Option<&'static str> {
     EVALUATE_GATE
         .iter()
         .filter(|(_, lifted, _)| !(allow_network_requests && *lifted))
