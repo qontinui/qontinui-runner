@@ -1032,10 +1032,7 @@ async fn do_capture(
     let provider = resolve_frame_provider(state, &req.target)
         .await
         .map_err(|e| e.to_json_err())?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
 
     let capture_backend = capture_backend_label(&frame);
 
@@ -1255,10 +1252,7 @@ async fn do_multi_capture(
     let provider = resolve_frame_provider(state, target)
         .await
         .map_err(|e| e.to_json_err())?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
     let frame_w = frame.width;
     let frame_h = frame.height;
     let capture_backend = capture_backend_label(&frame);
@@ -1503,10 +1497,7 @@ async fn produce_intermediate_frame(
     let provider = resolve_frame_provider(state, &req.target)
         .await
         .map_err(|e| e.to_json_err())?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
 
     let crop = resolve_crop_region(state, &req.region, &req.element, frame.width, frame.height)
         .await
@@ -1703,10 +1694,7 @@ async fn vision_raw_handler(
     let provider = resolve_frame_provider(&state, &req.target)
         .await
         .map_err(|e| e.to_json_err())?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(&state).await.map_err(|e| e.to_json_err())?;
 
     let capture_backend = capture_backend_label(&frame);
 
@@ -1958,10 +1946,7 @@ async fn capture_and_encode_png(
     let provider = resolve_frame_provider(state, target)
         .await
         .map_err(|e| e.to_json_err())?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
     let capture_backend = capture_backend_label(&frame);
     let crop = resolve_crop_region(state, region_req, element_id, frame.width, frame.height)
         .await
@@ -3851,10 +3836,7 @@ async fn vision_baseline_handler(
     let provider = resolve_frame_provider(&state, &req.target)
         .await
         .map_err(|e| e.to_json_err())?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(&state).await.map_err(|e| e.to_json_err())?;
 
     // Encode for storage. Use PNG-strict so the baseline is lossless.
     let capture_req: CaptureRequest = match req.capture {

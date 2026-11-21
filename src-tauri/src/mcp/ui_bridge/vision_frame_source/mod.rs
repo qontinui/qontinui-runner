@@ -9,9 +9,11 @@
 //! source its [`Frame`] from a *target* device/app instead. The resolution is
 //! driven by an optional `target` field on each request:
 //!
-//!   - `None`            → [`RunnerWindowSource`] — byte-identical to the
-//!     pre-existing behavior (delegates straight to
-//!     [`capture_runner_window_frame`]).
+//!   - `None`            → [`RunnerWindowSource`] — the capture itself is
+//!     byte-identical to the pre-existing behavior (delegates straight to
+//!     [`capture_runner_window_frame`]). One visible difference: a
+//!     soft-failing route's `frame_error` now carries a `CODE: ` prefix
+//!     ([`FrameSourceError::to_frame_error`]).
 //!   - registered phone  → [`DeviceScreenshotSource`] hitting the device's
 //!     proxy `…/ui-bridge/control/screenshot` endpoint.
 //!   - registered app    → by the app's TRANSPORT ([`provider_for_app`]):
@@ -188,8 +190,9 @@ pub trait FrameProvider: Send + Sync {
 
 /// Captures the runner's own desktop window. This is the legacy behavior and
 /// the resolution target for `target == None`; it delegates directly to the
-/// untouched [`capture_runner_window_frame`] so the no-target path is
-/// byte-identical to pre-decoupling.
+/// untouched [`capture_runner_window_frame`], so the no-target capture is
+/// byte-identical to pre-decoupling (only a soft-failing route's
+/// `frame_error` text gains its `CODE: ` prefix).
 pub struct RunnerWindowSource;
 
 #[async_trait]
@@ -243,11 +246,12 @@ impl DeviceScreenshotSource {
     pub async fn fetch(&self) -> Result<Frame, FrameSourceError> {
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/ui-bridge/control/screenshot");
-        let unreachable = |message: String, retryable: Option<bool>| FrameSourceError::Unreachable {
-            message,
-            code: CODE_APP_UNREACHABLE,
-            retryable,
-        };
+        let unreachable =
+            |message: String, retryable: Option<bool>| FrameSourceError::Unreachable {
+                message,
+                code: CODE_APP_UNREACHABLE,
+                retryable,
+            };
 
         let client = reqwest::Client::builder()
             .timeout(SCREENSHOT_HTTP_TIMEOUT)
@@ -256,7 +260,9 @@ impl DeviceScreenshotSource {
             // read timeout.
             .connect_timeout(Duration::from_secs(3))
             .build()
-            .map_err(|e| FrameSourceError::RunnerCapture(format!("build screenshot client: {e}")))?;
+            .map_err(|e| {
+                FrameSourceError::RunnerCapture(format!("build screenshot client: {e}"))
+            })?;
         let client = if self.phone {
             crate::mcp::sdk_http::probe_device_client(base, client)
                 .await
@@ -295,29 +301,43 @@ impl DeviceScreenshotSource {
                     ),
                 });
             }
+            // A gateway in front of the device answered for it (bad gateway,
+            // unavailable, gateway timeout): the device itself was never
+            // reached, so this is the transport's failure, not the app's.
+            let gateway = matches!(
+                status,
+                reqwest::StatusCode::BAD_GATEWAY
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    | reqwest::StatusCode::GATEWAY_TIMEOUT
+            );
             // A pairing refusal's `error` says what to do; keep it.
             let reason = resp
                 .json::<serde_json::Value>()
                 .await
                 .ok()
                 .and_then(|body| body.get("error")?.as_str().map(str::to_string));
-            return Err(FrameSourceError::CaptureFailed {
-                message: match reason {
-                    Some(reason) => {
-                        format!("device screenshot {url} returned HTTP {status}: {reason}")
-                    }
-                    None => format!("device screenshot {url} returned HTTP {status}"),
-                },
-                code: None,
-                retryable: None,
+            let message = match reason {
+                Some(reason) => format!("device screenshot {url} returned HTTP {status}: {reason}"),
+                None => format!("device screenshot {url} returned HTTP {status}"),
+            };
+            return Err(if gateway {
+                unreachable(message, None)
+            } else {
+                FrameSourceError::CaptureFailed {
+                    message,
+                    code: None,
+                    retryable: None,
+                }
             });
         }
         let body: serde_json::Value =
-            resp.json().await.map_err(|e| FrameSourceError::Unreachable {
-                message: format!("device screenshot {url} bad JSON: {e}"),
-                code: CODE_APP_RESPONSE_UNREADABLE,
-                retryable: None,
-            })?;
+            resp.json()
+                .await
+                .map_err(|e| FrameSourceError::Unreachable {
+                    message: format!("device screenshot {url} bad JSON: {e}"),
+                    code: CODE_APP_RESPONSE_UNREADABLE,
+                    retryable: None,
+                })?;
 
         frame_from_screenshot_json(&body).map_err(|e| FrameSourceError::CaptureFailed {
             message: format!("device at {base}: {e}"),
@@ -440,7 +460,8 @@ impl FrameProvider for AdbScreencapSource {
 
 /// The reason a WebSocket-transport app with no `screenshot` capability is
 /// refused (D2 of the plan).
-const WEBSOCKET_NO_CAPABILITY_REASON: &str = "the app is connected over /ui-bridge/ws and does not \
+const WEBSOCKET_NO_CAPABILITY_REASON: &str =
+    "the app is connected over /ui-bridge/ws and does not \
      advertise the `screenshot` capability (a plain in-page SDK tab cannot capture itself; a \
      wrapper or the extension live relay can)";
 
@@ -724,9 +745,24 @@ mod tests {
     /// of its page origin, and never sent a command frame.
     #[tokio::test]
     async fn a_websocket_app_without_the_capability_is_refused_with_422() {
+        // One registry, one WS manager, one dispatcher over both — the wiring
+        // `create_router` gives `ApiState` — so the frame channel read below is
+        // the one a dispatch to this app would write.
+        let registry = crate::mcp::app_registry::AppRegistry::new();
         let ws = crate::mcp::ws_relay::WsConnectionManager::new();
-        let (_conn, mut outbound_rx) = ws.test_register("plain-tab").await;
-        let entry = registered("plain-tab", AppTransport::Websocket, &["control"]).await;
+        let (conn, mut outbound_rx) = ws.test_register("plain-tab").await;
+        let mut app =
+            crate::mcp::app_dispatch::test_support::sample_app("plain-tab", "https://page.example");
+        app.capabilities = vec!["control".into()];
+        registry
+            .upsert(app, None, AppTransport::Websocket, Some(conn), None)
+            .await;
+        let relay = crate::mcp::command_relay::CommandRelay::with_timeout(
+            ws,
+            std::time::Duration::from_secs(2),
+        );
+        let dispatcher = crate::mcp::app_dispatch::AppDispatcher::new(registry.clone(), relay);
+        let entry = registry.get_live("plain-tab").await.expect("live row");
 
         let err = match provider_for_app("plain-tab", &entry) {
             Ok(p) => panic!(
@@ -746,6 +782,13 @@ mod tests {
         let (status, body) = err.to_json_err();
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.0.code.as_deref(), Some("FRAME_SOURCE_UNSUPPORTED"));
+
+        // The capture path itself refuses too, through the dispatcher wired to
+        // this WS manager — and nothing reaches the app's socket.
+        let err = ws_relay_source::capture_over_relay(&dispatcher, &registry, "plain-tab")
+            .await
+            .expect_err("the capture path must refuse as well");
+        assert_eq!(err.code(), "FRAME_SOURCE_UNSUPPORTED", "{err:?}");
         assert!(
             outbound_rx.try_recv().is_err(),
             "a refused target must not be sent a frame"
@@ -755,8 +798,7 @@ mod tests {
     /// A capable WebSocket app gets the relay source.
     #[tokio::test]
     async fn a_capable_websocket_app_gets_the_relay_source() {
-        let entry =
-            registered("wrapper", AppTransport::Websocket, &[SCREENSHOT_CAPABILITY]).await;
+        let entry = registered("wrapper", AppTransport::Websocket, &[SCREENSHOT_CAPABILITY]).await;
         let provider = provider_for_app("wrapper", &entry).expect("capable app resolves");
         assert_eq!(provider.source_label(), "websocket_relay");
     }
@@ -764,9 +806,15 @@ mod tests {
     /// (c) An HTTP app still gets `DeviceScreenshotSource`, whatever it advertises.
     #[tokio::test]
     async fn an_http_app_still_gets_the_device_http_source() {
-        let entry = registered("happ", AppTransport::Http, &[]).await;
-        let provider = provider_for_app("happ", &entry).expect("http app resolves");
-        assert_eq!(provider.source_label(), "device_http");
+        for caps in [&[][..], &[SCREENSHOT_CAPABILITY][..]] {
+            let entry = registered("happ", AppTransport::Http, caps).await;
+            let provider = provider_for_app("happ", &entry).expect("http app resolves");
+            assert_eq!(
+                provider.source_label(),
+                "device_http",
+                "capabilities {caps:?}"
+            );
+        }
     }
 
     /// The HTTP arm's 404 for a non-phone app names the cause (finish-to-zero).
@@ -788,10 +836,39 @@ mod tests {
         assert_eq!(err.code(), "FRAME_SOURCE_UNSUPPORTED", "{err:?}");
         let text = err.to_string();
         assert!(
-            text.contains(&format!("app 'page-app' at {base} does not serve /ui-bridge/control/screenshot")),
+            text.contains(&format!(
+                "app 'page-app' at {base} does not serve /ui-bridge/control/screenshot"
+            )),
             "{text}"
         );
         assert!(text.contains("screenshotProvider"), "{text}");
+    }
+
+    /// A7: a gateway status in front of the device is the transport's failure.
+    #[tokio::test]
+    async fn a_gateway_status_from_the_device_is_unreachable() {
+        let app = axum::Router::new().route(
+            "/ui-bridge/control/screenshot",
+            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let err = DeviceScreenshotSource {
+            base_url: base,
+            phone: false,
+            target: "proxied".into(),
+        }
+        .fetch()
+        .await
+        .expect_err("a 503 is not a frame");
+        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+        assert_eq!(
+            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+            "transport"
+        );
     }
 
     #[test]
@@ -803,12 +880,18 @@ mod tests {
         assert_eq!(unknown.to_json_err().1 .0.hint, None);
         let runner = FrameSourceError::RunnerCapture("no window".into());
         assert_eq!(runner.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(runner.to_string(), "no window", "the capture text is unchanged");
+        assert_eq!(
+            runner.to_string(),
+            "no window",
+            "the capture text is unchanged"
+        );
         assert_eq!(runner.to_frame_error(), "RUNNER_CAPTURE_FAILED: no window");
     }
 
-    /// Every provider names an entry of `VISION_FRAME_SOURCES`, and every
-    /// entry is some provider's — the `/health` advertisement cannot drift.
+    /// The providers listed here name exactly the entries of
+    /// `VISION_FRAME_SOURCES`, in order. This catches drift between the const
+    /// and the hand-listed providers below; a NEW provider type is caught only
+    /// if it is added to this list too.
     #[test]
     fn vision_frame_sources_lists_every_provider_exactly() {
         let labels = [
@@ -847,5 +930,4 @@ mod tests {
         // The soft-fail site carries the code into `frame_error`.
         assert_eq!(src.matches(".to_frame_error()").count(), 1);
     }
-
 }
