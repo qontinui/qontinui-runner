@@ -14237,6 +14237,15 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             let rewritten =
                 needs_upgrade && rewrite_config_preserving_nonce(&root, bound_port, &nonce);
             adopt_on_disk_nonce(&root, &nonce, rewritten, minted_at);
+            // A rewrite went through `write_mcp_json`, which excluded the file;
+            // an adopted file left as it was may predate the exclude.
+            if !rewritten {
+                crate::provision_exclude::exclude_workdir_artifacts(
+                    "coord_mcp .mcp.json",
+                    root_dir,
+                    &[MCP_JSON_FILE],
+                );
+            }
             info!(
                 "coord_mcp: boot self-heal ADOPTED on-disk root nonce for {root} \
                  (port :{bound_port} unchanged; nonce preserved verbatim; header shape \
@@ -14522,7 +14531,19 @@ where
             }
         }
         match action {
-            ReconcileAction::Leave => continue,
+            ReconcileAction::Leave => {
+                // A proxy-shaped config is runner-written (device or agent) and
+                // may predate the workdir-artifact exclude: give it its line.
+                // Any other shape may be the operator's own file — left alone.
+                if current_proxy_port.is_some() {
+                    crate::provision_exclude::exclude_workdir_artifacts(
+                        "coord_mcp .mcp.json",
+                        Path::new(&workdir),
+                        &[MCP_JSON_FILE],
+                    );
+                }
+                continue;
+            }
             ReconcileAction::AdoptNonce => {
                 // NO `coord_mcp_safe_to_write` guard, and none is possible.
                 //
@@ -14559,6 +14580,14 @@ where
                 // A legacy-shaped config gets its upgrade on a LATER boot, once
                 // this adoption has made its nonce registered.
                 adopt_on_disk_nonce(&workdir, &nonce, false, config_mtime_or_epoch(&config_path));
+                // The adopted file is runner-written and may predate the
+                // workdir-artifact exclude (it is left byte-identical, so no
+                // `write_mcp_json` ran to exclude it).
+                crate::provision_exclude::exclude_workdir_artifacts(
+                    "coord_mcp .mcp.json",
+                    Path::new(&workdir),
+                    &[MCP_JSON_FILE],
+                );
                 counts.adopted += 1;
                 info!(
                     "coord_mcp: boot reconcile ADOPTED the on-disk nonce of session \
@@ -27420,8 +27449,10 @@ mod workdir_artifact_exclude_tests {
         let tmp = tempfile::tempdir().unwrap();
         assert_not_in_any_repo(tmp.path());
         let (main, wt) = linked_worktree(tmp.path());
+        // Block-scoped: `git init`'s stock template seeds info/exclude with
+        // comment lines, so the file itself need not be empty.
         assert!(
-            exclude_lines(&main).is_empty(),
+            block_entries(&exclude_lines(&main), WORKDIR_ARTIFACT_EXCLUDE_MARKER).is_empty(),
             "the fixture starts unexcluded"
         );
         let wd = wt.to_string_lossy().to_string();
@@ -27582,5 +27613,80 @@ mod workdir_artifact_exclude_tests {
             "the reused config does not read as untracked: {}",
             porcelain(&wt)
         );
+    }
+
+    /// The boot/session reconcile keeps a runner-written `.mcp.json` it does
+    /// not rewrite out of `git status` too: the `AdoptNonce` arm (an
+    /// unregistered nonce on the bound port, file left byte-identical) and the
+    /// `Leave` arm for a proxy-shaped config (the healthy case) both give it
+    /// its line.
+    ///
+    /// Mutants this must turn red: either reconcile call dropped.
+    #[test]
+    fn the_session_reconcile_excludes_an_adopted_or_left_proxy_config() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        assert_not_in_any_repo(tmp.path());
+        let (main, wt) = linked_worktree(tmp.path());
+        let wd = wt.to_string_lossy().to_string();
+        let exclude = main.join(".git").join("info").join("exclude");
+        let mcp_line = |lines: &[String]| {
+            block_entries(lines, WORKDIR_ARTIFACT_EXCLUDE_MARKER)
+                .contains(&"/.mcp.json".to_string())
+        };
+        // A config an OLDER runner wrote: current shape, a nonce this process
+        // never registered, and no exclude line (written by hand, not through
+        // `write_mcp_json`).
+        let nonce = format!("reconcile-excl-{}", uuid::Uuid::now_v7().simple());
+        let cfg = coord_mcp_proxy_config_json(9876, &nonce, ProxyConfigIdentity::device(&wd, None));
+        std::fs::write(
+            wt.join(MCP_JSON_FILE),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+        assert!(!proxy_nonce_is_valid(&nonce), "precondition: unregistered");
+        assert!(
+            !mcp_line(&exclude_lines(&main)),
+            "precondition: no line yet"
+        );
+
+        let counts = reconcile_session_configs(vec![wd.clone()], 9876);
+        assert_eq!(counts.adopted, 1, "{counts:?}");
+        assert!(
+            mcp_line(&exclude_lines(&main)),
+            "{:?}",
+            exclude_lines(&main)
+        );
+        assert!(
+            !porcelain(&wt).contains(MCP_JSON_FILE),
+            "{}",
+            porcelain(&wt)
+        );
+
+        // Now registered and healthy: the next pass takes `Leave`. Drop the
+        // line first, as a config that predates the exclude would lack it.
+        {
+            let _excl = crate::fleet::info_exclude_lock();
+            let text = std::fs::read_to_string(&exclude).unwrap_or_default();
+            let kept: String = text
+                .lines()
+                .filter(|l| *l != "/.mcp.json")
+                .map(|l| format!("{l}\n"))
+                .collect();
+            std::fs::write(&exclude, kept).unwrap();
+        }
+        let counts = reconcile_session_configs(vec![wd.clone()], 9876);
+        assert_eq!(
+            (counts.adopted, counts.rewritten, counts.upgraded),
+            (0, 0, 0),
+            "the healthy config is LEFT: {counts:?}"
+        );
+        assert!(
+            mcp_line(&exclude_lines(&main)),
+            "{:?}",
+            exclude_lines(&main)
+        );
+
+        NonceRegistry::global().test_live().remove(&nonce);
     }
 }
