@@ -311,6 +311,14 @@ const CFG_TEST_BRACE_WINDOW: usize = 1;
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn cfg_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    // A whole-file test module — `extract-rust-test-modules.py` moves an inline
+    // `#[cfg(test)] mod tests { .. }` to `foo/tests.rs` and opens it with
+    // `#![cfg(test)]` precisely so source scans like this one can still tell it
+    // is test code. Its first code line is that inner attribute; the whole file
+    // is then one test range.
+    if is_whole_file_test_module(lines) {
+        return vec![(0, lines.len().saturating_sub(1))];
+    }
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -384,6 +392,40 @@ fn code_only(lines: &[&str], lo: usize, hi: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// True iff the file's first non-comment, non-empty line is `#![cfg(test)]` —
+/// the whole file compiles only under test. Comment-stripped, so prose quoting
+/// the attribute never opens it.
+fn is_whole_file_test_module(lines: &[&str]) -> bool {
+    (0..lines.len())
+        .map(|i| code_only(lines, i, i))
+        .find(|code| !code.trim().is_empty())
+        .is_some_and(|code| code.trim() == "#![cfg(test)]")
+}
+
+#[test]
+fn a_whole_file_test_module_is_one_test_range() {
+    let extracted = [
+        "//! Tests for foo.",
+        "",
+        "#![cfg(test)]",
+        "",
+        "fn t() {",
+        "    client.post(url);",
+        "}",
+    ];
+    assert_eq!(cfg_test_ranges(&extracted), vec![(0, extracted.len() - 1)]);
+    // Prose quoting the attribute, or the attribute anywhere but first, is not one.
+    let quoted = [
+        "// #![cfg(test)] is what the codemod writes",
+        "fn prod() {",
+        "    client.post(url);",
+        "}",
+    ];
+    assert!(!is_whole_file_test_module(&quoted));
+    let late = ["fn prod() {}", "#![cfg(test)]"];
+    assert!(!is_whole_file_test_module(&late));
 }
 
 /// The contiguous comment block immediately above the statement containing the

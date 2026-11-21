@@ -406,7 +406,12 @@ fn build_config_get(
 
 async fn fetch_config_uncached(base: &str, target: PolicyTarget) -> Option<ComplianceConfig> {
     let client = http_client().ok()?;
-    let request = match build_config_get(&client, base, target) {
+    let (build_client, build_base) = (client.clone(), base.to_string());
+    let built = policy_tenant::build_off_runtime(move || {
+        build_config_get(&build_client, &build_base, target)
+    })
+    .await;
+    let request = match built {
         Ok(request) => request,
         Err(reason) => {
             debug!(reason = %reason, "session-compliance: config read not sent");
@@ -793,18 +798,29 @@ async fn post_compliance(
 ) -> Option<ComplianceVerdict> {
     let client = http_client().ok()?;
     let body = compliance_body(report, absent_reason, nudge_state_for(claude_session_id));
-    let request =
-        match build_compliance_post(&client, &coord_base(), claude_session_id, &body, target) {
-            Ok(request) => request,
-            Err(reason) => {
-                debug!(
-                    session = %claude_session_id,
-                    reason = %reason,
-                    "session-compliance: verdict POST not sent"
-                );
-                return None;
-            }
-        };
+    let (build_client, build_sid, build_body) =
+        (client.clone(), claude_session_id.to_string(), body.clone());
+    let built = policy_tenant::build_off_runtime(move || {
+        build_compliance_post(
+            &build_client,
+            &coord_base(),
+            &build_sid,
+            &build_body,
+            target,
+        )
+    })
+    .await;
+    let request = match built {
+        Ok(request) => request,
+        Err(reason) => {
+            debug!(
+                session = %claude_session_id,
+                reason = %reason,
+                "session-compliance: verdict POST not sent"
+            );
+            return None;
+        }
+    };
     let resp = client.execute(request).await.ok()?;
     if !resp.status().is_success() {
         debug!(
@@ -1316,17 +1332,29 @@ pub async fn observe_turn_end(
     hook_input: &Value,
     tenant: &Result<PolicyTarget, String>,
 ) -> Option<ComplianceNudge> {
+    observe_turn_end_outcome(hook_input, tenant)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`observe_turn_end`] with the withhold of an UNKNOWN tenant kept apart from
+/// "no nudge": `Err` means nothing was read or filed for this turn.
+async fn observe_turn_end_outcome(
+    hook_input: &Value,
+    tenant: &Result<PolicyTarget, String>,
+) -> Result<Option<ComplianceNudge>, Withheld> {
     let session = hook_input
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
-    let target = compliance_target(tenant, "turn_end", session).ok()?;
+    let target = compliance_target(tenant, "turn_end", session)?;
     match tokio::time::timeout(TURN_END_BUDGET, observe_turn_end_inner(hook_input, target)).await {
-        Ok(nudge) => nudge,
+        Ok(nudge) => Ok(nudge),
         Err(_) => {
             debug!("session-compliance: turn-end budget exceeded — allowing the stop");
-            None
+            Ok(None)
         }
     }
 }
@@ -1529,8 +1557,14 @@ pub fn finalize_on_close(claude_session_id: &str, store: &Weak<SessionLifecycleS
         // Whose compliance this is: the session's tenant, resolved from the
         // record (Design §5). The nonce may already be released, so the
         // registry leg — or the record's durable tenant — usually decides.
-        // Decided BEFORE taking a permit: the decision may wait its whole
-        // budget, and a permit held through it would stall the other closes.
+        // Decided BEFORE taking a finalize permit: the decision may wait its
+        // whole budget, and a finalize permit held through it would stall the
+        // other closes. It has its own, wider bound instead, so a boot sweep
+        // closing many records cannot fire an unbounded burst of proxy and
+        // secure-storage reads.
+        let Ok(decision_permit) = close_decision_permits().acquire().await else {
+            return;
+        };
         let tenant = policy_tenant::closed_session_policy_target(
             &inputs.terminal_id,
             &session_id,
@@ -1540,6 +1574,7 @@ pub fn finalize_on_close(claude_session_id: &str, store: &Weak<SessionLifecycleS
             CLOSE_TENANT_BUDGET,
         )
         .await;
+        drop(decision_permit);
         // The liveness poll closes many stale records at once after a crash
         // restart, and every one of these does a config-dir walk, a multi-MB
         // read and a coord POST. Bound the burst rather than letting a boot
@@ -1598,6 +1633,17 @@ static FINALIZE_PERMITS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 fn finalize_permits() -> &'static tokio::sync::Semaphore {
     FINALIZE_PERMITS.get_or_init(|| tokio::sync::Semaphore::new(FINALIZE_CONCURRENCY))
+}
+
+/// Concurrency bound for close-time TENANT DECISIONS — wider than
+/// [`FINALIZE_CONCURRENCY`], because a decision is a proxy read plus a few local
+/// slot reads, not a transcript read and a POST.
+const CLOSE_DECISION_CONCURRENCY: usize = 6;
+
+static CLOSE_DECISION_PERMITS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+fn close_decision_permits() -> &'static tokio::sync::Semaphore {
+    CLOSE_DECISION_PERMITS.get_or_init(|| tokio::sync::Semaphore::new(CLOSE_DECISION_CONCURRENCY))
 }
 
 /// The close-time detection + emit. `Err` is the withhold of an UNKNOWN
