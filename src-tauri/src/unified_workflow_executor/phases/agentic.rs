@@ -2069,7 +2069,10 @@ mod tests {
             reason: "over".to_string(),
         };
         assert_eq!(outcome_output_len(&real), 37);
-        assert_eq!(outcome_output_len(&stop), 0);
+        // The synthetic stop's `output()` is its reason string, so measuring
+        // the stop instead of the real session would record 4, not 37.
+        assert_eq!(outcome_output_len(&stop), 4);
+        assert_ne!(outcome_output_len(&real), outcome_output_len(&stop));
     }
 
     #[test]
