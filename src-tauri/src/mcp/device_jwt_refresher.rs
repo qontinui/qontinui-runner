@@ -179,6 +179,15 @@ pub(crate) fn binding_gap_seed_backoff(n: u32) -> i64 {
         .min(BINDING_GAP_SEED_BACKOFF_MAX_SECS)
 }
 
+/// Is this lapse waiting out an unanswered seed's backoff? A `seed_retry_after`
+/// further ahead than one full backoff can only come from a clock step or a
+/// skewed record, so it reads as due rather than holding the tenant silent
+/// with no seed and no ask.
+fn seed_retry_pending(r: &GapAskRecord, now: i64) -> bool {
+    r.seed_retry_after > now
+        && r.seed_retry_after <= now.saturating_add(BINDING_GAP_SEED_BACKOFF_MAX_SECS)
+}
+
 /// Floor of the transient-failure backoff. When a Cognito refresh fails
 /// transiently (network/5xx/429) we retry far sooner than the 5m steady
 /// cadence so parked autonomy self-recovers within seconds of connectivity
@@ -3641,7 +3650,7 @@ pub(crate) fn plan_gap_actions_at(
             .filter(|t| {
                 state.record(t).is_none_or(|r| {
                     !r.seed_attempted
-                        && r.seed_retry_after <= now
+                        && !seed_retry_pending(r, now)
                         && (!r.notified || r.seed_unanswered > 0)
                 })
             })
@@ -3677,9 +3686,10 @@ pub(crate) fn plan_gap_actions_at(
         }
         // An unanswered seed waiting out its backoff: nothing has shown yet
         // that a human is needed.
-        if state
-            .record(&tenant)
-            .is_some_and(|r| !r.seed_attempted && r.seed_retry_after > now)
+        if seed_enabled
+            && state
+                .record(&tenant)
+                .is_some_and(|r| !r.seed_attempted && seed_retry_pending(r, now))
         {
             actions.push(GapAction::Silent(tenant));
             continue;
@@ -3876,7 +3886,9 @@ pub(crate) enum SeedOutcome {
     NoPresenter,
     /// Coord answered non-2xx. `code` is the body's `code`/`error` string.
     Refused { status: u16, code: String },
-    /// The request never got an answer.
+    /// No answer was received: the client could not be built, the send
+    /// failed, or the client timed out. A timeout can fire after coord got the
+    /// request, so coord may have minted; the retry bound keeps that finite.
     Transport(String),
     /// A 2xx whose body was not a token.
     BadResponse(String),
@@ -3891,11 +3903,12 @@ impl SeedOutcome {
         matches!(self, SeedOutcome::Seeded | SeedOutcome::SlotAlreadyHeld)
     }
 
-    /// Did coord answer this attempt about the binding? False only when no
-    /// request got an answer: the send failed or the client could not be
-    /// built (`Transport`), or there was nothing to present so no request was
-    /// made (`NoPresenter`). Those are retried; every answered outcome uses
-    /// the lapse's seed up. Spelled out with no wildcard, so a new variant has
+    /// Does this outcome use the lapse's seed up? False only when no answer
+    /// was received (`Transport`) or there was nothing to present so no
+    /// request was made (`NoPresenter`); those are retried. Every other
+    /// outcome uses the seed up. That includes `PersistFailed`, which can be
+    /// a local credential-store READ failure before any request, kept on the
+    /// conservative side by design. Spelled out with no wildcard, so a new variant has
     /// to be classified here.
     pub(crate) fn reached_coord(&self) -> bool {
         match self {
@@ -3959,15 +3972,20 @@ impl SeedOutcome {
     }
 }
 
+/// The `Transport` text builds before [`GapAskRecord::seed_unanswered`] wrote
+/// (`"request failed: {e}"`). FROZEN: records already on disk carry this exact
+/// text, so it must not follow a later rewording of [`SeedOutcome::describe`].
+const LEGACY_SEED_TRANSPORT_PREFIX: &str = "request failed: ";
+/// The `NoPresenter` text those builds wrote. FROZEN, as above.
+const LEGACY_SEED_NO_PRESENTER: &str = "no usable device credential for another tenant to present";
+
 /// Does a STORED `seed_outcome` name an outcome coord never answered? Only for
-/// migrating records written before [`GapAskRecord::seed_unanswered`] existed:
-/// those builds wrote exactly [`SeedOutcome::describe`]'s text, so this
-/// matches that text (derived from `describe()` itself, never pasted) rather
-/// than guessing.
+/// migrating records written before [`GapAskRecord::seed_unanswered`] existed.
+/// It matches the frozen text those builds wrote, never today's `describe()`,
+/// so a rewording cannot silently stop the migration.
 fn seed_outcome_text_is_unanswered(seed_outcome: &str) -> bool {
-    let transport_prefix = SeedOutcome::Transport(String::new()).describe();
-    seed_outcome.starts_with(&transport_prefix)
-        || seed_outcome == SeedOutcome::NoPresenter.describe()
+    seed_outcome.starts_with(LEGACY_SEED_TRANSPORT_PREFIX)
+        || seed_outcome == LEGACY_SEED_NO_PRESENTER
 }
 
 /// Coord's `DeviceRefreshResponse`; only the token is used, and its own
@@ -4143,7 +4161,8 @@ pub(crate) fn record_seed_outcome_at(
     tenant: &uuid::Uuid,
     outcome: &SeedOutcome,
     now: i64,
-) {
+) -> bool {
+    let mut rearmed = false;
     let mut state = load_gap_ask_state(path);
     if let Some(rec) = state.tenants.get_mut(&tenant.to_string()) {
         rec.seed_outcome = outcome.describe();
@@ -4157,8 +4176,9 @@ pub(crate) fn record_seed_outcome_at(
                     now.saturating_add(binding_gap_seed_backoff(rec.seed_unanswered));
             }
         }
-        let _ = save_gap_ask_state(path, &state);
+        rearmed = !rec.seed_attempted && save_gap_ask_state(path, &state);
     }
+    rearmed
 }
 
 /// Run every [`GapAction::SeedDue`] in `actions`, sequentially. On success the
@@ -4184,24 +4204,36 @@ async fn run_due_seeds(
                  per-binding door ({})",
                 outcome.describe()
             );
-        } else if outcome.reached_coord() {
-            warn!(
-                "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
-                 per-binding door did not succeed — {}; coord answered, so the operator \
-                 ask follows on the next pass (no retry this lapse)",
-                outcome.describe()
-            );
-        } else {
-            warn!(
-                "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
-                 per-binding door got no answer from coord — {}; it is retried after a \
-                 backoff, up to {BINDING_GAP_SEED_MAX_UNANSWERED} times this lapse, before \
-                 the operator ask opens",
-                outcome.describe()
-            );
         }
-        if let Some(path) = state_path {
-            record_seed_outcome_at(path, tenant, &outcome, chrono::Utc::now().timestamp());
+        let rearmed = state_path.is_some_and(|path| {
+            record_seed_outcome_at(path, tenant, &outcome, chrono::Utc::now().timestamp())
+        });
+        if !outcome.succeeded() {
+            if outcome.reached_coord() {
+                warn!(
+                    "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
+                     per-binding door did not succeed — {}; this uses the lapse's seed up \
+                     (coord answered, or the local credential store failed), so the operator \
+                     ask follows on the next pass",
+                    outcome.describe()
+                );
+            } else if rearmed {
+                warn!(
+                    "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
+                     per-binding door received no answer — {}; it is retried after a \
+                     backoff, up to {BINDING_GAP_SEED_MAX_UNANSWERED} times this lapse, \
+                     before the operator ask opens",
+                    outcome.describe()
+                );
+            } else {
+                warn!(
+                    "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
+                     per-binding door received no answer — {}; the retry budget is spent \
+                     (or the lapse record could not be written), so the operator ask opens \
+                     on the next pass",
+                    outcome.describe()
+                );
+            }
         }
         results.push((*tenant, outcome));
     }
@@ -15712,6 +15744,80 @@ mod tenant_seed_arm_tests {
         assert_eq!(retry, vec![GapAction::SeedDue(t)], "the seed is retried");
     }
 
+    /// A pending retry holds the tenant silent only while a seed can run: with
+    /// the seed disabled the pass is the plain ask pass, so it asks.
+    #[test]
+    fn a_pending_retry_does_not_hold_the_ask_when_the_seed_is_disabled() {
+        let path = gap_state_path("pending_retry_seed_disabled");
+        let t = tenant(16);
+        let now = 1_800_000_000;
+        plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        record_seed_outcome_at(&path, &t, &SeedOutcome::Transport("refused".into()), now);
+        let actions =
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, false);
+        assert!(
+            matches!(actions.as_slice(), [GapAction::Notified { tenant, .. }] if *tenant == t),
+            "{actions:?}"
+        );
+    }
+
+    /// A `seed_retry_after` further ahead than one full backoff can only be a
+    /// clock step or a skewed record; it reads as due rather than holding the
+    /// tenant silent with no seed and no ask.
+    #[test]
+    fn a_retry_time_beyond_the_backoff_ceiling_reads_as_due() {
+        let path = gap_state_path("skewed_retry_after");
+        let t = tenant(17);
+        let now = 1_800_000_000;
+        plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        record_seed_outcome_at(&path, &t, &SeedOutcome::Transport("refused".into()), now);
+        let mut state = load_gap_ask_state(&path);
+        state
+            .tenants
+            .get_mut(&t.to_string())
+            .expect("record")
+            .seed_retry_after = now + 10 * BINDING_GAP_SEED_BACKOFF_MAX_SECS;
+        assert!(save_gap_ask_state(&path, &state));
+        assert_eq!(
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, true),
+            vec![GapAction::SeedDue(t)]
+        );
+    }
+
+    /// `record_seed_outcome_at` says whether it re-armed: yes while the budget
+    /// lasts, no on the outcome that spends it and on an answered one.
+    #[test]
+    fn recording_reports_whether_the_seed_was_re_armed() {
+        let path = gap_state_path("rearm_report");
+        let t = tenant(18);
+        let mut now = 1_800_000_000;
+        for n in 1..=BINDING_GAP_SEED_MAX_UNANSWERED + 1 {
+            assert_eq!(
+                plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true),
+                vec![GapAction::SeedDue(t)],
+                "attempt {n}"
+            );
+            let rearmed =
+                record_seed_outcome_at(&path, &t, &SeedOutcome::Transport("refused".into()), now);
+            assert_eq!(rearmed, n <= BINDING_GAP_SEED_MAX_UNANSWERED, "attempt {n}");
+            now += BINDING_GAP_SEED_BACKOFF_MAX_SECS;
+        }
+        let answered_path = gap_state_path("rearm_report_answered");
+        plan_gap_actions_at(
+            &answered_path,
+            &gaps(&[t]),
+            Some(&[]),
+            Some(ACCT),
+            now,
+            true,
+        );
+        let refused = SeedOutcome::Refused {
+            status: 503,
+            code: "unavailable".into(),
+        };
+        assert!(!record_seed_outcome_at(&answered_path, &t, &refused, now));
+    }
+
     /// (b) No presenter means no request was sent: coord never answered, so
     /// it is retried exactly like a transport failure.
     #[test]
@@ -15898,10 +16004,18 @@ mod tenant_seed_arm_tests {
 
     /// (f) A record written by a build that used the seed up on every outcome
     /// is migrated on load: a seed coord never answered is re-armed and due,
-    /// and an answered one stays used up. The legacy text is built from
-    /// today's `describe()`, so a wording change reddens this.
+    /// and an answered one stays used up. The fixture carries the FROZEN text
+    /// those builds wrote; the first assertions are what go red if
+    /// `describe()` is reworded without keeping the frozen strings in step.
     #[test]
     fn a_legacy_unanswered_lapse_is_re_armed_and_an_answered_one_is_not() {
+        assert!(SeedOutcome::Transport("x".into())
+            .describe()
+            .starts_with(LEGACY_SEED_TRANSPORT_PREFIX));
+        assert_eq!(
+            SeedOutcome::NoPresenter.describe(),
+            LEGACY_SEED_NO_PRESENTER
+        );
         let now = 1_800_000_000;
         let legacy = |path: &std::path::Path, t: uuid::Uuid, outcome: &str| {
             let body = serde_json::json!({
@@ -15918,9 +16032,8 @@ mod tenant_seed_arm_tests {
         };
         let t = tenant(10);
         let unanswered = [
-            SeedOutcome::Transport("tcp connect error: actively refused (os error 10061)".into())
-                .describe(),
-            SeedOutcome::NoPresenter.describe(),
+            format!("{LEGACY_SEED_TRANSPORT_PREFIX}tcp connect error: actively refused (os error 10061)"),
+            LEGACY_SEED_NO_PRESENTER.to_string(),
         ];
         for (i, outcome) in unanswered.iter().enumerate() {
             let path = gap_state_path(&format!("legacy_unanswered_{i}"));
