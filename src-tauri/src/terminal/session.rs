@@ -3395,13 +3395,53 @@ impl TerminalSession {
         Some(t.to_string())
     }
 
+    /// What the identity seam does for a pane it could not put the identity
+    /// shim in front of: start it anyway (fail-open), and say so when that
+    /// costs the pane its argv session id.
+    ///
+    /// Env vars are still set, so a directly-invoked provider could still be
+    /// pinned by a future absolute-path wrapper, but this terminal gets no PATH
+    /// shim. The child PATH is still composed, with no own dir: an inherited
+    /// foreign shim dir must not reach this child either (plan
+    /// 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2). A runner
+    /// with no PATH at all leaves the child's untouched.
+    ///
+    /// Not silent: a `claude` pane that would have taken its session id from
+    /// the shim ([`Self::pane_loses_shim_pin`]) now runs with none in argv, so
+    /// the session census can identify it only by Claude Code's own
+    /// `sessions/<pid>.json` record (plan
+    /// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    /// Phase 2, route (c)) — one `warn!` names the pane. It returns `()`: this
+    /// path never refuses a terminal.
+    fn start_without_identity_shim(
+        cmd: &mut CommandBuilder,
+        terminal_id: &str,
+        title: &str,
+        pinned: &str,
+    ) {
+        if let Ok(current_path) = std::env::var("PATH") {
+            Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
+        }
+        if Self::pane_loses_shim_pin(cmd) {
+            warn!(
+                terminal_id = %terminal_id,
+                title = %title,
+                pinned_session_id = %pinned,
+                "identity shim could not be materialized: this claude pane starts with no \
+                 --session-id in argv (the pinned id is in its env only)"
+            );
+        }
+    }
+
     /// Would this PTY child have taken its session id from the identity shim?
     /// True when argv's head is the BARE `claude` program name (resolved
     /// through `PATH`, where the shim sits) and its arguments make no session
     /// choice of their own — the exact case in which the shim appends
     /// `--session-id $QONTINUI_PINNED_SESSION_ID`. The session-choice token set
-    /// is the shim's own,
-    /// [`qontinui_runner_lib::claude_env::claude_argv_chooses_session`].
+    /// is the Rust spelling the native shim also reads,
+    /// [`qontinui_runner_lib::claude_env::claude_argv_chooses_session`]; the
+    /// `.bash` / `.cmd` script shims still carry copies of it (plan-library
+    /// follow-up edge `2ce2a5a6-da43-4585-a372-d533fb50b7e7`).
     ///
     /// False for a `claude` named by a path: it never reaches the PATH shim, so
     /// a missing shim changes nothing for it (that is route (d) of plan
@@ -3711,33 +3751,9 @@ impl TerminalSession {
                     "session-restore: always-on identity shim dir injected onto terminal PATH"
                 );
             }
-            None => {
-                // Fail-open: env vars are still set so a directly-invoked
-                // provider could still be pinned by a future absolute-path
-                // wrapper, but no PATH shim this terminal. The child PATH is
-                // still composed, with no own dir: an inherited foreign shim
-                // dir must not reach this child either (plan
-                // 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2).
-                // A runner with no PATH at all leaves the child's untouched.
-                if let Ok(current_path) = std::env::var("PATH") {
-                    Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
-                }
-                // Still fail-open, but not silent: a `claude` pane that would
-                // have taken its session id from the shim now runs with none in
-                // argv, so the session census can identify it only by Claude
-                // Code's own `sessions/<pid>.json` record (plan
-                // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
-                // Phase 2, route (c)).
-                if Self::pane_loses_shim_pin(cmd) {
-                    warn!(
-                        terminal_id = %terminal_id,
-                        title = %title,
-                        pinned_session_id = %pinned,
-                        "identity shim could not be materialized: this claude pane starts with no \
-                         --session-id in argv (the pinned id is in its env only)"
-                    );
-                }
-            }
+            // Fail-open, and the whole arm is this one call: it returns `()`,
+            // so it has no way to refuse the pane.
+            None => Self::start_without_identity_shim(cmd, terminal_id, title, &pinned),
         }
 
         // 4. Record AUTHORITATIVELY at spawn (zero transcript race). The
@@ -7815,9 +7831,47 @@ pub(crate) mod tests {
             "bash".to_string(),
             "-l".to_string(),
         ]))));
+    }
 
-        // The seam consults it in its no-shim (`None =>`) arm, and only to
-        // warn: that arm refuses nothing.
+    /// Route (c), what the seam DOES with no identity shim: the pane starts,
+    /// and exactly one `warn!` names a claude pane that loses its argv session
+    /// id — by terminal id and pinned id. A pane that loses nothing is silent.
+    #[test]
+    fn start_without_identity_shim_warns_once_for_a_pane_that_loses_its_pin() {
+        const PIN: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        // Spelled out here, not read from the implementation, so a reworded or
+        // deleted warning reds this test.
+        const WARNING: &str = "identity shim could not be materialized";
+
+        let mut cmd = claude_argv(&["--permission-mode", "bypassPermissions"]);
+        let ((), logs) = crate::resource_guard::capture_logs(|| {
+            TerminalSession::start_without_identity_shim(&mut cmd, "term-noshim", "pane", PIN)
+        });
+        assert_eq!(logs.matches(WARNING).count(), 1, "logs: {logs}");
+        assert!(logs.contains("term-noshim"), "logs: {logs}");
+        assert!(logs.contains(PIN), "logs: {logs}");
+
+        for mut quiet in [
+            TerminalSession::build_command_from(None),
+            claude_argv(&["--session-id", PIN]),
+            claude_argv(&["--continue"]),
+            TerminalSession::build_command_from(Some(
+                vec!["/home/u/.local/bin/claude".to_string()],
+            )),
+        ] {
+            let ((), logs) = crate::resource_guard::capture_logs(|| {
+                TerminalSession::start_without_identity_shim(&mut quiet, "term-quiet", "pane", PIN)
+            });
+            assert!(!logs.contains(WARNING), "logs: {logs}");
+        }
+    }
+
+    /// The seam's no-shim arm is exactly the one call above, and nothing else.
+    /// That function returns `()`, so this is what keeps the arm from refusing
+    /// the pane: an added `return Err(..)`, an `Err::<_, _>(..)?`, or a dropped
+    /// call all change this line.
+    #[test]
+    fn the_no_shim_arm_is_only_the_fail_open_call() {
         let src = include_str!("session.rs");
         let seam_start = src
             .find(&["fn apply_identity", "_seam("].concat())
@@ -7826,19 +7880,31 @@ pub(crate) mod tests {
         let match_at = seam
             .find(&["match &", "identity {"].concat())
             .expect("the seam matches on the materialized shim dir");
-        let arm = &seam[match_at..];
-        let arm_start = arm
-            .find("\n            None => {\n")
+        let after_match = &seam[match_at..];
+        let none_line = after_match
+            .lines()
+            .find(|l| l.trim_start().starts_with("None =>"))
             .expect("the no-shim arm exists");
-        let arm = &arm[arm_start..];
-        let arm = &arm[..arm.find("\n            }\n").expect("the no-shim arm ends")];
-        assert!(
-            arm.contains(&["if Self::pane_loses_", "shim_pin(cmd) {"].concat()),
-            "the no-shim arm must warn for a claude pane that loses its shim pin: {arm}"
+        assert_eq!(
+            none_line.trim(),
+            [
+                "None => Self::start_without_identity_",
+                "shim(cmd, terminal_id, title, &pinned),"
+            ]
+            .concat(),
+            "the no-shim arm must be the single fail-open call"
         );
-        assert!(
-            !arm.contains(&["return ", "Err"].concat()),
-            "the no-shim arm must not refuse the pane: {arm}"
+        // And the match closes right after it: no further arm or statement.
+        let mut rest = after_match
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("None =>"))
+            .skip(1)
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"));
+        assert_eq!(
+            rest.next(),
+            Some("}"),
+            "the match must end after the no-shim arm"
         );
     }
 

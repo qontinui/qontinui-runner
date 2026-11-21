@@ -521,30 +521,36 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
                 n if name.is_some() && n.starts_with("--name=") => {}
-                // Session flags: when the operator positioned the id via the
-                // `{sessionId}` placeholder, keep the flag in place; otherwise the
-                // spec owns session and we drop the template's.
-                "--session-id" | "--resume" => {
+                // Session flags that NAME an id — `--session-id`, `--resume`,
+                // `-r` and the `--session-id=` / `--resume=` inline forms: when
+                // the operator positioned the id via the `{sessionId}`
+                // placeholder, keep the flag in place; otherwise the spec owns
+                // session and we drop the template's.
+                n if names_session_id(n) => {
                     if had_placeholder {
                         other_units.push(unit);
                     }
                 }
-                // A template's `--continue` / `-c` is a third session choice —
-                // "the most recent conversation in this cwd" — and it cannot
-                // stand beside the spec's `--session-id` / `--resume`: Claude
-                // Code refuses the pair ("--session-id with --continue or
-                // --resume also needs --fork-session", measured on 2.1.330), and
-                // were it accepted the session would no longer be the one the
-                // runner pinned (plan
+                // Every other session choice — `--continue` / `-c` ("the most
+                // recent conversation in this cwd") and the `resume`
+                // subcommand, i.e. the rest of the one token set
+                // `claude_env::claude_argv_chooses_session` — cannot stand
+                // beside the spec's `--session-id` / `--resume`: Claude Code
+                // refuses the pair ("--session-id with --continue or --resume
+                // also needs --fork-session", measured on 2.1.330), and were it
+                // accepted the session would no longer be the one the runner
+                // pinned (plan
                 // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
                 // Phase 2). So whenever the spec names a session it is dropped,
                 // including when the template positions that id itself through
                 // `{sessionId}`.
-                "--continue" | "-c" if pin.is_some() => {
+                n if pin.is_some()
+                    && qontinui_runner_lib::claude_env::claude_argv_chooses_session(&[n]) =>
+                {
                     tracing::warn!(
                         flag = %flag_name_only(&unit.name),
                         "launch template flag dropped: the spec pins the session, so the \
-                         template cannot continue a different one"
+                         template cannot choose a different one"
                     );
                 }
                 // The append prompt flags are one mutually-exclusive group: when
@@ -734,6 +740,17 @@ fn pty_verbatim_alias(cfg: &LaunchConfig) -> Option<String> {
         .as_ref()
         .filter(|a| !is_claude_command(a))
         .cloned()
+}
+
+/// Is this template unit a session flag that NAMES an id — `--session-id`,
+/// `--resume`, `-r`, or the `--session-id=…` / `--resume=…` inline form? A
+/// subset of `claude_env::claude_argv_chooses_session`: the members that can
+/// carry a `{sessionId}` placeholder. Case-insensitive, as that set is.
+fn names_session_id(name: &str) -> bool {
+    let t = name.to_ascii_lowercase();
+    matches!(t.as_str(), "--session-id" | "--resume" | "-r")
+        || t.starts_with("--session-id=")
+        || t.starts_with("--resume=")
 }
 
 /// Whether `s` is a recognizable `claude …` invocation (vs. an opaque alias).
@@ -1364,6 +1381,57 @@ mod tests {
         // With no spec session the operator's own choice is left alone.
         let argv = render_argv(&spec(), &tmpl("claude --continue"), "claude");
         assert!(argv.iter().any(|a| a == "--continue"), "{argv:?}");
+    }
+
+    /// The drop covers every spelling of a session choice, not only exact
+    /// names: `-r <id>`, `--resume=<id>`, `--session-id=<id>` and the `resume`
+    /// subcommand in a template never ride beside the spec's own id.
+    #[test]
+    fn spec_owned_session_drops_every_spelling_of_a_template_session_choice() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        const OTHER: &str = "52e88829-c137-421d-893a-b45feac50a00";
+        for template in [
+            "claude -r 52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --resume=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --session-id=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --SESSION-ID=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude resume --verbose",
+        ] {
+            let mut new_session = spec();
+            new_session.session_id = Some(ID.to_string());
+            let argv = render_argv(&new_session, &tmpl(template), "claude");
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a.contains(OTHER)
+                    || a == "-r"
+                    || a == "resume"
+                    || a.to_ascii_lowercase().starts_with("--session-id=")
+                    || a.starts_with("--resume")),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+        }
+
+        // A template that positions the id itself in the inline form keeps it
+        // there — and is then the only session flag.
+        let mut s = spec();
+        s.session_id = Some(ID.to_string());
+        let argv = render_argv(&s, &tmpl("claude --session-id={sessionId}"), "claude");
+        let inline = format!("--session-id={ID}");
+        assert_eq!(argv.iter().filter(|a| **a == inline).count(), 1, "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--session-id"), "{argv:?}");
     }
 
     #[test]
