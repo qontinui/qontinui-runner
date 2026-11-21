@@ -538,15 +538,16 @@ export async function readOccupiedPageIds(): Promise<OccupancyRead> {
  * unreadable, or the restorable set withheld by a drain — removes nothing.
  * `remove` is the record-only `removeEmptyPage`, which itself keeps a page it
  * finds a terminal on; it resolves to `null` when it kept the page. Returns how
- * many pages were removed.
+ * many pages were removed, or `null` when the occupancy read was incomplete
+ * (UNKNOWN — distinct from `0`, "read fine, nothing empty").
  */
 export async function closeEmptyPagesWith<T>(
   visiblePages: TerminalPageConfig[],
   read: () => Promise<OccupancyRead>,
   remove: (id: string) => Promise<T | null>,
-): Promise<number> {
+): Promise<number | null> {
   const first = await read();
-  if (!first.complete) return 0;
+  if (!first.complete) return null;
   const { removed } = await removeEach(emptyPageIds(visiblePages, first.ids), read, remove);
   return removed.length;
 }
