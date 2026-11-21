@@ -60,6 +60,14 @@ const DEBUG_LOOPBACK = {
   backendUrlRefused: false,
 };
 const RELEASE_LOOPBACK = { ...DEBUG_LOOPBACK, backendUrlRefused: true };
+/** A read that SUCCEEDED but reports settings.json unreadable: `backendUrl` is a placeholder. */
+const FAULTED = {
+  ...BASE,
+  backendUrl: "https://backend.example.com",
+  settingsFault: { kind: "unreadable" },
+  backendUrlMachineLocal: false,
+  backendUrlRefused: false,
+};
 
 let host: HTMLDivElement;
 let root: Root;
@@ -130,6 +138,27 @@ async function mount() {
 
 const SIGN_IN_TARGET_UNKNOWN_TEXT =
   "Could not read the saved backend settings. Retry reads them again before signing in.";
+const COULD_NOT_READ_PREFIX = "Could not read";
+const RELEASE_REASON_FRAGMENT = "this release build does not dial machine-local backends";
+
+function reasonElement(): Element | null {
+  return host.querySelector("#web-integration-banner-sign-in-target-reason");
+}
+
+/** A `get_web_integration_status` reply held in flight until the test settles it. */
+function deferredStatus(): {
+  promise: Promise<unknown>;
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+} {
+  let resolve!: (v: unknown) => void;
+  let reject!: (e: Error) => void;
+  const promise = new Promise<unknown>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 function buttonLabelled(label: string, scope: ParentNode = host): HTMLButtonElement | undefined {
   return Array.from(scope.querySelectorAll("button")).find((b) => b.textContent === label);
@@ -303,6 +332,79 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     await act(async () => {});
     expect(await clickAuthorize()).toBe("http://127.0.0.1:8000");
   });
+
+  it("says beside Authorize why it targets production when this release build refuses the saved loopback backend", async () => {
+    statusReply = RELEASE_LOOPBACK;
+    await mount();
+    const banner = host.querySelector('[role="status"]')!;
+    expect(reasonElement()).not.toBeNull();
+    expect(banner.contains(reasonElement())).toBe(true);
+    expect(reasonElement()!.textContent).toContain(RELEASE_REASON_FRAGMENT);
+    expect(banner.textContent).not.toContain(COULD_NOT_READ_PREFIX);
+    expect(await clickAuthorize()).toBe("https://api.qontinui.io");
+  });
+
+  it("shows no reason line when Authorize targets the saved backend", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    await mount();
+    expect(buttonLabelled("Authorize")).toBeDefined();
+    expect(reasonElement()).toBeNull();
+  });
+
+  it("offers Retry instead of signing in when the read succeeds with a settingsFault, and re-reads on click", async () => {
+    statusReply = FAULTED;
+    await mount();
+    await expectAuthorizeRetry();
+    // Still faulted: still Retry, never a sign-in to production.
+    expect(buttonLabelled("Retry")).toBeDefined();
+    expect(reasonElement()).toBeNull();
+    expect(signInCalls().length).toBe(0);
+    // The fault clears on the next re-read: Authorize signs in to the saved backend.
+    statusReply = DEBUG_LOOPBACK;
+    await clickRetry(buttonLabelled("Retry"));
+    expect(await clickAuthorize()).toBe("http://127.0.0.1:8000");
+    expect(signInCalls().length).toBe(1);
+  });
+
+  it("shows 'Reading…' (disabled) while a Retry re-read is in flight, then Authorize once it succeeds", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    await mount();
+    statusReply = new Error("get_web_integration_status failed");
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {});
+    const pending = deferredStatus();
+    statusReply = pending.promise;
+    await clickRetry(buttonLabelled("Retry"));
+    const reading = buttonLabelled("Reading…");
+    expect(reading).toBeDefined();
+    expect(reading!.disabled).toBe(true);
+    expect(buttonLabelled("Retry")).toBeUndefined();
+    await act(async () => {
+      pending.resolve(DEBUG_LOOPBACK);
+    });
+    await act(async () => {});
+    expect(buttonLabelled("Reading…")).toBeUndefined();
+    expect(buttonLabelled("Authorize")!.disabled).toBe(false);
+    expect(signInCalls().length).toBe(0);
+  });
+
+  it("returns 'Reading…' to Retry when the retried re-read fails", async () => {
+    statusReply = FAULTED;
+    await mount();
+    const pending = deferredStatus();
+    statusReply = pending.promise;
+    await clickRetry(buttonLabelled("Retry"));
+    expect(buttonLabelled("Reading…")!.disabled).toBe(true);
+    await act(async () => {
+      pending.reject(new Error("get_web_integration_status failed"));
+    });
+    await act(async () => {});
+    expect(buttonLabelled("Reading…")).toBeUndefined();
+    expect(buttonLabelled("Retry")!.disabled).toBe(false);
+    expect(signInCalls().length).toBe(0);
+  });
 });
 
 function credentialCta(): HTMLButtonElement {
@@ -312,7 +414,9 @@ function credentialCta(): HTMLButtonElement {
   expect(alert!.textContent).toContain("The coord device credential expired.");
   const buttons = Array.from(alert!.querySelectorAll("button"));
   expect(buttons.some((b) => b.textContent === "Authorize")).toBe(false);
-  const cta = buttons.find((b) => ["Sign in", "Working…", "Retry"].includes(b.textContent ?? ""));
+  const cta = buttons.find((b) =>
+    ["Sign in", "Working…", "Retry", "Reading…"].includes(b.textContent ?? ""),
+  );
   expect(cta).toBeDefined();
   return cta!;
 }
@@ -419,5 +523,70 @@ describe("WebIntegrationAuthBanner credential-dark sign-in CTA target (operator 
     expect(cta.disabled).toBe(true);
     expect(alertText()).not.toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
     expect(signInCalls().length).toBe(1);
+  });
+
+  it("keeps the credential-dark CTA disabled under its normal label, with no error, while the FIRST status read is pending", async () => {
+    statusReply = new Promise(() => {});
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    const cta = credentialCta();
+    expect(cta.textContent).toBe("Sign in");
+    expect(cta.disabled).toBe(true);
+    expect(alertText()).not.toContain(COULD_NOT_READ_PREFIX);
+    expect(reasonElement()).toBeNull();
+    const readsBefore = statusReads();
+    await act(async () => {
+      cta.click();
+    });
+    await act(async () => {});
+    expect(signInCalls().length).toBe(0);
+    expect(statusReads()).toBe(readsBefore);
+  });
+
+  it("says in the credential-dark banner why its sign-in targets production for a release-refused loopback backend", async () => {
+    statusReply = RELEASE_LOOPBACK;
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    expect(host.querySelector('[role="alert"]')!.contains(reasonElement())).toBe(true);
+    expect(reasonElement()!.textContent).toContain(RELEASE_REASON_FRAGMENT);
+    await clickCta();
+    const calls = signInCalls();
+    expect(calls.length).toBe(1);
+    expect((calls[0][1] as { backendUrl?: string }).backendUrl).toBe("https://api.qontinui.io");
+  });
+
+  it("offers Retry on the credential-dark CTA when the read succeeds with a settingsFault, re-reads on click, and never signs in", async () => {
+    statusReply = FAULTED;
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    const cta = credentialCta();
+    expect(cta.textContent).toBe("Retry");
+    expect(cta.disabled).toBe(false);
+    expect(alertText()).toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    expect(reasonElement()).toBeNull();
+    await clickRetry(cta);
+    expect(credentialCta().textContent).toBe("Retry");
+    expect(signInCalls().length).toBe(0);
+  });
+
+  it("shows 'Reading…' (disabled) on the credential-dark CTA while a Retry re-read is in flight, then 'Sign in' once it succeeds", async () => {
+    statusReply = new Error("get_web_integration_status failed");
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    const pending = deferredStatus();
+    statusReply = pending.promise;
+    await clickRetry(credentialCta());
+    const reading = credentialCta();
+    expect(reading.textContent).toBe("Reading…");
+    expect(reading.disabled).toBe(true);
+    expect(alertText()).not.toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    await act(async () => {
+      pending.resolve(DEBUG_LOOPBACK);
+    });
+    await act(async () => {});
+    const settled = credentialCta();
+    expect(settled.textContent).toBe("Sign in");
+    expect(settled.disabled).toBe(false);
+    expect(signInCalls().length).toBe(0);
   });
 });

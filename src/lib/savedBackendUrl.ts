@@ -128,14 +128,20 @@ export function signInTargetExplanation(
 
 /** Read the saved status and decide. A failed read targets production.
  *
- *  KNOWN RESIDUAL: on the gate surfaces that call this, a REJECTED status read
- *  still targets production — the plan's "unusable → production" rule, kept so
- *  first-run sign-in is never blocked by an unreadable settings file. If the
- *  settings ARE readable by the time the sign-in finishes, the Rust
- *  `finalize_signed_in` then writes production over a backend URL that was
- *  saved before the first sign-in. The operator surfaces (auth banner, Settings
- *  → Account) do not take this path: they show "Retry" and re-read instead.
- *  Tracked as a follow-up on plan 2026-11-21-unify-runner-sign-in-backend-url-helper. */
+ *  KNOWN RESIDUAL — GATE surfaces only (LoginScreen, GithubRepoPicker, the
+ *  callers of this function): an unusable status read still targets
+ *  production, by either of two routes — a REJECTED read, or a read that
+ *  succeeds with a non-null `settingsFault` (its `backendUrl` is a placeholder
+ *  default). That is the plan's "unusable → production" rule, kept so
+ *  first-run sign-in is never blocked by an unreadable settings file. The Rust
+ *  `finalize_signed_in` then writes production into `web_integration
+ *  .backend_url`, which can overwrite a backend URL saved before the first
+ *  sign-in. `update_settings` refuses writes while settings are not
+ *  authoritative, so the window is narrow: a fault that CLEARS between the
+ *  status read and that write. The operator surfaces (auth banner, Settings →
+ *  Account) refuse both routes — they never sign in on a rejected or faulted
+ *  read, and offer "Retry" (re-read) instead. Tracked as a follow-up on plan
+ *  2026-11-21-unify-runner-sign-in-backend-url-helper. */
 export async function resolveSignInBackendUrl(surface: SignInSurface): Promise<string> {
   try {
     return signInBackendUrlFrom(

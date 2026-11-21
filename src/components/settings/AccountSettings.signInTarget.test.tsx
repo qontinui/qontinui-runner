@@ -63,7 +63,31 @@ const DEBUG_REMOTE = {
   backendUrlMachineLocal: false,
 };
 
+/** A read that SUCCEEDED but reports settings.json unreadable: `backendUrl` is a placeholder. */
+const FAULTED = {
+  ...BASE,
+  backendUrl: "https://backend.example.com",
+  settingsFault: { kind: "unreadable" },
+  backendUrlMachineLocal: false,
+  backendUrlRefused: false,
+};
+
 const COULD_NOT_READ = "Could not read the saved backend URL";
+
+/** A `get_web_integration_status` reply held in flight until the test settles it. */
+function deferredStatus(): {
+  promise: Promise<unknown>;
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+} {
+  let resolve!: (v: unknown) => void;
+  let reject!: (e: Error) => void;
+  const promise = new Promise<unknown>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 let host: HTMLDivElement;
 let root: Root;
@@ -302,5 +326,56 @@ describe("AccountSettings signed-out sign-in target (operator surface)", () => {
     await act(async () => {});
     expect(targetText()).toBe(COULD_NOT_READ);
     await expectSignInRetry();
+  });
+
+  it("offers Retry instead of signing in when the read succeeds with a settingsFault, and re-reads on click", async () => {
+    statusReply = FAULTED;
+    await mount();
+    expect(targetText()).toBe(COULD_NOT_READ);
+    expect(reasonElement()).toBeNull();
+    await expectSignInRetry();
+    // Still faulted: still Retry, never a sign-in to production.
+    expect(buttonLabelled("Retry")).toBeDefined();
+    expect(signInCalls().length).toBe(0);
+    // The fault clears on the next re-read: sign-in targets the saved backend.
+    statusReply = DEBUG_REMOTE;
+    await expectSignInRetry();
+    expect(targetText()).toBe("https://backend.example.test");
+    expect(await clickSignIn()).toBe("https://backend.example.test");
+  });
+
+  it("shows 'Reading…' (disabled) while a Retry re-read is in flight, then the sign-in button once it succeeds", async () => {
+    statusReply = new Error("get_web_integration_status failed");
+    await mount();
+    const pending = deferredStatus();
+    statusReply = pending.promise;
+    await expectSignInRetry();
+    const reading = buttonLabelled("Reading…");
+    expect(reading).toBeDefined();
+    expect(reading!.disabled).toBe(true);
+    expect(buttonLabelled("Retry")).toBeUndefined();
+    await act(async () => {
+      pending.resolve(DEBUG_LOOPBACK);
+    });
+    await act(async () => {});
+    expect(buttonLabelled("Reading…")).toBeUndefined();
+    expect(signInButton().disabled).toBe(false);
+    expect(signInCalls().length).toBe(0);
+  });
+
+  it("returns 'Reading…' to Retry when the retried re-read fails", async () => {
+    statusReply = FAULTED;
+    await mount();
+    const pending = deferredStatus();
+    statusReply = pending.promise;
+    await expectSignInRetry();
+    expect(buttonLabelled("Reading…")!.disabled).toBe(true);
+    await act(async () => {
+      pending.reject(new Error("get_web_integration_status failed"));
+    });
+    await act(async () => {});
+    expect(buttonLabelled("Reading…")).toBeUndefined();
+    expect(buttonLabelled("Retry")!.disabled).toBe(false);
+    expect(signInCalls().length).toBe(0);
   });
 });
