@@ -181,8 +181,12 @@ fn json_array_to_psv(arr: &[serde_json::Map<String, serde_json::Value>]) -> Opti
         return None;
     }
 
-    // Extract keys from first object
-    let keys: Vec<&String> = arr[0].keys().collect();
+    // Extract keys from first object, sorted: `serde_json`'s `preserve_order`
+    // is on in this crate (see `util::json_canon`), so `Map::keys()` follows
+    // input order and would make the header depend on how the caller happened
+    // to spell the first object.
+    let mut keys: Vec<&String> = arr[0].keys().collect();
+    keys.sort();
     if keys.is_empty() {
         return None;
     }
@@ -226,8 +230,10 @@ fn value_to_compact_string(val: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
-        // For nested objects/arrays, use compact JSON
-        other => other.to_string(),
+        // For nested objects/arrays, use compact JSON with sorted keys
+        // (`preserve_order` is on; see `util::json_canon`).
+        other => crate::util::json_canon::to_canonical_string(other)
+            .unwrap_or_else(|_| other.to_string()),
     }
 }
 
@@ -466,17 +472,14 @@ mod tests {
     fn test_compact_json_arrays_in_text() {
         let text = r#"Here is some data: [{"name":"alice","age":30},{"name":"bob","age":25},{"name":"carol","age":35}] and more text"#;
         let compacted = compact_json_arrays(text);
-        // Column order depends on whether `serde_json/preserve_order` is enabled
-        // anywhere in the dependency graph (the ACP client crate enables it, and
-        // cargo unifies features): input order ("name|age") with it, alphabetical
-        // ("age|name") without. Either is a correct compaction, so accept both
-        // rather than pinning a feature this module does not own.
+        // The header is sorted explicitly ("age", "name") whatever the input
+        // order, and whether or not serde_json's `preserve_order` is enabled.
         assert!(
-            compacted.contains("age|name") || compacted.contains("name|age"),
+            compacted.contains("age|name"),
             "header missing in compacted output: {compacted}"
         );
         assert!(
-            compacted.contains("30|alice") || compacted.contains("alice|30"),
+            compacted.contains("30|alice"),
             "first row missing in compacted output: {compacted}"
         );
         assert!(compacted.len() < text.len());

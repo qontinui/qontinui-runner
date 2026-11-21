@@ -861,6 +861,15 @@ check "an unqualified Value from this crate is refused" 1 "$rc"
 out="$(registry_text | sed 's/    Value::Object(m)/    serde_json::Value::Object(m)/' | parse_text)"; rc=$?
 check "  while a fully qualified serde_json::Value is fine" 0 "$rc"
 
+out="$(registry_text | sed 's/    Value::Object(m)/    crate::util::json_canon::sort_keys(Value::Object(m))/' | parse_text)"; rc=$?
+check "the json_canon::sort_keys wrapper (key order only) is accepted" 0 "$rc"
+
+out="$(registry_text | sed 's/    Value::Object(m)/    crate::util::json_canon::sort_keys(crate::v::Value::Object(m))/' | parse_text)"; rc=$?
+check "  but not around a Value from this crate" 1 "$rc"
+
+out="$(registry_text | sed 's/    Value::Object(m)/    crate::util::rewrite::sort_keys(Value::Object(m))/' | parse_text)"; rc=$?
+check "any other wrapper is refused" 1 "$rc"
+
 out="$(registry_text '    type Alpha = crate::payloads::Alpha;' | parse_text)"; rc=$?
 check "a type item in the function, shadowing an import, is refused" 1 "$rc"
 

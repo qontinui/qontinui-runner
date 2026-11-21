@@ -2537,7 +2537,12 @@ fn parse_inventory_json(text: &str) -> Option<PythonInventory> {
     let interpreter = parsed.get("py")?.as_str()?.to_string();
     let packages = parsed.get("packages")?.as_object()?;
     let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for (name, version) in packages {
+    // Walk the raw names SORTED: with serde_json's `preserve_order` on (see
+    // `util::json_canon`) the object iterates in pip's output order, which
+    // would make the collision winner — and so the digest — order-dependent.
+    let mut raw: Vec<(&String, &Value)> = packages.iter().collect();
+    raw.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, version) in raw {
         let Some(version) = version.as_str() else {
             continue;
         };
@@ -8551,5 +8556,19 @@ dependencies = [
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two names that normalize to one key: the winner (and so the digest) is
+    /// the same whatever order pip listed them in.
+    #[test]
+    fn inventory_collision_winner_is_independent_of_input_order() {
+        let a =
+            r#"{"venv": false, "py": "3.12", "packages": {"Foo_Bar": "1.0", "foo-bar": "2.0"}}"#;
+        let b =
+            r#"{"venv": false, "py": "3.12", "packages": {"foo-bar": "2.0", "Foo_Bar": "1.0"}}"#;
+        let ia = inventory_from_outcome(CaptureOutcome::Ok(a.to_string()));
+        let ib = inventory_from_outcome(CaptureOutcome::Ok(b.to_string()));
+        assert_eq!(ia.measured.as_ref().map(|m| m.1), Some(1));
+        assert_eq!(ia.measured, ib.measured);
     }
 }

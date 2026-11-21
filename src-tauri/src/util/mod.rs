@@ -18,3 +18,7 @@ pub mod egress_context;
 // (`crate_roots_ratchet` fails on that).
 pub use qontinui_runner_lib::util::error_chain;
 pub mod path_extraction;
+// Key-order-independent JSON canonicalisation (`serde_json`'s
+// `preserve_order` is on for this build). OWNED by the lib, re-exported here
+// so both crates share one copy, as `error_chain` is.
+pub use qontinui_runner_lib::util::json_canon;

@@ -101,7 +101,9 @@ async fn verify_artifact(
                     .unwrap_or(serde_json::Value::Null),
             });
 
-            let canonical_str = serde_json::to_string(&canonical)
+            // Sorted recursively: the hash must not depend on `Map` iteration
+            // order, which `preserve_order` makes insertion order here.
+            let canonical_str = crate::util::json_canon::to_canonical_string(&canonical)
                 .map_err(|e| format!("Failed to serialize canonical JSON: {e}"))?;
 
             let mut hasher = Sha256::new();

@@ -185,6 +185,11 @@ pub mod util {
     // `util/mod.rs` must NOT declare it (a second declaration is a second,
     // half-blind static).
     pub mod resource_exhaustion;
+    // Key-order-independent JSON canonicalisation. `agent-client-protocol`
+    // turns serde_json's `preserve_order` on for the whole build, so a
+    // `serde_json::Map` keeps insertion order; both crates sort through this
+    // one copy (the bin re-exports it).
+    pub mod json_canon;
 }
 
 // The allocation-failure breadcrumb (plan
