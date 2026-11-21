@@ -476,13 +476,19 @@ mod workflow_ai_session_tests {
             .get_workflow_ai_session(TASK, 1, PHASE, Some(0))
             .await
             .expect("get stage 0");
-        assert_eq!(got, Some(("cli-stage-0".to_string(), "running".to_string())));
+        assert_eq!(
+            got,
+            Some(("cli-stage-0".to_string(), "running".to_string()))
+        );
 
         let got = pg
             .get_workflow_ai_session(TASK, 1, PHASE, Some(1))
             .await
             .expect("get stage 1");
-        assert_eq!(got, Some(("cli-stage-1".to_string(), "running".to_string())));
+        assert_eq!(
+            got,
+            Some(("cli-stage-1".to_string(), "running".to_string()))
+        );
     }
 
     /// A stageless row (`None`, stored NULL, keyed as -1) is not shadowed by a
@@ -527,6 +533,9 @@ mod workflow_ai_session_tests {
             .get_workflow_ai_session(TASK, 3, PHASE, Some(2))
             .await
             .expect("get");
-        assert_eq!(got, Some(("cli-budget-stop".to_string(), "failed".to_string())));
+        assert_eq!(
+            got,
+            Some(("cli-budget-stop".to_string(), "failed".to_string()))
+        );
     }
 }

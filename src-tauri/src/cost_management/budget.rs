@@ -248,7 +248,12 @@ impl BudgetTracker {
 
     /// Record token consumption after an AI call.
     pub fn record(&self, phase: &str, tokens: u64, cost_usd: f64) -> BudgetResult {
-        let mut state = self.state.lock().unwrap();
+        // Poison-tolerant: a panic here unwinds through the agentic phase
+        // between its session row's create and its terminal write.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.total_tokens += tokens;
         state.total_cost_usd += cost_usd;
 
@@ -308,14 +313,20 @@ impl BudgetTracker {
 
     /// Check if the overall budget is exhausted.
     pub fn is_exhausted(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.total_cost_usd > self.budget.max_cost_per_run_usd
             || state.total_tokens > self.budget.max_tokens_per_run
     }
 
     /// Get remaining budget as a fraction (0.0 = exhausted, 1.0 = full).
     pub fn remaining_fraction(&self) -> f64 {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cost_remaining =
             1.0 - (state.total_cost_usd / self.budget.max_cost_per_run_usd).min(1.0);
         let token_remaining =
@@ -325,7 +336,10 @@ impl BudgetTracker {
 
     /// Get remaining budget for a specific phase.
     pub fn remaining_for_phase(&self, phase: &str) -> (u64, f64) {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let consumed = state.per_phase.get(phase).copied().unwrap_or((0, 0.0));
 
         let phase_fraction = self.budget.phase_budgets.get(phase).copied().unwrap_or(1.0);
@@ -341,7 +355,10 @@ impl BudgetTracker {
 
     /// Get a snapshot of current consumption.
     pub fn snapshot(&self) -> BudgetSnapshot {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         BudgetSnapshot {
             total_tokens: state.total_tokens,
             total_cost_usd: state.total_cost_usd,
