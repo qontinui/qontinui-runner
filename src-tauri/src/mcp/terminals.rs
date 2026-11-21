@@ -504,6 +504,8 @@ pub async fn create_terminal_handler(
     let title_for_intent = request.title.clone();
     let working_dir_for_wiring = working_dir.clone();
 
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
+    let facts_app = app_handle.clone();
     // door-scan: spawn — the door's real spawn; the context is in hand until here.
     match terminal_manager.create(
         request.title,
@@ -531,6 +533,18 @@ pub async fn create_terminal_handler(
         crate::coord_drain_state::SpawnOrigin::Unknown,
     ) {
         Ok(info) => {
+            // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+            // session-load, Phase 4). An HTTP / relay door: the caller's reason is not
+            // this runner's to name, so the origin is `unknown` — the kind says which door.
+            crate::session::run_record_emitter::stamp_spawn_facts(
+                &facts_app,
+                &info.id,
+                crate::session::run_record_emitter::SpawnFacts::new(
+                    crate::coord_drain_state::SpawnOrigin::Unknown,
+                )
+                .spawn_kind("http_terminals"),
+                spawn_since,
+            );
             info!("HTTP: Created terminal session: {}", info.id);
 
             // The same post-create coord wiring the `terminal_create` Tauri

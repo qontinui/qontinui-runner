@@ -715,6 +715,11 @@ async fn resume_one(
         registry: registry.clone(),
         cand: cand.clone(),
     };
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the first attempt's pane
+    // exists. Every attempt's pane opens after it, so the stamp below lands on
+    // the record the PROVEN attempt opened (it is keyed by that terminal).
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     let outcome = crate::terminal::respawn_liveness::confirm_respawn(
         &mut effects,
         store,
@@ -726,6 +731,15 @@ async fn resume_one(
         Ok(terminal_id) => terminal_id,
         Err(row) => return *row,
     };
+    // Run ledger: a closed unfinished session resumed here — the closed record
+    // re-opens, so this is its next run (`run_seq + 1`).
+    crate::session::run_record_emitter::stamp_spawn_facts(
+        app,
+        &terminal_id,
+        crate::session::run_record_emitter::SpawnFacts::new(SpawnOrigin::Respawn)
+            .spawn_kind("resume_door"),
+        spawn_since,
+    );
     match verify(tm, &cand, &terminal_id).await {
         Ok(ev) => ResumeRow::resumed(&cand.id, ev),
         Err(reason) => ResumeRow::failed(
@@ -1111,6 +1125,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 

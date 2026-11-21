@@ -1021,6 +1021,12 @@ async fn materialize(
     //     closed and the respawn reported failed through the receiver's error
     //     path. The coord row does NOT stay pending: see step 6 and
     //     `RespawnError::Died`.
+    //
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the first attempt's pane
+    // exists. Every attempt's pane opens after it, so the stamp below lands on
+    // the record the PROVEN attempt opened (it is keyed by that terminal).
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     let outcome = crate::terminal::respawn_liveness::confirm_respawn(
         &mut effects,
         lifecycle_store,
@@ -1029,6 +1035,18 @@ async fn materialize(
     )
     .await;
     let terminal_id = proven_terminal(respawn.source_session_id, outcome)?;
+
+    // Run ledger: a coord respawn materialized on this device — a new run of
+    // the resumed session id.
+    crate::session::run_record_emitter::stamp_spawn_facts(
+        // `app` moved into the effects; the proven attempt spawned with it.
+        &effects.app,
+        &terminal_id,
+        crate::session::run_record_emitter::SpawnFacts::new(
+            crate::coord_drain_state::SpawnOrigin::Respawn,
+        ),
+        spawn_since,
+    );
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.
@@ -1302,6 +1320,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 
