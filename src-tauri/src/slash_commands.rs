@@ -643,7 +643,11 @@ mod tests {
         assert_eq!(body.code.as_deref(), Some("workspace_root_unresolved"));
         let hint = body.hint.expect("the Refusal travels in hint");
         assert_eq!(hint["code"], "workspace_root_unresolved");
-        assert!(hint["next_action"]["kind"].is_string());
+        assert_eq!(hint["next_action"]["kind"], "set_setting");
+        assert_eq!(
+            hint["next_action"]["target"],
+            qontinui_types::paths::WORKSPACE_ROOT_SETTING
+        );
     }
 
     /// A checkout that IS there resolves, and a genuine fault stays a 500.
