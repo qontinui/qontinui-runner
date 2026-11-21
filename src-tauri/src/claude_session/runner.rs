@@ -93,10 +93,14 @@ pub struct CliSessionContext {
     pub is_resume: bool,
 }
 
-/// The session a runner-spawned `claude` CLI is launched under: a NEW session
-/// pinned with `--session-id <id>`, or an existing one resumed with
-/// `--resume <id>`. There is no third case — every runner `claude` carries an
-/// id in argv.
+/// The session a runner stream-json `claude` spawn is launched under: a NEW
+/// session pinned with `--session-id <id>`, or an existing one resumed with
+/// `--resume <id>`. There is no third case — every stream-json spawn
+/// ([`crate::claude_session::ClaudeSession::spawn`] and the inline runner)
+/// carries an id in argv. Not every runner `claude` does yet: the one-shot
+/// `--print` launches in `ai_provider/claude_cli.rs` and
+/// `commands/command_interpreter.rs` still start with none (a recorded
+/// follow-up of the plan below).
 ///
 /// With a [`CliSessionContext`] the caller's id is used as given. Without one,
 /// [`cli_session_pin`] mints a fresh v4 uuid ([`mint_cli_session_id`]) rather

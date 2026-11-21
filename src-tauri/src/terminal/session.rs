@@ -3396,31 +3396,33 @@ impl TerminalSession {
     }
 
     /// Would this PTY child have taken its session id from the identity shim?
-    /// True when argv's head is `claude` and its arguments make no session
+    /// True when argv's head is the BARE `claude` program name (resolved
+    /// through `PATH`, where the shim sits) and its arguments make no session
     /// choice of their own — the exact case in which the shim appends
-    /// `--session-id $QONTINUI_PINNED_SESSION_ID`. The token set mirrors the
-    /// shim's `user_chose_session` (`bin/qontinui_shim.rs`): `--session-id`,
-    /// `--resume`, `-r`, `resume`, `--continue`, `-c` and the
-    /// `--session-id=`/`--resume=` inline forms, scanned up to the first `--`.
-    /// A shell pane is false: a `claude` typed in it later is the shim's
-    /// question, not this spawn's.
+    /// `--session-id $QONTINUI_PINNED_SESSION_ID`. The session-choice token set
+    /// is the shim's own,
+    /// [`qontinui_runner_lib::claude_env::claude_argv_chooses_session`].
+    ///
+    /// False for a `claude` named by a path: it never reaches the PATH shim, so
+    /// a missing shim changes nothing for it (that is route (d) of plan
+    /// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    /// not route (c)). False for a shell pane: a `claude` typed in it later is
+    /// the shim's question, not this spawn's.
     fn pane_loses_shim_pin(cmd: &CommandBuilder) -> bool {
         let argv = cmd.get_argv();
-        if !Self::argv_head_is_claude(argv) {
+        let Some(head) = argv.first() else {
+            return false;
+        };
+        let head = head.to_string_lossy();
+        if head.contains(['/', '\\']) || !Self::argv_head_is_claude(argv) {
             return false;
         }
-        !argv
+        let args: Vec<String> = argv
             .iter()
             .skip(1)
-            .map(|a| a.to_string_lossy().to_ascii_lowercase())
-            .take_while(|a| a != "--")
-            .any(|t| {
-                matches!(
-                    t.as_str(),
-                    "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
-                ) || t.starts_with("--session-id=")
-                    || t.starts_with("--resume=")
-            })
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        !qontinui_runner_lib::claude_env::claude_argv_chooses_session(&args)
     }
 
     /// True when argv's head names the claude CLI image (basename compare,
@@ -7773,12 +7775,29 @@ pub(crate) mod tests {
             "bypassPermissions"
         ])));
         assert!(loses(&claude_argv(&[])));
+        // A bare `claude.exe` still resolves through PATH, where the shim sits.
         assert!(loses(&TerminalSession::build_command_from(Some(vec![
-            "/home/u/.nvm/versions/node/v24.19.0/bin/claude".to_string(),
+            "claude.exe".to_string(),
             "--verbose".to_string(),
         ]))));
         // A session flag after `--` is positional; it chooses nothing.
         assert!(loses(&claude_argv(&["--", "--continue"])));
+
+        // A claude named by a path never goes through the PATH shim, so a
+        // missing shim changes nothing for it (route (d), not (c)).
+        for path in [
+            "/home/u/.nvm/versions/node/v24.19.0/bin/claude",
+            "C:\\Users\\u\\.local\\bin\\claude.exe",
+            "./claude",
+        ] {
+            assert!(
+                !loses(&TerminalSession::build_command_from(Some(vec![
+                    path.to_string(),
+                    "--verbose".to_string(),
+                ]))),
+                "{path} is not resolved through the shim"
+            );
+        }
 
         for chosen in [
             vec!["--session-id", "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"],
@@ -7797,18 +7816,63 @@ pub(crate) mod tests {
             "-l".to_string(),
         ]))));
 
-        // The seam consults it on the no-shim arm, and only to warn: no
-        // refusal for this route.
+        // The seam consults it in its no-shim (`None =>`) arm, and only to
+        // warn: that arm refuses nothing.
         let src = include_str!("session.rs");
         let seam_start = src
             .find(&["fn apply_identity", "_seam("].concat())
             .expect("the identity seam exists");
         let seam = &src[seam_start..];
-        let seam = &seam[..seam.find("\n    }\n").expect("the seam body ends")];
+        let match_at = seam
+            .find(&["match &", "identity {"].concat())
+            .expect("the seam matches on the materialized shim dir");
+        let arm = &seam[match_at..];
+        let arm_start = arm
+            .find("\n            None => {\n")
+            .expect("the no-shim arm exists");
+        let arm = &arm[arm_start..];
+        let arm = &arm[..arm
+            .find("\n            }\n")
+            .expect("the no-shim arm ends")];
         assert!(
-            seam.contains(&["if Self::pane_loses_", "shim_pin(cmd) {"].concat()),
-            "apply_identity_seam must warn for a claude pane that loses its shim pin"
+            arm.contains(&["if Self::pane_loses_", "shim_pin(cmd) {"].concat()),
+            "the no-shim arm must warn for a claude pane that loses its shim pin: {arm}"
         );
+        assert!(
+            !arm.contains(&["return ", "Err"].concat()),
+            "the no-shim arm must not refuse the pane: {arm}"
+        );
+    }
+
+    /// The seam's predicate and the identity shim read ONE session-choice token
+    /// set (`claude_env::claude_argv_chooses_session`): a token the shim treats
+    /// as the user's choice is one the seam does not warn about, and vice versa.
+    #[test]
+    fn pane_loses_shim_pin_agrees_with_the_shared_session_choice_set() {
+        for tokens in [
+            vec![],
+            vec!["--verbose"],
+            vec!["--session-id", "x"],
+            vec!["--session-id=x"],
+            vec!["--resume", "x"],
+            vec!["--resume=x"],
+            vec!["-r", "x"],
+            vec!["resume"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--CONTINUE"],
+            vec!["--continued"],
+            vec!["--session-id-ish"],
+            vec!["--", "--continue"],
+            vec!["-p", "resume the work"],
+        ] {
+            let chose = qontinui_runner_lib::claude_env::claude_argv_chooses_session(&tokens);
+            assert_eq!(
+                TerminalSession::pane_loses_shim_pin(&claude_argv(&tokens)),
+                !chose,
+                "{tokens:?}"
+            );
+        }
     }
 
     /// The id the seam hands back to the spawn — and so the id the coord row

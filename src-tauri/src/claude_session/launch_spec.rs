@@ -531,14 +531,16 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 }
                 // A template's `--continue` / `-c` is a third session choice —
                 // "the most recent conversation in this cwd" — and it cannot
-                // stand beside the spec's own `--session-id` / `--resume`: the
-                // session would no longer be the one the runner pinned (plan
+                // stand beside the spec's `--session-id` / `--resume`: Claude
+                // Code refuses the pair ("--session-id with --continue or
+                // --resume also needs --fork-session", measured on 2.1.330), and
+                // were it accepted the session would no longer be the one the
+                // runner pinned (plan
                 // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
-                // Phase 2). When the spec owns the session, it is dropped. A
-                // template that positions the id itself through `{sessionId}`
-                // owns the session layout, so its `--continue` is kept beside
-                // that id, as the `--session-id` arm above keeps the flag.
-                "--continue" | "-c" if pin.is_some() && !had_placeholder => {
+                // Phase 2). So whenever the spec names a session it is dropped,
+                // including when the template positions that id itself through
+                // `{sessionId}`.
+                "--continue" | "-c" if pin.is_some() => {
                     tracing::warn!(
                         flag = %flag_name_only(&unit.name),
                         "launch template flag dropped: the spec pins the session, so the \
@@ -2130,7 +2132,9 @@ mod tests {
 
     #[test]
     fn pty_ai_launch_session_placeholder_substituted() {
-        // `{sessionId}` placeholder: id substituted in place, not appended.
+        // `{sessionId}` placeholder: id substituted in place, not appended. The
+        // template's `--continue` is dropped: Claude Code refuses
+        // `--session-id X --continue` without `--fork-session`.
         let mut s = spec();
         s.config_dir = Some("/h/.claude-x".to_string());
         s.session_id = Some("abc".to_string());
@@ -2142,7 +2146,7 @@ mod tests {
         assert_eq!(
             cmd,
             "CLAUDE_CONFIG_DIR=\"/h/.claude-x\" \
-             claude --permission-mode bypassPermissions --session-id abc --continue"
+             claude --permission-mode bypassPermissions --session-id abc"
         );
     }
 

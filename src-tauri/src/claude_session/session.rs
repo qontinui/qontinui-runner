@@ -28,6 +28,7 @@ use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, Progr
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 use super::dispatcher;
+use super::runner::{cli_session_pin, CliPin};
 use super::state::{SessionState, SessionStateTracker};
 use super::writer::StdinWriter;
 
@@ -335,13 +336,13 @@ impl ClaudeSession {
         // `None` mints a fresh id here instead of letting the CLI pick one, so
         // the id is in argv where the session census reads it (see
         // `runner::CliPin`).
-        let cli_pin = crate::claude_session::runner::cli_session_pin(cli_session_ctx);
+        let cli_pin = cli_session_pin(cli_session_ctx);
         match &cli_pin {
-            crate::claude_session::runner::CliPin::Resume(id) => info!(
+            CliPin::Resume(id) => info!(
                 "Resuming Claude CLI session {} for interactive session {}",
                 id, session_id
             ),
-            crate::claude_session::runner::CliPin::New(id) => info!(
+            CliPin::New(id) => info!(
                 "Pinning Claude CLI session id {} for interactive session {}",
                 id, session_id
             ),
