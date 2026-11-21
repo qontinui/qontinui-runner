@@ -253,11 +253,24 @@ fn resolve_exclude(writer: &str, base: &Path) -> Option<(PathBuf, String)> {
         );
         return None;
     };
-    let mut lines = text.split('\n');
+    parse_git_path_answer(writer, base, &mut text.split('\n'))
+}
+
+/// Parse the `--git-path info/exclude` and `--show-prefix` lines of a
+/// `git rev-parse --path-format=absolute` answer (the next two of `lines`)
+/// into the exclude file and the prefix. The one parser for both entry points
+/// ([`resolve_exclude`] and [`exclude_workdir_artifacts`]'s combined probe).
+/// `None`, logged at `warn!` naming `writer`, when the path is not what the
+/// flag promises.
+fn parse_git_path_answer<'a>(
+    writer: &str,
+    base: &Path,
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> Option<(PathBuf, String)> {
     let exclude = PathBuf::from(lines.next().map(str::trim_end).unwrap_or_default());
     let prefix = lines.next().map(str::trim_end).unwrap_or_default();
-    // A git older than 2.31 does not know `--path-format` and ECHOES it as the
-    // first line while still exiting 0. Accept only what the flag promises —
+    // A git older than 2.31 does not know `--path-format` and ECHOES it on the
+    // line where the path belongs, while still exiting 0. Accept only what the flag promises —
     // an absolute path ending in `info/exclude` — so such a git can never make
     // this write a relative file into the runner's own working directory.
     if !exclude.is_absolute() || !exclude.ends_with("info/exclude") {
@@ -549,11 +562,18 @@ fn is_root_entry_pattern(name: &str) -> bool {
 ///
 /// In order:
 ///
-/// 1. **Work-tree check.** One bounded `git rev-parse --is-inside-work-tree`,
-///    which must print `true`: `ls-files` alone answers a bare repository or a
-///    `.git` directory with an empty, successful listing, which would read as
-///    "nothing tracked" and write a line into a repository with no work tree.
-///    Anything else is [`WorkdirExcludeSkip::NotAWorkTree`], logged at `debug!`.
+/// 1. **Work-tree check and resolve, in one spawn.** One bounded
+///    `git rev-parse --is-inside-work-tree --path-format=absolute --git-path
+///    info/exclude --show-prefix`. Its first line must be `true`: `ls-files`
+///    alone answers a bare repository or a `.git` directory with an empty,
+///    successful listing, which would read as "nothing tracked" and write a
+///    line into a repository with no work tree. Anything else is
+///    [`WorkdirExcludeSkip::NotAWorkTree`], logged at `debug!`. The next two
+///    lines are the exclude file and the prefix, parsed as in
+///    [`resolve_exclude`] (same git-older-than-2.31 echo guard): a linked
+///    worktree writes its COMMON dir's `info/exclude`. An empty prefix is
+///    allowed here, unlike [`exclude_written_paths`]: these files sit at the
+///    session cwd by construction, which is often the work-tree root.
 /// 2. **Tracked check, path-limited.** One bounded
 ///    `git --literal-pathspecs ls-files -z -- <literals>` under `workdir`. It
 ///    costs only as much as the names asked about, rather than listing the
@@ -563,15 +583,11 @@ fn is_root_entry_pattern(name: &str) -> bool {
 ///    written and the miss is logged at `debug!`, never `warn!`: a breadcrumb
 ///    in a non-repo directory is normal, and would otherwise warn every refresh.
 ///    A name git tracks (or tracks anything beneath) gets no line.
-/// 3. **Resolve** the exclude file and prefix ([`resolve_exclude`]): a linked
-///    worktree writes its COMMON dir's `info/exclude`. An empty prefix is
-///    allowed here, unlike [`exclude_written_paths`]: these files sit at the
-///    session cwd by construction, which is often the work-tree root.
-/// 4. **Anchor without escaping the pattern.** Only the prefix goes through
+/// 3. **Anchor without escaping the pattern.** Only the prefix goes through
 ///    [`escape_pattern`] (`/` for an empty prefix); the pattern is appended
 ///    raw, because escaping `.coord-mcp-status.tmp-*` would write a line that
 ///    matches no temp file.
-/// 5. **Append** under [`WORKDIR_ARTIFACT_EXCLUDE_MARKER`] with no prune: these
+/// 4. **Append** under [`WORKDIR_ARTIFACT_EXCLUDE_MARKER`] with no prune: these
 ///    are fixed runner names, so no line of this block ever goes stale.
 ///
 /// Best-effort: never panics, never propagates, never fails its caller. The
@@ -595,14 +611,37 @@ pub(crate) fn exclude_workdir_artifacts(
     if literals.is_empty() {
         return WorkdirExclude::Skipped(NoUsablePattern);
     }
-    // An error can never read `true`, so one comparison covers both arms.
-    let in_work_tree = match crate::provision_guard::run_bounded_git(
+    // ONE rev-parse answers both "is this a work tree?" and "where is its
+    // exclude file, and what is the prefix?". An error can never read `true`,
+    // so one comparison covers both the refusal and the no-repo arm.
+    let answer = match crate::provision_guard::run_bounded_git(
         workdir,
-        &["rev-parse", "--is-inside-work-tree"],
+        &[
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+            "--show-prefix",
+        ],
     ) {
-        Ok(out) => String::from_utf8_lossy(&out).trim().to_string(),
+        // Not lossy: a replacement character in the path would still pass the
+        // absolute-path guard and send the write somewhere that is not the
+        // repository's exclude file.
+        Ok(out) => match String::from_utf8(out) {
+            Ok(text) => text,
+            Err(_) => {
+                warn!(
+                    workdir = %workdir.display(),
+                    "{writer}: git rev-parse printed non-UTF-8 output; nothing excluded"
+                );
+                return WorkdirExclude::Failed;
+            }
+        },
         Err(cause) => cause.to_string(),
     };
+    let mut lines = answer.split('\n');
+    let in_work_tree = lines.next().map(str::trim).unwrap_or_default();
     if in_work_tree != "true" {
         debug!(
             workdir = %workdir.display(),
@@ -611,6 +650,9 @@ pub(crate) fn exclude_workdir_artifacts(
         );
         return WorkdirExclude::Skipped(NotAWorkTree);
     }
+    let Some((exclude_path, prefix)) = parse_git_path_answer(writer, workdir, &mut lines) else {
+        return WorkdirExclude::Failed;
+    };
     let mut args = vec!["--literal-pathspecs", "ls-files", "-z", "--"];
     args.extend(literals.iter().copied());
     let listed = match crate::provision_guard::run_bounded_git(workdir, &args) {
@@ -653,9 +695,6 @@ pub(crate) fn exclude_workdir_artifacts(
     if wanted.is_empty() {
         return WorkdirExclude::Skipped(AllTracked);
     }
-    let Some((exclude_path, prefix)) = resolve_exclude(writer, workdir) else {
-        return WorkdirExclude::Failed;
-    };
     let Some(anchor) = escape_pattern(&prefix) else {
         debug!(
             workdir = %workdir.display(),

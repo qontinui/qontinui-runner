@@ -13065,17 +13065,37 @@ pub fn create_router(
                     )
                 })
             };
+            // On a blocking thread, like its neighbours: per workdir it reads
+            // the config and may run bounded git spawns (the workdir-artifact
+            // exclude), none of which belongs on a tokio worker. A panicked
+            // pass reports zero counts rather than taking the boot task down.
             let session_counts = if workdirs.is_empty() {
                 Default::default()
             } else {
-                crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port)
+                tokio::task::spawn_blocking(move || {
+                    crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("coord_mcp: boot session reconcile task failed ({e}); counts unknown, reported as zero");
+                    Default::default()
+                })
             };
 
             // Plan 2026-07-07 Change 1 secondary gap: root self-heal ALWAYS runs,
             // independent of session presence. Change 1 core fix: on a same-port
             // restart this ADOPTS the on-disk nonce (no file rewrite) instead of
             // minting a fresh one that would strand a live client's cached nonce.
-            let root_action = crate::coord_mcp::reconcile_root_config(reconcile_bound_port);
+            // Blocking thread for the same reason as the session pass above. A
+            // panicked pass reads as `Leave` (nothing applied), with a warning.
+            let root_action = tokio::task::spawn_blocking(move || {
+                crate::coord_mcp::reconcile_root_config(reconcile_bound_port)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                warn!("coord_mcp: boot root reconcile task failed ({e}); reported as Leave");
+                crate::coord_mcp::RootReconcileAction::Leave
+            });
 
             // Change 2 observability: one structured summary of restore vs
             // self-heal so a future silent rotation (restored=0 → root Rewrite) is
