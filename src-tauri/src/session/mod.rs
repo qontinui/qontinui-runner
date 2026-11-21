@@ -110,6 +110,7 @@ pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a 
 pub mod transcript_emitter;
 pub mod transcript_facts; // What a transcript says happened after a finish (prompt, turn opener, assistant work), from the newest copy — the close guard's revival input (plan 2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions, D6)
 pub mod transcript_last_turn; // When a transcript last had a TURN, cached per (len, mtime) — orders a migrated session's copies and stamps last_acted_at (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
+pub mod transcript_trees; // The directories a session's transcript names (record cwds, write-tool targets, main + subagent sidechains) and the no-write proof — the finished_close custody gather's transcript source (plan 2026-11-20-triage-sessions-custody-reads-the-sessions-recorded-trees-not-its-cwd, D6)
 pub mod transport;
 pub mod wind_down_executor; // The wind-down TICK — the only place that closes a session for wind-down, drained (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4) or finished (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod wind_down_observer; // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)

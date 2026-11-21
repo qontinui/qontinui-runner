@@ -5023,6 +5023,24 @@ mod tests {
         async fn slot_wip_state(&self, _root: &Path, _session_id: &str) -> Option<String> {
             None
         }
+        async fn reaped_allocation_state(&self, root: &Path) -> wind_down::MemberState {
+            // No transcript here names an allocation tree, so none is reaped.
+            wind_down::MemberState::ProbeFailed(format!("{}: not scripted", root.display()))
+        }
+        async fn transcript_scan(
+            &self,
+            _session_id: &str,
+        ) -> crate::session::transcript_trees::TranscriptScan {
+            // Every session here sits in its own tree: its transcript is read
+            // whole and names nothing beyond it.
+            crate::session::transcript_trees::TranscriptScan {
+                dirs: Vec::new(),
+                read: wind_down::TranscriptRead {
+                    incomplete: None,
+                    write_call: None,
+                },
+            }
+        }
     }
 
     /// A scripted [`FinishedCloseWorld`].

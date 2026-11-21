@@ -495,8 +495,10 @@ pub struct CustodyInputs {
     pub ownership: Result<(), String>,
     /// Every distinct worktree in the session's set: the repo holding its
     /// directory (absent when the directory is in no repo, e.g. the workspace
-    /// root), its coord-attributed worktrees, and its isolated-edit context's
-    /// materialized worktrees.
+    /// root), its coord-attributed worktrees, its isolated-edit context's
+    /// materialized worktrees, and the worktrees holding the directories its
+    /// transcript names (record `cwd`s and write-tool targets, main and
+    /// subagent sidechains).
     pub members: Vec<CustodyMember>,
     /// Every worktree path the gather COVERED: each attributed path it was
     /// handed (a reaped one included, since the gather positively saw it
@@ -506,6 +508,44 @@ pub struct CustodyInputs {
     /// so its state is UNKNOWN (see `ObligationsUnknown::WorktreeNotProbed`).
     /// Empty when the gather stopped before probing anything.
     pub covered: Vec<String>,
+    /// What reading the session's transcript, main and subagent sidechains,
+    /// established. Its directories are already in `members` and `covered`.
+    pub transcript: TranscriptRead,
+}
+
+/// What reading a session's transcript, main and subagent sidechains,
+/// established for [`custody_gate`] (plan
+/// `2026-11-20-triage-sessions-custody-reads-the-sessions-recorded-trees-not-its-cwd`,
+/// D2 and D6). There is deliberately no default: a value that read as "read
+/// whole, no write" by default would be a proof nobody made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRead {
+    /// Why the transcript was not read whole: no copy was found, a file could
+    /// not be read or parsed, or a bound was exceeded. `None` only when every
+    /// file was read to its end.
+    pub incomplete: Option<String>,
+    /// The first `tool_use` of a write-capable tool it holds, if any.
+    pub write_call: Option<String>,
+}
+
+impl TranscriptRead {
+    /// A transcript that was not read, for the reason given.
+    pub fn unread(why: impl Into<String>) -> Self {
+        Self {
+            incomplete: Some(why.into()),
+            write_call: None,
+        }
+    }
+
+    /// Read whole, with no write-capable call: the only proof that a session
+    /// naming no worktree touched none. `Err` says why the proof is not held.
+    pub fn no_write_proof(&self) -> Result<(), String> {
+        match (&self.write_call, &self.incomplete) {
+            (Some(call), _) => Err(format!("{call}, a write-capable tool")),
+            (None, Some(why)) => Err(format!("the transcript was not read whole: {why}")),
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 /// Why custody rules a session out.
@@ -531,6 +571,12 @@ pub enum CustodyUnknown {
     OwnershipUnreadable { detail: String },
     /// A member's probe failed or timed out.
     ProbeFailed { path: String, detail: String },
+    /// The session names no worktree at all, and its transcript does not
+    /// prove that it touched none.
+    NoTreeUnproven { detail: String },
+    /// The session's transcript could not be read whole, so a worktree it
+    /// names may never have been judged.
+    TranscriptUnreadable { detail: String },
 }
 
 /// The custody verdict. Only [`CustodyVerdict::Clean`] lets the
@@ -577,6 +623,8 @@ impl CustodyUnknown {
             Self::NoSessionDir => "no_session_dir",
             Self::OwnershipUnreadable { .. } => "ownership_unreadable",
             Self::ProbeFailed { .. } => "probe_failed",
+            Self::NoTreeUnproven { .. } => "no_tree_unproven",
+            Self::TranscriptUnreadable { .. } => "transcript_unreadable",
         }
     }
 
@@ -590,6 +638,15 @@ impl CustodyUnknown {
                 format!("the session's attributed worktrees could not be read: {detail}")
             }
             Self::ProbeFailed { path, detail } => format!("{path}: {detail}"),
+            Self::NoTreeUnproven { detail } => format!(
+                "the session's directory is in no repository and no worktree is attributed \
+                 to it or named by its transcript, but the transcript does not prove it \
+                 touched none: {detail}"
+            ),
+            Self::TranscriptUnreadable { detail } => format!(
+                "the session's transcript could not be read whole, so a worktree it names may \
+                 be unjudged: {detail}"
+            ),
         }
     }
 }
@@ -643,9 +700,20 @@ impl CustodyVerdict {
 ///    failed or timed out. A branch with no upstream is NOT one — the probe
 ///    then counts the commits on no remote-tracking ref (see
 ///    [`MemberState::Probed::ahead`]), which is a definite answer.
-/// 5. Otherwise **`Clean`** — including a session with NO members at all,
-///    which is a session sitting outside any repo (the workspace root) that
-///    no worktree is attributed to.
+/// 5. **A session that names no worktree at all is `Clean` only on proof.**
+///    No member and nothing covered means its directory is in no repository
+///    (the workspace root) and no attributed, isolated-edit or transcript
+///    source named a worktree. That set is empty either because the session
+///    touched no tree or because it touched one no source recorded (a `Bash`
+///    write by absolute path). Only the transcript tells the two apart
+///    ([`TranscriptRead::no_write_proof`]): `Clean` when it was read whole and
+///    holds no write-capable call, otherwise `Unknown(NoTreeUnproven)` (plan
+///    `2026-11-20-triage-sessions-custody-reads-the-sessions-recorded-trees-not-its-cwd`,
+///    D2 and D6).
+/// 6. **A transcript that could not be read whole → `Unknown`**
+///    (`TranscriptUnreadable`), however clean the other members are: the
+///    unread part may name a dirty tree.
+/// 7. Otherwise **`Clean`**.
 pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
     if inputs.session_dir.is_none() {
         return CustodyVerdict::Unknown(CustodyUnknown::NoSessionDir);
@@ -692,6 +760,17 @@ pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
             }
             MemberState::Probed { .. } | MemberState::PrimaryCheckout => {}
         }
+    }
+    if inputs.members.is_empty() && inputs.covered.is_empty() {
+        return match inputs.transcript.no_write_proof() {
+            Ok(()) => CustodyVerdict::Clean,
+            Err(detail) => CustodyVerdict::Unknown(CustodyUnknown::NoTreeUnproven { detail }),
+        };
+    }
+    if let Some(detail) = &inputs.transcript.incomplete {
+        return CustodyVerdict::Unknown(CustodyUnknown::TranscriptUnreadable {
+            detail: detail.clone(),
+        });
     }
     CustodyVerdict::Clean
 }
@@ -1619,6 +1698,25 @@ mod tests {
             ownership: Ok(()),
             members,
             covered: Vec::new(),
+            transcript: read_whole(None),
+        }
+    }
+
+    /// A transcript read to its end, holding `write_call` if given.
+    fn read_whole(write_call: Option<&str>) -> TranscriptRead {
+        TranscriptRead {
+            incomplete: None,
+            write_call: write_call.map(str::to_string),
+        }
+    }
+
+    /// The workspace-root shape: a directory in no repository, no member and
+    /// nothing covered, with what reading the transcript established.
+    fn no_tree(transcript: TranscriptRead) -> CustodyInputs {
+        CustodyInputs {
+            session_dir: Some("/ws".to_string()),
+            transcript,
+            ..custody(vec![])
         }
     }
 
@@ -1735,8 +1833,11 @@ mod tests {
     #[test]
     fn a_workspace_root_session_is_judged_by_its_attributed_worktrees_alone() {
         // No member for the directory itself: it is in no repo.
-        let none = custody(vec![]);
-        assert!(custody_gate(&none).is_clean(), "nothing attributed → clean");
+        let none = no_tree(read_whole(None));
+        assert!(
+            custody_gate(&none).is_clean(),
+            "nothing attributed and a proven no-write transcript → clean"
+        );
 
         let mut dirty = clean_member("/ws/agent-worktrees/x/repo");
         dirty.state = MemberState::Probed {
@@ -1744,6 +1845,105 @@ mod tests {
             ahead: 0,
         };
         assert_eq!(custody_gate(&custody(vec![dirty])).as_str(), "dirty");
+    }
+
+    /// D2/D6: an empty set is not evidence by itself. With no transcript, or
+    /// one that could not be read whole, it is UNKNOWN.
+    #[test]
+    fn an_empty_no_repo_set_with_an_absent_or_unreadable_transcript_is_unknown() {
+        for why in [
+            "no transcript for session s under any of 3 account root(s)",
+            "/p/s.jsonl could not be read: permission denied",
+        ] {
+            let v = custody_gate(&no_tree(TranscriptRead::unread(why)));
+            assert_eq!(
+                v,
+                CustodyVerdict::Unknown(CustodyUnknown::NoTreeUnproven {
+                    detail: format!("the transcript was not read whole: {why}")
+                })
+            );
+            assert_eq!(
+                (v.as_str(), v.reason()),
+                ("unknown", Some("no_tree_unproven"))
+            );
+            assert!(v.detail().unwrap().ends_with(why), "{:?}", v.detail());
+        }
+    }
+
+    #[test]
+    fn an_empty_no_repo_set_with_a_proven_no_write_transcript_is_clean() {
+        assert_eq!(
+            custody_gate(&no_tree(read_whole(None))),
+            CustodyVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn an_empty_no_repo_set_whose_transcript_calls_bash_is_unknown() {
+        let v = custody_gate(&no_tree(read_whole(Some(
+            "/p/s.jsonl line 4 calls \"Bash\"",
+        ))));
+        assert_eq!(
+            v,
+            CustodyVerdict::Unknown(CustodyUnknown::NoTreeUnproven {
+                detail: "/p/s.jsonl line 4 calls \"Bash\", a write-capable tool".to_string()
+            })
+        );
+    }
+
+    /// The no-write proof is asked of the empty set only: a session judged by
+    /// a clean, pushed worktree is clean whatever it called, and so is one
+    /// whose only named worktree was reaped (the gather covered it).
+    #[test]
+    fn a_linked_member_clean_set_is_clean_without_a_no_write_proof() {
+        let linked = CustodyInputs {
+            transcript: read_whole(Some("/p/s.jsonl line 2 calls \"Bash\"")),
+            ..custody(vec![clean_member("/ws/agent-worktrees/a/repo")])
+        };
+        assert_eq!(custody_gate(&linked), CustodyVerdict::Clean);
+
+        let mut reaped = no_tree(read_whole(Some("/p/s.jsonl line 2 calls \"Bash\"")));
+        reaped.covered = vec!["/ws/agent-worktrees/gone/repo".to_string()];
+        assert_eq!(custody_gate(&reaped), CustodyVerdict::Clean);
+    }
+
+    /// Re-plan 2026-11-21: a transcript that could not be read whole may name a
+    /// dirty tree, so it is UNKNOWN even beside clean members — and a dirty
+    /// member still outranks it.
+    #[test]
+    fn a_linked_clean_member_with_an_unreadable_transcript_reads_unknown() {
+        let why = "/p/s.jsonl is 9 bytes, past the 4 bytes left of the scan's byte bound";
+        let i = CustodyInputs {
+            transcript: TranscriptRead::unread(why),
+            ..custody(vec![clean_member("/ws/agent-worktrees/a/repo")])
+        };
+        let v = custody_gate(&i);
+        assert_eq!(
+            v,
+            CustodyVerdict::Unknown(CustodyUnknown::TranscriptUnreadable {
+                detail: why.to_string()
+            })
+        );
+        assert_eq!(v.reason(), Some("transcript_unreadable"));
+        assert!(v.detail().unwrap().ends_with(why), "{:?}", v.detail());
+
+        let mut covered_only = no_tree(TranscriptRead::unread(why));
+        covered_only.covered = vec!["/ws/agent-worktrees/gone/repo".to_string()];
+        assert_eq!(
+            custody_gate(&covered_only).reason(),
+            Some("transcript_unreadable")
+        );
+
+        let mut dirty = clean_member("/ws/agent-worktrees/b/repo");
+        dirty.state = MemberState::Probed {
+            dirty: true,
+            ahead: 0,
+        };
+        let i = CustodyInputs {
+            transcript: TranscriptRead::unread(why),
+            ..custody(vec![dirty])
+        };
+        assert_eq!(custody_gate(&i).reason(), Some("uncommitted"));
     }
 
     #[test]
