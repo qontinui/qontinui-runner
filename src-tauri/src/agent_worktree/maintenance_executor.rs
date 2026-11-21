@@ -729,23 +729,33 @@ pub fn spawn_maintenance() {
 // Device + tenant come from the device JWT `coord_get`/`coord_post` attach.
 //
 // Security shape:
-// - The one-shot has NO shell and runs under `--safe-mode` (no CLAUDE.md or
-//   its @-imports, no auto memory, skills, hooks, plugins or MCP) and
-//   `--restricted` (file tools confined to the working directory) — see
+// - The one-shot has NO shell and runs under `--safe-mode` (per the CLI's
+//   `--help`: all customizations — CLAUDE.md, skills, installed plugins,
+//   hooks, MCP servers, custom commands and agents, output styles, workflows,
+//   custom themes, keybindings, and more — disabled; admin-managed (policy)
+//   settings and the hooks of managed plugins still apply) and `--restricted`
+//   (file tools confined to the working directory) — see
 //   `ai_provider::claude_cli::OneshotTools`.
-// - For a request with a `repo_path` the runner — through libgit2 only, never
-//   the git CLI — requires an absolute path that is the ROOT of a non-bare
-//   work tree, refuses symlinks that leave the checkout or point into its git
-//   directory, gathers the git facts (capped, C-quoted) and APPENDS them to
-//   coord's prompt in a block whose markers and section headers all carry a
-//   per-run nonce. The run's cwd (and so its `--restricted` root) is the
-//   CANONICAL work-tree path the gate resolved, not the raw `repo_path`.
+// - No git CLI touches the checkout. The RUNNER's own git work goes through
+//   libgit2 only. The CHILD's git — the claude CLI runs the git CLI in its
+//   working directory on its own — is pointed at an empty, runner-private
+//   `GIT_DIR` that is not a repository, so it finds no repository and reads
+//   none of the checkout's config (`claude_cli::run_structured_oneshot_with`).
+// - For a request with a `repo_path` the runner requires an absolute, local
+//   (not network) path that is the ROOT of a non-bare work tree, refuses
+//   symlinks that leave the checkout or point into its git directory, gathers
+//   the git facts (capped, C-quoted) and APPENDS them to coord's prompt in a
+//   block whose markers and section headers all carry a per-run nonce. The
+//   run's cwd (and so its `--restricted` root) is the CANONICAL work-tree path
+//   the gate resolved, not the raw `repo_path`.
 // - What the symlink walk covers: index entries with the symlink mode, and the
 //   untracked / type-changed status entries (every path component of each).
-//   What it does NOT walk: ignored paths (e.g. the `node_modules` link
-//   `allocate-worktree.sh` plants on purpose), submodule work trees and
-//   untracked nested repositories. For those the CLI's `--restricted`
-//   confinement is the barrier.
+//   Each link is resolved one component at a time from the root down, so no
+//   stat ever passes through a link whose target text has not been read and
+//   checked; a network target is refused unresolved. What it does NOT walk:
+//   ignored paths (e.g. the `node_modules` link `allocate-worktree.sh` plants
+//   on purpose), submodule work trees and untracked nested repositories. For
+//   those the CLI's `--restricted` confinement is the barrier.
 // - A compile with no `repo_path` runs in a private, runner-owned directory
 //   under the runner's data dir, never a shared temp dir.
 // - Expiry: a VERDICT row that expires unanswered is re-enqueued by coord's
@@ -1073,6 +1083,14 @@ enum Preflight {
     },
 }
 
+/// Decide what to do with a request WITHOUT touching the filesystem: a
+/// network `repo_path` is refused here, from its text alone, before anything
+/// could contact the host. Whether the path exists, and everything else about
+/// the checkout, is checked on the blocking pool ([`prepare_checkout`]).
+///
+/// Not visible from the text: a drive letter mapped to a network share. Such a
+/// path is refused by [`usable_canonical_dir`] once canonicalization reports
+/// its UNC form — after the first filesystem calls have reached the share.
 fn preflight(
     req: &AgentRequest,
     now: chrono::DateTime<chrono::Utc>,
@@ -1099,14 +1117,14 @@ fn preflight(
         .map(str::trim)
         .filter(|p| !p.is_empty());
     let repo = match repo {
+        Some(p) if is_remote_link_target(Path::new(p)) => {
+            return Preflight::Refuse(AgentAnswer::error(format!(
+                "repo_path names a network location, refused without contacting it: {p}"
+            )))
+        }
         Some(p) if !Path::new(p).is_absolute() => {
             return Preflight::Refuse(AgentAnswer::error(format!(
                 "repo_path must be an absolute path: {p}"
-            )))
-        }
-        Some(p) if !Path::new(p).is_dir() => {
-            return Preflight::Refuse(AgentAnswer::error(format!(
-                "repo_path is not an existing directory on this device: {p}"
             )))
         }
         Some(p) => Some(std::path::PathBuf::from(p)),
@@ -1144,7 +1162,9 @@ fn preflight(
 
 // ---------------------------------------------------------------------------
 // Runner-side git, through libgit2 (`git2`) ONLY — this path never spawns the
-// `git` CLI. (The one-shot itself has no shell — see `OneshotTools`.)
+// `git` CLI. (The one-shot itself has no shell — see `OneshotTools` — and the
+// git CLI the claude child runs on its own is pointed at a non-repository
+// `GIT_DIR`; see `no_git_dir`.)
 //
 // A candidate checkout's config, attributes and commits are untrusted input,
 // and the git CLI executes programs they name: a `filter.<x>.clean` selected
@@ -1173,7 +1193,7 @@ const MAX_DIFF_STAT_FILES: usize = 500;
 /// Git mode of a symbolic link in the index.
 const GIT_SYMLINK_MODE: u32 = 0o120_000;
 
-/// Hops followed when resolving one link's target chain lexically.
+/// Links followed while resolving one path (the hop budget); more refuses.
 const MAX_LINK_HOPS: usize = 40;
 
 /// `p` canonicalized, in a form a child process can use as its working
@@ -1297,11 +1317,129 @@ fn is_remote_link_target(target: &Path) -> bool {
     b.len() >= 2 && matches!(b[0], b'\\' | b'/') && matches!(b[1], b'\\' | b'/')
 }
 
+/// The two filesystem calls the link resolver makes. A trait so a test can
+/// record WHICH paths [`resolve_link_free`] stats — no test can plant a real
+/// link to a network host and watch for the contact.
+trait LinkFs {
+    /// Whether `p` itself (not followed) is a symlink or junction.
+    fn is_link(&mut self, p: &Path) -> std::io::Result<bool>;
+    /// The target text of the link `p`, unresolved.
+    fn read_link(&mut self, p: &Path) -> std::io::Result<std::path::PathBuf>;
+}
+
+/// [`LinkFs`] over the real filesystem.
+struct RealFs;
+
+impl LinkFs for RealFs {
+    fn is_link(&mut self, p: &Path) -> std::io::Result<bool> {
+        Ok(std::fs::symlink_metadata(p)?.file_type().is_symlink())
+    }
+    fn read_link(&mut self, p: &Path) -> std::io::Result<std::path::PathBuf> {
+        std::fs::read_link(p)
+    }
+}
+
+/// One step of a path being resolved by [`resolve_link_free`].
+enum LinkStep {
+    /// Restart at this root (`/`, `C:\`, `\\?\C:\`).
+    Root(std::path::PathBuf),
+    /// `..`
+    Up,
+    /// A plain component.
+    Name(std::ffi::OsString),
+}
+
+/// `p` as resolution steps: its root (when absolute), then its components.
+/// `Err` for a drive- or root-relative Windows form (`C:x`, `\x`), which the
+/// resolver does not follow.
+fn link_steps(p: &Path) -> Result<Vec<LinkStep>, String> {
+    use std::path::Component;
+    let mut steps = Vec::new();
+    if p.is_absolute() {
+        steps.push(LinkStep::Root(
+            p.ancestors().last().unwrap_or(p).to_path_buf(),
+        ));
+    } else if p.has_root() || matches!(p.components().next(), Some(Component::Prefix(_))) {
+        return Err(format!(
+            "drive- or root-relative link target {}",
+            p.display()
+        ));
+    }
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => steps.push(LinkStep::Up),
+            Component::Normal(n) => steps.push(LinkStep::Name(n.to_os_string())),
+        }
+    }
+    Ok(steps)
+}
+
+/// Resolve the absolute `path` to the link-free path it names, ONE COMPONENT
+/// AT A TIME from the root down. Each component is stat-ed (not followed)
+/// under a prefix already found link-free, so no stat ever passes through a
+/// link whose target text this code has not read; and every target text is
+/// checked by [`is_remote_link_target`] BEFORE it is spliced in, so a network
+/// target anywhere in a chain (`a -> b/c` with `b -> \\host\share`) is refused
+/// without anything contacting the host. `..` is applied to the resolved
+/// prefix, as the kernel does. Refuses a missing component (a dangling link),
+/// any stat or `read_link` error, a drive- or root-relative target, and more
+/// than [`MAX_LINK_HOPS`] links (a loop).
+fn resolve_link_free(path: &Path, fs: &mut impl LinkFs) -> Result<std::path::PathBuf, String> {
+    let mut pending = link_steps(path)?;
+    pending.reverse(); // a stack: the next step is last
+    let mut resolved = std::path::PathBuf::new();
+    let mut hops = 0usize;
+    while let Some(step) = pending.pop() {
+        match step {
+            LinkStep::Root(root) => resolved = root,
+            LinkStep::Up => {
+                resolved.pop(); // a no-op at the root: `/..` is `/`
+            }
+            LinkStep::Name(name) => {
+                let next = resolved.join(&name);
+                let is_link = fs
+                    .is_link(&next)
+                    .map_err(|e| format!("cannot stat {}: {e}", next.display()))?;
+                if !is_link {
+                    resolved = next;
+                    continue;
+                }
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(format!(
+                        "more than {MAX_LINK_HOPS} links while resolving {}",
+                        path.display()
+                    ));
+                }
+                let target = fs
+                    .read_link(&next)
+                    .map_err(|e| format!("cannot read link {}: {e}", next.display()))?;
+                if is_remote_link_target(&target) {
+                    return Err(format!(
+                        "{} points at a network location ({})",
+                        next.display(),
+                        target.display()
+                    ));
+                }
+                let mut steps = link_steps(&target)?;
+                steps.reverse();
+                pending.extend(steps); // a relative target continues from `resolved`
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 /// Check one on-disk path for being a link. `Ok(true)` when it does not exist
 /// (nothing beyond it to follow), `Ok(false)` when it exists and is not a link
 /// or is a link that stays inside `root_canon` and out of every `forbidden`
 /// directory; `Err(refusal)` otherwise — including any metadata or
 /// `read_link` error other than "not found".
+///
+/// The caller checks every prefix of `path` first, so the first stat here only
+/// passes through links already vetted; the link itself is then resolved by
+/// [`resolve_link_free`], never by the OS.
 fn check_one_link(
     path: &Path,
     root_canon: &Path,
@@ -1315,30 +1453,11 @@ fn check_one_link(
     if !meta.file_type().is_symlink() {
         return Ok(false);
     }
-    // Walk the link chain lexically first: refuse a network target before
-    // anything (canonicalize) would resolve — and so contact — it.
-    let mut cur = path.to_path_buf();
-    for _ in 0..MAX_LINK_HOPS {
-        let target = std::fs::read_link(&cur)
-            .map_err(|e| format!("cannot read link {}: {e}", cur.display()))?;
-        if is_remote_link_target(&target) {
-            return Err(format!(
-                "symlink {} points at a network location ({})",
-                path.display(),
-                target.display()
-            ));
-        }
-        cur = if target.is_absolute() {
-            target
-        } else {
-            cur.parent().map(|p| p.join(&target)).unwrap_or(target)
-        };
-        match std::fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => continue,
-            _ => break,
-        }
-    }
-    let target = std::fs::canonicalize(path)
+    let resolved = resolve_link_free(path, &mut RealFs)
+        .map_err(|e| format!("symlink {} cannot be resolved: {e}", path.display()))?;
+    // `resolved` holds no link, so canonicalizing it follows none: it only
+    // normalizes the spelling (case, the `\\?\` form) for the comparisons.
+    let target = std::fs::canonicalize(&resolved)
         .map_err(|e| format!("symlink {} cannot be resolved: {e}", path.display()))?;
     if !target.starts_with(root_canon) {
         return Err(format!(
@@ -1355,6 +1474,37 @@ fn check_one_link(
         ));
     }
     Ok(false)
+}
+
+/// The directories a link must not resolve into: `<root>/.git` plus the
+/// repository's canonical git dir and common dir. Refuses — never skips — a
+/// git dir that cannot be canonicalized (a gate that cannot name the git dir
+/// cannot keep links out of it), and one that lies inside the checkout
+/// anywhere but `<root>/.git` (a `.git` file pointing at an in-tree directory):
+/// the one-shot's `.git/**` read denials would not cover it.
+fn forbidden_git_dirs(
+    root_canon: &Path,
+    git_dirs: &[&Path],
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let dot_git = root_canon.join(".git");
+    let mut forbidden = vec![dot_git.clone()];
+    for dir in git_dirs {
+        let d = std::fs::canonicalize(dir).map_err(|e| {
+            format!(
+                "cannot canonicalize the git directory {}: {e}",
+                dir.display()
+            )
+        })?;
+        if d.starts_with(root_canon) && d != dot_git {
+            return Err(format!(
+                "the git directory {} lies inside the checkout but is not its .git \
+                 (the .git read denials would not cover it)",
+                d.display()
+            ));
+        }
+        forbidden.push(d);
+    }
+    Ok(forbidden)
 }
 
 /// Refuse when any symlink (or junction) in the checkout resolves outside
@@ -1376,12 +1526,7 @@ fn check_symlinks(
 ) -> Result<(), String> {
     let root_canon = std::fs::canonicalize(root)
         .map_err(|e| format!("cannot canonicalize repo_path {}: {e}", root.display()))?;
-    let mut forbidden = vec![root_canon.join(".git")];
-    for dir in [repo.path(), repo.commondir()] {
-        if let Ok(d) = std::fs::canonicalize(dir) {
-            forbidden.push(d);
-        }
-    }
+    let forbidden = forbidden_git_dirs(&root_canon, &[repo.path(), repo.commondir()])?;
     let index = repo
         .index()
         .map_err(|e| format!("cannot read the index: {}", e.message()))?;
@@ -1427,14 +1572,55 @@ fn check_symlinks(
     Ok(())
 }
 
+/// Unicode general categories Zl (U+2028), Zp (U+2029) and Cf (format
+/// characters: the bidi embeddings, overrides and isolates, zero-width
+/// joiners, the BOM, …), per Unicode 15.1. `char::is_control` covers Cc only.
+/// Each is invisible yet changes how the text around it is displayed — or,
+/// for Zl/Zp, where a renderer breaks the line.
+fn is_line_separator_or_format(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x2028
+            | 0x2029
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// Whether [`c_quote`] must escape `c`.
+fn c_quote_escapes(c: char) -> bool {
+    c.is_control() || c == '"' || c == '\\' || is_line_separator_or_format(c)
+}
+
 /// `bytes` as text safe to embed in the context block: returned as-is when it
-/// is valid UTF-8 with no control character, `"` or `\`; otherwise C-quoted
-/// the way git quotes paths (`"a\nb"`, octal `\ooo` for other control bytes
-/// and for invalid UTF-8). A newline in an attacker-chosen name can therefore
-/// never start a line of its own.
+/// is valid UTF-8 with no control character, line/paragraph separator, format
+/// character, `"` or `\`; otherwise C-quoted the way git quotes paths
+/// (`"a\nb"`, octal `\ooo` UTF-8 bytes for the other escaped characters and
+/// for invalid UTF-8). A newline — or a U+2028 / bidi override — in an
+/// attacker-chosen name can therefore never start a line of its own or
+/// reorder the text around it.
 fn c_quote(bytes: &[u8]) -> String {
     let needs = match std::str::from_utf8(bytes) {
-        Ok(s) => s.chars().any(|c| c.is_control() || c == '"' || c == '\\'),
+        Ok(s) => s.chars().any(c_quote_escapes),
         Err(_) => true,
     };
     if !needs {
@@ -1449,7 +1635,7 @@ fn c_quote(bytes: &[u8]) -> String {
                 '\t' => out.push_str("\\t"),
                 '"' => out.push_str("\\\""),
                 '\\' => out.push_str("\\\\"),
-                c if c.is_control() => {
+                c if c_quote_escapes(c) => {
                     let mut buf = [0u8; 4];
                     for b in c.encode_utf8(&mut buf).bytes() {
                         out.push_str(&format!("\\{b:03o}"));
@@ -1559,27 +1745,14 @@ fn branch_refs(repo: &git2::Repository) -> Result<String, String> {
 type StatRow = (Vec<u8>, usize, usize, bool);
 
 /// Render diff-stat rows (built by this code, so every name is C-quoted —
-/// libgit2's own `to_buf` prints names raw) plus a git-style summary line.
+/// libgit2's own `to_buf` prints names raw) under a git-style summary line.
 /// `total_files` counts every changed file; rows beyond the listed ones are
-/// reported as a count.
+/// reported as a count. The summary and that count come FIRST, so the
+/// section cap ([`git_section_body`]) can only cut rows, never the totals.
 fn render_diff_stat(rows: &[StatRow], total_files: usize) -> String {
-    let mut out = String::new();
-    let (mut ins, mut del) = (0usize, 0usize);
-    for (path, a, d, binary) in rows {
-        ins += a;
-        del += d;
-        if *binary {
-            out.push_str(&format!(" {} | binary\n", c_quote(path)));
-        } else {
-            out.push_str(&format!(" {} | +{a} -{d}\n", c_quote(path)));
-        }
-    }
-    if total_files > rows.len() {
-        out.push_str(&format!(
-            " ... {} more files not listed (line counts cover the listed files)\n",
-            total_files - rows.len()
-        ));
-    }
+    let (ins, del) = rows
+        .iter()
+        .fold((0usize, 0usize), |(i, d), (_, a, r, _)| (i + a, d + r));
     let plural = |n: usize, one: &str, many: &str| {
         if n == 1 {
             format!("{n} {one}")
@@ -1594,7 +1767,20 @@ fn render_diff_stat(rows: &[StatRow], total_files: usize) -> String {
     if del > 0 {
         summary.push_str(&format!(", {}(-)", plural(del, "deletion", "deletions")));
     }
-    out.push_str(&summary);
+    let mut out = summary;
+    if total_files > rows.len() {
+        out.push_str(&format!(
+            "\n ... {} more files not listed (line counts cover the listed files)",
+            total_files - rows.len()
+        ));
+    }
+    for (path, a, d, binary) in rows {
+        if *binary {
+            out.push_str(&format!("\n {} | binary", c_quote(path)));
+        } else {
+            out.push_str(&format!("\n {} | +{a} -{d}", c_quote(path)));
+        }
+    }
     out
 }
 
@@ -1677,7 +1863,9 @@ fn new_context_nonce() -> String {
 }
 
 /// One section's body: the text capped at [`GIT_CONTEXT_SECTION_CAP`] with
-/// truncation marked, or a stated failure line — never a silent omission.
+/// truncation marked, or a stated failure line — never a silent omission. A
+/// failure message can carry repository text (ref names, paths), so it is
+/// C-quoted like every other gathered name.
 /// Any occurrence of `nonce` is replaced, so gathered text can never forge a
 /// marker or a section header (the nonce is random per run, so this is
 /// normally a no-op).
@@ -1700,7 +1888,7 @@ fn git_section_body(result: &Result<String, String>, nonce: &str) -> String {
         }
         Err(e) => format!(
             "[failed: {}]",
-            crate::str_utils::truncate_str(e.trim(), 300)
+            c_quote(crate::str_utils::truncate_str(e.trim(), 300).as_bytes())
         ),
     };
     body.replace(nonce, "[nonce-redacted]")
@@ -1782,6 +1970,14 @@ struct PreparedCheckout {
 /// and before or during the run is not seen; the CLI's `--restricted`
 /// confinement to the canonical cwd is the barrier then.
 fn prepare_checkout(repo_path: &Path) -> Result<PreparedCheckout, String> {
+    // The request's first filesystem call: on the blocking pool, after
+    // `preflight` refused any network path from its text alone.
+    if !repo_path.is_dir() {
+        return Err(format!(
+            "repo_path is not an existing directory on this device: {}",
+            repo_path.display()
+        ));
+    }
     let repo = open_checkout_root(repo_path)?;
     let cwd = usable_canonical_dir(repo_path)?;
     let index_len = repo
@@ -1796,7 +1992,7 @@ fn prepare_checkout(repo_path: &Path) -> Result<PreparedCheckout, String> {
     let status = collect_status(&repo, MAX_CHECKOUT_ENTRIES).map_err(|e| {
         format!("could not read the checkout status (needed for the symlink check): {e}")
     })?;
-    check_symlinks(&repo, repo_path, &status, MAX_CHECKOUT_ENTRIES)?;
+    check_symlinks(&repo, &cwd, &status, MAX_CHECKOUT_ENTRIES)?;
     let context = gather_git_context(&repo, &status, &new_context_nonce());
     Ok(PreparedCheckout { cwd, context })
 }
@@ -1808,6 +2004,28 @@ fn compile_cwd() -> Result<std::path::PathBuf, String> {
     let base = qontinui_runner_lib::instance_env::runner_data_local_base()
         .ok_or_else(|| "no runner data directory on this device".to_string())?;
     private_dir(&base.join("maintenance-agent").join("compile-cwd"))
+}
+
+/// The one-shot's `GIT_DIR`: an EMPTY private directory under the runner's
+/// data dir. The claude CLI runs the git CLI in its working directory on its
+/// own; pointed here, that git finds no repository and reads none of the
+/// checkout's config — see `claude_cli::run_structured_oneshot_with`.
+fn no_git_dir() -> Result<std::path::PathBuf, String> {
+    let base = qontinui_runner_lib::instance_env::runner_data_local_base()
+        .ok_or_else(|| "no runner data directory on this device".to_string())?;
+    empty_private_dir(&base.join("maintenance-agent").join("no-git-dir"))
+}
+
+/// [`private_dir`], refused unless EMPTY: anything inside could make it a
+/// repository.
+fn empty_private_dir(dir: &Path) -> Result<std::path::PathBuf, String> {
+    let d = private_dir(dir)?;
+    let mut entries =
+        std::fs::read_dir(&d).map_err(|e| format!("cannot list {}: {e}", d.display()))?;
+    if entries.next().is_some() {
+        return Err(format!("{} is not empty", d.display()));
+    }
+    Ok(d)
 }
 
 /// Create (if needed) and vet `dir` as a private directory: a real directory,
@@ -1910,16 +2128,27 @@ async fn process_agent_request(
                 "maintenance agent: running single-shot claude"
             );
             let prompt = req.prompt.clone();
-            // The one-shot runs under `--safe-mode`, so no CLAUDE.md (nor its
-            // @-imports) or auto memory from the checkout or any parent
-            // directory is loaded; the model can only Read/Grep/Glob inside
-            // the canonical checkout (no shell, no MCP, settings files
-            // ignored, `.git/` reads denied). Repo text it reads is data that
+            // The one-shot runs under `--safe-mode` — per the CLI's `--help`,
+            // all customizations (CLAUDE.md, skills, installed plugins, hooks,
+            // MCP servers, custom commands and agents, …) disabled, while
+            // admin-managed (policy) settings and the hooks of managed plugins
+            // still apply. The model can only Read/Grep/Glob inside the
+            // canonical checkout (no shell, no MCP, settings files ignored,
+            // `.git/` reads denied), and the git the CLI runs itself is pointed
+            // at a non-repository `GIT_DIR`. Repo text it reads is data that
             // can at most steer a read. The git facts it gets are gathered here
             // by the runner.
             let joined = spawn_blocking_tracked(move || {
                 let started = std::time::Instant::now();
                 let mut prompt = prompt;
+                let git_dir = match no_git_dir() {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        return BlockingOutcome::Refused(format!(
+                            "no private non-repository GIT_DIR for the one-shot: {e}"
+                        ))
+                    }
+                };
                 let cwd = match repo {
                     Some(repo_path) => {
                         // CONTRACT NOTE: the runner APPENDS this block to
@@ -1960,6 +2189,7 @@ async fn process_agent_request(
                 BlockingOutcome::Ran(run_structured_oneshot(
                     &prompt,
                     Some(&cwd),
+                    &git_dir,
                     tools,
                     max_turns,
                     timeout,
@@ -2283,9 +2513,14 @@ mod agent_request_tests {
 
     /// Run the git CLI for a test CONTROL, hermetically: no global or system
     /// config (`GIT_CONFIG_GLOBAL` = an empty file, `GIT_CONFIG_NOSYSTEM=1`),
-    /// `HOME`/`USERPROFILE` at an empty temp dir. `None` — with a loud stderr
-    /// line — when git cannot run here; the caller then skips only the control,
-    /// never the production assertion.
+    /// no config injected through the environment (`GIT_CONFIG_PARAMETERS`,
+    /// `GIT_CONFIG_COUNT` and its numbered `GIT_CONFIG_KEY_n` /
+    /// `GIT_CONFIG_VALUE_n` pairs — a session's own env can carry them), no
+    /// inherited repository location, and `HOME`/`USERPROFILE` at an empty temp
+    /// dir. `None` — with a loud stderr line — only when git cannot be SPAWNED
+    /// here; the caller then skips only the control, never the production
+    /// assertion. A control that TIMES OUT fails the test: a hung control
+    /// proves nothing either way.
     fn control_git(dir: &Path, home: &Path, args: &[&str]) -> Option<(bool, String, String)> {
         let global = home.join("empty-gitconfig");
         std::fs::write(&global, "").unwrap();
@@ -2297,11 +2532,37 @@ mod agent_request_tests {
             .env("USERPROFILE", home)
             .env("GIT_CONFIG_GLOBAL", &global)
             .env("GIT_CONFIG_NOSYSTEM", "1");
-        match run_git_capture(cmd, &dir.to_string_lossy(), args, GIT_LOCAL_TIMEOUT) {
-            Ok(r) => Some(r),
+        for var in [
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+        ] {
+            cmd.env_remove(var);
+        }
+        for (key, _) in std::env::vars_os() {
+            let k = key.to_string_lossy().to_ascii_uppercase();
+            if k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_") {
+                cmd.env_remove(&key);
+            }
+        }
+        match crate::process_helpers::run_with_timeout(cmd, GIT_LOCAL_TIMEOUT) {
+            Ok(crate::process_helpers::TimedOutput::Completed(out)) => Some((
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )),
+            Ok(crate::process_helpers::TimedOutput::TimedOut { .. }) => panic!(
+                "control `git {}` timed out after {}s — failing, not skipping: a hung \
+                 control proves nothing",
+                args.join(" "),
+                GIT_LOCAL_TIMEOUT.as_secs()
+            ),
             Err(e) => {
                 eprintln!(
-                    "SKIPPED CONTROL `git {}`: git could not run here ({e})",
+                    "SKIPPED CONTROL `git {}`: git could not be spawned here ({e})",
                     args.join(" ")
                 );
                 None
@@ -2331,13 +2592,26 @@ mod agent_request_tests {
         assert!(open_checkout_root(bare_dir.path()).is_err(), "bare repo");
     }
 
-    /// A5: the run's cwd is the CANONICAL work tree (usable as a child cwd).
+    /// A5 + round-6 A7: the run's cwd is the CANONICAL work tree (usable as a
+    /// child cwd) — the link TARGET when `repo_path` reaches the checkout
+    /// through a junction (Windows) or a symlink (Unix), never the link path.
     #[test]
     fn prepared_cwd_is_the_canonical_work_tree() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo(dir.path());
-        let prepared = prepare_checkout(dir.path()).unwrap();
-        assert_eq!(prepared.cwd, usable_canonical_dir(dir.path()).unwrap());
+        let real = dir.path().join("real");
+        init_repo(&real);
+        let via = dir.path().join("via");
+        dir_link(&via, &real);
+        assert!(
+            std::fs::symlink_metadata(&via)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "test premise: repo_path reaches the checkout through a link"
+        );
+        let prepared = prepare_checkout(&via).unwrap();
+        assert_eq!(prepared.cwd, usable_canonical_dir(&real).unwrap());
+        assert_ne!(prepared.cwd, via, "the link path is not the cwd");
         assert!(prepared.cwd.is_absolute());
         assert!(
             !prepared.cwd.to_string_lossy().starts_with(r"\\"),
@@ -2476,6 +2750,25 @@ mod agent_request_tests {
         }
     }
 
+    /// A link to the DIRECTORY `target`: a junction on Windows (no privilege
+    /// needed), a symlink elsewhere. `target` must be absolute on Windows.
+    fn dir_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        make_junction(link, target);
+        #[cfg(not(windows))]
+        make_symlink(target, link);
+    }
+
+    /// Remove a link made by [`dir_link`] (a junction is removed as a
+    /// directory, a symlink as a file).
+    fn rm_link(link: &Path) {
+        if cfg!(windows) {
+            std::fs::remove_dir(link).unwrap();
+        } else {
+            std::fs::remove_file(link).unwrap();
+        }
+    }
+
     fn check(repo: &git2::Repository, p: &Path) -> Result<(), String> {
         let status = collect_status(repo, MAX_CHECKOUT_ENTRIES).unwrap();
         check_symlinks(repo, p, &status, MAX_CHECKOUT_ENTRIES)
@@ -2561,6 +2854,184 @@ mod agent_request_tests {
         assert!(err.contains("git directory"), "{err}");
     }
 
+    /// Round-6 A2: links are resolved through CHAINS — `a -> b/x` where `b` is
+    /// itself a link. Junctions on Windows (so this always runs there; their
+    /// targets are absolute paths THROUGH the other junction), relative
+    /// symlinks elsewhere. A chain that stays inside passes; one whose middle
+    /// hop leaves the checkout, or lands in `.git`, is refused.
+    #[test]
+    fn link_chains_are_resolved_component_by_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let repo = init_repo(p);
+        let through = |first: &str, rest: &str| -> std::path::PathBuf {
+            if cfg!(windows) {
+                p.join(first).join(rest)
+            } else {
+                Path::new(first).join(rest)
+            }
+        };
+        std::fs::create_dir_all(p.join("sub").join("x")).unwrap();
+        std::fs::write(p.join("sub").join("x").join("f.txt"), "f").unwrap();
+        dir_link(&p.join("b"), &p.join("sub"));
+        dir_link(&p.join("a"), &through("b", "x"));
+        assert!(
+            check(&repo, p).is_ok(),
+            "a chain that stays inside is fine: {:?}",
+            check(&repo, p)
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("x")).unwrap();
+        dir_link(&p.join("b2"), outside.path());
+        dir_link(&p.join("a2"), &through("b2", "x"));
+        let err = check(&repo, p).unwrap_err();
+        assert!(err.contains("outside the checkout"), "{err}");
+        rm_link(&p.join("a2"));
+        rm_link(&p.join("b2"));
+        assert!(check(&repo, p).is_ok(), "removing the chain clears it");
+
+        dir_link(&p.join("g"), &p.join(".git"));
+        dir_link(&p.join("h"), &through("g", "refs"));
+        let err = check(&repo, p).unwrap_err();
+        assert!(err.contains("git directory"), "{err}");
+    }
+
+    /// A [`LinkFs`] over a map of link -> target text; every other path is a
+    /// plain directory. Records every path it is asked to stat.
+    struct MapFs {
+        links: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+        statted: Vec<std::path::PathBuf>,
+    }
+
+    impl MapFs {
+        fn new(links: &[(std::path::PathBuf, &str)]) -> Self {
+            MapFs {
+                links: links
+                    .iter()
+                    .map(|(l, t)| (l.clone(), std::path::PathBuf::from(t)))
+                    .collect(),
+                statted: Vec::new(),
+            }
+        }
+    }
+
+    impl LinkFs for MapFs {
+        fn is_link(&mut self, p: &Path) -> std::io::Result<bool> {
+            self.statted.push(p.to_path_buf());
+            Ok(self.links.contains_key(p))
+        }
+        fn read_link(&mut self, p: &Path) -> std::io::Result<std::path::PathBuf> {
+            self.links
+                .get(p)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a link"))
+        }
+    }
+
+    /// An absolute root for [`MapFs`] paths on this platform.
+    fn mock_root() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\r")
+        } else {
+            std::path::PathBuf::from("/r")
+        }
+    }
+
+    /// Round-6 A2: committed `a -> b/c` with `b -> \\host\share`. The old
+    /// lexical walk spliced `b/c` and stat-ed `<root>/b/c` — a stat that
+    /// follows `b` to the host. The resolver reads `b`'s target text first and
+    /// refuses it: no path at or under the share, and nothing BENEATH `b`, is
+    /// ever stat-ed.
+    #[test]
+    fn a_network_hop_inside_a_link_chain_is_refused_before_any_stat_through_it() {
+        let root = mock_root();
+        for remote in [r"\\host\share", "//host/share", r"\\?\UNC\host\share"] {
+            let mut fs = MapFs::new(&[(root.join("a"), "b/c"), (root.join("b"), remote)]);
+            let err = resolve_link_free(&root.join("a"), &mut fs).unwrap_err();
+            assert!(err.contains("network location"), "{remote}: {err}");
+            let b = root.join("b");
+            assert!(
+                !fs.statted.iter().any(|s| s.starts_with(&b) && *s != b),
+                "{remote}: a stat passed through the unvetted link b: {:?}",
+                fs.statted
+            );
+            assert!(
+                !fs.statted.iter().any(|s| is_remote_link_target(s)),
+                "{remote}: a network path was stat-ed: {:?}",
+                fs.statted
+            );
+        }
+        // The same chain with a LOCAL `b` resolves through it, and `..` is
+        // applied to the resolved prefix.
+        let mut fs = MapFs::new(&[(root.join("a"), "b/c"), (root.join("b"), "sub")]);
+        assert_eq!(
+            resolve_link_free(&root.join("a"), &mut fs).unwrap(),
+            root.join("sub").join("c")
+        );
+        let mut fs = MapFs::new(&[(root.join("d").join("up"), "../x")]);
+        assert_eq!(
+            resolve_link_free(&root.join("d").join("up"), &mut fs).unwrap(),
+            root.join("x")
+        );
+    }
+
+    /// Round-6 A2: the hop budget is a refusal, not a silent stop.
+    #[test]
+    fn a_link_loop_exhausts_the_hop_budget_and_refuses() {
+        let root = mock_root();
+        let mut fs = MapFs::new(&[(root.join("l1"), "l2"), (root.join("l2"), "l1")]);
+        let err = resolve_link_free(&root.join("l1"), &mut fs).unwrap_err();
+        assert!(
+            err.contains(&format!("more than {MAX_LINK_HOPS} links")),
+            "{err}"
+        );
+        #[cfg(windows)]
+        {
+            let mut fs = MapFs::new(&[(root.join("dr"), "C:elsewhere")]);
+            let err = resolve_link_free(&root.join("dr"), &mut fs).unwrap_err();
+            assert!(err.contains("drive- or root-relative"), "{err}");
+        }
+    }
+
+    /// Round-6 A8: a `.git` FILE pointing at an in-tree directory makes the
+    /// git dir something the `.git/**` read denials do not cover — refused.
+    #[test]
+    fn a_git_dir_inside_the_checkout_but_not_dot_git_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        drop(init_repo(p));
+        std::fs::rename(p.join(".git"), p.join("hidden-git")).unwrap();
+        std::fs::write(p.join(".git"), "gitdir: hidden-git\n").unwrap();
+        assert!(
+            open_checkout_root(p).is_ok(),
+            "test premise: the checkout still opens at its root"
+        );
+        let err = prepare_checkout(p).err().expect("refused");
+        assert!(
+            err.contains("inside the checkout but is not its .git"),
+            "{err}"
+        );
+    }
+
+    /// Round-6 A8: a git dir that cannot be canonicalized REFUSES; it is no
+    /// longer skipped (which left links into it unchecked).
+    #[test]
+    fn an_uncanonicalizable_git_dir_refuses_rather_than_being_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let gone = tempfile::tempdir().unwrap().path().join("no-such-git-dir");
+        let err = forbidden_git_dirs(&root, &[&gone]).unwrap_err();
+        assert!(
+            err.contains("cannot canonicalize the git directory"),
+            "{err}"
+        );
+        assert_eq!(
+            forbidden_git_dirs(&root, &[]).unwrap(),
+            vec![root.join(".git")]
+        );
+    }
+
     /// A TRACKED symlink (index mode 0o120000) pointing outside is refused
     /// even when it is not in the status list. Unix only: libgit2 on Windows
     /// stages links per `core.symlinks`, which a temp repo does not set.
@@ -2588,7 +3059,11 @@ mod agent_request_tests {
 
     /// A4: a path that is simply gone is skipped; any OTHER stat error refuses
     /// (fail closed). Unix only: an untraversable directory is the portable way
-    /// to provoke EACCES (and root bypasses it, so root is reported, not run).
+    /// to provoke EACCES. The EACCES arm never runs under root — nor under any
+    /// process holding `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH`, which
+    /// bypass directory search permission (capabilities(7)). A probe stat
+    /// through the locked directory detects that, and the arm is reported as
+    /// NOT RUN rather than failed or passed vacuously.
     #[test]
     fn missing_entries_pass_other_stat_errors_refuse() {
         let dir = tempfile::tempdir().unwrap();
@@ -2599,15 +3074,19 @@ mod agent_request_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // SAFETY: geteuid has no preconditions and cannot fail.
-            if unsafe { libc::geteuid() } == 0 {
-                eprintln!("NOT RUN (root bypasses directory permissions): the EACCES arm");
-                return;
-            }
             std::fs::create_dir_all(p.join("locked")).unwrap();
             std::fs::write(p.join("locked").join("f"), "x").unwrap();
             std::fs::set_permissions(p.join("locked"), std::fs::Permissions::from_mode(0o000))
                 .unwrap();
+            if std::fs::symlink_metadata(p.join("locked").join("f")).is_ok() {
+                std::fs::set_permissions(p.join("locked"), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                eprintln!(
+                    "NOT RUN: the EACCES arm — this process bypasses directory permissions \
+                     (root, or CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH per capabilities(7))"
+                );
+                return;
+            }
             let entries = vec![(b"locked/f".to_vec(), git2::Status::WT_NEW)];
             let r = check_symlinks(&repo, p, &entries, MAX_CHECKOUT_ENTRIES);
             std::fs::set_permissions(p.join("locked"), std::fs::Permissions::from_mode(0o755))
@@ -2727,6 +3206,18 @@ mod agent_request_tests {
         for q in [c_quote(b"a\nb"), c_quote(b"a\rb")] {
             assert!(!q.contains('\n') && !q.contains('\r'), "{q:?}");
         }
+        // Round-6 A5: line/paragraph separators (Zl/Zp) and format characters
+        // (Cf — bidi overrides and isolates, zero-width space, BOM) are
+        // escaped as their UTF-8 bytes in octal.
+        assert_eq!(c_quote("a\u{2028}b".as_bytes()), r#""a\342\200\250b""#);
+        assert_eq!(c_quote("a\u{2029}b".as_bytes()), r#""a\342\200\251b""#);
+        assert_eq!(c_quote("x\u{202e}y".as_bytes()), r#""x\342\200\256y""#);
+        assert_eq!(c_quote("\u{2066}i".as_bytes()), r#""\342\201\246i""#);
+        assert_eq!(c_quote("z\u{200b}w".as_bytes()), r#""z\342\200\213w""#);
+        assert_eq!(c_quote("\u{feff}bom".as_bytes()), r#""\357\273\277bom""#);
+        for c in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}', '\u{feff}'] {
+            assert!(!c_quote(c.to_string().as_bytes()).contains(c), "{c:?}");
+        }
     }
 
     /// A6: the diff stat is rendered here, with quoted names.
@@ -2738,20 +3229,61 @@ mod agent_request_tests {
             (b"img.png".to_vec(), 0, 0, true),
         ];
         let out = render_diff_stat(&rows, 5);
-        assert!(out.contains(" c.txt | +2 -0\n"), "{out}");
-        assert!(out.contains(r#" "x\n--- FORGED ---" | +1 -1"#), "{out}");
-        assert!(out.contains(" img.png | binary\n"), "{out}");
-        assert!(out.contains(" ... 2 more files not listed"), "{out}");
-        assert!(
-            out.ends_with(" 5 files changed, 3 insertions(+), 1 deletion(-)"),
+        let mut lines = out.lines();
+        // Round-6 A6: the totals come FIRST.
+        assert_eq!(
+            lines.next(),
+            Some(" 5 files changed, 3 insertions(+), 1 deletion(-)"),
             "{out}"
         );
+        assert_eq!(
+            lines.next(),
+            Some(" ... 2 more files not listed (line counts cover the listed files)"),
+            "{out}"
+        );
+        assert!(out.contains("\n c.txt | +2 -0\n"), "{out}");
+        assert!(out.contains(r#" "x\n--- FORGED ---" | +1 -1"#), "{out}");
+        assert!(out.ends_with("\n img.png | binary"), "{out}");
         assert!(!out.lines().any(|l| l == "--- FORGED ---"), "{out}");
         assert_eq!(
-            render_diff_stat(&[(b"a".to_vec(), 2, 0, false)], 1)
-                .lines()
-                .last(),
-            Some(" 1 file changed, 2 insertions(+)")
+            render_diff_stat(&[(b"a".to_vec(), 2, 0, false)], 1),
+            " 1 file changed, 2 insertions(+)\n a | +2 -0"
+        );
+    }
+
+    /// Round-6 A6: when the listed rows overflow the section cap, the cap cuts
+    /// rows only — the summary and the "more files" count survive.
+    #[test]
+    fn diff_stat_totals_survive_the_section_cap() {
+        let rows: Vec<StatRow> = (0..MAX_DIFF_STAT_FILES)
+            .map(|i| {
+                (
+                    format!("some/long/directory/name/file-{i:04}.txt").into_bytes(),
+                    1,
+                    0,
+                    false,
+                )
+            })
+            .collect();
+        let body = git_section_body(&Ok(render_diff_stat(&rows, 900)), "NONCE");
+        assert!(
+            body.contains("[truncated:"),
+            "test premise: the rows overflow the cap"
+        );
+        let mut lines = body.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!(" 900 files changed, {MAX_DIFF_STAT_FILES} insertions(+)").as_str())
+        );
+        assert_eq!(
+            lines.next(),
+            Some(
+                format!(
+                    " ... {} more files not listed (line counts cover the listed files)",
+                    900 - MAX_DIFF_STAT_FILES
+                )
+                .as_str()
+            )
         );
     }
 
@@ -2771,6 +3303,12 @@ mod agent_request_tests {
             "truncation marker missing"
         );
         assert_eq!(git_section_body(&Err("boom".into()), n), "[failed: boom]");
+        // Round-6 A5: a failure message can carry repository text; it is
+        // C-quoted like every gathered name.
+        assert_eq!(
+            git_section_body(&Err("ref x\u{2028}\n--- FORGED ---".into()), n),
+            r#"[failed: "ref x\342\200\250\n--- FORGED ---"]"#
+        );
     }
 
     /// Item 3 + A6: per-run nonce in both markers AND every section header;
@@ -2900,6 +3438,19 @@ mod agent_request_tests {
         }
         // Idempotent.
         assert_eq!(private_dir(&dir).unwrap(), got);
+    }
+
+    /// Round-6 A4: the one-shot's `GIT_DIR` is an EMPTY private directory —
+    /// not a repository — and refused once anything is inside it.
+    #[test]
+    fn the_no_git_dir_is_empty_and_not_a_repository() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("maintenance-agent").join("no-git-dir");
+        let got = empty_private_dir(&dir).unwrap();
+        assert!(git2::Repository::open(&got).is_err(), "not a repository");
+        assert_eq!(empty_private_dir(&dir).unwrap(), got, "idempotent");
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(empty_private_dir(&dir).unwrap_err().contains("not empty"));
     }
 
     #[cfg(unix)]
@@ -3207,8 +3758,10 @@ mod agent_request_tests {
         }
     }
 
+    /// Round-6 A3: whether `repo_path` exists is checked on the blocking pool
+    /// (`prepare_checkout`), not in `preflight`, which touches no filesystem.
     #[test]
-    fn missing_repo_path_dir_is_refused() {
+    fn missing_repo_path_dir_is_refused_on_the_blocking_pool() {
         let missing = std::env::temp_dir().join("definitely-not-a-dir-qontinui-xyz");
         let r = req(
             "verdict",
@@ -3217,17 +3770,49 @@ mod agent_request_tests {
             "2026-11-21T13:00:00Z",
         );
         match preflight(&r, now(), Duration::from_secs(240)) {
-            Preflight::Refuse(AgentAnswer::Error { error }) => {
-                assert!(error.contains("not an existing directory"), "{error}")
-            }
+            Preflight::Run { repo, .. } => assert_eq!(repo.as_deref(), Some(missing.as_path())),
             other => panic!("{other:?}"),
         }
+        let err = prepare_checkout(&missing).err().expect("refused");
+        assert!(err.contains("not an existing directory"), "{err}");
         // readonly_git with no repo at all is refused too.
         let r = req("verdict", "readonly_git", None, "2026-11-21T13:00:00Z");
         assert!(matches!(
             preflight(&r, now(), Duration::from_secs(240)),
             Preflight::Refuse(_)
         ));
+    }
+
+    /// Round-6 A3: a network `repo_path` is refused by `preflight` from its
+    /// text alone — before anything could contact the host.
+    #[test]
+    fn network_repo_path_is_refused_lexically_by_preflight() {
+        for net in [
+            "//host/share/repo",
+            r"\\host\share\repo",
+            r"\\?\UNC\host\share\repo",
+        ] {
+            let r = req("verdict", "readonly_git", Some(net), "2026-11-21T13:00:00Z");
+            match preflight(&r, now(), Duration::from_secs(240)) {
+                Preflight::Refuse(AgentAnswer::Error { error }) => {
+                    assert!(error.contains("network location"), "{net}: {error}")
+                }
+                other => panic!("{net}: {other:?}"),
+            }
+        }
+        // A verbatim LOCAL drive path is not a network path.
+        if cfg!(windows) {
+            let r = req(
+                "verdict",
+                "readonly_git",
+                Some(r"\\?\C:\some\repo"),
+                "2026-11-21T13:00:00Z",
+            );
+            assert!(matches!(
+                preflight(&r, now(), Duration::from_secs(240)),
+                Preflight::Run { .. }
+            ));
+        }
     }
 
     /// A16: a relative repo_path is refused before any gate runs.
