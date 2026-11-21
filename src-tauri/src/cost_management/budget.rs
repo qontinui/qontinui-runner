@@ -467,6 +467,40 @@ impl AiMiddleware for BudgetEnforcementMiddleware {
 mod tests {
     use super::*;
 
+    /// A tracker whose state mutex was poisoned by a panic while held — the
+    /// state the agentic phase reaches when any earlier holder panicked.
+    fn poisoned_tracker() -> BudgetTracker {
+        let tracker = BudgetTracker::with_defaults();
+        let held = std::panic::AssertUnwindSafe(&tracker);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = held.state.lock().expect("first lock");
+            panic!("poison the budget state lock");
+        });
+        assert!(tracker.state.is_poisoned(), "fixture must poison the lock");
+        tracker
+    }
+
+    /// Recording spend on a poisoned tracker must not panic: the agentic
+    /// phase records spend between its session row's create and its terminal
+    /// write, and a panic there would leave the row resumable.
+    #[test]
+    fn record_survives_a_poisoned_state_lock() {
+        let tracker = poisoned_tracker();
+        let _ = tracker.record("agentic", 10, 0.01);
+        let state = tracker
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.total_tokens, 10);
+    }
+
+    /// Reading the spend snapshot on a poisoned tracker must not panic.
+    #[test]
+    fn snapshot_survives_a_poisoned_state_lock() {
+        let tracker = poisoned_tracker();
+        assert_eq!(tracker.snapshot().total_tokens, 0);
+    }
+
     #[test]
     fn test_budget_tracker_basic() {
         let budget = TokenBudget {
