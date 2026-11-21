@@ -69,6 +69,8 @@ let host: HTMLDivElement;
 let root: Root;
 /** What the next `get_web_integration_status` read answers: a status, an Error to reject, or a pending Promise. */
 let statusReply: unknown;
+/** What `cognito_sign_in` answers: a pending Promise holds the sign-in in flight; anything else resolves. */
+let signInReply: unknown;
 // Stable across renders: the status effect depends on `onLog`.
 const onLog = vi.fn();
 const onOpenBackendConnection = vi.fn();
@@ -80,6 +82,7 @@ function emit(event: string, payload: unknown = null) {
 beforeEach(() => {
   listeners.clear();
   onLog.mockReset();
+  signInReply = undefined;
   invokeMock.mockReset();
   invokeMock.mockImplementation((cmd: string) => {
     switch (cmd) {
@@ -89,6 +92,7 @@ beforeEach(() => {
           ? Promise.reject(statusReply)
           : Promise.resolve(statusReply);
       case "cognito_sign_in":
+        if (signInReply instanceof Promise) return signInReply;
         return Promise.resolve({ userId: "u", email: null, tenantId: null, deviceId: "d" });
       // No sign-in pending in the browser — the pending notice stays quiet.
       case "cognito_pending_sign_in":
@@ -142,16 +146,29 @@ function signInCalls() {
   return invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in");
 }
 
-/** The sign-in button is disabled and a click starts no sign-in: the target is unknown. */
-async function expectSignInPaused(): Promise<void> {
-  const button = signInButton();
-  expect(button.disabled).toBe(true);
-  const before = signInCalls().length;
+function buttonLabelled(label: string): HTMLButtonElement | undefined {
+  return Array.from(host.querySelectorAll("button")).find((b) => b.textContent === label);
+}
+
+function statusReads(): number {
+  return invokeMock.mock.calls.filter(([cmd]) => cmd === "get_web_integration_status").length;
+}
+
+/** After a failed read the sign-in button is an ENABLED "Retry": a click re-reads the status once and starts no sign-in. */
+async function expectSignInRetry(): Promise<void> {
+  expect(buttonLabelled("Sign in with Qontinui")).toBeUndefined();
+  const button = buttonLabelled("Retry");
+  expect(button).toBeDefined();
+  expect(button!.disabled).toBe(false);
+  expect(targetText()).toBe(COULD_NOT_READ);
+  const readsBefore = statusReads();
+  const signInsBefore = signInCalls().length;
   await act(async () => {
-    button.click();
+    button!.click();
   });
   await act(async () => {});
-  expect(signInCalls().length).toBe(before);
+  expect(statusReads()).toBe(readsBefore + 1);
+  expect(signInCalls().length).toBe(signInsBefore);
 }
 
 async function clickSignIn(): Promise<string | undefined> {
@@ -184,7 +201,7 @@ describe("AccountSettings signed-out sign-in target (operator surface)", () => {
     expect(await clickSignIn()).toBe("https://api.qontinui.io");
   });
 
-  it("disables sign-in and says the URL could not be read after a failed re-read, instead of guessing production", async () => {
+  it("turns sign-in into an enabled Retry and says the URL could not be read after a failed re-read, instead of guessing production", async () => {
     statusReply = DEBUG_LOOPBACK;
     await mount();
     expect(targetText()).toBe("http://127.0.0.1:8000");
@@ -193,7 +210,62 @@ describe("AccountSettings signed-out sign-in target (operator surface)", () => {
     await act(async () => {});
     expect(targetText()).toBe(COULD_NOT_READ);
     expect(reasonElement()).toBeNull();
-    await expectSignInPaused();
+    await expectSignInRetry();
+    // The re-read failed again: still Retry, still no sign-in.
+    expect(buttonLabelled("Retry")).toBeDefined();
+    expect(targetText()).toBe(COULD_NOT_READ);
+    expect(signInCalls().length).toBe(0);
+  });
+
+  it("Retry re-reads the status, and once that read succeeds sign-in targets the saved backend", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    await mount();
+    statusReply = new Error("get_web_integration_status failed");
+    await rereadStatus();
+    await act(async () => {});
+    statusReply = DEBUG_REMOTE;
+    await expectSignInRetry();
+    expect(buttonLabelled("Retry")).toBeUndefined();
+    expect(targetText()).toBe("https://backend.example.test");
+    expect(await clickSignIn()).toBe("https://backend.example.test");
+    expect(signInCalls().length).toBe(1);
+  });
+
+  it("offers Retry when the FIRST status read fails, and signs in once a retried read lands", async () => {
+    statusReply = new Error("get_web_integration_status failed");
+    await mount();
+    await expectSignInRetry();
+    statusReply = DEBUG_LOOPBACK;
+    await expectSignInRetry();
+    expect(targetText()).toBe("http://127.0.0.1:8000");
+    expect(await clickSignIn()).toBe("http://127.0.0.1:8000");
+  });
+
+  it("keeps the sign-in button disabled (not Retry) while the first status read is still loading", async () => {
+    statusReply = new Promise(() => {});
+    await mount();
+    expect(targetText()).toBe("loading…");
+    const button = signInButton();
+    expect(button.disabled).toBe(true);
+    expect(buttonLabelled("Retry")).toBeUndefined();
+  });
+
+  it("keeps 'Waiting for browser…' (busy beats Retry) when a status re-read fails during an in-flight sign-in", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    signInReply = new Promise(() => {});
+    await mount();
+    await act(async () => {
+      signInButton().click();
+    });
+    await act(async () => {});
+    statusReply = new Error("get_web_integration_status failed");
+    await rereadStatus();
+    await act(async () => {});
+    const waiting = buttonLabelled("Waiting for browser…");
+    expect(waiting).toBeDefined();
+    expect(waiting!.disabled).toBe(true);
+    expect(buttonLabelled("Retry")).toBeUndefined();
+    expect(signInCalls().length).toBe(1);
   });
 
   it("ignores an older failed re-read that settles after a newer successful one", async () => {
@@ -229,6 +301,6 @@ describe("AccountSettings signed-out sign-in target (operator surface)", () => {
     });
     await act(async () => {});
     expect(targetText()).toBe(COULD_NOT_READ);
-    await expectSignInPaused();
+    await expectSignInRetry();
   });
 });

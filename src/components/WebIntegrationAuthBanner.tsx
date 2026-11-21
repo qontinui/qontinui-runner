@@ -75,9 +75,10 @@ import {
 /** Session-storage key used for dismissal persistence across re-renders. */
 const DISMISS_STORAGE_KEY = "qontinui:web-integration-auth-banner:dismissed-signature";
 
-/** Shown when sign-in is paused because the saved backend settings are unknown. */
+/** Shown beside the "Retry" control while the saved backend settings are
+ *  unknown: clicking it re-reads them instead of signing in. */
 const SIGN_IN_TARGET_UNKNOWN =
-  "Could not read the saved backend settings, so sign-in is paused until the next successful read.";
+  "Could not read the saved backend settings. Retry reads them again before signing in.";
 
 function readDismissedSignature(): string | null {
   try {
@@ -111,13 +112,16 @@ export function WebIntegrationAuthBanner() {
   const [status, setStatus] = useState<(AuthBannerStatus & SavedBackendStatus) | null>(null);
   // True while the LATEST status read failed. The banner keeps showing from
   // the previous `status` (a failed re-read must not hide or flash it), but
-  // Authorize is DISABLED while the target is unknown (no read yet, or the
-  // latest failed) — the same rule AccountSettings applies. Guessing
-  // production instead would let `finalize_signed_in` write production over a
-  // saved custom backend.
+  // Authorize does not sign in while the target is unknown (no read yet, or
+  // the latest failed): it becomes "Retry", which re-reads the status — the
+  // same rule AccountSettings applies. Guessing production instead would let
+  // `finalize_signed_in` write production over a saved custom backend.
   const [statusReadFailed, setStatusReadFailed] = useState(false);
   // Issue order of status reads; a read that is no longer the latest drops its result.
   const statusReadSeq = useRef(0);
+  // The live effect run's status read, so "Retry" can re-issue it outside the
+  // effect under the same `cancelled` + issue-order guards; null once unmounted.
+  const refetchStatusRef = useRef<(() => void) | null>(null);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );
@@ -244,11 +248,13 @@ export function WebIntegrationAuthBanner() {
         });
     };
 
+    refetchStatusRef.current = fetchStatus;
     fetchStatus();
     const unlisten = listen("web-integration-changed", fetchStatus);
 
     return () => {
       cancelled = true;
+      if (refetchStatusRef.current === fetchStatus) refetchStatusRef.current = null;
       unlisten
         .then((fn) => fn())
         .catch(() => {
@@ -410,12 +416,15 @@ export function WebIntegrationAuthBanner() {
   }, []);
 
   // The saved backend settings are unknown: no read has landed, or the latest
-  // one failed. Sign-in waits rather than guessing a target.
+  // one failed. Sign-in never guesses a target; the control becomes "Retry".
   const signInTargetUnknown = status === null || statusReadFailed;
 
   const handleAuthorize = useCallback(async () => {
     if (signInTargetUnknown) {
-      setAuthorizeError(SIGN_IN_TARGET_UNKNOWN);
+      // "Retry": re-read the saved settings; a successful read restores the
+      // sign-in control, a failed one leaves it on Retry. No sign-in here.
+      setAuthorizeError(null);
+      refetchStatusRef.current?.();
       return;
     }
     setAuthorizing(true);
@@ -531,9 +540,10 @@ export function WebIntegrationAuthBanner() {
   if (credentialDark?.dark) {
     const presentation = credentialDarkPresentation(credentialDark, undefined, showSwitcher);
     const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
-    // A sign-in CTA is PAUSED (not busy) while the saved backend settings are
-    // unknown, and says why.
-    const ctaPaused = presentation.ctaAction === "cognito_sign_in" && signInTargetUnknown;
+    // A sign-in CTA becomes "Retry" (re-read the saved settings) while they
+    // are unknown, and says why. Busy wins: an in-flight sign-in shows
+    // "Working…", never Retry beside it.
+    const ctaPaused = presentation.ctaAction === "cognito_sign_in" && signInTargetUnknown && !busy;
     const ctaError =
       (ctaPaused ? SIGN_IN_TARGET_UNKNOWN : null) ??
       (presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError) ??
@@ -628,8 +638,7 @@ export function WebIntegrationAuthBanner() {
             onClick={() => {
               void handleCredentialCta(presentation.ctaAction!);
             }}
-            disabled={busy || ctaPaused}
-            title={ctaPaused ? SIGN_IN_TARGET_UNKNOWN : undefined}
+            disabled={busy}
             style={{
               background: "var(--accent, #6366f1)",
               color: "#fff",
@@ -638,12 +647,12 @@ export function WebIntegrationAuthBanner() {
               padding: "4px 10px",
               fontSize: "0.8125rem",
               fontWeight: 600,
-              cursor: busy ? "wait" : ctaPaused ? "not-allowed" : "pointer",
-              opacity: busy || ctaPaused ? 0.7 : 1,
+              cursor: busy ? "wait" : "pointer",
+              opacity: busy ? 0.7 : 1,
               whiteSpace: "nowrap",
             }}
           >
-            {busy ? "Working…" : presentation.ctaLabel}
+            {busy ? "Working…" : ctaPaused ? "Retry" : presentation.ctaLabel}
           </button>
         ) : null}
         {presentation.showSwitchTenant ? (
@@ -760,6 +769,10 @@ export function WebIntegrationAuthBanner() {
   );
   if (!visible) return null;
 
+  // Busy wins over the unknown-target Retry, as on the credential CTA.
+  const authorizePaused = signInTargetUnknown && !authorizing;
+  const authorizeLine = authorizePaused ? SIGN_IN_TARGET_UNKNOWN : authorizeError;
+
   return (
     <div
       ref={rootRef}
@@ -793,10 +806,10 @@ export function WebIntegrationAuthBanner() {
         <div style={{ fontWeight: 600 }}>Connect this runner to your account</div>
         <div style={{ fontSize: "0.8125rem", opacity: 0.85 }}>
           Authorize this runner with qontinui-web to make it visible to your account.
-          {authorizeError ? (
+          {authorizeLine ? (
             <>
               <br />
-              <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
+              <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeLine}</span>
             </>
           ) : null}
           <PendingSignInNotice active={authorizing} noBrowserHint={NO_BROWSER_HINT.settings} />
@@ -806,8 +819,7 @@ export function WebIntegrationAuthBanner() {
         ref={authorizeButtonRef}
         type="button"
         onClick={handleAuthorize}
-        disabled={authorizing || signInTargetUnknown}
-        title={signInTargetUnknown ? SIGN_IN_TARGET_UNKNOWN : undefined}
+        disabled={authorizing}
         style={{
           background: "var(--accent, #6366f1)",
           color: "#fff",
@@ -816,12 +828,12 @@ export function WebIntegrationAuthBanner() {
           padding: "4px 10px",
           fontSize: "0.8125rem",
           fontWeight: 600,
-          cursor: authorizing ? "wait" : signInTargetUnknown ? "not-allowed" : "pointer",
-          opacity: authorizing || signInTargetUnknown ? 0.7 : 1,
+          cursor: authorizing ? "wait" : "pointer",
+          opacity: authorizing ? 0.7 : 1,
           whiteSpace: "nowrap",
         }}
       >
-        {authorizing ? "Opening…" : "Authorize"}
+        {authorizing ? "Opening…" : authorizePaused ? "Retry" : "Authorize"}
       </button>
       <button
         ref={dismissButtonRef}

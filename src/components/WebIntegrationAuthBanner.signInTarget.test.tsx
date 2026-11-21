@@ -67,6 +67,8 @@ let root: Root;
 let statusReply: unknown;
 /** What `get_coord_credential_posture` answers; `null` (no concluded pass) keeps the credential-dark banner out. */
 let postureReply: unknown;
+/** What `cognito_sign_in` answers: a pending Promise holds the sign-in in flight; anything else resolves. */
+let signInReply: unknown;
 
 /** A concluded posture pass whose credential cannot answer coord and whose remedy is a sign-in. */
 const DARK_SIGN_IN_POSTURE = {
@@ -85,6 +87,7 @@ beforeEach(() => {
   listeners.clear();
   sessionStorage.clear();
   postureReply = null;
+  signInReply = undefined;
   invokeMock.mockReset();
   invokeMock.mockImplementation((cmd: string) => {
     switch (cmd) {
@@ -102,6 +105,8 @@ beforeEach(() => {
       // No sign-in pending in the browser — the pending notice stays quiet.
       case "cognito_pending_sign_in":
         return Promise.resolve(null);
+      case "cognito_sign_in":
+        return signInReply instanceof Promise ? signInReply : Promise.resolve(undefined);
       default:
         return Promise.resolve(undefined);
     }
@@ -123,19 +128,41 @@ async function mount() {
   await act(async () => {});
 }
 
-/** Authorize is disabled and a click starts no sign-in: the target is unknown. */
-async function expectAuthorizePaused(): Promise<void> {
-  const button = Array.from(host.querySelectorAll("button")).find(
-    (b) => b.textContent === "Authorize",
-  );
+const SIGN_IN_TARGET_UNKNOWN_TEXT =
+  "Could not read the saved backend settings. Retry reads them again before signing in.";
+
+function buttonLabelled(label: string, scope: ParentNode = host): HTMLButtonElement | undefined {
+  return Array.from(scope.querySelectorAll("button")).find((b) => b.textContent === label);
+}
+
+function statusReads(): number {
+  return invokeMock.mock.calls.filter(([cmd]) => cmd === "get_web_integration_status").length;
+}
+
+function signInCalls() {
+  return invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in");
+}
+
+/** Click an ENABLED "Retry": it re-reads the status once and starts no sign-in. */
+async function clickRetry(button: HTMLButtonElement | undefined): Promise<void> {
   expect(button).toBeDefined();
-  expect(button!.disabled).toBe(true);
-  const before = invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in").length;
+  expect(button!.textContent).toBe("Retry");
+  expect(button!.disabled).toBe(false);
+  const readsBefore = statusReads();
+  const signInsBefore = signInCalls().length;
   await act(async () => {
     button!.click();
   });
   await act(async () => {});
-  expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in").length).toBe(before);
+  expect(statusReads()).toBe(readsBefore + 1);
+  expect(signInCalls().length).toBe(signInsBefore);
+}
+
+/** The target is unknown: Authorize is an ENABLED "Retry" with the reason shown inline, and a click re-reads instead of signing in. */
+async function expectAuthorizeRetry(): Promise<void> {
+  expect(buttonLabelled("Authorize")).toBeUndefined();
+  expect(host.querySelector('[role="status"]')!.textContent).toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+  await clickRetry(buttonLabelled("Retry"));
 }
 
 async function clickAuthorize(): Promise<string | undefined> {
@@ -165,7 +192,7 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     expect(await clickAuthorize()).toBe("https://api.qontinui.io");
   });
 
-  it("pauses Authorize after a failed status re-read instead of guessing production, though the banner still shows", async () => {
+  it("turns Authorize into an enabled Retry after a failed status re-read instead of guessing production, though the banner still shows", async () => {
     statusReply = DEBUG_LOOPBACK;
     await mount();
     statusReply = new Error("get_web_integration_status failed");
@@ -173,7 +200,48 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
       emit("web-integration-changed");
     });
     await act(async () => {});
-    await expectAuthorizePaused();
+    await expectAuthorizeRetry();
+    // The re-read failed again: still Retry, still no sign-in.
+    expect(buttonLabelled("Retry")).toBeDefined();
+    expect(signInCalls().length).toBe(0);
+  });
+
+  it("Retry re-reads the status, and once that read succeeds Authorize signs in to the saved backend", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    await mount();
+    statusReply = new Error("get_web_integration_status failed");
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {});
+    statusReply = DEBUG_LOOPBACK;
+    await clickRetry(buttonLabelled("Retry"));
+    expect(buttonLabelled("Retry")).toBeUndefined();
+    expect(host.querySelector('[role="status"]')!.textContent).not.toContain(
+      SIGN_IN_TARGET_UNKNOWN_TEXT,
+    );
+    expect(await clickAuthorize()).toBe("http://127.0.0.1:8000");
+    expect(signInCalls().length).toBe(1);
+  });
+
+  it("keeps 'Opening…' (busy beats Retry) when a status re-read fails during an in-flight sign-in", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    signInReply = new Promise(() => {});
+    await mount();
+    await act(async () => {
+      buttonLabelled("Authorize")!.click();
+    });
+    await act(async () => {});
+    expect(buttonLabelled("Opening…")).toBeDefined();
+    statusReply = new Error("get_web_integration_status failed");
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {});
+    expect(buttonLabelled("Opening…")!.disabled).toBe(true);
+    expect(buttonLabelled("Retry")).toBeUndefined();
+    expect(host.textContent).not.toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    expect(signInCalls().length).toBe(1);
   });
 
   it("ignores an older failed re-read that settles after a newer successful one", async () => {
@@ -215,7 +283,7 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
       resolveOlder(DEBUG_LOOPBACK);
     });
     await act(async () => {});
-    await expectAuthorizePaused();
+    await expectAuthorizeRetry();
   });
 
   it("targets the saved loopback backend again once a later re-read succeeds", async () => {
@@ -227,7 +295,7 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     });
     await act(async () => {});
     // The failing re-read has taken effect before the next one is issued.
-    await expectAuthorizePaused();
+    await expectAuthorizeRetry();
     statusReply = DEBUG_LOOPBACK;
     await act(async () => {
       emit("web-integration-changed");
@@ -237,9 +305,6 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
   });
 });
 
-const SIGN_IN_TARGET_UNKNOWN_TEXT =
-  "Could not read the saved backend settings, so sign-in is paused until the next successful read.";
-
 function credentialCta(): HTMLButtonElement {
   // The credential-dark banner (role=alert) is shown, not the "Connect this runner" one.
   const alert = host.querySelector('[role="alert"]');
@@ -247,13 +312,21 @@ function credentialCta(): HTMLButtonElement {
   expect(alert!.textContent).toContain("The coord device credential expired.");
   const buttons = Array.from(alert!.querySelectorAll("button"));
   expect(buttons.some((b) => b.textContent === "Authorize")).toBe(false);
-  const cta = buttons.find((b) => b.textContent === "Sign in" || b.textContent === "Working…");
+  const cta = buttons.find((b) => ["Sign in", "Working…", "Retry"].includes(b.textContent ?? ""));
   expect(cta).toBeDefined();
   return cta!;
 }
 
-function signInCalls() {
-  return invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in");
+function alertText(): string {
+  return host.querySelector('[role="alert"]')!.textContent ?? "";
+}
+
+async function clickCta(): Promise<void> {
+  const cta = credentialCta();
+  await act(async () => {
+    cta.click();
+  });
+  await act(async () => {});
 }
 
 describe("WebIntegrationAuthBanner credential-dark sign-in CTA target (operator surface)", () => {
@@ -272,7 +345,7 @@ describe("WebIntegrationAuthBanner credential-dark sign-in CTA target (operator 
     expect((calls[0][1] as { backendUrl?: string }).backendUrl).toBe("http://127.0.0.1:8000");
   });
 
-  it("pauses the credential-dark CTA after a failed status re-read and says why, not 'Working…'", async () => {
+  it("turns the credential-dark CTA into an enabled Retry after a failed status re-read, says why, and re-reads on click", async () => {
     statusReply = DEBUG_LOOPBACK;
     postureReply = DARK_SIGN_IN_POSTURE;
     await mount();
@@ -283,17 +356,68 @@ describe("WebIntegrationAuthBanner credential-dark sign-in CTA target (operator 
     });
     await act(async () => {});
     const cta = credentialCta();
-    expect(cta.disabled).toBe(true);
-    expect(cta.textContent).toBe("Sign in");
-    expect(cta.textContent).not.toBe("Working…");
-    expect(cta.title).toBe(SIGN_IN_TARGET_UNKNOWN_TEXT);
-    expect(host.querySelector('[role="alert"]')!.textContent).toContain(
-      SIGN_IN_TARGET_UNKNOWN_TEXT,
-    );
+    expect(cta.textContent).toBe("Retry");
+    expect(cta.disabled).toBe(false);
+    expect(alertText()).toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    await clickRetry(cta);
+    expect(credentialCta().textContent).toBe("Retry");
+    expect(signInCalls().length).toBe(0);
+  });
+
+  it("returns the credential-dark CTA to 'Sign in' once Retry's re-read succeeds, then signs in to the saved backend", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    statusReply = new Error("get_web_integration_status failed");
     await act(async () => {
-      cta.click();
+      emit("web-integration-changed");
     });
     await act(async () => {});
-    expect(signInCalls().length).toBe(0);
+    statusReply = DEBUG_LOOPBACK;
+    await clickRetry(credentialCta());
+    expect(credentialCta().textContent).toBe("Sign in");
+    expect(alertText()).not.toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    await clickCta();
+    const calls = signInCalls();
+    expect(calls.length).toBe(1);
+    expect((calls[0][1] as { backendUrl?: string }).backendUrl).toBe("http://127.0.0.1:8000");
+  });
+
+  it("offers Retry on the credential-dark CTA when the FIRST status read fails, and signs in once a retried read lands", async () => {
+    statusReply = new Error("get_web_integration_status failed");
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    const cta = credentialCta();
+    expect(cta.textContent).toBe("Retry");
+    expect(cta.disabled).toBe(false);
+    expect(alertText()).toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    await clickRetry(cta);
+    expect(credentialCta().textContent).toBe("Retry");
+    statusReply = DEBUG_LOOPBACK;
+    await clickRetry(credentialCta());
+    expect(credentialCta().textContent).toBe("Sign in");
+    await clickCta();
+    const calls = signInCalls();
+    expect(calls.length).toBe(1);
+    expect((calls[0][1] as { backendUrl?: string }).backendUrl).toBe("http://127.0.0.1:8000");
+  });
+
+  it("keeps 'Working…' on the credential-dark CTA (busy beats Retry) when a status re-read fails during an in-flight sign-in", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    postureReply = DARK_SIGN_IN_POSTURE;
+    signInReply = new Promise(() => {});
+    await mount();
+    await clickCta();
+    expect(credentialCta().textContent).toBe("Working…");
+    statusReply = new Error("get_web_integration_status failed");
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {});
+    const cta = credentialCta();
+    expect(cta.textContent).toBe("Working…");
+    expect(cta.disabled).toBe(true);
+    expect(alertText()).not.toContain(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    expect(signInCalls().length).toBe(1);
   });
 });

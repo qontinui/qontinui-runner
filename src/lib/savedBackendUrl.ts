@@ -126,7 +126,16 @@ export function signInTargetExplanation(
   return decide(status, surface).reason;
 }
 
-/** Read the saved status and decide. A failed read targets production. */
+/** Read the saved status and decide. A failed read targets production.
+ *
+ *  KNOWN RESIDUAL: on the gate surfaces that call this, a REJECTED status read
+ *  still targets production — the plan's "unusable → production" rule, kept so
+ *  first-run sign-in is never blocked by an unreadable settings file. If the
+ *  settings ARE readable by the time the sign-in finishes, the Rust
+ *  `finalize_signed_in` then writes production over a backend URL that was
+ *  saved before the first sign-in. The operator surfaces (auth banner, Settings
+ *  → Account) do not take this path: they show "Retry" and re-read instead.
+ *  Tracked as a follow-up on plan 2026-11-21-unify-runner-sign-in-backend-url-helper. */
 export async function resolveSignInBackendUrl(surface: SignInSurface): Promise<string> {
   try {
     return signInBackendUrlFrom(
