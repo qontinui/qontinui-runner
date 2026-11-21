@@ -513,6 +513,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             matched_pattern,
             "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
         );
+        super::limit_reprobe::note_unconfirmed(&terminal_id, &record.claude_session_id);
         return;
     }
 
