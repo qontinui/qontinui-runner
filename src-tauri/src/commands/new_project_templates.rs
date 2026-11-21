@@ -348,6 +348,14 @@ mod tests {
             (Some(p), Some(f)) if p >= f => {}
             (p, f) => bad.push(format!("ui-bridge pin {p:?} is below the runner's {f:?}")),
         }
+        let pin_spec = pkg["dependencies"]["@qontinui/ui-bridge"]
+            .as_str()
+            .unwrap_or("");
+        if !pin_spec.starts_with(|c: char| c.is_ascii_digit()) {
+            bad.push(format!(
+                "ui-bridge pin `{pin_spec}` is not an exact version"
+            ));
+        }
         for dep in ["tailwindcss", "@tailwindcss/vite"] {
             let spec = pkg["devDependencies"][dep].as_str().unwrap_or("");
             if version_floor(spec).map(|v| v.0) != Some(4) {
@@ -544,6 +552,35 @@ mod tests {
             }),
             "is not Tailwind v4",
         );
+        reddens(
+            mutate("package.json", &|c| {
+                c.replace("\"@tailwindcss/vite\": \"^4", "\"@tailwindcss/vite\": \"^3")
+            }),
+            "@tailwindcss/vite `^3",
+        );
+        for step in ["design-kit index --check && ", "tsc --noEmit && "] {
+            reddens(
+                mutate("package.json", &|c| c.replace(step, "")),
+                &format!("lacks `{}`", step.trim_end_matches(" && ")),
+            );
+        }
+        reddens(
+            mutate("package.json", &|c| c.replace(" && vite build", "")),
+            "lacks `vite build`",
+        );
+        reddens(
+            mutate("package.json", &|c| {
+                c.replace(
+                    "\"@qontinui/ui-bridge\": \"0.53.0\"",
+                    "\"@qontinui/ui-bridge\": \"^0.53.0\"",
+                )
+            }),
+            "is not an exact version",
+        );
+        reddens(
+            mutate("design/language.dtcg.json", &|_| "{}".to_string()),
+            "language source declares no leaves",
+        );
         // An agent-authored hue.
         reddens(
             mutate("design/language.dtcg.json", &|c| {
@@ -604,6 +641,11 @@ mod tests {
                 "- run: npm run build",
                 "- run: npm test",
                 "ci.yml must run npm run build",
+            ),
+            (
+                "- run: npm install",
+                "- run: npm i",
+                "ci.yml must run npm install",
             ),
         ] {
             reddens(

@@ -16,7 +16,7 @@ guide, whether it is carried and why. Authored values cite notification
 | `typography.fontFamilies` (Geist) | Not carried. A family is an identity value; it stays `undeclared` and renders as the platform keywords. |
 | `typography.fontWeights` | Carried as authored; `normal` is keyed `regular`, the package's name. |
 | `typography.lineHeights` | Carried as authored; `normal` is keyed `body`. |
-| `typography.letterSpacings` | Carried as authored, in `em` (the guide writes them as px at the 16px root). |
+| `typography.letterSpacings` | Carried as authored. The hand-written guide wrote them in `em`; the generated guide renders them as px at a 16px font size, which is exact only at that size (an `em` letter-spacing scales with the element's own font size). No generated rule reads them. |
 | `spacing` xs..xxxl | Carried as derived 4px multiples under the same keys. |
 | `borderRadius` | Carried as authored, same values in px. |
 | `shadows` none..xl | Carried as authored `space.depth`. |
@@ -34,7 +34,7 @@ a per-class rule, a height or a cursor.
 |---|---|
 | `text-color-compliance` | Replaced by `palette-color`. |
 | `card-background` | Replaced by `palette-background-color` (any palette role, not `surface-raised` only). |
-| `h1/h2/h3-typography` (size), `body-text-size`, `badge-typography`, `label-typography` (size), `font-size-range` | Replaced by `font-size-on-scale` and `heading-size-on-scale`. The weight halves are not carried: the kit emits no weight rule. |
+| `h1/h2/h3-typography` (size), `body-text-size`, `badge-typography`, `label-typography` (size), `font-size-range` | Replaced by `font-size-on-scale` and `heading-size-on-scale`, which are looser: any size on the scale, not one per element (`h1-typography` was exactly 24px), and the scale admits 11px (`caption`) and 32px (`display`), outside the old 12-30px `font-size-range`. The weight halves are not carried: the kit emits no weight rule. |
 | `btn-border-radius`, `input-border-radius`, `card-border-radius` | Replaced by `border-radius-on-scale` (any declared radius, not one per class). |
 | `btn-height`, `input-height` | Not carried: the source has no control-height group and the kit emits no height rule. |
 | `btn-cursor-pointer`, `interactive-cursor` | Not carried: the kit emits no cursor rule. |
