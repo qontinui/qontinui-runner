@@ -7,15 +7,20 @@
 //! Phase 1 (D2, D4, D5, D6). It is the seam the lifecycle kernel's `decide()`
 //! later replaces (lifecycle plan Phase 93): only the guard's BODY changes then.
 //!
-//! ## Shadow only, in this phase
+//! ## What a `Close` buys
 //!
-//! [`judge`] decides and the executor LOGS and PUBLISHES the verdict
+//! [`judge`] decides, and the executor LOGS and PUBLISHES the verdict
 //! (`close guard: would mint | held <reason> | unknown <reason>`, and
 //! `windDown.closeGuard` on `/restart-readiness`). A non-[`GuardVerdict::Close`]
-//! verdict stops the close attempt; a `Close` verdict lets the attempt proceed
-//! exactly as before, still presenting NO close authority, so the primitive
-//! still refuses it `no_close_authority`. Minting from a [`GuardClose`] is
-//! Phase 2, gated on this phase's shadow evidence.
+//! verdict stops the close attempt and no token exists for it. A `Close`
+//! verdict carries a [`GuardClose`]; `close_batch` hands it, for that one
+//! candidate and no other, to `wind_down_exit`, which checks its ids against the
+//! close and consumes it into the one `CloseAuthority` the graceful-exit
+//! primitive needs (`CloseAuthority::for_finished_close`, plan Phase 2). The
+//! primitive still applies its own refusals after that (a nested `claude`, a
+//! child process, a screen not at an empty prompt), so a `Close` admits an
+//! attempt and never forces one. Lifecycle Phase 93 later replaces this
+//! guard's body with `decide()`.
 //!
 //! ## The arms, in evaluation order (every one fail-closed)
 //!
@@ -131,8 +136,8 @@ impl ArmVerdict {
 
 /// The proof that [`judge`] answered `Close` for exactly this session in
 /// exactly this pane. Its fields are private and it has no constructor outside
-/// this module, so the only way to hold one is a `Close` from [`judge`]. Phase
-/// 2's minter consumes it by value.
+/// this module, so the only way to hold one outside tests is a `Close` from
+/// [`judge`]. `CloseAuthority::for_finished_close` consumes it by value.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GuardClose {
     session_id: String,
@@ -140,6 +145,17 @@ pub struct GuardClose {
 }
 
 impl GuardClose {
+    /// A token for the executor's own tests, which exercise the minter's
+    /// refusals (an id that does not match the close, a drain-arm call). Test-only
+    /// by construction: no shipped build can call it.
+    #[cfg(test)]
+    pub(crate) fn for_test(session_id: &str, terminal_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+        }
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }

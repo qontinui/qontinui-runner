@@ -267,9 +267,12 @@ pub const WIND_DOWN_NOT_ATTEMPTED: &str = "exit_not_submitted";
 /// `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a). Nothing was
 /// written and nothing was closed. The session is STILL RUNNING.
 ///
-/// Until the lifecycle Closer mints authorities (Phase 93), this is what EVERY
-/// wind-down close of a live session records, whichever arm attempted it.
-/// It is the read-back that the gate is armed on a box that restarted into it.
+/// What a wind-down close of a live session records when no close authority
+/// was presented: every drain-arm close, and a `finished_close` close the
+/// close guard did not answer `Close` for. A guard `Close` mints its authority
+/// (plan `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+/// Phase 2) and is not refused here. It is the read-back that the gate is armed
+/// on a box that restarted into it.
 pub const WIND_DOWN_NO_CLOSE_AUTHORITY: &str = "no_close_authority";
 
 /// [`TerminalSessionRecord::wind_down_arm`] — the close was made by the

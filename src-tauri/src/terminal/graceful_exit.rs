@@ -2109,6 +2109,19 @@ pub(crate) mod fake_process_table {
         }
     }
 
+    impl FakePane {
+        /// The pane's `claude` exits: every later probe finds no `claude` in it,
+        /// as it does once a real `/exit` has been honoured. Only a registered
+        /// view can leave; a scripted table's `claude` is its snapshot's.
+        pub(crate) fn claude_leaves(&self) {
+            let mut table = table().lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(Registered::View { view, .. }) = table.get_mut(&self.root_pid) {
+                view.subtree_claude.clear();
+                view.tracked_alive.clear();
+            }
+        }
+    }
+
     /// Register a pane whose every probe reads `view`, under a fresh fake root
     /// pid.
     pub(crate) fn register(view: PaneProcesses) -> FakePane {
