@@ -58,7 +58,8 @@ pub const BAND_MS: i64 = 1000;
 pub const KEPT_WORKING_MS: i64 = 10 * 60_000;
 
 /// coord's `PENDING_PAGE_LIMIT` for `GET /coord/session-messages/pending`. A
-/// page this full may have left a recipient's row off it.
+/// page this full may have left a recipient's row off it, unless the read named
+/// that recipient in `live` (see [`messages_arm`]).
 pub const PENDING_PAGE_LIMIT: usize = 50;
 
 /// CI conclusions that are not a failure. A completed check with one of these
@@ -189,9 +190,12 @@ impl GuardVerdict {
 pub struct PendingMessage {
     pub message_id: String,
     pub to_session: String,
-    /// The Claude session id `to_session` resolves to on this runner — `None`
-    /// when it resolves to nothing the runner knows (the guard then cannot
-    /// rule out that it is this session's).
+    /// The Claude session id `to_session` resolves to on this runner, by the
+    /// two lookups the delivery poller uses for a terminal session — `None`
+    /// when it resolves to no session this runner hosts. The poller never
+    /// delivers such a row, so it is no message for any pane here. The poller
+    /// then routes on the resolved record's terminal, which this field does not
+    /// carry (see the known gap on [`messages_arm`]).
     pub owner: Option<String>,
 }
 
@@ -466,13 +470,35 @@ pub fn revival_arm(
 ///
 /// `messages` is coord's `GET /coord/session-messages/pending` page for this
 /// device (undelivered, unacked, unexpired), each row attributed by the
-/// runner. A row addressed to this session holds the close. An empty page is
-/// none. A FULL page ([`PENDING_PAGE_LIMIT`]) may have left this session's row
-/// off it, and a row the runner cannot attribute may be this session's
-/// (coord's `to_session` is an `agent_sessions` id the runner does not always
-/// know); both are UNKNOWN. A message already delivered (injected) but not
-/// yet acked is not on the page — it reached the pane as a turn, which the
-/// revival arm catches.
+/// runner. A row addressed to this session, by its own id or through the
+/// runner's attribution, holds the close. An empty page is none.
+///
+/// A row for another recipient does not hold it, and neither does a row whose
+/// recipient this runner hosts no session for (`owner` is `None`): the
+/// delivery poller resolves a recipient the same way and leaves such a row
+/// undelivered until it expires, so keeping this session open for it would
+/// deliver nothing. Measured on a Linux box on 2026-11-20: the page was full
+/// with 50 rows for 50 recipients, 38 of them with no lifecycle record on this
+/// runner, the oldest 14 days old. Reading those rows as UNKNOWN held every
+/// candidate on the box.
+///
+/// KNOWN GAP, to close before Phase 2 mints: the poller routes a row on the
+/// RECORD it resolves to, and a pane can keep its original record open beside
+/// a resumed one. A row addressed to that sibling record is deliverable into
+/// this pane but is attributed to the sibling, so it does not hold this
+/// session, and it is not named in `live` either. None of 156 terminals on the
+/// measured box carried two open records.
+///
+/// A FULL page ([`PENDING_PAGE_LIMIT`]) can leave a recipient's row off it,
+/// but not a recipient the read named in `live`: coord ranks that recipient's
+/// oldest row directly after its rotation tier, which is at most half the
+/// page (`pending_for_reader` in qontinui-coord). The read names this session
+/// in `live` exactly when its id is a UUID
+/// (`wind_down_observer::fetch_pending_messages`), so a full page is UNKNOWN
+/// only for a session whose id is not one.
+///
+/// A message already delivered (injected) but not yet acked is not on the
+/// page — it reached the pane as a turn, which the revival arm catches.
 pub fn messages_arm(
     session_id: &str,
     messages: &Result<Vec<PendingMessage>, String>,
@@ -494,21 +520,14 @@ pub fn messages_arm(
             ),
         );
     }
-    if rows.len() >= PENDING_PAGE_LIMIT {
+    let named_in_live = session_id.trim().parse::<uuid::Uuid>().is_ok();
+    if rows.len() >= PENDING_PAGE_LIMIT && !named_in_live {
         return ArmVerdict::unknown(
             "undelivered_messages_page_full",
             format!(
-                "coord's pending page is full ({} rows), so a row for this session may be off it",
+                "coord's pending page is full ({} rows) and the read could not name this \
+                 session, so a row for it may be off the page",
                 rows.len()
-            ),
-        );
-    }
-    if let Some(row) = rows.iter().find(|r| r.owner.is_none()) {
-        return ArmVerdict::unknown(
-            "undelivered_messages_unattributable",
-            format!(
-                "undelivered message {} is addressed to {}, which this runner cannot attribute",
-                row.message_id, row.to_session
             ),
         );
     }
@@ -1185,22 +1204,34 @@ mod tests {
             f.outcome(),
             unknown("undelivered_messages", "undelivered_messages_unreadable")
         );
+        // A row whose recipient this runner hosts no session for is nobody's
+        // here: the delivery poller never delivers it.
         let mut f = Fixture::ok();
         f.messages = Ok(vec![msg("who-knows", None)]);
-        assert_eq!(
-            f.outcome(),
-            unknown(
-                "undelivered_messages",
-                "undelivered_messages_unattributable"
-            )
-        );
+        assert_eq!(f.outcome(), CLOSE);
+        // A full page is unknown for a session the read could not name in
+        // `live` (the fixture's id is not a UUID)...
+        let full_page = |owner: Option<&str>| -> Vec<PendingMessage> {
+            (0..PENDING_PAGE_LIMIT)
+                .map(|i| msg(&format!("s-other-{i}"), owner))
+                .collect()
+        };
         let mut f = Fixture::ok();
-        f.messages = Ok((0..PENDING_PAGE_LIMIT)
-            .map(|i| msg(&format!("s-other-{i}"), Some("s-other")))
-            .collect());
+        f.messages = Ok(full_page(Some("s-other")));
         assert_eq!(
             f.outcome(),
             unknown("undelivered_messages", "undelivered_messages_page_full")
+        );
+        // ...and holds none for one it did name: coord ranks that recipient's
+        // oldest row onto the page, so a full page of dead recipients' rows
+        // carries none of its own.
+        let named = "0192aaaa-0000-7000-8000-000000000001";
+        assert_eq!(messages_arm(named, &Ok(full_page(None))), ArmVerdict::Ok);
+        let mut with_own = full_page(None);
+        with_own[PENDING_PAGE_LIMIT - 1] = msg(&named.to_uppercase(), None);
+        assert_eq!(
+            messages_arm(named, &Ok(with_own)).reason(),
+            Some("undelivered_message")
         );
     }
 
