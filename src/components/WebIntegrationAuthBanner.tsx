@@ -105,6 +105,12 @@ export function WebIntegrationAuthBanner() {
   // the Authorize button's sign-in target (savedBackendUrl.ts, "operator"
   // surface); `null` (not loaded / read failed) targets production.
   const [status, setStatus] = useState<(AuthBannerStatus & SavedBackendStatus) | null>(null);
+  // True while the LATEST status read failed. The banner keeps showing from
+  // the previous `status` (a failed re-read must not hide or flash it), but
+  // Authorize must not take its sign-in target from that stale read — the
+  // same rule AccountSettings applies by clearing its status on a failed
+  // re-read. A stale read targets production, like `null`.
+  const [statusReadFailed, setStatusReadFailed] = useState(false);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );
@@ -213,10 +219,15 @@ export function WebIntegrationAuthBanner() {
         .then((next) => {
           if (cancelled) return;
           setStatus(next);
+          setStatusReadFailed(false);
         })
         .catch(() => {
           // If the command isn't available (e.g. older runner build), keep
           // the banner hidden rather than crashing — `status` stays null.
+          // A failed RE-read keeps the previous `status` for visibility but
+          // marks it stale, so Authorize no longer targets it.
+          if (cancelled) return;
+          setStatusReadFailed(true);
         });
     };
 
@@ -395,7 +406,7 @@ export function WebIntegrationAuthBanner() {
       // `web-integration-changed`, which refreshes the status + device-JWT
       // probe above and hides the banner.
       await invoke<void>("cognito_sign_in", {
-        backendUrl: signInBackendUrlFrom(status, "operator"),
+        backendUrl: signInBackendUrlFrom(statusReadFailed ? null : status, "operator"),
       });
       // A retry's "did not recover" is answered by this sign-in.
       setRetryRefresh(null);
@@ -406,7 +417,7 @@ export function WebIntegrationAuthBanner() {
     } finally {
       setAuthorizing(false);
     }
-  }, [status]);
+  }, [status, statusReadFailed]);
 
   // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
   // future sessions only — running sessions keep their tenant), close the
