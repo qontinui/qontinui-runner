@@ -2715,7 +2715,7 @@ mod tests {
     fn journey_rows_from_a_type_action_never_carry_the_value() {
         use crate::journey::capture::{edge_insert, finalize, snapshot_view};
         use crate::journey::cursor::{
-            failure_hint, ActionSpec, CursorKey, Cursors, Observed, Provenance,
+            verdict_hint, ActionSpec, CursorKey, Cursors, Observed, Provenance,
         };
         use crate::journey::node::{
             affordance_digest, build_node, extract_affordances, page_identity, SpecLookup,
@@ -2750,7 +2750,7 @@ mod tests {
             &key,
             &action,
             Provenance::default(),
-            failure_hint(false),
+            verdict_hint(&crate::mcp::ui_bridge::request::ActionOutcome::Succeeded),
             Instant::now(),
         );
         assert!(displaced.is_none(), "no earlier action was pending");

@@ -30,6 +30,7 @@ use super::app_dispatch::{AppDispatcher, ArmPayloads, DispatchError};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
+use super::ui_bridge::request::ActionOutcome;
 
 // =============================================================================
 // Types
@@ -712,6 +713,59 @@ async fn dispatch_app_request_by_id_with(
 /// Fallback `code` on the failure body a handler answers when the IPC
 /// fallback was REFUSED and the error carried no code of the app's own.
 const SDK_DISPATCH_FAILED: &str = "SDK_DISPATCH_FAILED";
+
+/// `code` of an SDK route's answer when its dispatch failed AFTER the request
+/// reached (or may have reached) the app — a relay timeout, a socket dropped
+/// in flight, a displaced tab, an answer that could not be read — so whether
+/// the app ACTED is unknown. A member of
+/// [`crate::journey::capture::VERDICT_UNKNOWN_CODES`]: the journey ledger
+/// records a `verdict_unknown` edge for it, and the route answers a 5xx so a
+/// client reads the verdict as UNKNOWN rather than "did not act" (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`,
+/// Phase 3).
+pub(crate) const SDK_DISPATCH_OUTCOME_UNKNOWN: &str = "SDK_DISPATCH_OUTCOME_UNKNOWN";
+
+/// When an SDK dispatch failed, relative to the request reaching the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchStage {
+    /// The request never left the runner (no app, an unregistered or
+    /// unresponsive one, a refused connect, an unencodable frame): nothing
+    /// acted.
+    BeforeSend,
+    /// The request was sent, or may have been, and no readable verdict came
+    /// back: whether the app acted is UNKNOWN.
+    AfterSend,
+    /// The app ANSWERED with a failure of its own: its answer is the verdict.
+    AppAnswered,
+}
+
+/// Classify a dispatch error by [`DispatchStage`]. Where one variant covers
+/// both sides of the send (a WebSocket `Disconnected` is both a send failure
+/// and a socket closed in flight), it is [`DispatchStage::AfterSend`]: reading
+/// "may have acted" as "did not act" is what licenses a second execution.
+fn dispatch_stage(err: &DispatchError) -> DispatchStage {
+    use super::command_relay::CommandRelayError;
+    match err {
+        DispatchError::NotRegistered(_)
+        | DispatchError::NotWebsocket(_)
+        | DispatchError::NotConnected
+        | DispatchError::NotResponsive(_)
+        | DispatchError::WebSocket(CommandRelayError::NotConnected(_))
+        | DispatchError::WebSocket(CommandRelayError::EncodeFailed(_)) => DispatchStage::BeforeSend,
+        DispatchError::HttpSend { source, .. } if source.is_connect() => DispatchStage::BeforeSend,
+        DispatchError::AppAnswered { .. }
+        | DispatchError::WebSocket(CommandRelayError::WrapperError(_)) => DispatchStage::AppAnswered,
+        DispatchError::HttpSend { .. }
+        | DispatchError::HttpStatus { .. }
+        | DispatchError::InvalidJson(_)
+        | DispatchError::WebSocket(
+            CommandRelayError::Timeout(_)
+            | CommandRelayError::Disconnected
+            | CommandRelayError::Displaced(_)
+            | CommandRelayError::UnreadableResponse(_),
+        ) => DispatchStage::AfterSend,
+    }
+}
 
 /// The app's own machine-readable code, from a JSON error body that has one
 /// (`code` / `errorCode`, top level or under `error`).
@@ -2280,33 +2334,41 @@ fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
     }
 }
 
-/// `(body, success, error)` for the WS/HTTP arm of [`handle_element_action`].
+/// `(body, outcome, error)` for the WS/HTTP arm of [`handle_element_action`].
+/// The three-state `outcome` is what the journey ledger records (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+/// D2): the normalised body says `success: false` for an indeterminate one,
+/// which must not reach the ledger as a failure.
 ///
 /// Normalised at THIS boundary: the app's JSON is forwarded to the caller and
 /// persisted as an `action_executed` event, so a body with no boolean `success`
 /// (a relay frame whose `result` was absent arrives as `null`) is rewritten to
 /// an explicit `success: false` + `INDETERMINATE:` error instead of reading as
 /// success here and at every permissive consumer downstream.
-fn ws_element_action_result(data: serde_json::Value) -> (serde_json::Value, bool, Option<String>) {
+fn ws_element_action_result(
+    data: serde_json::Value,
+) -> (serde_json::Value, ActionOutcome, Option<String>) {
     let (data, outcome) = super::ui_bridge::request::normalize_action_result(data);
     let err = outcome.error_message();
-    (data, outcome.succeeded(), err)
+    (data, outcome, err)
 }
 
-/// `(body, success, error)` for the IPC fallback arm of
+/// `(body, outcome, error)` for the IPC fallback arm of
 /// [`handle_element_action`]. Strict: only an explicit `success: true` is
 /// wrapped as a success — an absent key used to be re-minted as `true` here.
-fn ipc_element_action_result(data: serde_json::Value) -> (serde_json::Value, bool, Option<String>) {
+fn ipc_element_action_result(
+    data: serde_json::Value,
+) -> (serde_json::Value, ActionOutcome, Option<String>) {
     let (data, outcome) = super::ui_bridge::request::normalize_action_result(data);
     if outcome.succeeded() {
         (
             serde_json::json!({ "success": true, "data": data }),
-            true,
+            outcome,
             None,
         )
     } else {
         let err = outcome.error_message();
-        (data, false, err)
+        (data, outcome, err)
     }
 }
 
@@ -2483,6 +2545,10 @@ async fn handle_element_action(
     // when it is the holding session's own target.
     let active_origin = active_app_origin(&state).await;
     let mut acted_via_ipc = false;
+    // The action's own three-state verdict where an arm READ one (plan
+    // 2026-11-18 D2); `None` = take it from the arm's boolean (a refusal or a
+    // transport error, which carries no indeterminate state).
+    let mut journey_outcome: Option<ActionOutcome> = None;
     let result = match element_action_app_payloads(&id, &body, tab_id, active_origin.as_ref()) {
         // A placeholder no live condition session can substitute here: nothing
         // is dispatched, and the literal is never typed.
@@ -2506,7 +2572,9 @@ async fn handle_element_action(
                 // rewritten to an explicit `success: false` + `INDETERMINATE:`
                 // error instead of reading as success here and at every
                 // permissive consumer downstream.
-                let (data, success, err) = ws_element_action_result(data);
+                let (data, outcome, err) = ws_element_action_result(data);
+                let success = outcome.succeeded();
+                journey_outcome = Some(outcome);
                 (Json(data), success, err)
             }
             Err(e) => {
@@ -2563,7 +2631,9 @@ async fn handle_element_action(
                     });
                     match ui_bridge_request_sync(&state, "execute_action", payload).await {
                         Ok(data) => {
-                            let (data, success, err) = ipc_element_action_result(data);
+                            let (data, outcome, err) = ipc_element_action_result(data);
+                            let success = outcome.succeeded();
+                            journey_outcome = Some(outcome);
                             (Json(data), success, err)
                         }
                         Err(e) => (
@@ -2596,6 +2666,13 @@ async fn handle_element_action(
         ),
     };
     if !crate::journey::capture::sdk_refusal(&result.0) {
+        let outcome = journey_outcome.unwrap_or_else(|| {
+            if result.1 {
+                ActionOutcome::Succeeded
+            } else {
+                ActionOutcome::Failed(result.2.clone())
+            }
+        });
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
             crate::journey::cursor::CursorKey::new(journey_app, scope),
@@ -2608,7 +2685,7 @@ async fn handle_element_action(
                 app_version,
                 run_id: crate::journey::capture::run_id_from_task_run(query.task_run_id),
             },
-            !result.1,
+            outcome,
         );
     }
 
@@ -6101,11 +6178,6 @@ async fn handle_component_action(
     Json(response)
 }
 
-/// Whether an SDK route's JSON answer is an explicit failure.
-fn sdk_response_failed(response: &serde_json::Value) -> bool {
-    response.get("success") == Some(&serde_json::Value::Bool(false))
-}
-
 /// Journey ledger choke point for the SDK component action (plan
 /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, D3).
 ///
@@ -6121,20 +6193,13 @@ fn record_sdk_component_action(
     action_id: &str,
     response: &serde_json::Value,
 ) {
-    let Some((key, app_version)) =
-        crate::journey::capture::sdk_action_target(target_app, None, false, response)
-    else {
-        return;
-    };
-    crate::journey::capture::record_action(
-        state.app_state.pg_db.clone(),
-        key,
+    crate::journey::capture::record_sdk_result(
+        state,
+        target_app,
+        None,
+        false,
+        response,
         crate::journey::cursor::ActionSpec::component(component_id, action_id),
-        crate::journey::cursor::Provenance {
-            app_version,
-            run_id: None,
-        },
-        sdk_response_failed(response),
     );
 }
 
@@ -6155,22 +6220,10 @@ fn record_sdk_batch(
     action_steps: &[serde_json::Value],
     response: &serde_json::Value,
 ) {
-    let (Some((key, app_version)), Some(action)) = (
-        crate::journey::capture::sdk_action_target(active_app, None, false, response),
-        crate::journey::cursor::ActionSpec::batch(action_steps),
-    ) else {
+    let Some(action) = crate::journey::cursor::ActionSpec::batch(action_steps) else {
         return;
     };
-    crate::journey::capture::record_action(
-        state.app_state.pg_db.clone(),
-        key,
-        action,
-        crate::journey::cursor::Provenance {
-            app_version,
-            run_id: None,
-        },
-        sdk_response_failed(response),
-    );
+    crate::journey::capture::record_sdk_result(state, active_app, None, false, response, action);
 }
 
 /// GET /ui-bridge/sdk/control/element/:id/state-generic — Get generic element state
@@ -7058,32 +7111,36 @@ async fn handle_delete_intent(
 /// Journey ledger choke point (plan
 /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
 /// `/sdk/ai/recovery/attempt` re-attempts a failed action: ONE `batch_action`
-/// (`recovery_attempt`), like its control twin.
+/// (`recovery_attempt`), like its control twin. The edge's verdict is the
+/// attempt's own ([`crate::journey::capture::sdk_recovery_verdict`]), not the
+/// envelope's `success` alone.
 async fn handle_recovery_attempt(
     State(state): State<Arc<ApiState>>,
     Query(journey_query): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let active_app = active_app_identity(&state).await;
     let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
-    let response = handle_recovery_attempt_dispatch(State(Arc::clone(&state)), Json(body)).await;
-    crate::journey::capture::record_sdk_result(
+    let (status, response) =
+        handle_recovery_attempt_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_verdict(
         &state,
         active_app,
         scope.as_deref(),
         false,
         &response.0,
+        crate::journey::capture::sdk_recovery_verdict(status.as_u16(), &response.0),
         crate::journey::cursor::ActionSpec::batch_kind("recovery_attempt", None),
     );
-    response
+    (status, response)
 }
 
 /// POST /ui-bridge/sdk/ai/recovery/attempt — Attempt error recovery
 async fn handle_recovery_attempt_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let answer = dispatch_app_request_typed(
         &state,
         "attemptRecovery",
         body.clone(),
@@ -7091,10 +7148,125 @@ async fn handle_recovery_attempt_dispatch(
         "/ai/recovery/attempt",
         Some(body),
     )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    .await;
+    let (status, body) = recovery_attempt_answer(answer);
+    (status, Json(body))
+}
+
+/// The HTTP status of an SDK app's own recovery answer: the `httpStatus` hint
+/// the ui-bridge server stamps on a failed envelope (400 for "ran and nothing
+/// succeeded" or a refused payload, 500 for its own fault), else 200 — the
+/// SDK twin's convention for an answer it passes through.
+fn recovery_answer_status(body: &serde_json::Value) -> axum::http::StatusCode {
+    let failed = body.get("success").and_then(|v| v.as_bool()) == Some(false);
+    body.get("httpStatus")
+        .and_then(|v| v.as_u64())
+        .filter(|_| failed)
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| axum::http::StatusCode::from_u16(code).ok())
+        .filter(|code| code.is_client_error() || code.is_server_error())
+        .unwrap_or(axum::http::StatusCode::OK)
+}
+
+/// What `/ui-bridge/sdk/ai/recovery/attempt` answers for one dispatch, KEEPING
+/// what the app stated (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`,
+/// Phase 3). It used to rebuild every failure as `{success: false, error}`,
+/// which dropped the app's `data` (`attemptSucceeded`, `strategiesAttempted`,
+/// `finalResult`, `originalActionAttempted`) and carried no typed code, so a
+/// timeout after the app received the request read as "did not act".
+///
+/// - The app answered (any envelope): passed through verbatim, at the status
+///   its `httpStatus` hint names ([`recovery_answer_status`]).
+/// - The app answered a FAILURE over HTTP (or a wrapper failure frame), which
+///   the dispatcher surfaces as an error: `{success: false, error, code,
+///   failure_origin: "app", retryable, data}` with the app's own code (else
+///   `SDK_DISPATCH_FAILED`) and its `data` kept, at the app's own 4xx/5xx
+///   status. A wrapper failure frame has no status and answers 502.
+/// - The request never left the runner ([`DispatchStage::BeforeSend`]): `{success:
+///   false, error, code: SDK_DISPATCH_FAILED, failure_origin: "transport"}` at
+///   200 — nothing acted, and the journey ledger records nothing for it.
+/// - It was sent and no verdict came back ([`DispatchStage::AfterSend`]):
+///   `code:` [`SDK_DISPATCH_OUTCOME_UNKNOWN`] at 502, so a client reads the
+///   verdict as UNKNOWN and the ledger records `verdict_unknown`.
+fn recovery_attempt_answer(
+    answer: Result<serde_json::Value, DispatchError>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::http::StatusCode;
+    let err = match answer {
+        Ok(body) => return (recovery_answer_status(&body), body),
+        Err(err) => err,
+    };
+    let detail = dispatch_err_message(&err);
+    match dispatch_stage(&err) {
+        DispatchStage::AppAnswered => {
+            let (status, code, retryable, data) = match &err {
+                DispatchError::AppAnswered {
+                    status,
+                    code,
+                    retryable,
+                    data,
+                    ..
+                } => (
+                    StatusCode::from_u16(*status)
+                        .ok()
+                        .filter(|s| s.is_client_error() || s.is_server_error())
+                        .unwrap_or(StatusCode::OK),
+                    code.clone(),
+                    *retryable,
+                    data.clone(),
+                ),
+                DispatchError::WebSocket(super::command_relay::CommandRelayError::WrapperError(
+                    failure,
+                )) => (
+                    StatusCode::BAD_GATEWAY,
+                    failure.code.clone(),
+                    failure.retryable,
+                    None,
+                ),
+                _ => (StatusCode::BAD_GATEWAY, None, None, None),
+            };
+            let mut body = serde_json::json!({
+                "success": false,
+                "error": detail,
+                "code": code.unwrap_or_else(|| SDK_DISPATCH_FAILED.to_string()),
+                "failure_origin": "app",
+                "retryable": retryable,
+            });
+            if let Some(data) = data {
+                body["data"] = data;
+            }
+            (status, body)
+        }
+        DispatchStage::BeforeSend => (
+            StatusCode::OK,
+            serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "{SDK_DISPATCH_FAILED}: ai/recovery/attempt: the request never reached \
+                     an SDK app ({detail}); nothing acted"
+                ),
+                "code": SDK_DISPATCH_FAILED,
+                "failure_origin": "transport",
+                "detail": detail,
+                "retryable": serde_json::Value::Null,
+            }),
+        ),
+        DispatchStage::AfterSend => (
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "{SDK_DISPATCH_OUTCOME_UNKNOWN}: ai/recovery/attempt: the request was sent \
+                     to the SDK app and no readable verdict came back ({detail}); whether \
+                     the attempt acted is unknown"
+                ),
+                "code": SDK_DISPATCH_OUTCOME_UNKNOWN,
+                "failure_origin": "transport",
+                "detail": detail,
+                "retryable": serde_json::Value::Null,
+            }),
+        ),
     }
 }
 
@@ -9195,6 +9367,7 @@ mod tests {
                 error: "element not found".into(),
                 code: None,
                 retryable: None,
+                data: None,
             },
             DispatchError::InvalidJson("<html>".into()),
         ]
@@ -9257,6 +9430,7 @@ mod tests {
             error: "element not found: btn-7".into(),
             code: Some("ELEMENT_NOT_FOUND".into()),
             retryable: None,
+            data: None,
         };
         let refusal = ipc_fallback_refusal(&err, "element action").expect("refused");
         assert_eq!(refusal["failure_origin"], serde_json::json!("app"));
@@ -9355,6 +9529,7 @@ mod tests {
             error: "element not found".into(),
             code: Some("X".into()),
             retryable: None,
+            data: None,
         };
         assert_eq!(dispatch_err_to_string(err), "element not found");
     }
@@ -9669,13 +9844,18 @@ mod element_action_result_tests {
     //! both arms of `handle_element_action` read `success` through the strict
     //! shared reader, so a body with NO `success` key is a failure.
     use super::{ipc_element_action_result, ws_element_action_result};
-    use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+    use crate::mcp::ui_bridge::request::{ActionOutcome, INDETERMINATE_ACTION_ERROR};
     use serde_json::json;
 
     #[test]
     fn ws_arm_absent_success_is_failure_and_body_says_so() {
         let (body, ok, err) = ws_element_action_result(json!({ "elementId": "x" }));
-        assert!(!ok, "a success-less WS body must not read as success");
+        assert!(!ok.succeeded(), "a success-less WS body must not read as success");
+        assert_eq!(
+            ok,
+            ActionOutcome::Indeterminate,
+            "the journey ledger gets the unstated verdict, not the normalised false"
+        );
         assert_eq!(err.as_deref(), Some(INDETERMINATE_ACTION_ERROR));
         assert_eq!(
             body["success"],
@@ -9689,7 +9869,7 @@ mod element_action_result_tests {
     fn ws_arm_null_result_is_failure() {
         // A relay frame with no `result` arrives as `null`.
         let (body, ok, _) = ws_element_action_result(serde_json::Value::Null);
-        assert!(!ok);
+        assert_eq!(ok, ActionOutcome::Indeterminate);
         assert_eq!(body["success"], json!(false));
     }
 
@@ -9697,13 +9877,13 @@ mod element_action_result_tests {
     fn ws_arm_explicit_verdicts_pass_through_untouched() {
         let good = json!({ "success": true, "action": "click" });
         let (body, ok, err) = ws_element_action_result(good.clone());
-        assert!(ok);
+        assert_eq!(ok, ActionOutcome::Succeeded);
         assert_eq!(err, None);
         assert_eq!(body, good);
 
         let bad = json!({ "success": false, "error": "Element x not found" });
         let (body, ok, err) = ws_element_action_result(bad.clone());
-        assert!(!ok);
+        assert_eq!(ok, ActionOutcome::Failed(Some("Element x not found".into())));
         assert_eq!(err.as_deref(), Some("Element x not found"));
         assert_eq!(body, bad);
     }
@@ -9711,7 +9891,11 @@ mod element_action_result_tests {
     #[test]
     fn ipc_arm_absent_success_is_not_reminted_as_true() {
         let (body, ok, err) = ipc_element_action_result(json!({ "elementId": "x" }));
-        assert!(!ok, "an absent key used to be wrapped as {{success:true}}");
+        assert_eq!(
+            ok,
+            ActionOutcome::Indeterminate,
+            "an absent key used to be wrapped as {{success:true}}"
+        );
         assert_eq!(err.as_deref(), Some(INDETERMINATE_ACTION_ERROR));
         assert_eq!(body["success"], json!(false));
     }
@@ -9719,7 +9903,7 @@ mod element_action_result_tests {
     #[test]
     fn ipc_arm_explicit_true_is_wrapped_and_false_passes_through() {
         let (body, ok, _) = ipc_element_action_result(json!({ "success": true }));
-        assert!(ok);
+        assert!(ok.succeeded());
         assert_eq!(
             body,
             json!({ "success": true, "data": { "success": true } })
@@ -9727,7 +9911,7 @@ mod element_action_result_tests {
 
         let (body, ok, err) =
             ipc_element_action_result(json!({ "success": false, "error": "nope" }));
-        assert!(!ok);
+        assert_eq!(ok, ActionOutcome::Failed(Some("nope".into())));
         assert_eq!(err.as_deref(), Some("nope"));
         assert_eq!(body["success"], json!(false));
     }
@@ -11112,8 +11296,9 @@ mod condition_secrets_dispatch_tests {
             json!(SECRET),
             "the dispatched payload carried the value to the app"
         );
-        let (data, success, error) = ws_element_action_result(answered);
-        let (response, success, ledger_error) = scrub_action_result((Json(data), success, error));
+        let (data, outcome, error) = ws_element_action_result(answered);
+        let (response, success, ledger_error) =
+            scrub_action_result((Json(data), outcome.succeeded(), error));
         assert!(success);
         assert_eq!(ledger_error, None);
         assert!(
@@ -11379,5 +11564,162 @@ mod condition_secrets_dispatch_tests {
                     .contains(SECRET));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_attempt_twin_tests {
+    //! Plan `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`,
+    //! Phase 3: `/ui-bridge/sdk/ai/recovery/attempt` keeps what the app
+    //! stated, carries a typed code, and answers a dispatch that may have acted
+    //! as UNKNOWN — and the journey verdict read off each answer agrees.
+    use crate::mcp::command_relay::{CommandRelayError, WrapperFailure};
+    use super::*;
+    use crate::journey::capture::sdk_recovery_verdict;
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    fn answered(status: u16, code: Option<&str>, data: Option<serde_json::Value>) -> DispatchError {
+        DispatchError::AppAnswered {
+            url: "http://127.0.0.1:3000/ai/recovery/attempt".into(),
+            status,
+            error: "RECOVERY_FAILED: All recovery strategies exhausted".into(),
+            code: code.map(String::from),
+            retryable: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn an_app_failure_keeps_its_data_code_and_status() {
+        let data = json!({
+            "attemptSucceeded": false,
+            "originalActionAttempted": true,
+            "originalActionPerformed": false,
+            "strategiesAttempted": ["direct-instruction"],
+            "finalResult": { "success": false },
+        });
+        let (status, body) = recovery_attempt_answer(Err(answered(
+            400,
+            Some("UB-ACTION-FAILED"),
+            Some(data.clone()),
+        )));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["success"], json!(false));
+        assert_eq!(body["code"], json!("UB-ACTION-FAILED"));
+        assert_eq!(body["failure_origin"], json!("app"));
+        assert_eq!(body["data"], data, "the app's statement is kept whole");
+        assert!(matches!(
+            sdk_recovery_verdict(status.as_u16(), &body),
+            Some(ActionOutcome::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn a_validation_refusal_records_no_edge() {
+        let (status, body) = recovery_attempt_answer(Err(answered(
+            400,
+            Some("UB-VALIDATION-ERROR"),
+            Some(json!({ "attemptSucceeded": false, "originalActionAttempted": false })),
+        )));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(sdk_recovery_verdict(status.as_u16(), &body), None);
+    }
+
+    #[test]
+    fn an_app_failure_with_no_code_gets_a_typed_one() {
+        let (_, body) = recovery_attempt_answer(Err(answered(400, None, None)));
+        assert_eq!(body["code"], json!(SDK_DISPATCH_FAILED));
+        assert!(body.get("data").is_none());
+    }
+
+    #[test]
+    fn a_dispatch_error_after_send_is_verdict_unknown() {
+        for err in [
+            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(30))),
+            DispatchError::WebSocket(CommandRelayError::Disconnected),
+            DispatchError::WebSocket(CommandRelayError::Displaced("new tab".into())),
+            DispatchError::WebSocket(CommandRelayError::UnreadableResponse("garbage".into())),
+            DispatchError::HttpStatus {
+                url: "u".into(),
+                status: 502,
+                body: "<html>".into(),
+            },
+            DispatchError::InvalidJson("<html>".into()),
+        ] {
+            assert_eq!(dispatch_stage(&err), DispatchStage::AfterSend, "{err:?}");
+            let (status, body) = recovery_attempt_answer(Err(err));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["code"], json!(SDK_DISPATCH_OUTCOME_UNKNOWN));
+            assert_eq!(
+                sdk_recovery_verdict(status.as_u16(), &body),
+                Some(ActionOutcome::Indeterminate)
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_that_never_left_the_runner_records_nothing() {
+        for err in [
+            DispatchError::NotConnected,
+            DispatchError::NotRegistered("app".into()),
+            DispatchError::NotResponsive("no tab".into()),
+            DispatchError::WebSocket(CommandRelayError::NotConnected("app".into())),
+        ] {
+            assert_eq!(dispatch_stage(&err), DispatchStage::BeforeSend, "{err:?}");
+            let (status, body) = recovery_attempt_answer(Err(err));
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["code"], json!(SDK_DISPATCH_FAILED));
+            assert_eq!(sdk_recovery_verdict(status.as_u16(), &body), None);
+        }
+    }
+
+    #[test]
+    fn a_wrapper_failure_frame_is_the_apps_answer() {
+        let err = DispatchError::WebSocket(CommandRelayError::WrapperError(WrapperFailure {
+            code: Some("HANDLER_ERROR".into()),
+            message: "boom".into(),
+            retryable: Some(false),
+        }));
+        assert_eq!(dispatch_stage(&err), DispatchStage::AppAnswered);
+        let (status, body) = recovery_attempt_answer(Err(err));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["code"], json!("HANDLER_ERROR"));
+        assert_eq!(body["failure_origin"], json!("app"));
+    }
+
+    /// An answer the app sent whole (the WebSocket arm hands its envelope
+    /// back as `Ok`): verbatim, at the status its `httpStatus` hint names.
+    #[test]
+    fn an_answered_envelope_passes_through_at_its_own_status() {
+        let not_recovered = json!({
+            "success": false,
+            "data": { "attemptSucceeded": false, "originalActionAttempted": true },
+            "error": "RECOVERY_FAILED: exhausted",
+            "httpStatus": 400,
+        });
+        let (status, body) = recovery_attempt_answer(Ok(not_recovered.clone()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, not_recovered);
+
+        let recovered = json!({
+            "success": true,
+            "data": { "attemptSucceeded": true, "originalActionPerformed": true },
+            "httpStatus": 500,
+        });
+        let (status, _) = recovery_attempt_answer(Ok(recovered.clone()));
+        assert_eq!(status, StatusCode::OK, "a hint on a success envelope is ignored");
+        assert_eq!(
+            sdk_recovery_verdict(status.as_u16(), &recovered),
+            Some(ActionOutcome::Succeeded)
+        );
+
+        // A verdict-less success envelope: never a success edge.
+        let (status, body) = recovery_attempt_answer(Ok(json!({ "success": true, "data": {} })));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sdk_recovery_verdict(status.as_u16(), &body),
+            Some(ActionOutcome::Indeterminate)
+        );
     }
 }

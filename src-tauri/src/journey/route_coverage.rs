@@ -415,7 +415,9 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
 /// The ledger entry points a RECORDED handler (or the wrapper it is) calls.
 const LEDGER_CALLS: &[&str] = &[
     "record_control_result(",
+    "record_control_verdict(",
     "record_sdk_result(",
+    "record_sdk_verdict(",
     "record_action(",
     "record_diff(",
     "record_diff_result(",

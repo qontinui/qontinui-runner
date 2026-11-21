@@ -23,7 +23,7 @@
 //!   next control/SDK snapshot of that cursor closes it. Execute-with-diff is
 //!   no exception: its `SemanticSnapshot`s are not a shape the spec evaluator
 //!   reads, so they would be a SECOND node-identity source. A diff contributes
-//!   only an outcome hint (`error` / `settle_timeout`).
+//!   only an outcome hint (`error` / `verdict_unknown` / `settle_timeout`).
 //! - A second action arriving first, or a pending edge older than
 //!   [`super::cursor::PENDING_TTL`], closes as `to_node_unobserved` (D3).
 //!
@@ -49,8 +49,10 @@ use tracing::warn;
 use crate::database::pg::PgDb;
 
 use super::cursor::{
-    failure_hint, ActionSpec, CursorKey, Cursors, EdgeDraft, Observed, Provenance,
+    verdict_hint, ActionSpec, CursorKey, Cursors, EdgeDraft, Observed, Provenance,
 };
+use crate::mcp::ui_bridge::request::ActionOutcome;
+use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
 use super::frontier;
 use super::health;
 use super::node::{
@@ -75,13 +77,75 @@ pub(crate) fn runner_instance() -> String {
         .unwrap_or_else(|| "primary".to_string())
 }
 
-/// Did a control-route action act on the UI, and did it fail?
+/// The runner-owned tokens that say an action was ATTEMPTED and its own
+/// verdict is UNKNOWN (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+/// D3). Read from a control route's `error_detail.context.code`, and from an
+/// SDK route's top-level `code` ([`verdict_unknown_code`]); either records a
+/// `verdict_unknown` edge, never `error` and never a success.
 ///
-/// - `None` — the runner refused the request itself (a 4xx: malformed body,
-///   unknown element, unknown action) — no UI action occurred, so no edge;
-/// - `Some(true)` — the action was attempted and failed (a 5xx, or a 200 whose
-///   envelope says `success: false`) — an `error` edge;
-/// - `Some(false)` — the action succeeded.
+/// - `RECOVERY_VERDICT_MISSING` — `/ai/recovery/attempt`'s 500 for a reply
+///   that stated no `attemptSucceeded`
+///   ([`crate::mcp::ui_bridge::ai_analyze::RECOVERY_VERDICT_MISSING`]);
+/// - `SDK_DISPATCH_OUTCOME_UNKNOWN` — an SDK route's dispatch that failed
+///   AFTER the request reached the app (a timeout, a dropped socket, an
+///   unreadable answer), so whether the app acted is unknown
+///   ([`crate::mcp::sdk_client::SDK_DISPATCH_OUTCOME_UNKNOWN`]).
+///
+/// Add a token here, not a per-route table: the reader is typed, so every
+/// route that stamps one is covered without a second edit.
+pub(crate) const VERDICT_UNKNOWN_CODES: [&str; 2] = [
+    crate::mcp::ui_bridge::ai_analyze::RECOVERY_VERDICT_MISSING,
+    crate::mcp::sdk_client::SDK_DISPATCH_OUTCOME_UNKNOWN,
+];
+
+/// The verdict-unknown token a body carries, if any: its top-level `code`,
+/// else its `error_detail.context.code`.
+pub(crate) fn verdict_unknown_code(response: &serde_json::Value) -> Option<&'static str> {
+    [
+        response.get("code"),
+        response.pointer("/error_detail/context/code"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|v| v.as_str())
+    .find_map(|c| VERDICT_UNKNOWN_CODES.iter().copied().find(|t| *t == c))
+}
+
+/// The prefix of [`INDETERMINATE_ACTION_ERROR`]: the distinguishable half of
+/// that contract (see its doc).
+const INDETERMINATE_PREFIX: &str = "INDETERMINATE:";
+
+/// Is this an `INDETERMINATE:` error — the marker
+/// [`crate::mcp::ui_bridge::request::normalize_action_result`] writes over a
+/// result that carried no boolean `success`? Such a body says `success:
+/// false` only so no permissive reader downstream takes it for a pass; the
+/// action's verdict is UNKNOWN, not a failure.
+fn indeterminate_marker(error: Option<&str>) -> bool {
+    error.is_some_and(|e| e.starts_with(INDETERMINATE_PREFIX))
+}
+
+/// Did a control-route action act on the UI, and what was its verdict? Decided
+/// from the response's TYPED fields, never from route strings (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+/// D3), so a new route is covered by stamping the right code:
+///
+/// - a 2xx envelope: `success: true` → [`ActionOutcome::Succeeded`];
+///   `success: false` → [`ActionOutcome::Failed`], unless its `error` is the
+///   `INDETERMINATE:` marker → [`ActionOutcome::Indeterminate`];
+/// - an error whose `error_detail.context.code` is in
+///   [`VERDICT_UNKNOWN_CODES`] (any status) → [`ActionOutcome::Indeterminate`]:
+///   the action was attempted and its verdict is unknown;
+/// - a 4xx whose `error_detail.code` is `ACTION_FAILED` →
+///   [`ActionOutcome::Failed`]: the action was DISPATCHED and failed
+///   (`elements::as_action_failure`, `/ai/recovery/attempt`'s
+///   `RECOVERY_FAILED`). Every producer of that code is post-dispatch;
+/// - any other 4xx → `None`: the runner refused the request itself
+///   (malformed body, unknown element, unknown action), no UI action
+///   occurred, so no edge;
+/// - any other 5xx → [`ActionOutcome::Failed`] (a transport-level failure;
+///   sorting dispatch-time timeouts from pre-dispatch refusals is a named
+///   follow-up of that plan, not this reader's job).
 pub(crate) fn control_action_verdict<T: serde::Serialize, E: serde::Serialize>(
     result: &Result<
         axum::Json<crate::mcp::types::ApiResponse<T>>,
@@ -90,11 +154,48 @@ pub(crate) fn control_action_verdict<T: serde::Serialize, E: serde::Serialize>(
             axum::Json<crate::mcp::types::ApiResponse<E>>,
         ),
     >,
-) -> Option<bool> {
+) -> Option<ActionOutcome> {
     match result {
-        Ok(body) => Some(!body.success),
-        Err((status, _)) if status.is_client_error() => None,
-        Err(_) => Some(true),
+        Ok(body) if body.success => Some(ActionOutcome::Succeeded),
+        Ok(body) if indeterminate_marker(body.error.as_deref()) => {
+            Some(ActionOutcome::Indeterminate)
+        }
+        Ok(body) => Some(ActionOutcome::Failed(body.error.clone())),
+        Err((status, body)) => {
+            let detail = body.error_detail.as_ref();
+            let context_code = detail
+                .and_then(|d| d.context.as_ref())
+                .and_then(|c| c.get("code"))
+                .and_then(|c| c.as_str());
+            if context_code.is_some_and(|c| VERDICT_UNKNOWN_CODES.contains(&c)) {
+                return Some(ActionOutcome::Indeterminate);
+            }
+            if status.is_client_error() {
+                return detail
+                    .filter(|d| matches!(d.code, UiBridgeErrorCode::ActionFailed))
+                    .map(|_| ActionOutcome::Failed(body.error.clone()));
+            }
+            Some(ActionOutcome::Failed(body.error.clone()))
+        }
+    }
+}
+
+/// [`control_action_verdict`] for a handler that computed its success
+/// envelope's verdict itself (a batch aggregating its steps' three-state
+/// outcomes): `ok` stands for any 2xx, and an error is read the usual way.
+pub(crate) fn control_action_verdict_with<T: serde::Serialize, E: serde::Serialize>(
+    result: &Result<
+        axum::Json<crate::mcp::types::ApiResponse<T>>,
+        (
+            axum::http::StatusCode,
+            axum::Json<crate::mcp::types::ApiResponse<E>>,
+        ),
+    >,
+    ok: ActionOutcome,
+) -> Option<ActionOutcome> {
+    match result {
+        Ok(_) => Some(ok),
+        Err(_) => control_action_verdict(result),
     }
 }
 
@@ -113,13 +214,24 @@ pub(crate) fn record_control_result<T: serde::Serialize, E: serde::Serialize>(
     >,
     action: ActionSpec,
 ) {
-    if let Some(failed) = control_action_verdict(result) {
+    record_control_verdict(state, control_action_verdict(result), action);
+}
+
+/// Record a CONTROL-surface action from a verdict already decided
+/// ([`control_action_verdict`] / [`control_action_verdict_with`]). `None`
+/// records nothing.
+pub(crate) fn record_control_verdict(
+    state: &Arc<crate::mcp::types::ApiState>,
+    verdict: Option<ActionOutcome>,
+    action: ActionSpec,
+) {
+    if let Some(outcome) = verdict {
         record_action(
             state.app_state.pg_db.clone(),
             CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
             action,
             Provenance::default(),
-            failed,
+            outcome,
         );
     }
 }
@@ -154,11 +266,87 @@ pub(crate) fn sdk_action_target(
     }
 }
 
+/// What an SDK route's JSON answer says about the action's own verdict (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+/// D2), or `None` when it is a refusal that reached no UI ([`sdk_refusal`]):
+///
+/// - a verdict-unknown token ([`verdict_unknown_code`]) →
+///   [`ActionOutcome::Indeterminate`];
+/// - otherwise the strict reader [`crate::mcp::ui_bridge::request::action_outcome`]:
+///   `success: true` → succeeded, `success: false` → failed, NO boolean
+///   `success` → indeterminate (an absent verdict is never a pass);
+/// - a `success: false` whose `error` is the `INDETERMINATE:` marker
+///   (a body [`crate::mcp::ui_bridge::request::normalize_action_result`]
+///   rewrote) → indeterminate, never a failure.
+pub(crate) fn sdk_action_verdict(response: &serde_json::Value) -> Option<ActionOutcome> {
+    if verdict_unknown_code(response).is_some() {
+        return Some(ActionOutcome::Indeterminate);
+    }
+    if sdk_refusal(response) {
+        return None;
+    }
+    Some(match crate::mcp::ui_bridge::request::action_outcome(response) {
+        ActionOutcome::Failed(err) if indeterminate_marker(err.as_deref()) => {
+            ActionOutcome::Indeterminate
+        }
+        other => other,
+    })
+}
+
+/// The verdict of a `/ui-bridge/sdk/ai/recovery/attempt` answer for the
+/// journey ledger, from the HTTP `status` the route answers and its body.
+/// The attempt states its own verdict in `data.attemptSucceeded`, so the
+/// envelope's `success` alone is not it (an older ui-bridge server answered
+/// envelope `success: true` with `data.recovered: false` for an attempt that
+/// recovered nothing):
+///
+/// - a verdict-unknown token → [`ActionOutcome::Indeterminate`];
+/// - a refusal ([`sdk_refusal`], e.g. the app's 400 `UB-VALIDATION-ERROR` for
+///   an invalid payload, or a request that never reached an app) → `None`;
+/// - `attemptSucceeded: true` → succeeded, unless the envelope (or `data`)
+///   says `success: false` — a server that failed AFTER a strategy acted — which
+///   is indeterminate;
+/// - `attemptSucceeded: false` → failed;
+/// - no boolean `attemptSucceeded`: an explicit `success: false` is a failure
+///   below 500 and indeterminate at 500+ (not an attempt verdict); anything
+///   else stated no verdict → indeterminate.
+///
+/// The same reading as the ui-bridge Python client's `read_recovery_attempt`,
+/// so the ledger and the client never disagree about one answer.
+pub(crate) fn sdk_recovery_verdict(status: u16, body: &serde_json::Value) -> Option<ActionOutcome> {
+    if verdict_unknown_code(body).is_some() {
+        return Some(ActionOutcome::Indeterminate);
+    }
+    if sdk_refusal(body) {
+        return None;
+    }
+    let data = body.get("data").filter(|d| d.is_object());
+    let explicit_failure = [Some(body), data]
+        .into_iter()
+        .flatten()
+        .any(|v| v.get("success").and_then(|s| s.as_bool()) == Some(false));
+    let error = || {
+        body.get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_string)
+    };
+    let stated = data
+        .and_then(|d| d.get(crate::mcp::ui_bridge::ai_analyze::ATTEMPT_SUCCEEDED))
+        .and_then(|v| v.as_bool());
+    Some(match stated {
+        Some(true) if explicit_failure => ActionOutcome::Indeterminate,
+        Some(true) => ActionOutcome::Succeeded,
+        Some(false) => ActionOutcome::Failed(error()),
+        None if explicit_failure && status < 500 => ActionOutcome::Failed(error()),
+        None => ActionOutcome::Indeterminate,
+    })
+}
+
 /// Record an SDK-route action from its JSON answer (M3). `active_app` is the
 /// active SDK connection read BEFORE dispatch, `scope` the request's `tabId`,
 /// and `ipc_fallback` whether this route falls back to the runner's own
 /// webview when no SDK app is connected; [`sdk_action_target`] decides where
-/// it landed. An explicit `success: false` is an `error` edge.
+/// it landed, and [`sdk_action_verdict`] what the answer says happened.
 pub(crate) fn record_sdk_result(
     state: &Arc<crate::mcp::types::ApiState>,
     active_app: Option<(String, Option<String>)>,
@@ -167,6 +355,32 @@ pub(crate) fn record_sdk_result(
     response: &serde_json::Value,
     action: ActionSpec,
 ) {
+    record_sdk_verdict(
+        state,
+        active_app,
+        scope,
+        ipc_fallback,
+        response,
+        sdk_action_verdict(response),
+        action,
+    );
+}
+
+/// [`record_sdk_result`] with the verdict decided by the caller — for a route
+/// whose answer carries a verdict of its own beyond the envelope's `success`
+/// (`/sdk/ai/recovery/attempt`'s `attemptSucceeded`). `None` records nothing.
+pub(crate) fn record_sdk_verdict(
+    state: &Arc<crate::mcp::types::ApiState>,
+    active_app: Option<(String, Option<String>)>,
+    scope: Option<&str>,
+    ipc_fallback: bool,
+    response: &serde_json::Value,
+    verdict: Option<ActionOutcome>,
+    action: ActionSpec,
+) {
+    let Some(outcome) = verdict else {
+        return;
+    };
     let Some((key, app_version)) = sdk_action_target(active_app, scope, ipc_fallback, response)
     else {
         return;
@@ -179,7 +393,7 @@ pub(crate) fn record_sdk_result(
             app_version,
             run_id: None,
         },
-        response.get("success") == Some(&serde_json::Value::Bool(false)),
+        outcome,
     );
 }
 
@@ -248,8 +462,15 @@ pub(crate) fn snapshot_query_is_filtered(
         || query.contains_key("recency")
 }
 
-/// Relay/tab refusal codes: the SDK relay answered without reaching any UI.
-pub(crate) const SDK_REFUSAL_CODES: [&str; 2] = ["TAB_NOT_FOUND", "TAB_STALE"];
+/// Refusal codes: the answer came back without any UI being reached.
+///
+/// - `TAB_NOT_FOUND` / `TAB_STALE` — the SDK relay could not route to a tab;
+/// - `UB-VALIDATION-ERROR` — the app's own server refused the request's
+///   PAYLOAD before acting (ui-bridge `mapInternalErrorCode('VALIDATION_ERROR')`,
+///   e.g. `attemptRecovery`'s 400 for an invalid `failure` / `instruction`):
+///   nothing acted, exactly the control routes' 4xx rule.
+pub(crate) const SDK_REFUSAL_CODES: [&str; 3] =
+    ["TAB_NOT_FOUND", "TAB_STALE", "UB-VALIDATION-ERROR"];
 
 /// Did an SDK route's answer come from a REFUSAL rather than an attempted
 /// action (m3, N3)? Either the relay's `TAB_NOT_FOUND` / `TAB_STALE`
@@ -262,6 +483,11 @@ pub(crate) const SDK_REFUSAL_CODES: [&str; 2] = ["TAB_NOT_FOUND", "TAB_STALE"];
 /// (`failure_origin: "runner"`, see [`tag_runner_rejection`]) never touched
 /// the UI either and records nothing — the control routes' 4xx rule (e1).
 pub(crate) fn sdk_refusal(response: &serde_json::Value) -> bool {
+    // A verdict-unknown answer DID reach the app (the request was sent; only
+    // its outcome is unknown), so it is never a refusal, whatever its origin.
+    if verdict_unknown_code(response).is_some() {
+        return false;
+    }
     let code_in = |v: Option<&serde_json::Value>| {
         v.into_iter().any(|v| {
             ["code", "errorCode"].iter().any(|k| {
@@ -324,7 +550,12 @@ pub(crate) fn finalize(draft: EdgeDraft) -> JourneyEdgeObservation {
 ///   frontier with `reason = activation_failed` (upserted if absent), never
 ///   deleted: a failed click has not explored anything;
 /// - `to_node_unobserved`: where it led is unknown, so the frontier row is left
-///   exactly as it is.
+///   exactly as it is;
+/// - `verdict_unknown`: whether the action ACTIVATED is the unknown, so the
+///   frontier row is left exactly as it is too — neither cleared as explored
+///   nor marked `activation_failed` (plan
+///   `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+///   D1). Neither branch below names it, and a test pins that.
 ///
 /// Casts: `$1::text::uuid` and `$2::text::timestamptz` so the row carries
 /// exactly the id / close time the validated struct carries; the three JSONB
@@ -628,7 +859,7 @@ pub(crate) async fn journey_schema_supported(client: &tokio_postgres::Client) ->
 #[derive(Debug)]
 pub(crate) enum JourneyEvent {
     /// An action (opens a pending edge). `hint` is the outcome it forces
-    /// (`error` / `settle_timeout`), if any.
+    /// (`error` / `verdict_unknown` / `settle_timeout`), if any.
     Action {
         key: CursorKey,
         provenance: Provenance,
@@ -674,13 +905,15 @@ pub(crate) fn enqueue_edge_observation(pg_db: Arc<PgDb>, event: JourneyEvent) {
     }
 }
 
-/// An action through a choke point. `failed` becomes the `error` hint.
+/// An action through a choke point, with its own three-state verdict:
+/// [`verdict_hint`] maps a failure to the `error` hint and an unstated verdict
+/// to `verdict_unknown` (plan D2).
 pub(crate) fn record_action(
     pg_db: Arc<PgDb>,
     key: CursorKey,
     action: ActionSpec,
     provenance: Provenance,
-    failed: bool,
+    outcome: ActionOutcome,
 ) {
     enqueue_edge_observation(
         pg_db,
@@ -688,7 +921,7 @@ pub(crate) fn record_action(
             key,
             provenance,
             action,
-            hint: failure_hint(failed),
+            hint: verdict_hint(&outcome),
             timeline: None,
         },
     );
@@ -711,10 +944,17 @@ pub(crate) fn record_snapshot(
     );
 }
 
-/// The outcome hint of an execute-with-diff response: `error` when the route
-/// failed (`failed`) or the diff result's `actionSuccess` is present and not
-/// `true` (top level or under `data`); else `settle_timeout` when
-/// `settleTimedOut` is true; else none (the closing snapshot decides).
+/// The outcome hint of an execute-with-diff response:
+///
+/// - `error` when the route failed (`failed`) or the diff result's
+///   `actionSuccess` is present and not `true` (top level or under `data`);
+/// - else `verdict_unknown` when `actionSuccess` is ABSENT (or `null`): the
+///   route did not fail, but the diff never stated whether its action
+///   succeeded, and an absent verdict is never a pass (plan
+///   `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+///   D2);
+/// - else `settle_timeout` when `settleTimedOut` is true;
+/// - else none (the closing snapshot decides).
 pub(crate) fn diff_outcome_hint(response: &serde_json::Value, failed: bool) -> Option<EdgeOutcome> {
     let field = |name: &str| {
         response
@@ -722,9 +962,13 @@ pub(crate) fn diff_outcome_hint(response: &serde_json::Value, failed: bool) -> O
             .or_else(|| response.get("data").and_then(|d| d.get(name)))
             .filter(|v| !v.is_null())
     };
-    let action_failed = field("actionSuccess").is_some_and(|v| v != &serde_json::Value::Bool(true));
+    let action_success = field("actionSuccess");
+    let action_failed = action_success.is_some_and(|v| v != &serde_json::Value::Bool(true));
     if failed || action_failed {
         return Some(EdgeOutcome::Error);
+    }
+    if action_success.is_none() {
+        return Some(EdgeOutcome::VerdictUnknown);
     }
     (field("settleTimedOut").and_then(|v| v.as_bool()) == Some(true))
         .then_some(EdgeOutcome::SettleTimeout)
@@ -1216,10 +1460,347 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiResponse::<()>::error("boom".to_string())),
         ));
-        assert_eq!(control_action_verdict(&failed), Some(true));
+        assert_eq!(
+            control_action_verdict(&failed),
+            Some(ActionOutcome::Failed(Some("boom".to_string())))
+        );
         let ok: Result<_, (StatusCode, Json<ApiResponse<()>>)> =
             Ok(Json(ApiResponse::success(serde_json::json!({}))));
-        assert_eq!(control_action_verdict(&ok), Some(false));
+        assert_eq!(control_action_verdict(&ok), Some(ActionOutcome::Succeeded));
+    }
+
+    // ---- plan 2026-11-18 D3: the control verdict is read from typed fields ---
+
+    type ControlResult = Result<
+        axum::Json<crate::mcp::types::ApiResponse<serde_json::Value>>,
+        (
+            axum::http::StatusCode,
+            axum::Json<crate::mcp::types::ApiResponse<()>>,
+        ),
+    >;
+
+    fn recovery_reply(data: serde_json::Value) -> ControlResult {
+        crate::mcp::ui_bridge::ai_analyze::as_recovery_failure(Ok(axum::Json(
+            crate::mcp::types::ApiResponse::success(data),
+        )))
+    }
+
+    /// The 500 `/ai/recovery/attempt` answers for a reply that stated no
+    /// verdict records `verdict_unknown`, never `error`.
+    #[test]
+    fn a_recovery_verdict_missing_500_is_verdict_unknown() {
+        let result = recovery_reply(json!({ "strategiesAttempted": [] }));
+        let (status, _) = result.as_ref().expect_err("a verdict-less reply is a 500");
+        assert_eq!(*status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            control_action_verdict(&result),
+            Some(ActionOutcome::Indeterminate)
+        );
+    }
+
+    /// `RECOVERY_FAILED` — the attempt RAN and did not act — is a 400 whose
+    /// `error_detail.code` is `ACTION_FAILED`: an `error` edge, not "the runner
+    /// refused".
+    #[test]
+    fn a_recovery_failed_400_is_an_error_edge() {
+        let result = recovery_reply(json!({ "attemptSucceeded": false }));
+        let (status, _) = result.as_ref().expect_err("did-not-act is a 400");
+        assert_eq!(*status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(matches!(
+            control_action_verdict(&result),
+            Some(ActionOutcome::Failed(_))
+        ));
+    }
+
+    /// A recovery REFUSAL (`RECOVERY_UNSCOPED` → `INVALID_REQUEST`) ran
+    /// nothing: no edge.
+    #[test]
+    fn a_recovery_refusal_400_records_no_edge() {
+        let result = recovery_reply(json!({
+            "success": false,
+            "code": "RECOVERY_UNSCOPED",
+            "error": "RECOVERY_UNSCOPED: ai_recovery_attempt requires params.elementId",
+        }));
+        assert!(result.is_err());
+        assert_eq!(control_action_verdict(&result), None);
+    }
+
+    /// `execute_action`'s post-dispatch failures are re-coded `ACTION_FAILED`
+    /// by `as_action_failure`: an `error` edge. Built through the real
+    /// re-coder, so a change to the code it stamps reds here.
+    #[test]
+    fn an_action_failed_400_from_execute_action_is_an_error_edge() {
+        use crate::mcp::types::ApiResponse;
+        use axum::http::StatusCode;
+        use axum::Json;
+        let dispatched: ControlResult = Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error("TERMINAL_EXITED: pane 3 exited")),
+        ));
+        let result = crate::mcp::ui_bridge::elements::as_action_failure(
+            dispatched,
+            "click",
+            "btn",
+            json!(null),
+        );
+        let (status, Json(body)) = result.as_ref().expect_err("still a 400");
+        assert_eq!(*status, StatusCode::BAD_REQUEST);
+        assert!(matches!(
+            body.error_detail.as_ref().map(|d| &d.code),
+            Some(UiBridgeErrorCode::ActionFailed)
+        ));
+        assert_eq!(
+            control_action_verdict(&result),
+            Some(ActionOutcome::Failed(Some(
+                "TERMINAL_EXITED: pane 3 exited".to_string()
+            )))
+        );
+    }
+
+    /// Any other 4xx is still the runner refusing the request: no edge, even
+    /// with a typed detail.
+    #[test]
+    fn another_typed_4xx_records_no_edge() {
+        use crate::mcp::types::ApiResponse;
+        use crate::mcp::ui_bridge::UiBridgeError;
+        use axum::http::StatusCode;
+        use axum::Json;
+        let not_found: ControlResult = Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::error_detailed(
+                "no such element".to_string(),
+                UiBridgeError::element_not_found("btn"),
+            )),
+        ));
+        assert_eq!(control_action_verdict(&not_found), None);
+    }
+
+    /// A verdict-unknown token decides wherever it appears in
+    /// `error_detail.context.code`, whatever the status.
+    #[test]
+    fn a_verdict_unknown_token_wins_on_any_status() {
+        use crate::mcp::types::ApiResponse;
+        use crate::mcp::ui_bridge::UiBridgeError;
+        use axum::http::StatusCode;
+        use axum::Json;
+        for status in [StatusCode::BAD_REQUEST, StatusCode::BAD_GATEWAY] {
+            for token in VERDICT_UNKNOWN_CODES {
+                let result: ControlResult = Err((
+                    status,
+                    Json(ApiResponse::<()>::error_detailed(
+                        "x".to_string(),
+                        UiBridgeError {
+                            code: UiBridgeErrorCode::InternalError,
+                            message: "x".to_string(),
+                            recovery: None,
+                            context: Some(json!({ "code": token })),
+                        },
+                    )),
+                ));
+                assert_eq!(
+                    control_action_verdict(&result),
+                    Some(ActionOutcome::Indeterminate),
+                    "{status} {token}"
+                );
+            }
+        }
+    }
+
+    /// A 2xx envelope whose `error` is the `INDETERMINATE:` marker reads as
+    /// unknown, not as a failure; a batch handler's own verdict replaces the
+    /// envelope on a 2xx and leaves errors to the usual reading.
+    #[test]
+    fn an_indeterminate_envelope_and_a_batch_verdict_are_verdict_unknown() {
+        use crate::mcp::types::ApiResponse;
+        use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+        use axum::http::StatusCode;
+        use axum::Json;
+        let mut body = ApiResponse::success(json!({}));
+        body.success = false;
+        body.error = Some(INDETERMINATE_ACTION_ERROR.to_string());
+        let marker: ControlResult = Ok(Json(body));
+        assert_eq!(
+            control_action_verdict(&marker),
+            Some(ActionOutcome::Indeterminate)
+        );
+        // The control batch answers `success: false` for a batch with an
+        // indeterminate step; its folded verdict is what the ledger gets.
+        let mut batch = ApiResponse::success(json!({ "results": [] }));
+        batch.success = false;
+        batch.error = Some("One or more batch steps failed".to_string());
+        let batch: ControlResult = Ok(Json(batch));
+        assert_eq!(
+            control_action_verdict_with(&batch, ActionOutcome::Indeterminate),
+            Some(ActionOutcome::Indeterminate)
+        );
+        let refused: ControlResult = Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error("batch_size_exceeded")),
+        ));
+        assert_eq!(
+            control_action_verdict_with(&refused, ActionOutcome::Succeeded),
+            None
+        );
+    }
+
+    // ---- plan 2026-11-18 D2: the SDK verdict --------------------------------
+
+    #[test]
+    fn a_verdictless_sdk_reply_is_verdict_unknown() {
+        assert_eq!(
+            sdk_action_verdict(&json!({ "data": { "elementId": "x" } })),
+            Some(ActionOutcome::Indeterminate),
+            "no `success` key is not a success"
+        );
+        assert_eq!(
+            sdk_action_verdict(&json!({ "success": true })),
+            Some(ActionOutcome::Succeeded)
+        );
+        assert_eq!(
+            sdk_action_verdict(&json!({ "success": false, "error": "nope" })),
+            Some(ActionOutcome::Failed(Some("nope".to_string())))
+        );
+        // A body normalise_action_result rewrote: its `false` is a marker.
+        let (normalised, _) = crate::mcp::ui_bridge::request::normalize_action_result(
+            json!({ "elementId": "x" }),
+        );
+        assert_eq!(
+            sdk_action_verdict(&normalised),
+            Some(ActionOutcome::Indeterminate)
+        );
+        // An SDK dispatch that failed after the request was sent.
+        let after_send = json!({
+            "success": false,
+            "code": crate::mcp::sdk_client::SDK_DISPATCH_OUTCOME_UNKNOWN,
+            "failure_origin": "transport",
+        });
+        assert_eq!(
+            sdk_action_verdict(&after_send),
+            Some(ActionOutcome::Indeterminate)
+        );
+        assert!(
+            !sdk_refusal(&after_send),
+            "a verdict-unknown answer reached the app: never a refusal"
+        );
+    }
+
+    #[test]
+    fn a_ub_validation_error_refusal_records_no_edge() {
+        let refused = json!({
+            "success": false,
+            "code": "UB-VALIDATION-ERROR",
+            "error": "failure must be an object",
+            "failure_origin": "app",
+        });
+        assert!(sdk_refusal(&refused));
+        assert_eq!(sdk_action_verdict(&refused), None);
+        assert_eq!(sdk_recovery_verdict(400, &refused), None);
+        assert!(sdk_action_target(Some(("a".into(), None)), None, false, &refused).is_none());
+    }
+
+    /// `/sdk/ai/recovery/attempt` reads the attempt's OWN verdict, the way the
+    /// ui-bridge Python client's `read_recovery_attempt` does.
+    #[test]
+    fn the_sdk_recovery_verdict_is_the_attempts_own() {
+        use ActionOutcome::*;
+        // The TS server's success answer.
+        assert_eq!(
+            sdk_recovery_verdict(
+                200,
+                &json!({ "success": true, "data": { "attemptSucceeded": true } })
+            ),
+            Some(Succeeded)
+        );
+        // The TS server's not-recovered 400, data kept by the twin.
+        assert!(matches!(
+            sdk_recovery_verdict(
+                400,
+                &json!({ "success": false, "error": "RECOVERY_FAILED: exhausted",
+                         "data": { "attemptSucceeded": false } })
+            ),
+            Some(Failed(_))
+        ));
+        // A pre-#426 server: envelope success, no verdict — never a success.
+        assert_eq!(
+            sdk_recovery_verdict(
+                200,
+                &json!({ "success": true, "data": { "recovered": false } })
+            ),
+            Some(Indeterminate)
+        );
+        // The TS server's fault arm after a strategy acted.
+        assert_eq!(
+            sdk_recovery_verdict(
+                500,
+                &json!({ "success": false, "data": { "attemptSucceeded": true } })
+            ),
+            Some(Indeterminate)
+        );
+        // A failure with no stated verdict: below 500 did-not-act, 5xx unknown.
+        assert!(matches!(
+            sdk_recovery_verdict(400, &json!({ "success": false, "error": "x" })),
+            Some(Failed(_))
+        ));
+        assert_eq!(
+            sdk_recovery_verdict(500, &json!({ "success": false, "error": "x" })),
+            Some(Indeterminate)
+        );
+        // A dispatch error after the request was sent.
+        assert_eq!(
+            sdk_recovery_verdict(
+                502,
+                &json!({ "success": false,
+                         "code": crate::mcp::sdk_client::SDK_DISPATCH_OUTCOME_UNKNOWN,
+                         "failure_origin": "transport" })
+            ),
+            Some(Indeterminate)
+        );
+        // A request that never left the runner.
+        assert_eq!(
+            sdk_recovery_verdict(
+                200,
+                &json!({ "success": false, "code": "SDK_DISPATCH_FAILED",
+                         "failure_origin": "transport" })
+            ),
+            None
+        );
+    }
+
+    // ---- plan 2026-11-18 D1: the frontier is untouched by verdict_unknown ---
+
+    /// A `verdict_unknown` edge neither clears its affordance as explored nor
+    /// marks it `activation_failed`: whether it activated is the unknown. Both
+    /// statements branch on outcomes by NAME, so naming `verdict_unknown` in
+    /// either would change that.
+    #[test]
+    fn verdict_unknown_leaves_the_frontier_untouched() {
+        assert!(
+            !EDGE_WRITE_SQL.contains(EdgeOutcome::VerdictUnknown.as_str()),
+            "EDGE_WRITE_SQL must not clear or fail an affordance on verdict_unknown"
+        );
+        assert!(
+            !super::frontier::FRONTIER_UPSERT_SQL.contains(EdgeOutcome::VerdictUnknown.as_str()),
+            "FRONTIER_UPSERT_SQL must not count verdict_unknown as explored"
+        );
+        assert_eq!(EdgeOutcome::VerdictUnknown.as_str(), "verdict_unknown");
+        // The branches that DO act name their outcomes explicitly.
+        assert!(EDGE_WRITE_SQL.contains("$12 IN ('changed', 'no_change', 'settle_timeout')"));
+        assert!(EDGE_WRITE_SQL.contains("WHERE $12 = 'error'"));
+    }
+
+    /// An action recorded with an unstated verdict carries the
+    /// `verdict_unknown` hint into the cursor.
+    #[test]
+    fn record_action_maps_the_three_states_to_hints() {
+        assert_eq!(verdict_hint(&ActionOutcome::Succeeded), None);
+        assert_eq!(
+            verdict_hint(&ActionOutcome::Failed(None)),
+            Some(EdgeOutcome::Error)
+        );
+        assert_eq!(
+            verdict_hint(&ActionOutcome::Indeterminate),
+            Some(EdgeOutcome::VerdictUnknown)
+        );
     }
 
     // ---- N2 / N3: where an SDK action landed ---------------------------------
@@ -1388,8 +1969,19 @@ mod tests {
         let relay = json!({"actionResult": {}, "diff": {}});
         assert_eq!(
             diff_outcome_hint(&relay, false),
-            None,
-            "absent means undecided"
+            Some(EdgeOutcome::VerdictUnknown),
+            "an absent actionSuccess on a non-failed route is an unstated verdict, never a pass"
+        );
+        let null = json!({"data": {"actionSuccess": null, "settleTimedOut": true}});
+        assert_eq!(
+            diff_outcome_hint(&null, false),
+            Some(EdgeOutcome::VerdictUnknown),
+            "a null verdict is unstated too, and wins over the settle hint"
+        );
+        assert_eq!(
+            diff_outcome_hint(&relay, true),
+            Some(EdgeOutcome::Error),
+            "a failed route stays an error"
         );
     }
 

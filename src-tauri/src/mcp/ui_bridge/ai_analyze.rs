@@ -52,7 +52,12 @@ const RECOVERY_FAILED: &str = "RECOVERY_FAILED";
 /// answer the question (an older bundle, an early return, a future arm, or a
 /// success envelope with no `data`), so whether the scoped attempt acted is
 /// unknown. See [`verdict_missing_failure`].
-const RECOVERY_VERDICT_MISSING: &str = "RECOVERY_VERDICT_MISSING";
+///
+/// `pub(crate)` because the journey ledger reads it: it is a member of
+/// [`crate::journey::capture::VERDICT_UNKNOWN_CODES`], so this 500 records a
+/// `verdict_unknown` edge — never `error`, which would assert a failure the
+/// runner cannot prove.
+pub(crate) const RECOVERY_VERDICT_MISSING: &str = "RECOVERY_VERDICT_MISSING";
 
 /// Read the leading `CODE:` token out of a typed refusal message.
 ///
@@ -317,13 +322,14 @@ fn verdict_missing_failure(
 ///   read an absence as a pass, which is what this function did until plan
 ///   `2026-11-10-the-recovery-attempt-route-never-reads-a-missing-verdict-as-success`.
 ///   `RECOVERY_FAILED` would be wrong too, because it says the attempt ran.
-///   The status is a 5xx because the caller's request was fine, and because
-///   the journey ledger records no edge for a 4xx, which would erase an
-///   attempt that may have acted. The edge it keeps records the outcome
-///   `error`, not "unknown": the ledger's outcome vocabulary has no
-///   indeterminate value, so that edge asserts a failure the runner cannot
-///   prove. It is 500 rather than 502 because the code is `INTERNAL_ERROR`,
-///   and the status and the code must name one event.
+///   The status is a 5xx because the caller's request was fine. The journey
+///   ledger records a `verdict_unknown` edge for it (the token is in
+///   [`crate::journey::capture::VERDICT_UNKNOWN_CODES`], plan
+///   `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+///   D3): neither the `error` it used to record, which asserted a failure the
+///   runner cannot prove, nor no edge, which would erase an attempt that may
+///   have acted. It is 500 rather than 502 because the code is
+///   `INTERNAL_ERROR`, and the status and the code must name one event.
 ///
 /// On the error side, a 400 that arrived without a `code` gets one derived from
 /// its message. Transport-level failures (500 / 503: the frontend never
@@ -435,13 +441,117 @@ pub(crate) fn as_recovery_failure(result: BridgeResult) -> BridgeResult {
     }
 }
 
+/// The answer of `/ai/recovery/attempt`: its failure body may carry `data`
+/// (the stated verdict and the original-action facts, see
+/// [`recovery_route_answer`]).
+type RecoveryRouteResult = Result<
+    Json<ApiResponse<serde_json::Value>>,
+    (StatusCode, Json<ApiResponse<serde_json::Value>>),
+>;
+
+/// The executor's statements about the ORIGINAL action, in its reply's data:
+/// whether the attempt ran the original instruction, and whether that run
+/// reported success. The wire names the ui-bridge TS SDK server's
+/// `attemptRecovery` uses, so a client reads both servers the same way.
+const ORIGINAL_ACTION_FACTS: [&str; 2] = ["originalActionAttempted", "originalActionPerformed"];
+
+/// The original-action facts a reply's payload STATES: each one only when it
+/// is a boolean. An absent or non-boolean fact is left out, which a reader
+/// takes as UNKNOWN (the ui-bridge Python client never re-executes the
+/// original on an unknown) — never defaulted to `false`, which would license a
+/// second execution nothing established.
+fn original_action_facts(
+    payload: Option<&serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    ORIGINAL_ACTION_FACTS
+        .iter()
+        .filter_map(|key| {
+            payload
+                .and_then(|p| p.get(*key))
+                .filter(|v| v.is_boolean())
+                .map(|v| (key.to_string(), v.clone()))
+        })
+        .collect()
+}
+
+/// Put [`as_recovery_failure`]'s answer on the wire with the scoped
+/// executor's original-action facts kept (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`,
+/// Phase 3).
+///
+/// `result` is the frontend reply through
+/// [`super::request::wrap_ipc_result_keeping_failure_data`], so a failure
+/// still carries its payload. [`as_recovery_failure`] decides the status and
+/// the typed codes exactly as before. Then:
+///
+/// - a 200 passes through whole: its `data` is the executor's own, facts
+///   included;
+/// - a 4xx (the attempt ran and did not act, or was refused) gets `data:
+///   {attemptSucceeded: false, ...facts}`. That is the TS server's
+///   `recoveryNotSucceeded` shape, so a client that branches on
+///   `originalActionAttempted` (the original ran and failed, so it must not be
+///   re-run) reads it from either server;
+/// - a 5xx stays without `data`: its verdict is unknown, and a fact stated
+///   beside an unknown verdict would read as a verdict.
+fn recovery_route_answer(
+    result: Result<
+        Json<ApiResponse<serde_json::Value>>,
+        (StatusCode, Json<ApiResponse<serde_json::Value>>),
+    >,
+) -> RecoveryRouteResult {
+    let facts = match &result {
+        Ok(Json(resp)) => original_action_facts(resp.data.as_ref()),
+        Err((_, Json(body))) => original_action_facts(body.data.as_ref()),
+    };
+    let flat: BridgeResult = result.map_err(|(status, Json(body))| {
+        (
+            status,
+            Json(ApiResponse {
+                success: body.success,
+                data: None,
+                error: body.error,
+                error_detail: body.error_detail,
+                hint: body.hint,
+                code: body.code,
+                suggestions: body.suggestions,
+            }),
+        )
+    });
+    as_recovery_failure(flat).map_err(|(status, Json(body))| {
+        let data = status.is_client_error().then(|| {
+            let mut data = facts;
+            data.insert(
+                ATTEMPT_SUCCEEDED.to_string(),
+                serde_json::Value::Bool(false),
+            );
+            serde_json::Value::Object(data)
+        });
+        (
+            status,
+            Json(ApiResponse {
+                success: body.success,
+                data,
+                error: body.error,
+                error_detail: body.error_detail,
+                hint: body.hint,
+                code: body.code,
+                suggestions: body.suggestions,
+            }),
+        )
+    })
+}
+
 /// Journey ledger choke point (plan
 /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
 /// `/ai/recovery/attempt` re-attempts a failed action: ONE `batch_action` (`recovery_attempt`).
+/// The verdict is [`crate::journey::capture::control_action_verdict`]'s: a 200
+/// is a success edge, the 400 `RECOVERY_FAILED` (`ACTION_FAILED`) an `error`
+/// edge, the 500 [`RECOVERY_VERDICT_MISSING`] a `verdict_unknown` edge, and a
+/// refusal 400 no edge.
 pub async fn ui_bridge_ai_recovery_attempt_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> RecoveryRouteResult {
     let action = crate::journey::cursor::ActionSpec::batch_kind("recovery_attempt", None);
     let result =
         ui_bridge_ai_recovery_attempt_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
@@ -450,15 +560,18 @@ pub async fn ui_bridge_ai_recovery_attempt_handler(
 }
 
 /// `POST /ui-bridge/ai/recovery/attempt` — hand-written rather than
-/// macro-generated so the response passes through [`as_recovery_failure`].
+/// macro-generated so the response passes through [`as_recovery_failure`]
+/// (via [`recovery_route_answer`]).
 async fn ui_bridge_ai_recovery_attempt_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> BridgeResult {
+) -> RecoveryRouteResult {
     let payload = serde_json::json!({ "params": body });
-    as_recovery_failure(crate::mcp::ui_bridge::request::wrap_ipc_result(
-        ui_bridge_request_sync(&state, "ai_recovery_attempt", payload).await,
-    ))
+    recovery_route_answer(
+        crate::mcp::ui_bridge::request::wrap_ipc_result_keeping_failure_data(
+            ui_bridge_request_sync(&state, "ai_recovery_attempt", payload).await,
+        ),
+    )
 }
 
 // Pixel-accurate image diff (compareVisualRegression alias)
@@ -1011,5 +1124,134 @@ mod recovery_failure_tests {
         let failure: BridgeResult = Err((StatusCode::BAD_REQUEST, Json(pre)));
         let (_, Json(body)) = as_recovery_failure(failure).unwrap_err();
         assert_eq!(body.code.as_deref(), Some("RECOVERY_WRITE_REFUSED"));
+    }
+}
+
+#[cfg(test)]
+mod recovery_route_answer_tests {
+    //! Plan `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`,
+    //! Phase 3: `/ai/recovery/attempt` states what the scoped executor did to
+    //! the ORIGINAL action (`originalActionAttempted` /
+    //! `originalActionPerformed`), on its 200 and on its 4xx, like the ui-bridge
+    //! TS server — and states nothing beside an unknown verdict.
+    //!
+    //! Every reply here goes through the real seam the route uses:
+    //! `extract_response_data` (the frontend envelope → the dispatched value),
+    //! then `wrap_ipc_result_keeping_failure_data`, then
+    //! [`recovery_route_answer`].
+    use super::*;
+    use crate::mcp::ui_bridge::request::{
+        extract_response_data, wrap_ipc_result_keeping_failure_data,
+    };
+    use serde_json::json;
+
+    fn route(frontend_envelope: serde_json::Value) -> RecoveryRouteResult {
+        recovery_route_answer(wrap_ipc_result_keeping_failure_data(Ok(
+            extract_response_data(&frontend_envelope),
+        )))
+    }
+
+    #[test]
+    fn a_success_states_the_original_ran_and_was_performed() {
+        let Json(resp) = route(json!({
+            "success": true,
+            "data": {
+                "attemptSucceeded": true,
+                "elementId": "btn",
+                "originalActionAttempted": true,
+                "originalActionPerformed": true,
+            },
+        }))
+        .expect("an acted attempt is a 200");
+        let data = resp.data.expect("data");
+        assert_eq!(data["attemptSucceeded"], json!(true));
+        assert_eq!(data["originalActionAttempted"], json!(true));
+        assert_eq!(data["originalActionPerformed"], json!(true));
+    }
+
+    #[test]
+    fn a_recovery_failed_400_keeps_the_verdict_and_the_facts() {
+        let (status, Json(body)) = route(json!({
+            "success": false,
+            "error": "RECOVERY_FAILED: element is disabled",
+            "data": {
+                "code": "RECOVERY_FAILED",
+                "attemptSucceeded": false,
+                "elementId": "btn",
+                "originalActionAttempted": true,
+                "originalActionPerformed": false,
+            },
+        }))
+        .expect_err("ran and did not act is a 400");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("RECOVERY_FAILED"));
+        assert!(matches!(
+            body.error_detail.as_ref().map(|d| &d.code),
+            Some(UiBridgeErrorCode::ActionFailed)
+        ));
+        assert_eq!(
+            body.data,
+            Some(json!({
+                "attemptSucceeded": false,
+                "originalActionAttempted": true,
+                "originalActionPerformed": false,
+            })),
+            "only the verdict and the original-action facts ride the 400"
+        );
+    }
+
+    #[test]
+    fn a_refusal_400_states_nothing_ran() {
+        let (status, Json(body)) = route(json!({
+            "success": false,
+            "error": "RECOVERY_UNSCOPED: ai_recovery_attempt requires params.elementId",
+            "code": "RECOVERY_UNSCOPED",
+            "data": {
+                "code": "RECOVERY_UNSCOPED",
+                "attemptSucceeded": false,
+                "originalActionAttempted": false,
+                "originalActionPerformed": false,
+            },
+        }))
+        .expect_err("a refusal is a 400");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let data = body.data.expect("data");
+        assert_eq!(data["originalActionAttempted"], json!(false));
+        assert_eq!(data["attemptSucceeded"], json!(false));
+    }
+
+    /// An older bundle states no facts: the 400 carries the verdict alone,
+    /// and the absent facts stay absent (UNKNOWN), never `false`.
+    #[test]
+    fn absent_or_garbage_facts_stay_absent() {
+        let (_, Json(body)) = route(json!({
+            "success": false,
+            "error": "RECOVERY_FAILED: nope",
+            "data": {
+                "code": "RECOVERY_FAILED",
+                "attemptSucceeded": false,
+                "originalActionAttempted": "yes",
+            },
+        }))
+        .expect_err("a 400");
+        assert_eq!(body.data, Some(json!({ "attemptSucceeded": false })));
+    }
+
+    /// A verdict-less reply is the 500 `RECOVERY_VERDICT_MISSING`, and it
+    /// carries no `data`: a fact beside an unknown verdict would read as one.
+    #[test]
+    fn a_verdict_missing_500_carries_no_data() {
+        let (status, Json(body)) = route(json!({
+            "success": true,
+            "data": { "originalActionAttempted": true, "elementId": "btn" },
+        }))
+        .expect_err("no verdict is a 500");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.data, None);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire["error_detail"]["context"]["code"],
+            json!(RECOVERY_VERDICT_MISSING)
+        );
     }
 }
