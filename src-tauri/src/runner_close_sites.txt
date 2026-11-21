@@ -69,7 +69,7 @@
 
 # ── the graceful-exit primitive's callers — all refused `no_close_authority` on a live claude (R0a)
 session/wind_down_executor.rs | wind_down_exit | helper | wind_down_exit(
-session/wind_down_executor.rs | wind_down_one | product | the wind-down executor's ONE pane reach, for both arms — the drain arm and runner#2426's finished_close — through `TerminalManager::graceful_exit` with no CloseAuthority; refused on a live claude until the Closer (Phase 93)
+session/wind_down_executor.rs | wind_down_one | product | the wind-down executor's ONE pane reach, for both arms — the drain arm and runner#2426's finished_close — through `TerminalManager::graceful_exit`; the finished_close arm presents a CloseAuthority minted from a guard Close, the drain arm presents none and is refused on a live claude
 mcp/steward.rs | stop_at_boundary | helper | stop_at_boundary(
 mcp/steward.rs | steward_stop_handler | agent | POST /steward/{kind}/stop: the default arm is the `TerminalManager::close` kill; `?at=boundary` is the graceful exit (`stop_at_boundary`), refused `no_close_authority` on a live claude
 mcp/debug_graceful_exit.rs | graceful_exit_door | helper | graceful_exit_door(

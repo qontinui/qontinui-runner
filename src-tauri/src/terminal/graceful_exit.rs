@@ -28,10 +28,10 @@
 //!    **Then check the close authority.** A live `claude` has been found and
 //!    nothing has been typed yet. A caller that presents no
 //!    [`CloseAuthority`] is refused `NoCloseAuthority` here (plan
-//!    `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a). No
-//!    production code can mint one until the lifecycle Closer does (Phase
-//!    93), so today EVERY production call that finds a live `claude` ends
-//!    here — see [`crate::terminal::close_authority`].
+//!    `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a). The one
+//!    production minter is the wind-down executor's `finished_close` arm, from
+//!    a guard `Close`; every other production call that finds a live `claude`
+//!    ends here — see [`crate::terminal::close_authority`].
 //!
 //!    Past the authority: more than one `claude` (a nested one would not
 //!    leave with `/exit`), or a `claude` with child processes attached →
@@ -1739,9 +1739,8 @@ pub enum GracefulExitOutcome {
     /// [`CloseAuthority`]. Nothing was typed and nothing was closed (plan
     /// `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a).
     ///
-    /// On every build that ships today, EVERY caller that finds a live
-    /// `claude` gets this answer. No production code can mint an authority
-    /// until the lifecycle Closer does (Phase 93).
+    /// Every caller that finds a live `claude` gets this answer except the
+    /// `finished_close` arm acting on a guard `Close`, the one production minter.
     NoCloseAuthority {
         /// The `claude` pids the probe found.
         claude_pids: Vec<u32>,

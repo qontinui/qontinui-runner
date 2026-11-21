@@ -3549,7 +3549,8 @@ mod tests {
     /// constant, or flipping it without handing one, is red; so is a second
     /// mint anywhere in the module's executable lines.
     #[test]
-    fn the_one_graceful_exit_call_passes_the_guard_minted_authority_exactly_when_one_is_presented() {
+    fn the_one_graceful_exit_call_passes_the_guard_minted_authority_exactly_when_one_is_presented()
+    {
         let executor = executable_lines(include_str!("wind_down_executor.rs"));
         let calls: Vec<&str> = executor.split(".graceful_exit(").skip(1).collect();
         assert_eq!(calls.len(), 1, "exactly one graceful_exit call");
@@ -3594,7 +3595,9 @@ mod tests {
             args[2]
         );
         assert_eq!(
-            executor.matches("CloseAuthority::for_finished_close").count(),
+            executor
+                .matches("CloseAuthority::for_finished_close")
+                .count(),
             1,
             "the executor mints a close authority exactly once, at its one graceful_exit call"
         );
@@ -3602,8 +3605,14 @@ mod tests {
         // the trait: the type is named nowhere in either, and the drain arm's
         // branch of `close_batch` hands `wind_down_one` no token.
         for (name, body) in [
-            ("close_batch", fn_body(&executor, "pub(crate) async fn close_batch<")),
-            ("CloseEffects", fn_body(&executor, "pub(crate) trait CloseEffects {")),
+            (
+                "close_batch",
+                fn_body(&executor, "pub(crate) async fn close_batch<"),
+            ),
+            (
+                "CloseEffects",
+                fn_body(&executor, "pub(crate) trait CloseEffects {"),
+            ),
         ] {
             assert!(
                 !body.contains("CloseAuthority"),
@@ -4289,9 +4298,7 @@ mod tests {
             ("obligations unknown", |e| {
                 e.obligations = Err("coord unreachable".to_string())
             }),
-            ("first_verdict held", |e| {
-                e.obligations = pr_waiting_on_ci()
-            }),
+            ("first_verdict held", |e| e.obligations = pr_waiting_on_ci()),
             ("revival held", |e| {
                 e.transcript = Ok(TranscriptFacts {
                     last_prompt_ms: Some(FINISHED_AT_MS + 60_000),
@@ -4393,7 +4400,11 @@ mod tests {
     /// like every other caller.
     #[tokio::test(start_paused = true)]
     async fn wind_down_exit_refuses_a_token_for_another_close_or_under_the_drain_arm() {
-        let exit = |manager: &Arc<TerminalManager>, arm, guard| {
+        async fn exit(
+            manager: &Arc<TerminalManager>,
+            arm: CloseArm,
+            guard: Option<GuardClose>,
+        ) -> Result<GracefulExitOutcome, String> {
             wind_down_exit(
                 manager,
                 arm,
@@ -4403,7 +4414,8 @@ mod tests {
                 ChildExemptions::none(),
                 guard,
             )
-        };
+            .await
+        }
         let cases: Vec<(&str, CloseArm, Option<GuardClose>)> = vec![
             (
                 "a token judged for another session",

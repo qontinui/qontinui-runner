@@ -241,8 +241,7 @@ const AUTHORIZED_CONSTRUCTORS: &[(&str, &str)] =
 /// which mints once, immediately before its one `graceful_exit(` call. From
 /// Phase 16 the relay's operator arm may join it, for an end that carries the
 /// relay's `origin: user_session` stamp.
-const AUTHORIZED_MINTERS: &[(&str, &str)] =
-    &[("session/wind_down_executor.rs", "wind_down_exit")];
+const AUTHORIZED_MINTERS: &[(&str, &str)] = &[("session/wind_down_executor.rs", "wind_down_exit")];
 
 /// The only derive a close authority may carry. Anything else may build or
 /// duplicate one (`Default`, `Clone`, `Copy`, `Deserialize`, …), so the list is
@@ -3301,10 +3300,7 @@ fn a_second_minter_call_is_red() {
     );
     // A same-named fn in another file is not the authorized minter.
     assert_red(
-        &authority_tree(
-            SEALED_WITH_CONSTRUCTOR,
-            &[("mcp/steward.rs", THE_MINTER)],
-        ),
+        &authority_tree(SEALED_WITH_CONSTRUCTOR, &[("mcp/steward.rs", THE_MINTER)]),
         &["mcp/steward.rs:3 (wind_down_exit)"],
     );
 }
