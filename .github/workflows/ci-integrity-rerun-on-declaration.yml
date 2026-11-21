@@ -1,0 +1,158 @@
+name: ci-integrity-rerun-on-declaration
+
+# Re-runs the CI Integrity guard (ci-integrity.yml) when the declaration it
+# reads LIVE changes after its newest run on the PR head started.
+#
+# The guard reads `ci:gate-change=*` labels and the PR body's `Gate-Change:` /
+# `Gate-Removal:` lines at run time. But its `pull_request_target` trigger fires
+# only on opened/synchronize/reopened. So a declaration made after the PR opens
+# never reaches a run that already finished.
+#
+# Measured on qontinui-runner#2485: run 41244395178 started at
+# 2026-10-31T21:36:37Z, and the first label landed 12 s later. The guard went
+# red, and nothing re-ran it until a session did by hand on 2026-11-02, after
+# also switching to the declaration the change needed. That second half, a
+# remedy text naming the wrong declaration, is fixed in the guard by
+# qontinui-runner#2736. This
+# workflow closes the race.
+#
+# WHY A SEPARATE WORKFLOW, NOT AN ARM OF ci-rerun-on-declaration.yml
+# That workflow filters `branches:` to the gating bases, and its other arms rely
+# on that filter. The guard deliberately has NO base filter, so that stacked PRs
+# get it (see ci-integrity.yml, "NO BASE-BRANCH FILTER, deliberately").
+# An arm inside the filtered workflow would never fire on a stacked PR.
+#
+# What it re-runs: the newest guard run for the head, once concluded, and only
+# when its verdict can change because of this event:
+#   labeled   + not success -> re-run (a declaration was added)
+#   unlabeled + success     -> re-run (a pass may rest on the removed one)
+#   edited (body changed)               -> re-run (a Gate-Change line was added
+#                                          or removed; the guard takes seconds)
+# It never re-runs a run that started after the event, nor a run on a
+# superseded head. A re-run is a new attempt, which the guard's concurrency
+# expression puts in its own group, so it can never cancel the current head's
+# first-attempt run.
+#
+# This check is not a required context and never fails: every API answer is
+# shape-checked before use (gh prints an error body to stdout on failure), and
+# every failure is a note in the step summary and exit 0. A missed re-run is no worse than before
+# this workflow existed.
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, edited]
+
+permissions:
+  contents: read
+  # Minimum scope that can re-run a workflow run. On a fork PR the token is
+  # read-only, the POST is refused, and the step says so.
+  actions: write
+  pull-requests: read
+
+jobs:
+  rerun-guard:
+    name: Re-run CI Integrity after a declaration change
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # STEP-level `if:` (not job-level) so the job reports success, not
+      # `skipped`, on events it ignores.
+      - name: Re-run the guard if its verdict may predate this change
+        if: >-
+          startsWith(github.event.label.name, 'ci:gate-change=') ||
+          (github.event.action == 'edited' && github.event.changes.body != null)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          ACTION: ${{ github.event.action }}
+          SELF_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          note() { echo "$*"; echo "$*" >> "${GITHUB_STEP_SUMMARY}"; }
+          give_up() { note ""; note "⚠️ $*"; note "Re-run the PR's CI Integrity run by hand if it is red."; exit 0; }
+          is_ts()  { [[ "${1:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; }
+          is_sha() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]]; }
+
+          note "### ci-integrity-rerun-on-declaration"
+          note ""
+          note "- PR: \`${REPO}#${PR_NUMBER}\` @ \`${HEAD_SHA}\`"
+          note "- Event: \`${ACTION}\` \`${LABEL_NAME:-<body edit>}\`"
+
+          # This run was created BY the event, so its creation time bounds when
+          # the declaration changed.
+          event_time="$(gh api "repos/${REPO}/actions/runs/${SELF_RUN_ID}" -q .created_at 2>/dev/null || true)"
+          is_ts "${event_time}" || give_up "Could not read this run's own creation time."
+          note "- Change observed at: \`${event_time}\`"
+
+          runs="$(gh api "repos/${REPO}/actions/workflows/ci-integrity.yml/runs?head_sha=${HEAD_SHA}&event=pull_request_target&per_page=100" 2>/dev/null || true)"
+          printf '%s' "${runs}" | jq -e 'has("workflow_runs")' >/dev/null 2>&1 \
+            || give_up "Could not list CI Integrity runs for this head."
+          run_id="$(printf '%s' "${runs}" | jq -r '[.workflow_runs[]?] | sort_by(.created_at) | last | .id // empty' 2>/dev/null || true)"
+          if [ -z "${run_id}" ]; then
+            note ""
+            note "No CI Integrity run for this head: the PR touches no gating path, or its"
+            note "run is not created yet and will read the declaration live."
+            exit 0
+          fi
+
+          # Wait out an in-flight run: whether it saw the change is unknowable
+          # until it concludes, because the guard reads labels and body mid-step.
+          run_status=""
+          for _ in $(seq 1 60); do
+            run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q .status 2>/dev/null || echo unknown)"
+            case "${run_status}" in queued|in_progress|completed|waiting|requested|pending) ;; *) run_status=unknown ;; esac
+            [ "${run_status}" = "completed" ] && break
+            sleep 10
+          done
+          [ "${run_status}" = "completed" ] || give_up "Run \`${run_id}\` did not conclude within 10 min (status \`${run_status}\`); not re-running it."
+
+          run_json="$(gh api "repos/${REPO}/actions/runs/${run_id}" 2>/dev/null || true)"
+          printf '%s' "${run_json}" | jq -e '.id' >/dev/null 2>&1 \
+            || give_up "Could not read run \`${run_id}\` after it concluded."
+          conclusion="$(printf '%s' "${run_json}" | jq -r '.conclusion // ""')"
+          started="$(printf '%s' "${run_json}" | jq -r '.run_started_at // .created_at // ""')"
+          is_ts "${started}" || give_up "Run \`${run_id}\` carries no readable start time."
+          note "- Target run: [\`${run_id}\`](https://github.com/${REPO}/actions/runs/${run_id}) (\`${conclusion}\`, started \`${started}\`)"
+
+          # Both are fixed-shape RFC 3339 UTC strings, so they sort as text.
+          # Strictly later: the run read the current declaration. Equal re-runs.
+          if [ "$(printf '%s\n%s\n' "${event_time}" "${started}" | sort | head -1)" = "${event_time}" ] \
+             && [ "${started}" != "${event_time}" ]; then
+            note ""
+            note "Run started after the change, so it already read it. No re-run."
+            exit 0
+          fi
+
+          want=0
+          case "${ACTION}:${conclusion}" in
+            labeled:success)                ;;
+            labeled:*|edited:*)             want=1 ;;
+            unlabeled:success)              want=1 ;;
+            *)                              ;;
+          esac
+          if [ "${want}" != 1 ]; then
+            note ""
+            note "Verdict \`${conclusion}\` cannot change because of this \`${ACTION}\`. No re-run."
+            exit 0
+          fi
+
+          # An unreadable head is not "moved": re-running the old run of the
+          # same head is safe, because a re-run cannot cancel anything.
+          head_now="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" -q .head.sha 2>/dev/null || true)"
+          is_sha "${head_now}" || head_now=""
+          if [ -n "${head_now}" ] && [ "${head_now}" != "${HEAD_SHA}" ]; then
+            note ""
+            note "PR head moved (\`${HEAD_SHA}\` -> \`${head_now}\`); its own run reads the declaration live. No re-run."
+            exit 0
+          fi
+
+          note ""
+          if gh api -X POST "repos/${REPO}/actions/runs/${run_id}/rerun" >/dev/null 2>&1; then
+            note "✅ Re-ran CI Integrity run \`${run_id}\`; the new attempt reads the declaration live."
+          else
+            note "⚠️ Could not re-run CI Integrity run \`${run_id}\` (a fork PR's read-only token, or a re-run already in flight). Re-run it by hand if it is red."
+          fi
