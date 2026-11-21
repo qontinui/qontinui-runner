@@ -106,9 +106,6 @@ pub use capabilities::{
     ui_bridge_run_workflow_handler, BatchOperation, BatchOperationResult, BatchRequest,
     BatchResponse,
 };
-pub use structured_assert::{
-    ui_bridge_structured_assert_handler, AssertResult, StructuredAssertRequest,
-};
 pub use circuit_breaker::{CircuitBreakerState, UiBridgeCircuitBreaker};
 pub use design::{
     ui_bridge_design_audit_handler, ui_bridge_design_clear_style_guide_handler,
@@ -187,6 +184,9 @@ pub use screenshots::{
     ui_bridge_annotations_export_handler, ui_bridge_annotations_get_handler,
     ui_bridge_annotations_list_handler, ui_bridge_annotations_update_handler,
     ui_bridge_page_health_handler, PageHealthRequest,
+};
+pub use structured_assert::{
+    ui_bridge_structured_assert_handler, AssertResult, StructuredAssertRequest,
 };
 pub use types::{
     classify_assertion_failure, classify_transport_error, recovery_hint_for, ClipboardWriteRequest,

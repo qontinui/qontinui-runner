@@ -2833,7 +2833,10 @@ mod start_loop_validation_tests {
         .await
         .expect_err("the old placeholder shape is refused");
         assert!(err.contains("assertions[0]"), "names the element: {err}");
-        assert!(err.contains("unknown field `role`"), "names the field: {err}");
+        assert!(
+            err.contains("unknown field `role`"),
+            "names the field: {err}"
+        );
         assert!(!state.lock().await.running, "nothing started");
     }
 

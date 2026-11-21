@@ -636,7 +636,10 @@ mod diagnose_verdict_tests {
         let err = validate_diagnose_assertions(&[json!({ "type": "visible", "role": "tab" })])
             .expect_err("the old placeholder shape is refused");
         assert!(err.contains("assertions[0]"), "{err}");
-        assert!(err.contains("unknown field `role`"), "names the field: {err}");
+        assert!(
+            err.contains("unknown field `role`"),
+            "names the field: {err}"
+        );
         let err = validate_diagnose_assertions(&[
             json!({ "query": "p", "assertion": "exists" }),
             json!({ "query": "p", "assertion": "hasText", "expected": "" }),
