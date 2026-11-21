@@ -3,8 +3,8 @@
   "private": true,
   "description": "The design-kit CLI and the exact ui-bridge peers its validate-guide verb drives, installed outside the app by ci.yml (job design-guide). Not an app dependency.",
   "dependencies": {
-    "@qontinui/design-kit": "github:qontinui/qontinui-design-kit#v0.1.0",
-    "@qontinui/ui-bridge": "0.53.0",
+    "@qontinui/design-kit": "github:qontinui/qontinui-design-kit#v0.1.1",
+    "@qontinui/ui-bridge": "0.54.0",
     "@qontinui/ui-bridge-headless": "0.7.0",
     "@qontinui/ui-bridge-wrapper": "0.12.0"
   }
