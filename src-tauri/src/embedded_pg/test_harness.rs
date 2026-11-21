@@ -7,7 +7,7 @@
 //! # Why
 //!
 //! Until this existed, the runner's `DATABASE_URL`-backed tests were
-//! `#[ignore]`d, or compiled only under the `pg_integration_tests` feature, most
+//! `#[ignore]`d, or compiled only under an off-by-default test feature, most
 //! behind a silent localhost fallback, so no CI lane ran them and SQL verified
 //! by hand was retained nowhere. The harness boots the
 //! runner's OWN bundled server — the end user's production database — inside

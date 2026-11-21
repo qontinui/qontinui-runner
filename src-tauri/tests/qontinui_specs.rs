@@ -3,12 +3,11 @@
 //!
 //! These exercise the compiled binary as a subprocess (the canonical
 //! integration-test pattern for a separate `[[bin]]` target). Both are
-//! gated on a live PG (via DATABASE_URL) because the CLI requires its own
-//! short-lived connection — there is no in-process test seam for it.
-//!
-//! Run locally:
-//!   DATABASE_URL=postgres://qontinui_user:PASSWORD@localhost:5433/qontinui_db \
-//!     cargo test --bin qontinui-runner --test qontinui_specs -- --ignored
+//! PG-backed: the CLI opens its own short-lived connection, so each test
+//! takes a fresh database from the lib's test harness
+//! (`qontinui_runner_lib::embedded_pg::test_harness`) and hands its URL to the
+//! spawned binary as `RUNNER_DATABASE_URL`, with `QONTINUI_HOME` pointed at an
+//! empty temp dir so no real `profiles.json` can override it.
 //!
 //! Test #6: `coverage_with_app_filter_returns_one_section` — `--app foo`
 //! produces a single-section output (text) / single-key map (json).
@@ -26,10 +25,27 @@ fn binary_path() -> String {
         .expect("CARGO_BIN_EXE_qontinui_specs must be set when running integration tests")
 }
 
+/// Run the CLI against `db` with a hermetic profile/DSN environment.
+fn run_cli(
+    bin: &str,
+    db: &qontinui_runner_lib::embedded_pg::test_harness::TestDatabase,
+    args: &[&str],
+) -> std::process::Output {
+    let home = tempfile::tempdir().expect("temp QONTINUI_HOME");
+    Command::new(bin)
+        .args(args)
+        .env("QONTINUI_HOME", home.path())
+        .env("RUNNER_DATABASE_URL", db.url())
+        .env_remove("QONTINUI_ENV")
+        .env_remove("DATABASE_URL")
+        .output()
+        .expect("spawn qontinui-specs")
+}
+
 #[test]
-#[ignore = "requires PG via DATABASE_URL"]
 fn coverage_with_app_filter_returns_one_section() {
     let bin = binary_path();
+    let db = qontinui_runner_lib::embedded_pg::test_harness::fresh_database_blocking();
     let app_id = format!(
         "e9-cli-filter-{}",
         std::time::SystemTime::now()
@@ -42,10 +58,11 @@ fn coverage_with_app_filter_returns_one_section() {
     // just pass a typo'd id and assert exit code 2. The full "register
     // then run" path is exercised by the unit tests inside
     // `database/pg/apps.rs::tests`.
-    let out = Command::new(&bin)
-        .args(["coverage", "--app", &app_id, "--format", "json"])
-        .output()
-        .expect("spawn qontinui-specs");
+    let out = run_cli(
+        &bin,
+        &db,
+        &["coverage", "--app", &app_id, "--format", "json"],
+    );
 
     // Validation rejects an unregistered id with exit 2 + a usable error
     // message listing valid app_ids.
@@ -64,13 +81,10 @@ fn coverage_with_app_filter_returns_one_section() {
 }
 
 #[test]
-#[ignore = "requires PG via DATABASE_URL"]
 fn coverage_without_app_filter_returns_grouped_output() {
     let bin = binary_path();
-    let out = Command::new(&bin)
-        .args(["coverage", "--format", "json"])
-        .output()
-        .expect("spawn qontinui-specs");
+    let db = qontinui_runner_lib::embedded_pg::test_harness::fresh_database_blocking();
+    let out = run_cli(&bin, &db, &["coverage", "--format", "json"]);
 
     let code = out.status.code().unwrap_or(-1);
     assert!(

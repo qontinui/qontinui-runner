@@ -1050,18 +1050,34 @@ mod tests {
 
     // ── CompensationManager with PG ─────────────────────────
 
+    /// `iteration_commits` is a column of `task_runs`, so a commit recorded for an
+    /// execution with no `task_runs` row updates nothing. Seed the parents.
+    fn seed_task_runs(db: &PgDb, ids: &[&str]) {
+        for id in ids {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    db.create_task_run(&crate::database::CreateTaskRunInput::new(
+                        *id,
+                        "compensation-test",
+                    ))
+                    .await
+                    .expect("seed task_run")
+                })
+            });
+        }
+    }
+
     #[test]
-    #[ignore = "requires PG via DATABASE_URL"]
     fn compensation_manager_new_succeeds() {
         let db = PgDb::new_blocking_for_test();
         let _mgr = CompensationManager::new(db);
     }
 
-    #[test]
-    #[ignore = "requires PG via DATABASE_URL"]
-    fn record_and_get_iteration_commits() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_and_get_iteration_commits() {
         let db = PgDb::new_blocking_for_test();
         let exec_id = "test-exec-001";
+        seed_task_runs(&db, &[exec_id]);
         let mgr = CompensationManager::new(db);
 
         // Initially empty
@@ -1080,10 +1096,10 @@ mod tests {
         assert_eq!(commits[1].commit_hash, "def456");
     }
 
-    #[test]
-    #[ignore = "requires PG via DATABASE_URL"]
-    fn get_commits_isolated_by_execution_id() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_commits_isolated_by_execution_id() {
         let db = PgDb::new_blocking_for_test();
+        seed_task_runs(&db, &["exec-A", "exec-B"]);
         let mgr = CompensationManager::new(db);
 
         mgr.record_iteration_commit("exec-A", 1, "aaa111").unwrap();
@@ -1227,7 +1243,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn test_persist_and_load_stack() {
         // Verifies §1.3 persistence + rehydrate semantics:
         // push N actions through manager A, instantiate manager B on the same
@@ -1268,7 +1283,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG"]
     async fn test_startup_compensation_load_and_execute() {
         // Verifies the startup-resume auto-compensation flow (plan §1.3 option-b):
         // 1. Create CompensationManager A, push 2 FileCleanup actions, don't execute.

@@ -415,27 +415,14 @@ mod tests {
         assert_eq!(EventType::Completed.as_str(), "completed");
     }
 
-    // ── PG-gated integration tests ───────────────────────────────────────────
+    // ── Postgres integration tests ───────────────────────────────────────────
     //
-    // These follow the repo convention for `database/pg/*`: `#[ignore]` with an
-    // explicit reason, so they are NOT run (and cannot report a vacuous green)
-    // unless deliberately selected:
-    //
-    //   cargo test --lib database::pg::event_log -- --ignored --nocapture
-    //
-    // Every assertion below is an unconditional `assert*` — there is no
-    // in-test "skip if no DB" arm, so a missing database fails the test loudly
-    // rather than passing empty.
+    // Run on the bundled-Postgres test harness (`PgDb::new_for_test`): each
+    // test gets a fresh database, and a harness that cannot start fails the
+    // test rather than skipping it.
 
-    async fn test_db() -> PgDb {
-        // Deliberately NOT `PgDb::new_blocking_for_test()`: that spins its own
-        // tokio runtime and `block_on` panics when called from inside the
-        // `#[tokio::test]` runtime.
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string());
-        PgDb::new(&url)
-            .await
-            .expect("PgDb connection for test (set DATABASE_URL)")
+    async fn test_db() -> std::sync::Arc<PgDb> {
+        PgDb::new_for_test().await
     }
 
     /// Unique per test so concurrent runs on a shared PG never collide.
@@ -473,7 +460,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn append_assigns_monotonic_cursors_and_replay_returns_them_in_order() {
         let db = test_db().await;
         let exec = unique_execution_id("append");
@@ -526,7 +512,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn node_completed_reads_back_the_latest_completion_only() {
         let db = test_db().await;
         let exec = unique_execution_id("completed");
@@ -596,7 +581,6 @@ mod tests {
     /// record too — so a crash after one checkpoint re-executed (and re-billed)
     /// the whole upstream DAG.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn prune_is_scoped_to_the_loop_node_and_siblings_survive() {
         let db = test_db().await;
         let exec = unique_execution_id("prune-scope");
@@ -686,7 +670,6 @@ mod tests {
     /// `node_id` is workflow-authored text. A `LIKE`-based prefix match would
     /// read `_` as a single-character wildcard and delete a sibling's rows.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn prune_prefix_match_does_not_treat_node_id_as_a_wildcard_pattern() {
         let db = test_db().await;
         let exec = unique_execution_id("prune-wildcard");
@@ -731,7 +714,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn prune_keeps_rows_at_or_after_the_cursor() {
         let db = test_db().await;
         let exec = unique_execution_id("prune-cursor");
@@ -740,8 +722,15 @@ mod tests {
         db.event_log_append(&exec, "loop-a/iter0/body", &EventType::Completed, None)
             .await
             .expect("append iter0");
+        // `event_log_node_completed` reads `event_data`, and answers `None` for a
+        // row that stored none, so the kept row carries a payload to be seen.
         let keep_from = db
-            .event_log_append(&exec, "loop-a/iter1/body", &EventType::Completed, None)
+            .event_log_append(
+                &exec,
+                "loop-a/iter1/body",
+                &EventType::Completed,
+                Some(&serde_json::json!({"kept": true})),
+            )
             .await
             .expect("append iter1");
 
@@ -762,7 +751,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn delete_execution_removes_every_node_and_latest_cursor_resets() {
         let db = test_db().await;
         let exec = unique_execution_id("delete");

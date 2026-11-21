@@ -2885,7 +2885,7 @@ fn parse_time_cutoff_static(time_range: Option<&str>) -> Option<String> {
 mod decision_tests {
     //! A2-D3's decision, one literal fixture per arm, DB-free (plan
     //! 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
-    //! Phase 4). The `#[ignore]`d round-trips in `tests` drive the same arms
+    //! Phase 4). The round-trips in `tests` drive the same arms
     //! through `evaluate_pending_fixes` against real `timestamptz` rows.
     use super::*;
 
@@ -3068,62 +3068,20 @@ mod decision_tests {
 
 #[cfg(test)]
 mod tests {
-    //! `#[ignore]`d round-trips of the reflection-fix lifecycle against a
-    //! DISPOSABLE Postgres carrying the project schema, addressed by
-    //! `DATABASE_URL` (the `database/pg/*` convention, `token_usage.rs`; plan
+    //! Round-trips of the reflection-fix lifecycle against a fresh database on
+    //! the bundled-Postgres test harness (`PgDb::new_for_test`; plan
     //! 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
-    //! Phase 4). Every arm WRITES, so the database is never guessed:
-    //! [`disposable_pg`] refuses an unset `DATABASE_URL`, and one naming
-    //! `qontinui_db` (the canonical-dev fallback's database, and production's).
-    //! Each arm's fixtures live under a workflow name unique to the run, so the
-    //! evaluator's workflow-scoped re-queue touches only rows the arm created,
-    //! and each arm deletes its runs (cascading to findings, fixes and fix
-    //! applications) when it passes.
-    //!
-    //! Recipe: start a throwaway cluster
-    //! (`qontinui-claude-config/scripts/ephemeral-db.sh start pgvector` prints
-    //! a DSN), load `src-tauri/schema.pg.sql.generated` into a database other
-    //! than `qontinui_db` the way `embedded_pg::apply_canonical_schema` does
-    //! (`CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public` first,
-    //! every `CREATE SCHEMA` made `IF NOT EXISTS`, and on a cluster without
-    //! pgvector the vector columns as `bytea` with their ivfflat/hnsw indexes
-    //! dropped), export that DSN as `DATABASE_URL`, then from the runner
-    //! checkout run `cargo-guard.sh test -- --ignored database::pg::reflection`
-    //! (`database` is a BIN module, so `--lib` would match nothing).
+    //! Phase 4). Each arm's fixtures live under a workflow name unique to the
+    //! run, so the evaluator's workflow-scoped re-queue touches only rows the
+    //! arm created, and each arm deletes its runs (cascading to findings, fixes
+    //! and fix applications) when it passes.
     use super::*;
     use std::collections::HashMap;
 
-    /// A connection to the disposable database. `PgDb::new` runs the boot
-    /// self-provisioning DDL, which two arms racing on a fresh database can
-    /// collide on (`CREATE … IF NOT EXISTS` is not race-free), so connections
-    /// open one at a time.
-    async fn disposable_pg() -> PgDb {
-        static PROVISION: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            panic!(
-                "refusing to run: DATABASE_URL is unset. These round-trips WRITE, so they run \
-                 only against a disposable database carrying the project schema"
-            )
-        });
-        let config: tokio_postgres::Config = url
-            .parse()
-            .expect("DATABASE_URL parses as a Postgres connection string");
-        let database = config
-            .get_dbname()
-            .or(config.get_user())
-            .unwrap_or_default();
-        assert_ne!(
-            database, "qontinui_db",
-            "refusing to run against qontinui_db, the canonical dev database and production's: \
-             point DATABASE_URL at a disposable database"
-        );
-        let _one_at_a_time = PROVISION
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
-        PgDb::new(&url)
-            .await
-            .expect("PgDb::new against the disposable database")
+    /// A fresh test database (the harness provisions the schema and the
+    /// `PgDb::new` self-provisioning DDL once, then clones it per test).
+    async fn disposable_pg() -> std::sync::Arc<PgDb> {
+        PgDb::new_for_test().await
     }
 
     /// A workflow name no other run of these arms shares.
@@ -3263,7 +3221,6 @@ mod tests {
     /// stamp was ever earned, and the re-queue withdraws every `effective` stamp
     /// that carries no evidence.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_todays_count_query_as_written_errors_on_its_parameter_type() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("todays-query");
@@ -3341,7 +3298,6 @@ mod tests {
     /// returned with the verdict written; the unexposed one is neither written
     /// nor returned.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_evaluate_judges_only_exposed_fixes_and_returns_only_the_rows_it_wrote() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("evaluate");
@@ -3473,7 +3429,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_fewer_than_three_later_runs_leaves_the_fix_unevaluated() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("unexposed");
@@ -3520,7 +3475,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_a_recurring_finding_reads_ineffective() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("recurs");
@@ -3559,7 +3513,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_a_new_signature_in_two_later_runs_reads_caused_regression() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("regression");
@@ -3602,7 +3555,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_an_exposed_fix_without_recurrence_reads_effective_with_its_counts() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("effective");
@@ -3647,7 +3599,6 @@ mod tests {
 
     /// Both re-queue scopes, and what the re-queue never touches.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_requeue_withdraws_unjudged_and_unexposed_effective_stamps_of_this_workflow_only() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("requeue");
@@ -3798,7 +3749,6 @@ mod tests {
     /// run completed (a manual trigger) sees that run land after `applied_at`;
     /// counted, it is a third later run and its own finding a recurrence.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_the_source_run_is_not_its_own_exposure() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("own-run");
@@ -3866,7 +3816,6 @@ mod tests {
     /// `applied_at`", even when that run completed after the fix was applied
     /// (a manual trigger): the source run is prior, never later.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_a_signature_its_source_run_carried_is_not_new_after_the_fix() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("source-signature");
@@ -3920,7 +3869,6 @@ mod tests {
     /// tables have and read `snapshot_at` as text. One row inside a 7-day
     /// cutoff and one outside it, per read.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_the_trend_reads_apply_their_cutoff() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("trends");
@@ -4026,7 +3974,6 @@ mod tests {
     /// `store_convergence_snapshot`, the one writer of `convergence_snapshots`,
     /// stores a row `get_workflow_trends` reads back inside a 7-day cutoff.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_a_stored_convergence_snapshot_reads_back_in_the_trends() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("snapshot");
@@ -4082,7 +4029,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_the_hand_set_door_stamps_evaluated_at_in_sql() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("hand-set");
@@ -4134,7 +4080,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_save_reflection_fix_stamps_applied_and_created_at_in_sql() {
         // `save_reflection_fix` mirrors a stored fix into tenant memory; a
         // round-trip must not send one off the box.
@@ -4196,7 +4141,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_save_fix_application_stamps_applied_at_in_sql() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("fix-application");
@@ -4251,7 +4195,6 @@ mod tests {
     /// An unexposed fix now STAYS pending, so a hundred of them must not crowd
     /// an older, exposed fix out of the evaluator's 100-row read.
     #[tokio::test]
-    #[ignore = "needs a disposable Postgres (DATABASE_URL, never qontinui_db) carrying the project schema"]
     async fn pg_a_hundred_unexposed_fixes_do_not_starve_an_exposed_one() {
         let pg = disposable_pg().await;
         let wf = unique_workflow("starvation");

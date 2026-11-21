@@ -2217,12 +2217,7 @@ mod tests {
     /// worker. The fix binds `serde_json::Value` via `try_get`. This test
     /// round-trips through the write path (store_verification_phase_result) and
     /// all three read functions to prove the jsonb bind works end-to-end.
-    ///
-    /// `#[ignore]` because it needs a live PG fixture (a self-provisioned /
-    /// ephemeral PG via DATABASE_URL — NOT the canonical DB). Run manually:
-    /// `cargo test -p qontinui-runner database::pg::task_runs::tests::verification_result_json_round_trip_no_panic -- --ignored --nocapture`
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL with workflow_verification_phase_results)"]
     async fn verification_result_json_round_trip_no_panic() {
         let pg = PgDb::new_blocking_for_test();
 
@@ -2232,6 +2227,14 @@ mod tests {
             "phases": [{ "name": "phase-a", "passed": true }],
             "unicode": "naïve résumé",
         });
+
+        // The result rows reference `task_runs` by foreign key.
+        pg.create_task_run(&CreateTaskRunInput::new(
+            task_run_id.clone(),
+            "vpr-roundtrip",
+        ))
+        .await
+        .expect("seed the parent task_run");
 
         // Write path: binds serde_json::Value into the jsonb column.
         pg.store_verification_phase_result(&task_run_id, 0, &payload)

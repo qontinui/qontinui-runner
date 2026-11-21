@@ -358,10 +358,6 @@ test-fixtures = []
 # spec-check v1.0 ship; the user-facing `--enable-spec-authoring` alias
 # maps to this feature in the runner CLI/env layer.
 spec-authoring = []
-# PG-bound integration tests for the proposals subsystem (Stream E).
-# Off by default; enable with `--features spec-authoring,pg_integration_tests`
-# when a live PG (canonical or local) is available.
-pg_integration_tests = []
 # DEVELOPER-ONLY tokio-console wiring (Phase 5 of
 # `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`). Layers
 # `console_subscriber` alongside the existing logging stack so a developer can

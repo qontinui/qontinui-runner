@@ -856,21 +856,16 @@ mod handler_tests {
     }
 
     // =========================================================================
-    // PG-gated tests (Stream C C.8 1 + 2). Run with a live PG via:
-    //   DATABASE_URL=postgres://... cargo test --bin qontinui-runner --features spec-authoring \
-    //     -- --ignored spec_api::tests::handler_tests::pg --test-threads=1
+    // PG-backed tests (Stream C C.8 1 + 2). Each runs on a fresh database
+    // from the test harness (`PgDb::new_for_test`).
     // =========================================================================
 
     // C.8 (1) — GET /apps/:app_id/spec/list with unknown app returns 404
     // "app-not-found" via the AppError::NotRegistered mapping.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn get_list_unknown_app_returns_404_not_registered() {
         use crate::database::pg::PgDb;
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
-        });
-        let pg = PgDb::new(&url).await.expect("PgDb::new for spec_api tests");
+        let pg = PgDb::new_for_test().await;
         // Pick a deterministic-but-unique id that we never register.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -892,14 +887,10 @@ mod handler_tests {
     // when the registry resolves the app to its repo_root + writes land
     // there.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn get_list_with_app_returns_app_specific_pages() {
         use crate::database::pg::PgDb;
         use qontinui_types::apps::RegisterAppRequest;
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
-        });
-        let pg = PgDb::new(&url).await.expect("PgDb::new for spec_api tests");
+        let pg = PgDb::new_for_test().await;
 
         let tmp = tempfile::tempdir().unwrap();
         // Create the specs/ subdir the resolver requires.

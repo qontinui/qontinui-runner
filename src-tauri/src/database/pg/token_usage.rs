@@ -345,32 +345,12 @@ impl PgDb {
 mod tests {
     //! Round-trip tests for the budget-reload reader.
     //!
-    //! `#[ignore]`d to match the `database/pg/*` convention — they need a live
-    //! Postgres carrying the project schema, addressed by `DATABASE_URL`.
-    //! `#[ignore]` (rather than an in-test "no DB? return Ok" early return) is
-    //! deliberate: an ignored test is REPORTED as ignored, so a run without a
-    //! database cannot pass these off as green.
-    //!
-    //! Run them with (note: `database` is declared in `main.rs`, so these live
-    //! in the BIN target — `--lib` matches nothing and exits 0 vacuously):
-    //! `cargo test --bin qontinui-runner -- --ignored database::pg::token_usage`
+    //! They run on the bundled-Postgres test harness via `PgDb::new_for_test`.
 
     use super::*;
 
-    /// NOTE: the fallback DSN here deliberately differs from the one the other
-    /// `database/pg/*` and `spec_api/*` test modules hardcode
-    /// (`qontinui_password`). That value is STALE — canonical dev Postgres is
-    /// `qontinui-stack`'s, whose compose file defaults the password to
-    /// `qontinui_dev_password` (`qontinui-stack/docker-compose.yml:42`), and
-    /// the stale one fails auth with an opaque `db error`. `DATABASE_URL`
-    /// still overrides.
-    async fn test_pg() -> PgDb {
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db".to_string()
-        });
-        PgDb::new(&url)
-            .await
-            .expect("PgDb::new for token_usage tests")
+    async fn test_pg() -> std::sync::Arc<PgDb> {
+        PgDb::new_for_test().await
     }
 
     fn unique_run_id(label: &str) -> String {
@@ -402,7 +382,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn fresh_execution_has_no_prior_spend() {
         // The seeding path's zero case, against the real schema: an execution
         // with no ledger rows reads an empty Vec — which is why the production
@@ -421,7 +400,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn prior_spend_is_grouped_by_phase_and_summed() {
         let pg = test_pg().await;
         let run_id = unique_run_id("grouped");
@@ -522,7 +500,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn prior_spend_is_scoped_to_one_execution() {
         // A shared dev DB has other runs' rows in it; the reader must not
         // seed a run's budget with a neighbour's spend.

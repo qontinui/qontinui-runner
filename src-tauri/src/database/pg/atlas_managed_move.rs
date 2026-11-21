@@ -1141,26 +1141,17 @@ mod tests {
         assert!(report.changed_anything());
     }
 
-    /// Postgres-backed boot scenarios against scratch schemas on the
-    /// `DATABASE_URL` fixture (same fixture `PgDb::new_for_test` uses). Needs a
-    /// reachable Postgres, hence the feature gate.
-    ///
-    /// Run: `cargo test --features pg_integration_tests -- atlas_managed_move::tests::pg`
-    #[cfg(feature = "pg_integration_tests")]
+    /// Postgres-backed boot scenarios against scratch schemas, each in its own
+    /// fresh database on the bundled-Postgres test harness.
     mod pg {
         use super::super::*;
 
         const ALL: &[&str] = &ATLAS_MANAGED_TABLES;
 
-        fn url() -> String {
-            std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string())
-        }
-
-        async fn connect() -> Client {
-            let (client, conn) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+        async fn connect(url: &str) -> Client {
+            let (client, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
                 .await
-                .expect("connect to DATABASE_URL");
+                .expect("connect to the harness test database");
             tokio::spawn(async move {
                 let _ = conn.await;
             });
@@ -1168,6 +1159,8 @@ mod tests {
         }
 
         struct Scratch {
+            /// Held so the database outlives the test and is dropped with it.
+            db: crate::embedded_pg::test_harness::TestDatabase,
             client: Client,
             source: String,
             target: String,
@@ -1181,8 +1174,11 @@ mod tests {
                     .chars()
                     .take(12)
                     .collect();
+                let db = crate::embedded_pg::test_harness::fresh_database().await;
+                let client = connect(db.url()).await;
                 Self {
-                    client: connect().await,
+                    db,
+                    client,
                     source: format!("amv_src_{tag}"),
                     target: format!("amv_dst_{tag}"),
                 }
@@ -1634,7 +1630,7 @@ mod tests {
             let mut s = Scratch::new().await;
             let dst = s.target.clone();
             s.create(&dst, false, ALL).await;
-            let holder = connect().await;
+            let holder = connect(s.db.url()).await;
             holder
                 .execute("SELECT pg_advisory_lock($1)", &[&MOVE_LOCK_KEY])
                 .await
@@ -1659,7 +1655,7 @@ mod tests {
             let mut s = Scratch::new().await;
             let src = s.source.clone();
             s.create(&src, true, &["spec_proposals"]).await;
-            let holder = connect().await;
+            let holder = connect(s.db.url()).await;
             holder
                 .execute("SELECT pg_advisory_lock($1)", &[&MOVE_LOCK_KEY])
                 .await

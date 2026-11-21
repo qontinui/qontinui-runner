@@ -1453,13 +1453,10 @@ mod tests {
         assert_eq!(req.limit, Some(5));
     }
 
-    /// PG-bound tests are gated behind `pg_integration_tests` because the
-    /// shared dev DB is the only place the `atlas_managed.spec_proposals` table
-    /// exists (Atlas-managed). Unit tests above cover the pure helpers
+    /// PG-bound tests run on the test harness's bundled PostgreSQL
+    /// (`PgDb::new_for_test`), whose schema carries
+    /// `atlas_managed.spec_proposals`. Unit tests above cover the pure helpers
     /// (slug, JSON shapes, placeholder writer).
-    ///
-    /// To run: `cargo test --features spec-authoring,pg_integration_tests -- proposals::tests::pg`
-    #[cfg(feature = "pg_integration_tests")]
     mod pg {
         use super::*;
         use crate::database::pg::PgDb;
@@ -1468,7 +1465,7 @@ mod tests {
             let guard = crate::database::pg::spec_proposals::SPEC_PROPOSALS_TEST_LOCK
                 .lock()
                 .await;
-            // The integration DB must already have spec_proposals (Atlas).
+            // The harness schema already has spec_proposals (Atlas).
             let db = PgDb::new_for_test().await;
             // Wipe any prior test rows so dedup behaves deterministically.
             let conn = db.pool().get().await.expect("pg conn");
@@ -1536,7 +1533,7 @@ mod tests {
     // rather than the HTTP handler — the handler is a thin
     // `Path((app_id,)) -> resolve_specs_root -> ...` wrapper, so testing
     // the primitives transitively covers the route shape. Gated on
-    // DATABASE_URL because they touch live PG.
+    // the harness database because they touch PG.
 
     #[cfg(feature = "spec-authoring")]
     mod stream_e {
@@ -1544,11 +1541,8 @@ mod tests {
         use crate::database::pg::PgDb;
         use qontinui_types::apps::{AppError, RegisterAppRequest};
 
-        async fn pg() -> PgDb {
-            let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
-            });
-            PgDb::new(&url).await.expect("PgDb for Stream E tests")
+        async fn pg() -> std::sync::Arc<PgDb> {
+            PgDb::new_for_test().await
         }
 
         fn unique_id(prefix: &str) -> String {
@@ -1568,7 +1562,6 @@ mod tests {
         /// first; on unknown app it returns `AppError::NotRegistered`,
         /// which the handler converts to a 404 via `AppErrorExt::into_app_response`.
         #[tokio::test(flavor = "multi_thread")]
-        #[ignore = "requires PG via DATABASE_URL"]
         async fn scan_for_unknown_app_returns_404() {
             let pg = pg().await;
             let ghost = unique_id("e9-ghost");
@@ -1587,7 +1580,6 @@ mod tests {
         /// Insert an event under one app and confirm the round-trip carries
         /// the `app_id` correctly (via the per-app reader added by E.1).
         #[tokio::test(flavor = "multi_thread")]
-        #[ignore = "requires PG via DATABASE_URL"]
         async fn scan_for_known_app_writes_proposal_events_with_app_id() {
             let pg = pg().await;
             let app_id = unique_id("e9-app-write");
@@ -1642,7 +1634,6 @@ mod tests {
         /// app-scoped specs root, then promote — the canonical IR + projection
         /// land under `<repo_root>/specs/pages/<id>/` and `_pending/` is gone.
         #[tokio::test(flavor = "multi_thread")]
-        #[ignore = "requires PG via DATABASE_URL"]
         async fn promote_pending_under_app_root_succeeds() {
             let pg = pg().await;
             let app_id = unique_id("e9-app-promote");
