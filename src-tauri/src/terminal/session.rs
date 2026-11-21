@@ -3365,25 +3365,32 @@ impl TerminalSession {
         Some(t.to_string())
     }
 
-    /// The refusal for a pane the identity shim could not be put in front of:
-    /// `Some` when the PTY child IS `claude` and its argv names no session id
-    /// (`--session-id` / `--resume` / `-r`), because that pane's id would have
-    /// reached argv only through the shim's `--session-id
-    /// $QONTINUI_PINNED_SESSION_ID`. `None` for every other command — a shell
-    /// (a `claude` typed later is a separate question the shim answers), or a
-    /// `claude` that already carries its own id.
-    fn unshimmed_claude_pane_refusal(cmd: &CommandBuilder) -> Option<String> {
-        if !Self::argv_head_is_claude(cmd.get_argv()) {
-            return None;
+    /// Would this PTY child have taken its session id from the identity shim?
+    /// True when argv's head is `claude` and its arguments make no session
+    /// choice of their own — the exact case in which the shim appends
+    /// `--session-id $QONTINUI_PINNED_SESSION_ID`. The token set mirrors the
+    /// shim's `user_chose_session` (`bin/qontinui_shim.rs`): `--session-id`,
+    /// `--resume`, `-r`, `resume`, `--continue`, `-c` and the
+    /// `--session-id=`/`--resume=` inline forms, scanned up to the first `--`.
+    /// A shell pane is false: a `claude` typed in it later is the shim's
+    /// question, not this spawn's.
+    fn pane_loses_shim_pin(cmd: &CommandBuilder) -> bool {
+        let argv = cmd.get_argv();
+        if !Self::argv_head_is_claude(argv) {
+            return false;
         }
-        if Self::explicit_session_id_from(cmd).is_some() {
-            return None;
-        }
-        Some(
-            "refusing to start a claude pane: the identity shim could not be materialized, \
-             so this claude would run without its pinned --session-id"
-                .to_string(),
-        )
+        !argv
+            .iter()
+            .skip(1)
+            .map(|a| a.to_string_lossy().to_ascii_lowercase())
+            .take_while(|a| a != "--")
+            .any(|t| {
+                matches!(
+                    t.as_str(),
+                    "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
+                ) || t.starts_with("--session-id=")
+                    || t.starts_with("--resume=")
+            })
     }
 
     /// True when argv's head names the claude CLI image (basename compare,
@@ -3532,35 +3539,6 @@ impl TerminalSession {
 
         // 1 + 2. Pin the child's session identity and inject it as env.
         let pinned = Self::pin_child_session_identity(cmd, terminal_id);
-
-        // Materialize the always-on identity shims FIRST (applied to PATH at
-        // step 3 below), so a pane that must not start without them is
-        // refused before anything else — the coord-mcp nonce, the hook files,
-        // the lifecycle record — is provisioned for it.
-        // Phase 6 (B2): the dir is CONTENT-ADDRESSED per runner build and
-        // shared by every terminal, so this costs 4 rendered scripts + 2 exe
-        // copies + a hardlink ONCE per build instead of once per spawn. See
-        // `shim_materializer::identity_build_tag` for the staleness check that
-        // replaces the old "every spawn re-copies, so it is accidentally
-        // fresh" behavior.
-        let identity = {
-            let _span =
-                tracing::debug_span!("terminal_spawn.shim_materialize", terminal_id = %terminal_id)
-                    .entered();
-            shim_materializer::materialize_identity(&std::env::temp_dir())
-        };
-        // Fail CLOSED for a `claude` pane whose argv names no session id: its
-        // id reaches argv ONLY through the shim, so without one it would start
-        // unpinned while the runner records a pin it never runs under — a row
-        // the session census cannot identify (plan
-        // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
-        // Phase 2, route (c)). The caller surfaces the refusal.
-        if identity.is_none() {
-            if let Some(refusal) = Self::unshimmed_claude_pane_refusal(cmd) {
-                warn!(terminal_id = %terminal_id, "{refusal}");
-                return Err(refusal);
-            }
-        }
         // The identity shim's confirmation POST targets the runner loopback on
         // this port. Inject it even when install-interception is OFF so the
         // confirmation works out of the box (the var is shared but harmless when
@@ -3679,7 +3657,19 @@ impl TerminalSession {
             delivered.delivery
         };
 
-        // 3. Prepend the identity shim dir materialized above.
+        // 3. Materialize the always-on identity shims + prepend their dir.
+        // Phase 6 (B2): the dir is CONTENT-ADDRESSED per runner build and
+        // shared by every terminal, so this costs 4 rendered scripts + 2 exe
+        // copies + a hardlink ONCE per build instead of once per spawn. See
+        // `shim_materializer::identity_build_tag` for the staleness check that
+        // replaces the old "every spawn re-copies, so it is accidentally
+        // fresh" behavior.
+        let base_dir = std::env::temp_dir();
+        let shim_span =
+            tracing::debug_span!("terminal_spawn.shim_materialize", terminal_id = %terminal_id)
+                .entered();
+        let identity = shim_materializer::materialize_identity(&base_dir);
+        drop(shim_span);
         match &identity {
             Some(identity_dir) => {
                 Self::apply_identity_path_shim(cmd, identity_dir);
@@ -3690,9 +3680,7 @@ impl TerminalSession {
                 );
             }
             None => {
-                // Every pane that reaches here (a shell, or a claude that names
-                // its own id — the id-less claude pane was refused above)
-                // stays fail-open: env vars are still set so a directly-invoked
+                // Fail-open: env vars are still set so a directly-invoked
                 // provider could still be pinned by a future absolute-path
                 // wrapper, but no PATH shim this terminal. The child PATH is
                 // still composed, with no own dir: an inherited foreign shim
@@ -3701,6 +3689,21 @@ impl TerminalSession {
                 // A runner with no PATH at all leaves the child's untouched.
                 if let Ok(current_path) = std::env::var("PATH") {
                     Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
+                }
+                // Still fail-open, but not silent: a `claude` pane that would
+                // have taken its session id from the shim now runs with none in
+                // argv, so the session census can identify it only by Claude
+                // Code's own `sessions/<pid>.json` record (plan
+                // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+                // Phase 2, route (c)).
+                if Self::pane_loses_shim_pin(cmd) {
+                    warn!(
+                        terminal_id = %terminal_id,
+                        title = %title,
+                        pinned_session_id = %pinned,
+                        "identity shim could not be materialized: this claude pane starts with no \
+                         --session-id in argv (the pinned id is in its env only)"
+                    );
                 }
             }
         }
@@ -7674,68 +7677,60 @@ pub(crate) mod tests {
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
     }
 
+    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    /// Phase 2, route (c) — regression test only (measured 0 on both boxes):
+    /// with no identity shim the pane still spawns, and the seam warns exactly
+    /// for the panes that would have taken their `--session-id` from the shim.
+    #[test]
+    fn pane_loses_shim_pin_only_for_a_claude_that_makes_no_session_choice() {
+        let loses = |cmd: &CommandBuilder| TerminalSession::pane_loses_shim_pin(cmd);
+
+        assert!(loses(&claude_argv(&["--permission-mode", "bypassPermissions"])));
+        assert!(loses(&claude_argv(&[])));
+        assert!(loses(&TerminalSession::build_command_from(Some(vec![
+            "/home/u/.nvm/versions/node/v24.19.0/bin/claude".to_string(),
+            "--verbose".to_string(),
+        ]))));
+        // A session flag after `--` is positional; it chooses nothing.
+        assert!(loses(&claude_argv(&["--", "--continue"])));
+
+        for chosen in [
+            vec!["--session-id", "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"],
+            vec!["--session-id=7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"],
+            vec!["--resume", "52e88829-c137-421d-893a-b45feac50a00"],
+            vec!["-r", "52e88829-c137-421d-893a-b45feac50a00"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["resume"],
+        ] {
+            assert!(!loses(&claude_argv(&chosen)), "{chosen:?} chose a session");
+        }
+        assert!(!loses(&TerminalSession::build_command_from(None)));
+        assert!(!loses(&TerminalSession::build_command_from(Some(vec![
+            "bash".to_string(),
+            "-l".to_string(),
+        ]))));
+
+        // The seam consults it on the no-shim arm, and only to warn: no
+        // refusal for this route.
+        let src = include_str!("session.rs");
+        let seam_start = src
+            .find(&["fn apply_identity", "_seam("].concat())
+            .expect("the identity seam exists");
+        let seam = &src[seam_start..];
+        let seam = &seam[..seam.find("\n    }\n").expect("the seam body ends")];
+        assert!(
+            seam.contains(&["if Self::pane_loses_", "shim_pin(cmd) {"].concat()),
+            "apply_identity_seam must warn for a claude pane that loses its shim pin"
+        );
+    }
+
     /// The id the seam hands back to the spawn — and so the id the coord row
     /// is registered under — is byte-identical to what the child sees as
     /// `QONTINUI_PINNED_SESSION_ID`: adopted from argv when argv names one,
     /// minted otherwise. This is the runner-side half of the
     /// `session_not_owned_by_caller` fix: the row's `claude_code_session_id`
     /// must be the id the session actually runs under, never the runner's own.
-    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
-    /// Phase 2, route (c): with no identity shim, a `claude` pane whose argv
-    /// names no session id is refused — it would run unpinned. Every pane whose
-    /// argv already carries `--session-id <uuid>` / `--resume <uuid>`, and every
-    /// non-claude pane, is not.
-    #[test]
-    fn unshimmed_claude_pane_refusal_refuses_only_an_id_less_claude() {
-        let refuse = |cmd: &CommandBuilder| TerminalSession::unshimmed_claude_pane_refusal(cmd);
-
-        assert!(refuse(&claude_argv(&["--permission-mode", "bypassPermissions"])).is_some());
-        assert!(refuse(&claude_argv(&[])).is_some());
-        assert!(refuse(&TerminalSession::build_command_from(Some(vec![
-            "/home/u/.nvm/versions/node/v24.19.0/bin/claude".to_string(),
-            "--verbose".to_string(),
-        ])))
-        .is_some());
-        // `--continue` names no id either; without the shim nothing pins it.
-        assert!(refuse(&claude_argv(&["--continue"])).is_some());
-
-        assert!(refuse(&claude_argv(&[
-            "--session-id",
-            "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"
-        ]))
-        .is_none());
-        assert!(refuse(&claude_argv(&[
-            "--resume",
-            "52e88829-c137-421d-893a-b45feac50a00"
-        ]))
-        .is_none());
-        // A shell pane: a `claude` typed later is the shim's question.
-        assert!(refuse(&TerminalSession::build_command_from(None)).is_none());
-        assert!(refuse(&TerminalSession::build_command_from(Some(vec![
-            "bash".to_string(),
-            "-l".to_string(),
-        ])))
-        .is_none());
-
-        // The seam consults it — and before provisioning the coord-mcp nonce,
-        // so a refused pane leaves nothing behind.
-        let src = include_str!("session.rs");
-        let seam_start = src
-            .find(&["fn apply_identity", "_seam("].concat())
-            .expect("the identity seam exists");
-        let seam = &src[seam_start..];
-        let refusal_at = seam
-            .find(&["Self::unshimmed_claude_pane_refusal", "(cmd)"].concat())
-            .expect("apply_identity_seam must refuse an unshimmed id-less claude pane");
-        let provision_at = seam
-            .find(&["deliver_terminal_", "coord_mcp("].concat())
-            .expect("the seam provisions coord-mcp");
-        assert!(
-            refusal_at < provision_at,
-            "the refusal must precede coord-mcp provisioning"
-        );
-    }
-
     #[test]
     fn pin_child_session_identity_returns_the_id_it_injected() {
         use crate::install_effects_producer::intercept::shim_materializer::{
