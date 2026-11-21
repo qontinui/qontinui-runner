@@ -8,7 +8,7 @@
  * saved URL is never its target, a remote one the build dials is.
  */
 
-import { act, createElement } from "react";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -51,7 +51,7 @@ afterEach(() => {
 
 async function clickSignIn(): Promise<string | undefined> {
   await act(async () => {
-    root.render(createElement(LoginScreen));
+    root.render(<LoginScreen />);
   });
   const button = host.querySelector<HTMLButtonElement>('[data-testid="cognito-sign-in"]');
   expect(button).not.toBeNull();
