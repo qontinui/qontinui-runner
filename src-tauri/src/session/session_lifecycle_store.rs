@@ -3483,14 +3483,22 @@ impl SessionLifecycleStore {
     /// with the flag so no re-finish can see the mark unsynced but not yet
     /// re-addressed). `expect_synced` is the sync state the caller decided on:
     /// a mark whose state moved since (another heal withdrew the stamp first)
-    /// is refused, so two heals over one snapshot queue one re-send. Taken
-    /// under `finish_forward`. Returns whether it recorded.
+    /// is refused, so two heals over one snapshot queue one re-send.
+    /// `expect_row` is the [`TerminalSessionRecord::finish_coord_session_id`]
+    /// the caller read: a mark whose target moved since — another re-address,
+    /// or the pane-row re-offer (`AiCoordRegistrar::reoffer_finish_to`, plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D5) queueing it to a pane row after the heal read the mark — is
+    /// refused too, so the heal never overwrites a target it did not decide
+    /// on and leaves a `Finished` pending to two rows. Taken under
+    /// `finish_forward`. Returns whether it recorded.
     pub fn note_finish_readdressed(
         &self,
         claude_session_id: &str,
         finished_at: i64,
         coord_session_id: uuid::Uuid,
         expect_synced: bool,
+        expect_row: Option<uuid::Uuid>,
     ) -> bool {
         let _forward = self
             .finish_forward
@@ -3505,7 +3513,9 @@ impl SessionLifecycleStore {
         };
         let changed = match m.get_mut(claude_session_id) {
             Some(rec)
-                if rec.finished_at == Some(finished_at) && rec.finish_synced == expect_synced =>
+                if rec.finished_at == Some(finished_at)
+                    && rec.finish_synced == expect_synced
+                    && rec.finish_coord_session_id == expect_row =>
             {
                 rec.finish_synced = false;
                 rec.finish_coord_session_id = Some(coord_session_id);
