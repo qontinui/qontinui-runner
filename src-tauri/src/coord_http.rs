@@ -115,7 +115,7 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
 /// auth-coverage metric, so these reads now count toward the same
 /// unpaired→paired dogfood signal the write path reports.
 pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its downstream callers (21 at the Census E1 reading; that number is a census snapshot, not a live count -- `grep` for it) span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for` (:123-129). Callers adopt it one at a time as each establishes its own class (plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant` P3).
+    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its downstream callers (21 at the Census E1 reading; that number is a census snapshot, not a live count -- `grep` for it) span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for`. Callers adopt it one at a time as each establishes its own class (plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant` P3).
     qontinui_runner_lib::auth::attach_device_auth(client.get(url))
 }
 

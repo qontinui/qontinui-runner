@@ -15,9 +15,10 @@
 //! PINNED at creation keeps its tenant, but one frozen UNPINNED (the normal
 //! single-tenant shape, and a restored/adopted nonce with no recorded tenant)
 //! re-reads the machine pin on every request (`coord_mcp::decide_session_tenant`
-//! rows 2-4), so an unpinned -> pinned switch moves running sessions too. Only the coord-mcp nonce restore and the
-//! boot-time on-disk nonce adoption read the pin once at startup, so they see
-//! a switch only at the next runner start. [`PIN_SURFACES`] is the
+//! rows 2-4), so an unpinned -> pinned switch moves running sessions too.
+//! Only the coord-mcp nonce restore and the boot-time on-disk nonce
+//! adoption read the pin once at startup, so they see a switch only at the
+//! next runner start. [`PIN_SURFACES`] is the
 //! per-consumer table; `PUT /tenant/active` reports it with a live count.
 //!
 //! The frontend [`TenantContext`] reads the active tenant id (per machine)

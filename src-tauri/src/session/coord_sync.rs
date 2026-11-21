@@ -10211,20 +10211,13 @@ mod tests {
         }
     }
 
-    /// The boot path starts exactly the coord-sync loops it should, and no
-    /// tenant-policy flag poll (plan
-    /// `2026-11-20-coord-native-sessions-phase-9-reverified-cleanup` Phase 2).
-    ///
-    /// `main.rs`'s `.setup()` cannot be driven from a unit test (it needs a
-    /// live Tauri app), so this reads the one `spawn` block that starts the
-    /// coord-sync loops and pins the set of `start_*` calls in it. The
-    /// deleted Phase-10 poll was started from this block; re-adding any
-    /// periodic task here — that one or another — fails until this list is
-    /// updated on purpose.
-    ///
-    /// Second half: nothing in `src` builds a `/tenant-policy` URL except the
-    /// cached, per-tenant transcript-sync read in `transcript_autobind.rs`,
-    /// which is not a poll. A revived 60 s poll would add a second builder.
+    /// Source guard for the boot path's coord-sync spawn block in `main.rs`
+    /// (plan `2026-11-20-coord-native-sessions-phase-9-reverified-cleanup`
+    /// Phase 2). `.setup()` cannot be driven from a unit test (it needs a live
+    /// Tauri app), so this reads source text and fails on either of two
+    /// edits: any `start_*` call in that block beyond the pinned set, or a
+    /// second builder of the `/tenant-policy?tenant_id=` URL anywhere in
+    /// `src` besides `transcript_autobind.rs`.
     #[test]
     fn the_boot_path_registers_no_tenant_policy_flag_poll() {
         let main_src = include_str!("../main.rs");
