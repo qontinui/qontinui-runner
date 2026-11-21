@@ -12119,6 +12119,7 @@ pub(crate) fn finalize_headless_child_env(
     // this function was extracted: a posture nothing asserts is a posture that
     // silently regresses. See `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(cmd);
+    crate::terminal::apply_python_utf8_default_tokio(cmd);
 
     crate::terminal::scrub_credential_env_tokio(cmd);
 }
@@ -14495,6 +14496,7 @@ mod tests {
             &cmd,
             "finalize_headless_child_env",
         );
+        crate::terminal::assert_python_utf8_default_tokio(&cmd, "finalize_headless_child_env");
     }
 
     /// The headless seam must stamp the ACTUALLY-BOUND port into both values a
