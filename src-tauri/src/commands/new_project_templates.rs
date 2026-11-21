@@ -62,10 +62,10 @@ transitions with `<TransitionTo>` from `@qontinui/ui-bridge`; the
 `src/state-machine.derived.json` on every build.
 "#;
 
-/// UI Bridge dependency versions are never below the caret ranges the
-/// runner itself ships with (see the repo-root `package.json`): the template
-/// tracks npm `latest`, which may be ahead of the runner, but a fresh scaffold
-/// is never older than it. Bump `@qontinui/ui-bridge` and
+/// The lower bound of each UI Bridge dependency range is never below the
+/// lower bound the runner itself ships with (see the repo-root
+/// `package.json`): the template may be ahead of the runner (at a newer npm
+/// release), but a fresh scaffold is never older than it. Bump `@qontinui/ui-bridge` and
 /// `@qontinui/ui-bridge-auto` together, and check that the new
 /// `ui-bridge-auto` peer range accepts the new `ui-bridge`
 /// (`npm view @qontinui/ui-bridge-auto@<v> peerDependencies`) — no test reads
