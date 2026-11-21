@@ -177,7 +177,7 @@
 //! its OWNING tenant's, and coord scopes the agent door's rows from the bearer
 //! it is shown. So every fetch here presents the credential of the tenant the
 //! coord-mcp proxy decides for this session
-//! ([`crate::mcp::policy_tenant::route_policy_decision`]) through the
+//! ([`crate::mcp::policy_tenant::route_policy_target`]) through the
 //! tenant-stating seam (`coord_http::coord_get_for`), the in-process cache is
 //! keyed on `(coord base, tenant)`, the spawn cache file is named for the
 //! tenant whose credential actually fetched the body, and the injected body
@@ -1835,7 +1835,7 @@ fn now_stamp() -> String {
 /// falling back to the Claude session id) and `session_key` is what
 /// `mcp::sessions::resolve_session_key` made of it. Together they name the
 /// session whose tenant the coord-mcp proxy decides
-/// ([`crate::mcp::policy_tenant::route_policy_decision`]) — the tenant whose
+/// ([`crate::mcp::policy_tenant::route_policy_target`]) — the tenant whose
 /// credential every fetch here presents.
 ///
 /// `delivered_sha` is the session's spawn-time marker
@@ -1885,17 +1885,14 @@ pub async fn policy_context(
             // Whose policy: the tenant the coord-mcp proxy decides for THIS
             // session, awaited (SessionStart is its first call). An UNKNOWN on a
             // multi-bound device is no target at all, so nothing is fetched.
-            let tenant_decision = crate::mcp::policy_tenant::route_policy_decision(
+            match crate::mcp::policy_tenant::route_policy_target(
                 route_id,
                 session_key,
                 None,
                 crate::mcp::policy_tenant::ROUTE_TENANT_BUDGET,
             )
-            .await;
-            match crate::mcp::policy_tenant::fetch_target(
-                tenant_decision,
-                crate::mcp::policy_tenant::default_slot_tenant,
-            ) {
+            .await
+            {
                 Err(reason) => {
                     warn!(session = %session_key, source, reason = %reason, "policy-context: session tenant unresolved — injecting the fail-open notice instead of the default tenant's policy");
                     (

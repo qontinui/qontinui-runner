@@ -823,50 +823,52 @@ fn one_status_from_body(body: &WireResponse, csid: &str) -> OneStatus {
 // One session's work axis under ITS tenant's credential
 // ---------------------------------------------------------------------------
 
-/// One tenant's resolved credential for the one-session read: the coord base
-/// and the `Authorization` value `coord_get_for` attached for that tenant's
-/// scope, as of when it was resolved.
-#[derive(Clone)]
+/// One tenant's resolved credential for the one-session read: the
+/// `Authorization` value `coord_get_for` attached for that tenant's scope, as
+/// of when it was resolved.
 struct TenantCredential {
     at: std::time::Instant,
-    base: String,
     authorization: reqwest::header::HeaderValue,
 }
 
-/// Keyed per tenant ([`PolicyTarget::tenant`]). The device census's
-/// [`CREDENTIAL`] is ONE slot because it is one credential; the Stop-hook read
-/// presents a different tenant's per session, and one slot would hand the last
-/// resolved tenant's bearer to the next session's read — which `build_checked`
-/// would then refuse, so every alternation would cost a re-resolve. Reused for
-/// [`CREDENTIAL_REUSE`]; a failure is never cached.
+/// One credential slot: the coord base and the tenant ([`PolicyTarget::tenant`]).
+type CredentialKey = (String, Option<uuid::Uuid>);
+
+/// Keyed per `(coord base, tenant)`. The device census's [`CREDENTIAL`] is ONE
+/// slot because it is one credential; the Stop-hook read presents a different
+/// tenant's per session, and one slot would hand the last resolved tenant's
+/// bearer to the next session's read — which `build_checked` would then
+/// refuse, so every alternation would cost a re-resolve. The base is in the key
+/// so a re-pointed coord never receives a bearer resolved for another. Reused
+/// for [`CREDENTIAL_REUSE`]; a failure is never cached.
 static TENANT_CREDENTIALS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<Option<uuid::Uuid>, TenantCredential>>,
+    std::sync::Mutex<HashMap<CredentialKey, TenantCredential>>,
 > = std::sync::OnceLock::new();
 
-fn tenant_credentials() -> &'static std::sync::Mutex<HashMap<Option<uuid::Uuid>, TenantCredential>>
-{
+fn tenant_credentials() -> &'static std::sync::Mutex<HashMap<CredentialKey, TenantCredential>> {
     TENANT_CREDENTIALS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// `tenant`'s cached `(base, Authorization)`, while within [`CREDENTIAL_REUSE`]
-/// of `now`.
+/// The `Authorization` cached for `(base, tenant)`, while within
+/// [`CREDENTIAL_REUSE`] of `now`.
 fn tenant_credential_lookup(
+    base: &str,
     tenant: Option<uuid::Uuid>,
     now: std::time::Instant,
-) -> Option<(String, reqwest::header::HeaderValue)> {
+) -> Option<reqwest::header::HeaderValue> {
     let g = tenant_credentials()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.get(&tenant)
+    g.get(&(base.to_string(), tenant))
         .filter(|c| now.duration_since(c.at) < CREDENTIAL_REUSE)
-        .map(|c| (c.base.clone(), c.authorization.clone()))
+        .map(|c| c.authorization.clone())
 }
 
-/// Cache `authorization` (resolved at `at` against `base`) as `tenant`'s.
+/// Cache `authorization` (resolved at `at`) as `(base, tenant)`'s.
 fn tenant_credential_store(
+    base: &str,
     tenant: Option<uuid::Uuid>,
     at: std::time::Instant,
-    base: String,
     mut authorization: reqwest::header::HeaderValue,
 ) {
     authorization.set_sensitive(true);
@@ -874,12 +876,8 @@ fn tenant_credential_store(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(
-            tenant,
-            TenantCredential {
-                at,
-                base,
-                authorization,
-            },
+            (base.to_string(), tenant),
+            TenantCredential { at, authorization },
         );
 }
 
@@ -908,47 +906,40 @@ fn build_work_status_get(
 /// that credential when none is reusable. Resolution reads secure storage and
 /// may reach the OS keychain, so it runs on a blocking thread under
 /// [`CREDENTIAL_TIMEOUT`], serialised with the census's resolution.
+///
+/// A REUSED credential is attached as the cached header rather than through
+/// `coord_get_for` (that is the point of reusing it); it still passes
+/// [`crate::mcp::policy_tenant::build_checked`] on every send, so a cached
+/// bearer that no longer claims the target tenant is refused, not sent.
 async fn tenant_request(
     client: &reqwest::Client,
     id: &str,
     target: PolicyTarget,
 ) -> Result<reqwest::Request, String> {
-    let reuse = |client: &reqwest::Client| {
-        tenant_credential_lookup(target.tenant, std::time::Instant::now()).map(
-            |(base, authorization)| {
-                build_work_status_get(
-                    client,
-                    work_status_url(&base, id),
-                    target,
-                    Some(authorization),
-                )
-            },
+    let base = crate::mcp::continuation_verdict::coord_base();
+    let url = work_status_url(&base, id);
+    let reuse = || {
+        tenant_credential_lookup(&base, target.tenant, std::time::Instant::now()).map(
+            |authorization| build_work_status_get(client, url.clone(), target, Some(authorization)),
         )
     };
-    if let Some(built) = reuse(client) {
+    if let Some(built) = reuse() {
         return built.map_err(|e| format!("coord work-status: {e}"));
     }
     let _one_at_a_time = CREDENTIAL_RESOLVE.lock().await;
-    if let Some(built) = reuse(client) {
+    if let Some(built) = reuse() {
         return built.map_err(|e| format!("coord work-status: {e}"));
     }
-    let (blocking_client, blocking_id) = (client.clone(), id.to_string());
+    let (blocking_client, blocking_url) = (client.clone(), url.clone());
     let resolved = tokio::time::timeout(
         CREDENTIAL_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            let base = crate::mcp::continuation_verdict::coord_base();
-            let request = build_work_status_get(
-                &blocking_client,
-                work_status_url(&base, &blocking_id),
-                target,
-                None,
-            )?;
-            Ok::<_, String>((base, request))
+            build_work_status_get(&blocking_client, blocking_url, target, None)
         }),
     )
     .await;
-    let (base, request) = match resolved {
-        Ok(Ok(Ok(built))) => built,
+    let request = match resolved {
+        Ok(Ok(Ok(request))) => request,
         Ok(Ok(Err(e))) => return Err(format!("coord work-status: {e}")),
         Ok(Err(e)) => {
             return Err(format!(
@@ -964,9 +955,9 @@ async fn tenant_request(
     };
     if let Some(authorization) = request.headers().get(reqwest::header::AUTHORIZATION) {
         tenant_credential_store(
+            &base,
             target.tenant,
             std::time::Instant::now(),
-            base,
             authorization.clone(),
         );
     }
@@ -1539,34 +1530,44 @@ mod tests {
         }
     }
 
-    /// Tests bullet 2. The one-session work-status read for tenant B presents
-    /// B's credential: the reusable credential is keyed per tenant, so the
-    /// default tenant A's never answers a lookup for B, and a request carrying
-    /// A's bearer for target B is refused before it can be sent. The old read
-    /// went through ONE process-wide default-credential slot.
+    /// Tests bullet 2. On a runner whose default credential claims A and which
+    /// holds B's own slot, the one-session work-status read for tenant B is
+    /// built under B's scope and presents B's credential — the old read went
+    /// through ONE process-wide default-credential slot, so it presented A's.
     #[test]
-    fn the_work_status_read_for_tenant_b_presents_bs_credential_never_as() {
+    fn the_work_status_read_for_tenant_b_presents_bs_credential_not_the_defaults() {
         let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let now = std::time::Instant::now();
-        tenant_credential_store(
-            Some(a),
-            now,
-            "https://ws-a.example".into(),
-            bearer_claiming(a),
+        let _runner = crate::mcp::policy_tenant::test_support::two_tenant_runner(a, b);
+        let request = build_work_status_get(
+            &reqwest::Client::new(),
+            work_status_url("https://coord.example.com", "x"),
+            owned(b),
+            None,
+        )
+        .expect("B's credential is presented for B");
+        assert_eq!(
+            crate::mcp::policy_tenant::presented_claim(request.headers()),
+            Some(b)
         );
-        tenant_credential_store(
-            Some(b),
-            now,
-            "https://ws-b.example".into(),
-            bearer_claiming(b),
-        );
+    }
 
-        let (base_b, auth_b) = tenant_credential_lookup(Some(b), now).expect("B's own slot");
-        assert_eq!(base_b, "https://ws-b.example");
+    /// Review A8. The reusable credential is keyed per `(coord base, tenant)`:
+    /// the default tenant A's never answers a lookup for B, neither does B's
+    /// under another base, and a request carrying A's cached bearer for target
+    /// B is refused before it can be sent.
+    #[test]
+    fn the_reused_credential_is_keyed_per_base_and_tenant() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let base = "https://ws-cache.example";
+        let now = std::time::Instant::now();
+        tenant_credential_store(base, Some(a), now, bearer_claiming(a));
+        tenant_credential_store(base, Some(b), now, bearer_claiming(b));
+
+        let auth_b = tenant_credential_lookup(base, Some(b), now).expect("B's own slot");
         assert!(auth_b.is_sensitive(), "a cached bearer never prints");
         let request = build_work_status_get(
             &reqwest::Client::new(),
-            work_status_url(&base_b, "x"),
+            work_status_url(base, "x"),
             owned(b),
             Some(auth_b),
         )
@@ -1576,10 +1577,10 @@ mod tests {
             Some(b)
         );
 
-        let (_, auth_a) = tenant_credential_lookup(Some(a), now).expect("A's own slot");
+        let auth_a = tenant_credential_lookup(base, Some(a), now).expect("A's own slot");
         let refused = build_work_status_get(
             &reqwest::Client::new(),
-            work_status_url(&base_b, "x"),
+            work_status_url(base, "x"),
             owned(b),
             Some(auth_a),
         )
@@ -1587,11 +1588,20 @@ mod tests {
         assert!(refused.contains(&format!("claims tenant {a}")), "{refused}");
 
         assert_eq!(
-            tenant_credential_lookup(Some(uuid::Uuid::new_v4()), now),
+            tenant_credential_lookup("https://another-coord.example", Some(b), now),
+            None,
+            "a credential resolved for one coord is never sent to another"
+        );
+        assert_eq!(
+            tenant_credential_lookup(base, Some(uuid::Uuid::new_v4()), now),
             None
         );
         assert_eq!(
-            tenant_credential_lookup(Some(b), now + CREDENTIAL_REUSE + Duration::from_secs(1)),
+            tenant_credential_lookup(
+                base,
+                Some(b),
+                now + CREDENTIAL_REUSE + Duration::from_secs(1)
+            ),
             None,
             "a credential is reused only for CREDENTIAL_REUSE"
         );
@@ -1623,7 +1633,11 @@ mod tests {
             "{note}"
         );
         assert_eq!(
-            tenant_credential_lookup(Some(t), std::time::Instant::now()),
+            tenant_credential_lookup(
+                &crate::mcp::continuation_verdict::coord_base(),
+                Some(t),
+                std::time::Instant::now()
+            ),
             None,
             "a failure is never cached"
         );
