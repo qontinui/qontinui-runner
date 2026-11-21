@@ -191,6 +191,9 @@ async fn refuse_headless(
                 uuid::Uuid::new_v4(),
                 Some(f.ctx),
                 &super::LaunchFrame::default(),
+                crate::session::run_record_emitter::SpawnFacts::new(
+                    crate::coord_drain_state::SpawnOrigin::GateContinuation,
+                ),
             )
             .await;
             (res, OBSERVED_REMOVAL.with(|slot| slot.borrow_mut().take()))

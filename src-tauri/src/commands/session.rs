@@ -108,13 +108,29 @@ fn map_err(e: SessionError) -> String {
 /// follow-up calls (focus/close/describe/steal) by id.
 #[tauri::command]
 pub fn session_start(
+    app: tauri::AppHandle,
     registry: tauri::State<'_, Arc<SessionRegistry>>,
     args: StartSessionArgs,
 ) -> Result<CommandResponse, String> {
     let intent: Intent = args.into();
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the session's terminal exists.
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     match registry.inner().start(intent) {
         Ok(handle) => {
             let id = handle.id();
+            // The runner UI's own session start: stamp the facts on the PTY
+            // record it opened (a non-PTY transport has none to stamp).
+            if let Some(terminal_id) = registry.inner().pty_terminal_id(id) {
+                crate::session::run_record_emitter::stamp_spawn_facts(
+                    &app,
+                    &terminal_id,
+                    crate::session::run_record_emitter::SpawnFacts::new(
+                        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+                    ),
+                    spawn_since,
+                );
+            }
             Ok(CommandResponse {
                 success: true,
                 message: None,

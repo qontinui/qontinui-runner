@@ -2548,6 +2548,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 
@@ -3074,6 +3076,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3284,6 +3288,8 @@ mod tests {
                     gate_id: None,
                     gate_consuming_device_id: None,
                     gate_bound_boot_ms: None,
+                    spawn: None,
+                    run: Default::default(),
                 });
             };
             let hook = |id: &str, source: &str| {
@@ -3387,6 +3393,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3481,6 +3489,8 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            spawn: None,
+            run: Default::default(),
         });
 
         let req = SessionOpenRequest {
