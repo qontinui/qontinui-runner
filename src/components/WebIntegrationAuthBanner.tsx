@@ -224,7 +224,9 @@ export function WebIntegrationAuthBanner() {
     const fetchStatus = () => {
       // Reads overlap (mount + each `web-integration-changed`) and may settle
       // out of order; only the most recently ISSUED read may set state, so
-      // "the latest read failed" means exactly that.
+      // "the latest read failed" means exactly that. A superseded effect
+      // run's listener must not bump the counter and drop the live run's read.
+      if (cancelled) return;
       const seq = ++statusReadSeq.current;
       invoke<AuthBannerStatus & SavedBackendStatus>("get_web_integration_status")
         .then((next) => {
@@ -528,9 +530,12 @@ export function WebIntegrationAuthBanner() {
   // CAUSE rather than one generic sentence.
   if (credentialDark?.dark) {
     const presentation = credentialDarkPresentation(credentialDark, undefined, showSwitcher);
-    const busy =
-      presentation.ctaAction === "cognito_sign_in" ? authorizing || signInTargetUnknown : reKicking;
+    const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
+    // A sign-in CTA is PAUSED (not busy) while the saved backend settings are
+    // unknown, and says why.
+    const ctaPaused = presentation.ctaAction === "cognito_sign_in" && signInTargetUnknown;
     const ctaError =
+      (ctaPaused ? SIGN_IN_TARGET_UNKNOWN : null) ??
       (presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError) ??
       retryRefreshError ??
       (presentation.showSwitchTenant ? switchTenantError : null);
@@ -623,7 +628,8 @@ export function WebIntegrationAuthBanner() {
             onClick={() => {
               void handleCredentialCta(presentation.ctaAction!);
             }}
-            disabled={busy}
+            disabled={busy || ctaPaused}
+            title={ctaPaused ? SIGN_IN_TARGET_UNKNOWN : undefined}
             style={{
               background: "var(--accent, #6366f1)",
               color: "#fff",
@@ -632,8 +638,8 @@ export function WebIntegrationAuthBanner() {
               padding: "4px 10px",
               fontSize: "0.8125rem",
               fontWeight: 600,
-              cursor: busy ? "wait" : "pointer",
-              opacity: busy ? 0.7 : 1,
+              cursor: busy ? "wait" : ctaPaused ? "not-allowed" : "pointer",
+              opacity: busy || ctaPaused ? 0.7 : 1,
               whiteSpace: "nowrap",
             }}
           >

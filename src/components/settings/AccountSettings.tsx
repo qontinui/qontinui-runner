@@ -254,8 +254,13 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
   }, [onLog]);
 
   const handleCognitoSignIn = useCallback(async () => {
-    // Disabled until the status read lands (SignedOutPanel), so a null here is
-    // a race only; the rule still answers it (production).
+    // The button is disabled until a status read lands (SignedOutPanel); the
+    // handler refuses too, so an unknown target is never guessed as
+    // production (finalize_signed_in would write it over a saved backend).
+    if (backendStatus === null) {
+      setFlowError("Could not read the saved backend settings; sign-in is paused until they load.");
+      return;
+    }
     const backendUrl = signInBackendUrlFrom(backendStatus, "operator");
     setCognitoState("signing-in");
     setFlowError(null);

@@ -65,6 +65,17 @@ let host: HTMLDivElement;
 let root: Root;
 /** What the next `get_web_integration_status` read answers: a status, an Error to reject, or a pending Promise. */
 let statusReply: unknown;
+/** What `get_coord_credential_posture` answers; `null` (no concluded pass) keeps the credential-dark banner out. */
+let postureReply: unknown;
+
+/** A concluded posture pass whose credential cannot answer coord and whose remedy is a sign-in. */
+const DARK_SIGN_IN_POSTURE = {
+  posture: "expired",
+  canAnswer: false,
+  cta: "sign_in",
+  reason: "The coord device credential expired.",
+  since: null,
+};
 
 function emit(event: string, payload: unknown = null) {
   for (const h of listeners.get(event) ?? []) h({ payload });
@@ -73,6 +84,7 @@ function emit(event: string, payload: unknown = null) {
 beforeEach(() => {
   listeners.clear();
   sessionStorage.clear();
+  postureReply = null;
   invokeMock.mockReset();
   invokeMock.mockImplementation((cmd: string) => {
     switch (cmd) {
@@ -84,9 +96,9 @@ beforeEach(() => {
       // Unpaired: the "Connect this runner" banner with Authorize is shown.
       case "device_jwt_present":
         return Promise.resolve(false);
-      // No concluded posture pass — the credential-dark banner stays out.
+      // Default: no concluded posture pass — the credential-dark banner stays out.
       case "get_coord_credential_posture":
-        return Promise.resolve(null);
+        return Promise.resolve(postureReply);
       // No sign-in pending in the browser — the pending notice stays quiet.
       case "cognito_pending_sign_in":
         return Promise.resolve(null);
@@ -222,5 +234,66 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     });
     await act(async () => {});
     expect(await clickAuthorize()).toBe("http://127.0.0.1:8000");
+  });
+});
+
+const SIGN_IN_TARGET_UNKNOWN_TEXT =
+  "Could not read the saved backend settings, so sign-in is paused until the next successful read.";
+
+function credentialCta(): HTMLButtonElement {
+  // The credential-dark banner (role=alert) is shown, not the "Connect this runner" one.
+  const alert = host.querySelector('[role="alert"]');
+  expect(alert).not.toBeNull();
+  expect(alert!.textContent).toContain("The coord device credential expired.");
+  const buttons = Array.from(alert!.querySelectorAll("button"));
+  expect(buttons.some((b) => b.textContent === "Authorize")).toBe(false);
+  const cta = buttons.find((b) => b.textContent === "Sign in" || b.textContent === "Working…");
+  expect(cta).toBeDefined();
+  return cta!;
+}
+
+function signInCalls() {
+  return invokeMock.mock.calls.filter(([cmd]) => cmd === "cognito_sign_in");
+}
+
+describe("WebIntegrationAuthBanner credential-dark sign-in CTA target (operator surface)", () => {
+  it("signs in against the saved loopback backend from the credential-dark CTA in a debug build", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    const cta = credentialCta();
+    expect(cta.disabled).toBe(false);
+    await act(async () => {
+      cta.click();
+    });
+    await act(async () => {});
+    const calls = signInCalls();
+    expect(calls.length).toBe(1);
+    expect((calls[0][1] as { backendUrl?: string }).backendUrl).toBe("http://127.0.0.1:8000");
+  });
+
+  it("pauses the credential-dark CTA after a failed status re-read and says why, not 'Working…'", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    expect(credentialCta().disabled).toBe(false);
+    statusReply = new Error("get_web_integration_status failed");
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {});
+    const cta = credentialCta();
+    expect(cta.disabled).toBe(true);
+    expect(cta.textContent).toBe("Sign in");
+    expect(cta.textContent).not.toBe("Working…");
+    expect(cta.title).toBe(SIGN_IN_TARGET_UNKNOWN_TEXT);
+    expect(host.querySelector('[role="alert"]')!.textContent).toContain(
+      SIGN_IN_TARGET_UNKNOWN_TEXT,
+    );
+    await act(async () => {
+      cta.click();
+    });
+    await act(async () => {});
+    expect(signInCalls().length).toBe(0);
   });
 });
