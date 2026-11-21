@@ -4,12 +4,12 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 186
+# total: 189
 #   guarded: 26
 #   literal: 60
 #   registry: 43
 #   delegated: 9
-#   builtin: 15
+#   builtin: 18
 #   fixture: 33
 
 src/App.tsx	literal	component	complete	schema=no	arity=0	effect=write
@@ -183,6 +183,9 @@ src/components/terminal/terminalLaunchMenuActions.ts	guarded	free	create-ai-sess
 src/components/terminal/terminalLaunchMenuActions.ts	guarded	free	create-best-account	schema=yes	arity=-	effect=destructive
 src/components/terminal/terminalLaunchMenuActions.ts	guarded	free	create-with-command	schema=yes	arity=-	effect=destructive
 src/hooks/changeTrackingHandler.test.ts	builtin	element	click	schema=no	arity=-	effect=-
+src/hooks/ui-bridge-events/recoveryScope.test.ts	builtin	element	click	schema=no	arity=-	effect=-
+src/hooks/ui-bridge-events/recoveryScope.test.ts	builtin	element	focus	schema=no	arity=-	effect=-
+src/hooks/ui-bridge-events/recoveryScope.test.ts	builtin	element	type	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/usePageEvents.ts	delegated	component	map	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/utils.ts	delegated	component	map	schema=no	arity=-	effect=-
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx	literal	component	open-advanced-controls	schema=no	arity=0	effect=read
