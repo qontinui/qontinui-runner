@@ -23,9 +23,10 @@ use crate::mcp::adb_helper;
 /// no subprocess fallback is needed.
 ///
 /// `Clone` is cheap — both registries are `Arc<Mutex<_>>` shared across clones.
-/// We rely on cloning so the shutdown handler in `main.rs` can call
-/// `release_all` on the same forward/reverse registries the USB scanner task
-/// owns.
+/// We rely on cloning so the shutdown handler (`mcp/ai_session.rs`) can call
+/// `release_all` on the same forward/reverse registries the USB scanner
+/// (`usb_scanner.rs`) drives — every supervised run of it holds a clone of the
+/// one transport published into `AppState::usb_transport`.
 #[derive(Clone)]
 pub struct UsbTransport {
     /// Maps ADB serial number → locally forwarded TCP port.
