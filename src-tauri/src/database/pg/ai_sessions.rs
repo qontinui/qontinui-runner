@@ -4,6 +4,15 @@ use super::PgDb;
 use crate::database::types::AiSessionSummary;
 use tracing::info;
 
+/// One attempt on a `workflow_ai_sessions` row: the row and the
+/// `session_started_at` (epoch microseconds) its create stamped. A resume
+/// re-uses the row and the CLI id but gets a new `started_at_us`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowAiSessionAttempt {
+    pub row_id: i64,
+    pub started_at_us: i64,
+}
+
 impl PgDb {
     /// Get recent AI sessions (chat-type task runs) for the sidebar.
     #[expect(
@@ -190,8 +199,10 @@ impl PgDb {
             .collect())
     }
 
-    /// Create (or upsert) a workflow AI session record.
-    /// Returns the row ID of the inserted/updated session.
+    /// Create (or upsert) a workflow AI session record -- one ATTEMPT on its
+    /// key. Every call (a first run, a resume under the same CLI id, the
+    /// resume-failed fallback) stamps a fresh `session_started_at`, so the
+    /// returned [`WorkflowAiSessionAttempt`] names this attempt and no other.
     #[expect(
         clippy::disallowed_methods,
         reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
@@ -203,7 +214,7 @@ impl PgDb {
         phase: &str,
         stage_index: Option<i32>,
         claude_cli_session_id: &str,
-    ) -> Result<i64, String> {
+    ) -> Result<WorkflowAiSessionAttempt, String> {
         let conn = self
             .pool
             .get()
@@ -224,37 +235,47 @@ impl PgDb {
             .await
             .map_err(|e| crate::database::pg::pg_err("PG create_workflow_ai_session query", &e))?;
 
-        let row_id: i64 = if let Some(row) = existing {
+        let attempt = if let Some(row) = existing {
             let id: i64 = row.get(0);
-            conn.execute(
-                r#"UPDATE workflow_ai_sessions
-                   SET claude_cli_session_id = $1, session_started_at = NOW(),
-                       session_completed_at = NULL, output_length = 0, status = 'running'
-                   WHERE id = $2"#,
-                &[&claude_cli_session_id, &id],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG create_workflow_ai_session update", &e))?;
-            id
+            let row = conn
+                .query_one(
+                    r#"UPDATE workflow_ai_sessions
+                       SET claude_cli_session_id = $1, session_started_at = clock_timestamp(),
+                           session_completed_at = NULL, output_length = 0, status = 'running'
+                       WHERE id = $2
+                       RETURNING (EXTRACT(EPOCH FROM session_started_at) * 1000000)::bigint"#,
+                    &[&claude_cli_session_id, &id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::database::pg::pg_err("PG create_workflow_ai_session update", &e)
+                })?;
+            WorkflowAiSessionAttempt {
+                row_id: id,
+                started_at_us: row.get(0),
+            }
         } else {
             let row = conn
                 .query_one(
                     r#"INSERT INTO workflow_ai_sessions
                        (task_run_id, iteration, phase, stage_index, claude_cli_session_id, session_started_at, status)
-                       VALUES ($1, $2, $3, $4, $5, NOW(), 'running')
-                       RETURNING id"#,
+                       VALUES ($1, $2, $3, $4, $5, clock_timestamp(), 'running')
+                       RETURNING id, (EXTRACT(EPOCH FROM session_started_at) * 1000000)::bigint"#,
                     &[&task_run_id, &iteration, &phase, &stage_index, &claude_cli_session_id],
                 )
                 .await
                 .map_err(|e| crate::database::pg::pg_err("PG create_workflow_ai_session insert", &e))?;
-            row.get(0)
+            WorkflowAiSessionAttempt {
+                row_id: row.get(0),
+                started_at_us: row.get(1),
+            }
         };
 
         info!(
             "Created workflow AI session: task={}, iter={}, phase={}, cli_session={}",
             task_run_id, iteration, phase, claude_cli_session_id
         );
-        Ok(row_id)
+        Ok(attempt)
     }
 
     /// Mark a workflow AI session with its terminal status.
@@ -301,21 +322,17 @@ impl PgDb {
         Ok(())
     }
 
-    /// Write the abandoned status `status` ONLY while the row is still
-    /// `running` AND still owned by `claude_cli_session_id`, on the same
-    /// `(task_run_id, iteration, phase, COALESCE(stage_index, -1))` key
-    /// `complete_workflow_ai_session` uses. The abandoned-phase write: it
-    /// never overwrites a terminal status already committed (an abort that
-    /// lands after the terminal write), nor a later attempt's row -- finished
-    /// or still running -- since a re-create stamps that attempt's own CLI
-    /// session id. Returns the number of rows changed.
-    pub async fn fail_workflow_ai_session_if_running(
+    /// Write `status` ONLY while the row still holds `attempt` -- the row id
+    /// and the `session_started_at` that [`Self::create_workflow_ai_session`]
+    /// returned for it -- AND is still `running`. The abandoned-phase write:
+    /// it never overwrites a terminal status already committed (an abort that
+    /// lands after the terminal write), nor any LATER attempt on the same
+    /// row, finished or still running -- a resume under the same CLI id and
+    /// the fallback's re-create under a fresh one included, since every create
+    /// stamps a fresh `session_started_at`. Returns the number of rows changed.
+    pub async fn set_workflow_ai_session_status_if_running_attempt(
         &self,
-        task_run_id: &str,
-        iteration: i32,
-        phase: &str,
-        stage_index: Option<i32>,
-        claude_cli_session_id: &str,
+        attempt: WorkflowAiSessionAttempt,
         status: &str,
     ) -> Result<u64, String> {
         let conn = self
@@ -323,25 +340,18 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let coalesced_stage = stage_index.unwrap_or(-1);
         conn.execute(
             r#"UPDATE workflow_ai_sessions
                SET status = $1, session_completed_at = NOW()
-               WHERE task_run_id = $2 AND iteration = $3 AND phase = $4
-                 AND COALESCE(stage_index, -1) = $5
-                 AND claude_cli_session_id = $6
+               WHERE id = $2
+                 AND (EXTRACT(EPOCH FROM session_started_at) * 1000000)::bigint = $3
                  AND status = 'running'"#,
-            &[
-                &status,
-                &task_run_id,
-                &iteration,
-                &phase,
-                &coalesced_stage,
-                &claude_cli_session_id,
-            ],
+            &[&status, &attempt.row_id, &attempt.started_at_us],
         )
         .await
-        .map_err(|e| crate::database::pg::pg_err("PG fail_workflow_ai_session_if_running", &e))
+        .map_err(|e| {
+            crate::database::pg::pg_err("PG set_workflow_ai_session_status_if_running_attempt", &e)
+        })
     }
 
     /// Create a new session (orchestration session).
@@ -560,62 +570,90 @@ mod workflow_ai_session_tests {
         assert_eq!(got, expected);
     }
 
-    /// The abandoned-phase write changes a `running` row it owns to `failed`,
-    /// and leaves alone a row that already holds a terminal status and a
-    /// running row now owned by a later attempt's CLI session.
+    /// The abandoned-phase write changes only the `running` row of its OWN
+    /// attempt: a completed row, a later attempt under another CLI id, and a
+    /// RESUMED attempt under the same CLI id are all left alone.
     #[tokio::test]
-    async fn fail_if_running_only_touches_a_running_row() {
+    async fn status_if_running_attempt_only_touches_its_own_running_attempt() {
         let pg = fresh_db_with_task_run().await;
-        pg.create_workflow_ai_session(TASK, 4, PHASE, Some(0), "cli-done")
+        let done = pg
+            .create_workflow_ai_session(TASK, 4, PHASE, Some(0), "cli-done")
             .await
             .expect("create done");
         pg.complete_workflow_ai_session(TASK, 4, PHASE, Some(0), "completed", 7)
             .await
             .expect("complete");
-        pg.create_workflow_ai_session(TASK, 4, PHASE, Some(1), "cli-live")
-            .await
-            .expect("create live");
-
         let changed = pg
-            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(0), "cli-done", "failed")
+            .set_workflow_ai_session_status_if_running_attempt(done, "failed")
             .await
-            .expect("fail done");
+            .expect("write done");
         assert_eq!(changed, 0, "a completed row must not be overwritten");
-        let done = pg
-            .get_workflow_ai_session(TASK, 4, PHASE, Some(0))
-            .await
-            .expect("get done");
         assert_eq!(
-            done,
+            pg.get_workflow_ai_session(TASK, 4, PHASE, Some(0))
+                .await
+                .expect("get done"),
             Some(("cli-done".to_string(), "completed".to_string()))
         );
 
-        // A drop from an EARLIER attempt on the same key: the live row now
-        // belongs to "cli-live", so nothing changes.
-        let changed = pg
-            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(1), "cli-stale", "failed")
+        // A later attempt under ANOTHER CLI id.
+        let stale = pg
+            .create_workflow_ai_session(TASK, 4, PHASE, Some(1), "cli-stale")
             .await
-            .expect("fail stale");
+            .expect("create stale");
+        pg.create_workflow_ai_session(TASK, 4, PHASE, Some(1), "cli-live")
+            .await
+            .expect("create live");
+        let changed = pg
+            .set_workflow_ai_session_status_if_running_attempt(stale, "failed")
+            .await
+            .expect("write stale");
         assert_eq!(
             changed, 0,
-            "a later attempt's running row must not be failed"
+            "another CLI id's running row must not be failed"
         );
-        let live = pg
-            .get_workflow_ai_session(TASK, 4, PHASE, Some(1))
-            .await
-            .expect("get live");
-        assert_eq!(live, Some(("cli-live".to_string(), "running".to_string())));
+        assert_eq!(
+            pg.get_workflow_ai_session(TASK, 4, PHASE, Some(1))
+                .await
+                .expect("get live"),
+            Some(("cli-live".to_string(), "running".to_string()))
+        );
 
+        // A RESUMED attempt under the SAME CLI id: same row, same id, new
+        // session_started_at.
+        let first = pg
+            .create_workflow_ai_session(TASK, 4, PHASE, Some(2), "cli-same")
+            .await
+            .expect("create first");
+        let resumed = pg
+            .create_workflow_ai_session(TASK, 4, PHASE, Some(2), "cli-same")
+            .await
+            .expect("create resumed");
+        assert_eq!(first.row_id, resumed.row_id);
+        assert_ne!(first.started_at_us, resumed.started_at_us);
         let changed = pg
-            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(1), "cli-live", "failed")
+            .set_workflow_ai_session_status_if_running_attempt(first, "failed")
             .await
-            .expect("fail live");
+            .expect("write prior attempt");
+        assert_eq!(changed, 0, "the prior attempt must not fail a resumed one");
+        assert_eq!(
+            pg.get_workflow_ai_session(TASK, 4, PHASE, Some(2))
+                .await
+                .expect("get resumed"),
+            Some(("cli-same".to_string(), "running".to_string()))
+        );
+
+        // Its own running attempt changes.
+        let changed = pg
+            .set_workflow_ai_session_status_if_running_attempt(resumed, "failed")
+            .await
+            .expect("write own attempt");
         assert_eq!(changed, 1);
-        let live = pg
-            .get_workflow_ai_session(TASK, 4, PHASE, Some(1))
-            .await
-            .expect("get live");
-        assert_eq!(live, Some(("cli-live".to_string(), "failed".to_string())));
+        assert_eq!(
+            pg.get_workflow_ai_session(TASK, 4, PHASE, Some(2))
+                .await
+                .expect("get own"),
+            Some(("cli-same".to_string(), "failed".to_string()))
+        );
     }
 
     /// A terminal status written by `complete_workflow_ai_session` is what the

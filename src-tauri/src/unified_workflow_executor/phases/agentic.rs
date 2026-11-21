@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
+use crate::database::pg::ai_sessions::WorkflowAiSessionAttempt;
 use crate::database::CreateTaskRunEventInput;
 use crate::executor::timeout_helper;
 use crate::step_executor::ExecutionStepConfig;
@@ -1191,8 +1192,10 @@ impl AgenticExecutor {
             is_resume,
         });
 
-        // Record the AI session in the database for restart recovery
-        if let Err(e) = self
+        // Record the AI session in the database for restart recovery. The
+        // returned attempt marker scopes the guard's abandoned write to THIS
+        // attempt (a resume re-uses the CLI id but gets a new marker).
+        let attempt = match self
             .app_state
             .pg_db
             .create_workflow_ai_session(
@@ -1204,8 +1207,12 @@ impl AgenticExecutor {
             )
             .await
         {
-            warn!("PG create_workflow_ai_session failed: {}", e);
-        }
+            Ok(attempt) => Some(attempt),
+            Err(e) => {
+                warn!("PG create_workflow_ai_session failed: {}", e);
+                None
+            }
+        };
         // Armed until the terminal write: a cancelled (JoinHandle::abort) or
         // panicking phase drops it armed and it best-effort writes `failed`.
         let mut session_guard = WorkflowAiSessionGuard::arm(
@@ -1215,6 +1222,7 @@ impl AgenticExecutor {
             iteration as i32,
             config.stage_index.map(|i| i as i32),
             &cli_session_id,
+            attempt,
         );
 
         // Attach DB flush context for periodic output persistence
@@ -1278,8 +1286,9 @@ impl AgenticExecutor {
                 cli_session_id: fresh_cli_id.clone(),
                 is_resume: false,
             });
-            // Update the DB record with the new session ID
-            match self
+            // Update the DB record with the new session ID; the guard follows
+            // the new attempt only when that re-create succeeded.
+            let created = self
                 .app_state
                 .pg_db
                 .create_workflow_ai_session(
@@ -1289,14 +1298,8 @@ impl AgenticExecutor {
                     config.stage_index.map(|i| i as i32),
                     &fresh_cli_id,
                 )
-                .await
-            {
-                // The row now belongs to the fresh CLI session; the guard's
-                // abandoned write is scoped to it. On Err the row keeps the
-                // id the guard already holds.
-                Ok(_) => session_guard.rekey_cli_session(&fresh_cli_id),
-                Err(e) => warn!("PG create fallback workflow AI session failed: {}", e),
-            }
+                .await;
+            rekey_after_fallback_create(&mut session_guard, &fresh_cli_id, created);
             // Retry with the full enhanced prompt
             let (retry_result, retry_duration) = timeout_helper::timed_result_async(
                 self.ai_executor
@@ -1784,55 +1787,20 @@ fn cost_stop_terminal(
 /// so a cancelled or panicked phase is never resumed.
 pub(crate) const ABANDONED_SESSION_STATUS: &str = "failed";
 
-/// Holds one phase's `workflow_ai_sessions` key -- and the CLI session that
-/// owns the row -- from its create until its terminal write
-/// ([`WorkflowAiSessionGuard::write_terminal`] disarms it on success).
-/// Dropped while still ARMED -- the phase future was cancelled
-/// (`JoinHandle::abort`, `unified_workflow_executor/mod.rs`) or a panic
-/// unwound through it, or its terminal write itself failed -- it best-effort
-/// spawns a CONDITIONAL [`ABANDONED_SESSION_STATUS`] write
-/// (`fail_workflow_ai_session_if_running`: only a row still `running` AND
-/// still owned by this guard's CLI session changes) on the current tokio
-/// runtime, the way `WorkflowDropGuard` releases its locks. That spawn cannot
-/// run when the runtime is itself shutting down or the process is killed, so
-/// those rows stay `running` -- which is exactly the restart case resume
-/// exists for.
-pub(crate) struct WorkflowAiSessionGuard {
-    pg_db: std::sync::Arc<crate::database::pg::PgDb>,
-    session_phase: &'static str,
-    task_run_id: String,
-    iteration: i32,
-    stage_index: Option<i32>,
-    cli_session_id: String,
+/// The armed/disarmed state of a [`WorkflowAiSessionGuard`], with no
+/// database attached, so the disarm decision is testable on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionGuardState {
     armed: bool,
     terminal_write_failed: bool,
 }
 
-impl WorkflowAiSessionGuard {
-    pub(crate) fn arm(
-        pg_db: std::sync::Arc<crate::database::pg::PgDb>,
-        session_phase: &'static str,
-        task_run_id: &str,
-        iteration: i32,
-        stage_index: Option<i32>,
-        cli_session_id: &str,
-    ) -> Self {
+impl SessionGuardState {
+    pub(crate) fn armed() -> Self {
         Self {
-            pg_db,
-            session_phase,
-            task_run_id: task_run_id.to_string(),
-            iteration,
-            stage_index,
-            cli_session_id: cli_session_id.to_string(),
             armed: true,
             terminal_write_failed: false,
         }
-    }
-
-    /// Re-point the guard at the CLI session that now owns the row (the
-    /// resume-failed fallback re-creates it under a fresh id).
-    pub(crate) fn rekey_cli_session(&mut self, cli_session_id: &str) {
-        self.cli_session_id = cli_session_id.to_string();
     }
 
     /// The status a drop would write now: `Some` only while armed.
@@ -1851,9 +1819,9 @@ impl WorkflowAiSessionGuard {
         }
     }
 
-    /// Apply the terminal write's result: `Ok` disarms; `Err` leaves the
-    /// guard ARMED (so its drop retries with the conditional abandoned write)
-    /// and records that the write failed.
+    /// Apply the terminal write's result: `Ok` disarms; `Err` stays ARMED (so
+    /// the drop retries with the conditional abandoned write) and records
+    /// that the write failed.
     pub(crate) fn settle(&mut self, result: Result<(), String>) -> Result<(), String> {
         match result {
             Ok(()) => {
@@ -1866,9 +1834,70 @@ impl WorkflowAiSessionGuard {
             }
         }
     }
+}
 
-    /// Write the phase's terminal `status` under the guard's key and
-    /// [`settle`](Self::settle) the guard on the result.
+/// Holds one phase's `workflow_ai_sessions` ATTEMPT -- its key, its CLI
+/// session id, and the attempt marker its create returned -- from that create
+/// until its terminal write ([`WorkflowAiSessionGuard::write_terminal`]
+/// disarms it on success). Dropped while still ARMED -- the phase future was
+/// cancelled (`JoinHandle::abort`, `unified_workflow_executor/mod.rs`) or a
+/// panic unwound through it, or its terminal write itself failed -- it
+/// best-effort spawns a CONDITIONAL [`ABANDONED_SESSION_STATUS`] write
+/// (`set_workflow_ai_session_status_if_running_attempt`: only a row still
+/// `running` AND still holding this attempt's row id and start stamp
+/// changes, so a later attempt -- even a resume under the same CLI id -- is
+/// never touched) on the current
+/// tokio runtime, the way `WorkflowDropGuard` releases its locks. A guard
+/// whose create failed holds no attempt and writes nothing. The spawn cannot
+/// run when the runtime is itself shutting down or the process is killed, so
+/// those rows stay `running` -- which is exactly the restart case resume
+/// exists for.
+pub(crate) struct WorkflowAiSessionGuard {
+    pg_db: std::sync::Arc<crate::database::pg::PgDb>,
+    session_phase: &'static str,
+    task_run_id: String,
+    iteration: i32,
+    stage_index: Option<i32>,
+    cli_session_id: String,
+    attempt: Option<WorkflowAiSessionAttempt>,
+    state: SessionGuardState,
+}
+
+impl WorkflowAiSessionGuard {
+    pub(crate) fn arm(
+        pg_db: std::sync::Arc<crate::database::pg::PgDb>,
+        session_phase: &'static str,
+        task_run_id: &str,
+        iteration: i32,
+        stage_index: Option<i32>,
+        cli_session_id: &str,
+        attempt: Option<WorkflowAiSessionAttempt>,
+    ) -> Self {
+        Self {
+            pg_db,
+            session_phase,
+            task_run_id: task_run_id.to_string(),
+            iteration,
+            stage_index,
+            cli_session_id: cli_session_id.to_string(),
+            attempt,
+            state: SessionGuardState::armed(),
+        }
+    }
+
+    /// Re-point the guard at the attempt that now owns the row.
+    pub(crate) fn rekey(&mut self, cli_session_id: &str, attempt: WorkflowAiSessionAttempt) {
+        self.cli_session_id = cli_session_id.to_string();
+        self.attempt = Some(attempt);
+    }
+
+    /// The status a drop would write now: `Some` only while armed.
+    pub(crate) fn drop_write(&self) -> Option<&'static str> {
+        self.state.drop_write()
+    }
+
+    /// Write the phase's terminal `status` under the guard's key and settle
+    /// its state on the result ([`SessionGuardState::settle`]).
     pub(crate) async fn write_terminal(
         &mut self,
         status: &'static str,
@@ -1885,22 +1914,47 @@ impl WorkflowAiSessionGuard {
                 output_len,
             )
             .await;
-        self.settle(result)
+        self.state.settle(result)
+    }
+}
+
+/// The resume-failed fallback re-creates the row under `fresh_cli_id`: on
+/// success the guard follows the NEW attempt; on failure the row keeps the
+/// attempt the guard already holds.
+pub(crate) fn rekey_after_fallback_create(
+    guard: &mut WorkflowAiSessionGuard,
+    fresh_cli_id: &str,
+    created: Result<WorkflowAiSessionAttempt, String>,
+) {
+    match created {
+        Ok(attempt) => guard.rekey(fresh_cli_id, attempt),
+        Err(e) => warn!("PG create fallback workflow AI session failed: {}", e),
     }
 }
 
 impl Drop for WorkflowAiSessionGuard {
     fn drop(&mut self) {
-        let Some(status) = self.drop_write() else {
+        let Some(status) = self.state.drop_write() else {
+            return;
+        };
+        let Some(attempt) = self.attempt else {
+            warn!(
+                "AGENTIC-PHASE: {} session {} for task {} iteration {} {} -- no attempt marker (its create failed), so no row is written",
+                self.session_phase,
+                self.cli_session_id,
+                self.task_run_id,
+                self.iteration,
+                self.state.drop_reason()
+            );
             return;
         };
         warn!(
-            "AGENTIC-PHASE: {} session {} for task {} iteration {} {} -- recording {} if still running",
+            "AGENTIC-PHASE: {} session {} for task {} iteration {} {} -- recording {} if this attempt is still running",
             self.session_phase,
             self.cli_session_id,
             self.task_run_id,
             self.iteration,
-            self.drop_reason(),
+            self.state.drop_reason(),
             status
         );
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -1908,24 +1962,13 @@ impl Drop for WorkflowAiSessionGuard {
             return;
         };
         let pg = self.pg_db.clone();
-        let (phase, task, iteration, stage, cli) = (
-            self.session_phase,
-            self.task_run_id.clone(),
-            self.iteration,
-            self.stage_index,
-            self.cli_session_id.clone(),
-        );
-        // Conditional on the row still being `running` under this guard's
-        // CLI session: an abort that lands after the terminal write
-        // committed, or a drop that runs late against a later attempt's row
-        // (finished or still running), changes nothing.
         handle.spawn(async move {
             if let Err(e) = pg
-                .fail_workflow_ai_session_if_running(&task, iteration, phase, stage, &cli, status)
+                .set_workflow_ai_session_status_if_running_attempt(attempt, status)
                 .await
             {
                 warn!(
-                    "PG fail_workflow_ai_session_if_running (abandoned) failed: {}",
+                    "PG set_workflow_ai_session_status_if_running_attempt (abandoned) failed: {}",
                     e
                 );
             }
@@ -2135,6 +2178,29 @@ mod tests {
         assert_eq!(outcome_output_len(&stop), 4);
     }
 
+    /// A FAILED terminal write leaves the guard armed, so its drop still
+    /// retries with the conditional abandoned write, and the drop's log names
+    /// the failed write rather than a cancellation; an Ok write disarms.
+    #[test]
+    fn failed_terminal_write_leaves_the_guard_armed() {
+        let mut state = SessionGuardState::armed();
+        assert_eq!(
+            state.drop_reason(),
+            "was cancelled before its terminal write"
+        );
+        assert!(state
+            .settle(Err("PG pool error: boom".to_string()))
+            .is_err());
+        assert_eq!(
+            state.drop_write(),
+            Some(ABANDONED_SESSION_STATUS),
+            "an Err terminal write must leave the guard armed"
+        );
+        assert_eq!(state.drop_reason(), "had its terminal write fail");
+        state.settle(Ok(())).expect("ok");
+        assert_eq!(state.drop_write(), None, "an Ok terminal write must disarm");
+    }
+
     #[test]
     fn verifier_and_worker_sessions_have_distinct_keys() {
         assert_eq!(session_phase_for(AgenticRole::Worker), "agentic");
@@ -2152,8 +2218,8 @@ mod session_key_tests {
     //! against a FRESH database from `PgDb::new_for_test()`.
 
     use super::{
-        is_resumable, WorkflowAiSessionGuard, ABANDONED_SESSION_STATUS, AGENTIC_SESSION_PHASE,
-        VERIFIER_SESSION_PHASE,
+        is_resumable, rekey_after_fallback_create, WorkflowAiSessionGuard,
+        ABANDONED_SESSION_STATUS, AGENTIC_SESSION_PHASE, VERIFIER_SESSION_PHASE,
     };
     use crate::database::pg::PgDb;
     use std::sync::Arc;
@@ -2190,7 +2256,8 @@ mod session_key_tests {
     async fn guard_dropped_armed_writes_failed() {
         let task = "task-run-guard-dropped";
         let pg = db_with_task_run(task).await;
-        pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-x")
+        let attempt = pg
+            .create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-x")
             .await
             .expect("create");
         let guard = WorkflowAiSessionGuard::arm(
@@ -2200,6 +2267,7 @@ mod session_key_tests {
             1,
             Some(0),
             "cli-x",
+            Some(attempt),
         );
         assert_eq!(guard.drop_write(), Some(ABANDONED_SESSION_STATUS));
         assert_eq!(ABANDONED_SESSION_STATUS, "failed");
@@ -2227,7 +2295,8 @@ mod session_key_tests {
     async fn terminal_write_disarms_the_guard() {
         let task = "task-run-guard-disarmed";
         let pg = db_with_task_run(task).await;
-        pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-y")
+        let attempt = pg
+            .create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-y")
             .await
             .expect("create");
         let mut guard = WorkflowAiSessionGuard::arm(
@@ -2237,6 +2306,7 @@ mod session_key_tests {
             1,
             Some(0),
             "cli-y",
+            Some(attempt),
         );
         assert_eq!(guard.drop_write(), Some(ABANDONED_SESSION_STATUS));
         guard
@@ -2247,44 +2317,17 @@ mod session_key_tests {
         assert_eq!(status_of(&pg, task).await, "completed");
     }
 
-    /// A FAILED terminal write leaves the guard armed, so its drop still
-    /// retries with the conditional abandoned write, and the drop's log names
-    /// the failed write rather than a cancellation.
-    #[tokio::test]
-    async fn failed_terminal_write_leaves_the_guard_armed() {
-        let pg = PgDb::new_for_test().await;
-        let mut guard = WorkflowAiSessionGuard::arm(
-            pg,
-            AGENTIC_SESSION_PHASE,
-            "task-run-guard-write-err",
-            1,
-            Some(0),
-            "cli-err",
-        );
-        assert_eq!(
-            guard.drop_reason(),
-            "was cancelled before its terminal write"
-        );
-        let result = guard.settle(Err("PG pool error: boom".to_string()));
-        assert!(result.is_err());
-        assert_eq!(
-            guard.drop_write(),
-            Some(ABANDONED_SESSION_STATUS),
-            "an Err terminal write must leave the guard armed"
-        );
-        assert_eq!(guard.drop_reason(), "had its terminal write fail");
-        // Disarm so the test's own drop schedules nothing.
-        guard.settle(Ok(())).expect("ok");
-        assert_eq!(guard.drop_write(), None);
-    }
-
     /// The resume-failed fallback re-creates the row under a fresh CLI id;
-    /// a guard re-keyed to it fails THAT session when dropped armed.
+    /// `rekey_after_fallback_create` (what the fallback calls) moves the
+    /// guard onto that new attempt, so its armed drop fails the FRESH
+    /// session. Without the rekey the guard still holds the resumed attempt,
+    /// whose marker no longer matches, and the row stays `running`.
     #[tokio::test]
-    async fn rekeyed_guard_fails_the_fresh_session() {
+    async fn fallback_rekey_moves_the_guard_onto_the_fresh_attempt() {
         let task = "task-run-guard-rekeyed";
         let pg = db_with_task_run(task).await;
-        pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-resumed")
+        let resumed = pg
+            .create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-resumed")
             .await
             .expect("create");
         let mut guard = WorkflowAiSessionGuard::arm(
@@ -2294,11 +2337,15 @@ mod session_key_tests {
             1,
             Some(0),
             "cli-resumed",
+            Some(resumed),
         );
-        pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-fresh")
-            .await
-            .expect("fallback re-create");
-        guard.rekey_cli_session("cli-fresh");
+        let created = pg
+            .create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-fresh")
+            .await;
+        let fresh = *created.as_ref().expect("fallback re-create");
+        rekey_after_fallback_create(&mut guard, "cli-fresh", created);
+        assert_eq!(guard.attempt, Some(fresh));
+        assert_eq!(guard.cli_session_id, "cli-fresh");
         drop(guard);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -2313,6 +2360,33 @@ mod session_key_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// A failed fallback re-create leaves the guard on the attempt it holds.
+    #[tokio::test]
+    async fn failed_fallback_create_keeps_the_guards_attempt() {
+        let task = "task-run-guard-rekey-err";
+        let pg = db_with_task_run(task).await;
+        let resumed = pg
+            .create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-resumed")
+            .await
+            .expect("create");
+        let mut guard = WorkflowAiSessionGuard::arm(
+            pg.clone(),
+            AGENTIC_SESSION_PHASE,
+            task,
+            1,
+            Some(0),
+            "cli-resumed",
+            Some(resumed),
+        );
+        rekey_after_fallback_create(&mut guard, "cli-fresh", Err("PG pool error".to_string()));
+        assert_eq!(guard.attempt, Some(resumed));
+        assert_eq!(guard.cli_session_id, "cli-resumed");
+        guard
+            .write_terminal("completed", 0)
+            .await
+            .expect("terminal write");
     }
 
     #[tokio::test]
