@@ -4354,47 +4354,27 @@ async fn ui_bridge_click_by_selector_handler_dispatch(
     }
 }
 
-/// Validate the `all` parameter of `read-value`.
+/// Build the IPC payload for a `read_value` request from the HTTP body.
 ///
-/// Returns the effective boolean, or a 400 message naming the offending
-/// parameter(s). Mirrors `readValuePrimitive` in `@qontinui/ui-bridge`
-/// (`server/page-primitives.ts`) so the direct HTTP path and the SDK path
-/// reject the same bodies with the same reasons — the whole point of this fix
-/// is that the two paths stopped agreeing about `all`.
-///
-/// Pure + unit-tested: the validation is the part worth pinning, and it needs
-/// neither a router nor a webview.
-pub fn validate_read_value_all(body: &serde_json::Value) -> Result<bool, String> {
-    let Some(raw) = body.get("all") else {
-        return Ok(false);
-    };
-    if raw.is_null() {
-        return Ok(false);
+/// `windowLabel` rides at the TOP level (`ui_bridge_request_sync` consumes it
+/// to pick the target window and strips it); `selector`/`index`/`all` go under
+/// `params`, the shape the webview's `read_value` case reads. Absent fields stay
+/// absent. Validation (`all` must be a boolean, `all` + `index` are mutually
+/// exclusive, an empty selector) is NOT repeated here: the SDK primitive the
+/// webview calls owns it, so every door rejects the same bodies the same way.
+fn read_value_ipc_payload(body: &serde_json::Value) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    for key in ["selector", "index", "all"] {
+        if let Some(v) = body.get(key) {
+            params.insert(key.to_string(), v.clone());
+        }
     }
-    let Some(all) = raw.as_bool() else {
-        return Err(format!(
-            "'all' must be a boolean (got {})",
-            json_type_name(raw)
-        ));
-    };
-    if all && body.get("index").is_some_and(|v| !v.is_null()) {
-        return Err(
-            "'all' and 'index' are mutually exclusive — 'all' returns every match, 'index' selects one. Drop one of them.".to_string(),
-        );
+    let mut payload = serde_json::Map::new();
+    if let Some(label) = body.get("windowLabel") {
+        payload.insert("windowLabel".to_string(), label.clone());
     }
-    Ok(all)
-}
-
-/// JSON type name for a validation message ("string", "number", …).
-fn json_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
+    payload.insert("params".to_string(), serde_json::Value::Object(params));
+    serde_json::Value::Object(payload)
 }
 
 /// Read the value of a form element by CSS selector.
@@ -4402,82 +4382,23 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
 /// Body: { "selector": "textarea", "index": 0 }
 /// Or:   { "selector": "input.row", "all": true }
 ///
-/// `all: true` returns EVERY match in `values[]` (document order). This handler
-/// is an INDEPENDENT JS-injection implementation of the SDK's `readValue` — it
-/// reads only `selector`/`index` — so honouring `all` in `@qontinui/ui-bridge`
-/// (PR #156) did nothing for a caller reaching the runner over the direct HTTP
-/// path: it asked for 14 values, got 1, and nothing in the response said the
-/// parameter had been dropped. `all` and the singular `index` are mutually
-/// exclusive and a body carrying both is REJECTED by name (matching the SDK's
-/// wording) rather than one of them being silently reinterpreted; a non-boolean
-/// `all` is likewise rejected by name.
+/// Dispatches the `read_value` IPC request to the webview, where the SDK's
+/// `readValuePrimitive` serves it — the same implementation the
+/// `/ui-bridge/sdk/page/read-value` relay fallback reaches, so both doors share
+/// ONE read and ONE redaction verdict: a `type="password"` input or a value
+/// inside `data-bridge-redact="true"` reads back `[REDACTED]` with length 0.
+/// (This handler used to inject its own JS and read `el.value` raw, serving the
+/// stored auth token and the sign-in password in cleartext.)
 ///
-/// `totalMatches` was already computed and returned in both modes, so a 1-of-N
-/// read has always been able to say so.
+/// Success is `{ value, length, totalMatches, values? }`. Not-found, a bad
+/// `all`, or an empty selector come back as the primitive's error through
+/// [`wrap_ipc_result`] (400).
 pub async fn ui_bridge_read_value_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    if selector.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error("'selector' field is required")),
-        ));
-    }
-
-    let all = match validate_read_value_all(&body) {
-        Ok(v) => v,
-        Err(msg) => return Err((StatusCode::BAD_REQUEST, Json(api_error(msg)))),
-    };
-
-    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
-
-    let js = format!(
-        r#"(() => {{
-            const readOne = (el, i) => ({{
-                index: i,
-                tag: el.tagName,
-                type: el.type || null,
-                value: el.value || el.textContent?.trim() || '',
-                length: (el.value || el.textContent || '').length,
-                placeholder: el.placeholder || null,
-                disabled: el.disabled || false,
-                readOnly: el.readOnly || false
-            }});
-            const matches = Array.from(document.querySelectorAll('{selector}'));
-            if (matches.length === 0) return JSON.stringify({{ found: false, error: 'No elements match selector', totalMatches: 0 }});
-            if ({all}) {{
-                const values = matches.map(readOne);
-                return JSON.stringify(Object.assign({{ found: true }}, values[0], {{
-                    totalMatches: matches.length,
-                    values: values
-                }}));
-            }}
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ found: false, error: 'Index out of range', totalMatches: matches.length }});
-            return JSON.stringify(Object.assign({{ found: true }}, readOne(matches[idx], idx), {{
-                totalMatches: matches.length
-            }}));
-        }})()"#,
-        selector = escaped_selector,
-        index = index,
-        all = all
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "read-value",
-            "read result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    let result = ui_bridge_request_sync(&state, "read_value", read_value_ipc_payload(&body)).await;
+    wrap_ipc_result(result)
 }
 
 /// Build the element-RESOLUTION expression for `type-into`.
@@ -7856,51 +7777,41 @@ mod type_action_param_validation_tests {
 
 #[cfg(test)]
 mod read_value_tests {
-    //! Validation seam for `read-value`'s `all`, the half of
-    //! `@qontinui/ui-bridge` PR #156 the runner still had to grow. It is pure,
-    //! so it needs neither a router nor a webview.
-    //!
-    //! The `send-keys` key/target grammar is deliberately NOT here: that route
-    //! and its vocabulary live in `mcp/ui_bridge/keyboard.rs`, which owns the
-    //! single copy. A second implementation in this module registered the same
-    //! axum path and would have panicked the router at startup.
+    //! What the HTTP handler still owns for `read-value`: building the IPC
+    //! payload. Validation and the redaction verdict live in the SDK primitive
+    //! the webview calls (see `src/hooks/ui-bridge-events/readValueRequest.dom.test.ts`),
+    //! so there is nothing Rust-side to validate.
 
-    use super::validate_read_value_all;
+    use super::read_value_ipc_payload;
     use serde_json::json;
 
-    // ---- read-value `all` -------------------------------------------------
-
     #[test]
-    fn all_defaults_to_false_when_absent_or_null() {
-        assert!(!validate_read_value_all(&json!({ "selector": "input" })).unwrap());
-        assert!(!validate_read_value_all(&json!({ "selector": "input", "all": null })).unwrap());
+    fn window_label_is_top_level_and_params_carry_the_read() {
+        let payload = read_value_ipc_payload(
+            &json!({ "selector": "input", "index": 2, "windowLabel": "term-1" }),
+        );
+        assert_eq!(
+            payload,
+            json!({ "windowLabel": "term-1", "params": { "selector": "input", "index": 2 } })
+        );
     }
 
     #[test]
-    fn all_true_is_honoured() {
-        assert!(validate_read_value_all(&json!({ "selector": "input", "all": true })).unwrap());
+    fn absent_fields_stay_absent() {
+        let payload = read_value_ipc_payload(&json!({ "selector": "input" }));
+        assert_eq!(payload, json!({ "params": { "selector": "input" } }));
     }
 
     #[test]
-    fn a_non_boolean_all_is_rejected_by_name() {
-        let msg = validate_read_value_all(&json!({ "selector": "i", "all": "yes" })).unwrap_err();
-        assert!(msg.contains("'all'"), "{msg}");
-        assert!(msg.contains("string"), "{msg}");
-    }
-
-    #[test]
-    fn all_and_index_together_are_rejected_naming_both() {
-        let msg = validate_read_value_all(&json!({ "selector": "i", "all": true, "index": 2 }))
-            .unwrap_err();
-        assert!(msg.contains("'all'") && msg.contains("'index'"), "{msg}");
-    }
-
-    #[test]
-    fn all_false_with_index_is_fine() {
-        // Only `all: true` conflicts — `all:false` is the default spelled out.
-        assert!(
-            !validate_read_value_all(&json!({ "selector": "i", "all": false, "index": 2 }))
-                .unwrap()
+    fn all_and_null_pass_through_unvalidated() {
+        // The SDK primitive owns validation; a bad `all` must reach it intact so
+        // every door rejects it with the primitive's wording.
+        let payload = read_value_ipc_payload(
+            &json!({ "selector": "i", "all": "yes", "index": null, "stray": 1 }),
+        );
+        assert_eq!(
+            payload,
+            json!({ "params": { "selector": "i", "all": "yes", "index": null } })
         );
     }
 }
