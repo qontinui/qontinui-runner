@@ -97,6 +97,34 @@ impl AgenticExecutor {
     /// Step checkpointing is integrated for resume capability.
     /// Progress markers from previous sessions are included in the context
     /// to help the AI understand where to resume long operations.
+    pub async fn run_agentic(
+        &self,
+        config: &LoopConfig,
+        iteration: u32,
+        failure_context: &str,
+        has_agentic_steps: bool,
+        agentic_steps: &[ExecutionStepConfig],
+        logger: &StepEventLogger,
+    ) -> (AgenticOutcome, Vec<ExecutionStepConfig>) {
+        self.run_agentic_keyed(
+            AGENTIC_SESSION_PHASE,
+            config,
+            iteration,
+            failure_context,
+            has_agentic_steps,
+            agentic_steps,
+            logger,
+        )
+        .await
+    }
+
+    /// [`run_agentic`](Self::run_agentic) with an explicit
+    /// `workflow_ai_sessions.phase` key. A caller that runs a SECOND agentic
+    /// session for the same (task run, iteration, stage) — the verification
+    /// loop's verifier beside its worker — passes its own key
+    /// ([`VERIFIER_SESSION_PHASE`]), so restart-resume never hands one role
+    /// the other's CLI session.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(
         name = "qontinui.workflow.phase.agentic",
         skip(self, config, failure_context, agentic_steps, logger),
@@ -104,11 +132,13 @@ impl AgenticExecutor {
             execution_id = %config.execution_id,
             iteration = iteration,
             workflow_name = %config.workflow_name,
-            has_steps = has_agentic_steps
+            has_steps = has_agentic_steps,
+            session_phase = session_phase
         )
     )]
-    pub async fn run_agentic(
+    pub async fn run_agentic_keyed(
         &self,
+        session_phase: &'static str,
         config: &LoopConfig,
         iteration: u32,
         failure_context: &str,
@@ -1134,7 +1164,7 @@ impl AgenticExecutor {
             .get_workflow_ai_session(
                 &parent_task_id,
                 iteration as i32,
-                "agentic",
+                session_phase,
                 config.stage_index.map(|i| i as i32),
             )
             .await
@@ -1148,7 +1178,7 @@ impl AgenticExecutor {
             }
             Err(e) => {
                 warn!(
-                    "AGENTIC-PHASE: Failed to check for interrupted AI session: {} — starting fresh",
+                    "AGENTIC-PHASE: Failed to check for a resumable AI session: {} — starting fresh",
                     e
                 );
                 (uuid::Uuid::new_v4().to_string(), false)
@@ -1168,7 +1198,7 @@ impl AgenticExecutor {
             .create_workflow_ai_session(
                 &parent_task_id,
                 iteration as i32,
-                "agentic",
+                session_phase,
                 config.stage_index.map(|i| i as i32),
                 &cli_session_id,
             )
@@ -1245,7 +1275,7 @@ impl AgenticExecutor {
                 .create_workflow_ai_session(
                     &parent_task_id,
                     iteration as i32,
-                    "agentic",
+                    session_phase,
                     config.stage_index.map(|i| i as i32),
                     &fresh_cli_id,
                 )
@@ -1371,10 +1401,12 @@ impl AgenticExecutor {
                     0.0
                 };
 
+                // Poison-safe: a panic here would unwind past the terminal
+                // status write and leave this phase's row `running`.
                 let cumulative = self
                     .cost_trackers
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_ref()
                     .map(|t| t.budget.snapshot().total_cost_usd)
                     .unwrap_or(0.0);
@@ -1392,7 +1424,11 @@ impl AgenticExecutor {
                 );
 
                 // Record cost in budget tracker and check safety limits
-                let trackers = self.cost_trackers.lock().unwrap().clone();
+                let trackers = self
+                    .cost_trackers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 if let Some(ref trackers) = trackers {
                     let total_tokens =
                         session_input_tokens.unwrap_or(0) + session_output_tokens.unwrap_or(0);
@@ -1471,6 +1507,7 @@ impl AgenticExecutor {
         if let Some(reason) = budget_stop {
             let stop = AgenticOutcome::BudgetExceeded { reason };
             self.record_workflow_ai_session_terminal(
+                session_phase,
                 &parent_task_id,
                 iteration,
                 config.stage_index,
@@ -1489,6 +1526,7 @@ impl AgenticExecutor {
 
         // Mark the workflow AI session as completed/failed.
         self.record_workflow_ai_session_terminal(
+            session_phase,
             &parent_task_id,
             iteration,
             config.stage_index,
@@ -1581,18 +1619,13 @@ impl AgenticExecutor {
         (outcome, injected_steps)
     }
 
-    /// Run a focused AI session with a custom prompt.
-    ///
-    /// Unlike `run_agentic()`, this doesn't build the prompt from config.base_prompt.
-    /// It runs the provided prompt directly. Used by the multi-agent fixer to spawn
-    /// specialized fix agents with narrow, targeted prompts.
-    ///
-    /// Returns (success, output, duration_ms).
-    /// Write the agentic phase's terminal status to `workflow_ai_sessions`.
-    /// Every exit after `create_workflow_ai_session` goes through here, so a
-    /// row left `running` can only mean the process died mid-phase.
+    /// Write the agentic phase's terminal status to `workflow_ai_sessions`
+    /// under `session_phase`. Every exit after `create_workflow_ai_session`
+    /// goes through here, so a row left `running` means the phase did not
+    /// finish normally (the process died, or a panic unwound past it).
     async fn record_workflow_ai_session_terminal(
         &self,
+        session_phase: &str,
         parent_task_id: &str,
         iteration: u32,
         stage_index: Option<u32>,
@@ -1605,7 +1638,7 @@ impl AgenticExecutor {
             .complete_workflow_ai_session(
                 parent_task_id,
                 iteration as i32,
-                "agentic",
+                session_phase,
                 stage_index.map(|i| i as i32),
                 workflow_ai_session_terminal_status(outcome),
                 output_len,
@@ -1616,6 +1649,13 @@ impl AgenticExecutor {
         }
     }
 
+    /// Run a focused AI session with a custom prompt.
+    ///
+    /// Unlike `run_agentic()`, this doesn't build the prompt from config.base_prompt.
+    /// It runs the provided prompt directly. Used by the multi-agent fixer to spawn
+    /// specialized fix agents with narrow, targeted prompts.
+    ///
+    /// Returns (success, output, duration_ms).
     pub async fn run_focused_session(
         &self,
         execution_id: &str,
@@ -1713,6 +1753,15 @@ impl AgenticExecutor {
     }
 }
 
+/// `workflow_ai_sessions.phase` key of the main agentic session.
+pub(crate) const AGENTIC_SESSION_PHASE: &str = "agentic";
+
+/// `workflow_ai_sessions.phase` key of the verification loop's verifier
+/// session — distinct from [`AGENTIC_SESSION_PHASE`] so the verifier and the
+/// worker of one (task run, iteration, stage) never resume each other's CLI
+/// session after a restart.
+pub(crate) const VERIFIER_SESSION_PHASE: &str = "agentic_verifier";
+
 /// Status written to `workflow_ai_sessions` when the agentic phase exits with
 /// `outcome`. Every exit is terminal: nothing here is `running`, so a stopped
 /// phase (including one stopped for cost) is never resumed.
@@ -1727,11 +1776,15 @@ pub(crate) fn workflow_ai_session_terminal_status(outcome: &AgenticOutcome) -> &
 }
 
 /// Whether a prior `workflow_ai_sessions` row for the same
-/// `(task_run_id, iteration, stage, "agentic")`, read at the START of the
-/// phase, names a CLI session to `--resume`. Every exit writes a terminal
-/// status (`workflow_ai_session_terminal_status`), so a row still `running`
-/// at phase start means the process died mid-phase; `interrupted` is kept for
-/// any writer that records it explicitly.
+/// `(task_run_id, iteration, stage, session_phase)`, read at the START of the
+/// phase, names a CLI session to `--resume`. Every normal exit writes a
+/// terminal status (`workflow_ai_session_terminal_status`), so a row still
+/// `running` at phase start means the phase did not finish normally;
+/// `interrupted` is kept for any writer that records it explicitly.
+/// Residual: a row a pre-change build left `running` through its old
+/// budget/circuit-breaker early return also reads as resumable (production
+/// held 0 rows in this table when this changed, and the `--resume` failure
+/// fallback still starts fresh when the transcript is gone).
 pub(crate) fn is_resumable(status: &str) -> bool {
     matches!(status, "running" | "interrupted")
 }
@@ -1801,5 +1854,59 @@ mod tests {
             assert!(matches!(status, "completed" | "failed"), "{outcome:?}");
             assert!(!is_resumable(status), "{outcome:?} would be resumed");
         }
+    }
+}
+
+#[cfg(test)]
+mod session_key_tests {
+    //! The verifier's `workflow_ai_sessions` key never reads the worker's row,
+    //! against a FRESH database from `PgDb::new_for_test()`.
+
+    use super::{is_resumable, AGENTIC_SESSION_PHASE, VERIFIER_SESSION_PHASE};
+    use crate::database::pg::PgDb;
+
+    #[tokio::test]
+    async fn verifier_key_never_returns_the_workers_row() {
+        let pg = PgDb::new_for_test().await;
+        let task = "task-run-verifier-key";
+        // `workflow_ai_sessions.task_run_id` is FK'd to `task_runs(id)`.
+        pg.pool()
+            .get()
+            .await
+            .expect("PG pool")
+            .execute(
+                "INSERT INTO task_runs (id, task_name) VALUES ($1, $2)",
+                &[&task, &"verifier session key test"],
+            )
+            .await
+            .expect("insert task_run fixture");
+
+        // The worker's session is mid-phase (`running`, i.e. resumable).
+        pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-worker")
+            .await
+            .expect("create worker");
+        let verifier = pg
+            .get_workflow_ai_session(task, 1, VERIFIER_SESSION_PHASE, Some(0))
+            .await
+            .expect("get verifier");
+        assert_eq!(verifier, None, "verifier must not see the worker's session");
+
+        // Once the verifier has its own row, each key reads its own.
+        pg.create_workflow_ai_session(task, 1, VERIFIER_SESSION_PHASE, Some(0), "cli-verifier")
+            .await
+            .expect("create verifier");
+        let worker = pg
+            .get_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0))
+            .await
+            .expect("get worker")
+            .expect("worker row");
+        assert_eq!(worker.0, "cli-worker");
+        assert!(is_resumable(&worker.1));
+        let verifier = pg
+            .get_workflow_ai_session(task, 1, VERIFIER_SESSION_PHASE, Some(0))
+            .await
+            .expect("get verifier")
+            .expect("verifier row");
+        assert_eq!(verifier.0, "cli-verifier");
     }
 }
