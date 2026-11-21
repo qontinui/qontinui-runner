@@ -5447,7 +5447,11 @@ fn derive_and_publish_legacy_posture(
     // A runner holding no credential at all (never paired, a guest tier) has
     // nothing an outage can take away, so it is not warned about one.
     let holds_credential = matches!(read, crate::secure_storage::StoredTokenRead::Present(_));
-    record_recovery_inventory(RecoveryInventory::read(auth_manager), holds_credential);
+    record_and_announce_recovery_inventory(
+        app,
+        RecoveryInventory::read(auth_manager),
+        holds_credential,
+    );
     let obs = legacy_slot_observation(read);
     if let Some(transition) =
         derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
@@ -5656,7 +5660,7 @@ pub(crate) async fn refresh_tenant_slots(
     // Before either posture publish below reads it, so the boot publish
     // already carries a missing-recovery warning (P2.3).
     // Tenant slots exist, so this runner holds (or held) a credential.
-    record_recovery_inventory(RecoveryInventory::read(auth_manager), true);
+    record_and_announce_recovery_inventory(app, RecoveryInventory::read(auth_manager), true);
     let mut health: Vec<TenantSlotHealthRow> = Vec::with_capacity(tenants.len());
     // Phase 1 of the coord-credential-posture plan: what each slot HELD when
     // this pass looked at it — `(tenant, exp, present, unknown)`, pushed
@@ -6494,9 +6498,18 @@ pub(crate) fn record_recovery_inventory(
     inventory: RecoveryInventory,
     holds_credential: bool,
 ) -> bool {
+    record_recovery_inventory_returning_previous(inventory, holds_credential).0
+}
+
+/// [`record_recovery_inventory`], also returning the pair it replaced, taken
+/// in the same swap so a concurrent recorder cannot hide a change.
+fn record_recovery_inventory_returning_previous(
+    inventory: RecoveryInventory,
+    holds_credential: bool,
+) -> (bool, Option<(RecoveryInventory, bool)>) {
     let previous = replace_recovery_inventory((inventory, holds_credential));
     if previous == Some((inventory, holds_credential)) {
-        return false;
+        return (false, previous);
     }
     let warn_now = holds_credential && inventory.needs_a_human_after_expiry();
     if warn_now {
@@ -6507,7 +6520,80 @@ pub(crate) fn record_recovery_inventory(
             inventory.missing().join(", ")
         );
     }
-    warn_now
+    (warn_now, previous)
+}
+
+/// Frontend NUDGE: the recovery warning ([`recovery_warning`]) changed —
+/// re-read it with the `get_recovery_warning` command. Carries the new value
+/// for logging only: an event emitted before its listener registered is lost,
+/// so the UI reads the command on mount too.
+///
+/// Its own event, not [`AUTONOMY_CREDENTIAL_DARK_EVENT`]: that one is about a
+/// credential that CANNOT answer, while this warning is shown while it still
+/// can (plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+/// E2: "in the banner, before an outage").
+pub const AUTONOMY_RECOVERY_WARNING_EVENT: &str = "autonomy-recovery-warning";
+
+/// What the banner shows when a runner that holds a credential has no
+/// automatic recovery left. Wire shape of `get_recovery_warning`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryWarning {
+    /// The tokens of [`RecoveryInventory::missing`], e.g. `no_cognito_session`.
+    pub missing: Vec<&'static str>,
+    /// The operator-facing sentence.
+    pub message: String,
+}
+
+/// The sentence a [`RecoveryWarning`] carries.
+pub(crate) const RECOVERY_WARNING_MESSAGE: &str = "This runner holds neither a Cognito \
+     session nor a device machine key. Its credential works now, but if the runner is down for \
+     longer than the device-credential lifetime (~4 h) it cannot recover by itself: someone will \
+     have to sign in again. Signing in now stores a session it can recover with.";
+
+/// Pure: the warning for a recorded `(inventory, holds_credential)` pair.
+/// `None` unless the runner holds a credential AND both automatic recoveries
+/// are KNOWN absent — an UNKNOWN inventory never warns.
+pub(crate) fn recovery_warning_from(
+    inventory: &RecoveryInventory,
+    holds_credential: bool,
+) -> Option<RecoveryWarning> {
+    (holds_credential && inventory.needs_a_human_after_expiry()).then(|| RecoveryWarning {
+        missing: inventory.missing(),
+        message: RECOVERY_WARNING_MESSAGE.to_string(),
+    })
+}
+
+/// The warning for what the latest slot pass recorded, or `None` before the
+/// first pass (UNKNOWN shows nothing).
+pub fn recovery_warning() -> Option<RecoveryWarning> {
+    #[cfg(not(test))]
+    let recorded = *RECOVERY_INVENTORY.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(test)]
+    let recorded = RECOVERY_INVENTORY.with(std::cell::Cell::get);
+    recorded.and_then(|(inventory, holds)| recovery_warning_from(&inventory, holds))
+}
+
+/// [`record_recovery_inventory`], then nudge the UI when the
+/// [`recovery_warning`] it implies changed. `app: None` (hermetic tests,
+/// headless callers) records without emitting; the value stays readable
+/// through the command and `/health`.
+fn record_and_announce_recovery_inventory(
+    app: Option<&tauri::AppHandle>,
+    inventory: RecoveryInventory,
+    holds_credential: bool,
+) {
+    let (_, previous) = record_recovery_inventory_returning_previous(inventory, holds_credential);
+    let before = previous.and_then(|(inv, holds)| recovery_warning_from(&inv, holds));
+    let after = recovery_warning_from(&inventory, holds_credential);
+    if before == after {
+        return;
+    }
+    if let Some(app) = app {
+        if let Err(e) = app.emit(AUTONOMY_RECOVERY_WARNING_EVENT, &after) {
+            warn!("device_jwt_refresher: failed to emit {AUTONOMY_RECOVERY_WARNING_EVENT}: {e}");
+        }
+    }
 }
 
 /// The most recent MEASURED verdict, or `Unknown` before any tick measured one.
@@ -15781,6 +15867,47 @@ mod recovery_inventory_tests {
         assert!(record_recovery_inventory(NONE_HELD, true), "paired: warned");
         assert!(!record_recovery_inventory(NONE_HELD, true), "warned once");
         assert_eq!(recovery_inventory(), NONE_HELD);
+    }
+
+    #[test]
+    fn the_banner_warning_needs_a_held_credential_and_both_recoveries_known_absent() {
+        assert_eq!(recovery_warning_from(&NONE_HELD, false), None, "unpaired");
+        assert_eq!(
+            recovery_warning_from(&RecoveryInventory::UNKNOWN, true),
+            None,
+            "UNKNOWN never warns"
+        );
+        let cognito_held = RecoveryInventory {
+            cognito_session: Some(true),
+            ..NONE_HELD
+        };
+        assert_eq!(recovery_warning_from(&cognito_held, true), None);
+        let w = recovery_warning_from(&NONE_HELD, true).expect("a warning");
+        assert_eq!(
+            w.missing,
+            vec![MISSING_COGNITO_SESSION, MISSING_DEVICE_MACHINE_KEY]
+        );
+        let json = serde_json::to_value(&w).expect("serialises");
+        assert_eq!(
+            json["missing"],
+            serde_json::json!(["no_cognito_session", "no_device_machine_key"])
+        );
+        assert!(json["message"].as_str().is_some_and(|m| m.contains("~4 h")));
+    }
+
+    #[test]
+    fn the_recorded_inventory_drives_the_command_answer() {
+        // Thread-local under test, so this sequence is this test's alone.
+        record_and_announce_recovery_inventory(None, NONE_HELD, false);
+        assert_eq!(recovery_warning(), None, "unpaired: nothing to warn");
+        record_and_announce_recovery_inventory(None, NONE_HELD, true);
+        assert!(recovery_warning().is_some(), "paired with no recovery");
+        let key_held = RecoveryInventory {
+            device_machine_key: Some(true),
+            ..NONE_HELD
+        };
+        record_and_announce_recovery_inventory(None, key_held, true);
+        assert_eq!(recovery_warning(), None, "a machine key clears it");
     }
 
     #[test]

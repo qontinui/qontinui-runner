@@ -2191,6 +2191,22 @@ pub async fn get_coord_credential_posture() -> Option<serde_json::Value> {
     crate::mcp::device_jwt_refresher::coord_credential_posture().map(|s| s.to_json())
 }
 
+/// The "no automatic recovery is left" warning, or `null` when there is none
+/// or no refresher pass has concluded yet.
+///
+/// A runner that holds a credential but neither a Cognito session nor a device
+/// machine key works today and needs a human after the next outage longer than
+/// the device-JWT lifetime. `/health` carries that only as the answering
+/// posture's `detail`, and the credential banner renders nothing while the
+/// posture answers; this is what lets it warn BEFORE the outage (plan
+/// `2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human`,
+/// E2). The PULL half: `autonomy-recovery-warning` nudges a re-read, and has
+/// no replay.
+#[tauri::command]
+pub fn get_recovery_warning() -> Option<crate::mcp::device_jwt_refresher::RecoveryWarning> {
+    crate::mcp::device_jwt_refresher::recovery_warning()
+}
+
 /// Read the OPEN binding-gap asks — one per bound tenant this device holds no
 /// credential for, recorded once per lapse by the device-JWT refresher.
 ///
@@ -2262,6 +2278,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             get_coord_device_token,
             kick_device_jwt_refresher_cmd,
             get_coord_credential_posture,
+            get_recovery_warning,
             get_binding_gap_asks,
         ])
         .build()
