@@ -116,12 +116,17 @@
   --dk-type-leading-relaxed: 1.625;
   --dk-type-leading-snug: 1.375;
   --dk-type-leading-tight: 1.25;
+  --dk-type-scale-2xl: 24px;
+  --dk-type-scale-3xl: 30px;
+  --dk-type-scale-base: 16px;
   --dk-type-scale-body: 14px;
   --dk-type-scale-caption: 11px;
   --dk-type-scale-counter: 28px;
   --dk-type-scale-display: 32px;
   --dk-type-scale-label: 12px;
+  --dk-type-scale-lg: 18px;
   --dk-type-scale-title: 22px;
+  --dk-type-scale-xl: 20px;
   --dk-type-tracking-normal: 0em;
   --dk-type-tracking-tight: -0.025em;
   --dk-type-tracking-tighter: -0.05em;

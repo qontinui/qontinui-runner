@@ -2569,7 +2569,7 @@ jobs:
     # provision, and its installs (a git dependency whose `prepare` builds the
     # kit, a clone + build of @qontinui/design-tokens at the source's ref,
     # Chromium) are network-bound. Public repo: hosted minutes cost nothing.
-    # Expected p50 ~3 min (the web twin's); cap 15 until measured.
+    # Duration UNMEASURED; cap 15 min until measured.
     # coord-pools: [ubuntu-latest]
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -99,12 +99,17 @@
   --leading-relaxed: var(--dk-type-leading-relaxed);
   --leading-snug: var(--dk-type-leading-snug);
   --leading-tight: var(--dk-type-leading-tight);
+  --text-2xl: var(--dk-type-scale-2xl);
+  --text-3xl: var(--dk-type-scale-3xl);
+  --text-base: var(--dk-type-scale-base);
   --text-body: var(--dk-type-scale-body);
   --text-caption: var(--dk-type-scale-caption);
   --text-counter: var(--dk-type-scale-counter);
   --text-display: var(--dk-type-scale-display);
   --text-label: var(--dk-type-scale-label);
+  --text-lg: var(--dk-type-scale-lg);
   --text-title: var(--dk-type-scale-title);
+  --text-xl: var(--dk-type-scale-xl);
   --tracking-normal: var(--dk-type-tracking-normal);
   --tracking-tight: var(--dk-type-tracking-tight);
   --tracking-tighter: var(--dk-type-tracking-tighter);

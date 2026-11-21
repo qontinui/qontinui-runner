@@ -175,12 +175,17 @@ export const tokens = {
       "tight": "1.25"
     },
     "scale": {
+      "2xl": "24px",
+      "3xl": "30px",
+      "base": "16px",
       "body": "14px",
       "caption": "11px",
       "counter": "28px",
       "display": "32px",
       "label": "12px",
-      "title": "22px"
+      "lg": "18px",
+      "title": "22px",
+      "xl": "20px"
     },
     "tracking": {
       "normal": "0em",
@@ -374,12 +379,17 @@ export const vars = {
       "tight": "var(--dk-type-leading-tight)"
     },
     "scale": {
+      "2xl": "var(--dk-type-scale-2xl)",
+      "3xl": "var(--dk-type-scale-3xl)",
+      "base": "var(--dk-type-scale-base)",
       "body": "var(--dk-type-scale-body)",
       "caption": "var(--dk-type-scale-caption)",
       "counter": "var(--dk-type-scale-counter)",
       "display": "var(--dk-type-scale-display)",
       "label": "var(--dk-type-scale-label)",
-      "title": "var(--dk-type-scale-title)"
+      "lg": "var(--dk-type-scale-lg)",
+      "title": "var(--dk-type-scale-title)",
+      "xl": "var(--dk-type-scale-xl)"
     },
     "tracking": {
       "normal": "var(--dk-type-tracking-normal)",
