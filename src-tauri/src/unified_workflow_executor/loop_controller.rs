@@ -34,9 +34,9 @@ use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, Verifica
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
 use super::types::{
-    get_parent_task_id, step_execution_to_record, AgenticOutcome, LoopConfig, LoopResult,
-    PhaseResult, SweepResult,
+    step_execution_to_record, AgenticOutcome, LoopConfig, LoopResult, PhaseResult, SweepResult,
 };
+use crate::step_executor::get_parent_task_id;
 use crate::str_utils::truncate_str;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -659,7 +659,7 @@ impl LoopController {
 
             if has_any_steps {
                 info!("Normalizing single-phase workflow into stages");
-                let single_stage = super::StageConfig {
+                let single_stage = crate::step_executor::StageConfig {
                     id: format!("{}-phase-1", config.workflow_id),
                     name: config.workflow_name.clone(),
                     index: 0,
@@ -3407,11 +3407,7 @@ pub use super::startup_resume::WorkflowResult;
 // Internal re-exports for use within this crate
 pub(crate) use super::startup_resume::evaluate_stage_condition;
 
-// Step conversion utilities extracted to step_conversion module
-pub use super::step_conversion::{
-    convert_all_json_steps_with_phase, convert_json_steps_with_phase,
-    extract_prompt_steps_with_phase, substitute_step_vars,
-};
+use crate::step_executor::step_conversion::substitute_step_vars;
 
 /// Persist a `PhaseResult` to PG, emit it to the frontend via Tauri, and —
 /// when server-mode web-backend integration is configured — fire-and-forget

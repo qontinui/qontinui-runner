@@ -196,7 +196,7 @@ pub async fn execute_triggered_workflow(
     let normalized_stages = workflow.normalize_to_stages();
     let total_stages = normalized_stages.len();
 
-    let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
+    let stages: Vec<crate::step_executor::StageConfig> = normalized_stages
         .iter()
         .enumerate()
         .map(|(idx, stage)| {

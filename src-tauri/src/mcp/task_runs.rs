@@ -551,9 +551,8 @@ pub async fn resume_task_run(
     request: ResumeTaskRunRequest,
     origin: crate::coord_drain_state::SpawnOrigin,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::unified_workflow_executor::{
-        extract_workflow_id_from_task_id, LoopConfig, LoopController,
-    };
+    use crate::step_executor::extract_workflow_id_from_task_id;
+    use crate::unified_workflow_executor::{LoopConfig, LoopController};
 
     info!("Resume task run request: {}", id);
 
@@ -658,7 +657,7 @@ pub async fn resume_task_run(
     let total_stages = normalized_stages.len();
 
     // Convert each stage to StageConfig
-    let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
+    let stages: Vec<crate::step_executor::StageConfig> = normalized_stages
         .iter()
         .enumerate()
         .map(|(idx, stage)| {
@@ -3143,6 +3142,7 @@ pub async fn resume_breakpoint_snapshot(
 // ============================================================================
 // End Task Run HTTP API Handlers
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
+    use super::task_run_full_state::{get_full_workflow_state, get_task_output};
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/task-runs", get(list_task_runs).post(create_task_run))

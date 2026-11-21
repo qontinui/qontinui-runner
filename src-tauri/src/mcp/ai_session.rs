@@ -2577,7 +2577,7 @@ pub async fn run_prompt(
     let max_video_frames = request.max_video_frames.unwrap_or(3) as u32;
     let max_trace_screenshots = request.max_trace_screenshots.unwrap_or(5) as u32;
 
-    let (all_images, trace_timeline) = super::trace_verification::collect_images_for_analysis(
+    let (all_images, trace_timeline) = super::ai_session_media::collect_images_for_analysis(
         &image_paths,
         &video_paths,
         request.trace_path.as_deref(),

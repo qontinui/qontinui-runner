@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::types::is_sequence_child;
+use crate::step_executor::is_sequence_child;
 use crate::workflow_state::{
     CheckpointManager, StepCheckpoint, StepCheckpointStatus, WorkflowExecutionStateRecord,
 };
@@ -1272,7 +1272,7 @@ impl ResumeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unified_workflow_executor::get_parent_task_id;
+    use crate::step_executor::get_parent_task_id;
     use crate::unified_workflow_executor::states::UnifiedWorkflowState;
 
     #[test]

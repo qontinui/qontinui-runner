@@ -10,7 +10,7 @@ use crate::workflow_state::{StateMachine, WorkflowState};
 
 use super::loop_controller::LoopController;
 use super::states::UnifiedWorkflowState;
-use super::types::get_parent_task_id;
+use crate::step_executor::get_parent_task_id;
 
 impl LoopController {
     /// Check if the task has been stopped externally (via stop_ai_analysis endpoint).

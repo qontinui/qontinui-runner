@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::conditional_routing::{evaluate_routing_rules, ResolvedModelConfig, RoutingContext};
+use crate::step_executor::StageConfig;
 use crate::unified_workflows::{ModelOverrideConfig, UnifiedWorkflowExt};
 
 /// Structured diff captured after each agentic iteration.
@@ -242,56 +243,6 @@ impl LoopResult {
             format!("Loop ended after {} iteration(s)", self.iterations_run)
         }
     }
-}
-
-/// Configuration for a single stage within a multi-stage workflow.
-///
-/// Each stage has its own steps and execution settings. The loop controller
-/// iterates over stages sequentially, running each stage's verification-agentic
-/// loop independently.
-#[derive(Debug, Clone)]
-pub struct StageConfig {
-    /// Unique identifier for this stage.
-    pub id: String,
-    /// Display name for this stage.
-    pub name: String,
-    /// Index of this stage (0-indexed).
-    pub index: usize,
-    /// Total number of stages in the workflow.
-    pub total_stages: usize,
-    /// Setup automation steps for this stage.
-    pub setup_automation_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    /// Setup prompt steps for this stage.
-    pub setup_prompt_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    /// Verification steps for this stage.
-    pub verification_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    /// Agentic steps for this stage.
-    pub agentic_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    /// Completion automation steps for this stage.
-    pub completion_automation_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    /// Completion prompt steps for this stage.
-    pub completion_prompt_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    /// Maximum iterations for this stage's loop.
-    pub max_iterations: u32,
-    /// AI provider override for this stage (None = use workflow default).
-    pub provider: Option<String>,
-    /// Model override for this stage (None = use workflow default).
-    pub model: Option<String>,
-    /// Per-phase model overrides for this stage.
-    pub model_overrides: HashMap<String, ModelOverrideConfig>,
-    /// Timeout in seconds for this stage's AI sessions.
-    pub timeout_seconds: Option<u64>,
-    /// Whether to pause for human approval after each agentic phase.
-    pub approval_gate: bool,
-    /// Optional condition for conditional stage execution.
-    /// When set, the stage is evaluated against this condition before running.
-    /// If the condition is not met, the stage is skipped.
-    pub condition: Option<crate::unified_workflows::StageCondition>,
-    /// When true, run completion prompt steps BEFORE automation steps.
-    /// Default (false) runs automation first, then prompts.
-    /// This is used by meta-workflows to ensure the AI hardener runs
-    /// before save_workflow_artifact persists the final result.
-    pub completion_prompts_first: bool,
 }
 
 /// Configuration for the verification-agentic loop.
@@ -934,27 +885,6 @@ pub struct SweepResult {
     pub no_more_steps: bool,
 }
 
-/// Phase of workflow execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowPhase {
-    Setup,
-    Verification,
-    Agentic,
-    Completion,
-}
-
-impl WorkflowPhase {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            WorkflowPhase::Setup => "setup",
-            WorkflowPhase::Verification => "verification",
-            WorkflowPhase::Agentic => "agentic",
-            WorkflowPhase::Completion => "completion",
-        }
-    }
-}
-
 /// Outcome of attempting to run the agentic phase.
 #[derive(Debug, Clone)]
 pub enum AgenticOutcome {
@@ -1059,58 +989,6 @@ impl AgenticOutcome {
             | AgenticOutcome::Skipped => None,
         }
     }
-}
-
-/// Extract the parent task ID from a composed run child ID.
-///
-/// For composed runs, individual workflows have IDs like:
-/// `composed-run-{timestamp}-workflow-{n}`
-///
-/// But only the parent `composed-run-{timestamp}` exists in task_runs.
-/// This function extracts the parent ID for use in database operations that
-/// reference task_runs (step checkpoints, task_run_events, etc.).
-///
-/// For non-composed IDs (e.g., `unified-workflow-{id}-{timestamp}`), returns
-/// the original ID unchanged.
-///
-/// # Examples
-///
-/// ```
-/// use qontinui_runner::unified_workflow_executor::get_parent_task_id;
-///
-/// // Composed run child → parent
-/// assert_eq!(
-///     get_parent_task_id("composed-run-1234567890-workflow-1"),
-///     "composed-run-1234567890"
-/// );
-///
-/// // Non-composed → unchanged
-/// assert_eq!(
-///     get_parent_task_id("unified-workflow-abc-1234567890"),
-///     "unified-workflow-abc-1234567890"
-/// );
-/// ```
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
-pub fn get_parent_task_id(execution_id: &str) -> String {
-    // Check if this is a composed run child: composed-run-{timestamp}-workflow-{n}
-    if let Some(pos) = execution_id.rfind("-workflow-") {
-        let potential_parent = &execution_id[..pos];
-        // Verify it looks like a composed run parent (starts with composed-run-)
-        if potential_parent.starts_with("composed-run-") {
-            return potential_parent.to_string();
-        }
-    }
-    execution_id.to_string()
-}
-
-/// Check if an execution ID is a composed run child.
-///
-/// Returns true for IDs like `composed-run-{timestamp}-workflow-{n}`.
-pub fn is_sequence_child(execution_id: &str) -> bool {
-    get_parent_task_id(execution_id) != execution_id
 }
 
 #[cfg(test)]

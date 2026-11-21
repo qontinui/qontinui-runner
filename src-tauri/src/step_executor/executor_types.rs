@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::iteration_bundle::{ActionEvent, ImageRecognitionEvent};
+use crate::step_executor::log_events::{ActionEvent, ImageRecognitionEvent};
 
 /// Workflow phase for step execution.
 ///

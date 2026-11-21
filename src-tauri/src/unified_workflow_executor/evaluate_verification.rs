@@ -26,7 +26,8 @@ use super::loop_handlers_decisions::{
 };
 use super::loop_state_machine::{CompletionReason, LoopContext, LoopState};
 use super::states::UnifiedWorkflowState;
-use super::types::{get_parent_task_id, IterationResult, LoopConfig};
+use super::types::{IterationResult, LoopConfig};
+use crate::step_executor::get_parent_task_id;
 
 /// One iteration's convergence metrics, as the dashboard receives them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

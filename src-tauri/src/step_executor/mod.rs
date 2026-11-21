@@ -38,6 +38,7 @@ pub mod dag;
 mod executor;
 pub mod executor_types;
 pub(crate) mod legacy_steps;
+pub mod log_events;
 pub mod log_watch;
 pub mod verification_context;
 pub(crate) mod verification_execution;
@@ -46,7 +47,10 @@ pub(crate) mod verification_execution;
 pub mod dry_run;
 pub mod events;
 pub mod handlers;
+pub mod stage_config;
 pub mod step_cache;
+pub mod step_conversion;
+pub mod task_ids;
 
 /// Parser-against-the-real-config tests for `step_injection`, kept here
 /// beside the `InjectableStep` impl so the parser names no execution type.
@@ -61,5 +65,7 @@ pub use executor::*;
 pub use executor_types::*;
 #[allow(unused_imports)]
 pub use log_watch::*;
+pub use stage_config::StageConfig;
+pub use task_ids::{extract_workflow_id_from_task_id, get_parent_task_id, is_sequence_child};
 #[allow(unused_imports)]
 pub use verification_context::*;

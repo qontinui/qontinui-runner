@@ -9,8 +9,8 @@ use tracing::warn;
 
 use crate::database::pg::PgDb;
 use crate::step_event_builder::StepEventBuilder;
+use crate::step_executor::get_parent_task_id;
 use crate::step_metadata::{StepDetails, StepMetadata};
-use crate::unified_workflow_executor::get_parent_task_id;
 
 use super::definitions::StepEventKind;
 use super::policy::{PolicyViolation, StepKey};
@@ -289,8 +289,8 @@ impl StepEventLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::step_registry::WorkflowPhase;
     use crate::step_types::StepType;
-    use crate::unified_workflow_executor::WorkflowPhase;
 
     // Note: These tests would require mocking the CheckpointDb.
     // For now, we test the policy enforcement logic.

@@ -12,9 +12,11 @@ mod definitions;
 mod facade;
 mod policy;
 mod tracker;
+mod workflow_phase;
 
 pub use definitions::StepEventKind;
 pub use facade::StepEventLogger;
+pub use workflow_phase::WorkflowPhase;
 // Re-exported for future use and testing
 #[allow(unused_imports)]
 pub use policy::{PolicyViolation, StepKey};
@@ -25,8 +27,8 @@ pub use tracker::ExecutionTracker;
 mod tests {
     use super::*;
     use crate::step_metadata::StepMetadata;
+    use crate::step_registry::WorkflowPhase;
     use crate::step_types::StepType;
-    use crate::unified_workflow_executor::WorkflowPhase;
 
     #[test]
     fn test_step_event_kind_categorization() {

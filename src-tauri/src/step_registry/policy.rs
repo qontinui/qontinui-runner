@@ -6,8 +6,8 @@
 //! 3. No duplicate ends - each step can only have one complete/error event
 
 use crate::step_metadata::StepMetadata;
+use crate::step_registry::WorkflowPhase;
 use crate::step_types::StepType;
-use crate::unified_workflow_executor::WorkflowPhase;
 use std::fmt;
 
 /// Unique identifier for a step instance.

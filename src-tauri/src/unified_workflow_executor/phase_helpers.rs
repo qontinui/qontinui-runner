@@ -514,9 +514,7 @@ pub struct EnvironmentReadinessResult {
 /// Returns true iff at least one command / shell_command / check_command /
 /// ui_bridge_snapshot_target references the SDK family. Empty stage list →
 /// false (can't be SDK-dependent if there's nothing to execute).
-pub fn workflow_uses_sdk_endpoints(
-    stages: &[crate::unified_workflow_executor::StageConfig],
-) -> bool {
+pub fn workflow_uses_sdk_endpoints(stages: &[crate::step_executor::StageConfig]) -> bool {
     fn step_uses_sdk(step: &crate::step_executor::ExecutionStepConfig) -> bool {
         // Collect all string fields that could carry a URL or SDK-mode flag.
         // `prompt_content` carries agentic prompts (which may embed SDK curl

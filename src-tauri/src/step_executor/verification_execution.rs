@@ -6,10 +6,10 @@
 use tracing::{info, warn};
 
 use crate::step_event_builder::StepEventBuilder;
+use crate::step_executor::get_parent_task_id;
 use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_types::StepType;
 use crate::test_executor::TestStatus;
-use crate::unified_workflow_executor::get_parent_task_id;
 use crate::workflow_state::{CheckpointManager, StepCheckpoint};
 
 use super::executor::StepExecutor;

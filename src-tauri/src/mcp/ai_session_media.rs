@@ -1,6 +1,5 @@
-//! Trace Utilities
-//!
-//! Contains functions for extracting trace and video data for analysis.
+//! Image, video-frame and Playwright-trace collection for the AI session
+//! run-prompt handler (`mcp::ai_session`), its only caller.
 
 use tracing::{info, warn};
 
@@ -9,7 +8,7 @@ use tracing::{info, warn};
 // ============================================================================
 
 /// Extract action timeline and screenshots from a Playwright trace ZIP file
-pub fn extract_trace_data(
+fn extract_trace_data(
     trace_path: &str,
     max_screenshots: u32,
 ) -> Result<(String, Vec<String>), String> {
@@ -64,7 +63,7 @@ pub fn extract_trace_data(
 }
 
 /// Format trace events into a human-readable timeline
-pub fn format_trace_timeline(json: &serde_json::Value) -> String {
+fn format_trace_timeline(json: &serde_json::Value) -> String {
     let mut timeline = String::from("## Action Timeline from Trace\n\n");
 
     if let Some(events) = json.as_array() {
@@ -98,7 +97,7 @@ pub fn format_trace_timeline(json: &serde_json::Value) -> String {
 }
 
 /// Extract key frames from a video file using ffmpeg
-pub fn extract_video_frames(video_path: &str, max_frames: u32) -> Result<Vec<String>, String> {
+fn extract_video_frames(video_path: &str, max_frames: u32) -> Result<Vec<String>, String> {
     info!(
         "Extracting {} frames from video: {}",
         max_frames, video_path
@@ -159,7 +158,7 @@ pub fn extract_video_frames(video_path: &str, max_frames: u32) -> Result<Vec<Str
 }
 
 /// Collect all images for AI analysis (screenshots, trace screenshots, video frames)
-pub fn collect_images_for_analysis(
+pub(crate) fn collect_images_for_analysis(
     image_paths: &[String],
     video_paths: &[String],
     trace_path: Option<&str>,

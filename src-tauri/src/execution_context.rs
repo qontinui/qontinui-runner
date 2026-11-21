@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use crate::unified_workflow_executor::WorkflowPhase;
+use crate::step_registry::WorkflowPhase;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;

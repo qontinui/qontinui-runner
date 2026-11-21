@@ -8,7 +8,7 @@
 //! 2. Exhaustiveness - all events are documented in one place
 //! 3. Self-documenting code - reading this file shows all possible events
 
-use crate::unified_workflow_executor::WorkflowPhase;
+use crate::step_registry::WorkflowPhase;
 
 /// All possible step events in the unified workflow system.
 ///

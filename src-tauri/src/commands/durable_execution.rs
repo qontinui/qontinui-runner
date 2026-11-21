@@ -185,7 +185,7 @@ pub async fn get_phase_results(
     storage: State<'_, StorageCompartment>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::PhaseResult>, String> {
-    let parent_id = crate::unified_workflow_executor::types::get_parent_task_id(&execution_id);
+    let parent_id = crate::step_executor::get_parent_task_id(&execution_id);
     storage.pg_db().get_phase_results(&parent_id).await
 }
 

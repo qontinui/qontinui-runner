@@ -38,10 +38,11 @@ use crate::runtime_env::{
     get_available_mcp_tools, AiSessionContextExt, AiSessionContextToolsExt, ExecutionContextExt,
 };
 use crate::settings::get_ai_settings;
+use crate::step_executor::get_parent_task_id;
 use crate::step_metadata::{StepDetails, StepMetadata};
+use crate::step_registry::WorkflowPhase;
 use crate::step_registry::{StepEventKind, StepEventLogger};
 use crate::step_types::StepType;
-use crate::unified_workflow_executor::{get_parent_task_id, WorkflowPhase};
 use crate::AppState;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 

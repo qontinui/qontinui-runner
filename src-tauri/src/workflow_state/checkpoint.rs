@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::database::pg::PgDb;
-use crate::unified_workflow_executor::get_parent_task_id;
+use crate::step_executor::get_parent_task_id;
 
 /// Status of a step checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
