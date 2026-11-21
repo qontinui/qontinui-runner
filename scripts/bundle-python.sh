@@ -198,7 +198,7 @@ build_executor() {
     echo "  Installing dependencies..."
     poetry install --no-interaction
 
-    # Poetry's parallel install can mix or tear the files of Xlib/ and cv2/,
+    # Poetry's parallel install can mix or tear the files of cv2/,
     # which several locked distributions write, and PyInstaller would freeze
     # that damage into the executor. The repair ships with qontinui (the path
     # dependency at ../../qontinui); --lock names this project's lock. Why and
@@ -208,7 +208,7 @@ build_executor() {
         echo "ERROR: $enforce not found; update the qontinui checkout (it landed in qontinui#81)"
         exit 1
     fi
-    echo "  Enforcing the locked owners of Xlib/ and cv2/..."
+    echo "  Enforcing the locked owner of cv2/..."
     poetry run python "$enforce" --lock poetry.lock
 
     # Build arguments
