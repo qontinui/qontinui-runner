@@ -276,6 +276,59 @@ pub fn poll_claude_presence(
     }
 }
 
+/// The session-lifecycle poll's one look per tick (`main.rs`), with the two
+/// facts the tick derives from its table. See [`poll_tick_look`].
+pub(crate) struct PollTickLook {
+    /// The tick's look: a FRESH process table and Claude Code's session
+    /// registry read for the runner's and every live terminal's subtree.
+    pub(crate) look: PaneLook,
+    /// When the table's read began — a lower bound on every row's
+    /// observation — capped at when it was asked for; the ask time when no
+    /// read produced the table (`observed_at_ms` 0).
+    pub(crate) snap_captured_at_ms: i64,
+    /// The table is this tick's and readable ([`ProcessSnapshot::is_unknown`]
+    /// is false). When it is not, `classify` Skips every matched record.
+    pub(crate) tick_snapshot_ok: bool,
+}
+
+/// Take the lifecycle poll's look for one tick: one system-wide look shared by
+/// every open record, rooted at the runner and at every live terminal pid in
+/// `live_terminal_pids` (a pid of `0` — a terminal that reports none — is not
+/// a root), so an npm-installed `claude` (`node … cli.js`) reads present (plan
+/// 2026-11-05-npm-installed-claude-is-invisible-…). FRESH, never the memo: the
+/// poll closes a record on an ABSENT `claude`.
+///
+/// Extracted from the poll closure in `main.rs` so a test can drive the poll's
+/// own look over a real process table (plan
+/// 2026-11-18-runner-npm-claude-liveness-follow-ups-…, Phase 3); the poll is
+/// its one non-test caller, and the extraction changes nothing it computes.
+pub(crate) async fn poll_tick_look(live_terminal_pids: &[u32]) -> PollTickLook {
+    let asked_at_ms = chrono::Utc::now().timestamp_millis();
+    let look_roots: Vec<u32> = std::iter::once(std::process::id())
+        .chain(live_terminal_pids.iter().copied().filter(|&p| p > 0))
+        .collect();
+    let look = PaneLook::take_fresh(&look_roots).await;
+    let snap = look.snapshot();
+    // Stamp the epoch with when the table's read began — a lower bound on
+    // every row's observation — not with the time it was asked for. A table
+    // no read produced (observed_at_ms 0) is UNKNOWN and records nothing
+    // (`tick_snapshot_ok` below).
+    let snap_captured_at_ms = if snap.observed_at_ms > 0 {
+        snap.observed_at_ms.min(asked_at_ms)
+    } else {
+        asked_at_ms
+    };
+    // A totally-empty system parent_map means the snapshot helper failed, and
+    // a `stale` one is the last good table, not this tick's → classify Skips
+    // every matched record.
+    let tick_snapshot_ok = !snap.is_unknown();
+    PollTickLook {
+        look,
+        snap_captured_at_ms,
+        tick_snapshot_ok,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Health-check report
 // ---------------------------------------------------------------------------
@@ -4870,5 +4923,98 @@ mod tests {
             .map(|u| (u.pid, u.nested_under_undecided))
             .collect();
         assert_eq!(nested, vec![(50, false), (52, true)]);
+    }
+}
+
+/// The lifecycle poll's population entry (plan
+/// `2026-11-18-runner-npm-claude-liveness-follow-ups-arming-through-population-entries-and-round-3-nits`,
+/// Phase 3): the poll's own look ([`poll_tick_look`]) over the REAL process
+/// table and the REAL registry read, then the same per-record read and
+/// decision the poll makes ([`poll_claude_presence`] →
+/// `session_lifecycle_store::classify`), for a pane whose shell runs a real
+/// npm-installed `claude` (`session::npm_claude_fixture`). Linux only: the
+/// fixture is.
+#[cfg(all(test, target_os = "linux"))]
+mod poll_tick_tests {
+    use super::*;
+    use crate::session::npm_claude_fixture::{NpmClaudeFixture, FIXTURE_LOCK};
+    use crate::session::session_lifecycle_store::{PollAction, WorkerPlane};
+
+    /// One poll tick's decision for a confirmed record whose terminal (the
+    /// pane root `shell`) is alive, after `consecutive_dead` claude-absent
+    /// ticks.
+    async fn tick_action(
+        shell: u32,
+        reference_unix_millis: i64,
+        consecutive_dead: u32,
+    ) -> PollAction {
+        let tick = poll_tick_look(&[shell]).await;
+        assert!(
+            tick.tick_snapshot_ok,
+            "the tick's process table could not be read"
+        );
+        assert!(tick.snap_captured_at_ms > 0);
+        let (claude_present, snapshot_ok) = poll_claude_presence(
+            &tick.look,
+            shell,
+            reference_unix_millis,
+            tick.tick_snapshot_ok,
+        );
+        crate::session::session_lifecycle_store::classify(
+            Some(true),
+            claude_present,
+            consecutive_dead,
+            0,
+            snapshot_ok,
+            false,
+            true,
+            WorkerPlane::NotWorker,
+        )
+    }
+
+    /// A live npm-installed `claude` keeps its record open on every tick; the
+    /// same `node` with no record behind it is a bare shell the debounce
+    /// closes (the pre-#2967 reading of a live npm session, which closed it);
+    /// and with the registry unlistable the record is Skipped, never closed,
+    /// however long the dead streak.
+    #[tokio::test]
+    async fn the_poll_tick_keeps_an_npm_claude_and_never_closes_an_undecided_one() {
+        let _serial = FIXTURE_LOCK.lock().await;
+        // The runner's boot, for the PID-reuse guard: before the pane began.
+        let reference = chrono::Utc::now().timestamp_millis() - 60_000;
+        let fixture = NpmClaudeFixture::spawn_under_shell().await;
+        let shell = fixture
+            .shell_pid()
+            .expect("a shell-hosted fixture has a shell");
+
+        assert_eq!(
+            tick_action(shell, reference, 0).await,
+            PollAction::KeepAlive
+        );
+        assert_eq!(
+            tick_action(shell, reference, u32::MAX).await,
+            PollAction::KeepAlive,
+            "a present claude keeps the record whatever the dead streak"
+        );
+
+        fixture.drop_record();
+        assert_eq!(
+            tick_action(shell, reference, 0).await,
+            PollAction::NeedsConfirm
+        );
+        assert_eq!(
+            tick_action(shell, reference, u32::MAX).await,
+            PollAction::Close,
+            "a `node` no record names is no claude: past the debounce the record closes"
+        );
+
+        fixture.make_sessions_unlistable();
+        for consecutive_dead in [0, u32::MAX] {
+            assert_eq!(
+                tick_action(shell, reference, consecutive_dead).await,
+                PollAction::Skip,
+                "an undecided `node` is never closed (dead streak {consecutive_dead})"
+            );
+        }
     }
 }
