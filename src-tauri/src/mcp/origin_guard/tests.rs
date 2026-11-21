@@ -2185,3 +2185,35 @@ fn session_stop_reason_is_a_credential_door() {
     // Only the read is named; nothing else under the session is widened.
     assert!(!is_credential_door("GET", "/sessions/{id}/policy-context"));
 }
+
+/// The same door, through the guard LAYER: under the default `enforce-doors`
+/// policy a request carrying a Foreign or a web origin to
+/// `/sessions/x/stop-reason` is refused before the handler runs, while an
+/// agent (no origin) reaches it.
+#[tokio::test]
+async fn a_foreign_origin_cannot_read_a_session_stop_reason() {
+    const ROUTE: &str = "/sessions/{id}/stop-reason";
+    async fn reached() -> StatusCode {
+        StatusCode::OK
+    }
+    let h = harness("enforce-doors");
+    let router = apply(Router::new().route(ROUTE, get(reached)), h.guard.clone());
+    let host = host(&h);
+    for (origin, want) in [
+        (Some(EVIL), StatusCode::FORBIDDEN),
+        (Some(WEB), StatusCode::FORBIDDEN),
+        (None, StatusCode::OK),
+    ] {
+        let mut headers = vec![("host", host.as_str())];
+        if let Some(o) = origin {
+            headers.push(("origin", o));
+        }
+        let got = router
+            .clone()
+            .oneshot(req("GET", "/sessions/x/stop-reason", &headers, ""))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(got, want, "origin {origin:?}");
+    }
+}
