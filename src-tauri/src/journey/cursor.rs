@@ -5,7 +5,7 @@
 //! spec evaluator cannot read — opens a PENDING edge from the last node this
 //! runner resolved for its cursor, and the next CONTROL / SDK snapshot of that
 //! cursor closes it. A diff contributes only an OUTCOME HINT (`error` /
-//! `settle_timeout`); the destination is always the closing snapshot's node,
+//! `verdict_unknown` / `settle_timeout`); the destination is always the closing snapshot's node,
 //! so the same page resolves to one key whichever route acted on it.
 //!
 //! Cursor scope: one pending edge per `(app_id, runner_instance, scope)`,
@@ -27,6 +27,7 @@ use qontinui_types::journey::{
 use qontinui_vision_core::ChangeTimeline;
 
 use super::node::{component_action_fingerprint, unknown_node, AffordanceIndex};
+use crate::mcp::ui_bridge::request::ActionOutcome;
 
 /// A pending edge older than this closes as `to_node_unobserved` when the
 /// next event for its cursor arrives (or when the retention tick sweeps it):
@@ -318,9 +319,16 @@ pub(crate) struct Observed {
 
 /// How an edge closed.
 ///
-/// - no destination → `to_node_unobserved`;
-/// - a hint (`error` from a failed action, `settle_timeout` from a diff) wins
-///   over the comparison: the destination is data, the outcome is the hint;
+/// - no destination → `to_node_unobserved`, whatever the hint (the ledger's
+///   CHECK ties a null `to_node` to that outcome alone);
+/// - a hint (`error` from a failed action, `verdict_unknown` from an action
+///   whose own verdict was not stated, `settle_timeout` from a diff) wins
+///   over the comparison: the destination is data, the outcome is the hint.
+///   `verdict_unknown` must win over `no_change` in particular: `no_change`
+///   says the action LANDED and moved nothing, which an unstated verdict
+///   cannot claim (plan
+///   `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+///   D1);
 /// - `no_change` only when the node keys are equal AND the from-snapshot's
 ///   affordance digest is known and equal to the destination's;
 /// - otherwise `changed` (which may join equal keys).
@@ -333,6 +341,7 @@ pub(crate) fn outcome_of(
     match (to, hint) {
         (None, _) => EdgeOutcome::ToNodeUnobserved,
         (Some(_), Some(EdgeOutcome::Error)) => EdgeOutcome::Error,
+        (Some(_), Some(EdgeOutcome::VerdictUnknown)) => EdgeOutcome::VerdictUnknown,
         (Some(_), Some(EdgeOutcome::SettleTimeout)) => EdgeOutcome::SettleTimeout,
         (Some(to), _) if to.node.key() == from.key() && from_digest == Some(to.digest.as_str()) => {
             EdgeOutcome::NoChange
@@ -341,9 +350,17 @@ pub(crate) fn outcome_of(
     }
 }
 
-/// The outcome hint of an action: `error` when it failed.
-pub(crate) fn failure_hint(failed: bool) -> Option<EdgeOutcome> {
-    failed.then_some(EdgeOutcome::Error)
+/// The outcome hint of an action, from its own three-state verdict (plan
+/// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+/// D2): a success hints nothing (the closing snapshot decides), a failure
+/// hints `error`, and a verdict the action never stated hints
+/// `verdict_unknown` — never a success, never a failure.
+pub(crate) fn verdict_hint(outcome: &ActionOutcome) -> Option<EdgeOutcome> {
+    match outcome {
+        ActionOutcome::Succeeded => None,
+        ActionOutcome::Failed(_) => Some(EdgeOutcome::Error),
+        ActionOutcome::Indeterminate => Some(EdgeOutcome::VerdictUnknown),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +722,7 @@ mod tests {
             &key(),
             &click("b"),
             Provenance::default(),
-            failure_hint(true),
+            verdict_hint(&ActionOutcome::Failed(None)),
             now,
         );
         let edge = c
@@ -764,6 +781,55 @@ mod tests {
     }
 
     #[test]
+    fn the_hint_is_the_actions_three_state_verdict() {
+        assert_eq!(verdict_hint(&ActionOutcome::Succeeded), None);
+        assert_eq!(
+            verdict_hint(&ActionOutcome::Failed(Some("nope".into()))),
+            Some(EdgeOutcome::Error)
+        );
+        assert_eq!(
+            verdict_hint(&ActionOutcome::Indeterminate),
+            Some(EdgeOutcome::VerdictUnknown),
+            "an unstated verdict is neither a success nor a failure"
+        );
+    }
+
+    /// An action whose verdict was unstated, closed by a snapshot of the very
+    /// page it started on: `verdict_unknown`, never `no_change` (D1).
+    #[test]
+    fn an_unstated_verdict_closes_as_verdict_unknown_on_a_self_loop() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d"),
+            AffordanceIndex::default(),
+            now,
+        );
+        c.open(
+            &key(),
+            &click("b"),
+            Provenance::default(),
+            verdict_hint(&ActionOutcome::Indeterminate),
+            now,
+        );
+        let edge = c
+            .observe(
+                &key(),
+                seen("home", &["idle"], "d"),
+                AffordanceIndex::default(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(edge.outcome, EdgeOutcome::VerdictUnknown);
+        assert_eq!(
+            edge.to_node.unwrap().key(),
+            "home#idle",
+            "the observed destination is still stored"
+        );
+    }
+
+    #[test]
     fn outcome_precedence() {
         let a = node("a", &["1"]);
         let same = Observed {
@@ -785,6 +851,31 @@ mod tests {
         assert_eq!(
             outcome_of(&a, Some("d"), Some(&same), Some(EdgeOutcome::SettleTimeout)),
             EdgeOutcome::SettleTimeout
+        );
+        // D1: an unstated verdict wins over the comparison, `no_change`
+        // included (a self-loop with an equal digest), and over `changed`.
+        assert_eq!(
+            outcome_of(
+                &a,
+                Some("d"),
+                Some(&same),
+                Some(EdgeOutcome::VerdictUnknown)
+            ),
+            EdgeOutcome::VerdictUnknown
+        );
+        assert_eq!(
+            outcome_of(
+                &a,
+                Some("d"),
+                Some(&other),
+                Some(EdgeOutcome::VerdictUnknown)
+            ),
+            EdgeOutcome::VerdictUnknown
+        );
+        // ...but never over an unobserved destination, which the CHECK pins.
+        assert_eq!(
+            outcome_of(&a, Some("d"), None, Some(EdgeOutcome::VerdictUnknown)),
+            EdgeOutcome::ToNodeUnobserved
         );
         assert_eq!(
             outcome_of(&a, Some("d"), Some(&same), None),

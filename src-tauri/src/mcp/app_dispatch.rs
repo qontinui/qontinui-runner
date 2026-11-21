@@ -135,6 +135,11 @@ pub enum DispatchError {
         error: String,
         code: Option<String>,
         retryable: Option<bool>,
+        /// The answer's own `data`, when it carried one: the part of an
+        /// app-reported failure that is a STATEMENT, not an error message
+        /// (`attemptRecovery`'s `attemptSucceeded` / `strategiesAttempted` /
+        /// `finalResult`). `None` when absent or `null`.
+        data: Option<serde_json::Value>,
     },
 }
 
@@ -178,6 +183,7 @@ fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Opt
             .get("retryable")
             .and_then(serde_json::Value::as_bool)
             .or(retryable),
+        data: json.get("data").filter(|d| !d.is_null()).cloned(),
     })
 }
 

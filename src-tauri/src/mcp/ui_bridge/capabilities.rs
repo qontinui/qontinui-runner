@@ -505,20 +505,35 @@ pub async fn ui_bridge_control_batch_execute_handler(
             .map(Vec::as_slice)
             .unwrap_or_default(),
     );
-    let result =
-        ui_bridge_control_batch_execute_handler_dispatch(State(Arc::clone(&state)), Json(body))
-            .await;
+    let mut verdict = super::request::ActionOutcome::Succeeded;
+    let result = ui_bridge_control_batch_execute_handler_dispatch(
+        State(Arc::clone(&state)),
+        Json(body),
+        &mut verdict,
+    )
+    .await;
     // An empty batch acted on nothing: no edge (N7).
     if let Some(action) = action {
-        crate::journey::capture::record_control_result(&state, &result, action);
+        crate::journey::capture::record_control_verdict(
+            &state,
+            crate::journey::capture::control_action_verdict_with(&result, verdict),
+            action,
+        );
     }
     result
 }
 
 /// POST /ui-bridge/control/batch-execute
+///
+/// `verdict` receives the batch's three-state ACTION verdict for the journey
+/// ledger (plan 2026-11-18 D2): its `action` steps folded with
+/// [`super::request::ActionOutcome::and_then_step`]. The envelope answers
+/// `success: true` for a batch that RAN, whatever its steps said, so the
+/// envelope cannot be the ledger's verdict.
 async fn ui_bridge_control_batch_execute_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<serde_json::Value>,
+    verdict: &mut super::request::ActionOutcome,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let actions = match resolve_batch_steps(&request) {
         Ok(steps) => steps,
@@ -580,9 +595,11 @@ async fn ui_bridge_control_batch_execute_handler_dispatch(
                         if let Some(err) = outcome.error_message() {
                             step["error"] = serde_json::Value::String(err);
                         }
+                        verdict.absorb(outcome);
                         step
                     }
                     Err(e) => {
+                        verdict.absorb(super::request::ActionOutcome::Failed(Some(e.clone())));
                         serde_json::json!({ "index": i, "success": false, "error": e })
                     }
                 }
@@ -1505,11 +1522,20 @@ pub async fn ui_bridge_control_batch_handler(
             .map(Vec::as_slice)
             .unwrap_or_default(),
     );
-    let result =
-        ui_bridge_control_batch_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    let mut verdict = super::request::ActionOutcome::Succeeded;
+    let result = ui_bridge_control_batch_handler_dispatch(
+        State(Arc::clone(&state)),
+        Json(body),
+        &mut verdict,
+    )
+    .await;
     // An empty batch acted on nothing: no edge (N7).
     if let Some(action) = action {
-        crate::journey::capture::record_control_result(&state, &result, action);
+        crate::journey::capture::record_control_verdict(
+            &state,
+            crate::journey::capture::control_action_verdict_with(&result, verdict),
+            action,
+        );
     }
     result
 }
@@ -1518,9 +1544,14 @@ pub async fn ui_bridge_control_batch_handler(
 ///
 /// Execute a sequence of element actions and report per-step timing plus a
 /// snapshot diff (element ids added / removed) between pre- and post-batch.
+///
+/// `verdict` receives the batch's three-state verdict for the journey ledger
+/// (plan 2026-11-18 D2). The envelope's `success: false` covers an
+/// INDETERMINATE step too, so it cannot be the ledger's verdict.
 async fn ui_bridge_control_batch_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<serde_json::Value>,
+    verdict: &mut super::request::ActionOutcome,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     const MAX_BATCH_SIZE: usize = 50;
 
@@ -1600,14 +1631,19 @@ async fn ui_bridge_control_batch_handler_dispatch(
         let res = ui_bridge_request_sync(&state, "execute_action", payload).await;
         let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
-        let (ok, response_value) = match res {
+        let (outcome, response_value) = match res {
             Ok(data) => {
                 // Strict, normalised: an absent `success` is INDETERMINATE.
                 let (data, outcome) = super::request::normalize_action_result(data);
-                (outcome.succeeded(), data)
+                (outcome, data)
             }
-            Err(e) => (false, serde_json::json!({"success": false, "error": e})),
+            Err(e) => (
+                super::request::ActionOutcome::Failed(Some(e.clone())),
+                serde_json::json!({"success": false, "error": e}),
+            ),
         };
+        let ok = outcome.succeeded();
+        verdict.absorb(outcome);
 
         results.push(serde_json::json!({
             "step": i,

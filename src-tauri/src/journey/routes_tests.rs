@@ -1293,3 +1293,42 @@ fn edge_timing_coverage_never_claims_full_measurement_beside_a_gap() {
         "measured == considered beside a gap: {v:#}"
     );
 }
+
+// -- Plan 2026-11-18 D1: verdict_unknown is unmeasured, never a negative -----
+
+/// A -> B by a click whose own verdict was never stated: the row stores B as
+/// its observed destination, but the runner cannot say the click did it. So
+/// the route answers neither "A is a dead end" (a negative) nor "B is
+/// reachable in one step from A" (a confirmation).
+#[test]
+fn a_verdict_unknown_departure_neither_confirms_nor_negates() {
+    let rows = vec![edge(
+        1,
+        "a",
+        Some("b"),
+        "affordance",
+        "verdict_unknown",
+        "fp-a1",
+    )];
+    let g = build_graph(&rows, &[], &writing(), &JourneyFilter::default());
+
+    let v = answer_dead_ends(&ctx("dead-ends"), &g);
+    assert!(
+        !listed(&v, "deadEnds").contains(&key("a")),
+        "an unknown departure is not a settled dead end: {v:#}"
+    );
+
+    let v = answer_steps(&ctx("steps"), &g, &key("a"), &key("b"));
+    assert_ne!(
+        status(&v),
+        "measured",
+        "an unknown verdict never confirms a step: {v:#}"
+    );
+
+    // The same row closed `changed` IS a confirmed step — the contrast that
+    // shows the assertion above is about the outcome.
+    let confirmed = vec![edge(1, "a", Some("b"), "affordance", "changed", "fp-a1")];
+    let g = build_graph(&confirmed, &[], &writing(), &JourneyFilter::default());
+    let v = answer_steps(&ctx("steps"), &g, &key("a"), &key("b"));
+    assert_eq!(status(&v), "measured", "{v:#}");
+}

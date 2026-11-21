@@ -551,6 +551,10 @@ pub async fn ui_bridge_batch_actions_handler(
     let mut failed = 0u32;
     let mut skipped = 0u32;
     let mut stopped = false;
+    // The batch's three-state verdict for the journey ledger (plan
+    // 2026-11-18 D2): a step whose result stated no `success` is UNKNOWN,
+    // which the counts below fold into `failed`.
+    let mut journey_outcome = super::request::ActionOutcome::Succeeded;
 
     for (i, step) in steps.iter().enumerate() {
         if stopped {
@@ -581,15 +585,20 @@ pub async fn ui_bridge_batch_actions_handler(
 
         let result = ui_bridge_request_sync(&state, "execute_action", payload).await;
 
-        let (success, response) = match result {
+        let (outcome, response) = match result {
             Ok(data) => {
                 // Strict, and normalised so `response` always carries an
                 // explicit `success` — an absent one is INDETERMINATE.
                 let (data, outcome) = super::request::normalize_action_result(data);
-                (outcome.succeeded(), data)
+                (outcome, data)
             }
-            Err(e) => (false, serde_json::json!({"success": false, "error": e})),
+            Err(e) => (
+                super::request::ActionOutcome::Failed(Some(e.clone())),
+                serde_json::json!({"success": false, "error": e}),
+            ),
         };
+        let success = outcome.succeeded();
+        journey_outcome.absorb(outcome);
 
         results.push(serde_json::json!({
             "index": i,
@@ -621,7 +630,7 @@ pub async fn ui_bridge_batch_actions_handler(
             crate::journey::cursor::CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
             action,
             crate::journey::cursor::Provenance::default(),
-            failed > 0,
+            journey_outcome,
         );
     }
 
@@ -1209,7 +1218,7 @@ pub async fn ui_bridge_execute_action_handler(
         body_bytes,
     )
     .await;
-    if let (Some(failed), Some(action)) = (
+    if let (Some(outcome), Some(action)) = (
         crate::journey::capture::control_action_verdict(&result),
         action_name,
     ) {
@@ -1228,7 +1237,7 @@ pub async fn ui_bridge_execute_action_handler(
                 app_version: None,
                 run_id: crate::journey::capture::run_id_from_task_run(task_run_id),
             },
-            failed,
+            outcome,
         );
     }
     result
@@ -2743,13 +2752,13 @@ pub async fn ui_bridge_execute_component_action_handler(
     // `ChokePoint::ComponentAction`, the same kind as the SDK component action
     // (`sdk_client::record_sdk_component_action`): the choke point names the
     // ACTION KIND, so the SDK/control transport distinction is NOT recorded.
-    if let Some(failed) = crate::journey::capture::control_action_verdict(&result) {
+    if let Some(outcome) = crate::journey::capture::control_action_verdict(&result) {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
             crate::journey::cursor::CursorKey::new(app_id, None),
             crate::journey::cursor::ActionSpec::component(&id, &action_id),
             crate::journey::cursor::Provenance::default(),
-            failed,
+            outcome,
         );
     }
     result
