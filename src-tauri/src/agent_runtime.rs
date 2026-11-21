@@ -2428,7 +2428,8 @@ impl ContinuationConsumedBody {
 /// The runner's decision after POSTing the consume CLAIM, derived purely from
 /// the claim response (status + body). Factored out as a pure fn
 /// ([`decide_spawn`]) so the 200 / 409-cancelled / 409-superseded /
-/// 409-rerouted / error branches are unit-testable without a live coord.
+/// 409-rerouted / 409-wrong_device / error branches are unit-testable without
+/// a live coord.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnDecision {
     /// Claim accepted (HTTP 200) → proceed to spawn.
@@ -3251,7 +3252,8 @@ enum ClaimOutcome {
 /// the skip/spawn decision are one unit, and
 /// `superseded_skip_releases_local_dispatch_claim_so_relist_reclaims` asserts
 /// the [`ClaimOutcome`] **and** the resulting claim state for every
-/// [`SpawnDecision`] variant.
+/// [`SpawnDecision`] variant except `SkipWrongDevice`, which
+/// `a_wrong_device_refusal_skips_and_releases_the_claim` covers the same way.
 ///
 /// The residual, stated rather than overstated: the gap is NARROWED to one
 /// statement, not removed. Deleting the whole wiring line in
@@ -6576,8 +6578,8 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
     {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            // Body is needed only to distinguish the 409 cancelled / superseded
-            // shapes; read it unconditionally (small) and tolerate a read error.
+            // Body is needed only to distinguish the 409 cancelled / superseded /
+            // rerouted / wrong_device shapes; read it unconditionally (small) and tolerate a read error.
             let text = resp.text().await.unwrap_or_default();
             decide_spawn(status, &text)
         }
@@ -20279,7 +20281,8 @@ mod tests {
         // …and the WIRING: `settle_claim_decision` is the whole of step 2's
         // decision handling, so this drives the fn `run_gate_continuation_inner`
         // actually calls rather than a copy of a match arm. Outcome AND claim
-        // state, for all SIX variants — the superseded release is no longer a
+        // state, for six variants (`SkipWrongDevice` is covered by
+        // `a_wrong_device_refusal_skips_and_releases_the_claim`) — the superseded release is no longer a
         // deletable statement at an untested call site.
         let gate = uuid::Uuid::now_v7();
 
