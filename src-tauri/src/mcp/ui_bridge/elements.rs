@@ -4185,6 +4185,17 @@ async fn ui_bridge_click_by_text_handler_dispatch(
         ));
     }
 
+    // The primitive clicks the first match; a caller-supplied `index` would be
+    // silently ignored (a wrong-element click), so refuse it.
+    if body.get("index").is_some_and(|v| !v.is_null()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "'index' is not supported on click-by-text (the first match is clicked); use click-by-selector with 'index'",
+            )),
+        ));
+    }
+
     // Bust the vision cache: a click can change rendered pixels.
     crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
@@ -4459,7 +4470,7 @@ async fn ui_bridge_type_into_handler_dispatch(
     } else if let Some(lbl) = label {
         let escaped = lbl.replace('\\', "\\\\").replace('\'', "\\'");
         format!(
-            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
+            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => !l.closest('[data-bridge-redact="true"]') && l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
             escaped.to_lowercase()
         )
     } else {
