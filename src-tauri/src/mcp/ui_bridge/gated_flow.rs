@@ -436,6 +436,7 @@ mod tests {
     #[test]
     fn view_control_is_disabled_unless_flag_is_exactly_1() {
         let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[VIEW_CONTROL_FLAG]);
         // P1's capability gate. Default (unset) MUST be disabled — a released
         // operator build must not expose the view-open footgun.
         std::env::remove_var(VIEW_CONTROL_FLAG);
@@ -451,8 +452,6 @@ mod tests {
 
         std::env::set_var(VIEW_CONTROL_FLAG, "1");
         assert!(view_control_enabled(), "explicit opt-in enables it");
-
-        std::env::remove_var(VIEW_CONTROL_FLAG);
     }
 
     // R9: the views payload must TELL a driver that the opening half exists
@@ -461,6 +460,7 @@ mod tests {
     #[test]
     fn views_payload_advertises_the_view_control_capability() {
         let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[VIEW_CONTROL_FLAG]);
 
         std::env::remove_var(VIEW_CONTROL_FLAG);
         let disabled = with_view_control_capability(serde_json::json!({ "views": [] }));
@@ -478,13 +478,12 @@ mod tests {
         std::env::set_var(VIEW_CONTROL_FLAG, "1");
         let enabled = with_view_control_capability(serde_json::json!({ "views": [] }));
         assert_eq!(enabled["viewControlEnabled"], serde_json::json!(true));
-
-        std::env::remove_var(VIEW_CONTROL_FLAG);
     }
 
     #[test]
     fn views_payload_wraps_a_bare_array_without_losing_it() {
         let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[VIEW_CONTROL_FLAG]);
         std::env::remove_var(VIEW_CONTROL_FLAG);
         let wrapped = with_view_control_capability(serde_json::json!([{ "name": "setup-wizard" }]));
         assert_eq!(wrapped["viewControlEnabled"], serde_json::json!(false));
