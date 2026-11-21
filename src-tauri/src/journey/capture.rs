@@ -136,13 +136,17 @@ fn indeterminate_marker(error: Option<&str>) -> bool {
 /// - an error whose `error_detail.context.code` is in
 ///   [`VERDICT_UNKNOWN_CODES`] (any status) → [`ActionOutcome::Indeterminate`]:
 ///   the action was attempted and its verdict is unknown;
-/// - a 4xx whose `error_detail.code` is `ACTION_FAILED` →
-///   [`ActionOutcome::Failed`]: the action was DISPATCHED and failed
+/// - a 4xx whose `error_detail.code` is `ACTION_FAILED` AND whose context
+///   carries a post-dispatch re-coder's stamp ([`post_dispatch_action_failure`])
+///   → [`ActionOutcome::Failed`]: the action was DISPATCHED and failed
 ///   (`elements::as_action_failure`, `/ai/recovery/attempt`'s
-///   `RECOVERY_FAILED`). Every producer of that code is post-dispatch;
+///   `RECOVERY_FAILED`). The code ALONE is not evidence of dispatch:
+///   `classify_transport_error` also codes any refusal whose prose merely
+///   contains "Operation failed" / "action failed" as `ACTION_FAILED`, with no
+///   context, and that refusal reached no UI;
 /// - any other 4xx → `None`: the runner refused the request itself
-///   (malformed body, unknown element, unknown action), no UI action
-///   occurred, so no edge;
+///   (malformed body, unknown element, unknown action, an unstamped
+///   `ACTION_FAILED`), no UI action occurred, so no edge;
 /// - any other 5xx → [`ActionOutcome::Failed`] (a transport-level failure;
 ///   sorting dispatch-time timeouts from pre-dispatch refusals is a named
 ///   follow-up of that plan, not this reader's job).
@@ -172,12 +176,38 @@ pub(crate) fn control_action_verdict<T: serde::Serialize, E: serde::Serialize>(
             }
             if status.is_client_error() {
                 return detail
-                    .filter(|d| matches!(d.code, UiBridgeErrorCode::ActionFailed))
+                    .filter(|d| post_dispatch_action_failure(d))
                     .map(|_| ActionOutcome::Failed(body.error.clone()));
             }
             Some(ActionOutcome::Failed(body.error.clone()))
         }
     }
+}
+
+/// Is this typed error a GENUINELY post-dispatch action failure? Its code is
+/// `ACTION_FAILED` and its context carries the stamp one of the two typed
+/// re-coders writes — and the prose classifier never does:
+///
+/// - `elements::as_action_failure` stamps `context.requested_action` (with
+///   `element_id` and the `recovery` trail) on every 400 it re-codes, after
+///   `execute_action` dispatched;
+/// - `ai_analyze::recovery_error_detail` stamps the recovery token into
+///   `context.code` (`RECOVERY_FAILED` and any future token it maps to
+///   `ACTION_FAILED`: recovery RAN and did not recover the element).
+///
+/// `classify_transport_error`'s `ACTION_FAILED` (prose containing "Operation
+/// failed" / "action failed") carries no context at all, so it is not trusted:
+/// the same reason `bookmarks::is_attempted_failure` reads a message prefix
+/// rather than the code.
+fn post_dispatch_action_failure(detail: &crate::mcp::ui_bridge::UiBridgeError) -> bool {
+    if !matches!(detail.code, UiBridgeErrorCode::ActionFailed) {
+        return false;
+    }
+    let Some(context) = detail.context.as_ref().and_then(|c| c.as_object()) else {
+        return false;
+    };
+    context.get("requested_action").is_some_and(|v| v.is_string())
+        || context.get("code").is_some_and(|v| v.is_string())
 }
 
 /// [`control_action_verdict`] for a handler that computed its success
@@ -301,8 +331,8 @@ pub(crate) fn sdk_action_verdict(response: &serde_json::Value) -> Option<ActionO
 /// recovered nothing):
 ///
 /// - a verdict-unknown token → [`ActionOutcome::Indeterminate`];
-/// - a refusal ([`sdk_refusal`], e.g. the app's 400 `UB-VALIDATION-ERROR` for
-///   an invalid payload, or a request that never reached an app) → `None`;
+/// - a refusal ([`sdk_refusal`], a request that never reached an app), or the
+///   app's 400 [`SDK_RECOVERY_VALIDATION_ERROR`] for an invalid payload → `None`;
 /// - `attemptSucceeded: true` → succeeded, unless the envelope (or `data`)
 ///   says `success: false` — a server that failed AFTER a strategy acted — which
 ///   is indeterminate;
@@ -311,13 +341,17 @@ pub(crate) fn sdk_action_verdict(response: &serde_json::Value) -> Option<ActionO
 ///   below 500 and indeterminate at 500+ (not an attempt verdict); anything
 ///   else stated no verdict → indeterminate.
 ///
-/// The same reading as the ui-bridge Python client's `read_recovery_attempt`,
-/// so the ledger and the client never disagree about one answer.
+/// The same reading as the ui-bridge Python client's `read_recovery_attempt`
+/// with ONE deliberate, more conservative difference: a 4xx stating
+/// `attemptSucceeded: true` beside `success: false` reads as `False` (failed)
+/// in the Python client, but as [`ActionOutcome::Indeterminate`] here — a
+/// strategy acted and the server then failed, so the ledger records neither a
+/// success nor a failure it cannot vouch for.
 pub(crate) fn sdk_recovery_verdict(status: u16, body: &serde_json::Value) -> Option<ActionOutcome> {
     if verdict_unknown_code(body).is_some() {
         return Some(ActionOutcome::Indeterminate);
     }
-    if sdk_refusal(body) {
+    if sdk_refusal(body) || carries_code(body, &[SDK_RECOVERY_VALIDATION_ERROR]) {
         return None;
     }
     let data = body.get("data").filter(|d| d.is_object());
@@ -462,15 +496,34 @@ pub(crate) fn snapshot_query_is_filtered(
         || query.contains_key("recency")
 }
 
-/// Refusal codes: the answer came back without any UI being reached.
-///
-/// - `TAB_NOT_FOUND` / `TAB_STALE` — the SDK relay could not route to a tab;
-/// - `UB-VALIDATION-ERROR` — the app's own server refused the request's
-///   PAYLOAD before acting (ui-bridge `mapInternalErrorCode('VALIDATION_ERROR')`,
-///   e.g. `attemptRecovery`'s 400 for an invalid `failure` / `instruction`):
-///   nothing acted, exactly the control routes' 4xx rule.
-pub(crate) const SDK_REFUSAL_CODES: [&str; 3] =
-    ["TAB_NOT_FOUND", "TAB_STALE", "UB-VALIDATION-ERROR"];
+/// Refusal codes on EVERY SDK route: the answer came back without any UI being
+/// reached — `TAB_NOT_FOUND` / `TAB_STALE`, the SDK relay could not route to a
+/// tab.
+pub(crate) const SDK_REFUSAL_CODES: [&str; 2] = ["TAB_NOT_FOUND", "TAB_STALE"];
+
+/// `UB-VALIDATION-ERROR` — on `/sdk/ai/recovery/attempt` ONLY
+/// ([`sdk_recovery_verdict`]), the app's own server refusing the request's
+/// PAYLOAD before acting (ui-bridge `mapInternalErrorCode('VALIDATION_ERROR')`,
+/// `attemptRecovery`'s 400 for an invalid `failure` / `instruction`): nothing
+/// acted, exactly the control routes' 4xx rule. Not a refusal code for the
+/// other SDK routes, whose validation-error answers are not established as
+/// pre-action, so they keep their pre-existing reading.
+pub(crate) const SDK_RECOVERY_VALIDATION_ERROR: &str = "UB-VALIDATION-ERROR";
+
+/// Does `response` carry one of `codes` as `code` / `errorCode` at its top
+/// level, under `error`, or under `data`?
+fn carries_code(response: &serde_json::Value, codes: &[&str]) -> bool {
+    let code_in = |v: Option<&serde_json::Value>| {
+        v.into_iter().any(|v| {
+            ["code", "errorCode"].iter().any(|k| {
+                v.get(*k)
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| codes.contains(&c))
+            })
+        })
+    };
+    code_in(Some(response)) || code_in(response.get("error")) || code_in(response.get("data"))
+}
 
 /// Did an SDK route's answer come from a REFUSAL rather than an attempted
 /// action (m3, N3)? Either the relay's `TAB_NOT_FOUND` / `TAB_STALE`
@@ -488,23 +541,11 @@ pub(crate) fn sdk_refusal(response: &serde_json::Value) -> bool {
     if verdict_unknown_code(response).is_some() {
         return false;
     }
-    let code_in = |v: Option<&serde_json::Value>| {
-        v.into_iter().any(|v| {
-            ["code", "errorCode"].iter().any(|k| {
-                v.get(*k)
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| SDK_REFUSAL_CODES.contains(&c))
-            })
-        })
-    };
     let refused_before_ui = matches!(
         response.get("failure_origin").and_then(|v| v.as_str()),
         Some(RUNNER_REJECTION_ORIGIN | "transport")
     );
-    refused_before_ui
-        || code_in(Some(response))
-        || code_in(response.get("error"))
-        || code_in(response.get("data"))
+    refused_before_ui || carries_code(response, &SDK_REFUSAL_CODES)
 }
 
 /// `task_run_id` (the run the action routes already attribute events to) as
@@ -1557,6 +1598,51 @@ mod tests {
         );
     }
 
+    /// An `ACTION_FAILED` the prose classifier assigned to a REFUSAL (its
+    /// message merely contains "Operation failed") carries no re-coder stamp:
+    /// no edge. The typed re-coders' `RECOVERY_FAILED` / `as_action_failure`
+    /// 400s are covered above and still record `error`.
+    #[test]
+    fn an_unstamped_prose_action_failed_400_records_no_edge() {
+        use crate::mcp::types::ApiResponse;
+        use crate::mcp::ui_bridge::types::classify_transport_error;
+        use axum::http::StatusCode;
+        use axum::Json;
+        let msg = "Operation failed: intent not registered";
+        let detail = classify_transport_error(msg);
+        assert!(
+            matches!(detail.code, UiBridgeErrorCode::ActionFailed),
+            "the classifier codes this prose ACTION_FAILED"
+        );
+        let refused: ControlResult = Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error_detailed(msg.to_string(), detail)),
+        ));
+        assert_eq!(control_action_verdict(&refused), None);
+        // The re-coded forms on the same status still record `error`.
+        let recovery_failed = recovery_reply(json!({ "attemptSucceeded": false }));
+        assert!(matches!(
+            control_action_verdict(&recovery_failed),
+            Some(ActionOutcome::Failed(_))
+        ));
+        let recoded = crate::mcp::ui_bridge::elements::as_action_failure(
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::error_detailed(
+                    msg.to_string(),
+                    classify_transport_error(msg),
+                )),
+            )),
+            "click",
+            "btn",
+            json!(null),
+        );
+        assert!(matches!(
+            control_action_verdict(&recoded),
+            Some(ActionOutcome::Failed(_))
+        ));
+    }
+
     /// Any other 4xx is still the runner refusing the request: no edge, even
     /// with a typed detail.
     #[test]
@@ -1684,18 +1770,48 @@ mod tests {
         );
     }
 
+    /// `UB-VALIDATION-ERROR` is a refusal on the recovery twin ONLY: there it
+    /// records no edge; on every other SDK route it is read as before this
+    /// rule existed — an app-origin `success: false`, an `error` edge.
     #[test]
-    fn a_ub_validation_error_refusal_records_no_edge() {
+    fn a_ub_validation_error_is_a_refusal_on_the_recovery_twin_only() {
         let refused = json!({
             "success": false,
             "code": "UB-VALIDATION-ERROR",
             "error": "failure must be an object",
             "failure_origin": "app",
         });
-        assert!(sdk_refusal(&refused));
-        assert_eq!(sdk_action_verdict(&refused), None);
         assert_eq!(sdk_recovery_verdict(400, &refused), None);
-        assert!(sdk_action_target(Some(("a".into(), None)), None, false, &refused).is_none());
+        // Nested under `data` / `error` too, on the recovery twin.
+        assert_eq!(
+            sdk_recovery_verdict(
+                400,
+                &json!({ "success": false, "error": { "code": "UB-VALIDATION-ERROR" } })
+            ),
+            None
+        );
+        // Any other SDK route: not a refusal.
+        assert!(!sdk_refusal(&refused));
+        assert_eq!(
+            sdk_action_verdict(&refused),
+            Some(ActionOutcome::Failed(Some(
+                "failure must be an object".to_string()
+            )))
+        );
+        assert!(sdk_action_target(Some(("a".into(), None)), None, false, &refused).is_some());
+        // The relay refusals still refuse everywhere.
+        let tab = json!({ "success": false, "code": "TAB_STALE" });
+        assert!(sdk_refusal(&tab));
+        assert_eq!(sdk_action_verdict(&tab), None);
+        assert_eq!(sdk_recovery_verdict(400, &tab), None);
+    }
+
+    /// The `INDETERMINATE:` reader matches the marker the normaliser writes.
+    #[test]
+    fn the_indeterminate_prefix_is_the_markers_prefix() {
+        use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+        assert!(INDETERMINATE_ACTION_ERROR.starts_with(INDETERMINATE_PREFIX));
+        assert!(indeterminate_marker(Some(INDETERMINATE_ACTION_ERROR)));
     }
 
     /// `/sdk/ai/recovery/attempt` reads the attempt's OWN verdict, the way the

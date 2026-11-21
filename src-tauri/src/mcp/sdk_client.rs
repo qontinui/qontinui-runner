@@ -753,6 +753,11 @@ fn dispatch_stage(err: &DispatchError) -> DispatchStage {
         | DispatchError::WebSocket(CommandRelayError::NotConnected(_))
         | DispatchError::WebSocket(CommandRelayError::EncodeFailed(_)) => DispatchStage::BeforeSend,
         DispatchError::HttpSend { source, .. } if source.is_connect() => DispatchStage::BeforeSend,
+        // The route is ABSENT on the app's server (an older app build): the
+        // server matched no handler, so nothing acted.
+        DispatchError::HttpStatus { status, .. } if matches!(*status, 404 | 405) => {
+            DispatchStage::BeforeSend
+        }
         DispatchError::AppAnswered { .. }
         | DispatchError::WebSocket(CommandRelayError::WrapperError(_)) => DispatchStage::AppAnswered,
         DispatchError::HttpSend { .. }
@@ -765,6 +770,17 @@ fn dispatch_stage(err: &DispatchError) -> DispatchStage {
             | CommandRelayError::UnreadableResponse(_),
         ) => DispatchStage::AfterSend,
     }
+}
+
+/// The journey verdict of an SDK element action whose dispatch failed with
+/// `err` and was answered by [`ipc_fallback_refusal`]: a dispatch that failed
+/// AFTER the request was sent ([`DispatchStage::AfterSend`]) may have acted,
+/// so it is [`ActionOutcome::Indeterminate`] (a `verdict_unknown` edge) even
+/// though the refusal body says `failure_origin: "transport"`; any other stage
+/// is `None` — the refusal body decides (a before-send refusal records
+/// nothing, an app-answered failure is an `error` edge).
+fn element_action_dispatch_outcome(err: &DispatchError) -> Option<ActionOutcome> {
+    (dispatch_stage(err) == DispatchStage::AfterSend).then_some(ActionOutcome::Indeterminate)
 }
 
 /// The app's own machine-readable code, from a JSON error body that has one
@@ -2549,6 +2565,11 @@ async fn handle_element_action(
     // 2026-11-18 D2); `None` = take it from the arm's boolean (a refusal or a
     // transport error, which carries no indeterminate state).
     let mut journey_outcome: Option<ActionOutcome> = None;
+    // Set when the dispatch failed AFTER the request was sent: the answer is
+    // still the transport refusal below (its shape is the route's contract),
+    // but the action may have run, so the ledger records `verdict_unknown`
+    // instead of skipping it as a refusal.
+    let mut dispatch_verdict_unknown = false;
     let result = match element_action_app_payloads(&id, &body, tab_id, active_origin.as_ref()) {
         // A placeholder no live condition session can substitute here: nothing
         // is dispatched, and the literal is never typed.
@@ -2586,10 +2607,16 @@ async fn handle_element_action(
                         .and_then(|v| v.as_str())
                         .map(String::from);
                     // Recorded as a FAILED action_executed event below. The
-                    // journey ledger decides on the refusal's `failure_origin`
-                    // (N3): a TRANSPORT refusal reached no UI and records nothing
-                    // (the control twin's 4xx rule); an APP-origin failure
-                    // reached the app and is an `error` edge.
+                    // journey ledger decides on the dispatch stage first: after
+                    // the send, the verdict is UNKNOWN (`verdict_unknown`);
+                    // otherwise on the refusal's `failure_origin` (N3): a
+                    // TRANSPORT refusal reached no UI and records nothing (the
+                    // control twin's 4xx rule); an APP-origin failure reached
+                    // the app and is an `error` edge.
+                    if let Some(outcome) = element_action_dispatch_outcome(&e) {
+                        dispatch_verdict_unknown = true;
+                        journey_outcome = Some(outcome);
+                    }
                     (Json(refusal), false, err)
                 } else if let Some(refused) = crate::condition_secrets::ipc_refusal(&body) {
                     // No SDK app is connected, so the fallback would act on the
@@ -2665,7 +2692,7 @@ async fn handle_element_action(
             None,
         ),
     };
-    if !crate::journey::capture::sdk_refusal(&result.0) {
+    if dispatch_verdict_unknown || !crate::journey::capture::sdk_refusal(&result.0) {
         let outcome = journey_outcome.unwrap_or_else(|| {
             if result.1 {
                 ActionOutcome::Succeeded
@@ -6213,7 +6240,7 @@ fn record_sdk_component_action(
 /// edge. `action_steps` are the steps that act on an element; an empty batch
 /// acted on nothing and records nothing; `sdk_action_target` decides where
 /// the rest landed (a refusal or no SDK app: nowhere — this route has no
-/// IPC fallback, C1).
+/// IPC fallback, C1). The verdict is [`sdk_batch_verdict`]'s.
 fn record_sdk_batch(
     state: &Arc<ApiState>,
     active_app: Option<(String, Option<String>)>,
@@ -6223,7 +6250,63 @@ fn record_sdk_batch(
     let Some(action) = crate::journey::cursor::ActionSpec::batch(action_steps) else {
         return;
     };
-    crate::journey::capture::record_sdk_result(state, active_app, None, false, response, action);
+    crate::journey::capture::record_sdk_verdict(
+        state,
+        active_app,
+        None,
+        false,
+        response,
+        sdk_batch_verdict(response),
+        action,
+    );
+}
+
+/// The journey verdict of an SDK batch answer. The outer envelope is read
+/// first ([`crate::journey::capture::sdk_action_verdict`]: a refusal is `None`,
+/// a failed or verdict-less envelope is its own answer). An envelope that says
+/// `success: true` is only the TRANSPORT's verdict — ui-bridge's batch handlers
+/// answer `success: true` around a `data` that states the batch's own — so a
+/// successful envelope is then read inside, with the
+/// [`ActionOutcome::and_then_step`] fold the control batch uses:
+///
+/// - each `data.results[]` step: its `response.success` when it carries a
+///   `response` (`/control/batch-action`), else its own `success`
+///   (`/control/batch`), read strictly — absent is
+///   [`ActionOutcome::Indeterminate`];
+/// - `data.success: false` is a failure when the steps do not already account
+///   for it: with no readable step, or every step succeeded. Beside an
+///   indeterminate step it adds nothing (the app's own aggregate counts an
+///   absent `success` as a failure, so it cannot sharpen an unknown);
+/// - a `data` stating neither keeps the envelope's verdict.
+fn sdk_batch_verdict(response: &serde_json::Value) -> Option<ActionOutcome> {
+    use crate::mcp::ui_bridge::request::action_outcome;
+    let outer = crate::journey::capture::sdk_action_verdict(response)?;
+    if !outer.succeeded() {
+        return Some(outer);
+    }
+    let Some(data) = response.get("data").filter(|d| d.is_object()) else {
+        return Some(outer);
+    };
+    let steps = data.get("results").and_then(|r| r.as_array());
+    let mut verdict = ActionOutcome::Succeeded;
+    for step in steps.into_iter().flatten() {
+        let read = step
+            .get("response")
+            .filter(|r| r.is_object())
+            .unwrap_or(step);
+        verdict.absorb(action_outcome(read));
+    }
+    if data.get("success").and_then(|v| v.as_bool()) == Some(false)
+        && verdict.succeeded()
+    {
+        let error = data
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("One or more batch steps failed")
+            .to_string();
+        verdict.absorb(ActionOutcome::Failed(Some(error)));
+    }
+    Some(verdict)
 }
 
 /// GET /ui-bridge/sdk/control/element/:id/state-generic — Get generic element state
@@ -11721,5 +11804,145 @@ mod recovery_attempt_twin_tests {
             sdk_recovery_verdict(status.as_u16(), &body),
             Some(ActionOutcome::Indeterminate)
         );
+    }
+}
+
+#[cfg(test)]
+mod sdk_journey_verdict_tests {
+    //! The SDK batch verdict reads the batch's OWN statement inside a
+    //! successful envelope; an element-action dispatch that failed after the
+    //! send is `verdict_unknown`; a 404/405 means the route is absent.
+    use super::*;
+    use crate::mcp::command_relay::CommandRelayError;
+    use serde_json::json;
+
+    #[test]
+    fn a_batch_whose_data_says_it_failed_is_an_error_edge() {
+        // `/control/batch-action`: outer `success: true`, the batch's own
+        // `data.success: false` with a failed step.
+        let failed = json!({
+            "success": true,
+            "data": {
+                "success": false,
+                "results": [
+                    { "index": 0, "elementId": "a", "response": { "success": true } },
+                    { "index": 1, "elementId": "b",
+                      "response": { "success": false, "error": "not clickable" } },
+                ],
+            },
+        });
+        assert_eq!(
+            sdk_batch_verdict(&failed),
+            Some(ActionOutcome::Failed(Some("not clickable".to_string())))
+        );
+        // `data.success: false` with no step to read is still a failure.
+        let bare = json!({ "success": true, "data": { "success": false } });
+        assert!(matches!(
+            sdk_batch_verdict(&bare),
+            Some(ActionOutcome::Failed(_))
+        ));
+        // `/control/batch`: steps carry their own `success`.
+        let control = json!({
+            "success": true,
+            "data": { "results": [
+                { "index": 0, "success": true, "data": {} },
+                { "index": 1, "success": false, "error": "Action failed" },
+            ] },
+        });
+        assert_eq!(
+            sdk_batch_verdict(&control),
+            Some(ActionOutcome::Failed(Some("Action failed".to_string())))
+        );
+    }
+
+    #[test]
+    fn a_batch_step_with_no_success_key_is_verdict_unknown() {
+        for data_success in [json!(true), json!(false)] {
+            let unknown = json!({
+                "success": true,
+                "data": {
+                    "success": data_success,
+                    "results": [
+                        { "index": 0, "elementId": "a", "response": { "success": true } },
+                        { "index": 1, "elementId": "b", "response": { "elementId": "b" } },
+                    ],
+                },
+            });
+            assert_eq!(
+                sdk_batch_verdict(&unknown),
+                Some(ActionOutcome::Indeterminate),
+                "data.success = {data_success}"
+            );
+        }
+        let ok = json!({
+            "success": true,
+            "data": { "success": true, "results": [
+                { "index": 0, "elementId": "a", "response": { "success": true } },
+            ] },
+        });
+        assert_eq!(sdk_batch_verdict(&ok), Some(ActionOutcome::Succeeded));
+        // The envelope's own failure and a relay refusal are unchanged.
+        assert!(matches!(
+            sdk_batch_verdict(&json!({ "success": false, "error": "e" })),
+            Some(ActionOutcome::Failed(_))
+        ));
+        assert_eq!(
+            sdk_batch_verdict(&json!({ "success": false, "code": "TAB_STALE" })),
+            None
+        );
+    }
+
+    #[test]
+    fn an_element_action_dispatch_error_after_send_is_verdict_unknown() {
+        for err in [
+            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(30))),
+            DispatchError::WebSocket(CommandRelayError::Disconnected),
+            DispatchError::WebSocket(CommandRelayError::Displaced("new tab".into())),
+            DispatchError::WebSocket(CommandRelayError::UnreadableResponse("garbage".into())),
+        ] {
+            assert_eq!(
+                element_action_dispatch_outcome(&err),
+                Some(ActionOutcome::Indeterminate),
+                "{err:?}"
+            );
+            // The route's answer keeps its shape: a transport refusal.
+            let refusal = ipc_fallback_refusal(&err, "element action").expect("an app was targeted");
+            assert_eq!(refusal["failure_origin"], json!("transport"));
+            assert_eq!(refusal["success"], json!(false));
+        }
+        for err in [
+            DispatchError::NotRegistered("app".into()),
+            DispatchError::NotResponsive("no tab".into()),
+            DispatchError::WebSocket(CommandRelayError::NotConnected("app".into())),
+            DispatchError::HttpStatus {
+                url: "u".into(),
+                status: 404,
+                body: "Not Found".into(),
+            },
+        ] {
+            assert_eq!(element_action_dispatch_outcome(&err), None, "{err:?}");
+            let refusal = ipc_fallback_refusal(&err, "element action").expect("an app was targeted");
+            assert!(crate::journey::capture::sdk_refusal(&refusal), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn a_404_or_405_from_the_app_server_is_before_send() {
+        for status in [404u16, 405] {
+            let err = DispatchError::HttpStatus {
+                url: "u".into(),
+                status,
+                body: "".into(),
+            };
+            assert_eq!(dispatch_stage(&err), DispatchStage::BeforeSend, "{status}");
+        }
+        for status in [400u16, 500, 502] {
+            let err = DispatchError::HttpStatus {
+                url: "u".into(),
+                status,
+                body: "".into(),
+            };
+            assert_eq!(dispatch_stage(&err), DispatchStage::AfterSend, "{status}");
+        }
     }
 }
