@@ -851,6 +851,14 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
     let mut ai_child = std::process::Command::new("claude");
     crate::ai_provider::process::prepare_ai_child_env(&mut ai_child);
 
+    // A bare `claude` with no arguments holds none of the characters the
+    // builder refuses, so this builds; were it ever refused, the bare command
+    // below reports a seam that clears nothing (which the seam test reddens)
+    // rather than panicking inside the report.
+    let scorer = crate::ai_provider::claude_cli::build_scorer_command("claude", config_dir)
+        // console-ok: fallback built only to fingerprint the env, never spawned.
+        .unwrap_or_else(|_| std::process::Command::new("claude"));
+
     vec![
         pty_seam(fp, config_dir),
         tokio_seam(
@@ -887,7 +895,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
             fp,
             "ai_provider::claude_cli::build_scorer_command",
             "scrub_credential_env_std",
-            &crate::ai_provider::claude_cli::build_scorer_command("claude", config_dir),
+            &scorer,
         ),
         tokio_seam(
             fp,
