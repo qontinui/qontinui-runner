@@ -1876,6 +1876,119 @@ mod tests {
         );
     }
 
+    /// One REAL census pass — `tracking_health::compute`, the one body behind
+    /// `GET /restart-readiness` — with nothing tracked: no terminal, no open
+    /// record, no AI-plane session, empty coord status maps.
+    #[cfg(target_os = "linux")]
+    async fn real_census_pass(
+        primary_boot_unix_millis: i64,
+    ) -> crate::session::tracking_health::TrackingHealthPass {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+                dir.path().join("terminal-sessions.json"),
+            )
+            .unwrap(),
+        );
+        let pass = crate::session::tracking_health::compute(
+            &std::sync::Arc::new(crate::terminal::TerminalManager::new()),
+            &store,
+            &std::sync::Arc::new(crate::claude_session::SessionManager::new()),
+            primary_boot_unix_millis,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .expect("the process table could not be read");
+        pass
+    }
+
+    /// Restart readiness over a REAL npm-installed `claude` (plan
+    /// `2026-11-18-runner-npm-claude-liveness-follow-ups-arming-through-population-entries-and-round-3-nits`,
+    /// Phase 2): a `node` child of this process, named by its own
+    /// `CLAUDE_CONFIG_DIR`'s registry record (`session::npm_claude_fixture`),
+    /// counted by `compute` over the real `/proc` table and the real registry
+    /// read — not a hand-built `PaneLook` — then judged by the handler's own
+    /// verdict assembly (`verdict_from`). Named, it is a live untracked
+    /// process and the restart is unsafe; with the record dropped it is a
+    /// plain `node`, counted nowhere (what #2967 kept); with `sessions/`
+    /// unlistable it is UNDECIDED, and the restart is still unsafe — never
+    /// zero.
+    ///
+    /// Asserted by the child's pid, never by totals alone: anything else this
+    /// test binary has running under the test process is in the same subtree.
+    /// The limit: the test enters at `compute`, which the route calls, not at
+    /// the axum route itself, because no in-process `AppHandle` exists.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn compute_over_the_real_table_counts_an_npm_claude_and_blocks_the_restart() {
+        use crate::session::npm_claude_fixture::{NpmClaudeFixture, FIXTURE_LOCK};
+        let _serial = FIXTURE_LOCK.lock().await;
+        let fixture = NpmClaudeFixture::spawn().await;
+        let pid = fixture.pid();
+        // The PID-reuse guard reads the runner's boot: before the child began,
+        // never now().
+        let boot = fixture.started_s() * 1000 - 60_000;
+        let classified = |report: &TrackingHealthReport| {
+            report
+                .classes()
+                .iter()
+                .any(|class| class.iter().any(|p| p.pid == pid))
+        };
+        let undecided =
+            |report: &TrackingHealthReport| report.undecided.iter().any(|u| u.pid == pid);
+        let verdict = |pass: &crate::session::tracking_health::TrackingHealthPass| {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            verdict_from(
+                &pass.report,
+                &pass.open_records,
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                idle_drain(),
+                fresh_census(now_ms),
+                now_ms,
+            )
+        };
+
+        let named = real_census_pass(boot).await;
+        let report = &named.report;
+        assert!(
+            report.live_untracked.iter().any(|p| p.pid == pid),
+            "a registry-named `node` no terminal claims is a live untracked claude: {report:?}"
+        );
+        assert!(!undecided(report), "{report:?}");
+        assert!(report.partition_covers_total(), "{report:?}");
+        assert!(report.live_claude_total >= 1, "{report:?}");
+        let v = verdict(&named);
+        assert!(!v.safe_to_restart, "{}", v.reason);
+        assert!(
+            v.live_claude.as_ref().is_some_and(|t| t.total >= 1),
+            "the claude is counted: {v:?}"
+        );
+
+        fixture.drop_record();
+        let dropped = real_census_pass(boot).await;
+        let report = &dropped.report;
+        assert!(
+            !classified(report) && !undecided(report),
+            "a `node` no record names is not a claude (any other unlistable sessions dir on \
+             this box would make it undecided instead): {report:?}"
+        );
+        assert!(report.partition_covers_total(), "{report:?}");
+
+        fixture.make_sessions_unlistable();
+        let unlistable = real_census_pass(boot).await;
+        let report = &unlistable.report;
+        assert!(
+            undecided(report) && !classified(report),
+            "a `node` whose sessions dir cannot be listed is UNDECIDED: {report:?}"
+        );
+        assert!(report.partition_covers_total(), "{report:?}");
+        assert!(report.live_claude_total >= 1, "never zero: {report:?}");
+        let v = verdict(&unlistable);
+        assert!(!v.safe_to_restart, "{}", v.reason);
+    }
+
     /// A genuinely idle runner: both planes empty → `safe_to_restart: true`.
     #[test]
     fn idle_runner_is_safe() {
