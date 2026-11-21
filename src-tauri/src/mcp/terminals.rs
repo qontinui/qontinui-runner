@@ -745,6 +745,95 @@ pub async fn get_buffer_handler(
     }))))
 }
 
+/// Request body for `POST /terminals/{id}/launch-evidence`. Every field is
+/// optional: an absent launch command is recorded as `UNKNOWN (typed by
+/// hand)`, never refused (plan `2026-11-20-terminal-launch-failure-analyze-button`).
+#[derive(Debug, Default, Deserialize)]
+pub struct LaunchEvidenceRequest {
+    #[serde(default, alias = "launchCommand")]
+    pub launch_command: Option<String>,
+    #[serde(default, alias = "configDir")]
+    pub config_dir: Option<String>,
+    #[serde(default, alias = "pinnedSessionId")]
+    pub pinned_session_id: Option<String>,
+}
+
+/// `POST /terminals/{id}/launch-evidence` — the HTTP twin of the
+/// `capture_launch_evidence` Tauri command: writes the pane's launch evidence
+/// file and provisions the fleet commands into its cwd. `data` is
+/// `{path, cwd, commandsProvisioned}`; an unknown terminal is a 404, and a
+/// control character in a request field is a 400.
+pub async fn capture_launch_evidence_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<LaunchEvidenceRequest>>,
+) -> Result<
+    Json<ApiResponse<crate::terminal::launch_evidence::LaunchEvidence>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    capture_launch_evidence_for(get_terminal_manager(&state), id, body).await
+}
+
+/// The whole body of [`capture_launch_evidence_handler`] against a bare
+/// [`TerminalManager`], so a route test with no `ApiState` drives the real
+/// status mapping: 404 for an unknown terminal, 400 for a control character
+/// in a request field, 500 otherwise.
+pub(crate) async fn capture_launch_evidence_for(
+    manager: Arc<TerminalManager>,
+    id: String,
+    body: Option<Json<LaunchEvidenceRequest>>,
+) -> Result<
+    Json<ApiResponse<crate::terminal::launch_evidence::LaunchEvidence>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    use crate::terminal::launch_evidence::{capture_launch_evidence, CaptureError};
+
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    let result = spawn_blocking_tracked(move || {
+        capture_launch_evidence(
+            &manager,
+            &id,
+            request.launch_command,
+            request.config_dir,
+            request.pinned_session_id,
+        )
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "launch evidence: capture task failed: {e}"
+            ))),
+        )
+    })?;
+    match result {
+        Ok(evidence) => Ok(Json(ApiResponse::success(evidence))),
+        Err(e @ CaptureError::TerminalNotFound(_)) => {
+            Err((StatusCode::NOT_FOUND, Json(api_error(e.to_string()))))
+        }
+        Err(e @ CaptureError::InvalidField { .. }) => {
+            Err((StatusCode::BAD_REQUEST, Json(api_error(e.to_string()))))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )),
+    }
+}
+
+/// `GET /terminals/{id}/launch-failure` — the shim's launch-failure record for
+/// this pane: `data` is `{"recorded": false}` or `{"recorded": true, "kind",
+/// "detail", "settings", "userChoseSession", "atMs"}`. "Not recorded" is not
+/// "launched OK". Reads an in-memory registry, so it answers for any id.
+pub async fn get_launch_failure_handler(
+    Path(id): Path<String>,
+) -> Json<ApiResponse<crate::terminal::launch_evidence::LaunchFailureView>> {
+    Json(ApiResponse::success(
+        crate::terminal::launch_evidence::read_launch_failure(&id),
+    ))
+}
+
 /// Submit a prompt to an interactive TUI running in the terminal (e.g.
 /// Claude Code). Wraps the message in ANSI bracketed-paste markers and
 /// follows it with a bare CR; see [`crate::terminal::session::TerminalSession::submit_prompt`].
@@ -1276,6 +1365,16 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         // Alias — the cheatsheet and intuition both reach for `/output`.
         // Same handler, no behavior difference.
         .route("/terminals/{id}/output", get(get_buffer_handler))
+        // Launch evidence + the shim's launch-failure record for the "Analyze
+        // launch" button (plan 2026-11-20-terminal-launch-failure-analyze-button).
+        .route(
+            "/terminals/{id}/launch-evidence",
+            post(capture_launch_evidence_handler),
+        )
+        .route(
+            "/terminals/{id}/launch-failure",
+            get(get_launch_failure_handler),
+        )
         // Late-bind lookup for the agent's own SessionStart hook — the coord
         // session id mirrored onto this terminal, or `null` when none is bound
         // yet. Read-only. Phase 2 of
@@ -1313,6 +1412,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/terminals/{id}/write"),
         ("GET", "/terminals/{id}/buffer"),
         ("GET", "/terminals/{id}/output"),
+        ("POST", "/terminals/{id}/launch-evidence"),
+        ("GET", "/terminals/{id}/launch-failure"),
         ("GET", "/terminals/{id}/coord-session"),
         ("POST", "/terminals/{id}/submit-prompt"),
         ("POST", "/terminals/{id}/resize"),
@@ -1892,6 +1993,61 @@ mod tests {
         // fall-through to `DELETE /terminals/{id}` closing a terminal.
         let (status, body) = call(Method::DELETE).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+    }
+
+    /// `POST /terminals/{id}/launch-evidence` on its REAL path and handler
+    /// body: a control character in `launch_command` is a 400 naming the
+    /// field, checked before the terminal lookup; a clean body for an unknown
+    /// terminal is the 404.
+    #[tokio::test]
+    async fn launch_evidence_route_answers_400_for_a_control_character() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TerminalManager::new());
+        let app = axum::Router::new().route(
+            "/terminals/{id}/launch-evidence",
+            post(
+                move |Path(id): Path<String>, body: Option<Json<LaunchEvidenceRequest>>| {
+                    let tm = tm.clone();
+                    async move { capture_launch_evidence_for(tm, id, body).await }
+                },
+            ),
+        );
+        let call = |json: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/terminals/t-none/launch-evidence")
+                            .header("content-type", "application/json")
+                            .body(Body::from(json.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8(bytes.to_vec()).unwrap())
+            }
+        };
+
+        let (status, body) = call(serde_json::json!({
+            "launchCommand": "claude\n- account: /forged"
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("launch_command"), "{body}");
+        assert!(body.contains("control character"), "{body}");
+
+        let (status, body) = call(serde_json::json!({ "launchCommand": "claude" })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
 
     /// `route_entries()` is the policy's view of this module, so it must not
