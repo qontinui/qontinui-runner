@@ -7768,7 +7768,10 @@ pub(crate) mod tests {
     fn pane_loses_shim_pin_only_for_a_claude_that_makes_no_session_choice() {
         let loses = |cmd: &CommandBuilder| TerminalSession::pane_loses_shim_pin(cmd);
 
-        assert!(loses(&claude_argv(&["--permission-mode", "bypassPermissions"])));
+        assert!(loses(&claude_argv(&[
+            "--permission-mode",
+            "bypassPermissions"
+        ])));
         assert!(loses(&claude_argv(&[])));
         assert!(loses(&TerminalSession::build_command_from(Some(vec![
             "/home/u/.nvm/versions/node/v24.19.0/bin/claude".to_string(),

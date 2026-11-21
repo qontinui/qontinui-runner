@@ -1339,7 +1339,10 @@ mod tests {
             );
             assert_eq!(value_after(&argv, "--session-id"), Some(ID));
             // The template's other flags still layer in.
-            assert!(argv.iter().any(|a| a == "--verbose"), "{template}: {argv:?}");
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
 
             let mut resumed = spec();
             resumed.resume_id = Some(ID.to_string());
