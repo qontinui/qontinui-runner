@@ -1775,9 +1775,11 @@ pub(crate) const ABANDONED_SESSION_STATUS: &str = "failed";
 /// terminal write ([`record_workflow_ai_session_terminal`] disarms it).
 /// Dropped while still ARMED — the phase future was cancelled
 /// (`JoinHandle::abort`, `unified_workflow_executor/mod.rs`) or a panic
-/// unwound through it — it best-effort spawns a
-/// [`ABANDONED_SESSION_STATUS`] write on the current tokio runtime, the way
-/// `WorkflowDropGuard` releases its locks. That spawn cannot run when the
+/// unwound through it, or its terminal write failed — it best-effort spawns a
+/// CONDITIONAL [`ABANDONED_SESSION_STATUS`] write
+/// (`fail_workflow_ai_session_if_running`: only a row still `running`
+/// changes) on the current tokio runtime, the way `WorkflowDropGuard`
+/// releases its locks. That spawn cannot run when the
 /// runtime is itself shutting down or the process is killed, so those rows
 /// stay `running` — which is exactly the restart case resume exists for.
 pub(crate) struct WorkflowAiSessionGuard {
@@ -1838,12 +1840,19 @@ impl Drop for WorkflowAiSessionGuard {
             self.iteration,
             self.stage_index,
         );
+        // Conditional on the row still being `running`: an abort that lands
+        // after the terminal write committed, or a drop that runs late
+        // against a later attempt's finished row, changes nothing.
+        debug_assert_eq!(status, "failed");
         handle.spawn(async move {
             if let Err(e) = pg
-                .complete_workflow_ai_session(&task, iteration, phase, stage, status, 0)
+                .fail_workflow_ai_session_if_running(&task, iteration, phase, stage)
                 .await
             {
-                warn!("PG complete_workflow_ai_session (abandoned) failed: {}", e);
+                warn!(
+                    "PG fail_workflow_ai_session_if_running (abandoned) failed: {}",
+                    e
+                );
             }
         });
     }
@@ -1852,8 +1861,11 @@ impl Drop for WorkflowAiSessionGuard {
 /// Write the phase's terminal `status` under the guard's key, then disarm the
 /// guard. Every normal exit after `create_workflow_ai_session` goes through
 /// here; a phase that does not reach it drops its guard armed (see
-/// [`WorkflowAiSessionGuard`]), so a row left `running` means the phase did
-/// not finish normally — the process died, or the drop's write could not run.
+/// [`WorkflowAiSessionGuard`]). When the terminal write itself fails the guard
+/// stays ARMED, so its drop retries once with the conditional `failed`. A row
+/// left `running` therefore means the phase did not finish normally — the
+/// process died, or the terminal write itself failed and the drop's retry
+/// could not run or failed too.
 pub(crate) async fn record_workflow_ai_session_terminal(
     mut guard: WorkflowAiSessionGuard,
     status: &'static str,
@@ -1871,7 +1883,10 @@ pub(crate) async fn record_workflow_ai_session_terminal(
         )
         .await
     {
+        // Leave the guard armed: its drop retries with the conditional
+        // `failed` write.
         warn!("PG complete_workflow_ai_session failed: {}", e);
+        return;
     }
     guard.armed = false;
 }
@@ -1896,7 +1911,8 @@ pub(crate) fn workflow_ai_session_terminal_status(outcome: &AgenticOutcome) -> &
 /// or panicking phase best-effort writes `failed` from its
 /// [`WorkflowAiSessionGuard`]; so a row still `running` at phase start means
 /// the phase did not finish normally (the process died or was shut down, or
-/// that best-effort write did not run). `interrupted` is kept for any writer
+/// the terminal write itself failed, or that best-effort write did not run).
+/// `interrupted` is kept for any writer
 /// that records it explicitly.
 /// Residual: a row a pre-change build left `running` through its old
 /// budget/circuit-breaker early return also reads as resumable (production
@@ -2033,6 +2049,27 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// A cost stop records the REAL session's output length: the synthetic
+    /// `BudgetExceeded` outcome carries no output, so measuring it would
+    /// record 0.
+    #[test]
+    fn cost_stop_records_the_real_sessions_output_length() {
+        let real = AgenticOutcome::Failed {
+            output: "x".repeat(37),
+            error: "e".to_string(),
+            parsed: None,
+            input_tokens: None,
+            output_tokens: None,
+            tools_used: Vec::new(),
+            tools_rejected: Vec::new(),
+        };
+        let stop = AgenticOutcome::BudgetExceeded {
+            reason: "over".to_string(),
+        };
+        assert_eq!(outcome_output_len(&real), 37);
+        assert_eq!(outcome_output_len(&stop), 0);
     }
 
     #[test]

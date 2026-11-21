@@ -301,6 +301,37 @@ impl PgDb {
         Ok(())
     }
 
+    /// Mark a workflow AI session `failed` ONLY while it is still `running`,
+    /// on the same `(task_run_id, iteration, phase, COALESCE(stage_index, -1))`
+    /// key `complete_workflow_ai_session` uses. The abandoned-phase write: it
+    /// never overwrites a terminal status already committed (an abort that
+    /// lands after the terminal write), nor a later attempt's row once that
+    /// attempt has finished. Returns the number of rows changed.
+    pub async fn fail_workflow_ai_session_if_running(
+        &self,
+        task_run_id: &str,
+        iteration: i32,
+        phase: &str,
+        stage_index: Option<i32>,
+    ) -> Result<u64, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let coalesced_stage = stage_index.unwrap_or(-1);
+        conn.execute(
+            r#"UPDATE workflow_ai_sessions
+               SET status = 'failed', session_completed_at = NOW()
+               WHERE task_run_id = $1 AND iteration = $2 AND phase = $3
+                 AND COALESCE(stage_index, -1) = $4
+                 AND status = 'running'"#,
+            &[&task_run_id, &iteration, &phase, &coalesced_stage],
+        )
+        .await
+        .map_err(|e| crate::database::pg::pg_err("PG fail_workflow_ai_session_if_running", &e))
+    }
+
     /// Create a new session (orchestration session).
     pub async fn create_session(
         &self,
@@ -515,6 +546,47 @@ mod workflow_ai_session_tests {
             .await
             .expect("get Some(-1)");
         assert_eq!(got, expected);
+    }
+
+    /// The abandoned-phase write changes a `running` row to `failed` and
+    /// leaves a row that already holds a terminal status alone.
+    #[tokio::test]
+    async fn fail_if_running_only_touches_a_running_row() {
+        let pg = fresh_db_with_task_run().await;
+        pg.create_workflow_ai_session(TASK, 4, PHASE, Some(0), "cli-done")
+            .await
+            .expect("create done");
+        pg.complete_workflow_ai_session(TASK, 4, PHASE, Some(0), "completed", 7)
+            .await
+            .expect("complete");
+        pg.create_workflow_ai_session(TASK, 4, PHASE, Some(1), "cli-live")
+            .await
+            .expect("create live");
+
+        let changed = pg
+            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(0))
+            .await
+            .expect("fail done");
+        assert_eq!(changed, 0, "a completed row must not be overwritten");
+        let done = pg
+            .get_workflow_ai_session(TASK, 4, PHASE, Some(0))
+            .await
+            .expect("get done");
+        assert_eq!(
+            done,
+            Some(("cli-done".to_string(), "completed".to_string()))
+        );
+
+        let changed = pg
+            .fail_workflow_ai_session_if_running(TASK, 4, PHASE, Some(1))
+            .await
+            .expect("fail live");
+        assert_eq!(changed, 1);
+        let live = pg
+            .get_workflow_ai_session(TASK, 4, PHASE, Some(1))
+            .await
+            .expect("get live");
+        assert_eq!(live, Some(("cli-live".to_string(), "failed".to_string())));
     }
 
     /// A terminal status written by `complete_workflow_ai_session` is what the
