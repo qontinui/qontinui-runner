@@ -68,6 +68,7 @@ pub mod discovery;
 // answers with a build in flight, never gated on the deletion gates).
 pub mod disk_reclaim;
 pub mod dom_capture;
+pub mod element_state_projection;
 pub mod entity_profiles_api;
 pub mod envelope;
 #[cfg(debug_assertions)]
