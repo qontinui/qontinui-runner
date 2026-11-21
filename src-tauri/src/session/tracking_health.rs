@@ -276,6 +276,59 @@ pub fn poll_claude_presence(
     }
 }
 
+/// The session-lifecycle poll's one look per tick (`main.rs`), with the two
+/// facts the tick derives from its table. See [`poll_tick_look`].
+pub(crate) struct PollTickLook {
+    /// The tick's look: a FRESH process table and Claude Code's session
+    /// registry read for the runner's and every live terminal's subtree.
+    pub(crate) look: PaneLook,
+    /// When the table's read began — a lower bound on every row's
+    /// observation — capped at when it was asked for; the ask time when no
+    /// read produced the table (`observed_at_ms` 0).
+    pub(crate) snap_captured_at_ms: i64,
+    /// The table is this tick's and readable ([`ProcessSnapshot::is_unknown`]
+    /// is false). When it is not, `classify` Skips every matched record.
+    pub(crate) tick_snapshot_ok: bool,
+}
+
+/// Take the lifecycle poll's look for one tick: one system-wide look shared by
+/// every open record, rooted at the runner and at every live terminal pid in
+/// `live_terminal_pids` (a pid of `0` — a terminal that reports none — is not
+/// a root), so an npm-installed `claude` (`node … cli.js`) reads present (plan
+/// 2026-11-05-npm-installed-claude-is-invisible-…). FRESH, never the memo: the
+/// poll closes a record on an ABSENT `claude`.
+///
+/// Extracted from the poll closure in `main.rs` so a test can drive the poll's
+/// own look over a real process table (plan
+/// 2026-11-18-runner-npm-claude-liveness-follow-ups-…, Phase 3); the poll is
+/// its one non-test caller, and the extraction changes nothing it computes.
+pub(crate) async fn poll_tick_look(live_terminal_pids: &[u32]) -> PollTickLook {
+    let asked_at_ms = chrono::Utc::now().timestamp_millis();
+    let look_roots: Vec<u32> = std::iter::once(std::process::id())
+        .chain(live_terminal_pids.iter().copied().filter(|&p| p > 0))
+        .collect();
+    let look = PaneLook::take_fresh(&look_roots).await;
+    let snap = look.snapshot();
+    // Stamp the epoch with when the table's read began — a lower bound on
+    // every row's observation — not with the time it was asked for. A table
+    // no read produced (observed_at_ms 0) is UNKNOWN and records nothing
+    // (`tick_snapshot_ok` below).
+    let snap_captured_at_ms = if snap.observed_at_ms > 0 {
+        snap.observed_at_ms.min(asked_at_ms)
+    } else {
+        asked_at_ms
+    };
+    // A totally-empty system parent_map means the snapshot helper failed, and
+    // a `stale` one is the last good table, not this tick's → classify Skips
+    // every matched record.
+    let tick_snapshot_ok = !snap.is_unknown();
+    PollTickLook {
+        look,
+        snap_captured_at_ms,
+        tick_snapshot_ok,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Health-check report
 // ---------------------------------------------------------------------------
@@ -818,23 +871,59 @@ struct UndecidedKey {
 
 impl UndecidedKey {
     fn of(undecided: &[UndecidedProcess]) -> Self {
-        let mut roots: Vec<u32> = undecided
-            .iter()
-            .filter(|u| !u.nested_under_undecided)
-            .map(|u| u.pid)
-            .collect();
-        roots.sort_unstable();
         Self {
-            roots,
+            roots: undecided_roots(undecided),
             causes: undecided.iter().map(pid_free_reason).collect(),
         }
     }
 }
 
+/// The ROOTS of an undecided population, sorted: the undecided processes no
+/// other undecided process is an ancestor of. The one roots computation, for
+/// the census log key and the periodic warn.
+fn undecided_roots(undecided: &[UndecidedProcess]) -> Vec<u32> {
+    let mut roots: Vec<u32> = undecided
+        .iter()
+        .filter(|u| !u.nested_under_undecided)
+        .map(|u| u.pid)
+        .collect();
+    roots.sort_unstable();
+    roots
+}
+
 /// `u.reason` with its own pid taken out: the witness names the pid inside
 /// the sentence, and the cause — not the pid — is what a reader acts on.
 fn pid_free_reason(u: &UndecidedProcess) -> String {
-    u.reason.replace(&u.pid.to_string(), "<pid>")
+    without_pid_token(&u.reason, u.pid)
+}
+
+/// `reason` with every `pid <pid>` TOKEN rewritten to `pid <pid>` literally:
+/// only where the word `pid` (not the tail of a longer word) is followed by
+/// exactly these digits and then a non-digit. Any other occurrence of the
+/// digits — another pid that starts with them, a `5 s` budget, a path
+/// number — is part of the cause and is left alone.
+fn without_pid_token(reason: &str, pid: u32) -> String {
+    let needle = format!("pid {pid}");
+    let mut out = String::with_capacity(reason.len());
+    let mut copied = 0;
+    for (at, _) in reason.match_indices(&needle) {
+        let end = at + needle.len();
+        let (Some(head), Some(tail)) = (reason.get(..at), reason.get(end..)) else {
+            continue;
+        };
+        let word_start = head
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let digits_end = tail.chars().next().is_none_or(|c| !c.is_ascii_digit());
+        if word_start && digits_end {
+            out.push_str(reason.get(copied..at).unwrap_or_default());
+            out.push_str("pid <pid>");
+            copied = end;
+        }
+    }
+    out.push_str(reason.get(copied..).unwrap_or_default());
+    out
 }
 
 /// Logs the UNDECIDED population a census blocks on — once when it appears,
@@ -913,6 +1002,24 @@ impl UndecidedLog {
         *reported = Some((key, now));
         line
     }
+}
+
+/// Child -> parent, inverted from a parent -> children index. A table read
+/// from the OS lists each pid under one parent; should a malformed one list a
+/// pid under several, the MINIMUM parent pid wins, so the answer never depends
+/// on the map's iteration order. The one inversion: `graceful_exit`'s
+/// `parent_index` calls it too.
+pub(crate) fn child_to_min_parent(parent_map: &HashMap<u32, Vec<u32>>) -> HashMap<u32, u32> {
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+    for (&parent, kids) in parent_map {
+        for &kid in kids {
+            parent_of
+                .entry(kid)
+                .and_modify(|p| *p = (*p).min(parent))
+                .or_insert(parent);
+        }
+    }
+    parent_of
 }
 
 /// Result of one cross-reference pass.
@@ -1507,12 +1614,7 @@ pub fn evaluate(
 
     // Child -> parent, inverted once from the snapshot's parent -> children
     // index. Used only for `parent_pid` / `nested_under_claude` reporting.
-    let mut parent_of: HashMap<u32, u32> = HashMap::new();
-    for (&parent, kids) in &snapshot.parent_map {
-        for &kid in kids {
-            parent_of.entry(kid).or_insert(parent);
-        }
-    }
+    let parent_of = child_to_min_parent(&snapshot.parent_map);
 
     // A claim is only ever made on a LIVE pid: an undecided pid under a plane
     // root stays undecided (it was noted when the universe was walked, or is
@@ -1957,10 +2059,11 @@ async fn run_once(
         );
     }
     if !report.undecided.is_empty() {
-        let undecided_pids: Vec<u32> = report.undecided.iter().map(|u| u.pid).collect();
+        let roots = undecided_roots(&report.undecided);
         warn!(
-            undecided = report.undecided.len(),
-            undecided_pids = ?undecided_pids,
+            undecided_roots = ?roots,
+            undecided_total = report.undecided.len(),
+            undecided_root_count = roots.len(),
             live_claude_total = report.live_claude_total,
             "session tracking health: UNDECIDED — processes that may be a live npm-installed \
              `claude` the session registry could not settle (a restart would be refused)"
@@ -4660,6 +4763,104 @@ mod tests {
         assert_eq!(log.observe_at(&set, due), UndecidedLogLine::Silent);
     }
 
+    /// Only the exact `pid <n>` token is taken out of a cause: a longer pid
+    /// that starts with the same digits, a possessive, and the digits
+    /// anywhere else in the sentence are left alone.
+    #[test]
+    fn the_pid_token_rewrite_takes_out_only_the_exact_pid_token() {
+        assert_eq!(
+            without_pid_token("pid 50 and pid 5's record", 5),
+            "pid 50 and pid <pid>'s record"
+        );
+        assert_eq!(
+            without_pid_token("pid 50 is unknown", 5),
+            "pid 50 is unknown"
+        );
+        assert_eq!(without_pid_token("pid 5", 5), "pid <pid>");
+        assert_eq!(
+            without_pid_token("within a 5 s budget, pid 5 in /tmp/5 is unknown", 5),
+            "within a 5 s budget, pid <pid> in /tmp/5 is unknown"
+        );
+        assert_eq!(
+            without_pid_token("rapid 5 then pid 5.", 5),
+            "rapid 5 then pid <pid>."
+        );
+        // Two distinct pids with one cause are one cause.
+        let causes: std::collections::BTreeSet<String> = [undecided(5, false), undecided(7, false)]
+            .iter()
+            .map(pid_free_reason)
+            .collect();
+        assert_eq!(causes.len(), 1, "{causes:?}");
+    }
+
+    /// The roots are the sorted non-nested pids.
+    #[test]
+    fn undecided_roots_are_the_sorted_non_nested_pids() {
+        assert_eq!(
+            undecided_roots(&[
+                undecided(70, false),
+                undecided(71, true),
+                undecided(50, false)
+            ]),
+            vec![50, 70]
+        );
+        assert!(undecided_roots(&[]).is_empty());
+    }
+
+    /// Pins existing behaviour: a new cause under unchanged roots is a new
+    /// line, while the same cause with only the pids changed is silent.
+    #[test]
+    fn the_undecided_log_warns_on_a_new_cause_under_the_same_roots() {
+        let log = UndecidedLog::new("test", "test consequence");
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            log.observe_at(&[undecided(50, false), undecided(51, true)], t0),
+            UndecidedLogLine::Warned
+        );
+        let mut other_cause = undecided(51, true);
+        other_cause.reason = "a different cause".to_string();
+        assert_eq!(
+            log.observe_at(&[undecided(50, false), other_cause.clone()], t0),
+            UndecidedLogLine::Warned,
+            "same roots, a new cause"
+        );
+        let mut other_cause_new_pid = other_cause;
+        other_cause_new_pid.pid = 52;
+        assert_eq!(
+            log.observe_at(&[undecided(50, false), other_cause_new_pid], t0),
+            UndecidedLogLine::Silent,
+            "same roots and causes, only a pid changed"
+        );
+    }
+
+    /// ARMING: a census whose nested undecided pid merely churns, under an
+    /// unchanged root and cause, stays silent even when the cause sentence
+    /// carries a number that shares the pid's digits.
+    #[test]
+    fn the_census_undecided_log_is_silent_when_a_nested_pid_sharing_the_causes_digits_churns() {
+        fn row(pid: u32, nested: bool) -> UndecidedProcess {
+            UndecidedProcess {
+                pid,
+                image: Some("node".to_string()),
+                reason: format!(
+                    "Claude Code's session registry did not answer within a 5 s budget, so \
+                     whether pid {pid} in the pane is a JS-runtime claude is unknown"
+                ),
+                nested_under_undecided: nested,
+            }
+        }
+        let log = UndecidedLog::new("test", "test consequence");
+        assert_eq!(
+            log.observe(&[row(50, false), row(5, true)]),
+            UndecidedLogLine::Warned
+        );
+        assert_eq!(
+            log.observe(&[row(50, false), row(6, true)]),
+            UndecidedLogLine::Silent,
+            "only a nested pid churned; the root and the cause are unchanged"
+        );
+    }
+
     /// `evaluate` marks an undecided process under another undecided one as
     /// nested, so only the roots key the log.
     #[test]
@@ -4683,5 +4884,138 @@ mod tests {
             .map(|u| (u.pid, u.nested_under_undecided))
             .collect();
         assert_eq!(nested, vec![(50, false), (51, true)]);
+    }
+
+    /// A child listed under several parents takes the MINIMUM parent, so the
+    /// answer does not depend on iteration order: 64 fresh maps, each with
+    /// its own `RandomState`, all agree.
+    #[test]
+    fn a_child_under_several_parents_takes_the_minimum_parent() {
+        for _ in 0..64 {
+            let parent_map: HashMap<u32, Vec<u32>> = [90, 7, 300, 12]
+                .into_iter()
+                .map(|parent| (parent, vec![50]))
+                .collect();
+            assert_eq!(child_to_min_parent(&parent_map).get(&50), Some(&7));
+        }
+    }
+
+    /// The nesting walk passes through a DECIDED intermediate: shell 51
+    /// (decided by its image) between undecided `node` 50 and undecided
+    /// `node` 52 does not stop 52 being nested.
+    #[test]
+    fn evaluate_nests_an_undecided_process_through_a_decided_intermediate() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let mut snap = snap_with(
+            &[(1, &[5]), (5, &[50]), (50, &[51]), (51, &[52])],
+            &[(5, now_s), (50, now_s), (51, now_s), (52, now_s)],
+            &[(5, "bash"), (50, "node"), (51, "bash"), (52, "node")],
+        );
+        snap.stale = false;
+        let look = PaneLook::over_whole_table(
+            snap,
+            crate::terminal::graceful_exit::RegistryWitness::unreadable("test"),
+        );
+        let report = eval_npm(&look, &[], now_ms);
+        let nested: Vec<(u32, bool)> = report
+            .undecided
+            .iter()
+            .map(|u| (u.pid, u.nested_under_undecided))
+            .collect();
+        assert_eq!(nested, vec![(50, false), (52, true)]);
+    }
+}
+
+/// The lifecycle poll's population entry (plan
+/// `2026-11-18-runner-npm-claude-liveness-follow-ups-arming-through-population-entries-and-round-3-nits`,
+/// Phase 3): the poll's own look ([`poll_tick_look`]) over the REAL process
+/// table and the REAL registry read, then the same per-record read and
+/// decision the poll makes ([`poll_claude_presence`] →
+/// `session_lifecycle_store::classify`), for a pane whose shell runs a real
+/// npm-installed `claude` (`session::npm_claude_fixture`). Linux only: the
+/// fixture is.
+#[cfg(all(test, target_os = "linux"))]
+mod poll_tick_tests {
+    use super::*;
+    use crate::session::npm_claude_fixture::{NpmClaudeFixture, FIXTURE_LOCK};
+    use crate::session::session_lifecycle_store::{PollAction, WorkerPlane};
+
+    /// One poll tick's decision for a confirmed record whose terminal (the
+    /// pane root `shell`) is alive, after `consecutive_dead` claude-absent
+    /// ticks.
+    async fn tick_action(
+        shell: u32,
+        reference_unix_millis: i64,
+        consecutive_dead: u32,
+    ) -> PollAction {
+        let tick = poll_tick_look(&[shell]).await;
+        assert!(
+            tick.tick_snapshot_ok,
+            "the tick's process table could not be read"
+        );
+        assert!(tick.snap_captured_at_ms > 0);
+        let (claude_present, snapshot_ok) = poll_claude_presence(
+            &tick.look,
+            shell,
+            reference_unix_millis,
+            tick.tick_snapshot_ok,
+        );
+        crate::session::session_lifecycle_store::classify(
+            Some(true),
+            claude_present,
+            consecutive_dead,
+            0,
+            snapshot_ok,
+            false,
+            true,
+            WorkerPlane::NotWorker,
+        )
+    }
+
+    /// A live npm-installed `claude` keeps its record open on every tick; the
+    /// same `node` with no record behind it is a bare shell the debounce
+    /// closes (the pre-#2967 reading of a live npm session, which closed it);
+    /// and with the registry unlistable the record is Skipped, never closed,
+    /// however long the dead streak.
+    #[tokio::test]
+    async fn the_poll_tick_keeps_an_npm_claude_and_never_closes_an_undecided_one() {
+        let _serial = FIXTURE_LOCK.lock().await;
+        // The runner's boot, for the PID-reuse guard: before the pane began.
+        let reference = chrono::Utc::now().timestamp_millis() - 60_000;
+        let fixture = NpmClaudeFixture::spawn_under_shell().await;
+        let shell = fixture
+            .shell_pid()
+            .expect("a shell-hosted fixture has a shell");
+
+        assert_eq!(
+            tick_action(shell, reference, 0).await,
+            PollAction::KeepAlive
+        );
+        assert_eq!(
+            tick_action(shell, reference, u32::MAX).await,
+            PollAction::KeepAlive,
+            "a present claude keeps the record whatever the dead streak"
+        );
+
+        fixture.drop_record();
+        assert_eq!(
+            tick_action(shell, reference, 0).await,
+            PollAction::NeedsConfirm
+        );
+        assert_eq!(
+            tick_action(shell, reference, u32::MAX).await,
+            PollAction::Close,
+            "a `node` no record names is no claude: past the debounce the record closes"
+        );
+
+        fixture.make_sessions_unlistable();
+        for consecutive_dead in [0, u32::MAX] {
+            assert_eq!(
+                tick_action(shell, reference, consecutive_dead).await,
+                PollAction::Skip,
+                "an undecided `node` is never closed (dead streak {consecutive_dead})"
+            );
+        }
     }
 }

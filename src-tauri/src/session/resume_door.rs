@@ -489,7 +489,7 @@ fn holder_from_command_lines(
 // ---------------------------------------------------------------------------
 
 /// Why one verify poll could not read the pane — the poll is skipped, and
-/// when EVERY poll was skipped, the last one's reason is the verdict.
+/// when EVERY poll was skipped, the reason [`sticky_skip`] kept is the verdict.
 const PROCESS_TABLE_UNREADABLE: &str = "process_table_unreadable";
 /// The pane holds a process Claude Code's session registry could not settle
 /// (it may be the resumed npm-installed `claude`), so the list is undecided.
@@ -568,12 +568,25 @@ async fn verify(
     .await
 }
 
+/// The skip reason a skipped poll leaves: `new`, except that once a poll was
+/// [`REGISTRY_UNDECIDED`] a later [`PROCESS_TABLE_UNREADABLE`] does not erase
+/// it. A registry that could not settle a `node` that may be the resumed
+/// `claude` is the more specific cause, and a transient table failure after it
+/// says nothing new about that `node`.
+fn sticky_skip(prev: &'static str, new: &'static str) -> &'static str {
+    if prev == REGISTRY_UNDECIDED && new == PROCESS_TABLE_UNREADABLE {
+        prev
+    } else {
+        new
+    }
+}
+
 /// The poll loop behind [`verify`], over an injected pane check and process
 /// read (`Err(reason)` = that poll could not read the pane). At the deadline
 /// it reports `no_claude_resume_process_observed` only when at least one poll
-/// actually READ it; when every poll was skipped it reports the last skip's
-/// reason (`process_table_unreadable` or `registry_undecided`) — "could not
-/// look" is not "looked and found nothing".
+/// actually READ it; when every poll was skipped it reports the skip reason
+/// [`sticky_skip`] kept (`process_table_unreadable` or `registry_undecided`)
+/// — "could not look" is not "looked and found nothing".
 async fn verify_with<A, R, Fut>(
     cand: &Candidate,
     terminal_id: &str,
@@ -603,7 +616,7 @@ where
                     Err(None) => {}
                 }
             }
-            Err(reason) => last_skip = reason,
+            Err(reason) => last_skip = sticky_skip(last_skip, reason),
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(if any_poll_readable {
@@ -1502,6 +1515,90 @@ mod tests {
         )
         .await;
         assert_eq!(every_poll_undecided, Err("registry_undecided".to_string()));
+    }
+
+    /// `verify_with` over polls scripted by call index: `Some(reason)` skips
+    /// the poll with `reason`, `None` reads an empty pane. The LAST element
+    /// repeats for every later poll (the window is time-bound).
+    async fn verify_scripted(script: &[Option<&'static str>]) -> Result<ProcessEvidence, String> {
+        let mut call = 0;
+        verify_with(
+            &cand(),
+            "t",
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            || true,
+            || {
+                let step = script[call.min(script.len() - 1)];
+                call += 1;
+                std::future::ready(match step {
+                    Some(reason) => Err(reason),
+                    None => Ok(Vec::new()),
+                })
+            },
+        )
+        .await
+    }
+
+    /// Once a poll was UNDECIDED, an unreadable table on another poll does
+    /// not erase it, in either order; only unreadable polls stay unreadable,
+    /// and one readable poll is still "looked and found nothing".
+    // A paused clock: the 40 ms window is virtual time, so a scheduler stall
+    // cannot end it before the scripted polls run.
+    #[tokio::test(start_paused = true)]
+    async fn resume_door_verify_keeps_registry_undecided_over_an_unreadable_table() {
+        assert_eq!(
+            verify_scripted(&[Some(REGISTRY_UNDECIDED), Some(PROCESS_TABLE_UNREADABLE)]).await,
+            Err("registry_undecided".to_string())
+        );
+        assert_eq!(
+            verify_scripted(&[Some(PROCESS_TABLE_UNREADABLE), Some(REGISTRY_UNDECIDED)]).await,
+            Err("registry_undecided".to_string())
+        );
+        assert_eq!(
+            verify_scripted(&[
+                Some(PROCESS_TABLE_UNREADABLE),
+                Some(PROCESS_TABLE_UNREADABLE)
+            ])
+            .await,
+            Err("process_table_unreadable".to_string())
+        );
+        assert_eq!(
+            verify_scripted(&[
+                Some(REGISTRY_UNDECIDED),
+                None,
+                Some(PROCESS_TABLE_UNREADABLE)
+            ])
+            .await,
+            Err("no_claude_resume_process_observed".to_string())
+        );
+    }
+
+    /// ARMING: a resume whose first poll was undecided and every later poll
+    /// unreadable reports `registry_undecided`, not `process_table_unreadable`.
+    // A paused clock: the 40 ms window is virtual time, so a scheduler stall
+    // cannot end it before the scripted polls run.
+    #[tokio::test(start_paused = true)]
+    async fn resume_door_verify_reports_undecided_then_unreadable_as_registry_undecided() {
+        let mut polls = 0;
+        let verdict = verify_with(
+            &cand(),
+            "t",
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            || true,
+            || {
+                polls += 1;
+                std::future::ready(Err(if polls == 1 {
+                    REGISTRY_UNDECIDED
+                } else {
+                    PROCESS_TABLE_UNREADABLE
+                }))
+            },
+        )
+        .await;
+        assert!(polls > 1, "the window must reach an unreadable poll");
+        assert_eq!(verdict, Err("registry_undecided".to_string()));
     }
 
     #[test]
