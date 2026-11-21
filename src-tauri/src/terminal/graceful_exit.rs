@@ -1268,16 +1268,7 @@ impl PaneLook {
 /// malformed one list a pid under several, the LOWEST parent pid wins, so the
 /// answer never depends on `HashMap` iteration order.
 fn parent_index(snapshot: &ProcessSnapshot) -> std::collections::HashMap<u32, u32> {
-    let mut parents: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for (&parent, kids) in &snapshot.parent_map {
-        for &kid in kids {
-            parents
-                .entry(kid)
-                .and_modify(|seen| *seen = (*seen).min(parent))
-                .or_insert(parent);
-        }
-    }
-    parents
+    crate::session::tracking_health::child_to_min_parent(&snapshot.parent_map)
 }
 
 /// The pids of `subtree` (the inclusive subtree of `root`) that descend from

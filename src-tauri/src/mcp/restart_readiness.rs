@@ -1890,7 +1890,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let pass = crate::session::tracking_health::compute(
+        crate::session::tracking_health::compute(
             &std::sync::Arc::new(crate::terminal::TerminalManager::new()),
             &store,
             &std::sync::Arc::new(crate::claude_session::SessionManager::new()),
@@ -1899,8 +1899,7 @@ mod tests {
             &HashMap::new(),
         )
         .await
-        .expect("the process table could not be read");
-        pass
+        .expect("the process table could not be read")
     }
 
     /// Restart readiness over a REAL npm-installed `claude` (plan

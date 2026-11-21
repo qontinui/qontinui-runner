@@ -908,21 +908,21 @@ fn without_pid_token(reason: &str, pid: u32) -> String {
     let mut copied = 0;
     for (at, _) in reason.match_indices(&needle) {
         let end = at + needle.len();
-        let word_start = reason[..at]
+        let (Some(head), Some(tail)) = (reason.get(..at), reason.get(end..)) else {
+            continue;
+        };
+        let word_start = head
             .chars()
             .next_back()
             .is_none_or(|c| !c.is_alphanumeric() && c != '_');
-        let digits_end = reason[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_ascii_digit());
+        let digits_end = tail.chars().next().is_none_or(|c| !c.is_ascii_digit());
         if word_start && digits_end {
-            out.push_str(&reason[copied..at]);
+            out.push_str(reason.get(copied..at).unwrap_or_default());
             out.push_str("pid <pid>");
             copied = end;
         }
     }
-    out.push_str(&reason[copied..]);
+    out.push_str(reason.get(copied..).unwrap_or_default());
     out
 }
 
@@ -1004,11 +1004,12 @@ impl UndecidedLog {
     }
 }
 
-/// Child -> parent, inverted from a parent -> children index. A child listed
-/// under more than one parent (a table read across a reparenting) takes the
-/// MINIMUM parent pid, so the answer never depends on the map's iteration
-/// order.
-fn child_to_min_parent(parent_map: &HashMap<u32, Vec<u32>>) -> HashMap<u32, u32> {
+/// Child -> parent, inverted from a parent -> children index. A table read
+/// from the OS lists each pid under one parent; should a malformed one list a
+/// pid under several, the MINIMUM parent pid wins, so the answer never depends
+/// on the map's iteration order. The one inversion: `graceful_exit`'s
+/// `parent_index` calls it too.
+pub(crate) fn child_to_min_parent(parent_map: &HashMap<u32, Vec<u32>>) -> HashMap<u32, u32> {
     let mut parent_of: HashMap<u32, u32> = HashMap::new();
     for (&parent, kids) in parent_map {
         for &kid in kids {

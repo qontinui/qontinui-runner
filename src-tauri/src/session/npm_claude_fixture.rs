@@ -13,12 +13,11 @@
 //! How it is built, and why each piece:
 //!
 //! - **The image.** A symlink named `node` to the `sleep` binary, exec'd by
-//!   its symlink path. Linux sets `/proc/<pid>/comm` from the basename of the
-//!   path handed to `execve`, so the process table reads `node` while the
-//!   binary stays a harmless `sleep`. `argv[0]` is set to `sleep` so a
-//!   multi-call `sleep` (busybox, uutils) still dispatches to itself; where no
-//!   argv[0] can be set (the shell-hosted form) the spawn asserts the process
-//!   is alive and reads `node`, loudly, rather than skipping.
+//!   its symlink path, with `argv[0]` set to `sleep`. That the process table
+//!   then reads `node` is not assumed: the spawn waits for the table to show
+//!   the child as a live `node` with a start time and panics, loudly, if it
+//!   never does (the shell-hosted form, which cannot set `argv[0]`, gets the
+//!   same check) rather than skipping.
 //! - **The config dir.** `CLAUDE_CONFIG_DIR=<tmp>/cfg` is set in the CHILD's
 //!   environment only. The registry witness reads each JS-runtime candidate's
 //!   own `CLAUDE_CONFIG_DIR` from `/proc/<pid>/environ`
@@ -148,18 +147,23 @@ impl NpmClaudeFixture {
                 Host::Direct(child) | Host::Shell(child) => child,
             };
             if let Ok(Some(status)) = child.try_wait() {
+                host.kill_and_reap();
                 panic!(
                     "npm-claude fixture: the fixture process exited ({status}) before the \
                      process table showed a `node` child — a `sleep` that cannot run under the \
                      name `node` (a multi-call binary?) breaks this fixture"
                 );
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "npm-claude fixture: the process table never showed the fixture's child as a \
+            if tokio::time::Instant::now() >= deadline {
+                // No `Self` exists yet, so its `Drop` will not reap the host:
+                // do it here, or a failed spawn leaves the `node` running.
+                host.kill_and_reap();
+                panic!(
+                    "npm-claude fixture: the process table never showed the fixture's child as a \
                  `node` process with a start time within {SPAWN_DEADLINE:?} (table unknown: {})",
-                snap.is_unknown()
-            );
+                    snap.is_unknown()
+                );
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         let fixture = Self {
@@ -254,9 +258,11 @@ impl NpmClaudeFixture {
     }
 }
 
-impl Drop for NpmClaudeFixture {
-    fn drop(&mut self) {
-        match &mut self.host {
+impl Host {
+    /// Kill and reap the host — and, for the shell form, its whole process
+    /// group, so the `node` is never orphaned past the test.
+    fn kill_and_reap(&mut self) {
+        match self {
             Host::Direct(child) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -275,6 +281,12 @@ impl Drop for NpmClaudeFixture {
                 let _ = sh.wait();
             }
         }
+    }
+}
+
+impl Drop for NpmClaudeFixture {
+    fn drop(&mut self) {
+        self.host.kill_and_reap();
     }
 }
 
