@@ -558,10 +558,31 @@ fn parse_component_action_target(
         .map_err(|e| format!("UI Bridge component_action: invalid target {raw:?}: {e}"))
 }
 
+/// The refusal for a snapshot target the runner does not serve. Only
+/// `control` and `sdk` exist: the `proxy:PORT` target addressed the runtime
+/// injection proxy, which was removed in `82d2e2174` (2026-03-14); no repo in
+/// the qontinui org serves it (searched all 53 repos' default branches,
+/// 2026-11-21), so a step still carrying it fails here naming the accepted
+/// targets instead of with a connection error.
+fn unknown_snapshot_target(target: &str) -> String {
+    format!("Unknown snapshot target: '{target}'. Use 'control' or 'sdk'")
+}
+
+/// The snapshot route for a snapshot target: `control` (the default) the
+/// runner's own UI, `sdk` an SDK app reached through the runner.
+fn snapshot_endpoint(base_url: &str, snapshot_target: Option<&str>) -> Result<String, String> {
+    let base = base_url.trim_end_matches('/');
+    match snapshot_target {
+        None | Some("control") => Ok(format!("{base}/control/snapshot")),
+        Some("sdk") => Ok(format!("{base}/sdk/snapshot")),
+        Some(t) => Err(unknown_snapshot_target(t)),
+    }
+}
+
 /// The component-action route for a snapshot target, mirroring the snapshot
 /// arm: `sdk` is the SDK's route through the runner
 /// (`POST /ui-bridge/sdk/component/:id/action/:actionId`, `sdk_client.rs`),
-/// `control` (the default) the runner's own UI, `proxy:PORT` a proxied app.
+/// `control` (the default) the runner's own UI.
 fn component_action_endpoint(
     base_url: &str,
     snapshot_target: Option<&str>,
@@ -576,22 +597,7 @@ fn component_action_endpoint(
     match snapshot_target {
         None | Some("control") => Ok(format!("{base}/control/{path}")),
         Some("sdk") => Ok(format!("{base}/sdk/{path}")),
-        Some(t) => match t.strip_prefix("proxy:") {
-            // Parse the port: raw text here would let `proxy:80@host` turn
-            // `127.0.0.1:80` into userinfo and send this state-changing POST
-            // to `host`, past the network policy (which checks only raw_url).
-            Some(port) => {
-                let port: u16 = port.parse().map_err(|_| {
-                    format!("Invalid proxy port in snapshot target '{t}': expected proxy:PORT")
-                })?;
-                Ok(format!(
-                    "http://127.0.0.1:{port}/__ui-bridge/control/{path}"
-                ))
-            }
-            None => Err(format!(
-                "Unknown snapshot target: '{t}'. Use 'control', 'sdk', or 'proxy:PORT'"
-            )),
-        },
+        Some(t) => Err(unknown_snapshot_target(t)),
     }
 }
 
@@ -1228,23 +1234,12 @@ impl StepHandler for UiBridgeHandler {
                     client.post(&endpoint).json(&body).send().await
                 }
                 "snapshot" => {
-                    let endpoint = match step.ui_bridge_snapshot_target.as_deref() {
-                        None | Some("control") => {
-                            format!("{}/control/snapshot", base_url.trim_end_matches('/'))
-                        }
-                        Some("sdk") => {
-                            format!("{}/sdk/snapshot", base_url.trim_end_matches('/'))
-                        }
-                        Some(t) if t.starts_with("proxy:") => {
-                            let port = &t["proxy:".len()..];
-                            format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
-                        }
-                        Some(other) => {
-                            return StepHandlerResult::failure(format!(
-                                "Unknown snapshot target: '{}'. Use 'control', 'sdk', or 'proxy:PORT'",
-                                other
-                            ));
-                        }
+                    let endpoint = match snapshot_endpoint(
+                        base_url,
+                        step.ui_bridge_snapshot_target.as_deref(),
+                    ) {
+                        Ok(e) => e,
+                        Err(e) => return StepHandlerResult::failure(e),
                     };
                     client.get(&endpoint).send().await
                 }
@@ -1605,20 +1600,10 @@ impl UiBridgeHandler {
             .unwrap_or(serde_json::json!({}));
 
         // Fetch snapshot to find element ID matching criteria
-        let snapshot_target = step
-            .ui_bridge_snapshot_target
-            .as_deref()
-            .unwrap_or("control");
-        let snapshot_endpoint = match snapshot_target {
-            "sdk" => format!("{}/sdk/snapshot", base_url.trim_end_matches('/')),
-            "control" => format!("{}/control/snapshot", base_url.trim_end_matches('/')),
-            t if t.starts_with("proxy:") => {
-                let port = &t["proxy:".len()..];
-                format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
-            }
-            other => {
-                return StepHandlerResult::failure(format!("Unknown snapshot target: '{}'", other));
-            }
+        let endpoint = match snapshot_endpoint(base_url, step.ui_bridge_snapshot_target.as_deref())
+        {
+            Ok(e) => e,
+            Err(e) => return StepHandlerResult::failure(e),
         };
 
         let client = match reqwest::Client::builder()
@@ -1632,7 +1617,7 @@ impl UiBridgeHandler {
         };
 
         // Get snapshot and find matching element
-        let snapshot_resp = match client.get(&snapshot_endpoint).send().await {
+        let snapshot_resp = match client.get(&endpoint).send().await {
             Ok(r) => r,
             Err(e) => {
                 return StepHandlerResult::failure(format!("Failed to fetch snapshot: {}", e));
@@ -1828,20 +1813,10 @@ impl UiBridgeHandler {
             .and_then(|t| t.as_u64())
             .unwrap_or(5000);
 
-        let snapshot_target = step
-            .ui_bridge_snapshot_target
-            .as_deref()
-            .unwrap_or("control");
-        let snapshot_endpoint = match snapshot_target {
-            "sdk" => format!("{}/sdk/snapshot", base_url.trim_end_matches('/')),
-            "control" => format!("{}/control/snapshot", base_url.trim_end_matches('/')),
-            t if t.starts_with("proxy:") => {
-                let port = &t["proxy:".len()..];
-                format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
-            }
-            other => {
-                return StepHandlerResult::failure(format!("Unknown snapshot target: '{}'", other));
-            }
+        let endpoint = match snapshot_endpoint(base_url, step.ui_bridge_snapshot_target.as_deref())
+        {
+            Ok(e) => e,
+            Err(e) => return StepHandlerResult::failure(e),
         };
 
         let client = match reqwest::Client::builder()
@@ -1859,7 +1834,7 @@ impl UiBridgeHandler {
         let deadline = std::time::Duration::from_millis(timeout_ms);
 
         loop {
-            if let Ok(resp) = client.get(&snapshot_endpoint).send().await {
+            if let Ok(resp) = client.get(&endpoint).send().await {
                 if let Ok(snapshot) = resp.json::<serde_json::Value>().await {
                     let elements = snapshot
                         .get("data")
@@ -1939,23 +1914,10 @@ impl UiBridgeHandler {
         }
 
         // Fetch snapshot
-        let snapshot_target = step
-            .ui_bridge_snapshot_target
-            .as_deref()
-            .unwrap_or("control");
-        let snapshot_endpoint = match snapshot_target {
-            "sdk" => format!("{}/sdk/snapshot", base_url.trim_end_matches('/')),
-            "control" => format!("{}/control/snapshot", base_url.trim_end_matches('/')),
-            t if t.starts_with("proxy:") => {
-                let port = &t["proxy:".len()..];
-                format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
-            }
-            other => {
-                return StepHandlerResult::failure(format!(
-                    "Unknown snapshot target: '{}'. Use 'control', 'sdk', or 'proxy:PORT'",
-                    other
-                ));
-            }
+        let endpoint = match snapshot_endpoint(base_url, step.ui_bridge_snapshot_target.as_deref())
+        {
+            Ok(e) => e,
+            Err(e) => return StepHandlerResult::failure(e),
         };
 
         let client = match reqwest::Client::builder()
@@ -1968,12 +1930,12 @@ impl UiBridgeHandler {
             }
         };
 
-        let snapshot_response = match client.get(&snapshot_endpoint).send().await {
+        let snapshot_response = match client.get(&endpoint).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 return StepHandlerResult::failure(format!(
                     "Failed to fetch snapshot from {}: {}",
-                    snapshot_endpoint, e
+                    endpoint, e
                 ));
             }
         };
@@ -2429,13 +2391,40 @@ mod tests {
             component_action_endpoint(base, None, &t).unwrap(),
             "http://127.0.0.1:9876/ui-bridge/control/component/a%20b/action/go"
         );
+        // The removed injection proxy's target is refused, naming the two
+        // targets that exist, rather than routed to a port nothing serves.
         assert_eq!(
-            component_action_endpoint(base, Some("proxy:4000"), &t).unwrap(),
-            "http://127.0.0.1:4000/__ui-bridge/control/component/a%20b/action/go"
+            component_action_endpoint(base, Some("proxy:4000"), &t).unwrap_err(),
+            "Unknown snapshot target: 'proxy:4000'. Use 'control' or 'sdk'"
         );
-        assert!(component_action_endpoint(base, Some("elsewhere"), &t).is_err());
+        assert_eq!(
+            component_action_endpoint(base, Some("elsewhere"), &t).unwrap_err(),
+            "Unknown snapshot target: 'elsewhere'. Use 'control' or 'sdk'"
+        );
         assert!(component_action_endpoint(base, Some("proxy:80@evil.example"), &t).is_err());
         assert!(component_action_endpoint(base, Some("proxy:"), &t).is_err());
+    }
+
+    #[test]
+    fn snapshot_endpoint_serves_control_and_sdk_and_refuses_the_proxy_target() {
+        let base = "http://127.0.0.1:9876/ui-bridge/";
+        assert_eq!(
+            snapshot_endpoint(base, None).unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/control/snapshot"
+        );
+        assert_eq!(
+            snapshot_endpoint(base, Some("control")).unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/control/snapshot"
+        );
+        assert_eq!(
+            snapshot_endpoint(base, Some("sdk")).unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/sdk/snapshot"
+        );
+        assert_eq!(
+            snapshot_endpoint(base, Some("proxy:4000")).unwrap_err(),
+            "Unknown snapshot target: 'proxy:4000'. Use 'control' or 'sdk'"
+        );
+        assert!(snapshot_endpoint(base, Some("elsewhere")).is_err());
     }
 
     #[test]

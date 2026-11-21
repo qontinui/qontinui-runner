@@ -1766,7 +1766,6 @@ async fn try_health_check(
     let paths: &[(&str, &str)] = &[
         ("/api/ui-bridge/health", "/api/ui-bridge"),
         ("/ui-bridge/health", "/ui-bridge"),
-        ("/__ui-bridge/health", "/__ui-bridge"),
         ("/health", ""),
     ];
 
