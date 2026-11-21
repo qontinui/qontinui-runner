@@ -63,12 +63,14 @@ transitions with `<TransitionTo>` from `@qontinui/ui-bridge`; the
 "#;
 
 /// UI Bridge dependency versions are never below the caret ranges the
-/// runner itself ships with (see the repo-root `package.json`), so a fresh
-/// scaffold and the runner agree on the UI Bridge contract. Bump
-/// `@qontinui/ui-bridge` and `@qontinui/ui-bridge-auto` together: a caret on
-/// 0.x never crosses a minor, so moving one alone can leave an incompatible
-/// companion. `template_ui_bridge_pins_are_not_below_the_runners_own` keeps
-/// the floor.
+/// runner itself ships with (see the repo-root `package.json`): the template
+/// tracks npm `latest`, which may be ahead of the runner, but a fresh scaffold
+/// is never older than it. Bump `@qontinui/ui-bridge` and
+/// `@qontinui/ui-bridge-auto` together, and check that the new
+/// `ui-bridge-auto` peer range accepts the new `ui-bridge`
+/// (`npm view @qontinui/ui-bridge-auto@<v> peerDependencies`) — no test reads
+/// npm metadata. `template_ui_bridge_pins_are_not_below_the_runners_own`
+/// keeps the floor.
 const REACT_PACKAGE_JSON: &str = r#"{
   "name": "{{app_id}}",
   "private": true,
