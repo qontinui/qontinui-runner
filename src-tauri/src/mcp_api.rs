@@ -23646,6 +23646,549 @@ mod supervised_workers_health_tests {
             "create_router must not run a re-check pass outside the supervised loop"
         );
     }
+
+    /// Where a census row's needle sits in `create_router`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Site {
+        /// The needle keys an inline spawn site (`tokio::spawn(` or a runtime
+        /// handle's `.spawn(`): it lies inside that spawn's body, and every
+        /// spawn site holds exactly one such needle.
+        Spawn,
+        /// The needle is a starter CALL (`::spawn_*(`, `::start_*(`,
+        /// `.spawn_*(`, `.start_*(`) whose task is started by the callee.
+        Call,
+    }
+
+    /// The census of every task `create_router` starts (plan
+    /// `2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised`
+    /// Phase 0). Plan `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`
+    /// supervised the loops `main.rs` starts and never counted these, so a
+    /// panic ended them silently while `/health` read them as never started.
+    ///
+    /// Closed tables, every row a needle with a reason: `SUPERVISED` (under
+    /// `worker_supervisor`, listed on `/health`), `TASK_SUPERVISED` (under
+    /// `mcp::task_supervisor`), `ONE_SHOT`, `PER_EVENT` and `DEFERRED` (a
+    /// long-lived loop still on a bare spawn). A later phase that supervises a
+    /// loop moves its row from `DEFERRED` to `SUPERVISED` — an inline row's
+    /// needle then becomes the `::spawn_<role>(` call that replaced the body.
+    ///
+    /// Closure: every spawn site in the region (`::spawn(` / `.spawn(`) holds
+    /// exactly one `Site::Spawn` needle; every `::spawn_*(` / `::start_*(` /
+    /// `.spawn_*(` / `.start_*(` call is covered by as many rows as it has
+    /// occurrences; every needle is found exactly once (a moved or renamed
+    /// region goes red instead of passing with nothing counted); registry names
+    /// are unique.
+    ///
+    /// The census boundary — what this test does NOT see:
+    /// - a starter named some other way (not `spawn_*` / `start_*`, qualified
+    ///   or bare, and not a spawn written inline in the region);
+    /// - tasks a callee starts beneath a classified row:
+    ///   `WrapperState::new_default`'s `spawn_health_loop` / `spawn_idle_reaper`
+    ///   (`wrappers/manager.rs`) and the trigger service's nested bridge loop
+    ///   (`trigger_system/service.rs`);
+    /// - the loops `main.rs` starts, classified by `worker_supervisor`'s own
+    ///   `every_phase4_entry_point_is_classified` (its DEFERRED set).
+    ///
+    /// When plan
+    /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    /// Phase 7b moves the boot spawns into `router/boot_tasks.rs`, this census
+    /// moves with them and reads `boot_tasks::spawn_all` instead.
+    #[test]
+    fn every_create_router_boot_task_is_classified() {
+        const PHASE1_2: &str = "migration target of plan \
+            2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised Phase 1/2";
+
+        // (site, needle in create_router, file under src/, entry fn signature
+        // at column 0, worker_supervisor registry name).
+        const SUPERVISED: &[(Site, &str, &str, &str, &str)] = &[(
+            Site::Call,
+            "crate::mcp::sdk_client::spawn_stored_bearer_recheck(",
+            "mcp/sdk_client.rs",
+            "pub fn spawn_stored_bearer_recheck(",
+            "sdk_client.stored_bearer_recheck",
+        )];
+        // (site, needle, reason).
+        const TASK_SUPERVISED_REASON: &str =
+            "under mcp::task_supervisor — restarts on panic or return, no /health registry";
+        const TASK_SUPERVISED: &[(Site, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::mcp::backend_relay::commands::auto_start_cloud_relay(",
+                TASK_SUPERVISED_REASON,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::device_jwt_refresher::commands::auto_start_device_jwt_refresher(",
+                TASK_SUPERVISED_REASON,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::fleet_policy_poller::commands::auto_start_fleet_policy_poller(",
+                TASK_SUPERVISED_REASON,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::session_message_poller::commands::auto_start_session_message_poller(",
+                TASK_SUPERVISED_REASON,
+            ),
+        ];
+        // (site, needle, reason). Each runs once at boot and ends.
+        const ONE_SHOT: &[(Site, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::wrappers::WrapperState::new_default()",
+                "one-shot WrapperState bootstrap into a OnceCell (its own loops are outside \
+                 the census boundary)",
+            ),
+            (
+                Site::Spawn,
+                "crate::ui_bridge_invoke_probe::probe_allowlist_wire_contracts(",
+                "one-shot UI Bridge invoke wire-contract probe after the frontend mounts",
+            ),
+            (
+                Site::Spawn,
+                "crate::unified_workflow_executor::resume_interrupted_workflows(",
+                "one pass over interrupted unified workflows; never supervise — a re-run \
+                 would resume a workflow twice",
+            ),
+            (
+                Site::Spawn,
+                "crate::commands::ai_session::resume_ai_sessions(",
+                "bounded retry; never supervise — resume is not idempotent",
+            ),
+            (
+                Site::Spawn,
+                "crate::coord_mcp::log_rotation_log_path_once()",
+                "one-shot coord-mcp nonce restore and session-config reconcile",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(crate::coord_mcp::warm_stdio_shim_probe)",
+                "one-shot blocking warm of the stdio-shim selftest cache",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(move || {",
+                "one-shot blocking census of on-disk .mcp.json configs, awaited by the restore",
+            ),
+            (
+                Site::Call,
+                "let reaped = spawn_blocking_tracked(",
+                "awaited blocking reap of stale session-restore configs (unqualified \
+                 wedge_diagnostics helper)",
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::web_backend_workflows::sync_workflows_from_backend(",
+                "one-shot workflow sync from the web backend",
+            ),
+            (
+                Site::Spawn,
+                "crate::agent_commands::publish_defaults::publish_embedded_defaults_once()",
+                "one-shot publish of the embedded command defaults",
+            ),
+            (
+                Site::Spawn,
+                ".cleanup_old_audit_events(",
+                "one-shot audit-event retention cleanup",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::transport::pairing::spawn_token_fetch(",
+                "one-shot pairing-token fetch per newly admitted USB device (inside the USB \
+                 scanner's body)",
+            ),
+        ];
+        // (site, needle, reason). Spawned from a Tauri event listener per
+        // event, not at boot.
+        const PER_EVENT: &[(Site, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::mcp::ui_bridge::handle_ui_bridge_response(",
+                "per-response delivery task from the UI Bridge response listener",
+            ),
+            (
+                Site::Spawn,
+                "\"UI Bridge invoke: response for unknown request_id {} (likely timed out)\"",
+                "per-response delivery task from the invoke-proxy listener",
+            ),
+            (
+                Site::Spawn,
+                "store.deliver(&window_label, &request_id, response)",
+                "per-response delivery task from the page/evaluate listener",
+            ),
+            (
+                Site::Spawn,
+                "\"scenarios/current: response for unknown request_id {} (likely timed out)\"",
+                "per-response delivery task from the scenarios/current projection listener",
+            ),
+        ];
+        // (site, needle, planned registry name, reason). Long-lived loops
+        // still on a bare spawn: a panic ends them silently.
+        const DEFERRED: &[(Site, &str, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::helper_tasks::poller::run_forever()",
+                "helper_tasks.poller",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "cleanup_registry.cleanup_stale(&cleanup_db)",
+                "file_registry.stale_sweep",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::transport::usb::UsbTransport::new()",
+                "usb.adb_scanner",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                ".start_health_monitor(",
+                "physical_device.health_monitor",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::transport::cloud::CloudTransport::new(",
+                "cloud_registry.poller",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::discovery::mdns_scanner::MdnsScanner::new()",
+                "mdns_scanner.events",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::util::egress_context::spawn_baseline_logger()",
+                "egress_context.baseline_logger",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::mcp::app_registry::spawn_sweeper(",
+                "app_registry.sweeper",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::canonical_corpus::start_refresh_loop()",
+                "canonical_corpus.refresh_loop",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::coord_mcp::start_stale_breadcrumb_sweep(",
+                "coord_mcp.stale_breadcrumb_sweep",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::zombie_sweep::start_zombie_sweep(",
+                "zombie_sweep.task_run_sweep",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::mcp::cascade::start_buffer_task(",
+                "cascade.buffer",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::trigger_system::start_trigger_service(",
+                "trigger_system.service",
+                "needs its own restart-safety read: start() takes its event_rx once, the \
+                 TRIGGER_SERVICE latch makes a rebuilt start a no-op, and \
+                 register_all_watchers would register twice",
+            ),
+        ];
+
+        let region_text = crate::mcp_api::mcp_api_item_source("fn create_router(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines: Vec<&str> = region_text.lines().collect();
+
+        // Every row, flattened: (table, site, needle).
+        let mut rows: Vec<(&str, Site, &str)> = Vec::new();
+        rows.extend(SUPERVISED.iter().map(|r| ("SUPERVISED", r.0, r.1)));
+        rows.extend(
+            TASK_SUPERVISED
+                .iter()
+                .map(|r| ("TASK_SUPERVISED", r.0, r.1)),
+        );
+        rows.extend(ONE_SHOT.iter().map(|r| ("ONE_SHOT", r.0, r.1)));
+        rows.extend(PER_EVENT.iter().map(|r| ("PER_EVENT", r.0, r.1)));
+        rows.extend(DEFERRED.iter().map(|r| ("DEFERRED", r.0, r.1)));
+
+        let mut violations: Vec<String> = Vec::new();
+
+        // Non-vacuity: every needle sits exactly once in the region, on one line.
+        let mut needle_line: Vec<Option<usize>> = Vec::new();
+        for (table, _, needle) in &rows {
+            let count = region_text.matches(needle).count();
+            if count != 1 {
+                violations.push(format!(
+                    "{table} needle `{needle}` occurs {count} times in create_router (want \
+                     exactly 1) — re-classify the row"
+                ));
+            }
+            needle_line.push(lines.iter().position(|l| l.contains(needle)));
+        }
+
+        // Spawn sites: a line holding `::spawn(` or `.spawn(`. Its body runs
+        // to the next line at the same indent that closes it (rustfmt shape);
+        // a site whose line ends in `;` is one line long.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !(line.contains("::spawn(") || line.contains(".spawn(")) {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let end = if line.trim_end().ends_with(';') {
+                i
+            } else {
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(i + 1)
+                    .find(|(_, l)| {
+                        let t = l.trim_start();
+                        l.len() - t.len() == indent && (t.starts_with('}') || t.starts_with(')'))
+                    })
+                    .map(|(j, _)| j)
+                    .unwrap_or(lines.len() - 1)
+            };
+            spans.push((i, end));
+        }
+        // Each Site::Spawn needle belongs to the innermost span holding it;
+        // each span must own exactly one.
+        let mut owned: Vec<Vec<&str>> = vec![Vec::new(); spans.len()];
+        for ((table, site, needle), at) in rows.iter().zip(&needle_line) {
+            if *site != Site::Spawn {
+                continue;
+            }
+            let Some(at) = *at else { continue };
+            match spans
+                .iter()
+                .enumerate()
+                .filter(|(_, (s, e))| *s <= at && at <= *e)
+                .max_by_key(|(_, (s, _))| *s)
+            {
+                Some((k, _)) => owned[k].push(needle),
+                None => violations.push(format!(
+                    "{table} needle `{needle}` is Site::Spawn but sits in no spawn body"
+                )),
+            }
+        }
+        for ((start, _), needles) in spans.iter().zip(&owned) {
+            if needles.len() != 1 {
+                violations.push(format!(
+                    "spawn site `{}` holds {} classified Site::Spawn needles {needles:?} (want \
+                     exactly 1) — classify it in a census table",
+                    lines[*start].trim(),
+                    needles.len()
+                ));
+            }
+        }
+        let spawn_rows = rows.iter().filter(|r| r.1 == Site::Spawn).count();
+        if spans.len() != spawn_rows {
+            violations.push(format!(
+                "create_router holds {} spawn sites ({} `tokio::spawn(`) but the census keys {} \
+                 Site::Spawn rows",
+                spans.len(),
+                region_text.matches("tokio::spawn(").count(),
+                spawn_rows
+            ));
+        }
+
+        // Starter calls: each distinct `::spawn_x(` / `::start_x(` /
+        // `.spawn_x(` / `.start_x(` token is covered by as many rows as it
+        // occurs.
+        let mut tokens: std::collections::BTreeMap<String, usize> = Default::default();
+        for prefix in ["::spawn_", "::start_", ".spawn_", ".start_"] {
+            for (at, _) in region_text.match_indices(prefix) {
+                let rest = &region_text[at + prefix.len()..];
+                let ident_len = rest
+                    .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(rest.len());
+                if ident_len > 0 && rest[ident_len..].starts_with('(') {
+                    let token = format!("{prefix}{}(", &rest[..ident_len]);
+                    *tokens.entry(token).or_default() += 1;
+                }
+            }
+        }
+        // Unqualified starter calls too — a `use`-imported `spawn_x(` /
+        // `start_x(` would otherwise start a task the census never counts.
+        // Keyed by the bare `spawn_x(` token; only a row whose needle names it
+        // unqualified covers it.
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut bare: std::collections::BTreeMap<String, usize> = Default::default();
+        for prefix in ["spawn_", "start_"] {
+            for (at, _) in region_text.match_indices(prefix) {
+                let before = region_text[..at].chars().next_back();
+                if before.is_some_and(|c| is_ident(c) || c == ':' || c == '.') {
+                    continue;
+                }
+                let rest = &region_text[at + prefix.len()..];
+                let ident_len = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
+                if ident_len > 0 && rest[ident_len..].starts_with('(') {
+                    let token = format!("{prefix}{}(", &rest[..ident_len]);
+                    *bare.entry(token).or_default() += 1;
+                }
+            }
+        }
+        let names_bare = |needle: &str, token: &str| {
+            needle.match_indices(token).any(|(at, _)| {
+                !needle[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_ident(c) || c == ':' || c == '.')
+            })
+        };
+        for (token, count) in &bare {
+            let covered = rows.iter().filter(|r| names_bare(r.2, token)).count();
+            if covered != *count {
+                violations.push(format!(
+                    "unqualified starter call `{token}` occurs {count} times in create_router but \
+                     {covered} census rows name it — classify it"
+                ));
+            }
+        }
+        for (token, count) in &tokens {
+            let covered = rows.iter().filter(|r| r.2.contains(token.as_str())).count();
+            if covered != *count {
+                violations.push(format!(
+                    "starter call `{token}` occurs {count} times in create_router but {covered} \
+                     census rows name it — classify it"
+                ));
+            }
+        }
+
+        // SUPERVISED: the entry fn goes through worker_supervisor under its
+        // registry name and holds no bare spawn.
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for (_, needle, file, signature, name) in SUPERVISED {
+            let fn_name = signature
+                .trim_start_matches("pub fn ")
+                .split('(')
+                .next()
+                .unwrap_or_default();
+            if !needle.ends_with(&format!("{fn_name}(")) {
+                violations.push(format!(
+                    "SUPERVISED needle `{needle}` does not call the entry fn `{fn_name}`"
+                ));
+            }
+            let path = src_root.join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let file_lines: Vec<&str> = text.lines().collect();
+            let Some(start) = file_lines.iter().position(|l| l.starts_with(signature)) else {
+                violations.push(format!(
+                    "{file}: no column-0 line starts with `{signature}`"
+                ));
+                continue;
+            };
+            let Some(len) = file_lines[start..].iter().position(|l| *l == "}") else {
+                violations.push(format!("{file}: `{signature}` never closes at column 0"));
+                continue;
+            };
+            let entry = file_lines[start..=start + len]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !entry.contains("spawn_supervised") {
+                violations.push(format!(
+                    "{file} `{signature}` does not go through worker_supervisor::spawn_supervised*"
+                ));
+            }
+            if entry.contains("tokio::spawn(") || entry.contains("tauri::async_runtime::spawn(") {
+                violations.push(format!("{file} `{signature}` holds a bare spawn"));
+            }
+            // The name as a literal in the entry fn, or a `const X: &str =
+            // "<name>";` in the file whose X the entry fn uses.
+            let literal = format!("\"{name}\"");
+            let via_const = file_lines.iter().any(|l| {
+                let Some((head, tail)) = l.split_once(": &str = ") else {
+                    return false;
+                };
+                let Some(ident) = head.split_whitespace().last() else {
+                    return false;
+                };
+                head.split_whitespace().any(|w| w == "const")
+                    && tail.trim_end() == format!("{literal};")
+                    && entry.contains(ident)
+            });
+            if !entry.contains(&literal) && !via_const {
+                violations.push(format!(
+                    "{file} `{signature}` does not name registry worker {literal} (literally or \
+                     through a `const …: &str = {literal};` in the file)"
+                ));
+            }
+        }
+
+        // TASK_SUPERVISED: each auto_start_* callee's module still starts its
+        // worker through mcp::task_supervisor, so a row cannot go on claiming
+        // supervision after the module drops it.
+        for file in [
+            "mcp/backend_relay.rs",
+            "mcp/device_jwt_refresher.rs",
+            "mcp/fleet_policy_poller.rs",
+            "mcp/session_message_poller.rs",
+        ] {
+            let path = src_root.join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let supervised = text.lines().any(|l| {
+                !l.trim_start().starts_with("//")
+                    && l.contains("task_supervisor::spawn_supervised(")
+            });
+            if !supervised {
+                violations.push(format!(
+                    "{file} no longer calls task_supervisor::spawn_supervised — its TASK_SUPERVISED \
+                     row is stale; re-classify it"
+                ));
+            }
+        }
+
+        // Registry names are unique: two loops on one key fold into one row.
+        let mut names: Vec<&str> = SUPERVISED
+            .iter()
+            .map(|r| r.4)
+            .chain(DEFERRED.iter().map(|r| r.2))
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() != total {
+            violations.push("duplicate registry name across SUPERVISED/DEFERRED".to_string());
+        }
+        for (table, _, reason) in TASK_SUPERVISED
+            .iter()
+            .map(|r| ("TASK_SUPERVISED", r.1, r.2))
+            .chain(ONE_SHOT.iter().map(|r| ("ONE_SHOT", r.1, r.2)))
+            .chain(PER_EVENT.iter().map(|r| ("PER_EVENT", r.1, r.2)))
+            .chain(DEFERRED.iter().map(|r| ("DEFERRED", r.1, r.3)))
+        {
+            if reason.trim().is_empty() {
+                violations.push(format!("{table} row has no reason"));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "create_router boot-task census drifted:\n{}",
+            violations.join("\n")
+        );
+    }
 }
 
 /// `/health` `uiBridgeBinding` (plan
