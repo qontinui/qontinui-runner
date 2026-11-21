@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -122,21 +122,10 @@ pub struct CensusSnapshot {
 /// implementation, shared with the session-identity reporter.
 pub use super::identity_stamp::{account_label, is_uuid_shaped};
 
-/// One timestamp spelling for every census field: RFC 3339, millisecond
-/// precision, `Z` suffix — the session-identity reporter's spelling, so the
-/// two producers of coord's session rows never disagree on the same instant.
-fn rfc3339(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-/// Epoch milliseconds → [`rfc3339`], `None` for a non-positive or out-of-range
-/// value (a registry row that omitted the field parses as `0`).
-fn ms_to_rfc3339(ms: i64) -> Option<String> {
-    if ms <= 0 {
-        return None;
-    }
-    Utc.timestamp_millis_opt(ms).single().map(rfc3339)
-}
+// The timestamp spelling (RFC 3339, millis, `Z`) — shared with the
+// session-identity reporter so the two producers of coord's session rows
+// never disagree on the same instant.
+use super::identity_stamp::{ms_to_rfc3339, rfc3339};
 
 // ===========================================================================
 // last_acted_at — the last turn line's own timestamp
@@ -910,6 +899,7 @@ fn reset_incomplete_log() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::fs;
 
     const SID_A: &str = "11111111-1111-4111-8111-111111111111";
