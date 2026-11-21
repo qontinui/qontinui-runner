@@ -1275,6 +1275,7 @@ POST /scheduler/tasks/{id}/run run_task_now
 POST /session-recap/analyze analyze_handler
 POST /sessions/spawn spawn_session
 POST /sessions/transcript-bind transcript_bind
+POST /sessions/{id}/close close_session
 POST /sessions/{id}/context-low context_low
 POST /sessions/{id}/continuation-verdict continuation_verdict
 POST /sessions/{id}/finish finish_session

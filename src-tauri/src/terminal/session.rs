@@ -3631,11 +3631,22 @@ impl TerminalSession {
                     .entered();
             // The whole decision — skip for a cwd that declares coord-mcp, else
             // provision a per-terminal config, and refuse a spawn tenant either
-            // arm cannot carry — lives in `coord_mcp::deliver_terminal_coord_mcp`
-            // so it is testable without a PTY. A refusal returns before the
-            // child PROCESS is spawned (the PTY pair opened above is simply
-            // dropped) and before the session is recorded.
-            let delivered = crate::coord_mcp::deliver_terminal_coord_mcp(
+            // arm cannot carry — lives in `coord_mcp::deliver_session_coord_mcp`
+            // (the one delivery terminals and AI sessions share) so it is
+            // testable without a PTY. A refusal returns before the child
+            // PROCESS is spawned (the PTY pair opened above is simply dropped)
+            // and before the session is recorded.
+            //
+            // `strict` is not rendered here: the identity shim builds this
+            // terminal's argv from `QONTINUI_MCP_CONFIG` alone, and on the arms
+            // that provision a file the additive `--mcp-config` already beats
+            // an ancestor `.mcp.json` (finding a1a66bfe case e). The one arm it
+            // would change is `Unprovisioned` (no bound API port), where a
+            // terminal still loads whatever `.mcp.json` its cwd chain declares —
+            // a direct-exec AI session renders `--strict-mcp-config` for it
+            // (`claude_session::coord_mcp_delivery`); a terminal would need the
+            // shim to.
+            let delivered = crate::coord_mcp::deliver_session_coord_mcp(
                 cwd,
                 terminal_id,
                 spawn_tenant,

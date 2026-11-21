@@ -1,6 +1,6 @@
 //! SessionManager - tracks active Claude sessions by task_run_id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
@@ -19,6 +19,13 @@ pub struct SessionManager {
     /// Used for system notes that should be delivered with the next user message
     /// rather than sent as standalone messages (which would trigger unwanted response turns).
     pending_context: Mutex<HashMap<String, Vec<String>>>,
+    /// The ids `POST /sessions/spawn` started — the only sessions
+    /// `POST /sessions/{id}/close` may close. This manager holds sessions from
+    /// every `ClaudeSession::spawn` caller (workflow phases, task runs, the
+    /// relay, the Tauri chat), and that door must never end one of theirs.
+    /// Kept after the close, so a repeat close is idempotent rather than a
+    /// 404: one id per HTTP spawn, for the life of the process.
+    http_spawned: Mutex<HashSet<String>>,
 }
 
 impl SessionManager {
@@ -27,7 +34,24 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             inline_pids: Mutex::new(HashMap::new()),
             pending_context: Mutex::new(HashMap::new()),
+            http_spawned: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Record that `POST /sessions/spawn` started `task_run_id`.
+    pub(crate) fn record_http_spawned(&self, task_run_id: &str) {
+        self.http_spawned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_run_id.to_string());
+    }
+
+    /// Did `POST /sessions/spawn` start `task_run_id`?
+    pub(crate) fn was_http_spawned(&self, task_run_id: &str) -> bool {
+        self.http_spawned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(task_run_id)
     }
 
     /// Register a session. Returns Err if a session already exists for this key.

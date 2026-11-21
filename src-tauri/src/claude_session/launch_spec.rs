@@ -555,7 +555,9 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // Any other operator flag is layered in, unless the caller's
                 // extra_required already provides that flag (spec wins).
                 _ => {
-                    if provided.contains(&unit.name) {
+                    // By NAME, whatever the spelling: `--mcp-config=/x` from a
+                    // template is the same flag as the caller's spaced one.
+                    if provided.contains(flag_name_only(&unit.name)) {
                         tracing::warn!(
                             flag = %flag_name_only(&unit.name),
                             "launch template flag dropped: the caller supplies the same flag"
@@ -825,12 +827,14 @@ fn provides_append_prompt_flag(extra: &[String]) -> bool {
 }
 
 /// Flag names (`--foo`) present in the caller's `extra_required`, used to keep a
-/// template from duplicating a flag the spec already provides.
+/// template from duplicating a flag the spec already provides. Stored by name
+/// only ([`flag_name_only`]), so an `=`-attached spelling on either side is
+/// the same flag.
 fn provided_flag_names(extra: &[String]) -> HashSet<String> {
     extra
         .iter()
         .filter(|t| t.len() > 2 && t.starts_with("--"))
-        .cloned()
+        .map(|t| flag_name_only(t).to_string())
         .collect()
 }
 
@@ -986,6 +990,74 @@ mod tests {
             account_command: None,
             ..Default::default()
         }
+    }
+
+    /// A template's `--mcp-config` never reaches a spawn whose caller supplies
+    /// the runner's own (plan
+    /// `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
+    /// Phase 2) — in the spaced spelling AND the `=`-attached one, which the
+    /// name-only dedup used to miss, under the bypass posture the stream-json
+    /// spawn uses (where `is_allow_list_owned_flag` does not apply).
+    #[test]
+    fn a_template_mcp_config_is_dropped_in_either_spelling_when_the_caller_supplies_one() {
+        for template in [
+            "claude --mcp-config /operator/mcp.json --verbose",
+            "claude --mcp-config=/x --verbose",
+        ] {
+            let mut s = spec();
+            s.extra_required = vec!["--mcp-config".to_string(), "/runner/coord.json".to_string()];
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            let configs: Vec<&String> = argv
+                .iter()
+                .filter(|a| flag_name_only(a) == "--mcp-config")
+                .collect();
+            assert_eq!(configs.len(), 1, "{template}: {argv:?}");
+            assert_eq!(
+                value_after(&argv, "--mcp-config"),
+                Some("/runner/coord.json"),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "/operator/mcp.json" || a.contains("=/x")),
+                "{template}: {argv:?}"
+            );
+            // The rest of the template still layers in.
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+        }
+    }
+
+    /// The same rule holds for every flag, not only `--mcp-config`: a caller's
+    /// `--settings` drops a template's `--settings=…`, so the spawn carries ONE.
+    #[test]
+    fn an_attached_template_flag_is_dropped_when_the_caller_supplies_that_flag() {
+        let mut s = spec();
+        s.extra_required = vec![
+            "--settings".to_string(),
+            "/runner/settings.json".to_string(),
+        ];
+        let argv = render_argv(&s, &tmpl("claude --settings=/operator/s.json"), "claude");
+        assert_eq!(
+            argv.iter()
+                .filter(|a| flag_name_only(a) == "--settings")
+                .count(),
+            1,
+            "{argv:?}"
+        );
+        // A template flag the caller does NOT supply still survives attached.
+        let argv = render_argv(
+            &spec(),
+            &tmpl("claude --settings=/operator/s.json"),
+            "claude",
+        );
+        assert!(
+            argv.iter().any(|a| a == "--settings=/operator/s.json"),
+            "{argv:?}"
+        );
     }
 
     /// Locate the value following `flag` in an argv slice.

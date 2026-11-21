@@ -366,7 +366,9 @@ pub(crate) async fn route_policy_decision(
 pub(crate) const ROUTE_TENANT_BUDGET: Duration = Duration::from_secs(8);
 
 /// `(workdir, registry session id)` for the route's session: the hosting
-/// terminal's cwd and coord row when `route_id` names a live terminal, else
+/// terminal's cwd and coord row when `route_id` names a live terminal; else,
+/// when it names a live stream-json AI session (the hook sends
+/// `$QONTINUI_AI_SESSION_ID`), the cwd its coord-mcp delivery recorded; and
 /// `session_key` read as a registry id.
 fn route_session_ref(route_id: &str, session_key: &str) -> (Option<String>, Option<Uuid>) {
     use tauri::Manager;
@@ -374,14 +376,33 @@ fn route_session_ref(route_id: &str, session_key: &str) -> (Option<String>, Opti
         app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
             .and_then(|tm| tm.get(route_id))
     });
-    let workdir = terminal
-        .as_ref()
-        .map(|t| t.working_dir().trim().to_string())
-        .filter(|w| !w.is_empty());
-    let registry_session = terminal
-        .and_then(|t| t.coord_session_id())
-        .or_else(|| Uuid::parse_str(session_key.trim()).ok());
-    (workdir, registry_session)
+    route_session_ref_from(
+        terminal.map(|t| (t.working_dir().to_string(), t.coord_session_id())),
+        || crate::claude_session::coord_mcp_delivery::session_workdir(route_id),
+        session_key,
+    )
+}
+
+/// The pure half of [`route_session_ref`].
+///
+/// The AI-session leg is what lets [`crate::coord_mcp::terminal_session_bearer_and_tenant`]
+/// read a declared cwd's `.mcp.json` for such a session: without a workdir the
+/// declared arm has no file to read, so a `WorkdirDeclared` AI session fell to
+/// the registry leg and was briefed from whatever that held.
+fn route_session_ref_from(
+    terminal: Option<(String, Option<Uuid>)>,
+    ai_session_workdir: impl FnOnce() -> Option<String>,
+    session_key: &str,
+) -> (Option<String>, Option<Uuid>) {
+    let non_empty = |w: String| {
+        let w = w.trim().to_string();
+        (!w.is_empty()).then_some(w)
+    };
+    let registry_key = Uuid::parse_str(session_key.trim()).ok();
+    match terminal {
+        Some((workdir, coord_session)) => (non_empty(workdir), coord_session.or(registry_key)),
+        None => (ai_session_workdir().and_then(non_empty), registry_key),
+    }
 }
 
 /// The tenant a DIRECT-EXEC spawn in `workdir` composes the policy body for
@@ -783,5 +804,90 @@ mod tests {
             "no session tenant, no file"
         );
         assert_eq!(cache_file_tenant(None, None), None);
+    }
+
+    /// The route's session ref, leg by leg: a live terminal answers with its
+    /// cwd and coord row; with no terminal, a live AI session's delivery cwd;
+    /// and the session key as a registry id either way.
+    #[test]
+    fn route_session_ref_resolves_an_ai_session_key_to_its_delivery_cwd() {
+        let coord = tenant(7);
+        let key = tenant(9).to_string();
+        assert_eq!(
+            route_session_ref_from(
+                Some(("  /w/term  ".to_string(), Some(coord))),
+                || panic!("a terminal hit must not consult the AI-session leg"),
+                &key,
+            ),
+            (Some("/w/term".to_string()), Some(coord))
+        );
+        assert_eq!(
+            route_session_ref_from(None, || Some("/w/ai".to_string()), &key),
+            (Some("/w/ai".to_string()), Some(tenant(9)))
+        );
+        assert_eq!(
+            route_session_ref_from(None, || None, "not-a-uuid"),
+            (None, None)
+        );
+        assert_eq!(
+            route_session_ref_from(Some((" ".to_string(), None)), || None, &key),
+            (None, Some(tenant(9))),
+            "a blank terminal cwd is no cwd"
+        );
+    }
+
+    /// An AI session whose cwd DECLARES coord-mcp holds no runner nonce of its
+    /// own — its credential is the cwd file's. The AI-session leg hands the
+    /// route that cwd, so the decision comes from the declared file's nonce
+    /// (a proxy answer), never the registry or `Unnamed`; without the leg the
+    /// same read has no file to open and falls through to `Unnamed`.
+    #[tokio::test]
+    async fn an_ai_session_in_a_declared_cwd_is_answered_by_the_declared_files_nonce() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant(1));
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&tenant(1), "header.payload.signature")
+            .unwrap();
+        let wd = amb
+            .root()
+            .join(format!("declared-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&wd).unwrap();
+        let wd = wd.to_string_lossy().into_owned();
+        crate::coord_mcp::write_coord_mcp_proxy_config(&wd, 23_947, None);
+        let key = format!("ai-{}", Uuid::new_v4());
+        let delivered = crate::claude_session::coord_mcp_delivery::deliver_for_ai_session(
+            &wd,
+            &key,
+            None,
+            Some(23_947),
+        )
+        .unwrap();
+        assert_eq!(
+            delivered.delivery(),
+            crate::coord_mcp::CoordMcpDelivery::WorkdirDeclared
+        );
+
+        let (workdir, registry) = route_session_ref_from(
+            None,
+            || crate::claude_session::coord_mcp_delivery::session_workdir(&key),
+            &key,
+        );
+        let read = read_session_policy_tenant(&key, workdir.as_deref(), registry).await;
+        assert!(
+            matches!(
+                read,
+                PolicyTenantRead::ProxyOwned { .. }
+                    | PolicyTenantRead::ProxyRefused { .. }
+                    | PolicyTenantRead::ProxyDefaultSlot
+            ),
+            "the declared file's nonce answers: {read:?}"
+        );
+
+        let without_leg = read_session_policy_tenant(&key, None, None).await;
+        assert!(
+            matches!(without_leg, PolicyTenantRead::Unnamed(_)),
+            "with no cwd the declared arm has no file to read: {without_leg:?}"
+        );
+        drop(delivered);
     }
 }

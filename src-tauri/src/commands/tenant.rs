@@ -298,8 +298,8 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
             "coord_mcp.rs::mint_and_register_nonce_with",
             "coord_mcp.rs::reusable_in_cwd_device_nonce",
             "coord_mcp.rs::cwd_key_pinned_away_from_machine",
-            "coord_mcp.rs::record_terminal_coord_mcp_delivery",
-            "coord_mcp.rs::deliver_terminal_coord_mcp_unrecorded",
+            "coord_mcp.rs::record_session_coord_mcp_delivery",
+            "coord_mcp.rs::deliver_session_coord_mcp_unrecorded",
         ],
         detail: "a new coord-mcp key with no spawn-chosen tenant samples the pin at mint and, \
                  if pinned, freezes it for the key's life; provisioning decides key reuse and \

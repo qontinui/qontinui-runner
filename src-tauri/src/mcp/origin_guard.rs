@@ -218,6 +218,9 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/execute-python",
     "/sessions/spawn",
     "/sessions/{id}/message",
+    // Ends a session `/sessions/spawn` started — it drives (kills) an AI
+    // session's process, the same capability class as its two neighbours.
+    "POST /sessions/{id}/close",
     "/terminals",
     "/terminals/*",
     // `debug_assertions` builds only — which is every supervisor-built runner,

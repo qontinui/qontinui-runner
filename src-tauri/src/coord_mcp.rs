@@ -12670,7 +12670,7 @@ fn credential_tenant_for_nonce(nonce: Option<&str>) -> CredentialTenantRead {
 }
 
 /// What the identity seam delivered to each terminal in this process, recorded
-/// by [`deliver_terminal_coord_mcp`]. It is what lets the tenancy report say
+/// by [`deliver_session_coord_mcp`]. It is what lets the tenancy report say
 /// whether a session's credential is its own per-terminal key or its cwd's
 /// `.mcp.json` — reading the cwd file for a terminal the seam provisioned would
 /// describe a key that session never presents. One small entry per spawned
@@ -12690,6 +12690,11 @@ struct TerminalDeliveryRecord {
     /// sessions only, so this, not the live default, is what such a session is
     /// compared against.
     spawn_default_tenant: SpawnDefaultSample,
+    /// Which delivery this is, unique for the life of the process. A key can be
+    /// delivered again (a rate-limit restart reuses its session id), so a
+    /// retire for an earlier delivery must not drop its successor's record
+    /// ([`forget_session_coord_mcp_delivery`]).
+    generation: u64,
 }
 
 /// What the machine's default-tenant pin read AT SPAWN (review nit, plan
@@ -12717,15 +12722,39 @@ impl From<crate::session::tenant_pin::TenantPin> for SpawnDefaultSample {
     }
 }
 
-fn record_terminal_coord_mcp_delivery(terminal_id: &str, delivery: CoordMcpDelivery) {
+/// Record what the seam delivered under `session_key`, returning the record's
+/// generation.
+fn record_session_coord_mcp_delivery(session_key: &str, delivery: CoordMcpDelivery) -> u64 {
+    static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let record = TerminalDeliveryRecord {
         delivery,
         spawn_default_tenant: crate::session::tenant_pin::resolve_tenant_pin().into(),
+        generation,
     };
     terminal_coord_mcp_deliveries()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(terminal_id.to_string(), record);
+        .insert(session_key.to_string(), record);
+    generation
+}
+
+/// Drop the delivery record [`deliver_session_coord_mcp`] made for
+/// `session_key` under `generation` — and nothing a later delivery to the same
+/// key recorded. The session-close half of the delivery's lifetime: without
+/// it every AI session (whose key, a task-run id, is never reused) would leave
+/// one record for the life of the process. Returns whether a record was dropped.
+pub(crate) fn forget_session_coord_mcp_delivery(session_key: &str, generation: u64) -> bool {
+    let mut deliveries = terminal_coord_mcp_deliveries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match deliveries.get(session_key) {
+        Some(record) if record.generation == generation => {
+            deliveries.remove(session_key);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The default-tenant pin the seam read when it spawned `terminal_id`: `None`
@@ -13242,19 +13271,39 @@ fn mint_device_proxy_config(
     )
 }
 
-/// What the identity seam gave a terminal's session for coord-mcp.
+/// What the coord-mcp delivery gave one session (a terminal's, or an AI
+/// session's).
 #[derive(Debug)]
-pub(crate) struct TerminalCoordMcp {
+pub(crate) struct SessionCoordMcp {
     /// The per-session outcome the briefing is gated on.
     pub(crate) delivery: CoordMcpDelivery,
-    /// The app-data `--mcp-config` file to export as [`MCP_CONFIG_ENV`], when
-    /// one was provisioned.
+    /// The app-data `--mcp-config` file, when one was provisioned. A terminal
+    /// exports it as [`MCP_CONFIG_ENV`] for the identity shim; a direct-exec
+    /// spawn passes it as `--mcp-config` itself.
     pub(crate) config_path: Option<std::path::PathBuf>,
+    /// The session must be launched with `--strict-mcp-config`: no runner file
+    /// carries its coord-mcp, so anything else it loaded — the nearest
+    /// ancestor `.mcp.json` above a cwd that has none, which on this fleet is
+    /// the workspace root's, keyed to the device's DEFAULT tenant — would be
+    /// another session's credential. True exactly on
+    /// [`CoordMcpDelivery::Unprovisioned`].
+    ///
+    /// On every other arm it is false, by measurement rather than preference
+    /// (finding `a1a66bfe`, Claude Code 2.1.330, stream-json): a `--mcp-config`
+    /// `coord-mcp` REPLACES an ancestor `.mcp.json`'s same-name entry (3 of 3
+    /// runs), and a cwd `.mcp.json` beats the ancestor too, so the additive
+    /// flag already closes the walk-up.
+    pub(crate) strict: bool,
+    /// Which delivery this was ([`forget_session_coord_mcp_delivery`]).
+    pub(crate) generation: u64,
 }
 
-/// The identity seam's coord-mcp delivery for one terminal
-/// ([`crate::terminal::session::TerminalSession`]'s spawn), extracted so every
-/// arm — including the refusals — is testable without a PTY.
+/// The coord-mcp delivery for one session the runner spawns, keyed by
+/// `session_key` — a terminal id ([`crate::terminal::session::TerminalSession`]'s
+/// spawn) or an AI session id (`claude_session::coord_mcp_delivery`). The key
+/// is only a string: [`session_nonce`] finds the nonce and the record by it, so
+/// one delivery and one resolver serve both kinds of session. Extracted so every
+/// arm — including the refusals — is testable without a PTY or a child.
 ///
 /// Give EVERY device-scope session coord-mcp with zero setup by materializing a
 /// runner-owned DEVICE `--mcp-config` file (app-data, never the cwd) — EXCEPT
@@ -13268,7 +13317,7 @@ pub(crate) struct TerminalCoordMcp {
 /// ([`credential_spawn_tenant`] is applied here). With a tenant:
 /// - a declared cwd is admitted only when its key resolves to that tenant
 ///   ([`check_workdir_declared_tenant`]) — its key IS the session's credential;
-/// - otherwise the per-terminal nonce is pinned to it, after
+/// - otherwise the per-session nonce is pinned to it, after
 ///   [`validate_spawn_tenant`].
 ///
 /// `Err` means refuse the spawn, and nothing has been minted or written.
@@ -13278,25 +13327,30 @@ pub(crate) struct TerminalCoordMcp {
 /// reason (plan 2026-08-24-headless-box-has-no-working-coord-credential-door
 /// Phase 4); one that does provision clears any stale breadcrumb, so the marker
 /// never outlives the condition it describes.
-pub(crate) fn deliver_terminal_coord_mcp(
+pub(crate) fn deliver_session_coord_mcp(
     cwd: &str,
-    terminal_id: &str,
+    session_key: &str,
     spawn_tenant: Option<Uuid>,
     bound_port: Option<u16>,
-) -> Result<TerminalCoordMcp, SpawnTenantRefusal> {
-    let delivered =
-        deliver_terminal_coord_mcp_unrecorded(cwd, terminal_id, spawn_tenant, bound_port)?;
-    record_terminal_coord_mcp_delivery(terminal_id, delivered.delivery);
-    Ok(delivered)
+) -> Result<SessionCoordMcp, SpawnTenantRefusal> {
+    let (delivery, config_path) =
+        deliver_session_coord_mcp_unrecorded(cwd, session_key, spawn_tenant, bound_port)?;
+    let generation = record_session_coord_mcp_delivery(session_key, delivery);
+    Ok(SessionCoordMcp {
+        delivery,
+        config_path,
+        strict: delivery == CoordMcpDelivery::Unprovisioned,
+        generation,
+    })
 }
 
-/// [`deliver_terminal_coord_mcp`] before the delivery is recorded.
-fn deliver_terminal_coord_mcp_unrecorded(
+/// [`deliver_session_coord_mcp`] before the delivery is recorded.
+fn deliver_session_coord_mcp_unrecorded(
     cwd: &str,
-    terminal_id: &str,
+    session_key: &str,
     spawn_tenant: Option<Uuid>,
     bound_port: Option<u16>,
-) -> Result<TerminalCoordMcp, SpawnTenantRefusal> {
+) -> Result<(CoordMcpDelivery, Option<std::path::PathBuf>), SpawnTenantRefusal> {
     let credential_tenant = credential_spawn_tenant(spawn_tenant);
     if workdir_declares_coord_mcp(cwd) {
         match credential_tenant {
@@ -13312,7 +13366,7 @@ fn deliver_terminal_coord_mcp_unrecorded(
                     let machine = crate::session::tenant_pin::resolve_tenant_pin();
                     if machine != crate::session::tenant_pin::TenantPin::Pinned(pinned) {
                         warn!(
-                            "coord-mcp: terminal {terminal_id}: tenant-less spawn into {cwd}, whose \
+                            "coord-mcp: session {session_key}: tenant-less spawn into {cwd}, whose \
                              .mcp.json key is pinned to tenant {pinned} while this machine reads \
                              {machine:?} — the session's coord-mcp writes go to {pinned}"
                         );
@@ -13321,27 +13375,21 @@ fn deliver_terminal_coord_mcp_unrecorded(
             }
         }
         info!(
-            "coord-mcp: terminal {terminal_id}: cwd already declares coord-mcp — skipping \
+            "coord-mcp: session {session_key}: cwd already declares coord-mcp — skipping \
              --mcp-config injection"
         );
         // UNPROBED, not unreachable: the runner neither wrote that file nor
         // asked it anything, so its bearer may be stale, foreign, or bound to a
         // port nothing serves. This is the arm the 2026-08-21 measurement landed
         // on.
-        return Ok(TerminalCoordMcp {
-            delivery: CoordMcpDelivery::WorkdirDeclared,
-            config_path: None,
-        });
+        return Ok((CoordMcpDelivery::WorkdirDeclared, None));
     }
-    match provision_coord_mcp_config_file(cwd, Some(terminal_id), credential_tenant, bound_port)? {
+    match provision_coord_mcp_config_file(cwd, Some(session_key), credential_tenant, bound_port)? {
         Some(config_path) => {
             // This cwd HAS coord-mcp now — retire any breadcrumb a previous
             // un-provisioned spawn left behind.
             clear_degraded_breadcrumb(cwd);
-            Ok(TerminalCoordMcp {
-                delivery: CoordMcpDelivery::Provisioned,
-                config_path: Some(config_path),
-            })
+            Ok((CoordMcpDelivery::Provisioned, Some(config_path)))
         }
         None => {
             // Provisioning was ATTEMPTED and produced nothing: the fail-closed
@@ -13350,19 +13398,16 @@ fn deliver_terminal_coord_mcp_unrecorded(
             // already warned about with the specific error. Name the OUTCOME so
             // the session's own cwd carries it.
             warn!(
-                "coord-mcp: terminal {terminal_id}: no --mcp-config provisioned for cwd {cwd} — \
+                "coord-mcp: session {session_key}: no --mcp-config provisioned for cwd {cwd} — \
                  the session starts with NO coord-mcp"
             );
             write_unprovisioned_breadcrumb(
                 cwd,
-                "the runner could not materialize a --mcp-config for this terminal (bound API \
+                "the runner could not materialize a --mcp-config for this session (bound API \
                  port unresolvable, or the app-data write failed) — see the runner log for the \
                  specific error",
             );
-            Ok(TerminalCoordMcp {
-                delivery: CoordMcpDelivery::Unprovisioned,
-                config_path: None,
-            })
+            Ok((CoordMcpDelivery::Unprovisioned, None))
         }
     }
 }
@@ -26313,7 +26358,7 @@ mod spawn_tenant_credential_tests {
         pair(tenant_a());
         let (wd, term) = (workdir(&amb, "unpaired"), terminal());
 
-        let refusal = deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT))
+        let refusal = deliver_session_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT))
             .expect_err("an unpaired tenant must refuse the spawn");
         assert_eq!(
             refusal,
@@ -26573,7 +26618,7 @@ mod spawn_tenant_credential_tests {
         write_coord_mcp_proxy_config(&wd, PORT, None);
         assert!(workdir_declares_coord_mcp(&wd));
 
-        let refusal = deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT))
+        let refusal = deliver_session_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT))
             .expect_err("a cwd key for A must refuse a spawn for B");
         match &refusal {
             SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
@@ -26594,10 +26639,12 @@ mod spawn_tenant_credential_tests {
 
         // Unchosen spawns keep today's skip.
         assert!(matches!(
-            deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)),
-            Ok(TerminalCoordMcp {
+            deliver_session_coord_mcp(&wd, &term, None, Some(PORT)),
+            Ok(SessionCoordMcp {
                 delivery: CoordMcpDelivery::WorkdirDeclared,
-                config_path: None
+                config_path: None,
+                strict: false,
+                ..
             })
         ));
 
@@ -26606,11 +26653,11 @@ mod spawn_tenant_credential_tests {
         // whole test, and the key is in `ambient::AMBIENT_ENV_KEYS`, so the
         // fixture restores it on drop even if an assertion below panics.
         std::env::set_var(SPAWN_TENANT_CREDENTIAL_ENV, "0");
-        let switched = deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT));
+        let switched = deliver_session_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT));
         std::env::remove_var(SPAWN_TENANT_CREDENTIAL_ENV);
         assert!(matches!(
             switched,
-            Ok(TerminalCoordMcp {
+            Ok(SessionCoordMcp {
                 delivery: CoordMcpDelivery::WorkdirDeclared,
                 ..
             })
@@ -26621,8 +26668,8 @@ mod spawn_tenant_credential_tests {
         let (wd_b, term_b) = (workdir(&amb, "declared-b"), terminal());
         write_coord_mcp_proxy_config(&wd_b, PORT, Some(tenant_b()));
         assert!(matches!(
-            deliver_terminal_coord_mcp(&wd_b, &term_b, Some(tenant_b()), Some(PORT)),
-            Ok(TerminalCoordMcp {
+            deliver_session_coord_mcp(&wd_b, &term_b, Some(tenant_b()), Some(PORT)),
+            Ok(SessionCoordMcp {
                 delivery: CoordMcpDelivery::WorkdirDeclared,
                 ..
             })
@@ -26739,7 +26786,7 @@ mod spawn_tenant_credential_tests {
         let resident = read_proxy_nonce(&mcp).unwrap();
 
         assert!(matches!(
-            deliver_terminal_coord_mcp(&wd, &terminal(), Some(tenant_b()), Some(PORT)),
+            deliver_session_coord_mcp(&wd, &terminal(), Some(tenant_b()), Some(PORT)),
             Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { .. })
         ));
         assert_eq!(
@@ -26765,7 +26812,7 @@ mod spawn_tenant_credential_tests {
         let (wd, term) = (workdir(&amb, "pinned-b"), terminal());
         write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
 
-        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        let delivered = deliver_session_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
         assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
         let credential = session_credential_tenant(&term, Some(&wd));
         assert_eq!(credential, CredentialTenantRead::Resolved(Some(tenant_b())));
@@ -26850,7 +26897,7 @@ mod spawn_tenant_credential_tests {
         std::fs::write(&mcp, &first_bytes).unwrap();
         assert!(live_binding(&first).is_none() && proxy_nonce_is_valid(&first));
 
-        match deliver_terminal_coord_mcp(&wd, &terminal(), Some(tenant_b()), Some(PORT)) {
+        match deliver_session_coord_mcp(&wd, &terminal(), Some(tenant_b()), Some(PORT)) {
             Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { declared, .. }) => {
                 assert_eq!(declared, DeclaredWorkdirKey::NotLive)
             }
@@ -26860,14 +26907,14 @@ mod spawn_tenant_credential_tests {
         let wd_port = workdir(&amb, "port");
         write_coord_mcp_proxy_config(&wd_port, PORT, Some(tenant_b()));
         assert!(matches!(
-            deliver_terminal_coord_mcp(&wd_port, &terminal(), Some(tenant_b()), Some(PORT + 1)),
+            deliver_session_coord_mcp(&wd_port, &terminal(), Some(tenant_b()), Some(PORT + 1)),
             Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
                 declared: DeclaredWorkdirKey::NotLive,
                 ..
             })
         ));
         assert!(
-            deliver_terminal_coord_mcp(&wd_port, &terminal(), Some(tenant_b()), Some(PORT)).is_ok()
+            deliver_session_coord_mcp(&wd_port, &terminal(), Some(tenant_b()), Some(PORT)).is_ok()
         );
     }
 
@@ -26881,7 +26928,7 @@ mod spawn_tenant_credential_tests {
         let amb = crate::test_env::isolated_ambient();
         amb.write_active_tenant_id(tenant_a());
         let (wd, term) = (workdir(&amb, "switch"), terminal());
-        deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        deliver_session_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
 
         amb.write_active_tenant_id(tenant_b());
         let credential = session_credential_tenant(&term, Some(&wd));
@@ -26924,7 +26971,7 @@ mod spawn_tenant_credential_tests {
         amb.write_active_tenant_id(tenant_b());
         let nonce = read_proxy_nonce(&Path::new(&wd).join(".mcp.json")).unwrap();
         assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
-        match deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT)) {
+        match deliver_session_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT)) {
             Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { declared, .. }) => {
                 assert_eq!(declared, DeclaredWorkdirKey::NotPinned)
             }
@@ -26936,7 +26983,7 @@ mod spawn_tenant_credential_tests {
         write_coord_mcp_proxy_config(&wd_stale, PORT, Some(tenant_b()));
         let stale = read_proxy_nonce(&Path::new(&wd_stale).join(".mcp.json")).unwrap();
         NonceRegistry::global().test_live().remove(&stale);
-        match deliver_terminal_coord_mcp(&wd_stale, &terminal(), Some(tenant_b()), Some(PORT)) {
+        match deliver_session_coord_mcp(&wd_stale, &terminal(), Some(tenant_b()), Some(PORT)) {
             Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { declared, .. }) => {
                 assert_eq!(declared, DeclaredWorkdirKey::NotLive)
             }
@@ -26964,7 +27011,7 @@ mod spawn_tenant_credential_tests {
         );
         let unprovisioned = terminal();
         let plain = workdir(&amb, "n1-plain");
-        let delivered = deliver_terminal_coord_mcp(&plain, &unprovisioned, None, None).unwrap();
+        let delivered = deliver_session_coord_mcp(&plain, &unprovisioned, None, None).unwrap();
         assert_eq!(delivered.delivery, CoordMcpDelivery::Unprovisioned);
         assert_eq!(
             session_credential_tenant(&unprovisioned, Some(&wd)),

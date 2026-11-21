@@ -313,18 +313,6 @@ impl ClaudeSession {
                 pinned_config_dir,
             );
 
-        // Required trailing flags for the interactive stream-json chat. The
-        // shared launch seam (below) layers the operator template + the
-        // caller-authoritative permission/session/model on top of these; this
-        // vector is the non-negotiable, verbatim tail.
-        let mut extra_required = vec![
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--input-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-        ];
-
         // ── Claude CLI session id (restart survival) ──────────────────────
         // `--session-id <uuid>` pins the CLI session id on a NEW launch so the
         // on-disk transcript lands at `<config_dir>/projects/<encoded(cwd)>/
@@ -360,49 +348,61 @@ impl ClaudeSession {
             );
         }
 
-        // ── Blueprint tool policy (Phase 3) ───────────────────────────────
-        // Same carrier as the inline runner: allow/deny flags plus, for
-        // argument-scoped denies, an ephemeral --settings <file> JSON block.
-        // None ⇒ no-op (no extra args, no settings file), preserving today's
-        // interactive spawn. These are non-negotiable required flags, so they
-        // ride `extra_required` (verbatim tail, never reordered/deduped).
-        let tool_policy_settings_path: Option<std::path::PathBuf>;
-        if let Some(policy) = tool_policy {
-            let (extra_args, settings_json) =
-                crate::claude_session::tool_policy_args::build_tool_policy_cli(policy);
-            extra_required.extend(extra_args);
-            tool_policy_settings_path = if let Some(json) = settings_json {
-                let settings_file = std::env::temp_dir()
-                    .join(format!("claude_session_settings_{}.json", session_id));
-                std::fs::write(&settings_file, &json)
-                    .map_err(|e| format!("Failed to write tool-policy settings file: {}", e))?;
-                extra_required.push("--settings".to_string());
-                extra_required.push(settings_file.to_string_lossy().to_string());
-                info!(
-                    "Applied tool-policy settings for interactive session {} at {}",
-                    session_id,
-                    settings_file.display()
-                );
-                Some(settings_file)
-            } else {
-                None
-            };
-        } else {
-            tool_policy_settings_path = None;
-        }
-        // The settings file is consumed by the spawned CLI at startup; it is a
-        // best-effort temp artifact left in temp_dir (mirrors the inline runner
-        // when the path can't be tracked to session end). Bind to silence the
-        // unused warning when no policy is present.
-        let _ = &tool_policy_settings_path;
+        // ── The runner-owned tail: coord-mcp, tool policy, hooks, prompt ──
+        // A DIRECT exec, so every flag an identity shim would add for a
+        // terminal is spelled out here (plan
+        // `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`).
+        // The coord-mcp delivery runs FIRST and once, before the trust gate: a
+        // refusal (or a fail-closed config that cannot be written) returns
+        // before any child exists, and the lease it returns retires what it
+        // minted on every later error by being dropped.
+        let api_port = crate::terminal::spawn_seam_api_port();
+        let extras = crate::claude_session::launch_extras::compose_launch_extras(
+            crate::claude_session::launch_extras::LaunchExtrasInputs {
+                working_dir,
+                session_id,
+                config_dir: effective_config_dir.as_deref(),
+                tool_policy,
+                bound_port: crate::coord_mcp::resolve_bound_api_port(),
+                api_port,
+                hook_settings: crate::session::claude_hook::materialize(
+                    &crate::session::claude_hook::session_restore_dir(),
+                ),
+                scratch_dir: &std::env::temp_dir(),
+            },
+            |delivery| {
+                // WHOSE policy body: the tenant a new session in this cwd
+                // resolves to (`None` on a refused or unsettled tenant — the
+                // SessionStart route then delivers the body or the UNKNOWN
+                // notice), never the device default by implication.
+                let policy_tenant =
+                    Self::block_on_async(crate::mcp::policy_tenant::new_session_policy_tenant(
+                        std::path::Path::new(working_dir),
+                    ));
+                crate::session::spawn_prompt::resolve_system_prompt_carrier(
+                    Some(crate::terminal::runner_context(
+                        api_port,
+                        delivery,
+                        &crate::served_corpus::probe(std::path::Path::new(working_dir)),
+                    )),
+                    policy_tenant,
+                )
+            },
+        )?;
+        let crate::claude_session::launch_extras::LaunchExtras {
+            extra_required,
+            env: extras_env,
+            prompt_carrier,
+            coord_mcp,
+        } = extras;
 
         // Compose the flag vector through the shared launch seam, then let
         // `render_program_and_argv` pick the program: `cmd /c claude …` on
         // Windows (for npm's `claude.cmd` shim), a directly-executed resolved
         // `claude` everywhere else.
         // The operator's global template + per-account command layer in here;
-        // with no operator config the composed tail is byte-identical to the
-        // historical hand-built argv.
+        // a template flag the runner's tail already supplies (`--mcp-config`,
+        // `--settings`, in either spelling) is dropped, so the runner's wins.
         let spec = crate::claude_session::launch_spec::LaunchSpec {
             permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
             session_id: session_id_pin,
@@ -416,6 +416,12 @@ impl ClaudeSession {
         );
         let (program, cli_args) =
             crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
+        // The delivered-policy marker, withheld when an operator template added
+        // a replacement prompt to the final argv.
+        let policy_delivery = crate::session::spawn_prompt::delivery_unless_replacement(
+            prompt_carrier.as_ref().and_then(|c| c.policy_delivery()),
+            &cli_args,
+        );
 
         let mut cmd = crate::process_helpers::no_window(&program);
         let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
@@ -456,6 +462,16 @@ impl ClaudeSession {
             if let Some(refusal) = gate.decision.refusal() {
                 return Err(refusal);
             }
+        }
+
+        // The session's coord-mcp config, hook port and AI session id, and the
+        // delivered-policy marker — set BEFORE the finalize below, which is the
+        // last env write (its scrub keeps every one of these).
+        Self::apply_child_env(&mut cmd, &extras_env);
+        for (name, value) in
+            crate::session::spawn_prompt::policy_delivery_env(policy_delivery.as_ref())
+        {
+            cmd.env(name, value);
         }
 
         // The LAST env mutations before the spawn — account pin, then the
@@ -1259,10 +1275,18 @@ impl ClaudeSession {
         // Interactive-agent log emitter (Phase 1b) — the waiter emits the
         // terminal `session_closed` line + final flush when the CLI exits.
         let agent_log_emitter_for_waiter = agent_log_emitter.clone();
+        // The coord-mcp delivery lives exactly as long as the child.
+        let coord_mcp_lease = coord_mcp.into_lease();
 
         thread::spawn(move || {
             // Wait for the child process to exit
             Self::wait_for_child(child, &session_id_for_waiter);
+
+            // Retire the coord-mcp delivery the child held — its nonce, its
+            // config file, its delivery record — BEFORE a rate-limit restart
+            // below re-delivers under the same session id. The lease touches
+            // only what this spawn minted, so it never retires a successor.
+            coord_mcp_lease.retire();
 
             // Remove PID from tracker
             if let Some(ref tracker) = pid_tracker_for_waiter {
@@ -2252,6 +2276,24 @@ impl ClaudeSession {
         // `credential_helper::non_interactive_git_env`.
         crate::credential_helper::apply_non_interactive_git_env_std(cmd);
         crate::terminal::scrub_credential_env_std(cmd);
+    }
+
+    /// Apply [`crate::claude_session::launch_extras::LaunchExtras::env`]:
+    /// `Some` sets, `None` removes.
+    pub(crate) fn apply_child_env(
+        cmd: &mut std::process::Command,
+        env: &[(&'static str, Option<String>)],
+    ) {
+        for (name, value) in env {
+            match value {
+                Some(value) => {
+                    cmd.env(name, value);
+                }
+                None => {
+                    cmd.env_remove(name);
+                }
+            }
+        }
     }
 
     /// Internal: wait for child process to exit.
