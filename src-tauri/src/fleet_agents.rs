@@ -717,10 +717,7 @@ fn is_transient_sharing_error(e: &std::io::Error) -> bool {
 /// `tmp.persist(dst)`, retried a bounded number of times while the failure is a
 /// Windows sharing violation. Any other error, or the last violation, is
 /// returned and the temporary file is dropped (deleted) with the error.
-fn persist_with_retry(
-    mut tmp: tempfile::NamedTempFile,
-    dst: &Path,
-) -> std::io::Result<()> {
+fn persist_with_retry(mut tmp: tempfile::NamedTempFile, dst: &Path) -> std::io::Result<()> {
     let mut attempt = 0;
     loop {
         match tmp.persist(dst) {
