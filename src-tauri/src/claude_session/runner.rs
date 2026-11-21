@@ -153,6 +153,28 @@ pub(crate) fn cli_session_pin(cli_session_ctx: Option<&CliSessionContext>) -> Cl
     }
 }
 
+/// The launch spec every stream-json spawn renders through the shared seam:
+/// bypass permissions, the pin's ONE session flag (`--session-id` or
+/// `--resume`, from [`CliPin::into_spec_ids`]), the model override, and the
+/// caller's verbatim tail. [`crate::claude_session::ClaudeSession::spawn`] and
+/// the inline runner both build their spec here, so neither can render a
+/// spawn whose argv carries no id.
+pub(crate) fn stream_json_launch_spec(
+    pin: CliPin,
+    model_override: Option<&str>,
+    extra_required: Vec<String>,
+) -> crate::claude_session::launch_spec::LaunchSpec {
+    let (session_id, resume_id) = pin.into_spec_ids();
+    crate::claude_session::launch_spec::LaunchSpec {
+        permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+        session_id,
+        resume_id,
+        model: model_override.map(str::to_string),
+        extra_required,
+        ..Default::default()
+    }
+}
+
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawHandle;
 
@@ -510,7 +532,6 @@ fn run_claude_session_inline(
             id, session_id
         ),
     }
-    let (session_id_pin, resume_id_pin) = cli_pin.into_spec_ids();
 
     // ── Blueprint tool policy (Phase 3) ───────────────────────────────────
     // Translate the policy into CLI flags (--allowedTools/--disallowedTools)
@@ -565,14 +586,7 @@ fn run_claude_session_inline(
     // everywhere else. The operator's global template + per-account command
     // layer in here; with no operator config the composed tail is
     // byte-identical to the historical argv.
-    let spec = crate::claude_session::launch_spec::LaunchSpec {
-        permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
-        session_id: session_id_pin,
-        resume_id: resume_id_pin,
-        model: model_override.map(|m| m.to_string()),
-        extra_required,
-        ..Default::default()
-    };
+    let spec = stream_json_launch_spec(cli_pin, model_override, extra_required);
     // ONE account resolution, so the launch template and the trust pre-accept
     // below name the same account. The resolved dir is a process-global that
     // every `pick_best_account` rewrites, and under `WeightedRandom` (the
@@ -2588,7 +2602,7 @@ pub fn run_claude_session_interactive(
         model_override,
         None, // worktree — promoted later via ClaudeSession::promote_to_worktree
         tool_policy,
-        None, // cli_session_ctx — non-chat spawn; CLI generates its own id
+        None, // cli_session_ctx — non-chat spawn; `cli_session_pin` mints its --session-id
         None, // agent_log_emitter — non-interactive path, no coord agent_logs
     )?;
 
@@ -2930,23 +2944,24 @@ mod cli_session_pin_tests {
     //! Phase 2: every runner-spawned stream-json `claude` carries exactly one
     //! session id in argv. The argv is rendered through the real launch seam
     //! and asserted as literal tokens.
-    use super::{cli_session_pin, CliPin, CliSessionContext};
-    use crate::claude_session::launch_spec::{render_argv, LaunchConfig, LaunchSpec};
+    use super::{cli_session_pin, stream_json_launch_spec, CliPin, CliSessionContext};
+    use crate::claude_session::launch_spec::{render_argv, LaunchConfig};
 
+    /// The argv a stream-json spawn renders for `ctx`, through the same two
+    /// functions both seams call: `cli_session_pin` and
+    /// `stream_json_launch_spec`.
     fn argv_for(ctx: Option<&CliSessionContext>) -> Vec<String> {
-        let (session_id, resume_id) = cli_session_pin(ctx).into_spec_ids();
-        let spec = LaunchSpec {
-            session_id,
-            resume_id,
-            extra_required: vec![
+        let spec = stream_json_launch_spec(
+            cli_session_pin(ctx),
+            None,
+            vec![
                 "--output-format".to_string(),
                 "stream-json".to_string(),
                 "--input-format".to_string(),
                 "stream-json".to_string(),
                 "--verbose".to_string(),
             ],
-            ..Default::default()
-        };
+        );
         render_argv(&spec, &LaunchConfig::default(), "claude")
     }
 
@@ -3006,24 +3021,81 @@ mod cli_session_pin_tests {
         );
     }
 
-    /// Both stream-json spawn seams take their pin from `cli_session_pin`;
-    /// a seam that goes back to its own inline match can re-grow an id-less
-    /// arm and escape again.
+    /// The spec builder carries the pin's one flag and nothing else: `New`
+    /// rides `--session-id`, `Resume` rides `--resume`, never both, never
+    /// neither.
+    #[test]
+    fn stream_json_launch_spec_carries_exactly_the_pins_flag() {
+        let new = stream_json_launch_spec(
+            CliPin::New("7b97f1e8-35c0-4bec-992d-63e5a3dc55d7".to_string()),
+            Some("sonnet"),
+            Vec::new(),
+        );
+        assert_eq!(
+            new.session_id.as_deref(),
+            Some("7b97f1e8-35c0-4bec-992d-63e5a3dc55d7")
+        );
+        assert_eq!(new.resume_id, None);
+        assert_eq!(new.model.as_deref(), Some("sonnet"));
+
+        let resumed = stream_json_launch_spec(
+            CliPin::Resume("52e88829-c137-421d-893a-b45feac50a00".to_string()),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(resumed.session_id, None);
+        assert_eq!(
+            resumed.resume_id.as_deref(),
+            Some("52e88829-c137-421d-893a-b45feac50a00")
+        );
+    }
+
+    /// Both stream-json spawn seams take their pin from `cli_session_pin` AND
+    /// hand that same pin to `stream_json_launch_spec`, building no
+    /// `LaunchSpec` of their own. A seam that computes the pin and then builds
+    /// its own spec — `session_id: None, resume_id: None` — escapes again even
+    /// though it still calls `cli_session_pin`; this reds that seam.
     #[test]
     fn both_stream_json_spawn_seams_take_their_pins_from_the_shared_helper() {
-        for (name, src) in [
-            ("claude_session/session.rs", include_str!("session.rs")),
-            ("claude_session/runner.rs", include_str!("runner.rs")),
+        // Each seam's body: from its `fn` line to the next item at the same
+        // indent (whichever kind of `fn` comes first).
+        fn body_of<'a>(src: &'a str, start: &str, indent: &str) -> &'a str {
+            let from = src
+                .find(start)
+                .unwrap_or_else(|| panic!("seam {start:?} not found"));
+            let body = &src[from..];
+            let end = ["pub fn ", "pub(crate) fn ", "fn "]
+                .iter()
+                .filter_map(|kind| body[1..].find(&format!("\n{indent}{kind}")))
+                .min()
+                .unwrap_or_else(|| panic!("seam {start:?} has no end"));
+            &body[..end + 1]
+        }
+        for (name, body) in [
+            (
+                "claude_session/session.rs ClaudeSession::spawn_body",
+                body_of(include_str!("session.rs"), "    fn spawn_body(", "    "),
+            ),
+            (
+                "claude_session/runner.rs run_claude_session_inline",
+                body_of(
+                    include_str!("runner.rs"),
+                    "\nfn run_claude_session_inline(",
+                    "",
+                ),
+            ),
         ] {
-            let code: String = src
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            let needle = ["cli_session_pin", "(cli_session_ctx)"].concat();
             assert!(
-                code.contains(&needle),
+                body.contains(&["cli_session_pin", "(cli_session_ctx)"].concat()),
                 "{name} must derive its CLI pin through cli_session_pin"
+            );
+            assert!(
+                body.contains(&["stream_json_launch_spec", "(cli_pin, "].concat()),
+                "{name} must build its spec from that pin through stream_json_launch_spec"
+            );
+            assert!(
+                !body.contains(&["LaunchSpec", " {"].concat()),
+                "{name} must not build a LaunchSpec of its own"
             );
         }
     }

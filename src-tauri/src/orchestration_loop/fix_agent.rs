@@ -46,20 +46,6 @@ pub(crate) fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::
     // plus the allow-list when selected.
     let permission = crate::settings::get_claude_session_permission()
         .apply(crate::claude_session::launch_spec::PermissionMode::BypassPermissions);
-    build_fix_agent_command_with(prompt_file, model, &permission)
-}
-
-/// [`build_fix_agent_command`] with an explicit permission mode (pure over its
-/// inputs, so the argv is testable without settings).
-pub(crate) fn build_fix_agent_command_with(
-    prompt_file: &str,
-    model: &str,
-    permission: &crate::claude_session::launch_spec::PermissionMode,
-) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.args(["--print", prompt_file]);
-    cmd.args(permission.render());
-    cmd.args(["--output-format", "text", "--model", model]);
     // The one id this process runs under, in argv where the session census
     // reads it — the CLI would otherwise pick its own and leave argv id-less
     // (plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
@@ -69,7 +55,22 @@ pub(crate) fn build_fix_agent_command_with(
         "Fix agent: claude --print pinned to session id {}",
         session_id
     );
-    cmd.args(["--session-id", session_id.as_str()]);
+    build_fix_agent_command_with(prompt_file, model, &permission, &session_id)
+}
+
+/// [`build_fix_agent_command`] with an explicit permission mode and session id
+/// (pure over its inputs, so the argv is testable without settings or a mint).
+pub(crate) fn build_fix_agent_command_with(
+    prompt_file: &str,
+    model: &str,
+    permission: &crate::claude_session::launch_spec::PermissionMode,
+    session_id: &str,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args(["--print", prompt_file]);
+    cmd.args(permission.render());
+    cmd.args(["--output-format", "text", "--model", model]);
+    cmd.args(["--session-id", session_id]);
     cmd.env_remove("CLAUDECODE")
         // Same rule, sibling marker — see `session::transport::claude_cli` docs.
         .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
@@ -265,7 +266,9 @@ mod tests {
     /// cannot reach a credential prompt. Removing the
     /// `apply_non_interactive_git_env_tokio` call from
     /// [`build_fix_agent_command`] reddens it.
-    /// Review M2: the fix agent honours the allow-list posture.
+    /// Review M2: the fix agent honours the allow-list posture. The whole
+    /// argv, literally: the builder is pure over its inputs, the session id
+    /// included.
     #[test]
     fn fix_agent_command_renders_the_session_permission_posture() {
         use crate::claude_session::launch_spec::PermissionMode;
@@ -275,6 +278,7 @@ mod tests {
             &PermissionMode::AllowList {
                 tools: vec!["Edit".to_string()],
             },
+            "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7",
         );
         let args: Vec<String> = cmd
             .as_std()
@@ -282,7 +286,7 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            args[..10],
+            args,
             [
                 "--print",
                 "/tmp/p.txt",
@@ -293,22 +297,23 @@ mod tests {
                 "--output-format",
                 "text",
                 "--model",
-                "sonnet"
+                "sonnet",
+                "--session-id",
+                "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7",
             ]
         );
-        assert_eq!(args.len(), 12, "args: {args:?}");
-        assert_eq!(args[10], "--session-id");
     }
 
     /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
-    /// Phase 2: the fix agent's one-shot `claude --print` carries exactly one
-    /// `--session-id <uuid>` in argv, so a census reading argv identifies it.
+    /// Phase 2: the fix agent's one-shot `claude --print` carries exactly the
+    /// one `--session-id <id>` it was given — the whole argv, literally.
     #[test]
     fn fix_agent_command_carries_exactly_one_session_id() {
         let cmd = build_fix_agent_command_with(
             "/tmp/p.txt",
             "sonnet",
             &crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+            "52e88829-c137-421d-893a-b45feac50a00",
         );
         let args: Vec<String> = cmd
             .as_std()
@@ -316,18 +321,47 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            args.iter().filter(|a| a.as_str() == "--session-id").count(),
-            1,
-            "args: {args:?}"
+            args,
+            [
+                "--print",
+                "/tmp/p.txt",
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "text",
+                "--model",
+                "sonnet",
+                "--session-id",
+                "52e88829-c137-421d-893a-b45feac50a00",
+            ]
         );
-        assert_eq!(
-            args.iter().filter(|a| a.as_str() == "--resume").count(),
-            0,
-            "args: {args:?}"
+    }
+
+    /// The production builder mints the id: one `--session-id` with a fresh
+    /// uuid, and a different one per command.
+    #[test]
+    fn build_fix_agent_command_mints_a_fresh_session_id_per_command() {
+        let id_of = |cmd: &tokio::process::Command| -> String {
+            let args: Vec<String> = cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                args.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "args: {args:?}"
+            );
+            let i = args.iter().position(|a| a == "--session-id").unwrap();
+            args[i + 1].clone()
+        };
+        let first = id_of(&build_fix_agent_command("/tmp/p.txt", "sonnet"));
+        let second = id_of(&build_fix_agent_command("/tmp/p.txt", "sonnet"));
+        assert!(
+            uuid::Uuid::parse_str(&first).is_ok(),
+            "not a uuid: {first:?}"
         );
-        let i = args.iter().position(|a| a == "--session-id").unwrap();
-        let id = args.get(i + 1).expect("a value follows --session-id");
-        assert!(uuid::Uuid::parse_str(id).is_ok(), "not a uuid: {id:?}");
+        assert_ne!(first, second);
     }
 
     #[test]

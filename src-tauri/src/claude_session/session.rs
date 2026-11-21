@@ -28,7 +28,7 @@ use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, Progr
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 use super::dispatcher;
-use super::runner::{cli_session_pin, CliPin};
+use super::runner::{cli_session_pin, stream_json_launch_spec, CliPin};
 use super::state::{SessionState, SessionStateTracker};
 use super::writer::StdinWriter;
 
@@ -347,7 +347,6 @@ impl ClaudeSession {
                 id, session_id
             ),
         }
-        let (session_id_pin, resume_id_pin) = cli_pin.into_spec_ids();
 
         // Model override (e.g., from per-stage config) is fed to the seam below
         // as `spec.model` so it wins over any template `--model`.
@@ -401,14 +400,7 @@ impl ClaudeSession {
         // The operator's global template + per-account command layer in here;
         // with no operator config the composed tail is byte-identical to the
         // historical hand-built argv.
-        let spec = crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
-            session_id: session_id_pin,
-            resume_id: resume_id_pin,
-            model: model_override.map(|m| m.to_string()),
-            extra_required,
-            ..Default::default()
-        };
+        let spec = stream_json_launch_spec(cli_pin, model_override, extra_required);
         let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );

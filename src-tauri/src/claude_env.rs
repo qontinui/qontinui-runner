@@ -78,12 +78,17 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 /// inline forms. A merely-prefixed token (`--session-id-ish`) does NOT match,
 /// and neither does anything after a `--`, which is positional.
 ///
-/// The ONE spelling of that set: the identity shim (`bin/qontinui_shim.rs`)
-/// decides from it whether to append `--session-id $QONTINUI_PINNED_SESSION_ID`,
-/// and the runner's terminal seam decides from it whether a pane started
-/// without that shim lost its pin (plan
+/// The Rust spelling of that set, shared by every Rust reader: the native
+/// identity shim (`bin/qontinui_shim.rs`) decides from it whether to append
+/// `--session-id $QONTINUI_PINNED_SESSION_ID`, the runner's terminal seam
+/// decides from it whether a pane started without that shim lost its pin, and
+/// the launch-template composer (`claude_session::launch_spec`) drops a
+/// template unit it matches when the spec pins the session (plan
 /// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
-/// Phase 2). Two copies would drift.
+/// Phase 2). It is NOT yet the only spelling: the `.bash` and `.cmd` script
+/// shims (`resources/intercept/identity_shim.bash` / `.cmd`) carry their own
+/// copies of the list — a recorded follow-up, plan-library edge
+/// `2ce2a5a6-da43-4585-a372-d533fb50b7e7`.
 pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
     args.iter()
         .map(AsRef::as_ref)
