@@ -988,17 +988,20 @@ mod tests {
 
         em2.emit_inner(&trid, "abcde");
 
+        // `pending()` orders rows by (session_id, seq), and the two coord
+        // session ids are freshly minted, so their relative order is not
+        // fixed. Pair each row with its session instead of its position.
         let rows = transcript_rows(&outbox2);
-        let offsets: Vec<i64> = rows
+        let mut by_session: Vec<(Uuid, i64)> = rows
             .iter()
-            .map(|r| r.payload["chunk_offset"].as_i64().unwrap())
+            .map(|r| (r.session_id, r.payload["chunk_offset"].as_i64().unwrap()))
             .collect();
+        by_session.sort_by_key(|&(_, offset)| offset);
         assert_eq!(
-            offsets,
-            vec![0, 10],
+            by_session,
+            vec![(sid_before, 0), (sid_after, 10)],
             "post-restart chunk continues the lane instead of colliding at 0"
         );
-        assert_eq!(rows[1].session_id, sid_after);
         assert_eq!(em2.offsets().next_offset(&trid), 15);
     }
 

@@ -769,6 +769,11 @@ pub(crate) mod test_env {
     }
 }
 
+/// Test-only: the scripted loopback coord double and the fixture that
+/// satisfies every fleet publisher's prerequisites against it.
+#[cfg(test)]
+pub(crate) mod test_coord;
+
 use commands::AppState;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;

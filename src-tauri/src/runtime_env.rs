@@ -62,14 +62,20 @@ pub struct RuntimeEnv {
 /// Priority:
 /// 1. QONTINUI_ENV environment variable
 /// 2. Build configuration (debug_assertions)
+///
+/// [`environment_from`] is the PURE twin that decides the answer.
 pub fn detect_environment() -> String {
-    // Check for explicit environment variable
-    if let Ok(env) = std::env::var("QONTINUI_ENV") {
+    environment_from(std::env::var("QONTINUI_ENV").ok(), cfg!(debug_assertions))
+}
+
+/// The environment for one `(QONTINUI_ENV, debug build)` reading: the env
+/// value when set, else `development` for a debug build and `production` for
+/// a release build. PURE — no env read, so its tests need no lock.
+pub(crate) fn environment_from(qontinui_env: Option<String>, debug_build: bool) -> String {
+    if let Some(env) = qontinui_env {
         return env;
     }
-
-    // Fall back to build configuration
-    if cfg!(debug_assertions) {
+    if debug_build {
         "development".to_string()
     } else {
         "production".to_string()
@@ -573,10 +579,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_detect_environment() {
-        let env = detect_environment();
-        // In test builds, should be "development"
-        assert!(env == "development" || env == "production");
+    fn environment_from_prefers_the_env_value() {
+        assert_eq!(environment_from(Some("staging".into()), true), "staging");
+    }
+
+    #[test]
+    fn environment_from_debug_build_without_env_is_development() {
+        assert_eq!(environment_from(None, true), "development");
+    }
+
+    #[test]
+    fn environment_from_release_build_without_env_is_production() {
+        assert_eq!(environment_from(None, false), "production");
+    }
+
+    /// `detect_environment` reads `QONTINUI_ENV` itself. The fixture holds the
+    /// env lock (so no sibling fixture can rewrite the key mid-read) and
+    /// restores the key on drop.
+    #[test]
+    fn detect_environment_reads_qontinui_env_under_the_fixture() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_ENV", "staging");
+        assert_eq!(detect_environment(), "staging");
     }
 
     #[test]

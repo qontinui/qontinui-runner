@@ -30,21 +30,10 @@ use crate::mcp::sdk_client::{
 use crate::mcp::transport::cloud::CloudTransport;
 use crate::mcp::transport::lan::LanTransport;
 use crate::mcp::transport::{is_off_machine_forwarder, ForgetForwarder};
+use crate::test_coord::{a_port_nothing_listens_on, a_stored_device_jwt};
 
 /// `(authority, Authorization)` of every request a recorder saw.
 type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
-
-/// Every variable reqwest's system proxy reads, in both spellings.
-const PROXY_ENV: [&str; 8] = [
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "NO_PROXY",
-    "no_proxy",
-];
 
 /// What a UI Bridge app answers to its `/health` probe.
 const HEALTH: &str = r#"{"uiBridge":{"appId":"door","appName":"Door","appType":"web"}}"#;
@@ -81,14 +70,7 @@ pub(super) fn door() -> Door {
     let ambient = crate::test_env::isolated_ambient();
     // Restored by the fixture: the key is in `ambient::AMBIENT_ENV_KEYS`.
     std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-    let proxies = crate::test_env::EnvVarRestore::capture(&PROXY_ENV);
-    for key in PROXY_ENV {
-        std::env::remove_var(key);
-    }
-    std::env::set_var(
-        "NO_PROXY",
-        qontinui_runner_lib::outbound_net::LOOPBACK_NO_PROXY.join(","),
-    );
+    let proxies = crate::test_coord::loopback_only_proxies();
     let adb_port = crate::test_env::EnvVarRestore::capture(&[
         "ANDROID_ADB_SERVER_PORT",
         "ANDROID_ADB_SERVER_ADDRESS",
@@ -107,27 +89,6 @@ pub(super) fn door() -> Door {
         _no_adb: no_adb,
         _ambient: ambient,
     }
-}
-
-/// A loopback port that refuses connections. The socket holds it, bound but not
-/// listening, so no peer test can be handed the number.
-fn a_port_nothing_listens_on() -> (tokio::net::TcpSocket, u16) {
-    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
-    socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-    let port = socket.local_addr().expect("local addr").port();
-    (socket, port)
-}
-
-/// An unexpired, JWT-shaped device token. It is unsigned: nothing on this path
-/// verifies a signature, only the token's shape and its `exp`.
-fn a_stored_device_jwt() -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine as _;
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
-    let exp = chrono::Utc::now().timestamp() + 3600;
-    let payload =
-        URL_SAFE_NO_PAD.encode(serde_json::json!({ "sub_type": "device", "exp": exp }).to_string());
-    format!("{header}.{payload}.sig")
 }
 
 /// A UI Bridge app on 127.0.0.1. It answers every path like a healthy app and
