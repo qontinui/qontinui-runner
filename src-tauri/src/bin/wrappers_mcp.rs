@@ -1603,8 +1603,11 @@ mod tests {
         );
 
         // Error arm — `tool_error` adds `isError` to the same envelope.
+        // Key order is the order `text_result_with` inserts them: serde_json's
+        // `preserve_order` is on for this build (the ACP client crate enables
+        // it), so the string comparison below sees insertion order.
         let before_err =
-            json!({ "isError": true, "content": [{ "type": "text", "text": "boom" }] });
+            json!({ "content": [{ "type": "text", "text": "boom" }], "isError": true });
         let after_err = tool_error("wrapper_v0__do_thing", "boom".to_string());
         assert_eq!(after_err, before_err);
         assert_eq!(
