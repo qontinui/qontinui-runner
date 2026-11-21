@@ -420,7 +420,15 @@ async fn read_gate_outcome(gate_id: uuid::Uuid) -> GateRead {
         return GateRead::Unknown("no shared coord client".to_string());
     };
     let url = format!("{base}/coord/agent-gates?gate_id={gate_id}&limit=1");
-    let resp = match crate::auth::attach_device_auth(client.get(&url))
+    // The gate row HAS an owning tenant that this call cannot name (the
+    // continuation payload carries the gate id, not its tenant), so state
+    // `Unresolved` rather than assert `Device`: a single-bound device presents
+    // its only credential as before, a multi-bound one sends none, and the read
+    // then degrades to UNKNOWN (`work_unreported`), never another tenant's view.
+    let resp = match crate::auth::attach_device_auth_for(
+        client.get(&url),
+        crate::auth::TenantScope::Unresolved,
+    )
         .timeout(Duration::from_secs(10))
         .send()
         .await
