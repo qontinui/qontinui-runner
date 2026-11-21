@@ -21,6 +21,8 @@
 
 pub mod apps;
 pub mod auth_injection;
+pub mod authoring;
+pub mod coverage;
 pub mod distinctness;
 pub mod events;
 pub mod handlers;

@@ -6,7 +6,7 @@
 //!   with the page it was captured on.
 //! - [`crate::spec_api::proposals`] compares on-disk spec ids against observed
 //!   pathnames to find un-spec'd pages.
-//! - [`crate::workflow_generation::spec_authoring`] resolves the page whose
+//! - [`crate::spec_api::authoring`] resolves the page whose
 //!   states it is authoring.
 //!
 //! They previously kept two independent copies, and the copies disagreed on

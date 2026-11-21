@@ -13,6 +13,7 @@ pub mod coercion;
 pub mod constrained_decoding;
 pub mod feedback;
 pub mod retry_with_validation;
+pub mod structured_output;
 pub mod validator;
 
 pub use coercion::CoercionPolicy;

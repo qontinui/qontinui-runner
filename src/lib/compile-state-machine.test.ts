@@ -101,7 +101,7 @@ function makeSpecWithElementCounts(
  * adapter (`DiscoveredState.to_dict`, qontinui/src/qontinui/discovery/models.py)
  * has only ever emitted `{ id, name, stateImageIds, screenshotIds,
  * confidence, metadata }`, and the Rust `Cluster` struct
- * (src-tauri/src/workflow_generation/spec_authoring.rs, fixed in PR #886)
+ * (src-tauri/src/spec_api/authoring.rs, fixed in PR #886)
  * reads exactly those names. Do not "simplify" these fixtures by inventing
  * fields — re-copy from a live row instead.
  *

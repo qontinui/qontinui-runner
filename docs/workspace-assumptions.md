@@ -120,7 +120,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workflow_generation/meta_workflow.rs` | `build_specification_meta_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
 | `src/workflow_generation/meta_workflow.rs` | `build_verification_review_prompt` | `15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420) AND verifies interactive UI behavior...` | 1 | unreviewed |
 | `src/workflow_generation/specification.rs` | `build_specification_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
-| `src/workflow_generation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
+| `src/validation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
 
 ## `supervisor_dependency` (57 rows)
 

@@ -225,7 +225,7 @@
     },
     {
       "class": "dev_ports",
-      "file": "src/workflow_generation/structured_output.rs",
+      "file": "src/validation/structured_output.rs",
       "symbol": "detect_backend",
       "excerpt": "base_url: \"http://localhost:8000\".to_string(),",
       "count": 1,

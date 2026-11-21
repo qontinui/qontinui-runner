@@ -52,8 +52,8 @@ use crate::spec_api::validator::{
     gate_b_execution_green_with_snapshot, gate_coverage, ValidatorError,
 };
 use crate::test_env::env_lock;
-use crate::workflow_generation::coverage::{coverage_of, generate_regression_suite};
-use crate::workflow_generation::spec_authoring::{merge_patch_into_ir, IrPatch};
+use crate::spec_api::coverage::{coverage_of, generate_regression_suite};
+use crate::spec_api::authoring::{merge_patch_into_ir, IrPatch};
 
 use qontinui_types::ui_bridge::{
     ElementIdentifier, ElementRect, ElementState, UIBridgeElement, UIBridgeSnapshot,

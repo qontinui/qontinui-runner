@@ -6,7 +6,6 @@
 pub mod benchmark;
 #[cfg(test)]
 mod blast_radius_bench;
-pub mod code_graph;
 pub mod complexity;
 pub mod consistency;
 pub mod constitution;
@@ -30,28 +29,22 @@ pub mod prompt_analysis;
 pub mod reflector;
 pub mod relevance_filter;
 pub mod revision;
-pub mod rules;
 pub mod schema_context;
 pub mod self_improve;
 pub mod similar_workflows;
 // Stream E (Flywheel) — coverage-growth loop. Gated behind the
 // `spec-authoring` Cargo feature so default builds never compile it.
 #[cfg(feature = "spec-authoring")]
-pub mod coverage;
 #[cfg(feature = "spec-authoring")]
-pub mod spec_authoring;
 pub mod spec_synthesis;
 pub mod specification;
-pub mod step_type_knowledge;
 pub mod step_type_metadata;
-pub mod structured_output;
 pub mod template_library;
 pub mod template_lifecycle;
 pub mod template_promotion;
 pub mod training_data;
 pub mod validation;
 pub mod verification_templates;
-pub mod wrapper_manifest;
 
 pub use generator::{
     extract_json_from_response, generate_workflow, GenerateWorkflowRequest,

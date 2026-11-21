@@ -27,7 +27,7 @@
 //!   * new-only => a **real resolved edge the substring heuristic missed** (classic
 //!     tsconfig-alias / index import whose specifier shares no substring with the path).
 
-use super::code_graph::{CodeGraph, ResolutionKind};
+use crate::mcp::code_semantics::code_graph::{CodeGraph, ResolutionKind};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 

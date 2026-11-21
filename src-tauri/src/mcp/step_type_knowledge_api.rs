@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::workflow_generation::step_type_knowledge::{
+use crate::step_registry::step_type_knowledge::{
     InsertKnowledgeInput, ListKnowledgeQuery, StepTypeKnowledge, UpdateKnowledgeInput,
 };
 

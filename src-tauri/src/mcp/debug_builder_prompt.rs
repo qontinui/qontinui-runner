@@ -101,7 +101,7 @@ pub async fn debug_builder_prompt_handler(
     // workflow from the same brief at the same instant.
     let port = runner_api_port(&state.app_state);
     let manifest =
-        crate::workflow_generation::wrapper_manifest::build_manifest(&state.app_state, port).await;
+        crate::mcp::wrapper_manifest::build_manifest(&state.app_state, port).await;
 
     let manifest_len = manifest.len();
     let wrapper_count = count_wrapper_bullets(&manifest);

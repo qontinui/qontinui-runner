@@ -28,6 +28,7 @@
 pub mod arch_classify;
 pub mod arch_observer;
 pub mod cargo_check;
+pub mod code_graph;
 pub mod code_graph_api;
 pub mod domain_observer;
 pub mod lang;
@@ -51,7 +52,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::mcp::types::ApiState;
-use crate::workflow_generation::code_graph::CodeGraph;
+use crate::mcp::code_semantics::code_graph::CodeGraph;
 
 use node_bridge::{check_availability, HelperAvailability, NodeBridge};
 use scope::{resolve_scope, Scope};

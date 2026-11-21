@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::workflow_generation::rules::{
+use crate::generation_rules::{
     GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput,
 };
 

@@ -316,6 +316,7 @@ mod slash_commands;
 /// 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2.
 mod spawn_off_worker;
 mod spawn_placement;
+mod generation_rules;
 mod spec_api;
 mod spec_experimentation;
 mod spec_utils;

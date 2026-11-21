@@ -52,6 +52,7 @@ pub mod container_status;
 pub mod contexts;
 pub mod continuation_verdict;
 pub mod debug_builder_prompt;
+pub mod wrapper_manifest;
 /// Debug-profile door onto `TerminalManager::graceful_exit` (plan
 /// `2026-09-13-drained-runner-never-reaches-idle` Phase 1). Present in every
 /// dev-profile runner, including supervisor-built ones; see the module docs.

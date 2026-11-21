@@ -11,6 +11,7 @@
 mod definitions;
 mod facade;
 mod policy;
+pub mod step_type_knowledge;
 mod tracker;
 mod workflow_phase;
 

@@ -731,7 +731,7 @@ pub fn build_builder_prompt(
         let wrapper_manifest = match app_state {
             Some(s) => tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    super::wrapper_manifest::build_manifest(s, brief_runner_port).await
+                    crate::mcp::wrapper_manifest::build_manifest(s, brief_runner_port).await
                 })
             }),
             None => String::new(),

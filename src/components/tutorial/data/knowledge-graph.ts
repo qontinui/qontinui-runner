@@ -116,7 +116,7 @@ The weight system allows traversal algorithms to prefer high-confidence paths.`,
     {
       id: "building-the-graph",
       title: "How the Graph is Built",
-      content: `The graph is built on-demand from **16+ database tables** by the \`build_from_db()\` function in \`reflection/graph_engine.rs\`.
+      content: `The graph is built on-demand from **16+ database tables** by the \`build_from_db()\` function in \`memory/graph/graph_engine.rs\`.
 
 **Build process:**
 1. **Load nodes** — Query each entity table, create typed nodes

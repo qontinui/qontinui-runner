@@ -89,7 +89,7 @@ export const INVALIDATION_WINDOW_HOURS = 24;
  * (`DiscoveredState.to_dict` in `qontinui/src/qontinui/discovery/models.py`),
  * which emits camelCase `stateImageIds` / `screenshotIds`, and are kept in
  * lockstep with the Rust reader's `Cluster` struct
- * (`src-tauri/src/workflow_generation/spec_authoring.rs`).
+ * (`src-tauri/src/spec_api/authoring.rs`).
  *
  * An earlier revision of BOTH readers declared an `elements` key plus
  * `support` / `contrast` / `state_hash` / `last_observed` — none of which the
@@ -712,7 +712,7 @@ function sizeProximityTolerance(elementCount: number): number {
  *
  * The id-ascending rule is borrowed from the sibling Rust reader's
  * determinism contract (`load_and_project_skeleton`,
- * src-tauri/src/workflow_generation/spec_authoring.rs). Note that is a
+ * src-tauri/src/spec_api/authoring.rs). Note that is a
  * borrowed convention, not a shared contract: that function projects clusters
  * 1:1 into states and does no state↔cluster matching, so there is nothing
  * there to keep in lockstep with this — changing one does not oblige changing

@@ -8,8 +8,8 @@ use crate::database::pg::PgDb;
 use std::sync::Arc;
 
 use super::relevance_filter::filter_relevant_step_types;
-use super::rules;
-use super::step_type_knowledge;
+use crate::generation_rules as rules;
+use crate::step_registry::step_type_knowledge;
 use super::step_type_metadata::{get_all_step_type_metadata, StepTypeMetadata};
 use crate::skills::SkillRegistry;
 

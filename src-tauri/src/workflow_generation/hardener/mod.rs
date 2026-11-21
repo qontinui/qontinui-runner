@@ -44,7 +44,7 @@ use crate::doctor::DoctorHandle;
 use crate::skills::SkillRegistry;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::generator::extract_json_from_response;
-use crate::workflow_generation::rules as generation_rules;
+use crate::generation_rules;
 use crate::workflow_generation::schema_context::{
     format_skills_for_generator, format_skills_for_generator_filtered,
 };

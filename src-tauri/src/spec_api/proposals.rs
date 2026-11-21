@@ -421,7 +421,7 @@ pub async fn post_execute(
                         .into_response();
                 }
             };
-            crate::workflow_generation::spec_authoring::AuthoringMode::FullPage { pathname }
+            crate::spec_api::authoring::AuthoringMode::FullPage { pathname }
         }
         "patch" => {
             let existing_spec_id = match row.spec_id.clone() {
@@ -468,7 +468,7 @@ pub async fn post_execute(
                             .into_response();
                     }
                 };
-            crate::workflow_generation::spec_authoring::AuthoringMode::Patch {
+            crate::spec_api::authoring::AuthoringMode::Patch {
                 existing_spec_id,
                 drift,
             }
@@ -493,7 +493,7 @@ pub async fn post_execute(
     // integration time, an unresolved import here means the sibling's PR
     // hasn't landed yet.
     let app_state_for_validator = app_state.clone();
-    let outcome = match crate::workflow_generation::spec_authoring::author_candidate(
+    let outcome = match crate::spec_api::authoring::author_candidate(
         pg_db.clone(),
         app_state,
         &app_id,
@@ -645,9 +645,9 @@ pub async fn post_execute(
 }
 
 fn authoring_error_reason(
-    e: &crate::workflow_generation::spec_authoring::AuthoringError,
+    e: &crate::spec_api::authoring::AuthoringError,
 ) -> &'static str {
-    use crate::workflow_generation::spec_authoring::AuthoringError::*;
+    use crate::spec_api::authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { .. } => "no-discovery-artifact",
         EmptyArtifact => "empty-artifact",
@@ -663,9 +663,9 @@ fn authoring_error_reason(
 }
 
 fn authoring_error_detail(
-    e: &crate::workflow_generation::spec_authoring::AuthoringError,
+    e: &crate::spec_api::authoring::AuthoringError,
 ) -> String {
-    use crate::workflow_generation::spec_authoring::AuthoringError::*;
+    use crate::spec_api::authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { pathname } => {
             format!("no discovery artifact for pathname={}", pathname)
@@ -1210,7 +1210,7 @@ mod tests {
     /// unable to enter ANY artifact — was told to re-derive forever.
     #[test]
     fn only_the_stale_artifact_diagnosis_prescribes_a_re_derive() {
-        use crate::workflow_generation::spec_authoring::AuthoringError;
+        use crate::spec_api::authoring::AuthoringError;
 
         let stale = AuthoringError::NoActiveStates {
             page_label: "account-billing".into(),
@@ -1250,7 +1250,7 @@ mod tests {
     /// click around the UI — for every page at once, and it would never help.
     #[test]
     fn only_the_never_observed_diagnosis_prescribes_visiting_the_page() {
-        use crate::workflow_generation::spec_authoring::AuthoringError;
+        use crate::spec_api::authoring::AuthoringError;
 
         let never = AuthoringError::NoPageObservations {
             page_label: "specs".into(),

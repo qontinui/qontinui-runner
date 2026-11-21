@@ -1795,8 +1795,8 @@ fn run_claude_session_inline(
                                         }
                                     }
                                     "instruction_clarification" | "workflow_step_rewrite" => {
-                                        use crate::workflow_generation::rules;
-                                        use crate::workflow_generation::step_type_knowledge;
+                                        use crate::generation_rules as rules;
+                                        use crate::step_registry::step_type_knowledge;
 
                                         // Check if this fix targets a specific step type
                                         if let Some(step_type) =

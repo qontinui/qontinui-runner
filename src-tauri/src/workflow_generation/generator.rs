@@ -36,7 +36,7 @@ use crate::workflow_generation::pipeline_artifacts::{
     compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
 };
 use crate::workflow_generation::revision;
-use crate::workflow_generation::rules;
+use crate::generation_rules as rules;
 use crate::workflow_generation::schema_context::{
     build_gotchas_section, build_rules_section_for_tier, build_schema_context,
     build_schema_context_full, format_skills_for_generator, format_skills_for_generator_filtered,
@@ -690,7 +690,7 @@ pub fn generate_workflow(
     // ── Code Graph (tree-sitter AST analysis) ────────────────────────────
     let code_graph = if discovery_mode != "disabled" {
         let project_dir = std::env::current_dir().unwrap_or_default();
-        let graph = super::code_graph::CodeGraph::build(&project_dir);
+        let graph = crate::mcp::code_semantics::code_graph::CodeGraph::build(&project_dir);
         if !graph.is_empty() {
             let graph_context = graph.format_for_prompt(&request.description);
             if !graph_context.is_empty() {
@@ -2496,7 +2496,7 @@ fn run_builder_agent(
         let wrapper_manifest = match app_state {
             Some(s) => tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    super::wrapper_manifest::build_manifest(s, runner_port).await
+                    crate::mcp::wrapper_manifest::build_manifest(s, runner_port).await
                 })
             }),
             None => String::new(),
@@ -2614,7 +2614,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     }
 
     // Append structured output format instructions
-    let output_format_instructions = super::structured_output::build_output_format_instructions();
+    let output_format_instructions = crate::validation::structured_output::build_output_format_instructions();
     final_prompt.push_str("\n\n");
     final_prompt.push_str(&output_format_instructions);
 
@@ -2668,7 +2668,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
         .map(|w| {
             // Validate parsed workflow against schema
             if let Ok(workflow_json) = serde_json::to_value(&w) {
-                let schema_errors = super::structured_output::validate_against_schema(&workflow_json);
+                let schema_errors = crate::validation::structured_output::validate_against_schema(&workflow_json);
                 if !schema_errors.is_empty() {
                     warn!(
                         "Structured output schema validation found {} issues: {:?}",
