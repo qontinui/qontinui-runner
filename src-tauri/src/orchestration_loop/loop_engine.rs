@@ -98,6 +98,16 @@ impl LoopState {
     }
 }
 
+/// Refusals a config earns before anything runs. Today: a diagnose phase
+/// whose assertions the structured assert route would reject, so a malformed
+/// config costs no iteration, rebuild or AI triage call.
+fn validate_loop_config(config: &OrchestrationLoopConfig) -> Result<(), String> {
+    if let Some(diagnose) = config.pipeline.as_ref().and_then(|p| p.diagnose.as_ref()) {
+        diagnostician::validate_diagnose_assertions(&diagnose.assertions)?;
+    }
+    Ok(())
+}
+
 /// Start an orchestration loop. Spawns a background task and returns immediately.
 pub async fn start_loop(
     loop_state: SharedLoopState,
@@ -107,6 +117,8 @@ pub async fn start_loop(
     if state.running {
         return Err("Orchestration loop is already running".to_string());
     }
+
+    validate_loop_config(&config)?;
 
     // Verify target runner is healthy before starting
     let target_port = config.target_runner_port.unwrap_or_else(|| {
@@ -236,6 +248,11 @@ pub async fn start_multi_loop(
     }
     let loop_count = seen_ids.len();
     drop(seen_ids);
+
+    for entry in &multi_config.loops {
+        validate_loop_config(&entry.config)
+            .map_err(|e| format!("loop '{}': {}", entry.loop_id, e))?;
+    }
 
     // Validate no duplicate target runner ports (resolve None to actual port)
     let mut seen_ports = std::collections::HashSet::new();
@@ -2779,5 +2796,78 @@ mod tests {
             Some(serde_json::json!({ "concurrency_cap": "three" })),
         );
         assert_eq!(stored_run_config(&bad), d);
+    }
+}
+
+#[cfg(test)]
+mod start_loop_validation_tests {
+    //! T8 (plan 2026-11-12-structured-assert-arms-never-pass-and-diagnose-assertions-never-reach-the-route):
+    //! a diagnose phase whose assertions the route would reject is refused
+    //! when the loop starts, before the target health check, naming the
+    //! element and the field.
+
+    use super::{start_loop, start_multi_loop, LoopState, MultiLoopManager};
+    use super::{MultiLoopConfig, OrchestrationLoopConfig};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Port 1: nothing listens there, so a config that got PAST validation
+    /// would be refused by the health check with a different message.
+    fn config_with_assertions(assertions: serde_json::Value) -> OrchestrationLoopConfig {
+        serde_json::from_value(json!({
+            "targetRunnerPort": 1,
+            "workflowId": "wf",
+            "pipeline": { "diagnose": { "assertions": assertions } },
+        }))
+        .expect("the config deserializes")
+    }
+
+    #[tokio::test]
+    async fn start_loop_refuses_an_assertion_the_route_would_reject() {
+        let state = Arc::new(Mutex::new(LoopState::new()));
+        let err = start_loop(
+            state.clone(),
+            config_with_assertions(json!([{ "type": "visible", "role": "tab" }])),
+        )
+        .await
+        .expect_err("the old placeholder shape is refused");
+        assert!(err.contains("assertions[0]"), "names the element: {err}");
+        assert!(err.contains("unknown field `role`"), "names the field: {err}");
+        assert!(!state.lock().await.running, "nothing started");
+    }
+
+    #[tokio::test]
+    async fn start_loop_lets_a_valid_config_reach_the_health_check() {
+        let err = start_loop(
+            Arc::new(Mutex::new(LoopState::new())),
+            config_with_assertions(json!([{ "query": "p", "assertion": "exists" }])),
+        )
+        .await
+        .expect_err("nothing listens on port 1");
+        assert!(!err.contains("assertions["), "validation passed: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_multi_loop_refuses_an_assertion_the_route_would_reject() {
+        let multi: MultiLoopConfig = serde_json::from_value(json!({
+            "loops": [{
+                "loopId": "a",
+                "config": {
+                    "targetRunnerPort": 1,
+                    "workflowId": "wf",
+                    "pipeline": { "diagnose": { "assertions": [
+                        { "query": "p", "assertion": "hasText", "expected": "" }
+                    ] } },
+                },
+            }],
+        }))
+        .expect("the multi config deserializes");
+        let err = start_multi_loop(Arc::new(Mutex::new(MultiLoopManager::new())), multi)
+            .await
+            .expect_err("an empty hasText expected is refused");
+        assert!(err.contains("loop 'a'"), "{err}");
+        assert!(err.contains("assertions[0]"), "{err}");
+        assert!(err.contains("`expected`"), "{err}");
     }
 }

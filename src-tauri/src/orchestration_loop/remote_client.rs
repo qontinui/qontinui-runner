@@ -20,6 +20,12 @@ struct ApiResponse<T> {
     pub success: bool,
     pub data: Option<T>,
     pub error: Option<String>,
+    /// The typed machine code a failure envelope carries, at the top level or
+    /// (for a UI Bridge typed error) under `error_detail.code`.
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub error_detail: Option<serde_json::Value>,
 }
 
 impl RunnerClient {
@@ -511,73 +517,76 @@ impl RunnerClient {
     }
 
     /// Get page health diagnostic from UI Bridge.
+    ///
+    /// `Err` for anything that is not a success envelope carrying an object:
+    /// a 503 "frontend not ready" envelope is an error here, never a report.
     pub async fn get_page_health(&self) -> Result<serde_json::Value, String> {
-        let url = format!("{}/ui-bridge/control/page-health", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to get page health: {}", e))?;
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse page health: {}", e))?;
-        let data = if body.get("success").is_some() {
-            body.get("data").cloned().unwrap_or(body.clone())
-        } else {
-            body
-        };
-        Ok(data)
+        self.ui_bridge_read(
+            reqwest::Method::POST,
+            "/ui-bridge/control/page-health",
+            "page health",
+        )
+        .await
     }
 
-    /// Get a DOM snapshot from UI Bridge.
+    /// Get a DOM snapshot from UI Bridge. `Err` for anything that is not a
+    /// success envelope carrying an object.
     pub async fn get_ui_snapshot(&self) -> Result<serde_json::Value, String> {
-        let url = format!("{}/ui-bridge/control/snapshot", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({}))
+        self.ui_bridge_read(
+            reqwest::Method::GET,
+            "/ui-bridge/control/snapshot",
+            "UI snapshot",
+        )
+        .await
+    }
+
+    /// One UI Bridge read, by the method its route is registered under
+    /// (`/control/page-health` is POST, `/control/snapshot` is GET).
+    async fn ui_bridge_read(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        what: &str,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.request(method.clone(), &url);
+        if method == reqwest::Method::POST {
+            request = request.json(&serde_json::json!({}));
+        }
+        let resp = request
             .send()
             .await
-            .map_err(|e| format!("Failed to get UI snapshot: {}", e))?;
-        let body: serde_json::Value = resp
-            .json()
+            .map_err(|e| format!("Failed to get {}: {}", what, e))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
             .await
-            .map_err(|e| format!("Failed to parse UI snapshot: {}", e))?;
-        let data = if body.get("success").is_some() {
-            body.get("data").cloned().unwrap_or(body.clone())
-        } else {
-            body
-        };
-        Ok(data)
+            .map_err(|e| format!("Failed to read {} (HTTP {}): {}", what, status, e))?;
+        read_api_envelope(status, &text)
+            .map_err(|refusal| format!("{} unavailable: {}", what, refusal.describe()))
     }
 
     /// Run assertions against the current UI state via UI Bridge.
     ///
-    /// `POST /ui-bridge/control/assert` takes ONE assertion per request — a
-    /// `StructuredAssertRequest` body (`query`, `queryType`, `assertion`,
-    /// `expected`, `attribute`) — so each configured assertion is posted on its
-    /// own, as `DiagnosePhaseConfig::assertions` documents. Coord finding
-    /// 0181f3d4: this used to post `{"assertions": [...]}` in one request,
-    /// which the route rejects at deserialization, so every configured
-    /// assertion read as failed.
+    /// The contract is qontinui-schemas `DiagnosePhaseConfig::assertions`:
+    /// "Each assertion is a JSON object passed to `POST /ui-bridge/control/assert`".
+    /// That route takes ONE assertion per request, so each configured element
+    /// is posted on its own and a malformed one fails alone (coord finding
+    /// 0181f3d4).
     ///
-    /// Returns one result per assertion, in order. A transport error, a non-2xx
-    /// status or an unparseable body becomes that assertion's
-    /// `{"passed": false, "error": …, "assertion": <the request>}` entry, so a
-    /// refused assertion is reported as refused rather than as a failed check.
-    pub async fn run_assertions(
-        &self,
-        assertions: &[serde_json::Value],
-    ) -> Result<Vec<serde_json::Value>, String> {
+    /// Returns one entry per assertion, in order. A verdict is the route's
+    /// `AssertResult` (boolean `passed`). Anything else (a transport error, a
+    /// refused request, a route that reached no verdict) is a NO-VERDICT entry
+    /// `{"evaluated": false, "error", "status", "code", "assertion"}` with NO
+    /// `passed` key, so no reader can count it as a failed check (plan
+    /// 2026-11-12-structured-assert-arms-never-pass-and-diagnose-assertions-never-reach-the-route, D3).
+    pub async fn run_assertions(&self, assertions: &[serde_json::Value]) -> Vec<serde_json::Value> {
         let url = format!("{}/ui-bridge/control/assert", self.base_url);
         let mut results = Vec::with_capacity(assertions.len());
         for assertion in assertions {
             results.push(self.run_one_assertion(&url, assertion).await);
         }
-        Ok(results)
+        results
     }
 
     async fn run_one_assertion(
@@ -587,19 +596,28 @@ impl RunnerClient {
     ) -> serde_json::Value {
         let resp = match self.client.post(url).json(assertion).send().await {
             Ok(resp) => resp,
-            Err(e) => return assertion_error(assertion, format!("Failed to run assertion: {}", e)),
-        };
-        let status = resp.status();
-        let text = match resp.text().await {
-            Ok(text) => text,
             Err(e) => {
-                return assertion_error(
+                return no_verdict_entry(
                     assertion,
-                    format!("Failed to read assertion response (HTTP {}): {}", status, e),
+                    format!("Failed to run assertion: {}", e),
+                    None,
+                    None,
                 )
             }
         };
-        assertion_result_from_response(assertion, status.as_u16(), &text)
+        let status = resp.status().as_u16();
+        let text = match resp.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                return no_verdict_entry(
+                    assertion,
+                    format!("Failed to read assertion response (HTTP {}): {}", status, e),
+                    Some(status),
+                    None,
+                )
+            }
+        };
+        assertion_result_from_response(assertion, status, &text)
     }
 
     /// Wait for the runner to become healthy.
@@ -672,79 +690,146 @@ impl SupervisorClient {
     }
 }
 
-/// One assertion's entry for a request that produced no route verdict.
-fn assertion_error(assertion: &serde_json::Value, error: String) -> serde_json::Value {
-    serde_json::json!({ "passed": false, "error": error, "assertion": assertion })
+/// Why a UI Bridge read produced no usable payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnvelopeRefusal {
+    /// The HTTP status the route answered.
+    pub status: u16,
+    /// The envelope's typed code (`code`, else `error_detail.code`).
+    pub code: Option<String>,
+    /// The envelope's `error`, else what the body was.
+    pub error: String,
+}
+
+impl EnvelopeRefusal {
+    pub(crate) fn describe(&self) -> String {
+        match &self.code {
+            Some(code) => format!("HTTP {} {}: {}", self.status, code, self.error),
+            None => format!("HTTP {}: {}", self.status, self.error),
+        }
+    }
+}
+
+/// Read a runner `ApiResponse` envelope: `Ok(data)` only for a 2xx
+/// `success: true` envelope whose `data` is an object. Every other answer (a
+/// non-2xx, a failure envelope, an unparseable body) is a refusal naming the
+/// status, the typed code and the message, never data.
+pub(crate) fn read_api_envelope(
+    status: u16,
+    body: &str,
+) -> Result<serde_json::Value, EnvelopeRefusal> {
+    let Ok(envelope) = serde_json::from_str::<ApiResponse<serde_json::Value>>(body) else {
+        return Err(EnvelopeRefusal {
+            status,
+            code: None,
+            error: format!("not a runner envelope: {}", body.trim()),
+        });
+    };
+    if (200..300).contains(&status) && envelope.success {
+        if let Some(data) = envelope.data.filter(|d| d.is_object()) {
+            return Ok(data);
+        }
+    }
+    let code = envelope.code.or_else(|| {
+        envelope
+            .error_detail
+            .as_ref()
+            .and_then(|d| d.get("code"))
+            .and_then(|c| c.as_str())
+            .map(str::to_owned)
+    });
+    let error = envelope.error.unwrap_or_else(|| {
+        if envelope.success {
+            "success envelope without an object `data`".to_string()
+        } else {
+            "failure envelope without an `error`".to_string()
+        }
+    });
+    Err(EnvelopeRefusal {
+        status,
+        code,
+        error,
+    })
+}
+
+/// One assertion's entry for a request that produced no route verdict: NO
+/// `passed` key, `evaluated: false`, and what the route said.
+fn no_verdict_entry(
+    assertion: &serde_json::Value,
+    error: String,
+    status: Option<u16>,
+    code: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "evaluated": false,
+        "error": error,
+        "status": status,
+        "code": code,
+        "assertion": assertion,
+    })
 }
 
 /// Read one `POST /ui-bridge/control/assert` response into that assertion's
-/// result: the `data` of a success envelope (an `AssertResult`), else an
-/// error entry naming the status and the body the route sent.
+/// entry: the route's `AssertResult` when it carries a boolean `passed`, else
+/// a no-verdict entry naming the status, code and message the route sent.
 fn assertion_result_from_response(
     assertion: &serde_json::Value,
     status: u16,
     body: &str,
 ) -> serde_json::Value {
-    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
-    if (200..300).contains(&status) {
-        if let Some(data) = parsed
-            .as_ref()
-            .filter(|b| b.get("success").and_then(|v| v.as_bool()) == Some(true))
-            .and_then(|b| b.get("data"))
-            .filter(|d| d.is_object())
-        {
-            return data.clone();
-        }
+    match read_api_envelope(status, body) {
+        Ok(data) if data.get("passed").is_some_and(|p| p.is_boolean()) => data,
+        Ok(data) => no_verdict_entry(
+            assertion,
+            format!("Assertion answer has no boolean `passed`: {}", data),
+            Some(status),
+            None,
+        ),
+        Err(refusal) => no_verdict_entry(
+            assertion,
+            format!("Assertion produced no verdict ({})", refusal.describe()),
+            Some(refusal.status),
+            refusal.code,
+        ),
     }
-    let detail = parsed
-        .as_ref()
-        .and_then(|b| b.get("error"))
-        .map(|e| {
-            e.as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| e.to_string())
-        })
-        .unwrap_or_else(|| body.trim().to_owned());
-    assertion_error(
-        assertion,
-        format!("Assertion request refused (HTTP {}): {}", status, detail),
-    )
 }
 
 #[cfg(test)]
 mod run_assertions_tests {
-    //! Coord finding 0181f3d4: `run_assertions` posted every configured
-    //! assertion in one `{"assertions": [...]}` body, which
-    //! `POST /ui-bridge/control/assert` rejects at deserialization, so every
-    //! diagnose-phase assertion read as failed. These serve a stub route that
-    //! deserializes the route's OWN request type, so the shape is checked
-    //! against what the real route accepts.
+    //! The diagnose client against a stub that answers as the real route does:
+    //! it deserializes the route's OWN request type, builds the route's OWN
+    //! script, maps the outcome through the route's OWN
+    //! `structured_assert_response`, and sits behind the production envelope
+    //! middleware. Coord finding 0181f3d4 (the batch body the route refused)
+    //! and plan 2026-11-12-structured-assert-arms-never-pass-and-diagnose-assertions-never-reach-the-route
+    //! (a refused or verdict-less assertion is not a failed check).
 
-    use super::{assertion_result_from_response, RunnerClient};
-    use crate::mcp::ui_bridge::structured_assert::StructuredAssertRequest;
-    use axum::{routing::post, Json, Router};
+    use super::{assertion_result_from_response, read_api_envelope, RunnerClient};
+    use crate::mcp::ui_bridge::structured_assert::{
+        build_structured_assert_expression, refuse_request, structured_assert_response,
+        EvalOutcome, StructuredAssertRequest,
+    };
+    use axum::{http::StatusCode, middleware, response::IntoResponse, routing::post, Json, Router};
     use serde_json::json;
 
-    async fn serve_stub_assert_route() -> u16 {
-        // The stub passes `query == "#ok"` and fails anything else, so the
-        // test can tell results apart and see their order.
-        let app = Router::new().route(
-            "/ui-bridge/control/assert",
-            post(|Json(request): Json<StructuredAssertRequest>| async move {
-                let passed = request.query == "#ok";
-                Json(json!({
-                    "success": true,
-                    "data": {
-                        "passed": passed,
-                        "assertion": request.assertion,
-                        "query": request.query,
-                        "actual": {},
-                        "expected": null,
-                        "message": "stub",
-                    }
-                }))
-            }),
-        );
+    /// `#ok` passes, `#missing` fails, anything else is a page that returned
+    /// `undefined` (no verdict).
+    async fn stub_assert(Json(request): Json<StructuredAssertRequest>) -> axum::response::Response {
+        if let Err(message) = build_structured_assert_expression(&request) {
+            return refuse_request(message).into_response();
+        }
+        let page = match request.query.as_str() {
+            "#ok" => json!({ "value": "{\"found\":1,\"passed\":true}", "type": "string" }),
+            "#missing" => json!({ "value": "{\"found\":0,\"passed\":false}", "type": "string" }),
+            _ => json!({ "type": "undefined" }),
+        };
+        structured_assert_response(&request, EvalOutcome::Ipc(Ok(page))).into_response()
+    }
+
+    async fn serve(app: Router) -> u16 {
+        let app = app.layer(middleware::from_fn(
+            crate::mcp::envelope::envelope_rewrite_middleware,
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a loopback port");
@@ -753,6 +838,10 @@ mod run_assertions_tests {
             axum::serve(listener, app).await.expect("the stub serves");
         });
         port
+    }
+
+    async fn serve_stub_assert_route() -> u16 {
+        serve(Router::new().route("/ui-bridge/control/assert", post(stub_assert))).await
     }
 
     #[tokio::test]
@@ -764,10 +853,7 @@ mod run_assertions_tests {
             // Not a StructuredAssertRequest: the route refuses it.
             json!({ "type": "visible", "role": "tab" }),
         ];
-        let results = RunnerClient::new(port)
-            .run_assertions(&assertions)
-            .await
-            .expect("run_assertions answers");
+        let results = RunnerClient::new(port).run_assertions(&assertions).await;
 
         assert_eq!(results.len(), 3, "one result per assertion: {results:?}");
         assert_eq!(results[0]["passed"], json!(true), "{results:?}");
@@ -778,30 +864,132 @@ mod run_assertions_tests {
             results[1].get("error").is_none(),
             "a failed check is not a refusal: {results:?}"
         );
-        assert_eq!(results[2]["passed"], json!(false), "{results:?}");
-        let error = results[2]["error"].as_str().unwrap_or("");
+        // The refused element is a no-verdict entry, not a failed check.
         assert!(
-            error.contains("HTTP 422"),
-            "a refused assertion names the refusal: {error}"
+            results[2].get("passed").is_none(),
+            "a refused assertion carries no `passed`: {results:?}"
         );
+        assert_eq!(results[2]["evaluated"], json!(false), "{results:?}");
+        assert_eq!(results[2]["status"], json!(422), "{results:?}");
         assert_eq!(
             results[2]["assertion"], assertions[2],
             "the refused request is echoed"
         );
     }
 
+    /// T2: a request the route refuses is a no-verdict entry naming the
+    /// rejected field, and the elements after it still run.
+    #[tokio::test]
+    async fn a_rejected_assertion_is_a_non_verdict_entry_and_the_rest_still_run() {
+        let port = serve_stub_assert_route().await;
+        let assertions = vec![
+            json!({ "query": "#ok", "assertion": "hasText", "expected": "" }),
+            json!({ "query": "#ok", "assertion": "exists" }),
+        ];
+        let results = RunnerClient::new(port).run_assertions(&assertions).await;
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results[0].get("passed").is_none(), "{results:?}");
+        assert_eq!(results[0]["evaluated"], json!(false), "{results:?}");
+        assert_eq!(results[0]["status"], json!(400), "{results:?}");
+        let error = results[0]["error"].as_str().unwrap_or_default();
+        assert!(error.contains("`expected`"), "names the field: {error}");
+        assert!(results[0]["code"].is_string(), "a typed code: {results:?}");
+        assert_eq!(results[1]["passed"], json!(true), "{results:?}");
+    }
+
+    /// T3: a route 500 (no verdict) is a no-verdict entry carrying its code.
+    #[tokio::test]
+    async fn a_route_500_is_a_non_verdict_entry_carrying_its_code() {
+        let port = serve_stub_assert_route().await;
+        let results = RunnerClient::new(port)
+            .run_assertions(&[json!({ "query": "#broken", "assertion": "exists" })])
+            .await;
+        assert!(results[0].get("passed").is_none(), "{results:?}");
+        assert_eq!(results[0]["evaluated"], json!(false), "{results:?}");
+        assert_eq!(results[0]["status"], json!(500), "{results:?}");
+        assert_eq!(results[0]["code"], json!("INTERNAL_ERROR"), "{results:?}");
+    }
+
+    /// T4: an unreachable runner is no verdict with no status.
+    #[tokio::test]
+    async fn an_unreachable_runner_is_a_non_verdict_entry_with_no_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let results = RunnerClient::new(port)
+            .run_assertions(&[json!({ "query": "#ok", "assertion": "exists" })])
+            .await;
+        assert!(results[0].get("passed").is_none(), "{results:?}");
+        assert_eq!(results[0]["evaluated"], json!(false), "{results:?}");
+        assert_eq!(results[0]["status"], json!(null), "{results:?}");
+    }
+
+    /// T6: a page-health failure envelope is an error, never a report.
+    #[tokio::test]
+    async fn a_503_page_health_envelope_is_an_error() {
+        let port = serve(Router::new().route(
+            "/ui-bridge/control/page-health",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "success": false,
+                        "error": "UI Bridge frontend did not become ready",
+                        "code": "FRONTEND_NOT_READY",
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let err = RunnerClient::new(port)
+            .get_page_health()
+            .await
+            .expect_err("a 503 envelope is not a page-health report");
+        assert!(err.contains("503"), "{err}");
+        assert!(err.contains("FRONTEND_NOT_READY"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_page_health_report_in_the_producers_shape_is_read_as_data() {
+        let port = serve(Router::new().route(
+            "/ui-bridge/control/page-health",
+            post(|| async {
+                Json(json!({
+                    "success": true,
+                    "data": {
+                        "summary": "OK",
+                        "findings": [],
+                        "heatmap": [],
+                        "element_count": 3,
+                        "visible_count": 3,
+                    },
+                }))
+            }),
+        ))
+        .await;
+        let report = RunnerClient::new(port)
+            .get_page_health()
+            .await
+            .expect("a success envelope is a report");
+        assert_eq!(report["summary"], json!("OK"));
+    }
+
     #[test]
-    fn a_failure_envelope_becomes_an_error_entry_naming_its_message() {
-        let assertion = json!({ "query": "x", "assertion": "bogus" });
+    fn a_failure_envelope_becomes_a_no_verdict_entry_naming_its_message() {
+        let assertion = json!({ "query": "x", "assertion": "exists" });
         let result = assertion_result_from_response(
             &assertion,
             400,
-            r#"{"success":false,"data":null,"error":"Invalid assertion 'bogus'"}"#,
+            r#"{"success":false,"data":null,"error":"`query` must be non-empty"}"#,
         );
-        assert_eq!(result["passed"], json!(false));
+        assert!(result.get("passed").is_none(), "{result}");
+        assert_eq!(result["evaluated"], json!(false));
+        assert_eq!(result["status"], json!(400));
         assert_eq!(
             result["error"],
-            json!("Assertion request refused (HTTP 400): Invalid assertion 'bogus'")
+            json!("Assertion produced no verdict (HTTP 400: `query` must be non-empty)")
         );
     }
 
@@ -814,5 +1002,29 @@ mod run_assertions_tests {
             r#"{"success":true,"data":{"passed":true,"query":"x"}}"#,
         );
         assert_eq!(result, json!({ "passed": true, "query": "x" }));
+    }
+
+    #[test]
+    fn a_success_envelope_without_a_boolean_passed_is_no_verdict() {
+        let assertion = json!({ "query": "x", "assertion": "exists" });
+        let result = assertion_result_from_response(
+            &assertion,
+            200,
+            r#"{"success":true,"data":{"query":"x"}}"#,
+        );
+        assert!(result.get("passed").is_none(), "{result}");
+        assert_eq!(result["evaluated"], json!(false));
+    }
+
+    #[test]
+    fn read_api_envelope_takes_a_typed_code_from_error_detail() {
+        let refusal = read_api_envelope(
+            500,
+            r#"{"success":false,"error":"boom","error_detail":{"code":"INTERNAL_ERROR"}}"#,
+        )
+        .expect_err("a failure envelope");
+        assert_eq!(refusal.code.as_deref(), Some("INTERNAL_ERROR"));
+        assert_eq!(refusal.status, 500);
+        assert!(read_api_envelope(200, "not json").is_err());
     }
 }
