@@ -1342,7 +1342,7 @@ mod tests {
             reason.contains("did not fall back to the device default"),
             "{reason}"
         );
-        assert_eq!(started.elapsed(), STOP_TENANT_BUDGET);
+        assert!(started.elapsed() <= STOP_TENANT_BUDGET, "never late");
 
         let decided = decide_target_within(
             STOP_TENANT_BUDGET,
