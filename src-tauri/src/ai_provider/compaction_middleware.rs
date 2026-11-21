@@ -466,14 +466,17 @@ mod tests {
     fn test_compact_json_arrays_in_text() {
         let text = r#"Here is some data: [{"name":"alice","age":30},{"name":"bob","age":25},{"name":"carol","age":35}] and more text"#;
         let compacted = compact_json_arrays(text);
-        // serde_json::Map is a BTreeMap without the `preserve_order` feature,
-        // so keys iterate alphabetically ("age", "name") regardless of input order.
+        // Column order depends on whether `serde_json/preserve_order` is enabled
+        // anywhere in the dependency graph (the ACP client crate enables it, and
+        // cargo unifies features): input order ("name|age") with it, alphabetical
+        // ("age|name") without. Either is a correct compaction, so accept both
+        // rather than pinning a feature this module does not own.
         assert!(
-            compacted.contains("age|name"),
+            compacted.contains("age|name") || compacted.contains("name|age"),
             "header missing in compacted output: {compacted}"
         );
         assert!(
-            compacted.contains("30|alice"),
+            compacted.contains("30|alice") || compacted.contains("alice|30"),
             "first row missing in compacted output: {compacted}"
         );
         assert!(compacted.len() < text.len());
