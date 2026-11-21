@@ -7748,9 +7748,7 @@ pub(crate) mod tests {
             .find("\n            None => {\n")
             .expect("the no-shim arm exists");
         let arm = &arm[arm_start..];
-        let arm = &arm[..arm
-            .find("\n            }\n")
-            .expect("the no-shim arm ends")];
+        let arm = &arm[..arm.find("\n            }\n").expect("the no-shim arm ends")];
         assert!(
             arm.contains(&["if Self::pane_loses_", "shim_pin(cmd) {"].concat()),
             "the no-shim arm must warn for a claude pane that loses its shim pin: {arm}"
