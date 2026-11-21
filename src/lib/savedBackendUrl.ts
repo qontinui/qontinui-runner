@@ -140,7 +140,11 @@ export function signInTargetExplanation(
  *  authoritative, so the window is narrow: a fault that CLEARS between the
  *  status read and that write. The operator surfaces (auth banner, Settings →
  *  Account) refuse both routes — they never sign in on a rejected or faulted
- *  read, and offer "Retry" (re-read) instead. Tracked as a follow-up on plan
+ *  read, and offer "Retry" (re-read) instead. A third route reaches production
+ *  on EVERY surface: a status missing the runner's verdict fields (UNKNOWN →
+ *  production, rule 3/4). The frontend and the Rust command ship in one
+ *  binary and Rust always serializes both fields, so it needs build skew.
+ *  Tracked as a follow-up on plan
  *  2026-11-21-unify-runner-sign-in-backend-url-helper. */
 export async function resolveSignInBackendUrl(surface: SignInSurface): Promise<string> {
   try {

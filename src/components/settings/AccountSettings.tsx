@@ -289,7 +289,7 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
         }
         return;
       }
-      setFlowError("Could not read the saved backend settings; sign-in is paused until they load.");
+      setFlowError("Waiting for the saved backend settings to load before signing in.");
       return;
     }
     const backendUrl = signInBackendUrlFrom(usableBackendStatus, "operator");
