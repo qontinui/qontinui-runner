@@ -1666,6 +1666,29 @@ pub fn record_response(
     }
 }
 
+/// Upper bound, in seconds, of the random delay added past every wait GitHub
+/// names on a response — the interactive floor sleep, the single retry sleep,
+/// and the background hold a rate refusal sets — before this process sends
+/// again. A `ProjectedShort` headroom deferral is not a wait: it is re-judged on
+/// each reconciler tick, whose phase already differs per runner.
+///
+/// Every runner on the fleet shares one user REST bucket, and every one of them
+/// computes the same wait from the same `x-ratelimit-reset` (or `Retry-After`).
+/// Resuming exactly there makes them all send in the same second the window
+/// opens — the synchronized burst recorded in coord finding `e4c384e7`
+/// (dossier `github-rate-limit-exhaustion`). Spreading the resume over half a
+/// minute costs a waiting caller at most that, and GitHub's wait is a floor, so
+/// a later resume is never a protocol violation.
+pub(crate) const RESUME_JITTER_SECS: u64 = 30;
+
+/// The wait a caller actually honours after GitHub said `wait_secs`: the same
+/// wait, plus this process's own random share of [`RESUME_JITTER_SECS`], so
+/// runners sharing a bucket do not all resume at the reset second.
+pub(crate) fn resume_after(wait_secs: u64) -> u64 {
+    use rand::Rng;
+    wait_secs.saturating_add(rand::rng().random_range(0..=RESUME_JITTER_SECS))
+}
+
 /// A BACKGROUND request was refused for rate and told to wait `wait_secs`:
 /// defer that credential's background spend until then, so the next tick or
 /// nudge does not re-send inside the window ([`Registry::record_not_before`]).
@@ -3289,5 +3312,34 @@ mod tests {
         assert_eq!(v["remainingFraction"], serde_json::Value::Null);
         assert_eq!(v["templatesDropped"], 0);
         assert_eq!(v["totals"]["notModified"], 0);
+    }
+
+    // -- Resume jitter --------------------------------------------------------
+
+    #[test]
+    fn resume_after_never_shortens_the_wait_and_saturates() {
+        assert_eq!(resume_after(u64::MAX), u64::MAX, "no overflow at the top");
+        for wait in [0u64, 1, 300] {
+            for _ in 0..50 {
+                let got = resume_after(wait);
+                assert!(
+                    (wait..=wait + RESUME_JITTER_SECS).contains(&got),
+                    "wait {wait}: {got} is outside [wait, wait + jitter]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resume_after_stays_in_bounds_and_actually_spreads() {
+        let samples: Vec<u64> = (0..200).map(|_| resume_after(60)).collect();
+        assert!(samples
+            .iter()
+            .all(|&s| (60..=60 + RESUME_JITTER_SECS).contains(&s)));
+        let distinct: std::collections::HashSet<_> = samples.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "200 draws all landed on one second — the resume is not jittered"
+        );
     }
 }
