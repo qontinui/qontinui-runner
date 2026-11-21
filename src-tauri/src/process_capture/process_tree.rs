@@ -285,9 +285,13 @@ fn is_claude_image(name: Option<&String>) -> bool {
     name.is_some_and(|name| image_stem(name) == "claude")
 }
 
-/// An image name as both image checks compare it: the last path component,
-/// lowercased, `.exe` stripped.
-fn image_stem(name: &str) -> String {
+/// An image name as every image check compares it: the last path component,
+/// lowercased, `.exe` stripped, and the ` (deleted)` the kernel appends to a
+/// `/proc/<pid>/exe` target whose binary was replaced on disk (a package
+/// upgrade under a running process) dropped first, so an exe path compares
+/// like a name.
+pub(crate) fn image_stem(name: &str) -> String {
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
     let base = name
         .rsplit(['/', '\\'])
         .next()
@@ -328,16 +332,24 @@ pub(crate) fn config_dir_of_pid(_pid: u32) -> Option<String> {
 /// registry cannot answer (`crate::terminal::graceful_exit::RegistryWitness`);
 /// every other image is judged by itself, and a shell is never a `claude`.
 /// Compared after [`image_stem`], so `node.exe` and `/usr/bin/node` match too.
-const JS_RUNTIME_IMAGES: &[&str] = &["node", "nodejs", "bun"];
+///
+/// `mainthread` is not an image: it is the `comm` Node ≥ 24 gives itself on
+/// Linux (measured with v24.19.0), and `comm` is what the `/proc` walk records
+/// as the name. Without it an npm-installed `claude` there reads as a
+/// non-runtime by name; the exe path (below) catches it too where readable.
+const JS_RUNTIME_IMAGES: &[&str] = &["node", "nodejs", "bun", "mainthread"];
 
 /// Could `pid` be a JS-runtime Claude Code that its image alone cannot
-/// recognise? `true` for a [`JS_RUNTIME_IMAGES`] image, and for a pid whose
-/// image the snapshot could not read — an unknown image cannot rule it out.
+/// recognise? `true` for a [`JS_RUNTIME_IMAGES`] name or executable path, and
+/// for a pid whose image the snapshot could not read — an unknown image cannot
+/// rule it out. The exe path matters on Linux, where the name is the settable
+/// thread name (`comm`), not the image.
 pub(crate) fn may_be_js_runtime_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
-    snapshot
-        .names
-        .get(&pid)
-        .is_none_or(|name| JS_RUNTIME_IMAGES.contains(&image_stem(name).as_str()))
+    let is_runtime = |n: &String| JS_RUNTIME_IMAGES.contains(&image_stem(n).as_str());
+    match snapshot.names.get(&pid) {
+        None => true,
+        Some(name) => is_runtime(name) || snapshot.exe_paths.get(&pid).is_some_and(is_runtime),
+    }
 }
 
 /// A pid counts as a live claude iff its image name matches `claude*` AND its
@@ -2006,6 +2018,31 @@ mod tests {
         // No claude image anywhere → None.
         let none = snap_with(&[(500, &[501])], &[], &[(500, "sh"), (501, "node")]);
         assert_eq!(image_anchor(500, &none), None);
+    }
+
+    /// Linux, Node ≥ 24: the recorded name is the thread name `MainThread`,
+    /// and the exe link may carry ` (deleted)` after an in-place upgrade.
+    /// Either must leave an npm-installed `claude` a JS-runtime candidate.
+    #[test]
+    fn may_be_js_runtime_claude_sees_renamed_threads_and_exe_paths() {
+        let mut s = snap_with(
+            &[],
+            &[],
+            &[
+                (1, "MainThread"),
+                (2, "libuv-worker"),
+                (3, "bash"),
+                (4, "node"),
+            ],
+        );
+        s.exe_paths.insert(2, "/usr/bin/node (deleted)".to_string());
+        s.exe_paths.insert(3, "/usr/bin/bash".to_string());
+        assert!(may_be_js_runtime_claude(1, &s), "renamed main thread");
+        assert!(may_be_js_runtime_claude(2, &s), "exe path decides");
+        assert!(!may_be_js_runtime_claude(3, &s), "a shell is not a runtime");
+        assert!(may_be_js_runtime_claude(4, &s), "plain node");
+        assert!(may_be_js_runtime_claude(5, &s), "unreadable image");
+        assert_eq!(image_stem("/usr/bin/node (deleted)"), "node");
     }
 
     #[test]
