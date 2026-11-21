@@ -69,7 +69,12 @@
 # the no-root arm of provision_agent_definitions now writes the embedded floor
 # and its overlay moved to provision_agent_definitions_layers, both re-reviewed
 # below as fallback_correct. 212 - 2 = 210. A fall, held.
-unreviewed_ceiling = 210
+# 210 -> 207 (qontinui-runner#3129, plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+# finding 3dad3856): the three unreviewed slash_commands.rs
+# find_commands_directory_reported rows moved to commands_directory_in and
+# `const COMMANDS_SIBLING` when that import's absent checkout became a typed
+# 422 refusal instead of a 500; reviewed below as fallback_correct. A fall, held.
+unreviewed_ceiling = 207
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -852,4 +857,25 @@ disposition = "fallback_correct"
 note = "Converts a Windows FILETIME (100 ns ticks since 1601) to Unix seconds so the owner record's start time compares with sysinfo's. Linux reads /proc/<pid>/stat starttime instead."
 reviewed = [
     "cfg(windows)-only fn `unix_seconds_of_filetime` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/slash_commands.rs"
+symbol = "commands_directory_in"
+disposition = "fallback_correct"
+note = "The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856)."
+reviewed = [
+    '"<workspace-root>/qontinui-claude-config/.claude/commands",',
+    '"this device has no qontinui-claude-config checkout, and this import has \',
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/slash_commands.rs"
+symbol = "const COMMANDS_SIBLING"
+disposition = "fallback_correct"
+note = "The sibling checkout name the slash-command import reads from and names in its sibling_checkout_absent refusal; its absence is handled by commands_directory_in's typed refusal (runner#3129)."
+reviewed = [
+    'const COMMANDS_SIBLING: &str = "qontinui-claude-config";',
 ]
