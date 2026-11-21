@@ -63,11 +63,13 @@ pub(crate) fn build_fix_agent_command_with(
     // The one id this process runs under, in argv where the session census
     // reads it — the CLI would otherwise pick its own and leave argv id-less
     // (plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
-    // Phase 2; `claude_session::runner::cli_session_pins` mints the same way).
-    let (session_id, _) = crate::claude_session::runner::cli_session_pins(None);
-    if let Some(id) = session_id {
-        cmd.args(["--session-id", id.as_str()]);
-    }
+    // Phase 2; `claude_session::runner::CliPin` documents the mint).
+    let session_id = crate::claude_session::runner::mint_cli_session_id();
+    info!(
+        "Fix agent: claude --print pinned to session id {}",
+        session_id
+    );
+    cmd.args(["--session-id", session_id.as_str()]);
     cmd.env_remove("CLAUDECODE")
         // Same rule, sibling marker — see `session::transport::claude_cli` docs.
         .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
