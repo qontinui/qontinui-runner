@@ -70,7 +70,7 @@ export async function fetchConstraintConfig(projectPath?: string): Promise<ReadC
  * The message of a failed save. The backend's one typed refusal here is the 422
  * for a save with no `project_path` when the workspace root does not resolve:
  * the `ApiResponse` envelope `{success: false, error, code:
- * "workspace_root_unresolved", hint}`, where `hint` is the shared Refusal
+ * "workspace_root_unresolved", refusal}`, where `refusal` is the shared Refusal
  * envelope (an object). Its `error` is the message. Anything else — a non-JSON
  * body, JSON without a string `error`, or an empty `error` — falls back to the
  * raw text.

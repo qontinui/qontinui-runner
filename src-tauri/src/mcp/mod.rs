@@ -133,6 +133,7 @@ pub mod queue;
 pub mod rag;
 pub mod recordings;
 pub mod reflection_api;
+pub mod refusal_envelope;
 pub mod relay_binding; // UI Bridge relay registrant principal binding (plan 2026-09-17-ui-bridge-relay-registration-is-unauthenticated)
 pub mod relay_path_policy; // The closed allowlist of local API paths `backend_relay`'s `http_request` arm may reach (review round 2 finding 1; inverted to an allowlist in round 4)
 pub mod relay_routable;
