@@ -75,7 +75,7 @@ describe("LoginScreen sign-in target (gate surface)", () => {
     expect(await clickSignIn()).toBe("https://api.qontinui.io");
   });
 
-  it("signs in against production for a saved bind-all [::] backend the runner classes machine-local", async () => {
+  it("signs in against production for a saved IPv6-unspecified bind-all backend the runner classes machine-local", async () => {
     // The runner's verdict, not a TS host check, decides: the IPv6 unspecified
     // host is machine-local, so a first-run screen does not dial it.
     status = {
