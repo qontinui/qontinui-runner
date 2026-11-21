@@ -1208,12 +1208,13 @@ impl AgenticExecutor {
         }
         // Armed until the terminal write: a cancelled (JoinHandle::abort) or
         // panicking phase drops it armed and it best-effort writes `failed`.
-        let session_guard = WorkflowAiSessionGuard::arm(
+        let mut session_guard = WorkflowAiSessionGuard::arm(
             self.app_state.pg_db.clone(),
             session_phase,
             &parent_task_id,
             iteration as i32,
             config.stage_index.map(|i| i as i32),
+            &cli_session_id,
         );
 
         // Attach DB flush context for periodic output persistence
@@ -1278,7 +1279,7 @@ impl AgenticExecutor {
                 is_resume: false,
             });
             // Update the DB record with the new session ID
-            if let Err(e) = self
+            match self
                 .app_state
                 .pg_db
                 .create_workflow_ai_session(
@@ -1290,7 +1291,11 @@ impl AgenticExecutor {
                 )
                 .await
             {
-                warn!("PG create fallback workflow AI session failed: {}", e);
+                // The row now belongs to the fresh CLI session; the guard's
+                // abandoned write is scoped to it. On Err the row keeps the
+                // id the guard already holds.
+                Ok(_) => session_guard.rekey_cli_session(&fresh_cli_id),
+                Err(e) => warn!("PG create fallback workflow AI session failed: {}", e),
             }
             // Retry with the full enhanced prompt
             let (retry_result, retry_duration) = timeout_helper::timed_result_async(
@@ -1499,13 +1504,8 @@ impl AgenticExecutor {
         // row is never left `running` (and so never resumed — `is_resumable`).
         // The output length is the REAL session's, not the synthetic stop's.
         if let Some(reason) = budget_stop {
-            let stop = AgenticOutcome::BudgetExceeded { reason };
-            record_workflow_ai_session_terminal(
-                session_guard,
-                workflow_ai_session_terminal_status(&stop),
-                outcome_output_len(&outcome),
-            )
-            .await;
+            let (stop, status, output_len) = cost_stop_terminal(&outcome, reason);
+            record_workflow_ai_session_terminal(session_guard, status, output_len).await;
             return (stop, Vec::new());
         }
 
@@ -1767,28 +1767,45 @@ fn outcome_output_len(outcome: &AgenticOutcome) -> i64 {
     outcome.output().map(|o| o.len() as i64).unwrap_or(0)
 }
 
+/// What a phase stopped for cost returns and records: the synthetic
+/// `BudgetExceeded` outcome, its terminal status, and the output length of
+/// the REAL session (`session_outcome`) -- never the stop's, whose `output()`
+/// is its reason string.
+fn cost_stop_terminal(
+    session_outcome: &AgenticOutcome,
+    reason: String,
+) -> (AgenticOutcome, &'static str, i64) {
+    let stop = AgenticOutcome::BudgetExceeded { reason };
+    let status = workflow_ai_session_terminal_status(&stop);
+    (stop, status, outcome_output_len(session_outcome))
+}
+
 /// Status a [`WorkflowAiSessionGuard`] dropped while armed writes: terminal,
 /// so a cancelled or panicked phase is never resumed.
 pub(crate) const ABANDONED_SESSION_STATUS: &str = "failed";
 
-/// Holds one phase's `workflow_ai_sessions` key from its create until its
-/// terminal write ([`record_workflow_ai_session_terminal`] disarms it).
-/// Dropped while still ARMED — the phase future was cancelled
+/// Holds one phase's `workflow_ai_sessions` key -- and the CLI session that
+/// owns the row -- from its create until its terminal write
+/// ([`WorkflowAiSessionGuard::write_terminal`] disarms it on success).
+/// Dropped while still ARMED -- the phase future was cancelled
 /// (`JoinHandle::abort`, `unified_workflow_executor/mod.rs`) or a panic
-/// unwound through it, or its terminal write failed — it best-effort spawns a
-/// CONDITIONAL [`ABANDONED_SESSION_STATUS`] write
-/// (`fail_workflow_ai_session_if_running`: only a row still `running`
-/// changes) on the current tokio runtime, the way `WorkflowDropGuard`
-/// releases its locks. That spawn cannot run when the
-/// runtime is itself shutting down or the process is killed, so those rows
-/// stay `running` — which is exactly the restart case resume exists for.
+/// unwound through it, or its terminal write itself failed -- it best-effort
+/// spawns a CONDITIONAL [`ABANDONED_SESSION_STATUS`] write
+/// (`fail_workflow_ai_session_if_running`: only a row still `running` AND
+/// still owned by this guard's CLI session changes) on the current tokio
+/// runtime, the way `WorkflowDropGuard` releases its locks. That spawn cannot
+/// run when the runtime is itself shutting down or the process is killed, so
+/// those rows stay `running` -- which is exactly the restart case resume
+/// exists for.
 pub(crate) struct WorkflowAiSessionGuard {
     pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     session_phase: &'static str,
     task_run_id: String,
     iteration: i32,
     stage_index: Option<i32>,
+    cli_session_id: String,
     armed: bool,
+    terminal_write_failed: bool,
 }
 
 impl WorkflowAiSessionGuard {
@@ -1798,6 +1815,7 @@ impl WorkflowAiSessionGuard {
         task_run_id: &str,
         iteration: i32,
         stage_index: Option<i32>,
+        cli_session_id: &str,
     ) -> Self {
         Self {
             pg_db,
@@ -1805,13 +1823,69 @@ impl WorkflowAiSessionGuard {
             task_run_id: task_run_id.to_string(),
             iteration,
             stage_index,
+            cli_session_id: cli_session_id.to_string(),
             armed: true,
+            terminal_write_failed: false,
         }
+    }
+
+    /// Re-point the guard at the CLI session that now owns the row (the
+    /// resume-failed fallback re-creates it under a fresh id).
+    pub(crate) fn rekey_cli_session(&mut self, cli_session_id: &str) {
+        self.cli_session_id = cli_session_id.to_string();
     }
 
     /// The status a drop would write now: `Some` only while armed.
     pub(crate) fn drop_write(&self) -> Option<&'static str> {
         self.armed.then_some(ABANDONED_SESSION_STATUS)
+    }
+
+    /// Why an armed drop is writing, for its log line.
+    pub(crate) fn drop_reason(&self) -> &'static str {
+        if std::thread::panicking() {
+            "panicked"
+        } else if self.terminal_write_failed {
+            "had its terminal write fail"
+        } else {
+            "was cancelled before its terminal write"
+        }
+    }
+
+    /// Apply the terminal write's result: `Ok` disarms; `Err` leaves the
+    /// guard ARMED (so its drop retries with the conditional abandoned write)
+    /// and records that the write failed.
+    pub(crate) fn settle(&mut self, result: Result<(), String>) -> Result<(), String> {
+        match result {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.terminal_write_failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Write the phase's terminal `status` under the guard's key and
+    /// [`settle`](Self::settle) the guard on the result.
+    pub(crate) async fn write_terminal(
+        &mut self,
+        status: &'static str,
+        output_len: i64,
+    ) -> Result<(), String> {
+        let result = self
+            .pg_db
+            .complete_workflow_ai_session(
+                &self.task_run_id,
+                self.iteration,
+                self.session_phase,
+                self.stage_index,
+                status,
+                output_len,
+            )
+            .await;
+        self.settle(result)
     }
 }
 
@@ -1820,33 +1894,34 @@ impl Drop for WorkflowAiSessionGuard {
         let Some(status) = self.drop_write() else {
             return;
         };
-        let why = if std::thread::panicking() {
-            "panicked"
-        } else {
-            "cancelled"
-        };
         warn!(
-            "AGENTIC-PHASE: {} session for task {} iteration {} {} before its terminal write — recording {}",
-            self.session_phase, self.task_run_id, self.iteration, why, status
+            "AGENTIC-PHASE: {} session {} for task {} iteration {} {} -- recording {} if still running",
+            self.session_phase,
+            self.cli_session_id,
+            self.task_run_id,
+            self.iteration,
+            self.drop_reason(),
+            status
         );
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!("AGENTIC-PHASE: no tokio runtime on drop; the row stays running");
             return;
         };
         let pg = self.pg_db.clone();
-        let (phase, task, iteration, stage) = (
+        let (phase, task, iteration, stage, cli) = (
             self.session_phase,
             self.task_run_id.clone(),
             self.iteration,
             self.stage_index,
+            self.cli_session_id.clone(),
         );
-        // Conditional on the row still being `running`: an abort that lands
-        // after the terminal write committed, or a drop that runs late
-        // against a later attempt's finished row, changes nothing.
-        debug_assert_eq!(status, "failed");
+        // Conditional on the row still being `running` under this guard's
+        // CLI session: an abort that lands after the terminal write
+        // committed, or a drop that runs late against a later attempt's row
+        // (finished or still running), changes nothing.
         handle.spawn(async move {
             if let Err(e) = pg
-                .fail_workflow_ai_session_if_running(&task, iteration, phase, stage)
+                .fail_workflow_ai_session_if_running(&task, iteration, phase, stage, &cli, status)
                 .await
             {
                 warn!(
@@ -1858,37 +1933,23 @@ impl Drop for WorkflowAiSessionGuard {
     }
 }
 
-/// Write the phase's terminal `status` under the guard's key, then disarm the
-/// guard. Every normal exit after `create_workflow_ai_session` goes through
-/// here; a phase that does not reach it drops its guard armed (see
-/// [`WorkflowAiSessionGuard`]). When the terminal write itself fails the guard
-/// stays ARMED, so its drop retries once with the conditional `failed`. A row
-/// left `running` therefore means the phase did not finish normally — the
-/// process died, or the terminal write itself failed and the drop's retry
-/// could not run or failed too.
+/// Write the phase's terminal `status` and settle the guard (see
+/// [`WorkflowAiSessionGuard::write_terminal`]). Every normal exit after
+/// `create_workflow_ai_session` goes through here; a phase that does not
+/// reach it drops its guard armed (see [`WorkflowAiSessionGuard`]). When the
+/// terminal write itself fails the guard stays ARMED, so its drop retries
+/// once with the conditional abandoned write. A row left `running` therefore
+/// means the phase did not finish normally -- the process died, or the
+/// terminal write itself failed and the drop's retry could not run or failed
+/// too.
 pub(crate) async fn record_workflow_ai_session_terminal(
     mut guard: WorkflowAiSessionGuard,
     status: &'static str,
     output_len: i64,
 ) {
-    if let Err(e) = guard
-        .pg_db
-        .complete_workflow_ai_session(
-            &guard.task_run_id,
-            guard.iteration,
-            guard.session_phase,
-            guard.stage_index,
-            status,
-            output_len,
-        )
-        .await
-    {
-        // Leave the guard armed: its drop retries with the conditional
-        // `failed` write.
+    if let Err(e) = guard.write_terminal(status, output_len).await {
         warn!("PG complete_workflow_ai_session failed: {}", e);
-        return;
     }
-    guard.armed = false;
 }
 
 /// Status written to `workflow_ai_sessions` when the agentic phase exits with
@@ -2055,7 +2116,7 @@ mod tests {
     /// `BudgetExceeded` outcome carries no output, so measuring it would
     /// record 0.
     #[test]
-    fn cost_stop_records_the_real_sessions_output_length() {
+    fn cost_stop_terminal_records_the_real_sessions_output_length() {
         let real = AgenticOutcome::Failed {
             output: "x".repeat(37),
             error: "e".to_string(),
@@ -2065,14 +2126,13 @@ mod tests {
             tools_used: Vec::new(),
             tools_rejected: Vec::new(),
         };
-        let stop = AgenticOutcome::BudgetExceeded {
-            reason: "over".to_string(),
-        };
-        assert_eq!(outcome_output_len(&real), 37);
-        // The synthetic stop's `output()` is its reason string, so measuring
-        // the stop instead of the real session would record 4, not 37.
+        let (stop, status, output_len) = cost_stop_terminal(&real, "over".to_string());
+        assert!(matches!(&stop, AgenticOutcome::BudgetExceeded { reason } if reason == "over"));
+        assert_eq!(status, "failed");
+        // 37 is the real session's output; measuring the stop instead would
+        // give 4, the length of its reason string.
+        assert_eq!(output_len, 37);
         assert_eq!(outcome_output_len(&stop), 4);
-        assert_ne!(outcome_output_len(&real), outcome_output_len(&stop));
     }
 
     #[test]
@@ -2092,8 +2152,8 @@ mod session_key_tests {
     //! against a FRESH database from `PgDb::new_for_test()`.
 
     use super::{
-        is_resumable, record_workflow_ai_session_terminal, WorkflowAiSessionGuard,
-        ABANDONED_SESSION_STATUS, AGENTIC_SESSION_PHASE, VERIFIER_SESSION_PHASE,
+        is_resumable, WorkflowAiSessionGuard, ABANDONED_SESSION_STATUS, AGENTIC_SESSION_PHASE,
+        VERIFIER_SESSION_PHASE,
     };
     use crate::database::pg::PgDb;
     use std::sync::Arc;
@@ -2133,8 +2193,14 @@ mod session_key_tests {
         pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-x")
             .await
             .expect("create");
-        let guard =
-            WorkflowAiSessionGuard::arm(pg.clone(), AGENTIC_SESSION_PHASE, task, 1, Some(0));
+        let guard = WorkflowAiSessionGuard::arm(
+            pg.clone(),
+            AGENTIC_SESSION_PHASE,
+            task,
+            1,
+            Some(0),
+            "cli-x",
+        );
         assert_eq!(guard.drop_write(), Some(ABANDONED_SESSION_STATUS));
         assert_eq!(ABANDONED_SESSION_STATUS, "failed");
         assert!(!is_resumable(ABANDONED_SESSION_STATUS));
@@ -2154,8 +2220,9 @@ mod session_key_tests {
         }
     }
 
-    /// The terminal write disarms the guard: the status it wrote stands, and
-    /// no abandoned `failed` write follows.
+    /// A successful terminal write disarms the guard: observed on the guard
+    /// itself, since the conditional drop write could not change a finished
+    /// row anyway.
     #[tokio::test]
     async fn terminal_write_disarms_the_guard() {
         let task = "task-run-guard-disarmed";
@@ -2163,16 +2230,89 @@ mod session_key_tests {
         pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-y")
             .await
             .expect("create");
-        let guard =
-            WorkflowAiSessionGuard::arm(pg.clone(), AGENTIC_SESSION_PHASE, task, 1, Some(0));
-        record_workflow_ai_session_terminal(guard, "completed", 42).await;
-
-        // Give any (wrongly) spawned abandoned write a chance to run.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let mut guard = WorkflowAiSessionGuard::arm(
+            pg.clone(),
+            AGENTIC_SESSION_PHASE,
+            task,
+            1,
+            Some(0),
+            "cli-y",
+        );
+        assert_eq!(guard.drop_write(), Some(ABANDONED_SESSION_STATUS));
+        guard
+            .write_terminal("completed", 42)
+            .await
+            .expect("terminal write");
+        assert_eq!(guard.drop_write(), None, "an Ok terminal write must disarm");
         assert_eq!(status_of(&pg, task).await, "completed");
+    }
+
+    /// A FAILED terminal write leaves the guard armed, so its drop still
+    /// retries with the conditional abandoned write, and the drop's log names
+    /// the failed write rather than a cancellation.
+    #[tokio::test]
+    async fn failed_terminal_write_leaves_the_guard_armed() {
+        let pg = PgDb::new_for_test().await;
+        let mut guard = WorkflowAiSessionGuard::arm(
+            pg,
+            AGENTIC_SESSION_PHASE,
+            "task-run-guard-write-err",
+            1,
+            Some(0),
+            "cli-err",
+        );
+        assert_eq!(
+            guard.drop_reason(),
+            "was cancelled before its terminal write"
+        );
+        let result = guard.settle(Err("PG pool error: boom".to_string()));
+        assert!(result.is_err());
+        assert_eq!(
+            guard.drop_write(),
+            Some(ABANDONED_SESSION_STATUS),
+            "an Err terminal write must leave the guard armed"
+        );
+        assert_eq!(guard.drop_reason(), "had its terminal write fail");
+        // Disarm so the test's own drop schedules nothing.
+        guard.settle(Ok(())).expect("ok");
+        assert_eq!(guard.drop_write(), None);
+    }
+
+    /// The resume-failed fallback re-creates the row under a fresh CLI id;
+    /// a guard re-keyed to it fails THAT session when dropped armed.
+    #[tokio::test]
+    async fn rekeyed_guard_fails_the_fresh_session() {
+        let task = "task-run-guard-rekeyed";
+        let pg = db_with_task_run(task).await;
+        pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-resumed")
+            .await
+            .expect("create");
+        let mut guard = WorkflowAiSessionGuard::arm(
+            pg.clone(),
+            AGENTIC_SESSION_PHASE,
+            task,
+            1,
+            Some(0),
+            "cli-resumed",
+        );
+        pg.create_workflow_ai_session(task, 1, AGENTIC_SESSION_PHASE, Some(0), "cli-fresh")
+            .await
+            .expect("fallback re-create");
+        guard.rekey_cli_session("cli-fresh");
+        drop(guard);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status = status_of(&pg, task).await;
+            if status == "failed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "re-keyed guard never failed the fresh session (status still {status})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
