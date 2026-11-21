@@ -219,6 +219,7 @@ GET /generator-eval/dashboard dashboard_handler
 GET /generator-eval/edit-analysis edit_analysis_handler
 GET /generator-eval/trends trends_handler
 GET /git-supervision/recent-events get_recent_supervision_events
+GET /glossary glossary_handler
 GET /graph/cross-run-patterns cross_run_patterns_handler
 GET /graph/effectiveness effectiveness_stub_handler
 GET /graph/impact impact_stub_handler
@@ -918,6 +919,7 @@ MERGE generation_rules_api::routes
 MERGE generator_eval::routes
 MERGE git_supervision_api::routes
 MERGE github_budget_api::routes
+MERGE glossary::routes
 MERGE graph_api::routes
 MERGE graphql_routes
 MERGE gui_config::routes
