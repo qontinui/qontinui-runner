@@ -296,8 +296,8 @@ fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
 ///
 /// On Windows route through cmd.exe `/c` (so a `.cmd`/`.ps1` shim on PATH
 /// resolves), elsewhere invoke the program directly. The prompt is piped over
-/// STDIN by the caller (not passed as a `-p` argv) — prompts here are long
-/// + multi-line + JSON-heavy, and cmd.exe corrupts special chars
+/// STDIN by the caller (not passed as a `-p` argv) — prompts here are long,
+/// multi-line and JSON-heavy, and cmd.exe corrupts special chars
 /// (`"`, `%`, `^`, `&`, `|`, `<`, `>`) in arguments (the exact reason
 /// `run_claude_cli` always pipes on Windows). `claude --print` reads the prompt
 /// from stdin when no positional prompt is given.
