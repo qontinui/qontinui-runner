@@ -54,6 +54,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::ai_provider::claude_cli::{run_structured_oneshot, OneshotError, OneshotTools};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -667,6 +668,19 @@ pub fn spawn_maintenance() {
         secs
     );
 
+    // Read ONCE: the agent-request arm is a spawn-time posture, logged here so
+    // the runner log says which side of the gate this process is on.
+    let agent_enabled = agent_requests_enabled();
+    info!(
+        "maintenance: agent requests {} ({AGENT_ENABLED_ENV}={})",
+        if agent_enabled {
+            "ENABLED"
+        } else {
+            "disabled (default)"
+        },
+        std::env::var(AGENT_ENABLED_ENV).unwrap_or_else(|_| "<unset>".to_string())
+    );
+
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -675,8 +689,405 @@ pub fn spawn_maintenance() {
             if let Err(e) = tick_once().await {
                 warn!("maintenance: {e}");
             }
+            // After the instruction pull, independent of its outcome: at most
+            // one coord maintenance agent request per tick.
+            if agent_enabled {
+                if let Err(e) = agent_requests_once().await {
+                    warn!("maintenance agent: {e}");
+                }
+            }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Agent requests (plan Phases 2-3): coord's semantic verdicts + NL task
+// compiles, answered by a single-shot headless `claude`.
+//
+// Pull:   GET  {coord}/coord/maintenance/agent-requests?limit=1
+//         → {"requests":[{"id","kind":"verdict"|"compile","prompt",
+//                         "repo_path":<str|null>,"tools":"readonly_git"|"none",
+//                         "expires_at":<rfc3339>}]}
+// Answer: POST {coord}/coord/maintenance/agent-requests/{id}/answer with
+//         exactly one of
+//           {"verdict":"yes"|"no"|"unknown","confidence":0..1,"rationale":".."}
+//           {"result":{..},"rationale":".."}
+//           {"error":".."}
+// Device + tenant come from the device JWT `coord_get`/`coord_post` attach.
+// ---------------------------------------------------------------------------
+
+/// Arms agent-request processing. Truthy (`1`/`true`/`yes`/`on`) = on;
+/// anything else, including unset, = OFF.
+const AGENT_ENABLED_ENV: &str = "RUNNER_MAINTENANCE_AGENT_ENABLED";
+
+/// Per-request budget for the one-shot `claude`, further capped by the time
+/// left before the request's `expires_at`. Override with
+/// `RUNNER_MAINTENANCE_AGENT_TIMEOUT_SECS` (floored 30s).
+const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 240;
+
+/// Tool-loop bound for a verdict (read-only repo inspection).
+const VERDICT_MAX_TURNS: u32 = 16;
+/// A compile has no tools: one answering turn (plus slack for the CLI's own
+/// accounting).
+const COMPILE_MAX_TURNS: u32 = 2;
+
+/// Longest `error` string posted back to coord.
+const MAX_ERROR_CHARS: usize = 500;
+
+/// Whether `value` (the env var's value, if set) arms agent requests.
+fn agent_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// `RUNNER_MAINTENANCE_AGENT_ENABLED` read from the process env; default OFF.
+pub fn agent_requests_enabled() -> bool {
+    agent_enabled_from(std::env::var(AGENT_ENABLED_ENV).ok().as_deref())
+}
+
+fn agent_timeout() -> Duration {
+    let secs = std::env::var("RUNNER_MAINTENANCE_AGENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS)
+        .max(30);
+    Duration::from_secs(secs)
+}
+
+/// The agent-request pull body.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AgentRequestPull {
+    #[serde(default)]
+    pub requests: Vec<AgentRequest>,
+}
+
+/// One claimed agent request. `kind` and `tools` stay strings so a value a
+/// newer coord introduces is answered with an error rather than failing the
+/// whole pull's decode (which would strand the claimed row until expiry).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentRequest {
+    pub id: String,
+    pub kind: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub tools: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// The answer body. Untagged: each variant serializes to exactly the
+/// contract's object for it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum AgentAnswer {
+    Verdict {
+        verdict: String,
+        confidence: f64,
+        rationale: String,
+    },
+    Compile {
+        result: serde_json::Value,
+        rationale: String,
+    },
+    Error {
+        error: String,
+    },
+}
+
+impl AgentAnswer {
+    fn error(msg: impl Into<String>) -> Self {
+        let msg: String = msg.into();
+        Self::Error {
+            error: msg.chars().take(MAX_ERROR_CHARS).collect(),
+        }
+    }
+
+    fn unparseable(detail: &str) -> Self {
+        Self::error(format!("unparseable claude output: {detail}"))
+    }
+}
+
+/// Map a request's `tools` field to the one-shot tool set. `None` for a value
+/// this build does not know.
+fn oneshot_tools_for(tools: &str) -> Option<OneshotTools> {
+    match tools {
+        "readonly_git" => Some(OneshotTools::ReadonlyGit),
+        "none" => Some(OneshotTools::None),
+        _ => None,
+    }
+}
+
+/// Validate a verdict object: `verdict` ∈ {yes,no,unknown}, numeric
+/// `confidence` (clamped to [0,1]), string `rationale`.
+pub fn validate_verdict(v: &serde_json::Value) -> AgentAnswer {
+    let verdict = match v.get("verdict").and_then(|x| x.as_str()) {
+        Some(s @ ("yes" | "no" | "unknown")) => s.to_string(),
+        Some(other) => {
+            return AgentAnswer::unparseable(&format!(
+                "verdict must be yes|no|unknown, got {:?}",
+                other.chars().take(40).collect::<String>()
+            ))
+        }
+        None => return AgentAnswer::unparseable("missing string `verdict`"),
+    };
+    let confidence = match v.get("confidence").and_then(|x| x.as_f64()) {
+        Some(c) if c.is_finite() => c.clamp(0.0, 1.0),
+        _ => return AgentAnswer::unparseable("missing numeric `confidence`"),
+    };
+    let rationale = match v.get("rationale").and_then(|x| x.as_str()) {
+        Some(r) => r.to_string(),
+        None => return AgentAnswer::unparseable("missing string `rationale`"),
+    };
+    AgentAnswer::Verdict {
+        verdict,
+        confidence,
+        rationale,
+    }
+}
+
+/// Validate a compile object: an object `result`. `rationale` is carried
+/// when it is a string, else sent empty (the contract's answer shape always
+/// has it). Deep validation of `result` is coord's (its closed types).
+pub fn validate_compile(v: &serde_json::Value) -> AgentAnswer {
+    let result = match v.get("result") {
+        Some(r @ serde_json::Value::Object(_)) => r.clone(),
+        Some(_) => return AgentAnswer::unparseable("`result` is not an object"),
+        None => return AgentAnswer::unparseable("missing object `result`"),
+    };
+    let rationale = v
+        .get("rationale")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    AgentAnswer::Compile { result, rationale }
+}
+
+/// Validate the model's parsed object against the request kind.
+pub fn validate_for_kind(kind: &str, v: &serde_json::Value) -> AgentAnswer {
+    match kind {
+        "verdict" => validate_verdict(v),
+        "compile" => validate_compile(v),
+        other => AgentAnswer::error(format!("unsupported request kind {other:?}")),
+    }
+}
+
+/// Time left before `expires_at`. `Some(ZERO)` when already expired; `None`
+/// when absent or unparseable (coord only hands out unexpired rows, so an
+/// unreadable stamp does not block the request).
+fn time_until_expiry(
+    expires_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Duration> {
+    let at = chrono::DateTime::parse_from_rfc3339(expires_at?).ok()?;
+    let left = at.with_timezone(&chrono::Utc) - now;
+    Some(left.to_std().unwrap_or(Duration::ZERO))
+}
+
+/// What to do with one request before any `claude` runs.
+#[derive(Debug, PartialEq)]
+enum Preflight {
+    /// Already expired: skip, post nothing (coord expires the row).
+    Skip,
+    /// Refuse with this error answer.
+    Refuse(AgentAnswer),
+    /// Run the one-shot in `cwd` with `tools`.
+    Run {
+        cwd: std::path::PathBuf,
+        tools: OneshotTools,
+        max_turns: u32,
+        timeout: Duration,
+    },
+}
+
+fn preflight(
+    req: &AgentRequest,
+    now: chrono::DateTime<chrono::Utc>,
+    budget: Duration,
+) -> Preflight {
+    let timeout = match time_until_expiry(req.expires_at.as_deref(), now) {
+        Some(left) if left.is_zero() => return Preflight::Skip,
+        Some(left) => budget.min(left),
+        None => budget,
+    };
+    let max_turns = match req.kind.as_str() {
+        "verdict" => VERDICT_MAX_TURNS,
+        "compile" => COMPILE_MAX_TURNS,
+        other => {
+            return Preflight::Refuse(AgentAnswer::error(format!(
+                "unsupported request kind {other:?}"
+            )))
+        }
+    };
+    let Some(tools) = oneshot_tools_for(&req.tools) else {
+        return Preflight::Refuse(AgentAnswer::error(format!(
+            "unsupported tools mode {:?}",
+            req.tools
+        )));
+    };
+    let repo = req
+        .repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let cwd = match repo {
+        Some(p) if Path::new(p).is_dir() => std::path::PathBuf::from(p),
+        Some(p) => {
+            return Preflight::Refuse(AgentAnswer::error(format!(
+                "repo_path is not an existing directory on this device: {p}"
+            )))
+        }
+        // A repo-inspecting request with no checkout cannot be answered.
+        None if tools == OneshotTools::ReadonlyGit => {
+            return Preflight::Refuse(AgentAnswer::error(
+                "repo_path is required for a readonly_git request",
+            ))
+        }
+        // No repo (a compile): a neutral cwd, so no project CLAUDE.md or
+        // settings from the runner's own working directory leak in.
+        None => std::env::temp_dir(),
+    };
+    Preflight::Run {
+        cwd,
+        tools,
+        max_turns,
+        timeout,
+    }
+}
+
+/// Map a one-shot outcome to the answer body for `kind`.
+fn answer_from_outcome(
+    kind: &str,
+    outcome: Result<serde_json::Value, OneshotError>,
+) -> AgentAnswer {
+    match outcome {
+        Ok(v) => validate_for_kind(kind, &v),
+        Err(OneshotError::Unparseable(detail)) => AgentAnswer::unparseable(&detail),
+        Err(e) => AgentAnswer::error(e.to_string()),
+    }
+}
+
+/// Answer one request: preflight, run the one-shot on the blocking pool,
+/// validate, and POST the answer. `Ok(())` also when the request was skipped.
+async fn process_agent_request(
+    client: &reqwest::Client,
+    base: &str,
+    req: AgentRequest,
+) -> Result<(), String> {
+    let answer = match preflight(&req, chrono::Utc::now(), agent_timeout()) {
+        Preflight::Skip => {
+            info!(id = %req.id, "maintenance agent: request already expired — skipping");
+            return Ok(());
+        }
+        Preflight::Refuse(a) => a,
+        Preflight::Run {
+            cwd,
+            tools,
+            max_turns,
+            timeout,
+        } => {
+            info!(
+                id = %req.id,
+                kind = %req.kind,
+                tools = ?tools,
+                cwd = %cwd.display(),
+                timeout_secs = timeout.as_secs(),
+                "maintenance agent: running single-shot claude"
+            );
+            let prompt = req.prompt.clone();
+            let joined = spawn_blocking_tracked(move || {
+                run_structured_oneshot(&prompt, Some(&cwd), tools, max_turns, timeout)
+            })
+            .await;
+            match joined {
+                Ok(outcome) => {
+                    if let Err(e) = &outcome {
+                        warn!(id = %req.id, timeout = e.is_timeout(), "maintenance agent: one-shot failed: {e}");
+                    }
+                    answer_from_outcome(&req.kind, outcome)
+                }
+                Err(e) => AgentAnswer::error(format!("one-shot task failed: {e}")),
+            }
+        }
+    };
+
+    let url = format!(
+        "{}/coord/maintenance/agent-requests/{}/answer",
+        base.trim_end_matches('/'),
+        req.id
+    );
+    let resp = crate::coord_http::coord_post(client, &url)
+        .json(&answer)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let excerpt: String = body.chars().take(200).collect();
+    if !status.is_success() {
+        return Err(format!("coord returned {status} for POST {url}: {excerpt}"));
+    }
+    info!(
+        id = %req.id,
+        answered_as = match &answer {
+            AgentAnswer::Verdict { .. } => "verdict",
+            AgentAnswer::Compile { .. } => "compile",
+            AgentAnswer::Error { .. } => "error",
+        },
+        "maintenance agent: answer posted: {excerpt}"
+    );
+    Ok(())
+}
+
+/// One agent-request cycle: claim at most ONE request and answer it. A 404
+/// (a coord predating the route) is no work. `Err` only on a transport /
+/// non-2xx failure.
+pub async fn agent_requests_once() -> Result<(), String> {
+    if super::census::load_device_id_pub().is_none() {
+        debug!("maintenance agent: no device_id — skipping");
+        return Ok(());
+    }
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        debug!("maintenance agent: no coord_url configured — skipping");
+        return Ok(());
+    };
+
+    let url = format!(
+        "{}/coord/maintenance/agent-requests?limit=1",
+        base.trim_end_matches('/')
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("build maintenance agent http client: {e}"))?;
+    let resp = crate::coord_http::coord_get(&client, &url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        debug!("maintenance agent: coord has no agent-requests route (404) — no work");
+        return Ok(());
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(200).collect();
+        return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+    }
+    let pull: AgentRequestPull = resp
+        .json()
+        .await
+        .map_err(|e| format!("decode agent-request pull: {e}"))?;
+
+    // At most one per tick, even if a coord ignores `limit`.
+    let Some(req) = pull.requests.into_iter().next() else {
+        debug!("maintenance agent: no requests");
+        return Ok(());
+    };
+    process_agent_request(&client, &base, req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +1095,301 @@ pub fn spawn_maintenance() {
 // load-bearing assertions (the safety re-check itself shells out to git, so
 // the deterministic decision logic is what we pin here).
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod agent_request_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn req(kind: &str, tools: &str, repo: Option<&str>, expires: &str) -> AgentRequest {
+        AgentRequest {
+            id: "r1".into(),
+            kind: kind.into(),
+            prompt: "p".into(),
+            repo_path: repo.map(str::to_string),
+            tools: tools.into(),
+            expires_at: Some(expires.into()),
+        }
+    }
+
+    // ── wire shapes ───────────────────────────────────────────────────────
+
+    #[test]
+    fn pull_parses_the_contract_shape() {
+        let j = r#"{"requests":[
+            {"id":"6f1c0a52-0000-4000-8000-000000000001","kind":"verdict",
+             "prompt":"Is this branch abandoned?","repo_path":"D:/x/repo",
+             "tools":"readonly_git","expires_at":"2026-11-21T13:00:00Z"},
+            {"id":"6f1c0a52-0000-4000-8000-000000000002","kind":"compile",
+             "prompt":"compile this","repo_path":null,"tools":"none",
+             "expires_at":"2026-11-21T13:00:00+00:00"}
+        ]}"#;
+        let p: AgentRequestPull = serde_json::from_str(j).unwrap();
+        assert_eq!(p.requests.len(), 2);
+        let v = &p.requests[0];
+        assert_eq!(v.id, "6f1c0a52-0000-4000-8000-000000000001");
+        assert_eq!(v.kind, "verdict");
+        assert_eq!(v.prompt, "Is this branch abandoned?");
+        assert_eq!(v.repo_path.as_deref(), Some("D:/x/repo"));
+        assert_eq!(v.tools, "readonly_git");
+        assert_eq!(v.expires_at.as_deref(), Some("2026-11-21T13:00:00Z"));
+        let c = &p.requests[1];
+        assert_eq!(c.kind, "compile");
+        assert_eq!(c.repo_path, None);
+        assert_eq!(c.tools, "none");
+    }
+
+    #[test]
+    fn empty_pull_and_unknown_kind_decode() {
+        let p: AgentRequestPull = serde_json::from_str("{}").unwrap();
+        assert!(p.requests.is_empty());
+        // A kind/tools a newer coord adds must not fail the decode.
+        let p: AgentRequestPull = serde_json::from_str(
+            r#"{"requests":[{"id":"x","kind":"summarize","prompt":"p","tools":"web"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.requests[0].kind, "summarize");
+    }
+
+    #[test]
+    fn answers_serialize_to_exactly_the_contract_objects() {
+        let v = AgentAnswer::Verdict {
+            verdict: "yes".into(),
+            confidence: 0.75,
+            rationale: "merged".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&v).unwrap(),
+            json!({"verdict":"yes","confidence":0.75,"rationale":"merged"})
+        );
+        let c = AgentAnswer::Compile {
+            result: json!({"name":"n","predicates":[]}),
+            rationale: "r".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            json!({"result":{"name":"n","predicates":[]},"rationale":"r"})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentAnswer::error("boom")).unwrap(),
+            json!({"error":"boom"})
+        );
+    }
+
+    // ── validation ────────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_accepts_and_clamps() {
+        let a = validate_verdict(&json!({"verdict":"no","confidence":1.7,"rationale":"x"}));
+        assert_eq!(
+            a,
+            AgentAnswer::Verdict {
+                verdict: "no".into(),
+                confidence: 1.0,
+                rationale: "x".into()
+            }
+        );
+        let a = validate_verdict(&json!({"verdict":"unknown","confidence":-3,"rationale":""}));
+        assert!(matches!(a, AgentAnswer::Verdict { confidence, .. } if confidence == 0.0));
+    }
+
+    #[test]
+    fn verdict_rejects_bad_or_missing_fields() {
+        for bad in [
+            json!({"confidence":0.5,"rationale":"x"}),
+            json!({"verdict":"maybe","confidence":0.5,"rationale":"x"}),
+            json!({"verdict":true,"confidence":0.5,"rationale":"x"}),
+            json!({"verdict":"yes","rationale":"x"}),
+            json!({"verdict":"yes","confidence":"high","rationale":"x"}),
+            json!({"verdict":"yes","confidence":0.5}),
+            json!({"verdict":"yes","confidence":0.5,"rationale":3}),
+        ] {
+            match validate_verdict(&bad) {
+                AgentAnswer::Error { error } => assert!(
+                    error.starts_with("unparseable claude output: "),
+                    "{bad} → {error}"
+                ),
+                other => panic!("{bad} should be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn compile_needs_an_object_result() {
+        let ok = validate_compile(&json!({"result":{"name":"t"},"rationale":"why"}));
+        assert_eq!(
+            ok,
+            AgentAnswer::Compile {
+                result: json!({"name":"t"}),
+                rationale: "why".into()
+            }
+        );
+        // Missing rationale is carried as "".
+        assert!(matches!(
+            validate_compile(&json!({"result":{}})),
+            AgentAnswer::Compile { rationale, .. } if rationale.is_empty()
+        ));
+        for bad in [
+            json!({"rationale":"x"}),
+            json!({"result":"a string"}),
+            json!({"result":[1]}),
+            json!({"result":null}),
+        ] {
+            assert!(
+                matches!(validate_compile(&bad), AgentAnswer::Error { .. }),
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_for_kind_dispatches_and_refuses_unknown_kinds() {
+        let v = json!({"verdict":"yes","confidence":0.9,"rationale":"r"});
+        assert!(matches!(
+            validate_for_kind("verdict", &v),
+            AgentAnswer::Verdict { .. }
+        ));
+        // A verdict object for a compile request is the wrong shape.
+        assert!(matches!(
+            validate_for_kind("compile", &v),
+            AgentAnswer::Error { .. }
+        ));
+        assert!(matches!(
+            validate_for_kind("nope", &v),
+            AgentAnswer::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn outcome_errors_map_to_error_answers() {
+        assert_eq!(
+            answer_from_outcome("verdict", Err(OneshotError::Unparseable("hi".into()))),
+            AgentAnswer::error("unparseable claude output: hi")
+        );
+        assert_eq!(
+            answer_from_outcome(
+                "verdict",
+                Err(OneshotError::Run(
+                    crate::ai_provider::claude_cli::PrintRunError::Timeout
+                ))
+            ),
+            AgentAnswer::error("claude CLI timed out")
+        );
+        let long = "x".repeat(2000);
+        match AgentAnswer::error(long) {
+            AgentAnswer::Error { error } => assert_eq!(error.chars().count(), MAX_ERROR_CHARS),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ── preflight ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn expired_requests_are_skipped() {
+        let r = req("verdict", "readonly_git", None, "2026-11-21T11:59:59Z");
+        assert_eq!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Skip
+        );
+    }
+
+    #[test]
+    fn timeout_is_capped_by_time_to_expiry() {
+        let dir = std::env::temp_dir();
+        let r = req(
+            "verdict",
+            "readonly_git",
+            Some(dir.to_str().unwrap()),
+            "2026-11-21T12:01:00Z",
+        );
+        match preflight(&r, now(), Duration::from_secs(240)) {
+            Preflight::Run {
+                cwd,
+                tools,
+                max_turns,
+                timeout,
+            } => {
+                assert_eq!(cwd, dir);
+                assert_eq!(tools, OneshotTools::ReadonlyGit);
+                assert_eq!(max_turns, VERDICT_MAX_TURNS);
+                assert_eq!(timeout, Duration::from_secs(60));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_repo_path_dir_is_refused() {
+        let r = req(
+            "verdict",
+            "readonly_git",
+            Some("Z:/definitely/not/a/dir/qontinui-xyz"),
+            "2026-11-21T13:00:00Z",
+        );
+        assert!(matches!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Refuse(AgentAnswer::Error { .. })
+        ));
+        // readonly_git with no repo at all is refused too.
+        let r = req("verdict", "readonly_git", None, "2026-11-21T13:00:00Z");
+        assert!(matches!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn compile_without_repo_runs_toolless_in_a_neutral_dir() {
+        let r = req("compile", "none", None, "2026-11-21T13:00:00Z");
+        match preflight(&r, now(), Duration::from_secs(240)) {
+            Preflight::Run {
+                cwd,
+                tools,
+                max_turns,
+                timeout,
+            } => {
+                assert_eq!(cwd, std::env::temp_dir());
+                assert_eq!(tools, OneshotTools::None);
+                assert_eq!(max_turns, COMPILE_MAX_TURNS);
+                assert_eq!(timeout, Duration::from_secs(240));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_kind_or_tools_is_refused() {
+        let r = req("summarize", "none", None, "2026-11-21T13:00:00Z");
+        assert!(matches!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Refuse(_)
+        ));
+        let r = req("compile", "web", None, "2026-11-21T13:00:00Z");
+        assert!(matches!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Refuse(_)
+        ));
+    }
+
+    // ── env gate ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn env_gate_defaults_off() {
+        assert!(!agent_enabled_from(None));
+        for off in ["", "0", "false", "off", "no", "nope", "2"] {
+            assert!(!agent_enabled_from(Some(off)), "{off:?} must be OFF");
+        }
+        for on in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert!(agent_enabled_from(Some(on)), "{on:?} must be ON");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

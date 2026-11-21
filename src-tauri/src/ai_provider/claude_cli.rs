@@ -275,6 +275,7 @@ fn run_claude_cli_with_arg(
 // the one that fails-safe-injects-nothing on a `None`.
 
 use crate::settings::ClaudeCliSettings;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -289,25 +290,13 @@ fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
-/// Run `claude -p <prompt>` (non-interactive print mode) once and return its
-/// trimmed stdout, or `None` on any failure (spawn error / missing binary /
-/// nonzero exit / timeout). Fail-closed by design — the auto-response caller
-/// injects NOTHING on `None`.
-///
-/// Auth/config reuse: resolves the effective config dir the same way the rest
-/// of the CLI provider does ([`get_effective_config_dir`]) and exports it as
-/// `CLAUDE_CONFIG_DIR`, refreshing OAuth credentials first — so the one-shot
-/// authenticates as the SAME account the runner's sessions use. `CLAUDECODE` is
-/// removed so a runner already running inside Claude Code can still spawn the
-/// nested print call (mirrors [`process::spawn_and_wait_with_doctor`]).
-///
-/// Bounded by `timeout`: the child is killed and `None` returned if it does not
-/// exit in time, so a wedged CLI never strands the scheduler task.
-/// Build the one-shot scorer's `claude --print` command, fully env-prepared.
+/// Build a one-shot `claude --print <extra_args…>` command, fully
+/// env-prepared. Shared by the option scorer ([`build_scorer_command`], no
+/// extra args) and the structured one-shot ([`run_structured_oneshot`]).
 ///
 /// On Windows route through cmd.exe `/c` (so a `.cmd`/`.ps1` shim on PATH
 /// resolves), elsewhere invoke the program directly. The prompt is piped over
-/// STDIN by the caller (not passed as a `-p` argv) — the scoring prompt is long
+/// STDIN by the caller (not passed as a `-p` argv) — prompts here are long
 /// + multi-line + JSON-heavy, and cmd.exe corrupts special chars
 /// (`"`, `%`, `^`, `&`, `|`, `<`, `>`) in arguments (the exact reason
 /// `run_claude_cli` always pipes on Windows). `claude --print` reads the prompt
@@ -315,16 +304,18 @@ fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
 ///
 /// **This seam does NOT route through
 /// [`super::process::spawn_and_wait_with_doctor`]** — it spawns and polls its
-/// own child so it can enforce a timeout — so it needs its own copy of the env
-/// preamble, credential scrub included. The scrub is last: the returned command
-/// is spawned directly by [`score_options_via_cli`] with no further env
-/// mutation. See `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
+/// own child ([`run_print_child`]) so it can enforce a timeout — so it needs
+/// its own copy of the env preamble, credential scrub included. The scrub is
+/// last: the returned command is spawned with no further env mutation (a
+/// caller may only set the working directory). See
+/// `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
 ///
 /// Returned by value (rather than the env work being inlined at the call site)
 /// so the constructed environment is unit-testable without spawning `claude`.
-pub(crate) fn build_scorer_command(
+pub(crate) fn build_print_command(
     program: &str,
     config_dir: Option<&str>,
+    extra_args: &[String],
 ) -> std::process::Command {
     let mut cmd = if std::env::consts::OS == "windows" {
         let mut c = crate::process_helpers::cmd_no_window();
@@ -335,6 +326,7 @@ pub(crate) fn build_scorer_command(
         c.arg("--print");
         c
     };
+    cmd.args(extra_args);
     if let Some(dir) = config_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
@@ -356,39 +348,70 @@ pub(crate) fn build_scorer_command(
     cmd
 }
 
-pub(crate) fn score_options_via_cli(
-    prompt: &str,
-    settings: &ClaudeCliSettings,
-    timeout: Duration,
-) -> Option<String> {
-    let program = scorer_claude_program(settings);
-    let (config_dir, _config_dir_source) = get_effective_config_dir(settings);
+/// Build the one-shot scorer's `claude --print` command (no extra flags).
+/// See [`build_print_command`] for the env discipline.
+pub(crate) fn build_scorer_command(
+    program: &str,
+    config_dir: Option<&str>,
+) -> std::process::Command {
+    build_print_command(program, config_dir, &[])
+}
 
-    // Refresh OAuth before spawning, same as run_claude_cli.
-    super::oauth_refresh::try_ensure_valid_credentials(config_dir.as_deref());
+/// Why a single `claude --print` child produced no usable stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrintRunError {
+    /// The child could not be spawned (missing binary, bad cwd, …).
+    Spawn(String),
+    /// Writing the prompt to the child's stdin failed.
+    StdinWrite(String),
+    /// The child did not exit within the budget; it was killed.
+    Timeout,
+    /// Polling or collecting the child failed.
+    Wait(String),
+    /// The child exited nonzero.
+    NonZeroExit {
+        code: Option<i32>,
+        stderr_excerpt: String,
+    },
+}
 
-    let mut cmd = build_scorer_command(&program, config_dir.as_deref());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "auto_response scorer: failed to spawn claude CLI — no scores");
-            return None;
+impl std::fmt::Display for PrintRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "failed to spawn claude CLI: {e}"),
+            Self::StdinWrite(e) => write!(f, "writing prompt to claude stdin failed: {e}"),
+            Self::Timeout => write!(f, "claude CLI timed out"),
+            Self::Wait(e) => write!(f, "waiting on claude CLI failed: {e}"),
+            Self::NonZeroExit {
+                code,
+                stderr_excerpt,
+            } => write!(f, "claude CLI exited {code:?}: {stderr_excerpt}"),
         }
-    };
+    }
+}
 
-    // Write the prompt to the child's stdin and close it so the CLI sees EOF
-    // and starts producing output. Failure to write → fail closed. The scoring
-    // prompt is a few KB (terminal context + a handful of options/dimensions),
-    // well under the OS pipe buffer, so a single blocking write-before-read
-    // can't deadlock against the child filling its stdout pipe.
+/// Spawn `cmd`, pipe `prompt` to its stdin (then EOF), and wait at most
+/// `timeout` for it to exit — killing it on the deadline. Returns the child's
+/// TRIMMED stdout on a zero exit. Every failure is an `Err` so the callers
+/// fail closed.
+///
+/// The prompt is a few KB, well under the OS pipe buffer, so a single blocking
+/// write-before-read can't deadlock against the child filling its stdout pipe.
+fn run_print_child(
+    mut cmd: std::process::Command,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, PrintRunError> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| PrintRunError::Spawn(e.to_string()))?;
+
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         if let Err(e) = stdin.write_all(prompt.as_bytes()) {
-            warn!(error = %e, "auto_response scorer: writing prompt to stdin failed — no scores");
             let _ = child.kill();
             let _ = child.wait();
-            return None;
+            return Err(PrintRunError::StdinWrite(e.to_string()));
         }
         // Drop closes stdin (EOF).
     }
@@ -400,48 +423,307 @@ pub(crate) fn score_options_via_cli(
             Ok(Some(_status)) => break,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    warn!(
-                        timeout_secs = timeout.as_secs(),
-                        "auto_response scorer: claude CLI timed out — killing, no scores"
-                    );
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(PrintRunError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                warn!(error = %e, "auto_response scorer: wait failed — no scores");
                 let _ = child.kill();
-                return None;
+                return Err(PrintRunError::Wait(e.to_string()));
             }
         }
     }
 
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
+    let output = child
+        .wait_with_output()
+        .map_err(|e| PrintRunError::Wait(format!("collecting output: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PrintRunError::NonZeroExit {
+            code: output.status.code(),
+            stderr_excerpt: truncate_str(&stderr, 300).to_string(),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run `claude -p <prompt>` (non-interactive print mode) once and return its
+/// trimmed stdout, or `None` on any failure (spawn error / missing binary /
+/// nonzero exit / timeout). Fail-closed by design — the auto-response caller
+/// injects NOTHING on `None`.
+///
+/// Auth/config reuse: resolves the effective config dir the same way the rest
+/// of the CLI provider does ([`get_effective_config_dir`]) and exports it as
+/// `CLAUDE_CONFIG_DIR`, refreshing OAuth credentials first — so the one-shot
+/// authenticates as the SAME account the runner's sessions use. `CLAUDECODE` is
+/// removed so a runner already running inside Claude Code can still spawn the
+/// nested print call (mirrors [`process::spawn_and_wait_with_doctor`]).
+///
+/// Bounded by `timeout`: the child is killed and `None` returned if it does not
+/// exit in time, so a wedged CLI never strands the scheduler task.
+pub(crate) fn score_options_via_cli(
+    prompt: &str,
+    settings: &ClaudeCliSettings,
+    timeout: Duration,
+) -> Option<String> {
+    let program = scorer_claude_program(settings);
+    let (config_dir, _config_dir_source) = get_effective_config_dir(settings);
+
+    // Refresh OAuth before spawning, same as run_claude_cli.
+    super::oauth_refresh::try_ensure_valid_credentials(config_dir.as_deref());
+
+    let cmd = build_scorer_command(&program, config_dir.as_deref());
+
+    let stdout = match run_print_child(cmd, prompt, timeout) {
+        Ok(s) => s,
+        Err(PrintRunError::Timeout) => {
+            warn!(
+                timeout_secs = timeout.as_secs(),
+                "auto_response scorer: claude CLI timed out — killing, no scores"
+            );
+            return None;
+        }
+        Err(PrintRunError::NonZeroExit {
+            code,
+            stderr_excerpt,
+        }) => {
+            warn!(
+                exit = ?code,
+                stderr = %stderr_excerpt,
+                "auto_response scorer: claude CLI nonzero exit — no scores"
+            );
+            return None;
+        }
         Err(e) => {
-            warn!(error = %e, "auto_response scorer: collecting output failed — no scores");
+            warn!(error = %e, "auto_response scorer: claude CLI failed — no scores");
             return None;
         }
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
-            exit = ?output.status.code(),
-            stderr = %truncate_str(&stderr, 300),
-            "auto_response scorer: claude CLI nonzero exit — no scores"
-        );
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
         debug!("auto_response scorer: claude CLI produced empty stdout — no scores");
         return None;
     }
     Some(stdout)
+}
+
+// ── Structured single-shot (scheduled-maintenance Phases 2-3) ────────────────
+//
+// coord's maintenance subsystem asks the runner semantic questions (verdicts
+// over a checkout) and to compile natural-language task descriptions. coord
+// composes the full prompt; the runner runs it ONCE through its own
+// authenticated Claude CLI with a closed tool set and returns the first JSON
+// object of the model's final answer. Same env discipline + bounded wait as the
+// scorer above (shared `build_print_command` / `run_print_child`).
+
+/// The tool set a structured one-shot may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneshotTools {
+    /// Read-only repository inspection: `Read`, `Grep`, `Glob` and read-only
+    /// git subcommands through `Bash`. Nothing else is pre-approved, and
+    /// `--permission-mode dontAsk` denies anything not pre-approved.
+    ReadonlyGit,
+    /// No tools at all (`--tools ""`): a pure text-in, text-out call.
+    None,
+}
+
+/// The read-only git `Bash` patterns [`OneshotTools::ReadonlyGit`] approves.
+/// Each is a subcommand that cannot modify the repository or the remote.
+const READONLY_GIT_BASH_PATTERNS: &[&str] = &[
+    "Bash(git log:*)",
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(git show:*)",
+    "Bash(git branch:*)",
+    "Bash(git rev-parse:*)",
+    "Bash(git merge-base:*)",
+];
+
+/// Why a structured one-shot produced no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OneshotError {
+    /// The `claude` child failed (spawn / stdin / timeout / nonzero exit).
+    Run(PrintRunError),
+    /// The CLI's `--output-format json` envelope reported an error result
+    /// (e.g. `error_max_turns`), or carried no result text.
+    CliError(String),
+    /// The model's answer contained no parseable JSON object.
+    Unparseable(String),
+}
+
+impl OneshotError {
+    /// Whether this failure was the bounded wait expiring.
+    pub(crate) fn is_timeout(&self) -> bool {
+        matches!(self, Self::Run(PrintRunError::Timeout))
+    }
+}
+
+impl std::fmt::Display for OneshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run(e) => write!(f, "{e}"),
+            Self::CliError(e) => write!(f, "claude CLI reported an error: {e}"),
+            Self::Unparseable(e) => write!(f, "unparseable claude output: {e}"),
+        }
+    }
+}
+
+/// The CLI flags (after `--print`) for a structured one-shot. Pure, so each
+/// tools mode's argv is pinned by a test without spawning `claude`.
+///
+/// - `--output-format json`: one JSON envelope whose `result` is the model's
+///   final text ([`final_text_from_cli_output`]).
+/// - `--max-turns`: bounds the tool loop.
+/// - `--restricted`: user/project/local settings files are ignored, so an
+///   operator's broad allow rules cannot widen the set below; code-running
+///   tools exist only when `--tools` names them.
+/// - `--strict-mcp-config` with no `--mcp-config`: no MCP servers at all.
+/// - `--permission-mode dontAsk`: anything not pre-approved is denied (never
+///   prompts — nobody is at the keyboard).
+/// - `--tools`: the built-in tools that EXIST (`""` = none).
+/// - `--allowedTools`: what is pre-approved. Rendered LAST because the flag is
+///   variadic and would otherwise swallow the next flag.
+pub(crate) fn oneshot_cli_args(tools: OneshotTools, max_turns: u32) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--output-format".into(),
+        "json".into(),
+        "--max-turns".into(),
+        max_turns.max(1).to_string(),
+        "--restricted".into(),
+        "--strict-mcp-config".into(),
+        "--permission-mode".into(),
+        "dontAsk".into(),
+        "--tools".into(),
+    ];
+    match tools {
+        OneshotTools::None => args.push(String::new()),
+        OneshotTools::ReadonlyGit => {
+            args.push("Read,Grep,Glob,Bash".into());
+            args.push("--allowedTools".into());
+            args.extend(["Read", "Grep", "Glob"].iter().map(|s| s.to_string()));
+            args.extend(READONLY_GIT_BASH_PATTERNS.iter().map(|s| s.to_string()));
+        }
+    }
+    args
+}
+
+/// Extract the model's final text from `claude --print --output-format json`
+/// stdout: `{"type":"result","subtype":"success","is_error":false,
+/// "result":"<text>",…}`. A stdout that is not such an envelope is returned
+/// verbatim (a CLI that ignored the flag prints plain text).
+pub(crate) fn final_text_from_cli_output(stdout: &str) -> Result<String, OneshotError> {
+    let trimmed = stdout.trim();
+    let Ok(serde_json::Value::Object(env)) = serde_json::from_str::<serde_json::Value>(trimmed)
+    else {
+        return Ok(trimmed.to_string());
+    };
+    if env.get("type").and_then(|v| v.as_str()) != Some("result") {
+        // A JSON object that is not the CLI envelope — the answer itself.
+        return Ok(trimmed.to_string());
+    }
+    let is_error = env
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let subtype = env
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    if is_error || subtype != "success" {
+        let detail = env.get("result").and_then(|v| v.as_str()).unwrap_or("");
+        return Err(OneshotError::CliError(format!(
+            "{subtype}: {}",
+            truncate_str(detail, 200)
+        )));
+    }
+    match env.get("result").and_then(|v| v.as_str()) {
+        Some(text) => Ok(text.to_string()),
+        None => Err(OneshotError::CliError(
+            "result envelope carried no result text".to_string(),
+        )),
+    }
+}
+
+/// Strip a single leading/trailing Markdown code fence pair if present,
+/// tolerating an optional language tag (```json). Returns the inner content;
+/// if no fence is found, returns the input trimmed.
+pub(crate) fn strip_code_fences(raw: &str) -> String {
+    let t = raw.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // Drop the optional language tag up to the first newline.
+        let after_tag = match rest.split_once('\n') {
+            Some((_tag, body)) => body,
+            None => rest,
+        };
+        let inner = after_tag.strip_suffix("```").unwrap_or(after_tag);
+        // Also handle a trailing fence on its own line.
+        return inner.trim_end_matches('`').trim().to_string();
+    }
+    t.to_string()
+}
+
+/// The first JSON OBJECT in `raw`, tolerating Markdown fences and prose around
+/// it. Tries the fence-stripped text as a whole first, then scans each `{` in
+/// order and takes the first position from which a complete object parses.
+/// `None` when no object is present.
+pub(crate) fn extract_first_json_object(raw: &str) -> Option<serde_json::Value> {
+    let cleaned = strip_code_fences(raw);
+    if let Ok(v @ serde_json::Value::Object(_)) = serde_json::from_str(&cleaned) {
+        return Some(v);
+    }
+    for (idx, _) in raw.match_indices('{') {
+        let Some(tail) = raw.get(idx..) else {
+            continue;
+        };
+        let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
+        if let Some(Ok(v @ serde_json::Value::Object(_))) = stream.next() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Run `prompt` ONCE through the runner's authenticated Claude CLI with the
+/// given closed tool set, and return the first JSON object of the model's
+/// final answer.
+///
+/// - `cwd`: the child's working directory (`None` = inherit the runner's).
+/// - `max_turns`: bounds the tool loop (floored at 1).
+/// - `timeout`: the child is killed and [`OneshotError::Run`]`(Timeout)`
+///   returned if it does not exit in time.
+///
+/// Blocking (spawns + polls a subprocess): call it on the blocking pool.
+pub(crate) fn run_structured_oneshot(
+    prompt: &str,
+    cwd: Option<&Path>,
+    tools: OneshotTools,
+    max_turns: u32,
+    timeout: Duration,
+) -> Result<serde_json::Value, OneshotError> {
+    let settings = crate::settings::load_settings();
+    let cli = &settings.ai.claude_cli;
+    let program = scorer_claude_program(cli);
+    let (config_dir, _config_dir_source) = get_effective_config_dir(cli);
+    super::oauth_refresh::try_ensure_valid_credentials(config_dir.as_deref());
+
+    let mut cmd = build_print_command(
+        &program,
+        config_dir.as_deref(),
+        &oneshot_cli_args(tools, max_turns),
+    );
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    let stdout = run_print_child(cmd, prompt, timeout).map_err(OneshotError::Run)?;
+    let text = final_text_from_cli_output(&stdout)?;
+    extract_first_json_object(&text).ok_or_else(|| {
+        OneshotError::Unparseable(truncate_str(text.trim(), 160).to_string())
+    })
 }
 
 /// Process CLI output into AiResponse
@@ -573,5 +855,170 @@ mod tests {
             &cmd,
             "build_scorer_command",
         );
+    }
+
+    // =======================================================================
+    // Structured single-shot (scheduled-maintenance Phases 2-3).
+    // =======================================================================
+
+    use super::{
+        build_print_command, extract_first_json_object, final_text_from_cli_output,
+        oneshot_cli_args, strip_code_fences, OneshotError, OneshotTools,
+    };
+
+    fn strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn oneshot_args_readonly_git_pin_the_exact_tool_set() {
+        let args = oneshot_cli_args(OneshotTools::ReadonlyGit, 8);
+        assert_eq!(
+            strs(&args),
+            vec![
+                "--output-format",
+                "json",
+                "--max-turns",
+                "8",
+                "--restricted",
+                "--strict-mcp-config",
+                "--permission-mode",
+                "dontAsk",
+                "--tools",
+                "Read,Grep,Glob,Bash",
+                "--allowedTools",
+                "Read",
+                "Grep",
+                "Glob",
+                "Bash(git log:*)",
+                "Bash(git status:*)",
+                "Bash(git diff:*)",
+                "Bash(git show:*)",
+                "Bash(git branch:*)",
+                "Bash(git rev-parse:*)",
+                "Bash(git merge-base:*)",
+            ]
+        );
+        // `--allowedTools` is variadic: it must be the LAST flag so it never
+        // swallows another one.
+        let pos = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert!(args[pos + 1..].iter().all(|a| !a.starts_with("--")));
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn oneshot_args_none_disables_every_tool() {
+        let args = oneshot_cli_args(OneshotTools::None, 1);
+        assert_eq!(
+            strs(&args),
+            vec![
+                "--output-format",
+                "json",
+                "--max-turns",
+                "1",
+                "--restricted",
+                "--strict-mcp-config",
+                "--permission-mode",
+                "dontAsk",
+                "--tools",
+                "",
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--allowedTools"));
+    }
+
+    #[test]
+    fn oneshot_args_floor_max_turns_at_one() {
+        let args = oneshot_cli_args(OneshotTools::None, 0);
+        let pos = args.iter().position(|a| a == "--max-turns").unwrap();
+        assert_eq!(args[pos + 1], "1");
+    }
+
+    /// The structured one-shot spawns through the same env preamble as the
+    /// scorer — credential scrub + git posture — and carries its flags.
+    #[test]
+    fn print_command_with_oneshot_args_keeps_the_scrub_and_posture() {
+        let _amb = crate::test_env::isolated_ambient();
+        let cmd = build_print_command(
+            "claude",
+            Some("/tmp/claude-config"),
+            &oneshot_cli_args(OneshotTools::ReadonlyGit, 4),
+        );
+        crate::terminal::assert_credentials_scrubbed_std(&cmd, "build_print_command");
+        crate::credential_helper::assert_non_interactive_git_posture_std(
+            &cmd,
+            "build_print_command",
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let print = args.iter().position(|a| a == "--print").unwrap();
+        assert_eq!(args[print + 1], "--output-format");
+        assert!(args.iter().any(|a| a == "Bash(git merge-base:*)"));
+    }
+
+    #[test]
+    fn final_text_reads_the_json_envelope_result() {
+        let out = r#"{"type":"result","subtype":"success","is_error":false,"result":"```json\n{\"verdict\":\"yes\"}\n```","num_turns":2}"#;
+        assert_eq!(
+            final_text_from_cli_output(out).unwrap(),
+            "```json\n{\"verdict\":\"yes\"}\n```"
+        );
+    }
+
+    #[test]
+    fn final_text_maps_an_error_envelope_to_cli_error() {
+        let out = r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#;
+        match final_text_from_cli_output(out) {
+            Err(OneshotError::CliError(m)) => assert!(m.starts_with("error_max_turns")),
+            other => panic!("expected CliError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn final_text_passes_plain_text_and_bare_answers_through() {
+        assert_eq!(final_text_from_cli_output("  hello  ").unwrap(), "hello");
+        // A JSON object that is not the CLI envelope is the answer itself.
+        assert_eq!(
+            final_text_from_cli_output(r#"{"verdict":"no"}"#).unwrap(),
+            r#"{"verdict":"no"}"#
+        );
+    }
+
+    #[test]
+    fn extract_json_from_fenced_output() {
+        let raw = "```json\n{\"verdict\":\"yes\",\"confidence\":0.9,\"rationale\":\"r\"}\n```";
+        let v = extract_first_json_object(raw).unwrap();
+        assert_eq!(v["verdict"], "yes");
+    }
+
+    #[test]
+    fn extract_json_from_bare_fence_and_surrounding_prose() {
+        let fenced = "```\n{\"a\":1}\n```";
+        assert_eq!(extract_first_json_object(fenced).unwrap()["a"], 1);
+        let prose = "Here is my answer:\n{\"result\":{\"name\":\"x\"},\"rationale\":\"ok\"}\nThanks {not json}";
+        let v = extract_first_json_object(prose).unwrap();
+        assert_eq!(v["result"]["name"], "x");
+        // Prose then a fenced block.
+        let mixed = "Sure.\n```json\n{\"b\":2}\n```\n";
+        assert_eq!(extract_first_json_object(mixed).unwrap()["b"], 2);
+    }
+
+    #[test]
+    fn extract_json_skips_a_broken_brace_and_rejects_non_objects() {
+        assert_eq!(
+            extract_first_json_object("{oops} then {\"c\":3}").unwrap()["c"],
+            3
+        );
+        assert!(extract_first_json_object("no json here").is_none());
+        assert!(extract_first_json_object("[1,2,3]").is_none());
+        assert!(extract_first_json_object("").is_none());
+    }
+
+    #[test]
+    fn strip_code_fences_handles_tag_and_no_fence() {
+        assert_eq!(strip_code_fences("```json\n{}\n```"), "{}");
+        assert_eq!(strip_code_fences("  {}  "), "{}");
     }
 }
