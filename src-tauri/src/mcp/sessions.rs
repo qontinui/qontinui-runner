@@ -1497,7 +1497,11 @@ async fn continuation_verdict(
     // runner's own continuation registry: a gate continuation is armed by
     // default, everything else keeps the flag's dark default.
     let mode = crate::mcp::continuation_verdict::mode_for_terminal(&id);
-    Json(crate::mcp::continuation_verdict::continuation_verdict(&key, &hook_input, mode).await)
+    // `id` and `key` together name the session whose OWN tenant every
+    // Stop-hook read is made under — decided once per Stop inside the verdict
+    // (plan
+    // `2026-11-13-runner-stop-hook-continuation-rules-and-compliance-use-the-device-default-tenant`).
+    Json(crate::mcp::continuation_verdict::continuation_verdict(&id, &key, &hook_input, mode).await)
 }
 
 // =============================================================================

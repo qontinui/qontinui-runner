@@ -1675,48 +1675,10 @@ async fn fetch_payload(
     Ok((payload, presented))
 }
 
-/// The tenant a built request's bearer claims — the credential it will
-/// ACTUALLY present, read off its `Authorization` header rather than
-/// re-resolved, so the check below and the cache-file name are about the bytes
-/// on the wire. `None` for no header, a non-bearer one, or a token whose
-/// `tenant_id` claim is absent or not a uuid. The token itself goes no further.
-fn presented_claim(headers: &reqwest::header::HeaderMap) -> Option<uuid::Uuid> {
-    let value = headers.get(reqwest::header::AUTHORIZATION)?.to_str().ok()?;
-    tenant_of_jwt(value.trim().strip_prefix("Bearer ")?)
-}
-
-/// Refuse to send a policy read whose credential is not the target tenant's.
-///
-/// `coord_get_for(Owned(t))` sends UNAUTHENTICATED when `t` has no usable slot
-/// (and a slot can lapse between the tenant decision and the fetch), and an
-/// answer to such a read could be another tenant's — which would then be
-/// rendered, cached and filed as `t`'s. The tenant decision already refuses the
-/// no-credential case up front ([`crate::mcp::policy_tenant::policy_tenant_decision`]);
-/// this is the same rule at the last moment, on the request that would go out.
-/// A target naming no tenant (a default slot whose credential claims none)
-/// asserts nothing, so it checks nothing.
-fn check_presented(
-    target: Option<uuid::Uuid>,
-    presented: Option<uuid::Uuid>,
-) -> Result<(), String> {
-    match (target, presented) {
-        (Some(t), Some(p)) if t == p => Ok(()),
-        (Some(t), Some(p)) => Err(format!(
-            "the credential this runner would present for tenant {t} claims tenant {p}, so the \
-             policy read was not sent"
-        )),
-        (Some(t), None) => Err(format!(
-            "this runner holds no usable credential claiming tenant {t}, so the policy read was \
-             not sent"
-        )),
-        (None, _) => Ok(()),
-    }
-}
-
 /// Build one tenant-stating policy GET — `target`'s credential through
 /// `coord_http::coord_get_for`, the attribution header, the validator — and
-/// [`check_presented`] it BEFORE it can be sent. Returns the request and the
-/// tenant its bearer claims.
+/// [`crate::mcp::policy_tenant::build_checked`] it BEFORE it can be sent.
+/// Returns the request and the tenant its bearer claims.
 fn build_policy_get(
     client: &reqwest::Client,
     url: String,
@@ -1731,12 +1693,7 @@ fn build_policy_get(
     if let Some(etag) = etag {
         req = req.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let request = req
-        .build()
-        .map_err(|e| format!("could not build the policy request: {e}"))?;
-    let presented = presented_claim(request.headers());
-    check_presented(target.tenant, presented)?;
-    Ok((request, presented))
+    crate::mcp::policy_tenant::build_checked(req, target)
 }
 
 /// Conditionally fetch the `kind=policy` index under `target`'s credential.
@@ -1917,18 +1874,24 @@ pub async fn policy_context(
     }
 
     let fetched_at = now_stamp();
-    // `coord_client_parts` is the shared accessor `continuation_verdict` and
-    // `session_compliance` both use — the coord base, and the "is this runner
-    // paired at all" gate. Its error is the honest "unpaired" reason, which the
-    // notice renders verbatim. Its token is NOT the fetch credential any more:
-    // that is the session's tenant's, decided next.
+    // `coord_client_parts` supplies the coord base and the "is this runner
+    // paired at all" gate — a DEVICE question, asked before any session is
+    // read. Its error is the honest "unpaired" reason, which the notice renders
+    // verbatim. Its token is NOT the fetch credential: that is the session's
+    // tenant's, decided next, and `policy_tenant::build_checked` refuses any
+    // fetch whose bearer does not claim it.
     let (text, decision, tenant) = match crate::mcp::continuation_verdict::coord_client_parts() {
         Ok((base, _default_jwt)) => {
             // Whose policy: the tenant the coord-mcp proxy decides for THIS
             // session, awaited (SessionStart is its first call). An UNKNOWN on a
             // multi-bound device is no target at all, so nothing is fetched.
-            let tenant_decision =
-                crate::mcp::policy_tenant::route_policy_decision(route_id, session_key).await;
+            let tenant_decision = crate::mcp::policy_tenant::route_policy_decision(
+                route_id,
+                session_key,
+                None,
+                crate::mcp::policy_tenant::ROUTE_TENANT_BUDGET,
+            )
+            .await;
             match crate::mcp::policy_tenant::fetch_target(
                 tenant_decision,
                 crate::mcp::policy_tenant::default_slot_tenant,
@@ -2041,17 +2004,6 @@ pub async fn policy_context(
 // ===========================================================================
 // Spawn-time body cache (the source the spawn seams compose from)
 // ===========================================================================
-
-/// The tenant a device JWT names, from its unverified `tenant_id` claim.
-///
-/// Used only to NAME a local cache file and to check that a request presents
-/// the target tenant's credential, never to authorize anything — the same
-/// posture `coord_mcp::device_jwt_claim_tenant` takes. Coord resolves the
-/// policy rows from this same bearer, so the claim is the right scope for both.
-fn tenant_of_jwt(jwt: &str) -> Option<uuid::Uuid> {
-    let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(jwt.trim())?;
-    uuid::Uuid::parse_str(&raw).ok()
-}
 
 /// Write the rendered body to the per-tenant spawn cache, best-effort.
 ///
@@ -2444,60 +2396,6 @@ mod tests {
     }
 
     // ── The presented credential (Design §2a) ────────────────────────────
-
-    /// A JWT-shaped token carrying `tenant_id` — the same shape
-    /// `tenant_of_jwt_reads_the_claim_and_rejects_non_uuids` builds.
-    fn jwt_claiming(tenant: uuid::Uuid) -> String {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        format!(
-            "h.{}.s",
-            URL_SAFE_NO_PAD.encode(
-                serde_json::to_vec(&serde_json::json!({"tenant_id": tenant.to_string()})).unwrap()
-            )
-        )
-    }
-
-    /// The claim is read off the request's own `Authorization` header — the
-    /// bearer that will actually be presented — and nothing else.
-    #[test]
-    fn the_presented_claim_is_read_off_the_requests_own_bearer() {
-        use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-        let t = uuid::Uuid::new_v4();
-        let mut headers = HeaderMap::new();
-        assert_eq!(presented_claim(&headers), None, "no header, no claim");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", jwt_claiming(t))).unwrap(),
-        );
-        assert_eq!(presented_claim(&headers), Some(t));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
-        );
-        assert_eq!(presented_claim(&headers), None, "a non-bearer credential");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer opaque-token"),
-        );
-        assert_eq!(presented_claim(&headers), None, "a bearer naming no tenant");
-    }
-
-    /// The last-moment guard: a read is sent only when its credential claims
-    /// the target tenant. A target naming no tenant asserts nothing.
-    #[test]
-    fn a_policy_read_is_sent_only_under_the_target_tenants_own_credential() {
-        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        assert_eq!(check_presented(Some(b), Some(b)), Ok(()));
-        let wrong = check_presented(Some(b), Some(a)).expect_err("A's credential for B");
-        assert!(wrong.contains(&format!("claims tenant {a}")), "{wrong}");
-        let none = check_presented(Some(b), None).expect_err("no credential for B");
-        assert!(
-            none.contains(&format!("no usable credential claiming tenant {b}")),
-            "{none}"
-        );
-        assert_eq!(check_presented(None, None), Ok(()));
-        assert_eq!(check_presented(None, Some(a)), Ok(()));
-    }
 
     /// Tests bullet 5, at the request layer: for a tenant this runner holds no
     /// usable credential for, `coord_get_for(Owned(t))` would go out
@@ -3538,30 +3436,6 @@ mod tests {
         headers.insert(DELIVERED_SHA_HEADER, HeaderValue::from_static("abc"));
         assert_eq!(delivered_sha_from_headers(&headers), None);
         assert_eq!(DELIVERED_SHA_HEADER, "x-qontinui-policy-delivered-sha");
-    }
-
-    #[test]
-    fn tenant_of_jwt_reads_the_claim_and_rejects_non_uuids() {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        let tenant = uuid::Uuid::new_v4();
-        let jwt_with = |claims: serde_json::Value| {
-            format!(
-                "h.{}.s",
-                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
-            )
-        };
-        assert_eq!(
-            tenant_of_jwt(&jwt_with(
-                serde_json::json!({"tenant_id": tenant.to_string()})
-            )),
-            Some(tenant)
-        );
-        assert_eq!(
-            tenant_of_jwt(&jwt_with(serde_json::json!({"tenant_id": "acme"}))),
-            None
-        );
-        assert_eq!(tenant_of_jwt(&jwt_with(serde_json::json!({}))), None);
-        assert_eq!(tenant_of_jwt("opaque-token"), None);
     }
 
     // ── Fail-open notice ────────────────────────────────────────────────

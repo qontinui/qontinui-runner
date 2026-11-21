@@ -133,18 +133,36 @@
 //! `production-and-cost#agent-spawn-authorization` requires a standing
 //! per-path opt-in that does not exist. When coord's config says `reopen`,
 //! this module does nothing — see [`Applicability::nudge_allowed`].
+//!
+//! ## Whose tenant — the session's
+//!
+//! Plan `2026-11-13-runner-stop-hook-continuation-rules-and-compliance-use-the-device-default-tenant`.
+//! Coord's compliance config and its compliance rows are per tenant. Both the
+//! config read and the POST present the credential of the SESSION's tenant:
+//! at turn end the one decision the continuation verdict made for this Stop,
+//! at close one resolved from the lifecycle record
+//! ([`crate::mcp::policy_tenant::closed_session_policy_decision`]). They used
+//! to present the device DEFAULT credential, so on a multi-bound device a
+//! session working another tenant's repo was gated by the default tenant's
+//! config and its rows landed in the default tenant. When the session's tenant
+//! is UNKNOWN nothing is read and nothing is filed — the turn or close is
+//! WITHHELD and counted ([`COMPLIANCE_WITHHELD_TENANT_UNKNOWN`]), never filed
+//! under the default tenant.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, info};
+use uuid::Uuid;
 
-use super::continuation_verdict::{coord_client_parts, http_client};
-use crate::session::session_lifecycle_store::SessionLifecycleStore;
+use super::continuation_verdict::{coord_base, http_client};
+use crate::mcp::policy_tenant::{self, PolicyTarget};
+use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use qontinui_runner_lib::file_tail::read_tail_lossy;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -312,42 +330,90 @@ impl ComplianceConfig {
     }
 }
 
-static CONFIG_CACHE: OnceLock<Mutex<Option<(Instant, Option<ComplianceConfig>)>>> = OnceLock::new();
+/// One config-cache slot: the coord base and the tenant whose credential read
+/// the config ([`PolicyTarget::tenant`]).
+///
+/// It used to be ONE slot keyed by nothing, so whichever tenant's config was
+/// read last gated every session on the box for the TTL. An UNKNOWN tenant
+/// reads and writes no entry (it reads nothing at all).
+type ConfigKey = (String, Option<Uuid>);
 
-fn config_cache() -> &'static Mutex<Option<(Instant, Option<ComplianceConfig>)>> {
-    CONFIG_CACHE.get_or_init(|| Mutex::new(None))
+type ConfigSlot = (Instant, Option<ComplianceConfig>);
+
+static CONFIG_CACHE: OnceLock<Mutex<HashMap<ConfigKey, ConfigSlot>>> = OnceLock::new();
+
+fn config_cache() -> &'static Mutex<HashMap<ConfigKey, ConfigSlot>> {
+    CONFIG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// TTL-cached enforcement-config read. `None` = coord could not be consulted
-/// (no JWT, transport error, non-2xx including the 404/501 this route returns
-/// until coord's Phase 3 lands, undecodable body) ⇒ the caller does nothing.
-async fn fetch_config() -> Option<ComplianceConfig> {
-    let now = Instant::now();
-    if let Ok(g) = config_cache().lock() {
-        if let Some((at, cached)) = g.as_ref() {
-            if now.duration_since(*at) < CONFIG_TTL {
-                return cached.clone();
-            }
-        }
-    }
-    let fresh = fetch_config_uncached().await;
+/// The config cached for `(base, tenant)` while within [`CONFIG_TTL`] of
+/// `now`. The outer `None` is a miss; `Some(None)` is a cached "coord could not
+/// be consulted".
+fn config_cache_lookup(
+    base: &str,
+    tenant: Option<Uuid>,
+    now: Instant,
+) -> Option<Option<ComplianceConfig>> {
+    let g = config_cache().lock().ok()?;
+    let (at, cached) = g.get(&(base.to_string(), tenant))?;
+    (now.duration_since(*at) < CONFIG_TTL).then(|| cached.clone())
+}
+
+/// Cache `config` as `(base, tenant)`'s, read at `at`.
+fn config_cache_store(
+    base: &str,
+    tenant: Option<Uuid>,
+    at: Instant,
+    config: Option<ComplianceConfig>,
+) {
     if let Ok(mut g) = config_cache().lock() {
-        *g = Some((now, fresh.clone()));
+        g.insert((base.to_string(), tenant), (at, config));
     }
+}
+
+/// TTL-cached enforcement-config read under `target`'s credential. `None` =
+/// coord could not be consulted (no usable credential for the target tenant,
+/// transport error, non-2xx including the 404/501 this route returns until
+/// coord's Phase 3 lands, undecodable body) ⇒ the caller does nothing.
+async fn fetch_config(target: PolicyTarget) -> Option<ComplianceConfig> {
+    let base = coord_base();
+    let now = Instant::now();
+    if let Some(cached) = config_cache_lookup(&base, target.tenant, now) {
+        return cached;
+    }
+    let fresh = fetch_config_uncached(&base, target).await;
+    config_cache_store(&base, target.tenant, now, fresh.clone());
     fresh
 }
 
-async fn fetch_config_uncached() -> Option<ComplianceConfig> {
-    let (base, jwt) = match coord_client_parts() {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("session-compliance: config skipped ({e})");
+/// The config GET under `target`'s credential (`coord_http::coord_get_for`),
+/// refused before it can be sent unless its bearer claims `target.tenant`.
+fn build_config_get(
+    client: &reqwest::Client,
+    base: &str,
+    target: PolicyTarget,
+) -> Result<reqwest::Request, String> {
+    policy_tenant::build_checked(
+        crate::coord_http::coord_get_for(
+            client,
+            format!("{base}/coord/session-compliance/config"),
+            target.scope,
+        ),
+        target,
+    )
+    .map(|(request, _presented)| request)
+}
+
+async fn fetch_config_uncached(base: &str, target: PolicyTarget) -> Option<ComplianceConfig> {
+    let client = http_client().ok()?;
+    let request = match build_config_get(&client, base, target) {
+        Ok(request) => request,
+        Err(reason) => {
+            debug!(reason = %reason, "session-compliance: config read not sent");
             return None;
         }
     };
-    let client = http_client().ok()?;
-    let url = format!("{base}/coord/session-compliance/config");
-    let resp = client.get(&url).bearer_auth(&jwt).send().await.ok()?;
+    let resp = client.execute(request).await.ok()?;
     if !resp.status().is_success() {
         debug!(
             status = resp.status().as_u16(),
@@ -357,6 +423,43 @@ async fn fetch_config_uncached() -> Option<ComplianceConfig> {
     }
     let body: Value = resp.json().await.ok()?;
     ComplianceConfig::from_body(&body)
+}
+
+// ===========================================================================
+// The session's tenant (Design §3)
+// ===========================================================================
+
+/// Process-lifetime count of compliance turns and closes WITHHELD because the
+/// session's tenant was UNKNOWN: no config read, no transcript read, no POST.
+/// Each withhold logs the running total as `withheld_total`; Phase 2's gate is
+/// that it stays 0 for sessions whose tenant resolves.
+static COMPLIANCE_WITHHELD_TENANT_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+
+/// The target compliance acts under — or `None`, WITHHELD, counted and logged,
+/// when the session's tenant is UNKNOWN. Never the default tenant: a row filed
+/// there would be a record about a session that tenant does not govern
+/// (served `verification-and-evidence` `unknown-must-not-render-as-a-default`).
+fn compliance_target(
+    tenant: &Result<PolicyTarget, String>,
+    at: &'static str,
+    session: &str,
+) -> Option<PolicyTarget> {
+    match tenant {
+        Ok(target) => Some(*target),
+        Err(reason) => {
+            let withheld_total =
+                COMPLIANCE_WITHHELD_TENANT_UNKNOWN.fetch_add(1, Ordering::Relaxed) + 1;
+            info!(
+                session = %session,
+                at,
+                withheld_total,
+                reason = %reason,
+                "session-compliance: compliance_withheld_tenant_unknown — the session's tenant is \
+                 unknown, so nothing was read or filed under any tenant"
+            );
+            None
+        }
+    }
 }
 
 // ===========================================================================
@@ -646,28 +749,54 @@ fn compliance_body(
     body
 }
 
-/// POST the (possibly absent) report to coord and return its verdict. `None`
-/// on every failure path — unreachable coord, 404/501 (the route does not
-/// exist on production coord yet), non-2xx, undecodable body.
+/// The compliance POST under `target`'s credential
+/// (`coord_http::coord_post_for`), refused before it can be sent unless its
+/// bearer claims `target.tenant` — so an unpaired runner, or a tenant with no
+/// usable slot, files nothing rather than filing anonymously.
+fn build_compliance_post(
+    client: &reqwest::Client,
+    base: &str,
+    claude_session_id: &str,
+    body: &Value,
+    target: PolicyTarget,
+) -> Result<reqwest::Request, String> {
+    policy_tenant::build_checked(
+        crate::coord_http::coord_post_for(
+            client,
+            format!("{base}/coord/sessions/{claude_session_id}/compliance"),
+            target.scope,
+        )
+        .json(body),
+        target,
+    )
+    .map(|(request, _presented)| request)
+}
+
+/// POST the (possibly absent) report to coord under `target`'s credential and
+/// return its verdict. `None` on every failure path — no usable credential,
+/// unreachable coord, 404/501 (the route does not exist on production coord
+/// yet), non-2xx, undecodable body.
 async fn post_compliance(
+    target: PolicyTarget,
     claude_session_id: &str,
     report: Option<&Value>,
     absent_reason: Option<&str>,
 ) -> Option<ComplianceVerdict> {
-    let (base, jwt) = coord_client_parts().ok()?;
     let client = http_client().ok()?;
-    let url = format!("{base}/coord/sessions/{claude_session_id}/compliance");
     let body = compliance_body(report, absent_reason, nudge_state_for(claude_session_id));
-    // coord-auth-exempt(device-jwt-required): `coord_client_parts` fails closed
-    // when unpaired, so the turn-end hook goes inert rather than filing a
-    // compliance verdict anonymously.
-    let resp = client
-        .post(&url)
-        .bearer_auth(&jwt)
-        .json(&body)
-        .send()
-        .await
-        .ok()?;
+    let request =
+        match build_compliance_post(&client, &coord_base(), claude_session_id, &body, target) {
+            Ok(request) => request,
+            Err(reason) => {
+                debug!(
+                    session = %claude_session_id,
+                    reason = %reason,
+                    "session-compliance: verdict POST not sent"
+                );
+                return None;
+            }
+        };
+    let resp = client.execute(request).await.ok()?;
     if !resp.status().is_success() {
         debug!(
             status = resp.status().as_u16(),
@@ -1165,13 +1294,26 @@ const TURN_END_BUDGET: Duration = Duration::from_millis(2500);
 /// `session_id` (the Claude UUID coord keys compliance on — *not* the runner
 /// terminal id the URL path may use) and the `transcript_path`.
 ///
+/// `tenant` is the ONE tenant decision the continuation verdict made for this
+/// Stop: the config read and the POST present that tenant's credential, and an
+/// UNKNOWN tenant withholds the whole turn ([`compliance_target`]).
+///
 /// Returns the nudge CANDIDATE. The caller
 /// ([`crate::mcp::continuation_verdict`]) owns the inherited loop guards
 /// (`stop_hook_active`, the rolling hourly cap) and calls [`mark_nudged`] only
 /// if it actually delivers. Every failure path — including exceeding
 /// [`TURN_END_BUDGET`] — returns `None`.
-pub async fn observe_turn_end(hook_input: &Value) -> Option<ComplianceNudge> {
-    match tokio::time::timeout(TURN_END_BUDGET, observe_turn_end_inner(hook_input)).await {
+pub async fn observe_turn_end(
+    hook_input: &Value,
+    tenant: &Result<PolicyTarget, String>,
+) -> Option<ComplianceNudge> {
+    let session = hook_input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let target = compliance_target(tenant, "turn_end", session)?;
+    match tokio::time::timeout(TURN_END_BUDGET, observe_turn_end_inner(hook_input, target)).await {
         Ok(nudge) => nudge,
         Err(_) => {
             debug!("session-compliance: turn-end budget exceeded — allowing the stop");
@@ -1180,17 +1322,22 @@ pub async fn observe_turn_end(hook_input: &Value) -> Option<ComplianceNudge> {
     }
 }
 
-async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
+async fn observe_turn_end_inner(
+    hook_input: &Value,
+    target: PolicyTarget,
+) -> Option<ComplianceNudge> {
     // 1. Applicability FIRST — before touching the transcript.
-    let config = fetch_config().await?;
+    let config = fetch_config(target).await?;
     let applicability = config.applicability();
     if !applicability.emits() {
         debug!(
             reason = %config.applicability_reason,
+            tenant = %policy_tenant::target_label(&Ok(target)),
             "session-compliance: inert for this tenant"
         );
         return None;
     }
+    let config_version = config.prompt_document_version;
 
     // 2. Identity + transcript, both straight off the hook payload.
     let session_id = hook_input
@@ -1224,13 +1371,13 @@ async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
     if !nudge_possible {
         let sid = session_id.to_string();
         tauri::async_runtime::spawn(async move {
-            let _ = emit(&sid, report.as_ref()).await;
+            let _ = emit(target, &sid, report.as_ref(), config_version).await;
         });
         return None;
     }
 
     // 4. Emit and wait — a nudge is possible, so the verdict is load-bearing.
-    let verdict = emit(session_id, report.as_ref()).await?;
+    let verdict = emit(target, session_id, report.as_ref(), config_version).await?;
 
     if verdict.verdict != "unverified" {
         return None;
@@ -1302,19 +1449,29 @@ fn detect(transcript: &Path) -> Option<Option<Value>> {
     Some(scan_transcript(&tail))
 }
 
-/// POST the detection result and log the outcome.
-async fn emit(session_id: &str, report: Option<&Value>) -> Option<ComplianceVerdict> {
+/// POST the detection result under `target`'s credential and log the
+/// outcome, naming the tenant it was filed under and the version of that
+/// tenant's prompt document its config was read against.
+async fn emit(
+    target: PolicyTarget,
+    session_id: &str,
+    report: Option<&Value>,
+    config_version: Option<i64>,
+) -> Option<ComplianceVerdict> {
     let absent_reason = if report.is_none() {
         Some(ABSENT_NO_BLOCK)
     } else {
         None
     };
-    let verdict = post_compliance(session_id, report, absent_reason).await?;
+    let verdict = post_compliance(target, session_id, report, absent_reason).await?;
     info!(
         session = %session_id,
         block_present = report.is_some(),
         verdict = %verdict.verdict,
         reason = %verdict.reason,
+        tenant = %policy_tenant::target_label(&Ok(target)),
+        config_prompt_document_version = %config_version
+            .map_or_else(|| "none".to_string(), |v| v.to_string()),
         "session-compliance"
     );
     Some(verdict)
@@ -1357,8 +1514,8 @@ pub fn finalize_on_close(claude_session_id: &str, store: &Weak<SessionLifecycleS
         return;
     }
     let session_id = claude_session_id.to_string();
+    let inputs = CloseTenantInputs::of(&record);
     let config_dir = record.config_dir;
-    let working_dir = record.working_dir;
     tauri::async_runtime::spawn(async move {
         // The liveness poll closes many stale records at once after a crash
         // restart, and every one of these does a config-dir walk, a multi-MB
@@ -1368,8 +1525,52 @@ pub fn finalize_on_close(claude_session_id: &str, store: &Weak<SessionLifecycleS
             Ok(p) => p,
             Err(_) => return,
         };
-        finalize_impl(&session_id, config_dir.as_deref(), working_dir.as_deref()).await;
+        // Whose compliance this is: the session's tenant, resolved from the
+        // record (Design §5). The nonce may already be released, so the
+        // registry leg usually decides.
+        let decision = policy_tenant::closed_session_policy_decision(
+            &inputs.terminal_id,
+            &session_id,
+            inputs.working_dir.as_deref(),
+            inputs.recorded_row,
+            CLOSE_TENANT_BUDGET,
+        )
+        .await;
+        let tenant = policy_tenant::fetch_target(decision, policy_tenant::default_slot_tenant);
+        finalize_impl(
+            &session_id,
+            config_dir.as_deref(),
+            inputs.working_dir.as_deref(),
+            &tenant,
+        )
+        .await;
     });
+}
+
+/// How long the close-time finalize waits for the session's tenant. Nothing
+/// waits on it — the finalize is detached — so it may take what SessionStart
+/// takes; a read that has not settled is `Unnamed` (UNKNOWN on a multi-bound
+/// device, which withholds).
+const CLOSE_TENANT_BUDGET: Duration = policy_tenant::ROUTE_TENANT_BUDGET;
+
+/// What a closed lifecycle record names for its close-time tenant decision
+/// (Design §5): the terminal that hosted it, its working dir, and the coord
+/// row it records (`finish_coord_session_id`). Pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloseTenantInputs {
+    terminal_id: String,
+    working_dir: Option<String>,
+    recorded_row: Option<Uuid>,
+}
+
+impl CloseTenantInputs {
+    fn of(record: &TerminalSessionRecord) -> Self {
+        CloseTenantInputs {
+            terminal_id: record.terminal_id.clone(),
+            working_dir: record.working_dir.clone(),
+            recorded_row: record.finish_coord_session_id,
+        }
+    }
 }
 
 /// Concurrency bound for close-time finalizes (see [`finalize_on_close`]).
@@ -1381,13 +1582,22 @@ fn finalize_permits() -> &'static tokio::sync::Semaphore {
     FINALIZE_PERMITS.get_or_init(|| tokio::sync::Semaphore::new(FINALIZE_CONCURRENCY))
 }
 
-async fn finalize_impl(session_id: &str, config_dir: Option<&str>, working_dir: Option<&str>) {
-    let Some(config) = fetch_config().await else {
+async fn finalize_impl(
+    session_id: &str,
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    tenant: &Result<PolicyTarget, String>,
+) {
+    let Some(target) = compliance_target(tenant, "session_close", session_id) else {
+        return;
+    };
+    let Some(config) = fetch_config(target).await else {
         return;
     };
     if !config.applicability().emits() {
         return;
     }
+    let config_version = config.prompt_document_version;
     let Some(path) = resolve_transcript(config_dir, working_dir, session_id) else {
         debug!(session = %session_id, "session-compliance: no transcript at close — no-op");
         return;
@@ -1397,7 +1607,7 @@ async fn finalize_impl(session_id: &str, config_dir: Option<&str>, working_dir: 
     let Ok(Some(report)) = spawn_blocking_tracked(move || detect(&path)).await else {
         return;
     };
-    let _ = emit(session_id, report.as_ref()).await;
+    let _ = emit(target, session_id, report.as_ref(), config_version).await;
 }
 
 /// Locate the on-disk transcript for a closed session. Prefers the recorded
@@ -2380,5 +2590,177 @@ mod tests {
     fn a_missing_transcript_reads_none_and_never_panics() {
         assert!(read_transcript_tail(Path::new("/definitely/not/here.jsonl")).is_none());
         assert!(detect(Path::new("/definitely/not/here.jsonl")).is_none());
+    }
+
+    // ── The session's tenant (plan 2026-11-13-runner-stop-hook-…) ───────
+
+    fn tenant_n(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    fn withheld() -> u64 {
+        COMPLIANCE_WITHHELD_TENANT_UNKNOWN.load(Ordering::Relaxed)
+    }
+
+    fn config_with_version(version: i64) -> ComplianceConfig {
+        ComplianceConfig::from_body(&json!({
+            "enabled": true, "applicable": true,
+            "applicability_reason": "applicable",
+            "prompt_document_version": version
+        }))
+        .expect("config")
+    }
+
+    /// Tests bullet 3 (config half). The default credential claims A, the
+    /// session is B: B's config is cached under (base, B), and a session of
+    /// tenant A never reads it. The old single slot served the last read to
+    /// every tenant.
+    #[test]
+    fn tenant_bs_config_is_cached_under_base_b_and_never_served_to_a() {
+        let (a, b) = (tenant_n(0xA1), tenant_n(0xB2));
+        let base = "https://compliance-config-b-not-a.example";
+        let now = Instant::now();
+        config_cache_store(base, Some(b), now, Some(config_with_version(9)));
+        assert_eq!(
+            config_cache_lookup(base, Some(b), now),
+            Some(Some(config_with_version(9)))
+        );
+        assert_eq!(config_cache_lookup(base, Some(a), now), None);
+        assert_eq!(config_cache_lookup(base, None, now), None);
+        // A cached "could not consult" is a hit, distinct from a miss.
+        config_cache_store(base, Some(a), now, None);
+        assert_eq!(config_cache_lookup(base, Some(a), now), Some(None));
+        assert_eq!(
+            config_cache_lookup(base, Some(b), now + CONFIG_TTL + Duration::from_secs(1)),
+            None,
+            "the TTL still applies per slot"
+        );
+    }
+
+    /// Tests bullets 3 and 4 (request half). The config GET and the
+    /// compliance POST are built under the TARGET tenant's scope, and for a
+    /// tenant this runner holds no usable credential for, neither is built to
+    /// send: no anonymous POST, and never under the default credential.
+    #[test]
+    fn no_config_read_or_compliance_post_is_built_for_a_tenant_with_no_usable_credential() {
+        let client = reqwest::Client::new();
+        let t = Uuid::new_v4();
+        let target = PolicyTarget {
+            scope: crate::auth::TenantScope::Owned(t),
+            tenant: Some(t),
+        };
+        let base = "https://coord.example.com";
+        let config = build_config_get(&client, base, target)
+            .expect_err("no config read for a tenant with no credential");
+        let body = compliance_body(None, Some(ABSENT_NO_BLOCK), None);
+        let post = build_compliance_post(
+            &client,
+            base,
+            "11111111-1111-1111-1111-111111111111",
+            &body,
+            target,
+        )
+        .expect_err("no compliance POST for a tenant with no credential");
+        for refused in [config, post] {
+            assert!(
+                refused.contains(&format!("no usable credential claiming tenant {t}")),
+                "{refused}"
+            );
+        }
+    }
+
+    /// Tests bullet 3 (withhold half). An unresolvable tenant on a
+    /// multi-bound device is UNKNOWN: the turn end makes no request at all —
+    /// no config read, so no POST — and the withhold is counted.
+    #[tokio::test]
+    async fn an_unknown_tenant_on_a_multi_bound_device_posts_nothing_and_is_counted() {
+        use crate::mcp::policy_tenant::{fetch_target, policy_tenant_decision, PolicyTenantRead};
+        let tenant = fetch_target(
+            policy_tenant_decision(
+                PolicyTenantRead::Unnamed("no coord-mcp session key names this session".into()),
+                true,
+            ),
+            || panic!("an Unknown never reads the default credential's tenant"),
+        );
+        assert!(tenant.is_err(), "{tenant:?}");
+
+        let before = withheld();
+        let hook = json!({
+            "session_id": "22222222-2222-2222-2222-222222222222",
+            "transcript_path": "/definitely/not/here.jsonl"
+        });
+        assert!(observe_turn_end(&hook, &tenant).await.is_none());
+        assert!(
+            withheld() > before,
+            "the withhold is counted in compliance_withheld_tenant_unknown"
+        );
+        assert_eq!(compliance_target(&tenant, "turn_end", "s"), None);
+    }
+
+    /// Tests bullet 5. The close-time finalize resolves its tenant from the
+    /// lifecycle record — its terminal, its working dir, its recorded coord
+    /// row — and an UNKNOWN decision withholds (counted) before any read.
+    #[tokio::test]
+    async fn the_close_time_finalize_resolves_from_the_record_and_unknown_withholds() {
+        let row = Uuid::new_v4();
+        let record: TerminalSessionRecord = serde_json::from_value(json!({
+            "claudeSessionId": "33333333-3333-3333-3333-333333333333",
+            "workingDir": "/work/bauhaus-b2b-shop",
+            "pageId": "p", "zoneIndex": 0,
+            "terminalId": "term-7",
+            "openedAt": 1, "lastSeenAt": 2,
+            "state": "closed",
+            "finishCoordSessionId": row.to_string()
+        }))
+        .expect("a lifecycle record");
+        assert_eq!(
+            CloseTenantInputs::of(&record),
+            CloseTenantInputs {
+                terminal_id: "term-7".to_string(),
+                working_dir: Some("/work/bauhaus-b2b-shop".to_string()),
+                recorded_row: Some(row),
+            }
+        );
+
+        let before = withheld();
+        finalize_impl(
+            &record.claude_session_id,
+            None,
+            record.working_dir.as_deref(),
+            &Err("this session's tenant is UNKNOWN".to_string()),
+        )
+        .await;
+        assert!(
+            withheld() > before,
+            "an UNKNOWN close is withheld and counted"
+        );
+    }
+
+    /// Tests bullet 7. A single-bound device behaves exactly as before: an
+    /// inconclusive read decides the default slot, which IS a target — the
+    /// compliance turn proceeds under the default credential and nothing is
+    /// withheld.
+    #[test]
+    fn a_single_bound_device_files_under_the_default_slot_as_before() {
+        use crate::mcp::policy_tenant::{fetch_target, policy_tenant_decision, PolicyTenantRead};
+        let a = tenant_n(0xA1);
+        let tenant = fetch_target(
+            policy_tenant_decision(PolicyTenantRead::Unnamed("inconclusive".into()), false),
+            || Some(a),
+        );
+        assert_eq!(
+            compliance_target(&tenant, "turn_end", "s"),
+            Some(PolicyTarget {
+                scope: crate::auth::TenantScope::Device,
+                tenant: Some(a),
+            })
+        );
+    }
+
+    /// Design §4: the Stop route's tenant read fits inside the turn-end
+    /// budget, so a slow read decides UNKNOWN rather than eating the hook.
+    #[test]
+    fn the_stop_tenant_budget_is_below_the_turn_end_budget() {
+        assert!(policy_tenant::STOP_TENANT_BUDGET < TURN_END_BUDGET);
     }
 }
