@@ -332,24 +332,22 @@ impl ClaudeSession {
         // losslessly from that transcript. The chat path passes the runner's
         // own `session_id` (== task_run_id) as the CLI id so resume is
         // deterministic without persisting a separate Claude-internal id.
-        // `None` preserves today's behavior (CLI generates a random id).
-        let (session_id_pin, resume_id_pin) = match cli_session_ctx {
-            Some(ctx) if ctx.is_resume => {
-                info!(
-                    "Resuming Claude CLI session {} for interactive session {}",
-                    ctx.cli_session_id, session_id
-                );
-                (None, Some(ctx.cli_session_id.clone()))
-            }
-            Some(ctx) => {
-                info!(
-                    "Pinning Claude CLI session id {} for interactive session {}",
-                    ctx.cli_session_id, session_id
-                );
-                (Some(ctx.cli_session_id.clone()), None)
-            }
-            None => (None, None),
-        };
+        // `None` mints a fresh id here instead of letting the CLI pick one, so
+        // the id is in argv where the session census reads it (see
+        // `runner::cli_session_pins`).
+        let (session_id_pin, resume_id_pin) =
+            crate::claude_session::runner::cli_session_pins(cli_session_ctx);
+        match (&session_id_pin, &resume_id_pin) {
+            (_, Some(resume)) => info!(
+                "Resuming Claude CLI session {} for interactive session {}",
+                resume, session_id
+            ),
+            (Some(pin), None) => info!(
+                "Pinning Claude CLI session id {} for interactive session {}",
+                pin, session_id
+            ),
+            (None, None) => {}
+        }
 
         // Model override (e.g., from per-stage config) is fed to the seam below
         // as `spec.model` so it wins over any template `--model`.
