@@ -592,6 +592,32 @@ mod tests {
             }),
             "identity leaf color.role.surface is agent-authored",
         );
+        // An agent-authored family (the second undeclared leaf is
+        // `type.family.sans`). The template carries no imagery leaf, so the
+        // `imagery` disjunct has no seed here.
+        reddens(
+            mutate("design/language.dtcg.json", &|c| {
+                let first = c.find("\"source\": \"undeclared\"").unwrap() + 1;
+                let at = first + c[first..].find("\"source\": \"undeclared\"").unwrap();
+                format!(
+                    "{}\"source\": \"authored(x)\"{}",
+                    &c[..at],
+                    &c[at + "\"source\": \"undeclared\"".len()..]
+                )
+            }),
+            "identity leaf type.family.sans is agent-authored",
+        );
+        // A bare `authored` source, with no parenthesised reference at all.
+        reddens(
+            mutate("design/language.dtcg.json", &|c| {
+                c.replacen(
+                    "authored(a784185b-4f36-4ad1-b57a-30ef4fbfc9ee)",
+                    "authored",
+                    1,
+                )
+            }),
+            "carries no notification_ref",
+        );
         // An authored leaf with no notification reference.
         reddens(
             mutate("design/language.dtcg.json", &|c| {
