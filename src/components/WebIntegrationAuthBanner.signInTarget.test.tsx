@@ -63,7 +63,7 @@ const RELEASE_LOOPBACK = { ...DEBUG_LOOPBACK, backendUrlRefused: true };
 
 let host: HTMLDivElement;
 let root: Root;
-/** What the next `get_web_integration_status` read answers: a status, or an Error to reject. */
+/** What the next `get_web_integration_status` read answers: a status, an Error to reject, or a pending Promise. */
 let statusReply: unknown;
 
 function emit(event: string, payload: unknown = null) {
@@ -77,6 +77,7 @@ beforeEach(() => {
   invokeMock.mockImplementation((cmd: string) => {
     switch (cmd) {
       case "get_web_integration_status":
+        if (statusReply instanceof Promise) return statusReply;
         return statusReply instanceof Error
           ? Promise.reject(statusReply)
           : Promise.resolve(statusReply);
@@ -148,6 +149,27 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     expect(await clickAuthorize()).toBe("https://api.qontinui.io");
   });
 
+  it("ignores an older failed re-read that settles after a newer successful one", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    await mount();
+    let rejectOlder!: (e: Error) => void;
+    statusReply = new Promise((_resolve, reject) => {
+      rejectOlder = reject;
+    });
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    statusReply = DEBUG_LOOPBACK;
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {
+      rejectOlder(new Error("slow read failed late"));
+    });
+    await act(async () => {});
+    expect(await clickAuthorize()).toBe("http://127.0.0.1:8000");
+  });
+
   it("targets the saved loopback backend again once a later re-read succeeds", async () => {
     statusReply = DEBUG_LOOPBACK;
     await mount();
@@ -155,6 +177,9 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     await act(async () => {
       emit("web-integration-changed");
     });
+    await act(async () => {});
+    // The failing re-read has taken effect before the next one is issued.
+    expect(await clickAuthorize()).toBe("https://api.qontinui.io");
     statusReply = DEBUG_LOOPBACK;
     await act(async () => {
       emit("web-integration-changed");

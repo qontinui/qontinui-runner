@@ -101,7 +101,9 @@ function decide(status: SavedBackendStatus | null, surface: SignInSurface): Sign
     );
   }
   if (status.backendUrlMachineLocal !== false) {
-    return production("The runner did not report a build verdict for the saved URL.");
+    return production(
+      "The runner did not report whether the saved URL is machine-local (verdict missing).",
+    );
   }
   return { target: saved, reason: null };
 }

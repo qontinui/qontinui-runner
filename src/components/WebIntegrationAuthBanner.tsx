@@ -33,7 +33,7 @@
  * so the integration showcase can find and interact with them via id.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useUIElement } from "@qontinui/ui-bridge";
@@ -111,6 +111,8 @@ export function WebIntegrationAuthBanner() {
   // same rule AccountSettings applies by clearing its status on a failed
   // re-read. A stale read targets production, like `null`.
   const [statusReadFailed, setStatusReadFailed] = useState(false);
+  // Issue order of status reads; a read that is no longer the latest drops its result.
+  const statusReadSeq = useRef(0);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );
@@ -215,9 +217,13 @@ export function WebIntegrationAuthBanner() {
     let cancelled = false;
 
     const fetchStatus = () => {
+      // Reads overlap (mount + each `web-integration-changed`) and may settle
+      // out of order; only the most recently ISSUED read may set state, so
+      // "the latest read failed" means exactly that.
+      const seq = ++statusReadSeq.current;
       invoke<AuthBannerStatus & SavedBackendStatus>("get_web_integration_status")
         .then((next) => {
-          if (cancelled) return;
+          if (cancelled || seq !== statusReadSeq.current) return;
           setStatus(next);
           setStatusReadFailed(false);
         })
@@ -226,7 +232,7 @@ export function WebIntegrationAuthBanner() {
           // the banner hidden rather than crashing — `status` stays null.
           // A failed RE-read keeps the previous `status` for visibility but
           // marks it stale, so Authorize no longer targets it.
-          if (cancelled) return;
+          if (cancelled || seq !== statusReadSeq.current) return;
           setStatusReadFailed(true);
         });
     };
