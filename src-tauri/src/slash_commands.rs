@@ -5,8 +5,12 @@
 
 use crate::capability_manifest::{record_observation, record_provision, ProvisionReport, Rung};
 use crate::database::pg::parse_workflow_id;
+use crate::mcp::types::ApiResponse;
 use crate::str_utils::truncate_str;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
+use axum::http::StatusCode;
+use qontinui_types::paths::{SiblingCheckoutAbsent, SiblingFallback, WorkspaceRootUnresolved};
+use qontinui_types::refusal::RefusalSource;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
@@ -46,53 +50,134 @@ pub struct SyncResult {
     pub errors: Vec<String>,
 }
 
+/// The sibling checkout this import scans. It has no embedded or bundled copy.
+const COMMANDS_SIBLING: &str = "qontinui-claude-config";
+
+/// Why a sync could not run. The first two arms are the device simply not
+/// having the checkout this import reads, which is the normal state of an
+/// installed runner, so each one maps to the shared typed refusal (a `422`
+/// carrying the schemas `Refusal`, next action included) instead of a `500`.
+/// Only [`SyncError::Failed`] is a fault.
+#[derive(Debug)]
+pub enum SyncError {
+    /// No workspace root resolved, so there was nowhere to look for the
+    /// checkout.
+    RootUnresolved(WorkspaceRootUnresolved),
+    /// A workspace root resolved but holds no
+    /// `qontinui-claude-config/.claude/commands`. Nothing else can serve the
+    /// import, so this is the unsupported arm of
+    /// [`SiblingCheckoutAbsent`].
+    CheckoutAbsent { commands_dir: PathBuf },
+    /// The checkout was there and the sync still failed: an unreadable
+    /// directory or an unavailable database pool.
+    Failed(String),
+}
+
+impl SyncError {
+    fn sibling_absent() -> SiblingCheckoutAbsent {
+        SiblingCheckoutAbsent::new(COMMANDS_SIBLING, SiblingFallback::Unsupported)
+    }
+
+    /// The HTTP status and error body for this failure. The two absent-checkout
+    /// arms answer `422` with the schemas `Refusal` in `hint` and its code in
+    /// `code` (the shape of [`ApiResponse::workspace_root_unresolved`]); a
+    /// genuine fault stays a `500`.
+    pub fn into_response(self) -> (StatusCode, ApiResponse<()>) {
+        match self {
+            SyncError::RootUnresolved(unresolved) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiResponse::workspace_root_unresolved(&unresolved),
+            ),
+            SyncError::CheckoutAbsent { .. } => {
+                let absent = Self::sibling_absent();
+                // `Unsupported` always yields an envelope; `refusal` is `None`
+                // only on the embedded-copy arm, which this import has not got.
+                let refusal =
+                    absent.refusal(RefusalSource::Runner, chrono::Utc::now().to_rfc3339());
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    ApiResponse {
+                        success: false,
+                        data: None,
+                        error: Some(absent.to_string()),
+                        error_detail: None,
+                        code: refusal.as_ref().map(|r| r.code.as_str().to_string()),
+                        hint: refusal.and_then(|r| serde_json::to_value(r).ok()),
+                        suggestions: None,
+                    },
+                )
+            }
+            SyncError::Failed(why) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::error(format!("Slash command sync failed: {why}")),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncError::RootUnresolved(unresolved) => write!(f, "{unresolved}"),
+            SyncError::CheckoutAbsent { commands_dir } => write!(
+                f,
+                "{} Looked for {}.",
+                Self::sibling_absent(),
+                commands_dir.display()
+            ),
+            SyncError::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// Find the commands directory relative to the workspace root, **and report
 /// which rung answered**.
 ///
 /// This import has no embedded or bundled fallback of any kind: it is a scan of
 /// a SIBLING checkout (`qontinui-claude-config`) and nothing else. On a device
-/// without that repo it does not degrade — it cannot run at all, and until plan
-/// `2026-08-31-published-build-parity-check` Phase 3 the only trace of that was
-/// a `String` error returned to whoever happened to call it. The report is what
-/// makes it a stated [`Rung::Unresolved`](crate::capability_manifest::Rung)
-/// finding instead.
+/// without that repo it does not degrade — it cannot run at all. The report
+/// makes that a stated [`Rung::Unresolved`](crate::capability_manifest::Rung)
+/// finding, and the typed [`SyncError`] makes it a refusal at the HTTP route
+/// rather than a `500`.
 ///
 /// The workspace root comes from the runner's one resolver
 /// ([`crate::workspace_paths::runner_workspace_root`]), so an unresolved root is
-/// its typed `WorkspaceRootUnresolved`, rendered into both the `Err` and the
-/// report — never a sentence of this module's own.
-fn find_commands_directory_reported() -> (Result<(PathBuf, PathBuf), String>, ProvisionReport) {
-    let workspace_root = match crate::workspace_paths::runner_workspace_root().require() {
+/// its typed `WorkspaceRootUnresolved` — never a sentence of this module's own.
+fn find_commands_directory_reported() -> (Result<(PathBuf, PathBuf), SyncError>, ProvisionReport) {
+    commands_directory_in(crate::workspace_paths::runner_workspace_root().require())
+}
+
+/// [`find_commands_directory_reported`] over an already-resolved workspace
+/// root, so the absent-checkout arms are testable without the ambient resolver.
+fn commands_directory_in(
+    workspace_root: Result<PathBuf, WorkspaceRootUnresolved>,
+) -> (Result<(PathBuf, PathBuf), SyncError>, ProvisionReport) {
+    let workspace_root = match workspace_root {
         Ok(root) => root,
         Err(unresolved) => {
-            return (
-                Err(unresolved.to_string()),
-                ProvisionReport::unresolved(
-                    "slash_commands",
-                    0,
-                    "<workspace-root>/qontinui-claude-config/.claude/commands",
-                    unresolved.to_string(),
-                ),
+            let report = ProvisionReport::unresolved(
+                "slash_commands",
+                0,
+                "<workspace-root>/qontinui-claude-config/.claude/commands",
+                unresolved.to_string(),
             );
+            return (Err(SyncError::RootUnresolved(unresolved)), report);
         }
     };
     let commands_dir = workspace_root
-        .join("qontinui-claude-config")
+        .join(COMMANDS_SIBLING)
         .join(".claude")
         .join("commands");
 
-    if !commands_dir.exists() {
-        let why = format!("Commands directory not found: {}", commands_dir.display());
-        return (
-            Err(why.clone()),
-            ProvisionReport::unresolved(
-                "slash_commands",
-                0,
-                commands_dir.display().to_string(),
-                "this device has no qontinui-claude-config checkout, and this import has \
-                 no embedded or bundled fallback — the workflows simply do not exist here",
-            ),
+    if !commands_dir.is_dir() {
+        let report = ProvisionReport::unresolved(
+            "slash_commands",
+            0,
+            commands_dir.display().to_string(),
+            "this device has no qontinui-claude-config checkout, and this import has \
+             no embedded or bundled fallback — the workflows simply do not exist here",
         );
+        return (Err(SyncError::CheckoutAbsent { commands_dir }), report);
     }
 
     let report = ProvisionReport::new("slash_commands", 0, Rung::OperatorCheckout)
@@ -287,14 +372,15 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
 )]
 pub async fn sync_slash_commands(
     pg: &std::sync::Arc<crate::database::pg::PgDb>,
-) -> Result<SyncResult, String> {
+) -> Result<SyncResult, SyncError> {
     let (resolved, mut report) = find_commands_directory_reported();
     let (workspace_root, commands_dir) = match resolved {
         Ok(paths) => paths,
         Err(e) => {
-            // Unchanged control flow — the caller still gets this `Err` — but
-            // the unresolved checkout is now a manifest row rather than only a
-            // string that dies at the call site.
+            // The absent checkout is a manifest row AND a typed error the
+            // route renders as the shared refusal. Returning before the
+            // database is touched also means an absent checkout never deletes
+            // previously imported workflows.
             record_observation("slash_commands", report.observation());
             return Err(e);
         }
@@ -303,7 +389,7 @@ pub async fn sync_slash_commands(
     // Parse all command files from disk
     let mut disk_commands: HashMap<String, SlashCommandParsed> = HashMap::new();
     let entries = std::fs::read_dir(&commands_dir)
-        .map_err(|e| format!("Failed to read commands directory: {}", e))?;
+        .map_err(|e| SyncError::Failed(format!("Failed to read commands directory: {}", e)))?;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -371,7 +457,7 @@ pub async fn sync_slash_commands(
                 .pool()
                 .get()
                 .await
-                .map_err(|e| format!("PG pool: {}", e))?;
+                .map_err(|e| SyncError::Failed(format!("PG pool: {}", e)))?;
             let current_hash: Option<String> = conn
                 .query_opt(
                     "SELECT source_content_hash FROM unified_workflows WHERE id = $1",
@@ -513,6 +599,72 @@ mod tests {
 
         let without_args = "# Clean\n\nClean stuff.\n\n## Steps\n\nDo things.";
         assert!(!without_args.contains("$ARGUMENTS"));
+    }
+
+    /// Regression for coord finding 3dad3856: on a device whose workspace root
+    /// resolves but holds no qontinui-claude-config checkout (the parity
+    /// harness's dev leg: an exe-relative root with no sibling), the sync used
+    /// to fail with a bare string that the route served as a 500. It must be
+    /// the typed `sibling_checkout_absent` refusal with a next action instead.
+    #[test]
+    fn a_root_without_the_commands_checkout_refuses_typed_not_500() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (resolved, report) = commands_directory_in(Ok(root.path().to_path_buf()));
+        assert_eq!(report.observation().rung, Rung::Unresolved);
+        let err = resolved.expect_err("no checkout, no sync");
+        assert!(matches!(err, SyncError::CheckoutAbsent { .. }), "{err:?}");
+
+        let (status, body) = err.into_response();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!body.success);
+        assert_eq!(body.code.as_deref(), Some("sibling_checkout_absent"));
+        let hint = body.hint.expect("the Refusal travels in hint");
+        assert_eq!(hint["code"], "sibling_checkout_absent");
+        assert_eq!(hint["discriminator"], COMMANDS_SIBLING);
+        assert_eq!(hint["next_action"]["kind"], "none_terminal");
+        assert!(!body.error.unwrap_or_default().is_empty());
+    }
+
+    /// The published leg: no workspace root at all. The route answers the
+    /// shared workspace-root refusal, not a 500.
+    #[test]
+    fn an_unresolved_root_refuses_with_the_shared_workspace_root_refusal() {
+        use qontinui_types::paths::{RejectedRoot, RootRejection, RootSource};
+        let unresolved = WorkspaceRootUnresolved {
+            rejected: RejectedRoot {
+                source: RootSource::Probes,
+                reason: RootRejection::NothingConfigured,
+            },
+        };
+        let (resolved, report) = commands_directory_in(Err(unresolved));
+        assert_eq!(report.observation().rung, Rung::Unresolved);
+        let (status, body) = resolved.expect_err("no root, no sync").into_response();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.code.as_deref(), Some("workspace_root_unresolved"));
+        let hint = body.hint.expect("the Refusal travels in hint");
+        assert_eq!(hint["code"], "workspace_root_unresolved");
+        assert!(hint["next_action"]["kind"].is_string());
+    }
+
+    /// A checkout that IS there resolves, and a genuine fault stays a 500.
+    #[test]
+    fn a_present_checkout_resolves_and_a_real_fault_stays_500() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root
+            .path()
+            .join(COMMANDS_SIBLING)
+            .join(".claude")
+            .join("commands");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (resolved, report) = commands_directory_in(Ok(root.path().to_path_buf()));
+        assert_eq!(report.observation().rung, Rung::OperatorCheckout);
+        let (got_root, got_dir) = resolved.expect("checkout present");
+        assert_eq!(got_root, root.path());
+        assert_eq!(got_dir, dir);
+
+        let (status, body) = SyncError::Failed("PG pool: down".into()).into_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.error.unwrap_or_default().contains("PG pool: down"));
     }
 
     #[test]
