@@ -78,11 +78,7 @@ impl FrameLaunch {
     /// Validate the three frame keys. `settings` is the `launch_settings`
     /// object (`{spawn_type, model_source, effort_source}`), used only to
     /// label the log line.
-    pub fn from_frame(
-        model: Option<&str>,
-        effort: Option<&str>,
-        settings: Option<&Value>,
-    ) -> Self {
+    pub fn from_frame(model: Option<&str>, effort: Option<&str>, settings: Option<&Value>) -> Self {
         let model = accept("launch_model", model, &MODEL_FAMILIES);
         let effort = accept("launch_effort", effort, &EFFORT_LEVELS);
         let label = |key: &str| {

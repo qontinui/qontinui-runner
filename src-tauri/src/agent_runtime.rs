@@ -14713,7 +14713,10 @@ mod tests {
             "target_device_id": uuid::Uuid::nil(),
             "initial_prompt": "go",
         });
-        inner.as_object_mut().unwrap().extend(launch.as_object().unwrap().clone());
+        inner
+            .as_object_mut()
+            .unwrap()
+            .extend(launch.as_object().unwrap().clone());
         serde_json::json!({ "payload": inner })
     }
 
@@ -14779,8 +14782,7 @@ mod tests {
     /// A frame with no launch keys leaves the argv exactly as before.
     #[test]
     fn frame_without_launch_keys_leaves_the_argv_unchanged() {
-        let payload =
-            parse_gate_continuation_payload(&frame_with(serde_json::json!({}))).unwrap();
+        let payload = parse_gate_continuation_payload(&frame_with(serde_json::json!({}))).unwrap();
         let cfg = crate::claude_session::launch_spec::LaunchConfig::default();
         let args = |launch: &crate::claude_session::frame_launch::FrameLaunch| {
             build_continuation_claude_command_with(
@@ -14845,7 +14847,10 @@ mod tests {
         }))
         .unwrap();
         let l = lp.launch.resolve();
-        assert_eq!((l.model.as_deref(), l.effort.as_deref()), (Some("fable"), Some("xhigh")));
+        assert_eq!(
+            (l.model.as_deref(), l.effort.as_deref()),
+            (Some("fable"), Some("xhigh"))
+        );
         let cp = condition_payload(None, "p".to_string());
         assert!(cp.launch.resolve().is_empty());
     }
