@@ -25,6 +25,7 @@ use crate::commands::logging::AiOutputEntry;
 use crate::context;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
+use crate::generation_rules as rules;
 use crate::skills::SkillRegistry;
 use crate::str_utils::truncate_str;
 use crate::unified_workflows::UnifiedWorkflow;
@@ -36,7 +37,6 @@ use crate::workflow_generation::pipeline_artifacts::{
     compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
 };
 use crate::workflow_generation::revision;
-use crate::generation_rules as rules;
 use crate::workflow_generation::schema_context::{
     build_gotchas_section, build_rules_section_for_tier, build_schema_context,
     build_schema_context_full, format_skills_for_generator, format_skills_for_generator_filtered,
@@ -2614,7 +2614,8 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     }
 
     // Append structured output format instructions
-    let output_format_instructions = crate::validation::structured_output::build_output_format_instructions();
+    let output_format_instructions =
+        crate::validation::structured_output::build_output_format_instructions();
     final_prompt.push_str("\n\n");
     final_prompt.push_str(&output_format_instructions);
 

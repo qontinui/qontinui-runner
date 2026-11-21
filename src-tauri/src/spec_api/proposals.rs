@@ -493,35 +493,31 @@ pub async fn post_execute(
     // integration time, an unresolved import here means the sibling's PR
     // hasn't landed yet.
     let app_state_for_validator = app_state.clone();
-    let outcome = match crate::spec_api::authoring::author_candidate(
-        pg_db.clone(),
-        app_state,
-        &app_id,
-        mode,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            let reason = authoring_error_reason(&e);
-            let detail = authoring_error_detail(&e);
-            let _ = pg_db
-                .update_proposal_status_with_error(&row.id, "failed", &detail)
-                .await;
-            metric_executed_inc("authoring-failed");
-            return (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": false,
-                    "proposalId": row.id,
-                    "outcome": "authoring-failed",
-                    "reason": reason,
-                    "detail": detail,
-                })),
-            )
-                .into_response();
-        }
-    };
+    let outcome =
+        match crate::spec_api::authoring::author_candidate(pg_db.clone(), app_state, &app_id, mode)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let reason = authoring_error_reason(&e);
+                let detail = authoring_error_detail(&e);
+                let _ = pg_db
+                    .update_proposal_status_with_error(&row.id, "failed", &detail)
+                    .await;
+                metric_executed_inc("authoring-failed");
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": false,
+                        "proposalId": row.id,
+                        "outcome": "authoring-failed",
+                        "reason": reason,
+                        "detail": detail,
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Step 8 — three-gate validator (distinctness → round-trip → coverage →
     // b-green). On Err, surface as `validator-rejected` + persist the
@@ -644,9 +640,7 @@ pub async fn post_execute(
         .into_response()
 }
 
-fn authoring_error_reason(
-    e: &crate::spec_api::authoring::AuthoringError,
-) -> &'static str {
+fn authoring_error_reason(e: &crate::spec_api::authoring::AuthoringError) -> &'static str {
     use crate::spec_api::authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { .. } => "no-discovery-artifact",
@@ -662,9 +656,7 @@ fn authoring_error_reason(
     }
 }
 
-fn authoring_error_detail(
-    e: &crate::spec_api::authoring::AuthoringError,
-) -> String {
+fn authoring_error_detail(e: &crate::spec_api::authoring::AuthoringError) -> String {
     use crate::spec_api::authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { pathname } => {

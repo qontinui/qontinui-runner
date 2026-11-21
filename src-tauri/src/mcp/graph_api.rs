@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use crate::database::{cross_run_ops, graph_ops};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, CachedKnowledgeGraph};
-use crate::memory::unified_query::{self, MemorySource, ReasoningLevel, UnifiedMemoryQuery};
 use crate::memory::graph::{
     fuzzy_matching, graph_engine::KnowledgeGraph, graph_types::GraphSummary, unified_search,
 };
+use crate::memory::unified_query::{self, MemorySource, ReasoningLevel, UnifiedMemoryQuery};
 
 use crate::database::types::{Observation, ObservationSearchResult};
 

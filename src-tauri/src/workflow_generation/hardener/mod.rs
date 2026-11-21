@@ -41,10 +41,10 @@ use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
+use crate::generation_rules;
 use crate::skills::SkillRegistry;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::generator::extract_json_from_response;
-use crate::generation_rules;
 use crate::workflow_generation::schema_context::{
     format_skills_for_generator, format_skills_for_generator_filtered,
 };

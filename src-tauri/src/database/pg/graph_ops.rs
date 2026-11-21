@@ -1171,7 +1171,10 @@ impl PgDb {
             .map_err(|e| format!("PG pool: {}", e))?;
 
         // Use ILIKE for basic text matching since PG trigram extension may not be installed
-        let search_term = format!("%{}%", crate::str_utils::truncate_str(error_description, 50));
+        let search_term = format!(
+            "%{}%",
+            crate::str_utils::truncate_str(error_description, 50)
+        );
         let limit_i64 = (limit * 2) as i64; // fetch more, then filter by similarity
 
         let rows = conn

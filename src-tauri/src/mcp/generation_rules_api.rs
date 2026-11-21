@@ -12,10 +12,8 @@ use axum::{
 use std::sync::Arc;
 use tracing::info;
 
+use crate::generation_rules::{GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::generation_rules::{
-    GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput,
-};
 
 /// GET /generation-rules
 ///

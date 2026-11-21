@@ -3,9 +3,7 @@
 //! Provides CRUD for the `generation_rules` table using raw SQL.
 
 use super::PgDb;
-use crate::generation_rules::{
-    GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput,
-};
+use crate::generation_rules::{GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput};
 use tracing::{info, warn};
 
 #[expect(

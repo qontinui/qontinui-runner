@@ -309,6 +309,7 @@ mod model_gateway;
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
 // axum router construction) write a `runner-panic.log` the supervisor can
 // pick up. Must come before any module that panics during static init.
+mod generation_rules;
 mod skills;
 mod slash_commands;
 /// The synchronous steps of a session spawn (the PTY create, the session-cwd
@@ -316,7 +317,6 @@ mod slash_commands;
 /// 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2.
 mod spawn_off_worker;
 mod spawn_placement;
-mod generation_rules;
 mod spec_api;
 mod spec_experimentation;
 mod spec_utils;

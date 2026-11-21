@@ -51,8 +51,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::mcp::types::ApiState;
 use crate::mcp::code_semantics::code_graph::CodeGraph;
+use crate::mcp::types::ApiState;
 
 use node_bridge::{check_availability, HelperAvailability, NodeBridge};
 use scope::{resolve_scope, Scope};
