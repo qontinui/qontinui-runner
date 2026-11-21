@@ -690,10 +690,23 @@ pub fn spawn_maintenance() {
                 warn!("maintenance: {e}");
             }
             // After the instruction pull, independent of its outcome: at most
-            // one coord maintenance agent request per tick.
+            // one coord maintenance agent request per tick, on its OWN task so
+            // a minutes-long one-shot never stretches this loop's cadence.
+            // Single-flight: a tick that finds the previous request still
+            // running starts nothing.
             if agent_enabled {
-                if let Err(e) = agent_requests_once().await {
-                    warn!("maintenance agent: {e}");
+                match try_begin_flight(&AGENT_IN_FLIGHT) {
+                    Some(guard) => {
+                        tokio::spawn(async move {
+                            let _guard = guard;
+                            if let Err(e) = agent_requests_once().await {
+                                warn!("maintenance agent: {e}");
+                            }
+                        });
+                    }
+                    None => {
+                        debug!("maintenance agent: previous request still in flight — not pulling")
+                    }
                 }
             }
         }
@@ -734,6 +747,34 @@ const COMPILE_MAX_TURNS: u32 = 2;
 /// Longest `error` string posted back to coord.
 const MAX_ERROR_CHARS: usize = 500;
 
+/// Time reserved after the one-shot for POSTing its answer before
+/// `expires_at`.
+const ANSWER_POST_MARGIN: Duration = Duration::from_secs(20);
+
+/// Below this much run time (after the margin) a request is skipped: it will
+/// expire and coord re-arms it, which beats a run that is cut off anyway.
+const MIN_AGENT_RUN: Duration = Duration::from_secs(30);
+
+/// Single-flight flag for agent-request processing (one in flight at a time).
+static AGENT_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds a single-flight slot; releases it on drop (including on panic).
+struct FlightGuard(&'static std::sync::atomic::AtomicBool);
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Take `flag`'s slot, or `None` when it is already held.
+fn try_begin_flight(flag: &'static std::sync::atomic::AtomicBool) -> Option<FlightGuard> {
+    use std::sync::atomic::Ordering;
+    flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| FlightGuard(flag))
+}
+
 /// Whether `value` (the env var's value, if set) arms agent requests.
 fn agent_enabled_from(value: Option<&str>) -> bool {
     matches!(
@@ -756,27 +797,83 @@ fn agent_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// The agent-request pull body.
+/// The agent-request pull body. Elements stay raw JSON and are decoded one at
+/// a time ([`decode_request`]), so one malformed element cannot fail the
+/// whole pull and strand its well-formed siblings' claimed rows.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AgentRequestPull {
     #[serde(default)]
-    pub requests: Vec<AgentRequest>,
+    pub requests: Vec<serde_json::Value>,
 }
 
-/// One claimed agent request. `kind` and `tools` stay strings so a value a
+/// One element's wire shape. `kind` and `tools` stay strings so a value a
 /// newer coord introduces is answered with an error rather than failing the
-/// whole pull's decode (which would strand the claimed row until expiry).
+/// decode.
 #[derive(Debug, Clone, Deserialize)]
+struct AgentRequestWire {
+    kind: String,
+    prompt: String,
+    #[serde(default)]
+    repo_path: Option<String>,
+    #[serde(default)]
+    tools: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+/// One claimed agent request, its `id` already proven a UUID (it is
+/// interpolated into the answer URL).
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentRequest {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub kind: String,
     pub prompt: String,
-    #[serde(default)]
     pub repo_path: Option<String>,
-    #[serde(default)]
     pub tools: String,
-    #[serde(default)]
     pub expires_at: Option<String>,
+}
+
+/// The outcome of decoding one pull element.
+#[derive(Debug, PartialEq)]
+enum DecodedRequest {
+    /// Well-formed: run it.
+    Ok(AgentRequest),
+    /// Malformed but addressable: answer `{"error": …}` so coord does not
+    /// wait for the row to expire.
+    BadWithId { id: uuid::Uuid, error: String },
+    /// No usable (UUID) id: nothing can be answered; log and skip.
+    Unusable(String),
+}
+
+/// Decode one pull element. The id is checked first: without a UUID id an
+/// element cannot be answered at all (and is never interpolated into a URL).
+fn decode_request(v: &serde_json::Value) -> DecodedRequest {
+    let id = match v.get("id").and_then(|x| x.as_str()) {
+        Some(s) => match uuid::Uuid::parse_str(s) {
+            Ok(id) => id,
+            Err(_) => {
+                return DecodedRequest::Unusable(format!(
+                    "id {:?} is not a UUID",
+                    s.chars().take(64).collect::<String>()
+                ))
+            }
+        },
+        None => return DecodedRequest::Unusable("no string `id`".to_string()),
+    };
+    match serde_json::from_value::<AgentRequestWire>(v.clone()) {
+        Ok(w) => DecodedRequest::Ok(AgentRequest {
+            id,
+            kind: w.kind,
+            prompt: w.prompt,
+            repo_path: w.repo_path,
+            tools: w.tools,
+            expires_at: w.expires_at,
+        }),
+        Err(e) => DecodedRequest::BadWithId {
+            id,
+            error: format!("malformed agent request: {e}"),
+        },
+    }
 }
 
 /// The answer body. Untagged: each variant serializes to exactly the
@@ -890,13 +987,16 @@ fn time_until_expiry(
 /// What to do with one request before any `claude` runs.
 #[derive(Debug, PartialEq)]
 enum Preflight {
-    /// Already expired: skip, post nothing (coord expires the row).
+    /// Expired, or too close to expiry to run and still POST in time: skip,
+    /// post nothing (coord expires the row and re-arms it).
     Skip,
     /// Refuse with this error answer.
     Refuse(AgentAnswer),
-    /// Run the one-shot in `cwd` with `tools`.
+    /// Run the one-shot in `cwd` with `tools`. `cwd_is_repo`: the cwd came
+    /// from `repo_path` and must be proven a git work tree first.
     Run {
         cwd: std::path::PathBuf,
+        cwd_is_repo: bool,
         tools: OneshotTools,
         max_turns: u32,
         timeout: Duration,
@@ -908,9 +1008,16 @@ fn preflight(
     now: chrono::DateTime<chrono::Utc>,
     budget: Duration,
 ) -> Preflight {
+    // Reserve ANSWER_POST_MARGIN for the POST; below MIN_AGENT_RUN of run
+    // time, skip rather than start a run that cannot be answered in time.
     let timeout = match time_until_expiry(req.expires_at.as_deref(), now) {
-        Some(left) if left.is_zero() => return Preflight::Skip,
-        Some(left) => budget.min(left),
+        Some(left) => {
+            let usable = left.saturating_sub(ANSWER_POST_MARGIN);
+            if usable < MIN_AGENT_RUN {
+                return Preflight::Skip;
+            }
+            budget.min(usable)
+        }
         None => budget,
     };
     let max_turns = match req.kind.as_str() {
@@ -952,10 +1059,45 @@ fn preflight(
     };
     Preflight::Run {
         cwd,
+        cwd_is_repo: repo.is_some(),
         tools,
         max_turns,
         timeout,
     }
+}
+
+/// Interpret `git rev-parse --is-inside-work-tree`'s captured result:
+/// `Ok(())` only on a zero exit printing `true`. A timeout or spawn failure
+/// (`Err`) refuses too — an unprovable checkout is not run in.
+fn work_tree_verdict(
+    dir: &Path,
+    rev_parse: Result<(bool, String, String), String>,
+) -> Result<(), String> {
+    match rev_parse {
+        Ok((true, stdout, _)) if stdout.trim() == "true" => Ok(()),
+        Ok((_, _, stderr)) => Err(format!(
+            "repo_path is not a git work tree: {} ({})",
+            dir.display(),
+            stderr.trim().chars().take(160).collect::<String>()
+        )),
+        Err(e) => Err(format!(
+            "could not verify repo_path is a git work tree: {} ({e})",
+            dir.display()
+        )),
+    }
+}
+
+/// Whether `dir` is a git work tree, via the bounded git helper.
+fn require_git_work_tree(dir: &Path) -> Result<(), String> {
+    let d = dir.to_string_lossy();
+    work_tree_verdict(
+        dir,
+        git_capture_with_timeout(
+            &d,
+            &["rev-parse", "--is-inside-work-tree"],
+            GIT_LOCAL_TIMEOUT,
+        ),
+    )
 }
 
 /// Map a one-shot outcome to the answer body for `kind`.
@@ -979,12 +1121,13 @@ async fn process_agent_request(
 ) -> Result<(), String> {
     let answer = match preflight(&req, chrono::Utc::now(), agent_timeout()) {
         Preflight::Skip => {
-            info!(id = %req.id, "maintenance agent: request already expired — skipping");
+            info!(id = %req.id, "maintenance agent: request expired or too close to expiry — skipping (coord re-arms it)");
             return Ok(());
         }
         Preflight::Refuse(a) => a,
         Preflight::Run {
             cwd,
+            cwd_is_repo,
             tools,
             max_turns,
             timeout,
@@ -998,29 +1141,61 @@ async fn process_agent_request(
                 "maintenance agent: running single-shot claude"
             );
             let prompt = req.prompt.clone();
-            let joined = spawn_blocking_tracked(move || {
-                run_structured_oneshot(&prompt, Some(&cwd), tools, max_turns, timeout)
-            })
+            // Accepted (review decision): a run whose cwd is the candidate
+            // checkout loads that repo's CLAUDE.md. That is deliberate — the
+            // repo's content is DATA for the question, coord's prompt frames
+            // it as such, and the tool set is read-only (closed allow-list,
+            // `--output` denied, no MCP, settings files ignored), so repo text
+            // that reads like instructions can at most steer a read.
+            let joined = spawn_blocking_tracked(
+                move || -> Result<Result<serde_json::Value, OneshotError>, String> {
+                    if cwd_is_repo {
+                        require_git_work_tree(&cwd)?;
+                    }
+                    Ok(run_structured_oneshot(
+                        &prompt,
+                        Some(&cwd),
+                        tools,
+                        max_turns,
+                        timeout,
+                    ))
+                },
+            )
             .await;
             match joined {
-                Ok(outcome) => {
+                Ok(Ok(outcome)) => {
                     if let Err(e) = &outcome {
                         warn!(id = %req.id, timeout = e.is_timeout(), "maintenance agent: one-shot failed: {e}");
                     }
                     answer_from_outcome(&req.kind, outcome)
+                }
+                Ok(Err(refusal)) => {
+                    warn!(id = %req.id, "maintenance agent: {refusal}");
+                    AgentAnswer::error(refusal)
                 }
                 Err(e) => AgentAnswer::error(format!("one-shot task failed: {e}")),
             }
         }
     };
 
+    post_answer(client, base, req.id, &answer).await
+}
+
+/// POST `answer` for request `id`. The id is a parsed UUID, so the URL
+/// carries only its canonical hyphenated form.
+async fn post_answer(
+    client: &reqwest::Client,
+    base: &str,
+    id: uuid::Uuid,
+    answer: &AgentAnswer,
+) -> Result<(), String> {
     let url = format!(
         "{}/coord/maintenance/agent-requests/{}/answer",
         base.trim_end_matches('/'),
-        req.id
+        id
     );
     let resp = crate::coord_http::coord_post(client, &url)
-        .json(&answer)
+        .json(answer)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -1031,8 +1206,8 @@ async fn process_agent_request(
         return Err(format!("coord returned {status} for POST {url}: {excerpt}"));
     }
     info!(
-        id = %req.id,
-        answered_as = match &answer {
+        id = %id,
+        answered_as = match answer {
             AgentAnswer::Verdict { .. } => "verdict",
             AgentAnswer::Compile { .. } => "compile",
             AgentAnswer::Error { .. } => "error",
@@ -1082,12 +1257,43 @@ pub async fn agent_requests_once() -> Result<(), String> {
         .await
         .map_err(|e| format!("decode agent-request pull: {e}"))?;
 
-    // At most one per tick, even if a coord ignores `limit`.
-    let Some(req) = pull.requests.into_iter().next() else {
+    if pull.requests.is_empty() {
         debug!("maintenance agent: no requests");
         return Ok(());
-    };
-    process_agent_request(&client, &base, req).await
+    }
+
+    // Decode per element. Malformed-but-addressable elements are answered with
+    // an error right away (no claude involved); unaddressable ones are logged
+    // and skipped. At most ONE well-formed request is run per tick, even if a
+    // coord ignores `limit`; any further one is left to expire and re-arm.
+    let mut to_run: Option<AgentRequest> = None;
+    let mut first_err: Option<String> = None;
+    for raw in &pull.requests {
+        match decode_request(raw) {
+            DecodedRequest::Ok(req) => {
+                if to_run.is_none() {
+                    to_run = Some(req);
+                } else {
+                    warn!(id = %req.id, "maintenance agent: more than one request claimed in one pull — leaving this one to expire");
+                }
+            }
+            DecodedRequest::BadWithId { id, error } => {
+                warn!(id = %id, "maintenance agent: {error}");
+                if let Err(e) = post_answer(&client, &base, id, &AgentAnswer::error(error)).await {
+                    first_err.get_or_insert(e);
+                }
+            }
+            DecodedRequest::Unusable(why) => {
+                warn!("maintenance agent: skipping a pull element with no usable id: {why}");
+            }
+        }
+    }
+    if let Some(req) = to_run {
+        if let Err(e) = process_agent_request(&client, &base, req).await {
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,7 +1315,7 @@ mod agent_request_tests {
 
     fn req(kind: &str, tools: &str, repo: Option<&str>, expires: &str) -> AgentRequest {
         AgentRequest {
-            id: "r1".into(),
+            id: uuid::Uuid::parse_str("6f1c0a52-0000-4000-8000-0000000000aa").unwrap(),
             kind: kind.into(),
             prompt: "p".into(),
             repo_path: repo.map(str::to_string),
@@ -1132,14 +1338,18 @@ mod agent_request_tests {
         ]}"#;
         let p: AgentRequestPull = serde_json::from_str(j).unwrap();
         assert_eq!(p.requests.len(), 2);
-        let v = &p.requests[0];
-        assert_eq!(v.id, "6f1c0a52-0000-4000-8000-000000000001");
+        let DecodedRequest::Ok(v) = decode_request(&p.requests[0]) else {
+            panic!("element 0 must decode");
+        };
+        assert_eq!(v.id.to_string(), "6f1c0a52-0000-4000-8000-000000000001");
         assert_eq!(v.kind, "verdict");
         assert_eq!(v.prompt, "Is this branch abandoned?");
         assert_eq!(v.repo_path.as_deref(), Some("D:/x/repo"));
         assert_eq!(v.tools, "readonly_git");
         assert_eq!(v.expires_at.as_deref(), Some("2026-11-21T13:00:00Z"));
-        let c = &p.requests[1];
+        let DecodedRequest::Ok(c) = decode_request(&p.requests[1]) else {
+            panic!("element 1 must decode");
+        };
         assert_eq!(c.kind, "compile");
         assert_eq!(c.repo_path, None);
         assert_eq!(c.tools, "none");
@@ -1151,10 +1361,96 @@ mod agent_request_tests {
         assert!(p.requests.is_empty());
         // A kind/tools a newer coord adds must not fail the decode.
         let p: AgentRequestPull = serde_json::from_str(
-            r#"{"requests":[{"id":"x","kind":"summarize","prompt":"p","tools":"web"}]}"#,
+            r#"{"requests":[{"id":"6f1c0a52-0000-4000-8000-000000000003","kind":"summarize","prompt":"p","tools":"web"}]}"#,
         )
         .unwrap();
-        assert_eq!(p.requests[0].kind, "summarize");
+        assert!(
+            matches!(decode_request(&p.requests[0]), DecodedRequest::Ok(r) if r.kind == "summarize")
+        );
+    }
+
+    /// Review 3 + 7: one bad element never fails the pull; a bad element
+    /// with a UUID id is answerable, one without a usable id is skipped, and a
+    /// non-UUID id never reaches the answer URL.
+    #[test]
+    fn pull_elements_decode_independently() {
+        let p: AgentRequestPull = serde_json::from_str(
+            r#"{"requests":[
+                {"id":"6f1c0a52-0000-4000-8000-000000000010","kind":"verdict","prompt":"p",
+                 "repo_path":"/r","tools":"readonly_git","expires_at":"2026-11-21T13:00:00Z"},
+                {"id":"6f1c0a52-0000-4000-8000-000000000011","kind":"verdict"},
+                {"id":"6f1c0a52-0000-4000-8000-000000000012","kind":7,"prompt":"p"},
+                {"id":"../../admin","kind":"verdict","prompt":"p"},
+                {"kind":"verdict","prompt":"p"},
+                {"id":12,"kind":"verdict","prompt":"p"},
+                "not even an object"
+            ]}"#,
+        )
+        .expect("a pull with bad elements must still decode");
+        let d: Vec<DecodedRequest> = p.requests.iter().map(decode_request).collect();
+        assert!(matches!(&d[0], DecodedRequest::Ok(r) if r.id.to_string().ends_with("010")));
+        for (i, suffix) in [(1, "011"), (2, "012")] {
+            match &d[i] {
+                DecodedRequest::BadWithId { id, error } => {
+                    assert!(id.to_string().ends_with(suffix));
+                    assert!(error.starts_with("malformed agent request"), "{error}");
+                }
+                other => panic!("element {i}: expected BadWithId, got {other:?}"),
+            }
+        }
+        for (i, el) in d.iter().enumerate().skip(3) {
+            assert!(
+                matches!(el, DecodedRequest::Unusable(_)),
+                "element {i} has no usable id: {el:?}"
+            );
+        }
+    }
+
+    // ── single flight ─────────────────────────────────────────────────────
+
+    #[test]
+    fn flight_guard_admits_one_at_a_time_and_releases_on_drop() {
+        static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let first = try_begin_flight(&FLAG).expect("free slot");
+        assert!(
+            try_begin_flight(&FLAG).is_none(),
+            "second flight while one is in flight"
+        );
+        drop(first);
+        assert!(try_begin_flight(&FLAG).is_some(), "slot released on drop");
+    }
+
+    // ── git work tree ─────────────────────────────────────────────────────
+
+    #[test]
+    fn work_tree_verdict_requires_a_true_zero_exit() {
+        let d = Path::new("/r");
+        assert!(work_tree_verdict(d, Ok((true, "true\n".into(), String::new()))).is_ok());
+        assert!(work_tree_verdict(d, Ok((true, "false\n".into(), String::new()))).is_err());
+        assert!(work_tree_verdict(
+            d,
+            Ok((false, String::new(), "fatal: not a git repository".into()))
+        )
+        .is_err());
+        assert!(work_tree_verdict(d, Err("timed out".into())).is_err());
+    }
+
+    #[test]
+    fn require_git_work_tree_against_a_real_dir_and_repo() {
+        let plain = tempfile::tempdir().unwrap();
+        assert!(
+            require_git_work_tree(plain.path()).is_err(),
+            "a plain directory is not a work tree"
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let init = git_capture_with_timeout(
+            &repo.path().to_string_lossy(),
+            &["init", "-q"],
+            GIT_LOCAL_TIMEOUT,
+        )
+        .expect("git init");
+        assert!(init.0, "git init failed: {}", init.2);
+        assert!(require_git_work_tree(repo.path()).is_ok());
     }
 
     #[test]
@@ -1311,17 +1607,45 @@ mod agent_request_tests {
         match preflight(&r, now(), Duration::from_secs(240)) {
             Preflight::Run {
                 cwd,
+                cwd_is_repo,
                 tools,
                 max_turns,
                 timeout,
             } => {
                 assert_eq!(cwd, dir);
+                assert!(cwd_is_repo, "a repo_path cwd must be proven a work tree");
                 assert_eq!(tools, OneshotTools::ReadonlyGit);
                 assert_eq!(max_turns, VERDICT_MAX_TURNS);
-                assert_eq!(timeout, Duration::from_secs(60));
+                // 60s to expiry minus the 20s answer-POST margin.
+                assert_eq!(timeout, Duration::from_secs(40));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Review 5: under 30s of run time left after the POST margin → skip.
+    #[test]
+    fn too_close_to_expiry_is_skipped() {
+        let dir = std::env::temp_dir();
+        let p = dir.to_str().unwrap();
+        // 45s left - 20s margin = 25s < 30s.
+        let r = req("verdict", "readonly_git", Some(p), "2026-11-21T12:00:45Z");
+        assert_eq!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Skip
+        );
+        // 50s left - 20s = exactly 30s: runs, for 30s.
+        let r = req("verdict", "readonly_git", Some(p), "2026-11-21T12:00:50Z");
+        assert!(matches!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Run { timeout, .. } if timeout == Duration::from_secs(30)
+        ));
+        // Plenty of time: the configured budget governs.
+        let r = req("verdict", "readonly_git", Some(p), "2026-11-21T13:00:00Z");
+        assert!(matches!(
+            preflight(&r, now(), Duration::from_secs(240)),
+            Preflight::Run { timeout, .. } if timeout == Duration::from_secs(240)
+        ));
     }
 
     #[test]
@@ -1350,11 +1674,16 @@ mod agent_request_tests {
         match preflight(&r, now(), Duration::from_secs(240)) {
             Preflight::Run {
                 cwd,
+                cwd_is_repo,
                 tools,
                 max_turns,
                 timeout,
             } => {
                 assert_eq!(cwd, std::env::temp_dir());
+                assert!(
+                    !cwd_is_repo,
+                    "the neutral temp cwd is not checked as a repo"
+                );
                 assert_eq!(tools, OneshotTools::None);
                 assert_eq!(max_turns, COMPILE_MAX_TURNS);
                 assert_eq!(timeout, Duration::from_secs(240));
