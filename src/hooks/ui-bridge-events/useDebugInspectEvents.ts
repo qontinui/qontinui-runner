@@ -581,7 +581,7 @@ export function useDebugInspectEvents(
                 type,
                 success: false,
                 error: `element state ${err.message}`,
-                code: err.code,
+                code: "UB-VALIDATION-ERROR",
                 timestamp: Date.now(),
               });
               return true;
