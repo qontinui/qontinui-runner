@@ -202,13 +202,13 @@ describe("signInTargetExplanation", () => {
       "refused verdict missing",
       { backendUrl: "https://backend.example.test", backendUrlMachineLocal: false },
       "operator",
-      /verdict/,
+      /build verdict/,
     ],
     [
       "machine-local verdict missing",
       { backendUrl: "https://backend.example.test", backendUrlRefused: false },
       "operator",
-      /verdict/,
+      /whether the saved URL is machine-local/,
     ],
   ];
 

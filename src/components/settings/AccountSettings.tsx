@@ -41,7 +41,7 @@
  * `WebIntegrationSettings` panel.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -217,17 +217,23 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
     };
   }, [refreshTier]);
 
+  // Issue order of status reads: reads overlap (mount + each
+  // `web-integration-changed`) and may settle out of order, so only the most
+  // recently ISSUED read may set state — the same guard the auth banner uses.
+  const backendStatusReadSeq = useRef(0);
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
+      const seq = ++backendStatusReadSeq.current;
+      const isLatest = () => !cancelled && seq === backendStatusReadSeq.current;
       try {
         const st = await invoke<SavedBackendStatus>("get_web_integration_status");
-        if (!cancelled) {
+        if (isLatest()) {
           setBackendStatus(st);
           setBackendUrlLoadFailed(false);
         }
       } catch (err) {
-        if (!cancelled) {
+        if (isLatest()) {
           // A failed re-read drops the earlier status: the target is not
           // decided from a stale read.
           setBackendStatus(null);

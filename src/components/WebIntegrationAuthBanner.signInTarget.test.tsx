@@ -170,6 +170,27 @@ describe("WebIntegrationAuthBanner Authorize sign-in target (operator surface)",
     expect(await clickAuthorize()).toBe("http://127.0.0.1:8000");
   });
 
+  it("ignores an older successful re-read that settles after a newer failed one", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    await mount();
+    let resolveOlder!: (v: unknown) => void;
+    statusReply = new Promise((resolve) => {
+      resolveOlder = resolve;
+    });
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    statusReply = new Error("get_web_integration_status failed");
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {
+      resolveOlder(DEBUG_LOOPBACK);
+    });
+    await act(async () => {});
+    expect(await clickAuthorize()).toBe("https://api.qontinui.io");
+  });
+
   it("targets the saved loopback backend again once a later re-read succeeds", async () => {
     statusReply = DEBUG_LOOPBACK;
     await mount();
