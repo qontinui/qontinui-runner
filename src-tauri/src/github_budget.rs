@@ -1478,6 +1478,35 @@ pub struct EtagCache {
     entries: LruCache<String, EtagEntry>,
     bytes: usize,
     max_bytes: usize,
+    /// Entries dropped to honour the entry ceiling (not same-key replaces).
+    evicted_for_entries: u64,
+    /// Entries dropped to honour the byte budget.
+    evicted_for_bytes: u64,
+}
+
+/// What the ETag cache holds, what it is bounded by, and how often each bound
+/// has evicted since process start — served as `etagCache` on
+/// `GET /github-budget`.
+///
+/// The ceilings are served beside the counts because "entries 512 (full)" and
+/// "approxBytes near the budget" are only readable against them, and the
+/// eviction counters because an LRU that evicts inside one reconciler cycle
+/// is exactly the thrash plan
+/// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`
+/// D5 measured: a rising `evictedForEntries` between two cycles means the cap
+/// binds again, a rising `evictedForBytes` means MB-scale bodies are crowding
+/// the cycle out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EtagCacheGauge {
+    pub entries: usize,
+    /// Approximate by construction — it drives an eviction budget, not an
+    /// accounting ledger.
+    pub approx_bytes: usize,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+    pub evicted_for_entries: u64,
+    pub evicted_for_bytes: u64,
 }
 
 impl EtagCache {
@@ -1489,6 +1518,8 @@ impl EtagCache {
             entries: LruCache::new(cap),
             bytes: 0,
             max_bytes,
+            evicted_for_entries: 0,
+            evicted_for_bytes: 0,
         }
     }
 
@@ -1518,8 +1549,11 @@ impl EtagCache {
         // `push` returns the displaced pair both when it replaces this key and
         // when it evicts the LRU entry to honour the entry ceiling, so the byte
         // counter stays exact without re-summing the cache on every store.
-        if let Some((_, old)) = self.entries.push(url.to_string(), entry) {
+        if let Some((displaced, old)) = self.entries.push(url.to_string(), entry) {
             self.bytes = self.bytes.saturating_sub(old.heap_bytes());
+            if displaced != url {
+                self.evicted_for_entries = self.evicted_for_entries.saturating_add(1);
+            }
         }
         self.bytes = self.bytes.saturating_add(added);
         self.evict_to_budget();
@@ -1538,10 +1572,17 @@ impl EtagCache {
         }
     }
 
-    /// `(entries, approximate bytes)` — the gauge that did not exist when
-    /// coord's equivalent cache OOMed a fleet.
-    pub fn stats(&self) -> (usize, usize) {
-        (self.entries.len(), self.bytes)
+    /// The gauge that did not exist when coord's equivalent cache OOMed a
+    /// fleet: counts, both ceilings, and per-bound eviction totals.
+    pub fn gauge(&self) -> EtagCacheGauge {
+        EtagCacheGauge {
+            entries: self.entries.len(),
+            approx_bytes: self.bytes,
+            max_entries: self.entries.cap().get(),
+            max_bytes: self.max_bytes,
+            evicted_for_entries: self.evicted_for_entries,
+            evicted_for_bytes: self.evicted_for_bytes,
+        }
     }
 
     /// Evict least-recently-used entries until the byte budget holds. The entry
@@ -1550,7 +1591,10 @@ impl EtagCache {
     fn evict_to_budget(&mut self) {
         while self.bytes > self.max_bytes && self.entries.len() > 1 {
             match self.entries.pop_lru() {
-                Some((_, old)) => self.bytes = self.bytes.saturating_sub(old.heap_bytes()),
+                Some((_, old)) => {
+                    self.bytes = self.bytes.saturating_sub(old.heap_bytes());
+                    self.evicted_for_bytes = self.evicted_for_bytes.saturating_add(1);
+                }
                 None => break,
             }
         }
@@ -1824,12 +1868,14 @@ pub fn invalidate(url: &str) {
     }
 }
 
-/// `(entries, approximate bytes)` held by the process-global ETag cache.
-pub fn etag_cache_stats() -> (usize, usize) {
-    match etag_cache().lock() {
-        Ok(cache) => cache.stats(),
-        Err(_) => (0, 0),
-    }
+/// The process-global ETag cache's gauge, or `None` when its mutex is
+/// poisoned — UNKNOWN, which must not be served as an empty cache.
+pub fn etag_cache_stats() -> Option<EtagCacheGauge> {
+    gauge_of(etag_cache())
+}
+
+fn gauge_of(cache: &Mutex<EtagCache>) -> Option<EtagCacheGauge> {
+    cache.lock().ok().map(|cache| cache.gauge())
 }
 
 // ---------------------------------------------------------------------------
@@ -2368,7 +2414,11 @@ mod tests {
 
         // A store for the same URL replaces rather than accumulating.
         cache.store("/repos/o/r/pulls/1", "W/\"def\"", Bytes::from_static(b"{}"));
-        let (entries, bytes) = cache.stats();
+        let EtagCacheGauge {
+            entries,
+            approx_bytes: bytes,
+            ..
+        } = cache.gauge();
         assert_eq!(entries, 1);
         assert_eq!(bytes, 2 + "W/\"def\"".len());
     }
@@ -2377,7 +2427,7 @@ mod tests {
     fn etag_store_ignores_an_empty_etag() {
         let mut cache = EtagCache::new(8, 1024);
         cache.store("/u", "   ", Bytes::from_static(b"body"));
-        assert_eq!(cache.stats().0, 0, "no ETag means nothing to replay");
+        assert_eq!(cache.gauge().entries, 0, "no ETag means nothing to replay");
         assert_eq!(cache.replay("/u"), None);
     }
 
@@ -2390,7 +2440,7 @@ mod tests {
         assert!(cache.etag_for("/a").is_some());
         cache.store("/c", "3", Bytes::from_static(b"c"));
 
-        assert_eq!(cache.stats().0, 2);
+        assert_eq!(cache.gauge().entries, 2);
         assert!(cache.replay("/b").is_none(), "LRU entry evicted");
         assert!(cache.replay("/a").is_some());
         assert!(cache.replay("/c").is_some());
@@ -2405,9 +2455,54 @@ mod tests {
         cache.store("/a", "1", Bytes::from_static(b"aaaa")); // 5 bytes
         cache.store("/b", "2", Bytes::from_static(b"bb")); // 3 bytes
         cache.store("/c", "3", Bytes::from_static(b"c")); // evicts /a; 2 bytes
-        assert_eq!(cache.stats(), (2, 5), "evicted /a's bytes subtracted");
+        assert_eq!(
+            (cache.gauge().entries, cache.gauge().approx_bytes),
+            (2, 5),
+            "evicted /a's bytes subtracted"
+        );
         cache.store("/b", "22", Bytes::from_static(b"bbbbbb")); // replace: 8 bytes
-        assert_eq!(cache.stats(), (2, 10), "replaced /b's old bytes subtracted");
+        assert_eq!(
+            (cache.gauge().entries, cache.gauge().approx_bytes),
+            (2, 10),
+            "replaced /b's old bytes subtracted"
+        );
+        let g = cache.gauge();
+        assert_eq!(g.evicted_for_entries, 1, "the replace is not an eviction");
+        assert_eq!(g.evicted_for_bytes, 0);
+        assert_eq!((g.max_entries, g.max_bytes), (2, 1024 * 1024));
+    }
+
+    #[test]
+    fn etag_cache_gauge_counts_byte_budget_evictions_separately() {
+        let mut cache = EtagCache::new(64, 300);
+        for i in 0..6 {
+            cache.store(&format!("/big/{i}"), "e", Bytes::from(vec![0u8; 100]));
+        }
+        let g = cache.gauge();
+        assert_eq!(g.evicted_for_entries, 0, "the entry ceiling never bound");
+        assert_eq!(g.evicted_for_bytes as usize, 6 - g.entries);
+        assert!(g.evicted_for_bytes > 0);
+    }
+
+    /// A poisoned cache lock is UNKNOWN and must be served as `null`, never as
+    /// an empty cache (which is what the `(0, 0)` fallback used to claim).
+    #[test]
+    fn etag_cache_gauge_is_none_when_the_lock_is_poisoned() {
+        let cache = Mutex::new(EtagCache::new(8, 1024));
+        assert!(gauge_of(&cache).is_some());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.lock().expect("fresh lock");
+            panic!("poison the cache lock");
+        }));
+        assert!(cache.is_poisoned());
+        assert_eq!(gauge_of(&cache), None);
+    }
+
+    #[test]
+    fn etag_cache_default_gauge_serves_the_production_ceilings() {
+        let g = EtagCache::default().gauge();
+        assert_eq!(g.max_entries, ETAG_CACHE_MAX_ENTRIES);
+        assert_eq!(g.max_bytes, ETAG_CACHE_MAX_BYTES);
     }
 
     #[test]
@@ -2418,7 +2513,11 @@ mod tests {
         for i in 0..6 {
             cache.store(&format!("/big/{i}"), "e", Bytes::from(vec![0u8; 100]));
         }
-        let (entries, bytes) = cache.stats();
+        let EtagCacheGauge {
+            entries,
+            approx_bytes: bytes,
+            ..
+        } = cache.gauge();
         assert!(bytes <= 300, "byte budget held, got {bytes}");
         assert!(entries < 6, "eviction happened, {entries} entries left");
         assert!(cache.replay("/big/5").is_some(), "newest survives");
@@ -2445,7 +2544,7 @@ mod tests {
                 "second-pass replay missed at entry {i} of {URLS}: the cache does not hold one cycle"
             );
         }
-        assert_eq!(cache.stats().0, URLS);
+        assert_eq!(cache.gauge().entries, URLS);
     }
 
     #[test]
@@ -2453,7 +2552,7 @@ mod tests {
         let mut cache = EtagCache::new(8, 1024);
         cache.store("/u", "e", Bytes::from_static(b"body"));
         cache.invalidate("/u");
-        assert_eq!(cache.stats(), (0, 0));
+        assert_eq!((cache.gauge().entries, cache.gauge().approx_bytes), (0, 0));
         assert_eq!(cache.replay("/u"), None);
     }
 
@@ -3176,7 +3275,7 @@ mod tests {
             replay("/global/etag/probe"),
             Some(Bytes::from_static(b"payload"))
         );
-        assert!(etag_cache_stats().0 >= 1);
+        assert!(etag_cache_stats().expect("cache lock").entries >= 1);
         invalidate("/global/etag/probe");
         assert_eq!(replay("/global/etag/probe"), None);
     }
