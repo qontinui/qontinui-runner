@@ -16,6 +16,7 @@ import {
 import { instanceStorage } from "@/lib/instance-storage";
 import { SectionHeader } from "./SectionHeader";
 import { RemoteAttachSettings } from "./RemoteAttachSettings";
+import { RemoteCreateSettings } from "./RemoteCreateSettings";
 import { getStatusColors } from "@/design-system";
 import { useFeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
 import type { DebugSettings, LogFunction } from "./types";
@@ -580,6 +581,10 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
           other machines opening a tab onto a session here. Beside the
           terminal performance caps because it is terminal policy. */}
       <RemoteAttachSettings onLog={onLog} />
+
+      {/* Remote create (headless-runner-parity plan, D2): the separate,
+          default-off switch for other machines SPAWNING a session here. */}
+      <RemoteCreateSettings onLog={onLog} />
 
       {/* Performance & Caps Section (many-sessions plan Phase 8) */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
