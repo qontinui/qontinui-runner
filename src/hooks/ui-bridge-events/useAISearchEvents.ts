@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
+import { scrubbedAttribute } from "./textActionRequests";
 import {
   RECOVERY_FAILED,
   RECOVERY_TARGET_MISSING,
@@ -738,8 +739,8 @@ export function useAISearchEvents(
                 id: el.id,
                 type: el.type,
                 label: el.label,
-                ariaLabel: domEl?.getAttribute("aria-label") ?? undefined,
-                title: domEl?.getAttribute("title") ?? undefined,
+                ariaLabel: scrubbedAttribute(domEl, "aria-label"),
+                title: scrubbedAttribute(domEl, "title"),
               };
               if (!matches(materialized, selector)) continue;
               if (

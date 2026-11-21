@@ -53,4 +53,28 @@ describe("read_value §4.6 redaction", () => {
     expect(runReadValueRequest({ selector: "#nope" }).success).toBe(false);
     expect(runReadValueRequest({ selector: undefined }).success).toBe(false);
   });
+
+  it("passes the primitive's error code through", () => {
+    const r = runReadValueRequest({ selector: "#nope" });
+    expect(r).toMatchObject({ success: false, code: "ELEMENT_NOT_FOUND" });
+  });
+
+  it("rejects a non-integer or negative index naming it", () => {
+    mount(`<input class="r" value="a"><input class="r" value="b">`);
+    for (const bad of [-1, 1.5, Number.NaN]) {
+      const r = runReadValueRequest({ selector: ".r", index: bad });
+      expect(r.success).toBe(false);
+      if (!r.success) expect(r.error).toContain("index");
+    }
+  });
+
+  it("a malformed selector is an error, never a value", () => {
+    let r: ReturnType<typeof runReadValueRequest> | undefined;
+    try {
+      r = runReadValueRequest({ selector: "[[" });
+    } catch {
+      r = undefined; // usePageEvents turns a throw into an error response
+    }
+    expect(r === undefined || r.success === false).toBe(true);
+  });
 });

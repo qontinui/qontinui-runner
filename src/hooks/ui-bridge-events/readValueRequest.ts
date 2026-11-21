@@ -15,17 +15,25 @@ import type { ReadValueResult } from "@qontinui/ui-bridge/control";
  */
 export type ReadValueOutcome =
   | { success: true; data: ReadValueResult }
-  | { success: false; error: string };
+  | { success: false; error: string; code?: string };
 
 export function runReadValueRequest(params: {
   selector?: string;
   index?: number | null;
   all?: unknown;
 }): ReadValueOutcome {
-  const result = readValuePrimitive(params.selector || undefined, params.index ?? undefined, {
+  const index = params.index ?? undefined;
+  if (index !== undefined && (!Number.isInteger(index) || index < 0)) {
+    return {
+      success: false,
+      error: `'index' must be a non-negative integer, got ${JSON.stringify(params.index)}`,
+      code: "INVALID_PARAMS",
+    };
+  }
+  const result = readValuePrimitive(params.selector || undefined, index, {
     all: params.all ?? undefined,
   });
   return result.ok
     ? { success: true, data: result.data }
-    : { success: false, error: result.error };
+    : { success: false, error: result.error, code: result.code };
 }
