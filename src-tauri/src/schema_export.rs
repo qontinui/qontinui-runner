@@ -674,11 +674,9 @@ pub fn export_all_schemas() -> Value {
     add!("DomainAssignment", qv::DomainAssignment);
     add!("WorkerStatus", qv::WorkerStatus);
     add!("WorkerInstance", qv::WorkerInstance);
-    add!("WorkerCoordinationMessage", qv::WorkerCoordinationMessage);
     add!("WorkerSignal", qv::WorkerSignal);
     add!("Finding", qv::Finding);
     add!("Confidence", qv::Confidence);
-    add!("ExtendIterationsRequest", qv::ExtendIterationsRequest);
     add!("CriterionOverride", qv::CriterionOverride);
     add!("OverrideCollection", qv::OverrideCollection);
     add!("StageTransition", qv::StageTransition);
