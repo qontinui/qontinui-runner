@@ -28,6 +28,13 @@ import {
 import { describeThrown } from "@/lib/utils";
 import { runTextVisibilityRequest } from "./textVisibilityRequest";
 import { runReadValueRequest } from "./readValueRequest";
+import {
+  runClickByTextRequest,
+  runClickBySelectorRequest,
+  runFindByTextRequest,
+  scrubbedTextContent,
+} from "./textActionRequests";
+import { isContentRedacted } from "@qontinui/ui-bridge";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -385,7 +392,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               return {
                 index: i,
                 tagName: htmlEl.tagName.toLowerCase(),
-                textContent: (htmlEl.textContent ?? "").slice(0, 200),
+                textContent: scrubbedTextContent(htmlEl).slice(0, 200),
                 id: htmlEl.id || undefined,
                 className: htmlEl.className || undefined,
                 visible: rect.width > 0 && rect.height > 0,
@@ -529,55 +536,10 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "click_by_text": {
           try {
-            const { text, tag, exact } = (payload.params || {}) as {
-              text?: string;
-              tag?: string;
-              exact?: boolean;
-            };
-            if (!text) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: "text is required",
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            const selector = tag || "*";
-            const searchText = text.toLowerCase();
-            const candidates = document.querySelectorAll<HTMLElement>(selector);
-            let clicked = false;
-            for (const el of candidates) {
-              const elText = el.textContent?.trim().toLowerCase() ?? "";
-              if (exact ? elText === searchText : elText.includes(searchText)) {
-                el.click();
-                clicked = true;
-                await sendResponse({
-                  requestId,
-                  type,
-                  success: true,
-                  data: {
-                    clicked: true,
-                    element: {
-                      tag: el.tagName.toLowerCase(),
-                      text: el.textContent?.trim().slice(0, 200),
-                    },
-                  },
-                  timestamp: Date.now(),
-                });
-                break;
-              }
-            }
-            if (!clicked) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: `No element found with text "${text}"`,
-                timestamp: Date.now(),
-              });
-            }
+            const outcome = runClickByTextRequest(
+              (payload.params || {}) as { text?: string; tag?: string; exact?: boolean },
+            );
+            await sendResponse({ requestId, type, ...outcome, timestamp: Date.now() });
           } catch (err) {
             await sendResponse({
               requestId,
@@ -592,48 +554,10 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "click_by_selector": {
           try {
-            const { selector, index } = (payload.params || {}) as {
-              selector?: string;
-              index?: number;
-            };
-            if (!selector) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: "selector is required",
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            const el =
-              index != null
-                ? document.querySelectorAll<HTMLElement>(selector)[index]
-                : document.querySelector<HTMLElement>(selector);
-            if (!el) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: `No element found for selector "${selector}"`,
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            el.click();
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: {
-                clicked: true,
-                element: {
-                  tag: el.tagName.toLowerCase(),
-                  text: el.textContent?.trim().slice(0, 200),
-                },
-              },
-              timestamp: Date.now(),
-            });
+            const outcome = runClickBySelectorRequest(
+              (payload.params || {}) as { selector?: string; index?: number | null },
+            );
+            await sendResponse({ requestId, type, ...outcome, timestamp: Date.now() });
           } catch (err) {
             await sendResponse({
               requestId,
@@ -678,7 +602,10 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             if (label) {
               const labels = document.querySelectorAll<HTMLLabelElement>("label");
               for (const lbl of labels) {
-                if (lbl.textContent?.trim().toLowerCase().includes(label.toLowerCase())) {
+                if (
+                  !isContentRedacted(lbl) &&
+                  lbl.textContent?.trim().toLowerCase().includes(label.toLowerCase())
+                ) {
                   el = lbl.htmlFor
                     ? document.getElementById(lbl.htmlFor)
                     : lbl.querySelector("input, select, textarea");
@@ -749,44 +676,10 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "find_by_text": {
           try {
-            const { text, tag, exact } = (payload.params || {}) as {
-              text?: string;
-              tag?: string;
-              exact?: boolean;
-            };
-            if (!text) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: "text is required",
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            const candidates = document.querySelectorAll<HTMLElement>(tag || "*");
-            const searchText = text.toLowerCase();
-            const results: Array<{ index: number; tag: string; text: string; visible: boolean }> =
-              [];
-            let idx = 0;
-            for (const el of candidates) {
-              const elText = el.textContent?.trim().toLowerCase() ?? "";
-              if (exact ? elText === searchText : elText.includes(searchText)) {
-                results.push({
-                  index: idx++,
-                  tag: el.tagName.toLowerCase(),
-                  text: el.textContent?.trim().slice(0, 200) ?? "",
-                  visible: el.offsetParent !== null,
-                });
-              }
-            }
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: results,
-              timestamp: Date.now(),
-            });
+            const outcome = runFindByTextRequest(
+              (payload.params || {}) as { text?: string; tag?: string; exact?: boolean },
+            );
+            await sendResponse({ requestId, type, ...outcome, timestamp: Date.now() });
           } catch (err) {
             await sendResponse({
               requestId,
