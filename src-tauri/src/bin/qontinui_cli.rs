@@ -1573,6 +1573,11 @@ fn find_session_mcp_config(start: &Path) -> Option<SessionMcpConfig> {
 fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let servers = v.get("mcpServers")?.as_object()?;
+    // First match wins, so walk entries in NAME order: serde_json's
+    // `preserve_order` is on for this build (see `util::json_canon`) and file
+    // order would otherwise decide which of two proxy-shaped entries is used.
+    let mut servers: Vec<(&String, &serde_json::Value)> = servers.iter().collect();
+    servers.sort_by(|a, b| a.0.cmp(b.0));
     for (name, server) in servers {
         // The `coord-mcp` entry is read through the runner's own resolver: a
         // stdio-shaped entry keeps its `url` and `headers` in the credential
@@ -2003,7 +2008,7 @@ mod tests {
             "mcpServers": {
                 "coord-mcp-static": {
                     "url": "http://127.0.0.1:9876/coord-mcp",
-                    "headers": { "Authorization": "Bearer xyz" }
+                    "headers": { "X-Unrelated": "no-nonce-here" }
                 },
                 "coord-mcp": {
                     "url": "http://127.0.0.1:9877/coord-mcp",
@@ -2242,5 +2247,26 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.nonce, "realnonce");
         assert_eq!(cfg.port, Some(9878));
+    }
+
+    /// Two proxy-shaped entries: the first by NAME wins, not the first in the
+    /// file (serde_json `preserve_order` is on for this build).
+    #[test]
+    fn parse_mcp_json_picks_the_first_entry_by_name_not_file_order() {
+        let text = r#"{
+            "mcpServers": {
+                "zeta": {
+                    "url": "http://127.0.0.1:9890/coord-mcp",
+                    "headers": { "X-Coord-Mcp-Proxy-Key": "zeta-nonce" }
+                },
+                "alpha": {
+                    "url": "http://127.0.0.1:9891/coord-mcp",
+                    "headers": { "X-Coord-Mcp-Proxy-Key": "alpha-nonce" }
+                }
+            }
+        }"#;
+        let cfg = parse_mcp_json(text).unwrap();
+        assert_eq!(cfg.nonce, "alpha-nonce");
+        assert_eq!(cfg.port, Some(9891));
     }
 }

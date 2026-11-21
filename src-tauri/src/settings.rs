@@ -611,6 +611,36 @@ pub struct AiSettings {
     /// Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
     #[serde(default = "default_git_op_federation_enabled")]
     pub git_op_federation_enabled: bool,
+    /// ACP agents this runner can drive for a headless coord continuation
+    /// (`harness: {"acp": "<id>"}`), keyed by the id the continuation names.
+    /// Empty by default: with no entry, a continuation asking for an ACP agent is
+    /// refused with `spawn_failed: acp_agent_absent:<id>` (never a silent Claude
+    /// fallback), and the runner advertises no `acp:*` host capability, so coord
+    /// never places one here.
+    ///
+    /// Plan `2026-11-13-acp-client-lane-for-acp-native-clis`, Phase 2.
+    #[serde(default)]
+    pub acp_agents: std::collections::BTreeMap<String, AcpAgentSettings>,
+}
+
+/// One entry of [`AiSettings::acp_agents`]: how to launch an ACP-native agent
+/// CLI (`gemini --experimental-acp`, `opencode acp`, `codex-acp`, ...).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpAgentSettings {
+    /// Executable. A bare name is resolved on `PATH`; an absolute path is used
+    /// as-is. The runner advertises `acp:<id>` only when this resolves to a
+    /// launchable file.
+    pub program: String,
+    /// Arguments that put the CLI into ACP mode, verbatim and in order.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Name of an environment variable to export to the child carrying the
+    /// config directory of the account the runner's selector picked for this
+    /// spawn (the same directory it pins as `CLAUDE_CONFIG_DIR` for Claude).
+    /// Account rotation is outside ACP, so it is still env on the child; this is
+    /// the per-agent variable name. `None` exports nothing.
+    #[serde(default)]
+    pub env_account_var: Option<String>,
 }
 
 /// The READ shape of the AI settings: the stored [`AiSettings`] plus the
@@ -725,6 +755,7 @@ impl Default for AiSettings {
             interactive_sessions_enabled: default_interactive_sessions_enabled(),
             ai_path_prediction_enabled: default_ai_path_prediction_enabled(),
             git_op_federation_enabled: default_git_op_federation_enabled(),
+            acp_agents: Default::default(),
         }
     }
 }
@@ -7777,5 +7808,44 @@ mod load_persist_tests {
             "no env-supplied web-integration value may appear anywhere in the \
              file: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod acp_agents_setting_tests {
+    use super::*;
+
+    /// Plan `2026-11-13-acp-client-lane-for-acp-native-clis`: no `acp_agents`
+    /// key is the default and means NO ACP agents (every ACP request refused,
+    /// no `acp:*` capability advertised), and an AiSettings blob that predates
+    /// the field still loads.
+    #[test]
+    fn absent_means_no_acp_agents_and_old_configs_still_load() {
+        assert!(AiSettings::default().acp_agents.is_empty());
+        let mut v = serde_json::to_value(AiSettings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("acp_agents");
+        let parsed: AiSettings = serde_json::from_value(v).unwrap();
+        assert!(parsed.acp_agents.is_empty());
+    }
+
+    #[test]
+    fn an_entry_round_trips_and_its_optional_fields_default() {
+        let parsed: AiSettings = {
+            let mut v = serde_json::to_value(AiSettings::default()).unwrap();
+            v["acp_agents"] = serde_json::json!({
+                "gemini": {"program": "gemini", "args": ["--experimental-acp"], "env_account_var": "GEMINI_HOME"},
+                "opencode": {"program": "/usr/bin/opencode"}
+            });
+            serde_json::from_value(v).unwrap()
+        };
+        let g = &parsed.acp_agents["gemini"];
+        assert_eq!(g.program, "gemini");
+        assert_eq!(g.args, vec!["--experimental-acp".to_string()]);
+        assert_eq!(g.env_account_var.as_deref(), Some("GEMINI_HOME"));
+        let o = &parsed.acp_agents["opencode"];
+        assert!(o.args.is_empty() && o.env_account_var.is_none());
+        let back: AiSettings =
+            serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+        assert_eq!(back.acp_agents, parsed.acp_agents);
     }
 }

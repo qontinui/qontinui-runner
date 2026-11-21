@@ -84,6 +84,12 @@ use crate::capability_manifest::{self, ProvisionReport};
 /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` D6.
 mod launch_frame;
 use launch_frame::{AppliedLaunch, LaunchFrame, LaunchSeam};
+// The ACP arm of the headless continuation (plan
+// `2026-11-13-acp-client-lane-for-acp-native-clis`): request parsing, refusal,
+// skill inlining and the continuation verdict live beside this file so the
+// 23k-line runtime only carries the dispatch.
+mod acp_continuation;
+use acp_continuation::{deserialize_lenient_harness, HarnessRequest};
 
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
@@ -173,6 +179,11 @@ pub struct LaunchPayload {
     /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
     #[serde(flatten)]
     pub launch: LaunchFrame,
+    /// Same key and semantics as [`GateContinuationPayload::harness`], for the
+    /// `/agents/spawn` door: `{"acp": "<agent id>"}` runs the spawn under an ACP
+    /// agent.
+    #[serde(default, deserialize_with = "deserialize_lenient_harness")]
+    pub harness: Option<HarnessRequest>,
 }
 
 impl LaunchPayload {
@@ -373,6 +384,23 @@ pub struct GateContinuationPayload {
     /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
     #[serde(flatten)]
     pub launch: LaunchFrame,
+    /// The harness this continuation asks to run under: `{"acp": "<agent id>"}`
+    /// runs the HEADLESS arm under that ACP agent (`acp_agents` setting) instead
+    /// of `claude -p`. Absent = Claude, which is every coord that predates the
+    /// key.
+    ///
+    /// **Without this field an older runner drops the key silently** — this
+    /// struct has no `deny_unknown_fields` — and would run Claude where an ACP
+    /// agent was asked for. That hole is closed on the placement side instead:
+    /// coord implies `required_capabilities += ["acp:<id>"]` from the same
+    /// key, and a runner too old to read it advertises no `acp:*` token, so it
+    /// is never placed.
+    ///
+    /// Lenient in ONE direction only: an unreadable value is carried as
+    /// [`HarnessRequest::Unreadable`] and REFUSED (`spawn_failed:
+    /// harness_unreadable: ...`), never read as "no harness".
+    #[serde(default, deserialize_with = "deserialize_lenient_harness")]
+    pub harness: Option<HarnessRequest>,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -7485,6 +7513,63 @@ async fn run_gate_continuation_inner(
         }
     }
 
+    // Step 2b: which harness this continuation runs under. Resolved AFTER the
+    // claim (a refusal below is a recorded `spawn_failed`, and an outcome can
+    // only be posted against a claimed gate) and BEFORE the worktree acquire, so
+    // a refusal costs no tree. No `harness` key = Claude, untouched. An unknown
+    // or unlaunchable agent id, an unreadable `harness`, or an ACP harness on a
+    // terminal presentation is REFUSED — never a spawn of the wrong harness.
+    let acp_agent = {
+        let harness = payload.harness.clone();
+        let presentation = payload.presentation;
+        let resolved = spawn_blocking_tracked(move || {
+            acp_continuation::resolve_harness_request(
+                harness.as_ref(),
+                presentation,
+                &crate::settings::get_ai_settings().acp_agents,
+                crate::acp_session::resolve_program,
+            )
+        })
+        .await;
+        match resolved {
+            Ok(Ok(agent)) => agent,
+            Ok(Err(refusal)) => {
+                let detail = refusal.detail();
+                warn!(
+                    "agent_runtime: gate-continuation refused: {detail} (anchor_key={:?})",
+                    payload.anchor_key
+                );
+                if let ConsumeTarget::Gate(gate_id, _) = consume_target {
+                    post_spawn_outcome(
+                        gate_id,
+                        device_id,
+                        ContinuationOutcome::SpawnFailed,
+                        Some(first_line(&detail)),
+                        None,
+                    )
+                    .await;
+                }
+                return Err(anyhow::anyhow!(detail));
+            }
+            Err(join) => {
+                // The resolver panicked or the pool is gone: UNKNOWN, so refuse
+                // rather than guess a harness.
+                let detail = format!("harness_unresolvable: {join}");
+                if let ConsumeTarget::Gate(gate_id, _) = consume_target {
+                    post_spawn_outcome(
+                        gate_id,
+                        device_id,
+                        ContinuationOutcome::SpawnFailed,
+                        Some(first_line(&detail)),
+                        None,
+                    )
+                    .await;
+                }
+                return Err(anyhow::anyhow!(detail));
+            }
+        }
+    };
+
     // Step 3: acquire a device-local worktree (+ claim heartbeat). The `ctx`
     // owns the claim heartbeat task. For the HEADLESS path it stays bound here
     // so its heartbeat runs for the whole subprocess and the claim releases on
@@ -7579,6 +7664,9 @@ async fn run_gate_continuation_inner(
     // STARTED and had already exited by its start verdict, whose exit path is
     // fired below only after `spawned` is posted.
     let mut exited_terminal: Option<String> = None;
+    // Set when the ACP arm already posted `spawned` (at session start) and its
+    // own verdict: Step 4 must not post a second `spawned` over it.
+    let mut acp_arm_reported = false;
     let result: anyhow::Result<Option<uuid::Uuid>> = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
@@ -7617,21 +7705,61 @@ async fn run_gate_continuation_inner(
                 &workdir,
                 no_worktree_cause.as_deref(),
             );
-            // Known lag, accepted: the headless fn returns only after the child
-            // EXITS, so on this presentation the `spawned` outcome — and the
-            // session id with it — reaches coord at exit rather than at spawn.
-            // Headless continuations are rare and the binding is still correct,
-            // just late; when `spawned` is posted is deliberately unchanged.
-            let res = run_continuation_headless(
-                agent_id,
-                &workdir,
-                &headless_prompt,
-                reservation,
-                pinned_session_id,
-                ctx,
-                &payload.launch,
-            )
-            .await;
+            // The gate this continuation reports its outcome against: a real
+            // gate row only (a work-unit dispatch has none).
+            let gate_identity = reportable_gate_id(&payload).map(|gate_id| {
+                crate::commands::terminal::GateIdentity {
+                    gate_id,
+                    consuming_device_id: device_id,
+                }
+            });
+            let harness = match acp_agent.as_ref() {
+                None => HeadlessHarness::ClaudeCli,
+                Some(agent) => acp_continuation::select_headless_harness(
+                    Some(agent),
+                    &workdir,
+                    acp_continuation::acp_launch_env(agent, gate_identity).await,
+                ),
+            };
+            let res = match harness {
+                // Known lag, accepted: the headless fn returns only after the
+                // child EXITS, so on this presentation the `spawned` outcome —
+                // and the session id with it — reaches coord at exit rather
+                // than at spawn. Headless continuations are rare and the
+                // binding is still correct, just late; when `spawned` is posted
+                // is deliberately unchanged.
+                HeadlessHarness::ClaudeCli => {
+                    run_continuation_headless(
+                        agent_id,
+                        &workdir,
+                        &headless_prompt,
+                        reservation,
+                        pinned_session_id,
+                        ctx,
+                        &payload.launch,
+                    )
+                    .await
+                }
+                // The ACP arm posts `spawned` itself at SESSION START (an ACP
+                // agent does not exit at `end_turn`, so "at exit" would be
+                // never) and its own verdict at the end.
+                HeadlessHarness::Acp(launch) => {
+                    acp_continuation::run_continuation_acp(
+                        acp_continuation::AcpArm {
+                            agent_id,
+                            workdir: workdir.clone(),
+                            prompt: headless_prompt.clone(),
+                            acp_id: acp_agent.as_ref().map(|a| a.id.clone()).unwrap_or_default(),
+                            launch,
+                            gate: gate_identity,
+                        },
+                        reservation,
+                        ctx,
+                    )
+                    .await
+                }
+            };
+            acp_arm_reported = matches!(res, Ok(HeadlessExit::Acp));
             presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
         }
     };
@@ -7649,6 +7777,9 @@ async fn run_gate_continuation_inner(
 
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
+        // The ACP arm posted `spawned` at session start and its own verdict at
+        // the end; posting `spawned` again over a `work_unreported` is refused.
+        ConsumeTarget::Gate(_, _) if acp_arm_reported => {}
         ConsumeTarget::Gate(gate_id, _) => {
             let resolution = spawn_resolution_outcome(&result);
             post_spawn_outcome(
@@ -7759,13 +7890,17 @@ enum HeadlessExit {
     /// A non-zero exit — the child did not exit cleanly; it still counts as
     /// `spawned`, but its id is NOT bound on coord.
     NonZero,
+    /// The run was an ACP agent's (`HeadlessHarness`). The arm posted `spawned`
+    /// at session start and its own verdict at the end, so Step 4 posts nothing,
+    /// and there is no Claude session id to bind: the agent minted its own.
+    Acp,
 }
 
 /// The session id the `spawned` outcome may bind for a headless child.
 fn headless_bindable_session(exit: HeadlessExit, pinned: uuid::Uuid) -> Option<uuid::Uuid> {
     match exit {
         HeadlessExit::Clean => Some(pinned),
-        HeadlessExit::NonZero => None,
+        HeadlessExit::NonZero | HeadlessExit::Acp => None,
     }
 }
 
@@ -9794,6 +9929,23 @@ fn headless_continuation_bound_port(resolve: impl FnOnce() -> Option<u16>) -> Op
     port
 }
 
+/// Which harness a HEADLESS gate continuation runs under, chosen in the headless
+/// arm of `run_gate_continuation_inner` beside [`spawn_claude_child`].
+///
+/// `ClaudeCli` is the default, so behaviour is unchanged unless a continuation
+/// asked for an ACP agent (`harness: {"acp": "<id>"}`). An `Acp` harness paired
+/// with `Presentation::Terminal` is refused before it ever gets here
+/// ([`acp_continuation::resolve_harness_request`]).
+///
+/// Phase 4 of plan `2026-11-13-acp-client-lane-for-acp-native-clis` folds this
+/// into `CliProfile.structured_lane` once runner PR #1990 lands.
+enum HeadlessHarness {
+    /// `claude -p` as a tokio child ([`run_continuation_headless`]).
+    ClaudeCli,
+    /// An ACP-native agent CLI over stdio ([`acp_continuation::run_continuation_acp`]).
+    Acp(crate::acp_session::AcpLaunch),
+}
+
 /// Run a gate continuation as a headless `claude` child (the existing
 /// subprocess flow), posting `spawn-complete` on first successful spawn and
 /// `spawn-failed` on a non-zero / failed exit. Mirrors the agent-spawn path's
@@ -10506,6 +10658,35 @@ async fn run_agent_subprocess(
     }
     let pinned_config_dir = pinned_account.as_ref().map(|a| a.config_dir.clone());
 
+    // Step 0a: the harness this spawn asks for (`{"acp": "<id>"}`), refused
+    // here — before any credential mint or worktree — when this device cannot
+    // run it. Never a silent Claude fallback. An agent spawn is always headless.
+    let acp_agent = {
+        let harness = payload.harness.clone();
+        let resolved = spawn_blocking_tracked(move || {
+            acp_continuation::resolve_harness_request(
+                harness.as_ref(),
+                Presentation::Headless,
+                &crate::settings::get_ai_settings().acp_agents,
+                crate::acp_session::resolve_program,
+            )
+        })
+        .await;
+        let refusal = match resolved {
+            Ok(Ok(agent)) => Ok(agent),
+            Ok(Err(refusal)) => Err(refusal.detail()),
+            Err(join) => Err(format!("harness_unresolvable: {join}")),
+        };
+        match refusal {
+            Ok(agent) => agent,
+            Err(detail) => {
+                warn!("agent_runtime: agent_id={agent_id} NOT launched — {detail}");
+                report_spawn_failed(agent_id, &detail, None, 0, primary_push_ref.as_deref()).await;
+                return Err(anyhow::anyhow!(detail));
+            }
+        }
+    };
+
     // Step 0b: mint this agent's credential against coord's credential door —
     // BEFORE materializing anything, so a refused credential costs no
     // worktrees, and before the token slot below is registered, so nothing
@@ -10788,6 +10969,40 @@ async fn run_agent_subprocess(
         // bail without (re)spawning.
         if stop.is_cancelled() {
             final_reason = Some("stopped by operator before (re)spawn".to_string());
+            // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
+            break;
+        }
+        // An ACP spawn runs ONCE under the ACP arm: no Claude session pin, no
+        // restart loop (a partially-run agent session is not safely replayable).
+        if let Some(agent) = acp_agent.as_ref() {
+            match acp_continuation::run_agent_spawn_acp(
+                payload.agent_id,
+                &primary_wt,
+                &payload.initial_prompt,
+                agent,
+                coord_mcp,
+                primary_push_ref.as_deref(),
+                &stop,
+            )
+            .await
+            {
+                acp_continuation::AcpSpawnEnd::Clean => {
+                    child_ever_started = true;
+                    final_exit_code = Some(0);
+                }
+                acp_continuation::AcpSpawnEnd::Stopped => {
+                    child_ever_started = true;
+                    final_reason =
+                        Some("stopped by operator (events.agent.stop_requested)".to_string());
+                }
+                acp_continuation::AcpSpawnEnd::Failed {
+                    reason,
+                    child_started,
+                } => {
+                    child_ever_started |= child_started;
+                    final_reason = Some(reason);
+                }
+            }
             // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
             break;
         }
@@ -15231,6 +15446,7 @@ mod tests {
             correlation_topic: Some("my-coordination-topic".to_string()),
             account: None,
             launch: LaunchFrame::default(),
+            harness: None,
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -18918,6 +19134,7 @@ mod tests {
             retry: None,
             allocation: None,
             launch: LaunchFrame::default(),
+            harness: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -22862,6 +23079,7 @@ mod tests {
                 retry: None,
                 allocation: None,
                 launch: LaunchFrame::default(),
+                harness: None,
             }
         }
         let gate = uuid::Uuid::now_v7();

@@ -431,6 +431,13 @@ fn extract_assertions(
     map
 }
 
+/// Key-order-independent rendering, so a version diff never reports a
+/// "modified" field whose only change is key order (`serde_json`'s
+/// `preserve_order` is on for this build; see `util::json_canon`).
+fn canonical_string(v: &serde_json::Value) -> String {
+    crate::util::json_canon::to_canonical_string(v).unwrap_or_else(|_| v.to_string())
+}
+
 fn diff_assertion(
     old: &serde_json::Value,
     new: &serde_json::Value,
@@ -440,8 +447,8 @@ fn diff_assertion(
     let fields = ["description", "assertionType", "severity", "enabled"];
 
     for field in &fields {
-        let old_val = old.get(field).map(|v| v.to_string()).unwrap_or_default();
-        let new_val = new.get(field).map(|v| v.to_string()).unwrap_or_default();
+        let old_val = old.get(field).map(canonical_string).unwrap_or_default();
+        let new_val = new.get(field).map(canonical_string).unwrap_or_default();
         if old_val != new_val {
             mods.push(AssertionModification {
                 id: assertion_id.to_string(),
@@ -456,12 +463,12 @@ fn diff_assertion(
     let old_criteria = old
         .get("target")
         .and_then(|t| t.get("criteria"))
-        .map(|c| c.to_string())
+        .map(canonical_string)
         .unwrap_or_default();
     let new_criteria = new
         .get("target")
         .and_then(|t| t.get("criteria"))
-        .map(|c| c.to_string())
+        .map(canonical_string)
         .unwrap_or_default();
     if old_criteria != new_criteria {
         mods.push(AssertionModification {
@@ -473,4 +480,23 @@ fn diff_assertion(
     }
 
     mods
+}
+
+#[cfg(test)]
+mod key_order_tests {
+    use super::*;
+
+    /// A criteria object whose keys are only REORDERED is not a modification.
+    #[test]
+    fn diff_assertion_ignores_key_order() {
+        let old: serde_json::Value = serde_json::from_str(
+            r#"{"description":"d","target":{"criteria":{"role":"button","text":"OK"}}}"#,
+        )
+        .unwrap();
+        let new: serde_json::Value = serde_json::from_str(
+            r#"{"target":{"criteria":{"text":"OK","role":"button"}},"description":"d"}"#,
+        )
+        .unwrap();
+        assert!(diff_assertion(&old, &new, "a1").is_empty());
+    }
 }

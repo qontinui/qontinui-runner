@@ -230,6 +230,7 @@ pub fn save_ai_settings(
             // unrelated AI setting. Plan:
             // `2026-07-28-git-op-federation-lost-its-kill-switch`.
             git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+            acp_agents: existing_settings.acp_agents,
         };
 
         Ok::<_, std::convert::Infallible>(ai_settings)
@@ -336,6 +337,7 @@ pub fn save_gemini_settings(
             // Preserve — see the note in `save_ai_settings`; reconstructing this
             // from the default would silently re-enable federation on every save.
             git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+            acp_agents: existing_settings.acp_agents,
         };
 
         Ok::<_, std::convert::Infallible>(ai_settings)
@@ -1051,6 +1053,7 @@ pub fn save_agentic_settings(
             // Preserve — see the note in `save_ai_settings`; reconstructing this
             // from the default would silently re-enable federation on every save.
             git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+            acp_agents: existing_settings.acp_agents,
         };
 
         Ok::<_, std::convert::Infallible>(ai_settings)
