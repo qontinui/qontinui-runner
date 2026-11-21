@@ -59,8 +59,16 @@ pub(crate) fn build_fix_agent_command_with(
     let mut cmd = tokio::process::Command::new("claude");
     cmd.args(["--print", prompt_file]);
     cmd.args(permission.render());
-    cmd.args(["--output-format", "text", "--model", model])
-        .env_remove("CLAUDECODE")
+    cmd.args(["--output-format", "text", "--model", model]);
+    // The one id this process runs under, in argv where the session census
+    // reads it — the CLI would otherwise pick its own and leave argv id-less
+    // (plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    // Phase 2; `claude_session::runner::cli_session_pins` mints the same way).
+    let (session_id, _) = crate::claude_session::runner::cli_session_pins(None);
+    if let Some(id) = session_id {
+        cmd.args(["--session-id", id.as_str()]);
+    }
+    cmd.env_remove("CLAUDECODE")
         // Same rule, sibling marker — see `session::transport::claude_cli` docs.
         .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
         .stdout(Stdio::piped())
@@ -271,8 +279,8 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            args,
-            vec![
+            args[..10],
+            [
                 "--print",
                 "/tmp/p.txt",
                 "--permission-mode",
@@ -285,6 +293,38 @@ mod tests {
                 "sonnet"
             ]
         );
+        assert_eq!(args.len(), 12, "args: {args:?}");
+        assert_eq!(args[10], "--session-id");
+    }
+
+    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    /// Phase 2: the fix agent's one-shot `claude --print` carries exactly one
+    /// `--session-id <uuid>` in argv, so a census reading argv identifies it.
+    #[test]
+    fn fix_agent_command_carries_exactly_one_session_id() {
+        let cmd = build_fix_agent_command_with(
+            "/tmp/p.txt",
+            "sonnet",
+            &crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "--session-id").count(),
+            1,
+            "args: {args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "--resume").count(),
+            0,
+            "args: {args:?}"
+        );
+        let i = args.iter().position(|a| a == "--session-id").unwrap();
+        let id = args.get(i + 1).expect("a value follows --session-id");
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "not a uuid: {id:?}");
     }
 
     #[test]
