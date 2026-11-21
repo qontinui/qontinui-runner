@@ -1871,7 +1871,7 @@ pub(crate) mod tests {
     /// `CARGO_MANIFEST_DIR` — or why git could not answer (no checkout, no
     /// git binary), in which case the census reads every file on disk.
     fn git_tracked_sources() -> Result<std::collections::HashSet<String>, String> {
-        let out = std::process::Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .args(["ls-files", "-z", "--", "src"])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()

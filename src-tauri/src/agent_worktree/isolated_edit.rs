@@ -1992,7 +1992,7 @@ mod tests {
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .args(args)

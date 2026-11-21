@@ -4528,7 +4528,7 @@ mod sensitive_action_tests {
     // ── D8 end to end, against a real repository ─────────────────────────
 
     fn run_git(dir: &std::path::Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        let ok = crate::process_helpers::no_window("git")
             .current_dir(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)

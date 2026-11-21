@@ -452,7 +452,6 @@ fn store_entry_is_complete(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     const SHA_A: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -540,7 +539,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")

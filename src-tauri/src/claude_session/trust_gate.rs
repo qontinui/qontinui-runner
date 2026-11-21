@@ -2015,20 +2015,17 @@ fn finish(
 pub(crate) mod test_fixtures {
     use std::path::{Path, PathBuf};
 
-    /// Run `git` in `dir`, scrubbed of the repo-selecting variables a git hook
-    /// exports — without that, a `cargo test` run from a hook would init and
-    /// add worktrees in the OUTER repository — and of the machine's global and
-    /// system config, so a `commit.gpgsign` or `core.hooksPath` there cannot
-    /// fail the fixture or run hooks inside it. The global path is a file that
-    /// does not exist, which git reads as empty on every platform.
+    /// Run `git` in `dir`, scrubbed (by `no_window`) of the repo-selecting
+    /// variables a git hook exports — without that, a `cargo test` run from a
+    /// hook would init and add worktrees in the OUTER repository — and of the
+    /// machine's global and system config, so a `commit.gpgsign` or
+    /// `core.hooksPath` there cannot fail the fixture or run hooks inside it.
+    /// The global path is a file that does not exist, which git reads as
+    /// empty on every platform.
     pub(crate) fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .args(args)
             .current_dir(dir)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_COMMON_DIR")
             .env("GIT_CONFIG_GLOBAL", dir.join("no-global-gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()

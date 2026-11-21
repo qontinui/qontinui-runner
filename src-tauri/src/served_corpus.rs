@@ -1706,12 +1706,12 @@ mod tests {
     use crate::agent_commands::{AgentCommandRegistry, CommandSource};
     use crate::agent_skills::AgentSkillRegistry;
     use crate::provision_guard::test_support::assert_not_in_any_repo;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     /// Run git in `dir` with no dependence on the user's global hooks or
     /// signing config.
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .args([
@@ -1725,9 +1725,6 @@ mod tests {
                 "user.name=t",
             ])
             .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
             .stdin(Stdio::null())
             .output()
             .expect("run git");

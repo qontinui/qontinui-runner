@@ -1817,7 +1817,7 @@ mod tests {
 
     /// Run git in `dir` with an identity and no hooks, panicking on failure.
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .args([
@@ -1833,8 +1833,6 @@ mod tests {
                 "init.defaultBranch=main",
             ])
             .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
             .output()
             .expect("git runs");
         assert!(

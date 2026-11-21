@@ -235,7 +235,7 @@ pub(crate) mod inherited_git_dir_reexec {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_str().expect("utf-8 tempdir").to_string();
         let git = |args: &[&str]| -> String {
-            let mut cmd = Command::new("git");
+            let mut cmd = super::host_git();
             cmd.args([
                 "-c",
                 "commit.gpgsign=false",
@@ -249,7 +249,6 @@ pub(crate) mod inherited_git_dir_reexec {
                 path.as_str(),
             ])
             .args(args);
-            super::scrub_repo_local_git_env(&mut cmd);
             let out = cmd.output().expect("git runs");
             assert!(out.status.success(), "git {args:?}: {out:?}");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -356,7 +355,7 @@ mod tests {
     fn fixture(path: &Path) -> impl Fn(&[&str]) + '_ {
         let dir = path.to_str().unwrap();
         let git = move |args: &[&str]| {
-            let mut cmd = Command::new("git");
+            let mut cmd = host_git();
             // Hermetic commits whatever the box's global config says (the
             // same overrides build_drift's `fixture_git` uses).
             cmd.args([
@@ -366,9 +365,6 @@ mod tests {
                 "core.hooksPath=/dev/null",
             ]);
             cmd.args([&["-C", dir], args].concat());
-            // Under a git hook these would point the fixture at the CALLER's
-            // repo — the same scrub production applies.
-            scrub_repo_local_git_env(&mut cmd);
             let out = cmd.output().unwrap();
             assert!(out.status.success(), "git {args:?} failed");
         };
@@ -581,6 +577,7 @@ mod tests {
 
         // Control: unscrubbed (a raw `Command`, not the scrubbed
         // `no_window` posture), the inherited GIT_DIR beats `-C <target>`.
+        // git-env-ok: unscrubbed control proving the child inherited the decoy GIT_DIR.
         let out = Command::new("git")
             .arg("-C")
             .arg(target)

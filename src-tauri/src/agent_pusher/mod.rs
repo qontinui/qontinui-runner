@@ -1327,7 +1327,7 @@ pub(crate) mod egress_tests {
     use crate::egress::{Flow, Level};
 
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        let ok = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .args([
@@ -1341,9 +1341,6 @@ pub(crate) mod egress_tests {
                 "user.name=t",
             ])
             .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run git")

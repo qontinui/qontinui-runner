@@ -7051,7 +7051,7 @@ mod tests {
     /// Run `git` in `dir` with an isolated identity and no signing, optionally
     /// pinning the committer date (which is also the REFLOG entry time).
     fn real_git(dir: &Path, args: &[&str], committer_date: Option<&str>) -> String {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = crate::process_helpers::no_window("git");
         cmd.arg("-C")
             .arg(dir)
             .args([

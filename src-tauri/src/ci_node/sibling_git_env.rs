@@ -364,6 +364,9 @@ mod tests {
     fn isolated_child() -> (BTreeMap<String, String>, SiblingGitEnv) {
         let inherited = os(HOSTILE);
         let env = SiblingGitEnv::isolation_for(inherited.clone(), &fake_paths());
+        // git-env-ok: never spawned; no_window would pre-remove GIT_DIR and
+        // pre-set the prompt posture, masking what isolate_std_git_command
+        // alone must strip or set and making these assertions vacuous.
         let mut cmd = std::process::Command::new("git");
         cmd.env("GIT_CONFIG_COUNT", "2")
             .env("GIT_CONFIG_KEY_1", "credential.helper")
@@ -516,7 +519,7 @@ mod tests {
     }
 
     fn git_installed() -> bool {
-        std::process::Command::new("git")
+        crate::process_helpers::no_window("git")
             .arg("--version")
             .output()
             .is_ok()
@@ -621,13 +624,12 @@ mod tests {
     }
 
     fn plain_git(cwd: &Path, args: &[&str]) {
-        // An exported GIT_DIR / GIT_WORK_TREE (a hook shell, a worktree)
-        // would aim `init` and `config` at the CALLER's repo and write a
-        // plaintext-store helper and an insteadOf into its real .git/config.
-        let out = std::process::Command::new("git")
+        // no_window scrubs an exported GIT_DIR / GIT_WORK_TREE (a hook shell,
+        // a worktree), which would otherwise aim `init` and `config` at the
+        // CALLER's repo and write a plaintext-store helper and an insteadOf
+        // into its real .git/config.
+        let out = crate::process_helpers::no_window("git")
             .current_dir(cwd)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
             .args(args)
             .output()
             .unwrap();

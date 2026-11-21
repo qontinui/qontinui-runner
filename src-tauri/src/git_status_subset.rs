@@ -308,7 +308,6 @@ fn resolve_gitdir(repo: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
     use tempfile::TempDir;
 
     /// `git init` + identity config. Returns the repo path (the tempdir
@@ -323,7 +322,7 @@ mod tests {
     }
 
     fn run(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = no_window("git")
             .args(args)
             .current_dir(repo)
             .output()

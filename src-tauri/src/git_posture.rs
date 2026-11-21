@@ -224,6 +224,8 @@ mod repo_local_env_tests {
 
     #[test]
     fn the_scrub_removes_the_list_and_keeps_command_scope_config() {
+        // git-env-ok: never spawned; no_window already runs this scrub, so
+        // building through it would make the assertions below vacuous.
         let mut cmd = std::process::Command::new("git");
         let kept = [
             ("GIT_CONFIG_PARAMETERS", "'baz.q'='p'"),
@@ -270,7 +272,7 @@ mod repo_local_env_tests {
     /// reported. Skipped only when no `git` can be spawned at all.
     #[test]
     fn repo_local_git_env_covers_gits_own_list() {
-        let Ok(out) = std::process::Command::new("git")
+        let Ok(out) = crate::process_helpers::no_window("git")
             .args(["rev-parse", "--local-env-vars"])
             .output()
         else {
