@@ -707,7 +707,11 @@ fn end_failed(
             };
             if !applied {
                 if let Some(rec) = store.find_open_by_terminal(current) {
-                    store.record_close_checked(&rec.claude_session_id, Some(current), "pty-exit");
+                    store.record_close_checked(
+                        &rec.claude_session_id,
+                        Some(current),
+                        crate::session::session_lifecycle_store::CLOSE_REASON_PTY_EXIT,
+                    );
                 }
             }
             if let Err(e) = panes.close(current) {

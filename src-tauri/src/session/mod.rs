@@ -104,6 +104,7 @@ pub mod finish_heal; // Heal finished marks stamped synced over a write coord ne
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod finished_close_guard; // The finished_close arm's close guard: every served close condition judged fresh per close, SHADOW in Phase 1 (plan 2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions)
 pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6)
+pub mod stop_reason; // "Why did my session stop?" — the typed answer behind GET /sessions/{id}/stop-reason (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, C5)
 pub mod stray_wait; // Tells a wait loop that can never end from work, so a finished session it holds can close (plan 2026-10-23-finished-sessions-stay-busy-behind-background-wait-loops-that-can-never-exit, Phase 4)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)

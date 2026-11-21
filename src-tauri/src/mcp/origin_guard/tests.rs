@@ -2174,3 +2174,14 @@ async fn no_browser_origin_can_upsert_a_managed_task() {
         }
     }
 }
+
+/// Plan 2026-09-20-the-published-product-works-without-knowing-a-development-
+/// environment-exists C5: the session stop-reason read is a door, so every
+/// browser class is refused under EVERY route policy — not only the shadowed
+/// allowlist refusal a plain unlisted route gets under the default.
+#[test]
+fn session_stop_reason_is_a_credential_door() {
+    assert!(is_credential_door("GET", "/sessions/{id}/stop-reason"));
+    // Only the read is named; nothing else under the session is widened.
+    assert!(!is_credential_door("GET", "/sessions/{id}/policy-context"));
+}
