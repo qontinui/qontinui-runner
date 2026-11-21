@@ -371,6 +371,14 @@ const READ_TOOLS: &[&str] = &[
     // no prefix below covers the `coord_ci_` pair.
     "coord_ci_job_log_tail",
     "coord_ci_run_jobs",
+    // This and coord_repo_tenant_bindings, coord_resolve_pr_author_session,
+    // coord_resolve_session, coord_secret_presence, coord_slo_metrics,
+    // coord_subproject_get, coord_symbol_lookup, coord_tenants_for_repo and
+    // coord_twin_catalog below are each documented "Read-only" (or a pure
+    // query/list/resolve) in coord's tool registry snapshot at fc3544aec. No
+    // read prefix covers them (`coord_resolve_` would also claim the
+    // unverified coord_resolve_origin), so they are exact entries.
+    "coord_claim_check",
     // The condition-runs read (twin `GET /coord/agent-condition-runs`); no read
     // prefix covers it, so without this it reads as a write.
     "coord_condition_runs",
@@ -399,9 +407,18 @@ const READ_TOOLS: &[&str] = &[
     "coord_primary_tree_branch_status",
     "coord_project_state",
     "coord_reevaluate_dry",
+    "coord_repo_tenant_bindings",
+    "coord_resolve_pr_author_session",
+    "coord_resolve_session",
+    "coord_secret_presence",
     "coord_session_obligations",
     "coord_session_worktrees",
     "coord_sessions_unfinished",
+    "coord_slo_metrics",
+    "coord_subproject_get",
+    "coord_symbol_lookup",
+    "coord_tenants_for_repo",
+    "coord_twin_catalog",
     "coord_verification_queue",
     "coord_watch_verdict",
     "coord_who_is_working_on",
@@ -1022,7 +1039,17 @@ mod tests {
         for tool in [
             "coord_alert_queue",
             "coord_auto_publish_status",
+            "coord_claim_check",
             "coord_expedited_land_status",
+            "coord_repo_tenant_bindings",
+            "coord_resolve_pr_author_session",
+            "coord_resolve_session",
+            "coord_secret_presence",
+            "coord_slo_metrics",
+            "coord_subproject_get",
+            "coord_symbol_lookup",
+            "coord_tenants_for_repo",
+            "coord_twin_catalog",
             "coord_fleet_dispatch_roles",
             "coord_fleet_drain_status",
             "coord_next_step_settings_effective",
