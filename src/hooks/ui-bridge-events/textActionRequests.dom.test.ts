@@ -90,6 +90,13 @@ describe("click_by_selector §4.6", () => {
 });
 
 describe("scrub helpers", () => {
+  it("a container's text keeps its redacted subtrees out", () => {
+    mount(`<main id="m">hello <section data-bridge-redact="true">token-7</section> world</main>`);
+    const t = scrubbedTextContent(document.getElementById("m")!);
+    expect(t).toBe("hello  world");
+    expect(t).not.toContain("token-7");
+  });
+
   it("scrubbedTextContent / scrubbedAttribute redact inside a boundary only", () => {
     mount(
       `<p id="p" aria-label="plain">visible</p><section data-bridge-redact="true"><p id="q" aria-label="secret-aria">secret</p></section>`,

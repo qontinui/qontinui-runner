@@ -476,7 +476,8 @@ Two thread-through styles, mirroring the `tabId` split:
 > SDK's §4.6-gated primitives. A miss is HTTP 400 (`ELEMENT_NOT_FOUND`), not
 > HTTP 200 `clicked: false`; content inside a `data-bridge-redact` boundary is
 > never matched, and a click echo is scrubbed to `[REDACTED]`. `click-by-text`
-> no longer takes `index` (the primitive clicks the first match); a non-integer
+> rejects `index` with a 400 (the primitive clicks the first match); matching no
+> longer filters on visibility and a click response is `{clicked, element:{tag,text,rect}}`; a non-integer
 > or negative `index` on `click-by-selector` / `read-value` is a 400 naming it.
 > Only `type-into` still evaluates injected JS (a resolution expression).
 

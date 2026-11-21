@@ -69,14 +69,32 @@ export function runClickBySelectorRequest(params: {
   );
 }
 
+/** Text of `el` with every `data-bridge-redact` subtree left out. */
+function textOutsideBoundaries(el: HTMLElement): string {
+  if (!el.querySelector('[data-bridge-redact="true"]')) return el.textContent ?? "";
+  let out = "";
+  const walk = (node: Node): void => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === Node.TEXT_NODE) out += child.textContent ?? "";
+      else if (child.nodeType === Node.ELEMENT_NODE) {
+        if ((child as Element).getAttribute("data-bridge-redact") === "true") continue;
+        walk(child);
+      }
+    }
+  };
+  walk(el);
+  return out;
+}
+
 /**
- * An element's `textContent`, or the SDK's `REDACTED_VALUE` when the element
- * sits inside a `data-bridge-redact` boundary. For call sites that echo or
- * compare caller-selected text and are not a find/click primitive.
+ * An element's `textContent` with §4.6 applied: `REDACTED_VALUE` when the
+ * element sits inside a `data-bridge-redact` boundary, and a container's text
+ * keeps its redacted subtrees out. For call sites that echo or compare
+ * caller-selected text and are not a find/click primitive.
  */
 export function scrubbedTextContent(el: HTMLElement | null | undefined): string {
   if (!el) return "";
-  return isContentRedacted(el) ? REDACTED_VALUE : (el.textContent ?? "");
+  return isContentRedacted(el) ? REDACTED_VALUE : textOutsideBoundaries(el);
 }
 
 /** An attribute read that yields `REDACTED_VALUE` inside a redaction boundary. */
