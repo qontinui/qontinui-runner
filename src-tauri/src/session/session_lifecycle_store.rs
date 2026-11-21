@@ -1329,6 +1329,10 @@ pub enum RedirectFinish<R> {
     MarkChanged,
     /// The mark's row already is the target (a concurrent redirect won).
     AlreadyOnRow,
+    /// The finish heal re-addressed the mark
+    /// ([`TerminalSessionRecord::finish_coord_readdressed`]): coord's observed
+    /// live row outranks the caller's local inference, so nothing was sent.
+    HealReaddressed,
     /// The sender ran, under `finish_forward`; its verdict.
     Ran(R),
 }
@@ -3564,10 +3568,11 @@ impl SessionLifecycleStore {
     /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
     /// D5) — as ONE critical section under `finish_forward`:
     ///
-    /// 1. re-read the mark: it must still be finished at `finished_at` and its
+    /// 1. re-read the mark: it must still be finished at `finished_at`, its
     ///    [`TerminalSessionRecord::finish_coord_session_id`] must name a row
-    ///    other than `row` ([`RedirectFinish::MarkChanged`] /
-    ///    [`RedirectFinish::AlreadyOnRow`] otherwise);
+    ///    other than `row`, and the finish heal must not have re-addressed it
+    ///    ([`RedirectFinish::MarkChanged`] / [`RedirectFinish::AlreadyOnRow`] /
+    ///    [`RedirectFinish::HealReaddressed`] otherwise);
     /// 2. withdraw its `finish_synced` stamp, if any;
     /// 3. run `send` with the re-read record (it enqueues, or finds a pending
     ///    row) — it answers its verdict and whether a finish for the mark now
@@ -3608,6 +3613,12 @@ impl SessionLifecycleStore {
             // Its finish is in flight again (unmarked and re-marked since the
             // caller read it): the caller's decision no longer applies.
             None => return RedirectFinish::MarkChanged,
+        }
+        // Re-checked here, under `finish_forward`, because the heal records
+        // its re-address under the same lock (`note_finish_readdressed`): a
+        // heal that landed after the caller's decision wins.
+        if rec.finish_coord_readdressed {
+            return RedirectFinish::HealReaddressed;
         }
         let snapshot = if rec.finish_synced {
             rec.finish_synced = false;
