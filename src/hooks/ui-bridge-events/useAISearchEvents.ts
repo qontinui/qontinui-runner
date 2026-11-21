@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
+import { scrubbedAttribute, scrubbedTextContent } from "./textActionRequests";
 import {
   RECOVERY_FAILED,
   RECOVERY_TARGET_MISSING,
@@ -324,7 +325,7 @@ export function useAISearchEvents(
                 id: row.id,
                 type: row.type,
                 label: row.label,
-                ariaLabel: domEl?.getAttribute?.("aria-label") ?? undefined,
+                ariaLabel: scrubbedAttribute(domEl as HTMLElement | null, "aria-label"),
                 state: undefined,
               };
               if (!predicateMatches(materialized, domEl)) continue;
@@ -339,9 +340,11 @@ export function useAISearchEvents(
                   const syntheticEl: Record<string, unknown> = {
                     id: domEl.id || `dom-${predicate.selector}`,
                     label:
-                      domEl.getAttribute("aria-label") ?? domEl.textContent?.trim() ?? undefined,
+                      scrubbedAttribute(domEl, "aria-label") ??
+                      scrubbedTextContent(domEl).trim() ??
+                      undefined,
                     type: domEl.tagName?.toLowerCase?.(),
-                    ariaLabel: domEl.getAttribute("aria-label") ?? undefined,
+                    ariaLabel: scrubbedAttribute(domEl, "aria-label"),
                   };
                   if (!requirementMet(syntheticEl, domEl)) return null;
                   return { element: syntheticEl, domEl };
@@ -406,7 +409,7 @@ export function useAISearchEvents(
                       id: row.id,
                       type: row.type,
                       label: row.label,
-                      ariaLabel: domEl?.getAttribute?.("aria-label") ?? undefined,
+                      ariaLabel: scrubbedAttribute(domEl as HTMLElement | null, "aria-label"),
                     };
                     if (predicateMatches(materialized, domEl)) {
                       lastPartial = materialized;
@@ -688,7 +691,7 @@ export function useAISearchEvents(
                 const label = ((el.label as string | undefined) ?? "").toLowerCase();
                 const aria = ((el.ariaLabel as string | undefined) ?? "").toLowerCase();
                 const tt = ((el.title as string | undefined) ?? "").toLowerCase();
-                const tc = (domEl?.textContent ?? "").toLowerCase();
+                const tc = scrubbedTextContent(domEl).toLowerCase();
                 return (
                   label.includes(needle) ||
                   aria.includes(needle) ||
@@ -738,8 +741,8 @@ export function useAISearchEvents(
                 id: el.id,
                 type: el.type,
                 label: el.label,
-                ariaLabel: domEl?.getAttribute("aria-label") ?? undefined,
-                title: domEl?.getAttribute("title") ?? undefined,
+                ariaLabel: scrubbedAttribute(domEl, "aria-label"),
+                title: scrubbedAttribute(domEl, "title"),
               };
               if (!matches(materialized, selector)) continue;
               if (

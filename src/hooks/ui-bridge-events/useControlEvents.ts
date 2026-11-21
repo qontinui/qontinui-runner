@@ -12,6 +12,7 @@ import {
 } from "./utils";
 import { buildKeyboardEventInit, shouldKeypress } from "./keyEventInit";
 import { describeThrown } from "@/lib/utils";
+import { scrubbedTextContent } from "./textActionRequests";
 
 /**
  * Handles: get_elements, get_element, execute_action, get_components, get_component,
@@ -493,13 +494,13 @@ export function useControlEvents(
           }
           if (spec.text !== undefined) {
             checked++;
-            const t = (es.text ?? htmlEl?.textContent ?? "") as string;
+            const t = (es.text ?? scrubbedTextContent(htmlEl)) as string;
             if (t !== spec.text)
               failures.push({ field: "text", expected: spec.text, actual: t, kind: "exact" });
           }
           if (spec.textContains !== undefined) {
             checked++;
-            const t = (es.text ?? htmlEl?.textContent ?? "") as string;
+            const t = (es.text ?? scrubbedTextContent(htmlEl)) as string;
             if (!t.includes(spec.textContains as string))
               failures.push({
                 field: "textContains",
