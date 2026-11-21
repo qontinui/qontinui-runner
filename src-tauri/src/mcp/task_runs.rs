@@ -2084,7 +2084,7 @@ pub async fn send_message_to_session(
     };
 
     // Build session context so the output event is associated with this task run
-    let session_ctx = AiSessionContext::setup(&id, "Ad-hoc Chat");
+    let session_ctx = AiSessionContext::for_session(&id, "Ad-hoc Chat");
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         emit_ai_output(
             &state.app_handle,
@@ -2419,7 +2419,7 @@ pub async fn create_ai_session(
         .to_string();
 
     // Create session context so output is properly captured and associated
-    let session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
+    let session_ctx = AiSessionContext::for_session(&task_run_id, &req.task_name);
 
     // Spawn the Claude session
     match crate::claude_session::ClaudeSession::spawn(

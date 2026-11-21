@@ -654,8 +654,9 @@ pub async fn dispatch_subtask(
     let joined = spawn_blocking_tracked(move || -> Result<(), WorkerSpawnFailure> {
         // AiSessionContext tags this worker's output events with the
         // task_run_id so the tab + transcript bind to this worker. Mirrors
-        // `create_ai_session`'s `AiSessionContext::setup`.
-        let session_ctx = crate::execution_context::AiSessionContext::setup(&trid, &task_name);
+        // `create_ai_session`'s `AiSessionContext::for_session`.
+        let session_ctx =
+            crate::execution_context::AiSessionContext::for_session(&trid, &task_name);
 
         // Pin the CLI session id to the task_run_id for a deterministic
         // transcript path (restart-resume parity with create_ai_session).

@@ -792,9 +792,9 @@ pub(crate) async fn promote_session_inner(
     };
 
     // 5. Reconstruct AiSessionContext for the new spawn so output events keep
-    //    flowing with the right task_run_id. Mirrors create_ai_session's setup
-    //    path (which is what regular interactive sessions use).
-    let session_ctx = AiSessionContext::setup(session_id, session_id);
+    //    flowing with the right task_run_id. Mirrors create_ai_session's
+    //    `for_session` context (which is what regular interactive sessions use).
+    let session_ctx = AiSessionContext::for_session(session_id, session_id);
 
     // 6. Run the promotion. promote_to_worktree handles state transitions,
     //    git worktree creation, PG persistence, kill+respawn, and replay.
@@ -2902,8 +2902,8 @@ If your task requires running visual automation, use the Runner API to execute w
     info!("MCP API: Created task run with ID: {}", task_run_id);
 
     // Create session context for AI output events so frontend can display the task name
-    // This is the first turn (iteration 1), so turn_count = 1
-    let session_ctx = AiSessionContext::agentic(&task_run_id, &prompt_name, 1)
+    // This is the first turn, so turn_count = 1
+    let session_ctx = AiSessionContext::for_session(&task_run_id, &prompt_name)
         .with_runtime_env()
         .with_new_trace()
         .with_ai_settings()

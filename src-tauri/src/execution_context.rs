@@ -27,8 +27,11 @@ pub struct ExecutionContext {
     /// Links to the `task_runs` table in the database.
     pub task_run_id: String,
 
-    /// Which workflow phase this execution is part of.
-    pub phase: WorkflowPhase,
+    /// Which workflow phase this execution is part of. `None` for an
+    /// execution that belongs to no workflow phase (a spawned or ad-hoc AI
+    /// session — see [`AiSessionContext::for_session`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<WorkflowPhase>,
 
     /// Iteration number within the phase (1-indexed).
     /// None for setup/completion phases which don't iterate.
@@ -106,6 +109,15 @@ pub struct ExecutionContext {
 impl ExecutionContext {
     /// Create a new execution context with required fields.
     pub fn new(task_run_id: impl Into<String>, phase: WorkflowPhase) -> Self {
+        Self::with_phase(task_run_id, Some(phase))
+    }
+
+    /// Create a context that belongs to no workflow phase (and no iteration).
+    pub fn unphased(task_run_id: impl Into<String>) -> Self {
+        Self::with_phase(task_run_id, None)
+    }
+
+    fn with_phase(task_run_id: impl Into<String>, phase: Option<WorkflowPhase>) -> Self {
         let task_run_id = task_run_id.into();
         Self {
             task_run_id: task_run_id.clone(),
@@ -242,9 +254,12 @@ impl ExecutionContext {
     /// Generate a session ID that includes phase suffix.
     /// Format: `{task_run_id}-{phase}` or `{task_run_id}-{phase}-{iteration}`
     pub fn session_id(&self) -> String {
-        match self.iteration {
-            Some(iter) => format!("{}-{}-{}", self.task_run_id, self.phase.as_str(), iter),
-            None => format!("{}-{}", self.task_run_id, self.phase.as_str()),
+        match (self.phase, self.iteration) {
+            (None, _) => self.task_run_id.clone(),
+            (Some(phase), Some(iter)) => {
+                format!("{}-{}-{}", self.task_run_id, phase.as_str(), iter)
+            }
+            (Some(phase), None) => format!("{}-{}", self.task_run_id, phase.as_str()),
         }
     }
 
@@ -263,7 +278,7 @@ impl ExecutionContext {
         let child_id = child_task_run_id.into();
         Self {
             task_run_id: child_id,
-            phase,
+            phase: Some(phase),
             iteration: None,
             parent_task_run_id: Some(self.task_run_id.clone()),
             root_task_run_id: self.root_task_run_id.clone(),
@@ -289,7 +304,9 @@ impl ExecutionContext {
     /// Merge context fields into an existing JSON object.
     pub fn merge_into(&self, obj: &mut serde_json::Map<String, Value>) {
         obj.insert("task_run_id".to_string(), json!(self.task_run_id));
-        obj.insert("phase".to_string(), json!(self.phase.as_str()));
+        if let Some(phase) = self.phase {
+            obj.insert("phase".to_string(), json!(phase.as_str()));
+        }
         if let Some(iteration) = self.iteration {
             obj.insert("iteration".to_string(), json!(iteration));
         }
@@ -475,6 +492,15 @@ impl AiSessionContext {
         }
     }
 
+    /// Create context for an AI session that is not part of a workflow phase
+    /// (a coord-spawned, ad-hoc or conductor session).
+    ///
+    /// No phase, no iteration, and `name` is the session name verbatim — the
+    /// session id is the task run id itself.
+    pub fn for_session(task_run_id: impl Into<String>, name: &str) -> Self {
+        Self::new(ExecutionContext::unphased(task_run_id), name)
+    }
+
     /// Create context for setup phase AI session.
     pub fn setup(task_run_id: impl Into<String>, workflow_name: &str) -> Self {
         let context = ExecutionContext::setup(task_run_id);
@@ -577,8 +603,8 @@ impl AiSessionContext {
         &self.context.task_run_id
     }
 
-    /// Get the phase.
-    pub fn phase(&self) -> WorkflowPhase {
+    /// Get the phase (`None` for a session outside any workflow phase).
+    pub fn phase(&self) -> Option<WorkflowPhase> {
         self.context.phase
     }
 
@@ -922,6 +948,20 @@ mod tests {
     }
 
     #[test]
+    fn for_session_carries_no_phase_and_its_name_verbatim() {
+        let ctx = AiSessionContext::for_session("task-789", "Fix the build");
+        assert_eq!(ctx.session_name, "Fix the build");
+        assert_eq!(ctx.phase(), None);
+        assert_eq!(ctx.iteration(), None);
+        assert_eq!(ctx.session_id, "task-789");
+        let json = ctx.to_json();
+        assert!(json.get("phase").is_none(), "{json}");
+        let mut obj = serde_json::Map::new();
+        ctx.context.merge_into(&mut obj);
+        assert!(!obj.contains_key("phase"));
+    }
+
+    #[test]
     fn test_execution_context_hierarchy() {
         let parent = ExecutionContext::agentic("parent-task", 1)
             .with_project_id("proj-123")
@@ -957,7 +997,7 @@ mod tests {
             .with_tokens(1000, 500);
 
         assert_eq!(ctx.task_run_id(), "task-123");
-        assert_eq!(ctx.phase(), WorkflowPhase::Agentic);
+        assert_eq!(ctx.phase(), Some(WorkflowPhase::Agentic));
         assert_eq!(ctx.iteration(), Some(3));
         assert_eq!(ctx.session_id, "task-123-agentic-3");
         assert_eq!(ctx.session_name, "My Workflow - Iteration 3");

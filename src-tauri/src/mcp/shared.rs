@@ -195,7 +195,9 @@ pub fn emit_ai_output(
         task_run_id: session_ctx.map(|ctx| ctx.task_run_id().to_string()),
         session_id: session_ctx.map(|ctx| ctx.session_id.clone()),
         session_name: session_ctx.map(|ctx| ctx.session_name.clone()),
-        phase: session_ctx.map(|ctx| ctx.phase().as_str().to_string()),
+        phase: session_ctx
+            .and_then(|ctx| ctx.phase())
+            .map(|p| p.as_str().to_string()),
         phase_iteration: session_ctx.and_then(|ctx| ctx.iteration()),
     };
 

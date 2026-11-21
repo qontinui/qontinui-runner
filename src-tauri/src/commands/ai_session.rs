@@ -576,7 +576,7 @@ pub async fn create_ai_session(
         // Create an AiSessionContext so output events include the taskRunId.
         // Without this, emit_ai_output would emit events with taskRunId=null
         // and the frontend would be unable to filter them.
-        let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
+        let session_ctx = AiSessionContext::for_session(&trid, &name_for_ctx);
 
         // Pin the Claude CLI session id to the task_run_id on this fresh launch
         // (Phase 3, restart resilience). This makes the on-disk transcript land
@@ -2088,7 +2088,7 @@ pub async fn resume_ai_sessions(
             .and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
 
         let joined = spawn_blocking_tracked(move || -> Result<(), ResumeSpawnFailure> {
-            let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
+            let session_ctx = AiSessionContext::for_session(&trid, &name_for_ctx);
 
             // Pin/resume the CLI session id to the task_run_id. `is_resume` is
             // true ONLY when an on-disk transcript exists (→ `--resume`); else
