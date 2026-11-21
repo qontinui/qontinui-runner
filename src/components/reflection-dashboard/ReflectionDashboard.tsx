@@ -43,6 +43,7 @@ import type {
   EffectivenessBucket,
 } from "../../types/architecture";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeEffectivenessEvidence } from "@/lib/reflectionEvidence";
 import { CrossRunPatternsPanel } from "./CrossRunPatternsPanel";
 import { StepProvenanceTimeline } from "./StepProvenanceTimeline";
 import { PipelineEventsTimeline } from "../pipeline-events/PipelineEventsTimeline";
@@ -753,7 +754,7 @@ export function ReflectionDashboard() {
                           {fix.effectiveness_evidence && (
                             <div>
                               <span className="font-medium">Evidence:</span>{" "}
-                              {fix.effectiveness_evidence}
+                              {describeEffectivenessEvidence(fix.effectiveness_evidence)}
                             </div>
                           )}
                           {fix.reasoning && (

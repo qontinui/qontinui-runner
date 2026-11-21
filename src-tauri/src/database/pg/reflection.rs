@@ -4,7 +4,9 @@
 //! This is one of the most heavily used tables (126+ callers for reflection_fixes).
 
 use super::PgDb;
-use crate::reflection::types::{CreateReflectionFixInput, FixEffectiveness, ReflectionFix};
+use crate::reflection::types::{
+    CreateReflectionFixInput, ExposureEvidence, FixEffectiveness, ReflectionFix,
+};
 use crate::str_utils::truncate_str;
 use tracing::{debug, info, warn};
 
@@ -1197,18 +1199,19 @@ fn judge_fix_exposure_read(
 /// verdict marks one nothing judged on exposure (the evaluator this replaced
 /// wrote none).
 fn verdict_evidence_json(exposure: &FixExposure, verdict: FixEffectiveness) -> String {
-    serde_json::json!({
-        "verdict": verdict.as_str(),
-        "window": "task_runs.completed_at > reflection_fixes.applied_at",
-        "later_runs": exposure.later_runs,
-        "min_later_runs": MIN_LATER_RUNS_FOR_EFFECTIVENESS,
-        "source_finding": exposure.has_source_finding,
-        "source_signature_known": exposure.source_signature_known,
-        "recurrences": exposure.recurrences,
-        "new_signature_peak_runs": exposure.new_signature_peak_runs,
-        "min_later_runs_for_regression": MIN_LATER_RUNS_FOR_REGRESSION,
-    })
-    .to_string()
+    let evidence = ExposureEvidence {
+        verdict: verdict.as_str().to_string(),
+        window: "task_runs.completed_at > reflection_fixes.applied_at".to_string(),
+        later_runs: exposure.later_runs,
+        min_later_runs: MIN_LATER_RUNS_FOR_EFFECTIVENESS,
+        source_finding: exposure.has_source_finding,
+        source_signature_known: exposure.source_signature_known,
+        recurrences: exposure.recurrences,
+        new_signature_peak_runs: exposure.new_signature_peak_runs,
+        min_later_runs_for_regression: MIN_LATER_RUNS_FOR_REGRESSION,
+    };
+    // A struct of strings, integers and booleans always serializes.
+    serde_json::to_string(&evidence).unwrap_or_default()
 }
 
 /// The evaluator's first statement: the scoped, idempotent re-queue. Within
@@ -3052,6 +3055,30 @@ mod decision_tests {
         assert_eq!(evidence["min_later_runs_for_regression"], 2);
         // An unexposed fix gets no verdict, so nothing is written for it.
         assert_eq!(judge_fix_exposure_read("fix-2", Ok(exposed(2))), None);
+    }
+
+    #[test]
+    fn the_written_evidence_parses_as_the_readers_exposure_evidence() {
+        // The readers (the reflection AI context, via
+        // `describe_effectiveness_evidence`) parse what this writer writes; a
+        // key renamed on one side only would fall them back to raw JSON.
+        let (_, raw) = judge_fix_exposure_read(
+            "fix-1",
+            Ok(FixExposure {
+                recurrences: 2,
+                ..exposed(5)
+            }),
+        )
+        .expect("an exposed fix is judged");
+        let parsed: ExposureEvidence =
+            serde_json::from_str(&raw).expect("the evidence parses as ExposureEvidence");
+        assert_eq!(parsed.verdict, "ineffective");
+        assert_eq!(parsed.later_runs, 5);
+        assert_eq!(parsed.recurrences, 2);
+        assert_eq!(
+            crate::reflection::types::describe_effectiveness_evidence(&raw),
+            parsed.summary()
+        );
     }
 
     #[test]
