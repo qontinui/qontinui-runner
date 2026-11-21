@@ -1836,6 +1836,9 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("POST", "/ui-bridge/design/evaluate/baseline"),
     ("GET", "/ui-bridge/design/evaluate/contexts"),
     ("POST", "/ui-bridge/design/evaluate/diff"),
+    // Reads computed styles of the registered elements and diffs them against
+    // declared tokens; relays to the webview, mutates nothing.
+    ("POST", "/ui-bridge/design/tokens/drift"),
     ("GET", "/ui-bridge/diagnostics/readiness"),
     // Not a runner route: a stand-in PHONE's pairing route in
     // `device_pairing_door_tests`, which the runner calls and never serves. The
@@ -1846,6 +1849,7 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("POST", "/ui-bridge/sdk/design/evaluate/baseline"),
     ("GET", "/ui-bridge/sdk/design/evaluate/contexts"),
     ("POST", "/ui-bridge/sdk/design/evaluate/diff"),
+    ("POST", "/ui-bridge/sdk/design/tokens/drift"),
     ("GET", "/ui-bridge/sdk/transition/{id}/can-execute"),
 ];
 

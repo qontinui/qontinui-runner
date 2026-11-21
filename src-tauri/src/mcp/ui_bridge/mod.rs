@@ -1058,6 +1058,13 @@ mod manifest_drift_tests {
             // Real subsystem (CLI subprocess orchestration), not a handler;
             // tracked separately.
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
+            // Component / element capture for `matches_isolated_render` —
+            // declared by ui-bridge since the pin moved past 6872c036; the
+            // runner half is Phase 3 of plan
+            // 2026-11-13-ui-bridge-matches-isolated-render-assertion, a
+            // separate piece of work. Delete these lines when it lands.
+            ("GET", "/ui-bridge/control/component/{}/capture"),
+            ("GET", "/ui-bridge/control/element/{}/capture"),
         ]
         .into_iter()
         .collect();
