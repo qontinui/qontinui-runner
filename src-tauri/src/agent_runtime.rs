@@ -2473,8 +2473,11 @@ enum SpawnDecision {
     /// guard would refuse it) and NO deferral (coord stamps a deferral only on
     /// an unconsumed row), and SEAL the local dispatch attempt exactly as the
     /// [`SpawnDecision::Spawn`] arm does, so no replayed copy of this attempt
-    /// spawns. A legitimate re-drive arrives as a newer attempt and claims
-    /// afresh over the seal. Carries the consumer device when the body names
+    /// spawns. A legitimate coord re-drive (which increments the attempt) is
+    /// claimed afresh by the poll row at that newer attempt; a WS frame
+    /// carries no retry, so it claims at attempt 0, meets the seal and is
+    /// dropped, and the re-drive lands up to one backstop poll tick later —
+    /// the same as after an accepted `Spawn` seal. Carries the consumer device when the body names
     /// one as a UUID, for the INFO log only.
     ///
     /// Plan `2026-11-21-a-continuation-claim-from-a-second-device-is-answered-consumed-so-both-devices-spawn`,
@@ -2676,7 +2679,7 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
         // rather than silently drop the continuation.
         return SpawnDecision::SpawnDespiteClaimError {
             cause: format!(
-                "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
+                "claim returned 409 without a structured refusal body (no string `error`): {body}"
             ),
         };
     }
@@ -3218,8 +3221,9 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   consumed the row, so it is not pending for us, and the arm SEALS the
 ///   attempt rather than keeping or releasing it (see
 ///   [`settle_claim_decision`]). The claim set is keyed by ATTEMPT and coord's
-///   re-drive increments it, so a legitimate re-delivery arrives as a newer
-///   attempt and claims afresh over the seal. Releasing would instead re-open
+///   re-drive increments it, so a legitimate re-delivery is claimed afresh
+///   by the poll row at the newer attempt (a WS frame carries no retry and is
+///   dropped against the seal until that poll tick). Releasing would instead re-open
 ///   this attempt to every replayed duplicate frame — the incident's own
 ///   shape — and any such re-claim that then failed at transport would become
 ///   [`SpawnDecision::SpawnDespiteClaimError`] and double-spawn (plan
@@ -20452,6 +20456,9 @@ mod tests {
             "a replayed frame of the SAME attempt must not re-claim after already_consumed \
              — the attempt is sealed, not released"
         );
+        // Documentation, not a falsifier: attempt+1 claims under the plain
+        // monotone rule whatever attempt K holds. The assertions that can fail
+        // are the Sealed check above and `!skip_leaves_row_pending` below.
         assert!(
             claim_gate_dispatch_attempt(funnel_consumed, K + 1),
             "a coord re-drive (attempt+1) claims afresh over the seal"
