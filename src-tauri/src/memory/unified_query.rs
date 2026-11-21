@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::database::pg::PgDb;
-use crate::reflection::graph_engine::KnowledgeGraph;
+use crate::memory::graph::graph_engine::KnowledgeGraph;
 use crate::str_utils::truncate_str_ellipsis;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 

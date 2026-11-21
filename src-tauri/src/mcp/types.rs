@@ -16,7 +16,7 @@ use crate::commands::rag::RAGState;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::doctor::DoctorHandle;
-use crate::reflection::graph_engine::KnowledgeGraph;
+use crate::memory::graph::graph_engine::KnowledgeGraph;
 
 /// Cached result of the last successful UI Bridge discover call.
 ///

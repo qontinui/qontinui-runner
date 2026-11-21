@@ -11,8 +11,8 @@ use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::database::types::{CreateEntityProfileInput, ObservationSearchResult};
-use crate::reflection::graph_engine::KnowledgeGraph;
-use crate::reflection::graph_types::GraphNodeKind;
+use crate::memory::graph::graph_engine::KnowledgeGraph;
+use crate::memory::graph::graph_types::GraphNodeKind;
 use crate::str_utils::truncate_str;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 

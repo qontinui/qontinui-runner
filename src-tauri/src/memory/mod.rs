@@ -19,6 +19,7 @@ pub mod consolidation;
 pub mod contradiction;
 pub mod decay;
 pub mod entity_profiles;
+pub mod graph;
 pub mod importance;
 pub mod memory_synthesis;
 pub mod scheduler;
