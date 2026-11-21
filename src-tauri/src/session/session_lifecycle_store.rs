@@ -2465,7 +2465,7 @@ impl SessionLifecycleStore {
         &self,
         claude_session_id: &str,
         expect: Option<&str>,
-        reason: &str,
+        reason: CloseReason,
     ) -> Option<CloseOutcome> {
         if self
             .held_sessions
@@ -2506,7 +2506,7 @@ impl SessionLifecycleStore {
         let incoming = HeldClose {
             claude_session_id: claude_session_id.to_string(),
             terminal_id: terminal.clone(),
-            reason: reason.to_string(),
+            reason,
         };
         match hold.arrivals.get(&terminal) {
             Some(prev) if prev.is_user_close() || !incoming.is_user_close() => {}
@@ -5110,12 +5110,12 @@ pub struct HeldClose {
     /// The terminal it named (or, for a terminal-less close, the one the row
     /// was bound to). Empty when neither was known.
     pub terminal_id: String,
-    pub reason: String,
+    pub reason: CloseReason,
 }
 
 /// The close reason the frontend sends when the USER closes a tab
 /// (`FrontendSessionCloseReason` in `sessionRecordArgs.ts`).
-pub const USER_CLOSE_REASON: &str = "explicit";
+pub const USER_CLOSE_REASON: CloseReason = CloseReason::Explicit;
 
 impl HeldClose {
     /// The user closed the pane — not a child exit, not a poll.

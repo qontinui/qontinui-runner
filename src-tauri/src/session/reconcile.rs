@@ -3240,13 +3240,17 @@ mod tests {
         store.record_open(rec_under("d1-a", "term-new", ROOT_B, false));
         let cmdlines: HashMap<u32, String> = HashMap::from([(777, "d1-a".to_string())]);
 
-        let actions = run_reconcile(
-            &store,
-            &[pty_anchored("term-new", 777, 1_000, "/repo")],
-            &ProcessSnapshot::default(),
-            &two_root_index("d1-a"),
-            &cmdlines,
-        );
+        let actions = {
+            let live_ptys = &[pty_anchored("term-new", 777, 1_000, "/repo")];
+            run_reconcile(
+                &store,
+                live_ptys,
+                &ProcessSnapshot::default(),
+                &two_root_index("d1-a"),
+                &cmdlines,
+                &every_listed_pty_is_live(live_ptys),
+            )
+        };
 
         assert_eq!(
             actions,
@@ -3275,13 +3279,17 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(rec_under("d1-a3", "term-new", ROOT_B, false));
 
-        let actions = run_reconcile(
-            &store,
-            &[pty_anchored("term-new", 777, 1_000, "/repo")],
-            &ProcessSnapshot::default(),
-            &two_root_index("d1-a3"),
-            &no_cmdlines(),
-        );
+        let actions = {
+            let live_ptys = &[pty_anchored("term-new", 777, 1_000, "/repo")];
+            run_reconcile(
+                &store,
+                live_ptys,
+                &ProcessSnapshot::default(),
+                &two_root_index("d1-a3"),
+                &no_cmdlines(),
+                &every_listed_pty_is_live(live_ptys),
+            )
+        };
 
         assert_eq!(
             actions,
@@ -3322,16 +3330,20 @@ mod tests {
         };
         let cmdlines: HashMap<u32, String> = HashMap::from([(777, "d1-b-typed".to_string())]);
 
-        run_reconcile(
-            &store,
-            &[
+        {
+            let live_ptys = &[
                 pty_anchored("term-typed", 777, 1_000, "/repo"),
                 pty_anchored("term-observed", 888, 1_000, "/repo2"),
-            ],
-            &ProcessSnapshot::default(),
-            &index,
-            &cmdlines,
-        );
+            ];
+            run_reconcile(
+                &store,
+                live_ptys,
+                &ProcessSnapshot::default(),
+                &index,
+                &cmdlines,
+                &every_listed_pty_is_live(live_ptys),
+            )
+        };
 
         for sid in ["d1-b-typed", "d1-b-observed"] {
             assert_eq!(
@@ -3365,16 +3377,20 @@ mod tests {
         )]);
 
         let snapshot = PreEvidenceSnapshot::take(&store);
-        let actions = run_reconcile(
-            &store,
-            &[
+        let actions = {
+            let live_ptys = &[
                 pty_anchored("term-new", 222, 1_000, "/repo"),
                 pty_anchored("term-old", 111, 1_000, "/repo"),
-            ],
-            &ProcessSnapshot::default(),
-            &two_root_index("d1-c"),
-            &cmdlines,
-        );
+            ];
+            run_reconcile(
+                &store,
+                live_ptys,
+                &ProcessSnapshot::default(),
+                &two_root_index("d1-c"),
+                &cmdlines,
+                &every_listed_pty_is_live(live_ptys),
+            )
+        };
         assert_eq!(
             actions,
             vec![
@@ -3414,16 +3430,20 @@ mod tests {
         store.record_open(rec_under("d1-x", "term-shell", ROOT_B, false));
         let cmdlines: HashMap<u32, String> = HashMap::from([(333, "d1-x".to_string())]);
 
-        run_reconcile(
-            &store,
-            &[
+        {
+            let live_ptys = &[
                 pty("term-shell", Some(1), "/repo"),
                 pty_anchored("term-resume", 333, 1_000, "/repo"),
-            ],
-            &ProcessSnapshot::default(),
-            &two_root_index("d1-x"),
-            &cmdlines,
-        );
+            ];
+            run_reconcile(
+                &store,
+                live_ptys,
+                &ProcessSnapshot::default(),
+                &two_root_index("d1-x"),
+                &cmdlines,
+                &every_listed_pty_is_live(live_ptys),
+            )
+        };
 
         assert_eq!(store.get("d1-x").unwrap().terminal_id, "term-resume");
     }
@@ -3446,13 +3466,17 @@ mod tests {
         store.record_open(rec_under(sid, "term-new", ROOT_B, true));
 
         let cmdlines: HashMap<u32, String> = HashMap::from([(111, sid.to_string())]);
-        let actions = run_reconcile(
-            store,
-            &[pty_anchored("term-old", 111, 1_000, "/repo")],
-            &ProcessSnapshot::default(),
-            &two_root_index(sid),
-            &cmdlines,
-        );
+        let actions = {
+            let live_ptys = &[pty_anchored("term-old", 111, 1_000, "/repo")];
+            run_reconcile(
+                store,
+                live_ptys,
+                &ProcessSnapshot::default(),
+                &two_root_index(sid),
+                &cmdlines,
+                &every_listed_pty_is_live(live_ptys),
+            )
+        };
         assert!(
             matches!(&actions[..], [ReconcileAction::Bind { terminal_id, .. }] if terminal_id == "term-old"),
             "{actions:?}"

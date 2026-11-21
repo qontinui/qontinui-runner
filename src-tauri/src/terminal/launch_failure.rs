@@ -872,7 +872,11 @@ mod tests {
             &live_by_id,
             now,
         );
-        assert_eq!(reason, CloseReason::PollDead, "seen alive after the failure");
+        assert_eq!(
+            reason,
+            CloseReason::PollDead,
+            "seen alive after the failure"
+        );
         let (reason, _) = close_dead_row(
             &store,
             &local,
@@ -880,7 +884,11 @@ mod tests {
             &live_by_id,
             now,
         );
-        assert_eq!(reason, CloseReason::LaunchFailed, "the same evidence with no note");
+        assert_eq!(
+            reason,
+            CloseReason::LaunchFailed,
+            "the same evidence with no note"
+        );
 
         // The global registry: the store's writers never note liveness.
         let tag = uuid::Uuid::new_v4();
@@ -893,7 +901,12 @@ mod tests {
         assert_eq!(registry().last_alive(&id, later), None);
         assert_eq!(
             registry()
-                .verdict(CloseReason::PollDead, &store.get(&id).unwrap(), Some(created), later)
+                .verdict(
+                    CloseReason::PollDead,
+                    &store.get(&id).unwrap(),
+                    Some(created),
+                    later
+                )
                 .reason,
             CloseReason::LaunchFailed
         );
@@ -921,7 +934,8 @@ mod tests {
                 "alive at {at}"
             );
             assert_eq!(
-                reg.verdict(CloseReason::PollDead, &rec, Some(CREATED), at).reason,
+                reg.verdict(CloseReason::PollDead, &rec, Some(CREATED), at)
+                    .reason,
                 CloseReason::PollDead,
                 "at {at}"
             );

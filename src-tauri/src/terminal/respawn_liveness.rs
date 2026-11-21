@@ -62,6 +62,7 @@ use futures::future::BoxFuture;
 use tracing::{info, warn};
 
 use super::account_migration::{probe_idle_prompt, IdlePromptProbe, ReadyDebounce};
+use crate::session::close_reason::CloseReason;
 use crate::session::session_lifecycle_store::{
     HeldClose, SessionLifecycleStore, TerminalSessionRecord, USER_CLOSE_REASON,
 };
@@ -550,7 +551,7 @@ impl<'s> SessionCloseHold<'s> {
         for c in self.store.release_session_hold(&self.session) {
             let t = (!c.terminal_id.is_empty()).then_some(c.terminal_id.as_str());
             self.store
-                .record_close_checked(&c.claude_session_id, t, &c.reason);
+                .record_close_checked(&c.claude_session_id, t, c.reason);
         }
     }
 
@@ -571,8 +572,8 @@ impl<'s> SessionCloseHold<'s> {
         }
         let (store, session) = (self.store, self.session.clone());
         self.finish_dropping();
-        let reason = user.map_or_else(|| USER_CLOSE_REASON.to_string(), |c| c.reason);
-        let outcome = store.record_close_checked(&session, None, &reason);
+        let reason = user.map_or(USER_CLOSE_REASON, |c| c.reason);
+        let outcome = store.record_close_checked(&session, None, reason);
         warn!(
             session = %session,
             outcome = ?outcome,
@@ -594,7 +595,7 @@ fn finish_replaying(
     let outcome = store.record_close_checked(
         &held.claude_session_id,
         Some(&held.terminal_id),
-        &held.reason,
+        held.reason,
     );
     info!(
         terminal_id = %held.terminal_id,
@@ -651,9 +652,8 @@ impl Drop for SessionCloseHold<'_> {
                     let _ = self.panes.close(&cur);
                 }
                 log_dropped(self.store.release_session_hold(&self.session));
-                let reason = user.map_or_else(|| USER_CLOSE_REASON.to_string(), |c| c.reason);
-                self.store
-                    .record_close_checked(&self.session, None, &reason);
+                let reason = user.map_or(USER_CLOSE_REASON, |c| c.reason);
+                self.store.record_close_checked(&self.session, None, reason);
             }
             // Nothing to roll back onto: the current pane's held close (if
             // any) is that session's own end, and is applied.
@@ -715,14 +715,18 @@ fn end_failed(
             let applied = match &failure {
                 Failure::ClosedByUser(c) => {
                     hold.finish_dropping();
-                    store.record_close_checked(&c.claude_session_id, Some(current), &c.reason);
+                    store.record_close_checked(&c.claude_session_id, Some(current), c.reason);
                     true
                 }
                 Failure::Died { .. } => hold.finish_replaying(Some(current)).is_some(),
             };
             if !applied {
                 if let Some(rec) = store.find_open_by_terminal(current) {
-                    store.record_close_checked(&rec.claude_session_id, Some(current), "pty-exit");
+                    store.record_close_checked(
+                        &rec.claude_session_id,
+                        Some(current),
+                        CloseReason::PtyExit,
+                    );
                 }
             }
             if let Err(e) = panes.close(current) {
@@ -1358,9 +1362,9 @@ mod tests {
         async fn spawn_next(&mut self) -> Result<String, String> {
             if let Some(Some(e)) = self.spawn_errors.pop_front() {
                 if self.close_old_in_failing_retry_spawn && !self.spawned.is_empty() {
-                    let o = self
-                        .store
-                        .record_close_checked(SID, Some("old"), "explicit");
+                    let o =
+                        self.store
+                            .record_close_checked(SID, Some("old"), CloseReason::Explicit);
                     self.exit_close_outcomes.push(o);
                     self.panes.gone.lock().unwrap().push("old".into());
                 }
@@ -1372,33 +1376,37 @@ mod tests {
             if self.old_exits_in_spawn && self.spawned.is_empty() {
                 let o = self
                     .store
-                    .record_close_checked(SID, Some("old"), "pty-exit");
+                    .record_close_checked(SID, Some("old"), CloseReason::PtyExit);
                 self.exit_close_outcomes.push(o);
             }
             if self.close_old_in_retry_spawn && !self.spawned.is_empty() {
                 let o = self
                     .store
-                    .record_close_checked(SID, Some("old"), "explicit");
+                    .record_close_checked(SID, Some("old"), CloseReason::Explicit);
                 self.exit_close_outcomes.push(o);
                 self.panes.gone.lock().unwrap().push("old".into());
             }
             if self.close_old_in_spawn && self.spawned.is_empty() {
                 let o = self
                     .store
-                    .record_close_checked(SID, Some("old"), "explicit");
+                    .record_close_checked(SID, Some("old"), CloseReason::Explicit);
                 self.exit_close_outcomes.push(o);
                 self.panes.gone.lock().unwrap().push("old".into());
             }
             if self.user_close_prev_in_spawn {
                 if let Some(prev) = self.spawned.last() {
-                    let o = self.store.record_close_checked(SID, Some(prev), "explicit");
+                    let o = self
+                        .store
+                        .record_close_checked(SID, Some(prev), CloseReason::Explicit);
                     self.exit_close_outcomes.push(o);
                 }
             }
             let id = format!("new-{}", self.spawned.len() + 1);
             self.store.record_open(record(&id, "/dst"));
             if self.close_in_spawn {
-                let o = self.store.record_close_checked(SID, Some(&id), "pty-exit");
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some(&id), CloseReason::PtyExit);
                 self.exit_close_outcomes.push(o);
             }
             self.spawned.push(id.clone());
@@ -1411,33 +1419,33 @@ mod tests {
                 .pop_front()
                 .expect("a scripted verdict per pane");
             if self.exit_on_first_alive && v == LivenessVerdict::Alive && self.awaited.len() == 1 {
-                let o = self
-                    .store
-                    .record_close_checked(SID, Some(terminal_id), "pty-exit");
+                let o =
+                    self.store
+                        .record_close_checked(SID, Some(terminal_id), CloseReason::PtyExit);
                 self.exit_close_outcomes.push(o);
             }
             if self.user_close_stale_while_proving {
                 let o = self
                     .store
-                    .record_close_checked(SID, Some("stale"), "explicit");
+                    .record_close_checked(SID, Some("stale"), CloseReason::Explicit);
                 self.exit_close_outcomes.push(o);
             }
             if self.user_close_retired_while_proving && terminal_id == "new-2" {
                 let o = self
                     .store
-                    .record_close_checked(SID, Some("new-1"), "explicit");
+                    .record_close_checked(SID, Some("new-1"), CloseReason::Explicit);
                 self.exit_close_outcomes.push(o);
             }
             if self.user_close && matches!(v, LivenessVerdict::Died(_)) {
-                let o = self
-                    .store
-                    .record_close_checked(SID, Some(terminal_id), "explicit");
+                let o =
+                    self.store
+                        .record_close_checked(SID, Some(terminal_id), CloseReason::Explicit);
                 self.exit_close_outcomes.push(o);
             }
             if (self.exit_close || self.user_close) && matches!(v, LivenessVerdict::Died(_)) {
-                let o = self
-                    .store
-                    .record_close_checked(SID, Some(terminal_id), "pty-exit");
+                let o =
+                    self.store
+                        .record_close_checked(SID, Some(terminal_id), CloseReason::PtyExit);
                 self.exit_close_outcomes.push(o);
             }
             v
@@ -1446,13 +1454,15 @@ mod tests {
             if self.close_old_in_pause {
                 let o = self
                     .store
-                    .record_close_checked(SID, Some("old"), "explicit");
+                    .record_close_checked(SID, Some("old"), CloseReason::Explicit);
                 self.exit_close_outcomes.push(o);
                 self.panes.gone.lock().unwrap().push("old".into());
             }
             if self.user_close_in_pause {
                 if let Some(prev) = self.spawned.last() {
-                    let o = self.store.record_close_checked(SID, Some(prev), "explicit");
+                    let o = self
+                        .store
+                        .record_close_checked(SID, Some(prev), CloseReason::Explicit);
                     self.exit_close_outcomes.push(o);
                 }
             }
@@ -1471,7 +1481,7 @@ mod tests {
 
     fn superseded(store: &SessionLifecycleStore, terminal: &str) -> bool {
         matches!(
-            store.record_close_checked(SID, Some(terminal), "pty-exit"),
+            store.record_close_checked(SID, Some(terminal), CloseReason::PtyExit),
             CloseOutcome::TerminalSuperseded { .. }
         )
     }
@@ -1610,7 +1620,7 @@ mod tests {
             }
             async fn await_liveness(&mut self, t: &str) -> LivenessVerdict {
                 let v = self.0.await_liveness(t).await;
-                self.0.store.record_close(SID, "poll-dead");
+                self.0.store.record_close(SID, CloseReason::PollDead);
                 v
             }
             async fn pause_before_retry(&mut self, _r: usize) {}
@@ -1872,7 +1882,7 @@ mod tests {
             );
             assert_eq!(store.held_session_count(), 0);
             assert_eq!(
-                store.record_close_checked(SID, Some("new-3"), "pty-exit"),
+                store.record_close_checked(SID, Some("new-3"), CloseReason::PtyExit),
                 CloseOutcome::AlreadyClosed {
                     claude_session_id: SID.into()
                 },
@@ -1892,12 +1902,12 @@ mod tests {
             let mut hold = SessionCloseHold::new(&store, Arc::new(FakePanes::default()), SID, None);
             hold.set_current("new-1");
             assert!(matches!(
-                store.record_close_checked(SID, Some("new-1"), "pty-exit"),
+                store.record_close_checked(SID, Some("new-1"), CloseReason::PtyExit),
                 CloseOutcome::HeldInFlight { .. }
             ));
             assert!(
                 matches!(
-                    store.record_close_checked(SID, None, "poll-dead"),
+                    store.record_close_checked(SID, None, CloseReason::PollDead),
                     CloseOutcome::HeldInFlight { .. }
                 ),
                 "a terminal-less close of a held session is held too"
@@ -1928,7 +1938,7 @@ mod tests {
             let mut hold = SessionCloseHold::new(&store, panes.clone(), SID, Some(&old));
             hold.set_current("new-1");
             assert!(matches!(
-                store.record_close_checked(SID, Some("new-1"), "pty-exit"),
+                store.record_close_checked(SID, Some("new-1"), CloseReason::PtyExit),
                 CloseOutcome::HeldInFlight { .. }
             ));
         }
@@ -2266,7 +2276,7 @@ mod tests {
     async fn an_old_pane_closed_before_the_hold_moves_nothing() {
         let (_d, store, closes) = observed_store();
         let old = record("old", "/src");
-        store.record_close_checked(SID, Some("old"), "explicit");
+        store.record_close_checked(SID, Some("old"), CloseReason::Explicit);
         assert_eq!(
             closes.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -2478,9 +2488,9 @@ mod tests {
         let (_d, store) = fresh_store();
         store.record_open(record("new-1", "/dst"));
         store.hold_session_closes(SID);
-        store.record_close_checked(SID, Some("x"), "explicit");
+        store.record_close_checked(SID, Some("x"), CloseReason::Explicit);
         store.set_release_hook(|s| {
-            s.record_close_checked(SID, Some("new-1"), "pty-exit");
+            s.record_close_checked(SID, Some("new-1"), CloseReason::PtyExit);
         });
         let applied = finish_replaying(&store, SID, Some("new-1"));
         assert_eq!(
@@ -2653,7 +2663,7 @@ mod tests {
         );
         fx.panes.no_claude.lock().unwrap().push("old".into());
         *fx.panes.on_probe.lock().unwrap() = Some(Box::new(move || {
-            let o = store.record_close_checked(SID, Some("new-1"), "pty-exit");
+            let o = store.record_close_checked(SID, Some("new-1"), CloseReason::PtyExit);
             assert!(
                 matches!(o, CloseOutcome::HeldInFlight { .. }),
                 "fixture: held, {o:?}"

@@ -4924,11 +4924,19 @@ mod tests {
         reg.on_terminal_coord_bind(csid, "term-new", new);
         store.mark_terminal_superseded("term-old", "term-new");
         assert!(matches!(
-            store.record_close_checked(csid, Some("term-old"), "pty-exit"),
+            store.record_close_checked(
+                csid,
+                Some("term-old"),
+                crate::session::close_reason::CloseReason::PtyExit
+            ),
             CloseOutcome::TerminalSuperseded { .. }
         ));
         assert!(matches!(
-            store.record_close_checked(csid, Some("term-old"), "pty-exit"),
+            store.record_close_checked(
+                csid,
+                Some("term-old"),
+                crate::session::close_reason::CloseReason::PtyExit
+            ),
             CloseOutcome::NotFound { .. }
         ));
 

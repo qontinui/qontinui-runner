@@ -389,7 +389,10 @@ fn note_repair(terminal_id: &str, session_id: &str, from: Option<&str>, to: &str
 
 #[cfg(test)]
 mod tests {
-    use super::super::{bind_record, run_reconcile, LivePty, TranscriptCandidate, TranscriptIndex};
+    use super::super::{
+        bind_record, every_listed_pty_is_live, run_reconcile, LivePty, TranscriptCandidate,
+        TranscriptIndex,
+    };
     use super::*;
     use crate::process_capture::process_tree::ProcessSnapshot;
     use crate::session::claude_activity::ProviderRowValidity;
@@ -753,13 +756,17 @@ mod tests {
 
         // Tick 1.
         let snapshot = PreEvidenceSnapshot::take(&store);
-        run_reconcile(
-            &store,
-            &[live("term-1", 777)],
-            &ProcessSnapshot::default(),
-            &index,
-            &cmdlines,
-        );
+        {
+            let live_ptys = &[live("term-1", 777)];
+            run_reconcile(
+                &store,
+                live_ptys,
+                &ProcessSnapshot::default(),
+                &index,
+                &cmdlines,
+                &every_listed_pty_is_live(live_ptys),
+            )
+        };
         assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
         assert_eq!(
             store.get("cfgrep-compose").unwrap().config_dir,
