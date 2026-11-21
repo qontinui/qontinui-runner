@@ -10796,6 +10796,13 @@ fn coord_mcp_agent_proxy_config_json(
 /// reason, so the absent-file case narrows to "healthy or not yet probed".
 pub(crate) const COORD_MCP_STATUS_FILE: &str = ".coord-mcp-status";
 
+/// Filename of the session config [`write_mcp_json`] writes INTO a workdir.
+/// One name for its writer and for the two exclude rosters that keep it out of
+/// `git status`: `fleet::MANAGED_REPO_EXCLUDES` (the primaries the tree
+/// publisher walks) and `provision_exclude::exclude_workdir_artifacts` (every
+/// repository the runner writes it into).
+pub(crate) const MCP_JSON_FILE: &str = ".mcp.json";
+
 /// Env var the runner injects at spawn carrying the absolute path of a
 /// runner-owned coord-mcp `--mcp-config` file (the DEVICE loopback-proxy shape).
 /// The identity shim's `claude` wrapper reads it and appends
@@ -10949,10 +10956,17 @@ pub(crate) fn write_degraded_breadcrumb(
 }
 
 /// Name prefix of the breadcrumb's atomic-replace temp file. Its readers are
-/// the two rosters that must recognise a crash-left temp file:
-/// `fleet::MANAGED_REPO_EXCLUDES` (spelled there as the glob
-/// `.coord-mcp-status.tmp-*`) and `agent_worktree::dirty::is_scaffolding_path`.
+/// the rosters that must recognise a crash-left temp file:
+/// `fleet::MANAGED_REPO_EXCLUDES` and
+/// `provision_exclude::exclude_workdir_artifacts` (both through
+/// [`COORD_MCP_STATUS_TMP_GLOB`]) and `agent_worktree::dirty::is_scaffolding_path`.
 pub(crate) const COORD_MCP_STATUS_TMP_PREFIX: &str = ".coord-mcp-status.tmp-";
+
+/// The exclude glob matching every [`breadcrumb_tmp_name`]: exactly
+/// [`COORD_MCP_STATUS_TMP_PREFIX`] then `*`. Spelled as a literal only because
+/// a `const` slice element (`fleet::MANAGED_REPO_EXCLUDES`) cannot be built by
+/// `format!`; `the_tmp_glob_is_the_tmp_prefix_then_a_star` pins the two together.
+pub(crate) const COORD_MCP_STATUS_TMP_GLOB: &str = ".coord-mcp-status.tmp-*";
 
 /// A fresh, unique temp-file name for [`replace_breadcrumb`]: the prefix, then
 /// this process's id and a v7 uuid, so concurrent writers never share one.
@@ -10976,7 +10990,23 @@ pub(crate) fn breadcrumb_tmp_name() -> String {
 /// (`fleet::MANAGED_REPO_EXCLUDES`) and is runner scaffolding to reclaim
 /// (`agent_worktree::dirty::is_scaffolding_path`), so it neither shows in a
 /// walked repo's `git status` nor pins an agent worktree unreclaimable.
+///
+/// Every breadcrumb writer reaches the file through here, so this is also
+/// where the breadcrumb and its temp glob are excluded in the repository that
+/// holds `path` ([`crate::provision_exclude::exclude_workdir_artifacts`]),
+/// including repos the tree publisher never walks and linked worktrees. That
+/// runs BEFORE the temp write: the `.tmp-*` line exists for a crash between
+/// the write and the rename, and a call after the rename would leave exactly
+/// that residue unexcluded on a repo's first breadcrumb. Best-effort, and
+/// silent outside a work tree.
 fn replace_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
+    if let Some(workdir) = path.parent() {
+        crate::provision_exclude::exclude_workdir_artifacts(
+            "coord_mcp breadcrumb",
+            workdir,
+            &[COORD_MCP_STATUS_FILE, COORD_MCP_STATUS_TMP_GLOB],
+        );
+    }
     let tmp = path.with_file_name(breadcrumb_tmp_name());
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -11452,8 +11482,13 @@ pub(crate) fn probe_and_breadcrumb_proxy_with_policy(
 /// Returns whether the write SUCCEEDED. Most callers ignore it (a failed write
 /// already warns, and there is no recovery), but the boot self-heal reports the
 /// rewrite in its own forensics line and must not assert one that never landed.
+///
+/// A successful write also excludes the file from the enclosing repository's
+/// `git status` ([`crate::provision_exclude::exclude_workdir_artifacts`]), so a
+/// runner-written config never reads as untracked work, in a repo the tree
+/// publisher does not walk or a linked worktree as much as in a walked primary.
 fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) -> bool {
-    let mcp_path = Path::new(primary_wt).join(".mcp.json");
+    let mcp_path = Path::new(primary_wt).join(MCP_JSON_FILE);
     match crate::fs_perms::write_owner_only(
         &mcp_path,
         serde_json::to_string_pretty(mcp_config)
@@ -11465,6 +11500,11 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) -> bool {
             // parent is a repo working-tree root that other tooling and the
             // operator must keep using, so it is deliberately left alone.
             info!("coord_mcp: wrote .mcp.json for coord-mcp in {}", primary_wt);
+            crate::provision_exclude::exclude_workdir_artifacts(
+                "coord_mcp .mcp.json",
+                Path::new(primary_wt),
+                &[MCP_JSON_FILE],
+            );
             // Rotation forensics (Phase 4/R6): every write of this file is a
             // client-visible rotation candidate — record which key it now
             // carries. Extraction is infallible-by-shape (the single writer
@@ -11714,6 +11754,16 @@ fn provision_coord_mcp_with_jwt(
                      device nonce on the bound port :{port} — reused (no mint, no \
                      eviction; header shape upgraded={rewritten})"
                 );
+                // The reused file is runner-owned too, and may predate the
+                // exclude: keep it out of `git status`. A rewrite already went
+                // through `write_mcp_json`, which excluded it.
+                if !rewritten {
+                    crate::provision_exclude::exclude_workdir_artifacts(
+                        "coord_mcp .mcp.json",
+                        Path::new(workdir),
+                        &[MCP_JSON_FILE],
+                    );
+                }
                 log_rotation_event_with(
                     "reuse",
                     workdir,
@@ -27324,5 +27374,213 @@ mod spawn_tenant_credential_tests {
         assert!(spawn_tenant_credential_enabled_from(Some("")));
         assert!(!spawn_tenant_credential_enabled_from(Some("0")));
         assert!(!spawn_tenant_credential_enabled_from(Some(" 0 ")));
+    }
+}
+
+/// The coord-mcp workdir artifacts are excluded where they are WRITTEN (plan
+/// `2026-11-21-the-coord-mcp-breadcrumb-dirties-every-tree-of-a-repo-the-runner-does-not-walk`).
+/// Every test here enters through the population's own writer — the probe's
+/// breadcrumb write, the agent and device `.mcp.json` writers — never through
+/// `provision_exclude::exclude_workdir_artifacts` directly, so dropping a call
+/// site turns its test red. The helper's own rules are pinned in
+/// `provision_exclude::tests`.
+#[cfg(test)]
+mod workdir_artifact_exclude_tests {
+    use super::*;
+    use crate::provision_exclude::test_support::{
+        block_entries, exclude_lines, linked_worktree, porcelain,
+    };
+    use crate::provision_exclude::WORKDIR_ARTIFACT_EXCLUDE_MARKER;
+    use crate::provision_guard::test_support::assert_not_in_any_repo;
+
+    #[test]
+    fn the_tmp_glob_is_the_tmp_prefix_then_a_star() {
+        assert_eq!(
+            COORD_MCP_STATUS_TMP_GLOB,
+            format!("{COORD_MCP_STATUS_TMP_PREFIX}*")
+        );
+        let tmp_name = breadcrumb_tmp_name();
+        assert!(
+            tmp_name.starts_with(COORD_MCP_STATUS_TMP_PREFIX),
+            "{tmp_name}"
+        );
+    }
+
+    /// Plan tests 1 and 2. A probe that fails at provisioning time writes the
+    /// breadcrumb into a LINKED worktree of a repo the publisher never walked
+    /// (its exclude is empty): the worktree still reads clean, even with a
+    /// crash-left temp file beside the breadcrumb, because the COMMON dir's
+    /// `info/exclude` now carries both names under the workdir marker. A second
+    /// write appends nothing.
+    ///
+    /// Mutants this must turn red: the call in `replace_breadcrumb` dropped;
+    /// the glob routed through `escape_pattern` (`.tmp-\*` matches no file).
+    #[test]
+    fn a_probe_breadcrumb_in_a_linked_worktree_leaves_it_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_not_in_any_repo(tmp.path());
+        let (main, wt) = linked_worktree(tmp.path());
+        assert!(
+            exclude_lines(&main).is_empty(),
+            "the fixture starts unexcluded"
+        );
+        let wd = wt.to_string_lossy().to_string();
+
+        apply_probe_verdict(
+            &wd,
+            9876,
+            &ProbeVerdict::ConnectRefused,
+            BreadcrumbWritePolicy::MayCreate,
+        );
+        assert!(
+            wt.join(COORD_MCP_STATUS_FILE).is_file(),
+            "the breadcrumb is written"
+        );
+        std::fs::write(wt.join(".coord-mcp-status.tmp-1-x"), "crash residue\n").unwrap();
+
+        assert_eq!(porcelain(&wt), "", "the linked worktree reads clean");
+        let lines = exclude_lines(&main);
+        assert_eq!(
+            block_entries(&lines, WORKDIR_ARTIFACT_EXCLUDE_MARKER),
+            vec![
+                "/.coord-mcp-status".to_string(),
+                "/.coord-mcp-status.tmp-*".to_string()
+            ],
+            "{lines:?}"
+        );
+
+        let exclude = main.join(".git").join("info").join("exclude");
+        let before = std::fs::read_to_string(&exclude).unwrap();
+        apply_probe_verdict(
+            &wd,
+            9876,
+            &ProbeVerdict::Timeout,
+            BreadcrumbWritePolicy::MayCreate,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            before,
+            "a second breadcrumb write appends nothing"
+        );
+    }
+
+    /// Plan test 6. A breadcrumb in a directory that is in no repository is
+    /// written as before; nothing git-shaped is created, nothing panics, and
+    /// the exclude step logs no `warn!` (it would otherwise warn on every
+    /// 5-minute refresh of a non-repo workdir's breadcrumb).
+    #[test]
+    fn a_probe_breadcrumb_in_a_non_repo_workdir_writes_no_exclude_and_no_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_not_in_any_repo(tmp.path());
+        let wd = tmp.path().to_string_lossy().to_string();
+
+        let ((), logs) = crate::resource_guard::capture_logs(|| {
+            apply_probe_verdict(
+                &wd,
+                9876,
+                &ProbeVerdict::ConnectRefused,
+                BreadcrumbWritePolicy::MayCreate,
+            )
+        });
+
+        assert!(tmp.path().join(COORD_MCP_STATUS_FILE).is_file());
+        let entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![COORD_MCP_STATUS_FILE.to_string()],
+            "only the breadcrumb: no .git, no info/exclude, no temp file"
+        );
+        assert!(
+            !logs.lines().any(|l| l.contains("WARN")),
+            "a non-repo workdir is normal and must not warn: {logs}"
+        );
+    }
+
+    /// Plan test 3. The AGENT writer puts `.mcp.json` into an untracked linked
+    /// worktree, and that worktree reads clean: `/.mcp.json` sits under the
+    /// workdir marker in the common exclude.
+    ///
+    /// Mutant this must turn red: the call in `write_mcp_json`'s `Ok` arm
+    /// dropped.
+    #[test]
+    fn the_agent_mcp_json_writer_excludes_its_file() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        assert_not_in_any_repo(tmp.path());
+        let (main, wt) = linked_worktree(tmp.path());
+        let wd = wt.to_string_lossy().to_string();
+
+        write_coord_mcp_agent_proxy_config(&wd, 31339, uuid::Uuid::new_v4());
+
+        assert!(wt.join(MCP_JSON_FILE).is_file(), "the config is written");
+        let lines = exclude_lines(&main);
+        assert_eq!(
+            block_entries(&lines, WORKDIR_ARTIFACT_EXCLUDE_MARKER),
+            vec!["/.mcp.json".to_string()],
+            "{lines:?}"
+        );
+        assert_eq!(porcelain(&wt), "", "the linked worktree reads clean");
+    }
+
+    /// The provisioning REUSE arm keeps a runner-owned `.mcp.json` already on
+    /// disk out of `git status` too, though it writes nothing: a config that
+    /// predates the exclude gets its line on the next spawn that reuses it.
+    ///
+    /// Mutant this must turn red: the call in the reuse arm dropped.
+    #[test]
+    fn a_reused_device_mcp_json_is_excluded_without_a_rewrite() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let amb = crate::test_env::isolated_ambient();
+        let dev = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#)
+        );
+        let root = amb
+            .dir()
+            .join(format!("coord-mcp-reuse-excl-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_not_in_any_repo(&root);
+        let (main, wt) = linked_worktree(&root);
+        let wd = wt.to_string_lossy().to_string();
+        let exclude = main.join(".git").join("info").join("exclude");
+
+        // First spawn mints and writes the config.
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19877), None);
+        let first = std::fs::read_to_string(wt.join(MCP_JSON_FILE)).unwrap();
+
+        // A config that predates the exclude: drop its line (under the lock,
+        // since the first spawn's detached probe may be writing its own).
+        {
+            let _excl = crate::fleet::info_exclude_lock();
+            let text = std::fs::read_to_string(&exclude).unwrap_or_default();
+            let kept: String = text
+                .lines()
+                .filter(|l| *l != "/.mcp.json")
+                .map(|l| format!("{l}\n"))
+                .collect();
+            std::fs::write(&exclude, kept).unwrap();
+        }
+
+        // Second spawn into the same cwd reuses the live nonce.
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19877), None);
+        assert_eq!(
+            std::fs::read_to_string(wt.join(MCP_JSON_FILE)).unwrap(),
+            first,
+            "the reuse arm, not a rewrite: the config is byte-identical"
+        );
+        let lines = exclude_lines(&main);
+        assert!(
+            block_entries(&lines, WORKDIR_ARTIFACT_EXCLUDE_MARKER)
+                .contains(&"/.mcp.json".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            !porcelain(&wt).contains(MCP_JSON_FILE),
+            "the reused config does not read as untracked: {}",
+            porcelain(&wt)
+        );
     }
 }
