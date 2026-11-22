@@ -125,9 +125,12 @@ pub struct Resources {
 
 // Per-session cost model — a MIRROR of qontinui-coord `crates/coord/src/fleet.rs`
 // (plan `2026-11-04-worktree-cap-charges-4gb-per-allocation-so-a-503gb-box-caps-at-124`).
-// coord is the authority: its budget ingest replaces the `max_concurrent_agents`
-// this runner publishes with coord's own derivation from the same publish's
-// `memory_gb` / `cpu_cores`, so a drift here changes only this runner's own log
+// coord is the authority: its budget ingest replaces a non-zero
+// `max_concurrent_agents` this runner publishes with coord's own derivation
+// from the same publish's `memory_gb` / `cpu_cores` / `ci_reserved_gib`, keeps
+// the last stored value when `ci_reserved_gib` is omitted, and stores an
+// explicit `0` (the Build role's) verbatim, so a drift here changes only this
+// runner's own log
 // line and `last_budget.json`, never a cap. The worked-example test below is the
 // same table coord pins; keep the two in step.
 
