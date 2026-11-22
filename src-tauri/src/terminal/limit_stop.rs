@@ -232,8 +232,18 @@ fn subagents_dir(transcript: &Path) -> std::path::PathBuf {
 fn subagent_limit_stop(dir: &Path, after_ms: i64) -> LimitStopRead {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        // No background subagent ever ran.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LimitStopRead::NotStopped,
+        // No background subagent ever ran: there is no `<sid>/subagents`
+        // directory. ENOTDIR says the same thing one level up: `<sid>` is not
+        // a directory (a transcript with no `.jsonl` extension, or a stray
+        // file of that name), so nothing can be listed under it either.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return LimitStopRead::NotStopped
+        }
         Err(e) => {
             return LimitStopRead::Unreadable(format!("cannot list subagent transcripts: {e}"))
         }
@@ -1189,6 +1199,19 @@ mod tests {
             transcript_limit_stop(&main),
             LimitStopRead::Stopped(ref s) if s.entry_uuid == SUBAGENT_STOP_UUID
         ));
+    }
+
+    #[test]
+    fn a_session_dir_that_is_a_file_means_no_subagents() {
+        // `<sid>` beside `<sid>.jsonl` is a FILE here, so listing
+        // `<sid>/subagents` fails with ENOTDIR: there are no subagent
+        // transcripts, and the session's own read (a reply) stands.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sid = "0f1e2d3c-4b5a-4968-8776-655443322110";
+        let main = dir.path().join(format!("{sid}.jsonl"));
+        std::fs::write(&main, SUBAGENT_PARENT).expect("write main");
+        std::fs::write(dir.path().join(sid), "not a directory").expect("write file");
+        assert_eq!(transcript_limit_stop(&main), LimitStopRead::NotStopped);
     }
 
     #[test]
