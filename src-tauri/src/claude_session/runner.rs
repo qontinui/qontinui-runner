@@ -3066,13 +3066,14 @@ mod cli_session_pin_tests {
             let from = src
                 .find(start)
                 .unwrap_or_else(|| panic!("seam {start:?} not found"));
-            let body = &src[from..];
+            let body = src.get(from..).expect("`find` returns a char boundary");
+            let rest = body.get(1..).expect("the seam starts with an ASCII space");
             let end = ["pub fn ", "pub(crate) fn ", "fn "]
                 .iter()
-                .filter_map(|kind| body[1..].find(&format!("\n{indent}{kind}")))
+                .filter_map(|kind| rest.find(&format!("\n{indent}{kind}")))
                 .min()
                 .unwrap_or_else(|| panic!("seam {start:?} has no end"));
-            &body[..end + 1]
+            body.get(..end + 1).expect("a newline is a char boundary")
         }
         for (name, body) in [
             (

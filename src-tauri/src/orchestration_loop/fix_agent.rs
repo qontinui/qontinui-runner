@@ -370,9 +370,10 @@ mod tests {
     #[test]
     fn run_fix_agent_mints_the_session_id_at_the_spawn() {
         let src = include_str!("fix_agent.rs");
-        let body = &src[src
+        let start = src
             .find(concat!("pub async fn ", "run_fix_agent"))
-            .expect("run_fix_agent")..];
+            .expect("run_fix_agent");
+        let body = src.get(start..).expect("`find` returns a char boundary");
         let mint = body
             .find(concat!(
                 "let session_id = crate::claude_session::runner::",
