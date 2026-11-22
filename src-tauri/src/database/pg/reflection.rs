@@ -933,162 +933,6 @@ impl PgDb {
             effective_fixes,
         })
     }
-
-    /// PG equivalent of prediction::compute_change_velocity
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn compute_change_velocity(
-        &self,
-        component_path: &str,
-        window_size: u32,
-    ) -> Result<f64, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool: {}", e))?;
-        let window_i64 = window_size as i64;
-
-        let fix_count: i64 = conn
-            .query_one(
-                r#"SELECT COUNT(*)
-                   FROM reflection_fixes
-                   WHERE target_component = $1
-                     AND applied_at >= (
-                         SELECT COALESCE(MIN(applied_at), '1970-01-01')
-                         FROM (
-                             SELECT DISTINCT applied_at FROM reflection_fixes
-                             WHERE target_component = $1
-                             ORDER BY applied_at DESC
-                             LIMIT $2
-                         ) sub
-                     )"#,
-                &[&component_path, &window_i64],
-            )
-            .await
-            .map(|r| r.get(0))
-            .unwrap_or(0);
-
-        Ok(fix_count as f64 / window_size as f64)
-    }
-
-    /// PG equivalent of prediction::score_knowledge_relevance
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn score_knowledge_relevance(
-        &self,
-        workflow_name: &str,
-        limit: u32,
-    ) -> Result<Vec<crate::reflection::prediction::ScoredKnowledge>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool: {}", e))?;
-
-        let rows = conn
-            .query(
-                r#"SELECT tk.id, tk.content, tk.category, tk.last_validated_at,
-                          tk.reflection_fix_id, tk.created_at
-                   FROM task_knowledge tk
-                   INNER JOIN task_runs tr ON tr.id = tk.task_run_id
-                   WHERE tr.workflow_name = $1
-                     AND (tk.is_resolved = false OR tk.is_resolved IS NULL)
-                     AND tk.category IN ('recurring_pattern', 'context', 'finding', 'root_cause',
-                                         'project_environment', 'project_architecture',
-                                         'project_test_pattern', 'project_recurring_issue')
-                   ORDER BY tk.created_at DESC
-                   LIMIT 50"#,
-                &[&workflow_name],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG score_knowledge", &e))?;
-
-        let now = chrono::Utc::now();
-        let mut scored: Vec<crate::reflection::prediction::ScoredKnowledge> = Vec::new();
-
-        for row in &rows {
-            let id: String = row.get(0);
-            let content: String = row.get(1);
-            let category: String = row.get(2);
-            let last_validated_at: Option<String> = row.get(3);
-            let reflection_fix_id: Option<String> = row.get(4);
-            let created_at: String = row.get(5);
-
-            // Effectiveness weight from linked fix
-            let effectiveness_weight = if let Some(ref fix_id) = reflection_fix_id {
-                let eff: Option<String> = conn
-                    .query_one(
-                        "SELECT effectiveness FROM reflection_fixes WHERE id = $1",
-                        &[&fix_id],
-                    )
-                    .await
-                    .ok()
-                    .and_then(|r| r.get(0));
-
-                match eff.as_deref() {
-                    Some("effective") => 1.0,
-                    Some("ineffective") | Some("caused_regression") => 0.0,
-                    Some("inconclusive") => 0.5,
-                    _ => 0.5,
-                }
-            } else {
-                0.7
-            };
-
-            // Recency weight
-            let reference_date = last_validated_at.as_deref().unwrap_or(&created_at);
-            let days_old = chrono::DateTime::parse_from_rfc3339(reference_date)
-                .map(|dt| (now - dt.with_timezone(&chrono::Utc)).num_days() as f64)
-                .unwrap_or(30.0);
-            let recency_weight = 1.0 / (1.0 + days_old * 0.1);
-
-            // Velocity factor from linked fix's target_component
-            let velocity_factor = if let Some(ref fix_id) = reflection_fix_id {
-                let comp: Option<String> = conn
-                    .query_one(
-                        "SELECT target_component FROM reflection_fixes WHERE id = $1",
-                        &[&fix_id],
-                    )
-                    .await
-                    .ok()
-                    .and_then(|r| r.get(0));
-
-                if let Some(comp) = comp {
-                    let velocity = self.compute_change_velocity(&comp, 5).await.unwrap_or(0.0);
-                    1.0 / (1.0 + velocity)
-                } else {
-                    1.0
-                }
-            } else {
-                1.0
-            };
-
-            let relevance_score = effectiveness_weight * recency_weight * velocity_factor;
-
-            scored.push(crate::reflection::prediction::ScoredKnowledge {
-                knowledge_id: id,
-                content,
-                category,
-                relevance_score,
-                effectiveness_weight,
-                recency_weight,
-                velocity_factor,
-            });
-        }
-
-        scored.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(limit as usize);
-        Ok(scored)
-    }
 }
 
 // ============================================================================
@@ -2881,8 +2725,14 @@ fn parse_time_cutoff_static(time_range: Option<&str>) -> Option<String> {
     Some((now - duration).format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
+mod knowledge_ranker;
+pub(crate) use knowledge_ranker::require_window;
+
 #[cfg(test)]
 mod decision_tests;
+
+#[cfg(test)]
+mod ranker_tests;
 
 #[cfg(test)]
 mod tests;

@@ -27,7 +27,7 @@ use std::collections::HashMap;
 /// self-provisioning DDL, which two arms racing on a fresh database can
 /// collide on (`CREATE … IF NOT EXISTS` is not race-free), so connections
 /// open one at a time.
-async fn disposable_pg() -> PgDb {
+pub(super) async fn disposable_pg() -> PgDb {
     static PROVISION: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         panic!(
@@ -57,13 +57,13 @@ async fn disposable_pg() -> PgDb {
 }
 
 /// A workflow name no other run of these arms shares.
-fn unique_workflow(arm: &str) -> String {
+pub(super) fn unique_workflow(arm: &str) -> String {
     format!("wfv-p4-{arm}-{}", uuid::Uuid::new_v4())
 }
 
 /// A run of `workflow`, completed at the literal RFC 3339 instant
 /// `completed_at`, or still running when that is `None`.
-async fn insert_run(pg: &PgDb, id: &str, workflow: &str, completed_at: Option<&str>) {
+pub(super) async fn insert_run(pg: &PgDb, id: &str, workflow: &str, completed_at: Option<&str>) {
     let status = if completed_at.is_some() {
         "complete"
     } else {
@@ -82,7 +82,7 @@ async fn insert_run(pg: &PgDb, id: &str, workflow: &str, completed_at: Option<&s
 /// The reflection run every fixture fix names (`reflection_task_run_id` is
 /// a foreign key). Named as production names it, so it is never a run of
 /// the reflected workflow.
-async fn insert_reflection_run(pg: &PgDb, workflow: &str) -> String {
+pub(super) async fn insert_reflection_run(pg: &PgDb, workflow: &str) -> String {
     let id = format!("{workflow}-reflection");
     insert_run(pg, &id, &format!("Reflection: {workflow}"), None).await;
     id
@@ -159,7 +159,7 @@ fn evidence_of(fix: &ReflectionFix) -> serde_json::Value {
 
 /// Delete `workflow`'s fixture runs; findings, fixes and fix applications
 /// go with them (`ON DELETE CASCADE`).
-async fn cleanup(pg: &PgDb, workflow: &str) {
+pub(super) async fn cleanup(pg: &PgDb, workflow: &str) {
     let reflection = format!("Reflection: {workflow}");
     let conn = pg.pool.get().await.expect("PG pool");
     conn.execute(
