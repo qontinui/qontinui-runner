@@ -288,44 +288,77 @@ pub(crate) async fn fetch_fresh_snapshot(
     )
     .await
     {
-        Ok(value) => {
-            // dispatch_app_request returns the full HTTP response body
-            // (`{success: true, data: {...snapshot...}}`) — wrap_snapshot's
-            // strict `serde_json::from_value::<UIBridgeSnapshot>` would parse
-            // the envelope as a default zero-element snapshot, silently
-            // producing matchRate=0 on every downstream evaluate(). Unwrap
-            // `data` (mirroring fetch_self_snapshot below) and strict-parse:
-            // ui-bridge >= 0.22.0 emits the canonical superset directly.
-            // Then synthesize the fingerprint directly — avoids a serde
-            // round-trip through wrap_snapshot.
-            let inner = value.get("data").cloned().unwrap_or(value.clone());
-            let snapshot = parse_supplied_snapshot(inner).map_err(|e| {
-                spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot parse: {e}"))
-            })?;
-            // Telemetry only: a canonicalisation refusal yields `None` (and
-            // a warn!), never a failed fetch.
-            let content_sha256 = spec_check::snapshot_telemetry_hash(&value);
-            let snapshot_timestamp =
-                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(snapshot.timestamp)
-                    .ok_or_else(|| {
-                        spec_check::SnapshotFetchError::Malformed(
-                            "timestamp out of range".to_string(),
-                        )
-                    })?
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
-                app_id,
-                app_version,
-                route,
-                bridge_version,
-                snapshot_timestamp,
-                element_count: snapshot.elements.len() as u32,
-            };
-            let snapshot_id = format!("scs_{}", uuid::Uuid::now_v7());
-            Ok((snapshot, fingerprint, snapshot_id, content_sha256))
-        }
+        Ok(value) => wrap_sdk_snapshot(
+            value,
+            app_id,
+            app_version,
+            route,
+            bridge_version,
+            qontinui_types::canonical_hash::canonical_hash::<serde_json::Value>,
+        ),
         Err(e) => Err(classify_sdk_error(&e)),
     }
+}
+
+/// The SDK branch of [`fetch_fresh_snapshot`] after dispatch, with the
+/// canonical hasher injected — the seam that lets a test prove a hasher
+/// refusal costs only `content_sha256` (None) and never the fetch. Today's
+/// `canonical_hash` cannot refuse a `serde_json::Value`, so a refusal can
+/// only be injected.
+fn wrap_sdk_snapshot<H>(
+    value: serde_json::Value,
+    app_id: String,
+    app_version: Option<String>,
+    route: Option<String>,
+    bridge_version: Option<String>,
+    hasher: H,
+) -> Result<
+    (
+        UIBridgeSnapshot,
+        qontinui_types::spec_check::BridgeFingerprint,
+        String,
+        Option<String>,
+    ),
+    spec_check::SnapshotFetchError,
+>
+where
+    H: FnOnce(
+        &serde_json::Value,
+    ) -> Result<String, qontinui_types::canonical_hash::CanonicalHashError>,
+{
+    // dispatch_app_request returns the full HTTP response body
+    // (`{success: true, data: {...snapshot...}}`) — wrap_snapshot's
+    // strict `serde_json::from_value::<UIBridgeSnapshot>` would parse
+    // the envelope as a default zero-element snapshot, silently
+    // producing matchRate=0 on every downstream evaluate(). Unwrap
+    // `data` (mirroring fetch_self_snapshot below) and strict-parse:
+    // ui-bridge >= 0.22.0 emits the canonical superset directly.
+    // Then synthesize the fingerprint directly — avoids a serde
+    // round-trip through wrap_snapshot.
+    let inner = value.get("data").cloned().unwrap_or(value.clone());
+    let snapshot = parse_supplied_snapshot(inner).map_err(|e| {
+        spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot parse: {e}"))
+    })?;
+    // Mint the id BEFORE hashing so a refusal's warn! line carries it.
+    let snapshot_id = format!("scs_{}", uuid::Uuid::now_v7());
+    // Telemetry only: a canonicalisation refusal yields `None` (and a
+    // warn!), never a failed fetch.
+    let content_sha256 = spec_check::snapshot_telemetry_hash_with(&value, &snapshot_id, hasher);
+    let snapshot_timestamp =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(snapshot.timestamp)
+            .ok_or_else(|| {
+                spec_check::SnapshotFetchError::Malformed("timestamp out of range".to_string())
+            })?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
+        app_id,
+        app_version,
+        route,
+        bridge_version,
+        snapshot_timestamp,
+        element_count: snapshot.elements.len() as u32,
+    };
+    Ok((snapshot, fingerprint, snapshot_id, content_sha256))
 }
 
 /// Loop back to the runner's own `/ui-bridge/control/snapshot` when no
@@ -734,7 +767,7 @@ pub async fn post_spec_check_batch(
                 Ok(s) => {
                     // Mirror the single supplied path: bind the synthesized
                     // fingerprint to the requested app; no raw bytes hashed
-                    // on the supplied path (content hash stays empty).
+                    // on the supplied path (content hash is None).
                     let fp = qontinui_types::spec_check::BridgeFingerprint {
                         app_id: req.app_id.clone(),
                         app_version: None,
@@ -1665,6 +1698,50 @@ mod tests {
             .expect("missing arrays are valid empty");
         assert!(snap.elements.is_empty());
         assert_eq!(snap.timestamp, 5);
+    }
+
+    #[test]
+    fn sdk_snapshot_hash_refusal_still_fetches_with_hash_absent() {
+        // The SDK branch of fetch_fresh_snapshot: a canonical-hash refusal
+        // must cost only content_sha256 (None), never the fetch. Injected,
+        // because today's canonical_hash cannot refuse a serde_json::Value.
+        let envelope = json!({ "success": true, "data": { "timestamp": 1_700_000_000_000i64 } });
+        let (snap, fp, snapshot_id, hash) = wrap_sdk_snapshot(
+            envelope,
+            "qontinui-web".to_string(),
+            None,
+            None,
+            None,
+            |_: &serde_json::Value| {
+                Err(
+                    qontinui_types::canonical_hash::CanonicalHashError::Canonicalize(
+                        "refused for the test".to_string(),
+                    ),
+                )
+            },
+        )
+        .expect("a refused telemetry hash must not fail the SDK snapshot fetch");
+        assert_eq!(hash, None);
+        assert!(snapshot_id.starts_with("scs_"));
+        assert_eq!(snap.timestamp, 1_700_000_000_000);
+        assert_eq!(fp.app_id, "qontinui-web");
+        assert_eq!(fp.snapshot_timestamp, "2023-11-14T22:13:20.000Z");
+
+        // And the accepting path still carries the real hash.
+        let envelope = json!({ "success": true, "data": { "timestamp": 0i64 } });
+        let (_s, _fp, _id, hash) = wrap_sdk_snapshot(
+            envelope.clone(),
+            "qontinui-web".to_string(),
+            None,
+            None,
+            None,
+            qontinui_types::canonical_hash::canonical_hash::<serde_json::Value>,
+        )
+        .expect("accepted");
+        assert_eq!(
+            hash,
+            Some(qontinui_types::canonical_hash::canonical_hash(&envelope).unwrap())
+        );
     }
 
     #[test]
