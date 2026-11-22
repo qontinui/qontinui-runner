@@ -4487,9 +4487,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -6680,6 +6680,7 @@ dependencies = [
  "reqwest 0.13.2",
  "restate-sdk",
  "rustls",
+ "same-file",
  "schemars 1.2.1",
  "scopeguard",
  "semver",
@@ -6741,7 +6742,7 @@ dependencies = [
  "winreg 0.55.0",
  "xcap",
  "zbus 4.4.0",
- "zip 9.0.4",
+ "zip 9.0.5",
 ]
 
 [[package]]
@@ -12253,9 +12254,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.4"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "aes 0.9.3",
  "bzip2",

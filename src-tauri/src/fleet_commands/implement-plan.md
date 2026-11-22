@@ -379,8 +379,11 @@ For each dep stem, resolve to a plan file:
 Use `Read` (a failure is the not-found signal) or `Glob` against the
 absolute path. Once located, read the dep's lifecycle word as the TOKEN of
 `"$stamp_reader" --stamp <dep plan path>` (above) — one of `DRAFT`,
-`VETTED`, `IN PROGRESS`, `SHIPPED`, `PARTIAL`, `NOT STARTED`,
-`SUPERSEDED`, `OBSOLETE`, from any stamp shape, so a plain
+`VETTED`, `IN PROGRESS`, `SHIPPED`, `PARTIAL` (legacy), `NOT STARTED`
+(legacy), `SUPERSEDED`, `OBSOLETE`, from any stamp shape (a
+`VETTED <date> — partial: …` / `DRAFT <date> — not started …` stamp, the
+form `/verify-plan-status` now writes, reads as its lead word; legacy
+`PARTIAL` / `NOT STARTED` — no writer emits them — stay readable), so a plain
 `**Status:** SHIPPED` dep reads `SHIPPED`. Its exit 3 (no status stamp in
 the window) is **UNKNOWN**, never `DRAFT`: surface the dep as
 `UNKNOWN (no status stamp)` through the conflict prompt below, exactly like
@@ -393,7 +396,7 @@ or `python3` is absent, read the dep file's first body stamp (a frontmatter
 After resolving every dep, apply these rules:
 
 - **All deps `SHIPPED`** → proceed silently to Step 0.5. No prompt.
-- **Any dep in `DRAFT` / `VETTED` / `IN PROGRESS` / `NOT STARTED` / `PARTIAL`,
+- **Any dep in `DRAFT` / `VETTED` / `IN PROGRESS` / `NOT STARTED` (legacy) / `PARTIAL` (legacy),
   or `UNKNOWN (no status stamp)`**
   → surface a conflict via `AskUserQuestion` (see below). Do NOT stamp
   IN PROGRESS until the operator resolves.
@@ -1130,15 +1133,31 @@ door, then `stop` the loop.** `plan-reserve-release.sh release` withdraws this
 plan's implement→ship net (Step 0.5) FIRST, then `remove`s the heartbeat row, then
 POSTs `/claims/release`: a release with the net still open clears it and dispatches
 a duplicate session. `<why>` becomes the net's reason, `implement→ship net
-retired: <why>`; drop `--net-gate` when Step 0.5 armed no net. It finds the
+retired: <why>`; drop `--net-gate` when Step 0.5 armed no net. Pass `--repo
+"<owner/name>"` for the plan's repo (its **Repo(s):** line): the script proves
+which of this device's tenants owns it and reads and writes the net under that
+tenant (served `coordination` `repo-writes-go-to-the-owning-tenant`). Without
+it, the script derives the repo from the cwd checkout's origin. It finds the
 session's ledger itself (no `--ledger`) and runs at most about 90 s, inside the
 Bash tool's 120 s default (its RUNTIME header):
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --net-gate "<net gate_id>" --reason "<why>"
+  --stem "<plan-stem>" --repo "<owner/name>" --net-gate "<net gate_id>" --reason "<why>"
+# Only after reading its final line: NOT on exit 7, 2 or 64 (below).
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh stop --ledger "$CLAIM_LEDGER"
 ```
+
+⚠️ **Exit 7 `RELEASE_WITHHELD` means NOTHING was released and the heartbeat row
+was kept** (`release=withheld heartbeat=kept`). A net could not be retired or
+read, so the script refused to clear it by releasing. Do **not** run `stop`.
+Fix the cause the `NET_UNRETIRED` line names and run the release again: a plan
+another tenant owns needs `--repo`, and an expired device JWT needs a fresh
+one. Or withdraw the net by hand
+(`coord-owner-call.sh --repo <owner/name> --call coord_withdraw_gate
+'{"gate_id":"<id>","reason":"<why>"}'`) and run it again. Only after a named
+remedy has failed, pass `--release-with-unretired-net` and report the net id as
+unretired, because a redundant session is then expected.
 
 `remove` of the last row stops the loop by itself and `stop` is idempotent
 **once the ledger is empty**, so running `stop` after the script is safe. Both are
@@ -1170,20 +1189,30 @@ that outlived KILL will NOT end by itself, so name its pid as left behind.
 "`stop` reports only what it observes".
 
 The script prints a line per net it found, then ONE final verdict line; quote
-that line in your report. `RELEASED` (exit 0) is clean. `NET_UNRETIRED <id|unknown>`
-(3): the net read or a withdraw failed, a `--net-gate` was not this plan's net, or
-the 60 s retire budget ran out, and the release ran anyway, so report the
-id (or `unknown`) as unretired and say a redundant session is expected (Step 0.5).
+that line in your report. `RELEASED` (exit 0) is clean. `RELEASE_WITHHELD
+<id|unknown>` (7): the net read or a withdraw failed, a `--net-gate` was not this
+plan's net, or the 60 s retire budget ran out, so nothing was released (above).
+`NET_UNRETIRED <id|unknown>` (3) is the same failure under
+`--release-with-unretired-net`: the release ran, so report the id (or `unknown`)
+as unretired and say a redundant session is expected (Step 0.5).
 `NET_FIRED <id>` (6): the net `--net-gate` names had already fired, so report the
 duplicate it dispatched; a consumed net it does not name is read as a predecessor's
 (`NET_INERT`) and changes nothing. `NOT_HELD` (4) and `RELEASE_UNKNOWN` (5) are the
 release half, below. `UNKNOWN` (2: no machine id, or no temp dir) and a usage
 error (64) did nothing and released NOTHING: the reserve is still held, so fix
 the cause and run it again.
-A `NET_MUTED <id>` line is the `NotRegistrant` fallback (cancel, then mute), and a
-`NET_CANCELLED <id>` line saying the mute did not land is that fallback one step
-short. Both nets stay open: name each id in your closeout (the final line's `--`
-note lists them).
+A `NET_CANCELLED <id>` line saying the withdraw was refused as not-the-registrant
+is the `NotRegistrant` fallback: the continuation is cancelled and the gate is
+never muted, so the release clears it inert. The final line's `--` note names it.
+`owner=` names the tenant whose bearer carried the gate doors. `owner=-` (no
+repo), `refuted`, and `unknown` with `owner_src=cwd` or `owner_src=-` (no
+`--repo`, and the proof could not run) mean the session's own doors carried
+them. `proven` (proven, but its bearer was only a bootstrap mint,
+or could not be read) and `unknown` with `owner_src=flag` mean NO door read the
+plan on a device bound to several tenants (or of unknown bindings): the
+session's default tenant is never asked in the owner's place, so the release is
+withheld (exit 7). On a device proven bound to ONE tenant the session's own
+doors read in both cases, since that tenant is the only possible owner.
 `holder=unknown` means the holder read failed and the script fell back to
 device-wide selection, so a net of another holder on this same device may have
 been touched: check the per-net lines before you report.
@@ -1264,7 +1293,10 @@ the roster's guard applies before the edit:
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    products — transcript tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides), its worktrees clean and 0 ahead of
 >    `origin/main`, and no PRs and no branches for the plan — **or that it
 >    delegated the plan to a hold gate whose continuation you are (the arm
 >    table's case 2b)**. Only then adopt it and append your own marker.
@@ -1314,11 +1346,12 @@ Edit the plan .md to update its status block to:
 ```
 
 Rules:
-- If the existing block is `Status: VETTED <date>` (and Step 0.45 check 1 did not find it HELD, and its headline carries no `IN PROGRESS` after that first token — guard rule 1; a `VETTED …, IN PROGRESS.` headline takes the `IN PROGRESS` rule below, and so does a `DRAFT` / `PARTIAL` / `NOT STARTED` first token whose headline carries `IN PROGRESS`), replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`). `VETTED (self) <date>` is the same state. `/vet-plan` writes it when it could not spawn its fresh-context reviewer. Keep the qualifier in the body (`Started from VETTED (self) 2026-05-02.`): dropping it turns a self-vet back into a stamp that cannot be told apart from an independent one. A lifted live-peer hold (Step 0.45's ``**HELD <date> behind <owner/repo#n>, resume gate `<id>`**`` run, every cited gate cleared) goes with the replaced block; keep its trail in `History:` (`Held <date> behind <owner/repo#n>; gate <id> cleared.`). This arm sees the run only on a direct resume. A `/vet-imp` resume re-vets first, and `/vet-plan` carries the same trail when its rewrite drops the hold.
+- If the existing block is `Status: VETTED <date>` (and Step 0.45 check 1 did not find it HELD, and its headline carries no `IN PROGRESS` after that first token — guard rule 1; a `VETTED …, IN PROGRESS.` headline takes the `IN PROGRESS` rule below, and so does a `DRAFT` / legacy `PARTIAL` / legacy `NOT STARTED` first token whose headline carries `IN PROGRESS`), replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`). `VETTED (self) <date>` is the same state. `/vet-plan` writes it when it could not spawn its fresh-context reviewer. Keep the qualifier in the body (`Started from VETTED (self) 2026-05-02.`): dropping it turns a self-vet back into a stamp that cannot be told apart from an independent one. A lifted live-peer hold (Step 0.45's ``**HELD <date> behind <owner/repo#n>, resume gate `<id>`**`` run, every cited gate cleared) goes with the replaced block; keep its trail in `History:` (`Held <date> behind <owner/repo#n>; gate <id> cleared.`). This arm sees the run only on a direct resume. A `/vet-imp` resume re-vets first, and `/vet-plan` carries the same trail when its rewrite drops the hold.
 - **Carry the vet's independence record forward, verbatim: every line from `> Vetted-by:` through `> Independence:`, inclusive, as the last lines of the new block.** `/vet-plan` §5 writes it under the VETTED headline. `Vetted-by:` is a paragraph wrapped over several lines carrying `Plan:`, `Read:`, `Checks:` and `Served policy`, so copy the whole range, not the one line that starts `Vetted-by:`. It is what a later attestation re-send rebuilds its `independence` declaration from (`/vet-plan` §5.4, the REFUSED arm), and a replace that drops it destroys the only durable copy outside git history. Step 6 carries it again into the SHIPPED block (single-stamp invariant item 4). It carries no `Depends-On:`, `**Area:` or `**Initiative-Item:` (`/vet-plan` §5 forbids all three), so the plan adapter parses nothing new out of it.
 - If the existing block is `Status: DRAFT` or absent, add the IN PROGRESS block but warn the user in your first text turn that the plan was not vetted — give them a chance to abort and run `/vet-plan` first.
-- If the existing block is `Status: PARTIAL` or `Status: NOT STARTED` (set by `/verify-plan-status`), replace it with the IN PROGRESS block and capture the prior state in the body's `History:` line, including a lifted live-peer hold's trail as in the VETTED arm. Don't run `/vet-plan` first unless the user asks — `/verify-plan-status` doesn't supplant a vet pass, but a recent NOT STARTED is also not a reason to re-vet.
-- If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: arm 1 — `shipped: true` ∧ `evidence_complete: true` ∧ the three phase-corroboration conjuncts `/vet-plan` §0.25 arm 1 states (`phases_remaining` the LITERAL `[]`, never `null`; that `[]` corroborated by a non-empty `phases_declared_indices` and, beside it, either `phases_complete_scope` the literal `true` (never an absent field) or every declared index covered by `phases_delivered` or by a `phases_attested` entry for which `phase_attestations` carries an entry with that `phase_index` whose `resolution` is `"resolved"`, with at least one declared index in `phases_delivered` (`/vet-plan` §0.25 arm 1); no `NO PHASE ATTRIBUTION` gap) — means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`. **Do not stop on `shipped` ∧ `evidence_complete` alone**: that pair is reachable on a unit with phases outstanding (plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`), and a response short of the phase conjuncts falls to arm 6 — fall through to the stamp arms; **the two UNKNOWN arms that a degraded read makes look clean are 2 and 3, and neither is an error shape** — `evidence_complete: false` is **arm 2 regardless of `shipped`** (the two derive independently — `shipped` from the landed citations and the phase-coverage gate, `evidence_complete = evidence_gaps.is_empty()` computed before the phase gaps are appended — so `shipped: true` ∧ `evidence_complete: false` is reachable, and keying arm 2 on `shipped: false` lets it fall through to the permissive arm), and a top-level `merged_degraded_reason` sitting BESIDE `delivery` is **arm 3**, evaluated ahead of every arm but 4 and **UNKNOWN whatever `delivery` says** — while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. Both answer `200` with a parseable `delivery` and no `citations_error`, so neither is caught by arm 6; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug` read under a `recon-tenant.sh` `MATCH`, or under a `MULTI` whose per-tenant answers folded `CLEAR` — every listed tenant answered a not-found body or a clean arm-5 body (Step 0.45 check 1, `/vet-plan` §0.25's per-tenant fold — otherwise that not-found is arm 6 too), any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). When that session's transcript is not on this box the death probe is UNKNOWN, and one of `/vet-plan`'s three positive signals ("Case 2 across machines") must stand in for the transcript-tail check — IN ADDITION to the other three checks (worktrees clean and 0 ahead, no PRs, no branches), never instead of them; without one the row is a STOP. The signals: an `ack_response` of "abandoned" read with `coord_message_status {message_id}` over the same door and tenant the message was sent over, `coord_send_message` to it answering `queued: false` + `refused_not_promptable` under the plan's tenant (ONLY when the next signal corroborates it: `waiting_human` is alive, and the refusal does not say which state it saw — its `reason` is one fixed string naming all three, so the words in it are never evidence), or coord's session row reading `finished` / `closed`. Silence on the bus is never adoptable, and an empty `coord_orient` `session_activity` is UNKNOWN. **Case 2b, gate-delegated adoption**, is the other earned branch, and it waives the no-PRs/no-branches checks: `printenv QONTINUI_GATE_ID` (by name) names gate G, the block's LAST `Held behind gate` line is literally `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` with G's full id (Step 6.5 writes it only at the owner's closeout), and a fresh `coord_gate_inspect {gate_id: G}` reads `verdict: cleared`, `continuation.consumed_by` equal to `$QONTINUI_GATE_DEVICE_ID` and to this device, and an `anchor.work_unit_id` equal to this plan's unit or the line's `anchor <work_unit_id>` (the last token before the closing `)`, parsed from the right) — any conjunct UNKNOWN is not 2b; the env var alone is a claim any shell can set. 2b → adopt, REPLACING that `Held behind gate` line (never keeping it) with `History: adopted from <prior session id> via consumed hold <G full id>`, a spelling that never satisfies 2b again. Verified-dead → adopt and append your marker, keeping the trail. Neither verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
+- A partial / not-started verdict `/verify-plan-status` writes is appended to a lifecycle word, and the lifecycle word picks the arm: `Status: VETTED <date> — partial: …` / `— not started …` takes the VETTED arm above (including carrying its `> Vetted-by:` … `> Independence:` lines), and `Status: DRAFT <date> — partial: …` / `— not started …` / `— brainstorm …` takes the DRAFT arm above. In both cases also capture the verdict in the body's `History:` line (`Verified partial 2026-05-02: Phase 3 open.`).
+- If the existing block is a legacy `Status: PARTIAL` or `Status: NOT STARTED` (no writer emits these lead words now; older plans and other tenants' plan directories may still carry them), replace it with the IN PROGRESS block and capture the prior state in the body's `History:` line, including a lifted live-peer hold's trail as in the VETTED arm. Don't run `/vet-plan` first unless the user asks — `/verify-plan-status` doesn't supplant a vet pass, but a recent not-started verdict is also not a reason to re-vet.
+- If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: arm 1 — `shipped: true` ∧ `evidence_complete: true` ∧ the three phase-corroboration conjuncts `/vet-plan` §0.25 arm 1 states (`phases_remaining` the LITERAL `[]`, never `null`; that `[]` corroborated by a non-empty `phases_declared_indices` and, beside it, either `phases_complete_scope` the literal `true` (never an absent field) or every declared index covered by `phases_delivered` or by a `phases_attested` entry for which `phase_attestations` carries an entry with that `phase_index` whose `resolution` is `"resolved"`, with at least one declared index in `phases_delivered` (`/vet-plan` §0.25 arm 1); no `NO PHASE ATTRIBUTION` gap) — means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`. **Do not stop on `shipped` ∧ `evidence_complete` alone**: that pair is reachable on a unit with phases outstanding (plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`), and a response short of the phase conjuncts falls to arm 6 — fall through to the stamp arms; **the two UNKNOWN arms that a degraded read makes look clean are 2 and 3, and neither is an error shape** — `evidence_complete: false` is **arm 2 regardless of `shipped`** (the two derive independently — `shipped` from the landed citations and the phase-coverage gate, `evidence_complete = evidence_gaps.is_empty()` computed before the phase gaps are appended — so `shipped: true` ∧ `evidence_complete: false` is reachable, and keying arm 2 on `shipped: false` lets it fall through to the permissive arm), and a top-level `merged_degraded_reason` sitting BESIDE `delivery` is **arm 3**, evaluated ahead of every arm but 4 and **UNKNOWN whatever `delivery` says** — while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. Both answer `200` with a parseable `delivery` and no `citations_error`, so neither is caught by arm 6; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug` read under a `recon-tenant.sh` `MATCH`, or under a `MULTI` whose per-tenant answers folded `CLEAR` — every listed tenant answered a not-found body or a clean arm-5 body (Step 0.45 check 1, `/vet-plan` §0.25's per-tenant fold — otherwise that not-found is arm 6 too), any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death, and, for a death read on this device, no live successor carries its id — `/vet-plan`'s successor void rule: `claude-successor.sh <sid>` answers 1, and a 0 or 2 is a STOP; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). When that session's transcript is not on this box the death probe is UNKNOWN, and one of `/vet-plan`'s three positive signals ("Case 2 across machines") must stand in for the transcript-tail check — IN ADDITION to the other three checks (worktrees clean and 0 ahead, no PRs, no branches), never instead of them; without one the row is a STOP. The signals: an `ack_response` of "abandoned" read with `coord_message_status {message_id}` over the same door and tenant the message was sent over, `coord_send_message` to it answering `queued: false` + `refused_not_promptable` under the plan's tenant (ONLY when the next signal corroborates it: `waiting_human` is alive, and the refusal does not say which state it saw — its `reason` is one fixed string naming all three, so the words in it are never evidence), or coord's session row reading `finished` / `closed` (every row matching its `claudeCodeSessionId`, in every tenant; one open row means LIVE). Silence on the bus is never adoptable, and an empty `coord_orient` `session_activity` is UNKNOWN. **Case 2b, gate-delegated adoption**, is the other earned branch, and it waives the no-PRs/no-branches checks: `printenv QONTINUI_GATE_ID` (by name) names gate G, the block's LAST `Held behind gate` line is literally `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` with G's full id (Step 6.5 writes it only at the owner's closeout), and a fresh `coord_gate_inspect {gate_id: G}` reads `verdict: cleared`, `continuation.consumed_by` equal to `$QONTINUI_GATE_DEVICE_ID` and to this device, and an `anchor.work_unit_id` equal to this plan's unit or the line's `anchor <work_unit_id>` (the last token before the closing `)`, parsed from the right) — any conjunct UNKNOWN is not 2b; the env var alone is a claim any shell can set. 2b → adopt, REPLACING that `Held behind gate` line (never keeping it) with `History: adopted from <prior session id> via consumed hold <G full id>`, a spelling that never satisfies 2b again. Verified-dead → adopt and append your marker, keeping the trail. Neither verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
 
 **Land the IN PROGRESS stamp with the helper — never by pushing "the branch".**
@@ -1330,7 +1363,8 @@ bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-
 ```
 
 **`--based-on` is required** (`_status-writers.md` → "Publishing a stamp — the compare-and-swap"): `<blob of the pre-stamp re-read>` is `git -C <plans checkout> rev-parse
-origin/main:plans/<stem>.md` from the same fetch as the pinned re-read above —
+refs/remotes/origin/main:plans/<stem>.md` (the full ref, which a local branch named
+`origin/main` cannot shadow) from the same fetch as the pinned re-read above —
 the version this step's guard judged. Edit THAT version: `cat-file -p` it into a
 private scratch file (`mktemp -d`), edit that copy and pass it as
 `<local plan file>` — never write it over a shared checkout's copy, which may
@@ -1420,6 +1454,19 @@ file push. (A repo that is NOT coord sole-authority lands its PRs via normal Git
 > edit (the worktree-claim guard exists for exactly that). If you cannot reach the
 > stale copy, that is the expected outcome: **report the residual and carry on.**
 > **Do NOT loop re-transitioning — the next scan wins again.**
+
+**Then declare the plan's phases on the unit, best-effort:**
+`bash <workspace-root>/qontinui-claude-config/scripts/declare-plan-phases.sh <plan-stem> <plan file>`.
+A unit a session minted carries no `phases` (on a multi-bound device no scanner
+writes them), and `coord_work_unit_attest_phase` refuses every phase of such a
+unit ("no established phase declaration"). The script skips a plan-backed unit,
+patches only on a difference, refuses any declaration that drops a phase coord
+has established (a narrowing is patched by hand), and bounds its own run time;
+its header is the contract. Quote its one verdict line in the report and
+continue whatever it says: it never blocks the implementation. Until the runner
+ships `qontinui-pr plan-phase-declaration` (that plan's Phase 1), the verdict is
+`UNKNOWN` on every box: expected, not a fault. `/vet-plan` §5.4
+step 1 runs the same script.
 
 #### Retire the vet→implement safety net — withdraw it (do this AT the stamp)
 
@@ -1565,14 +1612,15 @@ different device, on the same device when both sides carry differing agent ids,
 or on a NULL registrant. You see the MCP error *"only the gate's registrant may
 withdraw it; …"* or HTTP **403** — never the word `NotRegistrant` (full list:
 `_gate-registration` → "Continuation cancel + refresh", point 2). Then, and only then, fall back to two calls on the same
-gate: the cancel above, **then** the mute — `coord_mute_gate` `{gate_id}`, or its
-`/agent/` infix REST twin `POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute`
-— **and write one line naming the gate id in this session's closeout** (e.g.
-*"net `<gate_id>` muted, not withdrawn — NotRegistrant; still in the open set"*),
-because a muted net never leaves the open set on its own. That line is the
-interim until plan
-`2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds` ships
-`coord_retire_gate` (reason code `continuation_retired_and_muted`).
+gate: the cancel above, and **never the mute** (served `coordination`
+`gate-lifecycle-end`: a muted gate is skipped by the sweep and stays open for
+ever, while a gate whose continuation is cancelled still clears on its own
+predicate, inert, and dispatches nothing). **Write one line naming the gate id in
+this session's closeout** (e.g. *"net `<gate_id>` cancelled, not withdrawn —
+NotRegistrant; it clears inert"*). `plan-reserve-release.sh` takes the same
+cancel-only fallback (plan
+`2026-11-20-plan-reserve-release-routes-the-net-to-the-owning-tenant-and-withholds-an-unretired-release`
+D4).
 
 **Branch on the GATE ROW, not on an HTTP status.** Resolve the work unit for
 this plan-stem, then `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` and look
@@ -1757,10 +1805,11 @@ session marker carries, because the dispatched run matches the two.
 **Pin the continuation to the predicate's `<device_id>`, strictly:**
 `target_device_id` = that id and `"pin": "strict"` beside it (canonical:
 `_gate-registration` → "Device-local continuations"). Adoption needs this box:
-the death evidence (transcript tail, ledger `.alert`) and the worktrees it must
-find clean and 0 ahead live here only. Once coord honours `strict` the net never
-leaves this box: if the box does not return within 7 days the row expires
-undelivered, and the stall alert is then the only signal. The cross-machine
+the death evidence (transcript tail, ledger `.alert`), the successor scan that
+voids it, and the worktrees it must find clean and 0 ahead live here only. Once
+coord honours `strict` the net never leaves this box: if the box does not return
+within 7 days the row expires undelivered, and the stall alert is then the only
+signal. The cross-machine
 death signals below apply to a net-dispatched run only while the pin is inert,
 and even then such a run can STOP and report but never adopt. ⚠️ **The
 pin is not yet protection.** Read 2026-11-06 at qontinui-coord `40ceb5975`: no
@@ -1816,6 +1865,25 @@ enough:
   the bus, an empty `coord_orient` `session_activity` and a recon *clear* are
   never one.
 
+**A live successor VOIDS every death signal on this device**, the ledger line
+included (`/vet-plan` §5, "A live successor VOIDS every death signal on this
+device"). Before you accept a death read on this device (the first two
+bullets, or a coord row for a session that last ran here), run
+`bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <session id>`.
+Exit 0 prints a live Claude process whose argv carries that id, typically the
+`claude --resume <sid>` an account migration started under a new pid. The
+session is then LIVE: STOP, whatever the `OWNER_GONE … pid_dead` / `pid_reused`
+line, the transcript tail or a closed or finished coord session row says. Exit
+2 is UNKNOWN, so the death clause is UNKNOWN: STOP. Only exit 1 lets a death
+signal stand. On Git Bash the probe answers 2 (UNAVAILABLE), so a same-box
+death clause there reads UNKNOWN and STOPs until a Windows successor source
+exists. A substring `pgrep -af <sid>` or `ps … | grep <sid>` is never this
+probe: it matches the probing shell. A session that ran on another machine
+gets no scan here (its successor would run there): "Case 2 across machines"
+decides it. Both nets measured on 2026-11-16 were
+dispatched onto such a successor (findings `2a648c75` and `dd69d0ed`, dossier
+`implement-ship-net-fires-on-a-live-session`, mechanism 4).
+
 The other clauses are unchanged: its worktrees must be clean and 0 ahead of
 `origin/main`, and there must be no PRs and no branches for the plan. When all of
 these hold, ADOPT. When the death clause is UNKNOWN or any other clause fails, STOP
@@ -1857,7 +1925,8 @@ and the body. Before writing your stamp:
    all count.
 2. Use `Edit` to **delete every existing status-adjacent blockquote** —
    even if a different skill wrote it (`/vet-plan` writes `VETTED`;
-   `/verify-plan-status` writes `PARTIAL` / `NOT STARTED`). Yours
+   `/verify-plan-status` writes `VETTED/DRAFT <date> — partial: …` /
+   `— not started …`, and older runs left legacy `PARTIAL` / `NOT STARTED`). Yours
    replaces all of them.
 3. Then `Edit` again to insert your single new `> **Status:` block.
 4. If folding in history is useful (`Started from VETTED 2026-05-02`),
@@ -2323,6 +2392,16 @@ the re-acquire as the conflict flow above, and **say in the report which
 verdict you saw and what you re-acquired**. Silence here is the
 `silent-empty-is-unknown` failure: a dead loop looks exactly like a healthy
 one to anything that does not ask.
+
+**A `DEAD` loop may have been killed with its pane, and then the net may
+already have fired.** `status` prints a `launch: posture=…` line for the loop
+`start` last launched. Anything but `posture=scope` dies when its pane's systemd
+scope is torn down (an account migration, a closed tab), and `<ledger>.alert`
+`TERMINATED` records a trapped TERM from outside. In that case the plan reserve
+may already have expired, and Step 0.5's implement→ship net may already have
+dispatched a duplicate. So after re-acquiring, read
+`coord_gate_list {work_unit_id}` for that net. If it has cleared or dispatched,
+arm a fresh one exactly as Step 0.5 does, and say so in the report.
 
 #### `/loop` gap (documented limitation)
 
@@ -3110,9 +3189,10 @@ checkpoint at `RESUME_FROM` passed back verbatim rather than reconstructing
 its state. `UNKNOWN` (exit 4): nothing to act on; say so. A `failed`
 notification carrying a provider `429` with a stated reset is not retried
 blind: run `scripts/rate-limit-reset.sh schedule` **with `--hint`** (see
-`/vet-imp-sweep` Step 6 — without a brief the resumed agent's whole context is
-`run /<skill> <args>`) so the resume is a coord `time_elapsed` gate that
-survives this session, and quote its `gate_id`; a `529`/"Overloaded" is
+`/vet-imp-sweep` Step 6 — without a brief the resumed agent gets
+`run /<skill> <args>` and only what coord adds itself) so the resume is a
+coord `time_elapsed` gate that survives this session, and quote its `gate_id`;
+a `529`/"Overloaded" is
 `TRANSIENT` — retry once.
 
 **Claim release (per Step 0.6).** AFTER each phase Agent returns —
@@ -3168,6 +3248,10 @@ commit-abort wrapper installed
 on — the manual call is the fallback for unwrapped machines and stays harmless
 everywhere (same match keys, best-effort oplog). Never `--no-verify` to bypass
 the hook — that defeats both the hook and the supervision signal.
+
+**Before every push that moves the head**, run the repository's pre-push stage
+when this checkout does not — see "Run the repository's pre-push stage when this
+checkout does not", beside Step 4.5's re-review rule.
 
 #### Step 4.3: Fold in open follow-ups on the files this diff touches
 
@@ -3541,7 +3625,11 @@ and the task goals go under that same line**, as a path or a read command, never
 as text in the brief: they say what the change is FOR, which is exactly what
 Pass A judges without. Any review-focus text above the line names only WHAT to
 check (files, properties, failure shapes), never the plan's goals or the rules
-it sets. The repo standards (CLAUDE.md, the best-practices
+it sets. When the diff adds a name to a body this repository distributes to
+other machines (a bundled command, skill or agent), name that failure shape in
+the review focus: the repository's portability allowance for the new name, with
+a reason, and a regenerated portability census belong in the same diff. The repo
+standards (CLAUDE.md, the best-practices
 files) stay above it; they say nothing about this change. Tell the reviewer what the
 record's own THREAT MODEL says it cannot catch: `prove` is a control against
 honest mistakes, not against a constructed shadow (a `cfg` twin, a module no
@@ -4297,7 +4385,7 @@ and a retracted item would otherwise linger) and push the edited body over REST,
 then read it back:
 
 ```bash
-gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@$PR_BODY"
+bash <workspace-root>/qontinui-claude-config/scripts/pr-body-publish.sh <owner>/<repo> <n> "$PR_BODY"   # refuses an empty/collapsed body, reads it back
 gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep -F "Coord-Handoff-Head: $(git -C "$WORKTREE" rev-parse HEAD)"   # read back the NEW head
 ```
 
@@ -4326,6 +4414,21 @@ it as observed by coord or web. The read-back of that write is the evidence.
 When the PR moves to a new PR (the fresh-branch path below), carry the lines
 into the new body.
 
+**Run the repository's pre-push stage when this checkout does not.** Before every
+push that moves the branch's head, when the repo's `.pre-commit-config.yaml` puts
+hooks in its pre-push stage (a hook whose `stages:` names `pre-push`, or one with
+no `stages:` key at all, which runs at every stage) and this checkout's pre-push
+does not run each of them (no `$(git rev-parse --git-path hooks)/pre-push`, or one
+that does not name every such hook id and is not a hook manager's generated file),
+run each such `repo: local` hook whose `entry` is `bash <script>`, from the repo
+root over the head, feeding it the line git would, and name any other hook in the
+stage as not run. A non-zero exit is a red to fix before pushing. The line git
+would feed is:
+
+```bash
+printf 'HEAD %s refs/heads/%s 0000000000000000000000000000000000000000\n' "$(git rev-parse HEAD)" "<branch>"
+```
+
 **Re-review rule — every push that moves the head needs a new line.** The gate
 compares against the CURRENT head, so the moment you push again the recorded sha
 stops matching and the PR reads `not-reviewed` until the new head is reviewed.
@@ -4353,7 +4456,7 @@ section): re-run Step 4.4 items 3–6 on the new head (a new
 then EDIT the PR body to add a second `Coord-Reviewed-Head:` line for it:
 
 ```
-gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"
+bash <workspace-root>/qontinui-claude-config/scripts/pr-body-publish.sh <owner>/<repo> <n> "<file>"
 gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep 'Coord-Reviewed-Head'   # read it back
 ```
 
@@ -4375,7 +4478,13 @@ catches the ARTIFACT half of this drift (`contradiction_head_drift`); this
 trailer is the half coord's gate reads, and the two agree only when both are
 re-written for the same head — a re-review that re-records the artifact and
 forgets the body edit leaves a PR that corroborates locally and is refused by
-coord.
+coord. A **base-sync** corroboration is the second way to land there: when coord
+(e.g. `qontinui-merge-orchestrator[bot]`) pushes a clean merge of main onto the
+PR, Step 4.7 reads the row `corroborated` with `head_relation: base_sync`, but
+coord's `require_review` compares this trailer with the PR's current head by
+EQUALITY, so the old trailer no longer matches. Step 4.7's script does not
+rewrite the trailer; when `require_review` is on, the new head needs its own
+reviewed record.
 
 #### Step 4.5b: Open the PR in the served door order — then READ it back before anything uses its number
 
@@ -4463,7 +4572,7 @@ whose PR may already have landed" decides whether it still carries yours.
 read**, never from the create call's output: the review-arm `prs[]` row
 (`number`, `url`) Step 4.4's recorder writes, Step 4.3 item 4's `fixing`
 write (run it now, for every fold), the Step 4.5 trailer edits
-(`gh api -X PATCH repos/<owner>/<repo>/pulls/<n>`), Step 4.7's corroboration,
+(`pr-body-publish.sh <owner>/<repo> <n> <file>`), Step 4.7's corroboration,
 and Step 6.5's gates. A number no
 read returned is a number nothing verified.
 
@@ -4733,14 +4842,18 @@ touched), and exits on the **worst** verdict:
 
 | exit | verdict | what it means | what you do |
 |---|---|---|---|
-| `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, the re-measured tree equals the artifact's `reviewed_tree`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
-| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
-| `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the detail quotes the bound the door named, or says UNKNOWN-bound when the door's line names none) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared (`unknown_tree`), for example: no `--tree-root` covers the row's repo; no worktree stood at the reviewed head at the recorded time (reaped, or never offered — a same-named checkout is never a substitute); ANY candidate worktree's HEAD reflog cannot answer (logging off, an unreadable or gapped log, a gc-emptied log on a worktree standing at the reviewed head or a newer commit, a review older than the reflog expiry) or a root git could not list, which blocks the row even when the reviewed worktree is intact; the row's `measured=` time or its `reviewed_tree` line cannot be parsed; two or more worktrees were bound and now disagree; the producer refused or timed out; or a line carries the unresolved sentinel (two unresolved measurements never compare SAME). The row's detail names which | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
+| `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha` — or differs from it only by **proven base-sync steps** (`head_relation: base_sync`: clean merges of the base branch, or empty commits, after the reviewed head; counted by the verdict line's `base_sync=K` token) — the re-measured tree equals the artifact's `reviewed_tree` (or, on a `base_sync` row, advanced clean onto one of its proven steps from a tree recorded clean at the reviewed head), and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below; a `base_sync` row does NOT satisfy coord's equality-based `require_review` gate (Step 4.5's trailer paragraph) |
+| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see, and the row's `head_relation` names the measured fault: `new_commit` (a commit after the review changes the tree), `conflicted_merge` (a merge whose conflict resolution no review saw), `evil_merge` (a merge carrying content beyond the mechanical merge), `foreign_merge` (a merge of something not on the base) or `rewritten` (a force-push or rebase: the reviewed commit is not in the PR's history); `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`pr-body-publish.sh <owner>/<repo> <n> <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
+| `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the detail quotes the bound the door named, or says UNKNOWN-bound when the door's line names none) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), a head that differs could not be classified (`unknown_head_relation` — `head_relation: unmeasured` or `unrecognised`; the detail names the read that failed, e.g. no `--tree-root` whose origin names the repo, a shallow or partial-clone store, a commit absent after the bounded fetch, a git too old for the read), coord's card is **behind** the review (`unknown_card_behind_review` — its head is a strict ancestor of the reviewed one, so it cannot show what the PR carries), or the tree could not be compared (`unknown_tree`), for example: no `--tree-root` covers the row's repo; no worktree stood at the reviewed head at the recorded time (reaped, or never offered — a same-named checkout is never a substitute); ANY candidate worktree's HEAD reflog cannot answer (logging off, an unreadable or gapped log, a gc-emptied log on a worktree standing at the reviewed head or a newer commit, a review older than the reflog expiry) or a root git could not list, which blocks the row even when the reviewed worktree is intact; the row's `measured=` time or its `reviewed_tree` line cannot be parsed; two or more worktrees were bound and now disagree; the producer refused or timed out; or a line carries the unresolved sentinel (two unresolved measurements never compare SAME). The row's detail names which | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
 | `4` | **USAGE** | no artifact, no session id | the same finding Step 6 item 6 names: the review gate never wrote its record |
 | any other | **UNKNOWN** | any other exit (1, 129/130/143, …): the run did not complete — a crash, or a HUP / INT / TERM, e.g. a foreground Bash-tool timeout — and the artifact may or may not have been rewritten | report *"corroboration UNKNOWN: the run did not complete (exit <n>)"*; never corroborated |
 
 **The verdict line carries TWO halves — `heads=<n>/<m>` and `coverage=<…>` —
-and only the first decides the exit code.** The coverage read
+and only the first decides the exit code.** `heads=` counts the corroborated
+rows, base-sync ones included; when K > 0 of them corroborated only by proven
+base-sync steps, a separate ` base_sync=K` token follows it
+(`CORROBORATED heads=2/2 base_sync=1 coverage=…`), and an all-equal-head run's
+line carries no such token. The coverage read
 (`coord_pr_status(mine=true)`) requires a **session-scoped identity**, and the
 ordinary runner-provisioned session holds a device JWT: measured 2026-09-03, that
 door answers `mine=true requires a session-scoped identity (no
@@ -4755,9 +4868,13 @@ coverage=UNKNOWN` as exactly that — heads proven, coverage not established —
 carry both halves into the Step 6 report. Never write it up as "coverage
 checked".
 
-**What a corroborated row does and does not assert.** It proves the reviewed
-commit is the commit on the PR, and it records what CI concluded on that commit
-— with `coord_query_ci_state`'s own posture copied onto every row as
+**What a corroborated row does and does not assert.** For an `equal` row it
+proves the reviewed commit is the commit on the PR. For a `base_sync` row it
+proves the PR differs from the reviewed commit only by the recorded clean
+base-sync steps (`head_relation_steps`: each merge's second parent, author and
+subject), and the row's recorded `checks` ran on the PR's head — the merge —
+not on the reviewed commit. Either way it records what CI concluded on the
+card's head — with `coord_query_ci_state`'s own posture copied onto every row as
 `checks_credibility: "inherits-underlying-test"`. A green check on the reviewed
 head corroborates that CI **ran** and what it **concluded**; it never
 corroborates that the review was right. `findings_count` and `iterations` stay
@@ -4891,7 +5008,7 @@ established — a clean `gh pr checks` read is not proof of the latter.
      fi
      # Suite dir: publish the flipped 00-index.md with ITS OWN compare -- one
      # blob per call. After the fetch above:
-     #   IDX_BASED_ON="$(git -C "$TOP" rev-parse -q --verify "origin/main:<suite dir>/00-index.md")"
+     #   IDX_BASED_ON="$(git -C "$TOP" rev-parse -q --verify "refs/remotes/origin/main:<suite dir>/00-index.md")"
      # copy that blob into "$WORK/00-index.md", flip the row there, and publish it
      # with --based-on "$IDX_BASED_ON" (no session-marker check: an index carries none).
    else
@@ -4902,7 +5019,8 @@ established — a clean `gh pr checks` read is not proof of the latter.
    What the helper does, so its verdict can be read rather than trusted blind:
    it fetches the plans repo's default branch with an explicit refspec, probes
    that branch's ruleset, and — when no rule requires a PR — builds the commit
-   by plumbing on a separate index against a base resolved ONCE, so it never
+   by plumbing (lib/plumbing-commit.sh) on a private index against a base
+   resolved ONCE, so it never
    commits onto, rebases, or pushes the branch this checkout is on (routinely a
    peer's [policy: shared-checkout-route-around]). It pushes that commit to the
    default branch without force, rebuilding on a non-fast-forward. Then it reads
@@ -4985,26 +5103,30 @@ established — a clean `gh pr checks` read is not proof of the latter.
 
    ```bash
    bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh retire-net \
-     --stem "<plan-stem>" --net-gate "<net gate_id>" --reason "SHIPPED"
+     --stem "<plan-stem>" --repo "<owner/name>" --net-gate "<net gate_id>" --reason "SHIPPED"
    ```
 
-   It withdraws the net (reason `implement→ship net retired: SHIPPED`), reads it
-   back as `withdrawn`, and takes the `NotRegistrant` fallback (cancel then mute)
-   itself. The net
+   It withdraws the net (reason `implement→ship net retired: SHIPPED`) under the
+   tenant proven to own `--repo`, reads it back as `withdrawn`, and takes the
+   `NotRegistrant` fallback (cancel only, never mute) itself. The net
    is `claim_terminal` on the plan reserve, so the release in item 5, or an outer
    `/vet-imp`'s release, would otherwise clear it and dispatch a duplicate session
    onto a shipped plan. It runs at most about 60 s. Quote its final line:
-   `RETIRED` is clean, and every `NET_UNRETIRED` (3) or `NET_MUTED` id goes in
-   the closeout, as does a `NET_CANCELLED` id whose mute did not land (the
-   final line's `--` note names each net left open). `NET_FIRED` (6): the
+   `RETIRED` is clean, and every `NET_UNRETIRED` (3) id goes in the closeout,
+   as does a `NET_CANCELLED` id the final line's `--` note names (cancelled,
+   not withdrawn; it stays open until the release, which clears it inert). A
+   `NET_UNRETIRED` here makes item 5's release WITHHOLD (exit 7), so resolve
+   it first. `NET_FIRED` (6): the
    named net had already fired, so report the duplicate it dispatched.
    `UNKNOWN` (2) and a usage error (64) did nothing: fix the cause and run it
    again before item 5. Drop `--net-gate`
    when Step 0.5 armed no net; the plan-wide read still finds a net it missed.
 
 5. **Release the plan reserve (per Step 0.48) — only if THIS run acquired it.**
-   Run Step 0.48's `plan-reserve-release.sh release` with `--reason "SHIPPED"`,
-   in the same try/finally as the phase releases. It re-checks the net first (a
+   Run Step 0.48's `plan-reserve-release.sh release` with `--repo` and
+   `--reason "SHIPPED"`, in the same try/finally as the phase releases. On exit
+   7 (`RELEASE_WITHHELD`) the reserve is still held: do not `stop` the loop
+   (item 7), and follow Step 0.48's exit-7 remedy. It re-checks the net first (a
    no-op after item 4a), then POSTs `/claims/release` with the same
    `agent_session_id` used at acquire. **Skip it if Step 0.48 returned `renewed`** — an outer `/vet-imp`
    acquired the reserve and owns the release; dropping it here would unreserve
@@ -5290,12 +5412,15 @@ time window, operator approval). (canonical spec: `_gate-registration` →
     blocked-exit path says. The OFF-by-default headline above governs the other
     half: a Step 6 "follow-up plan with open items" that this session is still
     carrying.
-  - **When it IS on, populate `hint` — it is the spawned agent's only context.**
-    coord flattens the continuation to `run /<skill> <args>` and appends
-    `\n\n<hint>` only if a hint is present; no other key in the frame carries a
-    plan body, a PR body, prior findings or the predicate, so a hintless
-    continuation spawns an agent that knows nothing but the command line. Six
-    labelled lines, **references before bodies**, **≤2000 characters**:
+  - **When it IS on, populate `hint` — it is the only field that can carry
+    *why*.** coord flattens the continuation to `run /<skill> <args>` and appends
+    `\n\n<hint>` only if a hint is present; coord's own dispatch-time `brief`
+    beside it holds only references coord can resolve (the work unit's slug, the
+    PR the predicate names, its block reason, finding ids) and a fixed
+    end-of-session step, never a plan body, a PR body or what this session
+    tried, so a hintless continuation spawns an agent that knows the command
+    line and those references, not why it was sent. Six labelled lines,
+    **references before bodies**, **≤2000 characters**:
     `Plan: <plan-stem>` / `Why: <≤2 sentences>` / `PR: <owner/repo#N>` /
     `Blocked: <block_reason_code>[ ×N since <ISO8601>]` /
     `Resource-keys: <keys a peer's coord_recent_findings would match>` /
@@ -5604,7 +5729,7 @@ instead of it.
     --repo <repo> --intent "<plan-stem>: <phase title>" --work-unit <plan-work-unit-uuid> [--build-required]
   ```
 
-  It POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — an ANONYMOUS route: no runner, no mint, no cached credential, no `$COORD_HTTP_URL` (unset is an absent override, not a missing door; never substitute `127.0.0.1:9876`, which has no allocate route). `device_id` is a claim it reads from `$QONTINUI_MACHINE_ID` first, then `~/.qontinui/machine.json`, then any device JWT's payload, expired or not. It materialises every `worktrees[]` row (declared siblings included) at the RELATIVE path under the workspace root on the reserved branch, and refuses a STALE allocation whose branch already exists on origin (exit 9 — re-run, **and hand the leaked row back with `--done --branch <the reserved branch> --abandon` first**, since every real call mints a `coord.agent_worktrees` row the caller cannot retire and a bare retry loop leaks one per attempt; file it against `dossier:coord-allocate-returns-a-stale-allocation`). It **never switches the primary checkout's branch, on any answer** — the narrow claim, not "never touches it": `git worktree add` necessarily writes a branch ref and `.git/worktrees/<name>/` metadata into the primary's git dir, it fetches there, and a linked `node_modules` (below) makes the primary the write target for anything the worktree later installs. Output is five line kinds, not one: `agent_id <uuid>`; `<repo> <abs path> <branch>` per worktree; `node_modules <link> -> <target>`, interleaved after a worktree that got one; then -- only when the config is actually written -- one `sibling_store <abs path>` per SHA-keyed store entry it uses (`agent-worktrees/.siblings/<repo>@<sha>/`); and a trailing `cargo_config <path>`. What it sends (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`):
+  It POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — an ANONYMOUS route: no runner, no mint, no cached credential, no `$COORD_HTTP_URL` (unset is an absent override, not a missing door; never substitute `127.0.0.1:9876`, which has no allocate route). `device_id` is a claim it reads from `$QONTINUI_MACHINE_ID` first, then `~/.qontinui/machine.json`, then any device JWT's payload, expired or not. It materialises every `worktrees[]` row (declared siblings included) at the RELATIVE path under the workspace root on the reserved branch, and refuses a STALE allocation whose branch already exists on origin (exit 9 — re-run, **and hand the leaked row back with `--done --branch <the reserved branch> --abandon` first**, since every real call mints a `coord.agent_worktrees` row the caller has to hand back and a bare retry loop leaks one per attempt; file it against `dossier:coord-allocate-returns-a-stale-allocation`). It **never switches the primary checkout's branch, on any answer** — the narrow claim, not "never touches it": `git worktree add` necessarily writes a branch ref and `.git/worktrees/<name>/` metadata into the primary's git dir, it fetches there, and a linked `node_modules` (below) makes the primary the write target for anything the worktree later installs. Output is five line kinds, not one: `agent_id <uuid>`; `<repo> <abs path> <branch>` per worktree; `node_modules <link> -> <target>`, interleaved after a worktree that got one; then -- only when the config is actually written -- one `sibling_store <abs path>` per SHA-keyed store entry it uses (`agent-worktrees/.siblings/<repo>@<sha>/`); and a trailing `cargo_config <path>`. What it sends (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`):
 
   ```
   POST https://coord.qontinui.io/agents/allocate         // no Authorization header

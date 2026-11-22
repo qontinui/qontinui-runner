@@ -962,7 +962,10 @@ async fn run_all_catchups(
             // server-side materialized-child filter (keyed on the
             // `parent_session_id` the resume stamps), and the per-session
             // `MIGRATION_CAP` bounds any residue at 3 per 24 h rather than
-            // one per tick.
+            // one per tick. Each pending row is materialized on its own task
+            // (`respawn::spawn_tracked`, bounded, one per source at a time), so
+            // this returns once the GET is read: a respawn's minutes-long
+            // liveness proof never stalls this pump's Ping replies or frames.
             CatchupKind::Respawn => {
                 super::respawn::run_catchup(registry, lifecycle_store, http, coord_url, device_id)
                     .await
@@ -1830,10 +1833,10 @@ fn registry_record_from_restore_payload(
         finish_reason: None,
         finish_synced: false,
         finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
-        last_alive_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,

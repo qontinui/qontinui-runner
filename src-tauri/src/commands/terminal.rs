@@ -1357,10 +1357,10 @@ pub fn terminal_session_record_open(
         finish_reason: None,
         finish_synced: false,
         finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
-        last_alive_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
@@ -2293,6 +2293,24 @@ fn live_sessions_payload(
 /// handoff strategy (`ai_provider::pick_migration_target`), excluding the
 /// session's current account; an explicit target is recorded as a handoff
 /// too.
+///
+/// **This call can take minutes to resolve, and it reports no progress
+/// meanwhile.** It resolves only once the resumed CLI is PROVEN alive or the
+/// respawn has given up (`respawn_liveness::confirm_respawn`). Worst case, per
+/// attempt: up to 45 s for a launchable `claude` to reappear on PATH
+/// (`claude_cli_spawn::RESUME_RESOLVE_DELAYS`), plus up to 180 s for the pane
+/// to paint (`respawn_liveness::RESUME_LIVENESS_DEADLINE`). With
+/// `respawn_liveness::MAX_RESPAWN_ATTEMPTS` (3) attempts and the 1 s and 3 s
+/// pauses between them, that comes to about 11 minutes (3 × 225 s + 4 s =
+/// 679 s), plus the transcript carry before the first spawn. While a
+/// runner-owned CLI install is running, each attempt first waits it out, for
+/// up to `claude_cli_spawn::CLI_UPDATE_WAIT` (120 s) more. Only an install
+/// running at the start of each of the three attempts reaches the full
+/// 3 × 345 s + 4 s = 1039 s, about 17 minutes. A caller with a
+/// UI should show the migration as pending for that long, and must not read a
+/// slow answer as a hang. Returning at the first spawn and reporting the
+/// verdict by event would take a new event contract with the webview. That is
+/// deliberately not done here.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,
@@ -2329,6 +2347,11 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
+    // Resolves only once the resumed CLI is proven alive; a respawn that died
+    // (rolled back) or never painted is an error naming which. A pane that
+    // never painted is rolled back onto the old pane while that pane still runs
+    // (the new pane closed), unless the old pane is read to host no CLI — then
+    // the new pane keeps the session.
     let outcome = crate::terminal::account_migration::migrate_session_off_runtime(
         &app,
         &record,
@@ -2338,8 +2361,10 @@ pub async fn terminal_migrate_session_account(
     )
     .await
     .map_err(|e| {
-        // The session never reached `dst`: it must not count as a handoff.
-        crate::ai_provider::unrecord_handoff(&dst);
+        // A session that never reached `dst` must not count as a handoff.
+        if !e.reached_destination() {
+            crate::ai_provider::unrecord_handoff(&dst);
+        }
         // A refusal (already migrating / already moved / closed /
         // gone) reads as its own sentence, exactly as before the typed
         // error.
@@ -2461,6 +2486,35 @@ pub(crate) struct SessionCaptureHint {
 /// environment: a session's env carries plaintext passwords, and the habitual
 /// `JWT|KEY|TOKEN|SECRET` redaction filter matches none of them.
 pub(crate) const GATE_ID_ENV: &str = "QONTINUI_GATE_ID";
+
+/// The env a GATE continuation's PTY carries beyond the base child env: the
+/// gate it reports to ([`GATE_ID_ENV`] / [`GATE_DEVICE_ID_ENV`]) and the
+/// Stop-hook mode it runs under.
+///
+/// The mode is forwarded because `claude_stop_hook.sh` short-circuits on
+/// `QONTINUI_STOP_HOOK_CONTINUATION` before asking the runner, and the base
+/// child env sets that variable to the RUNNER's mode — `off` when unset. A gate
+/// continuation reads an unset flag as armed
+/// ([`crate::mcp::continuation_verdict::FlagReading::mode_for`]); without this
+/// override its Stop hook would be registered and then exit before ever
+/// reaching the verdict. Applied through `extra_env`, which runs after the base
+/// env, so it wins. Pure over its inputs (the unit-test surface).
+pub(crate) fn gate_identity_env(
+    gate: GateIdentity,
+    reading: crate::mcp::continuation_verdict::FlagReading,
+) -> Vec<(String, String)> {
+    vec![
+        (GATE_ID_ENV.to_string(), gate.gate_id.to_string()),
+        (
+            GATE_DEVICE_ID_ENV.to_string(),
+            gate.consuming_device_id.to_string(),
+        ),
+        (
+            crate::mcp::continuation_verdict::FLAG_ENV.to_string(),
+            reading.mode_for(true).as_str().to_string(),
+        ),
+    ]
+}
 
 /// Env var carrying the CONSUMING device id for [`GATE_ID_ENV`]'s gate.
 ///
@@ -2725,10 +2779,9 @@ pub(crate) fn create_terminal_session_backend(
     // to report to" — the correct signal, and the reason this is not a
     // sentinel value.
     if let Some(gate) = capture_hint.as_ref().and_then(|h| h.gate_identity) {
-        env_pairs.push((GATE_ID_ENV.to_string(), gate.gate_id.to_string()));
-        env_pairs.push((
-            GATE_DEVICE_ID_ENV.to_string(),
-            gate.consuming_device_id.to_string(),
+        env_pairs.extend(gate_identity_env(
+            gate,
+            crate::mcp::continuation_verdict::FlagReading::from_env(),
         ));
     }
     // The spawn-time policy delivery marker pair — set, or BLANKED, on every
@@ -3104,10 +3157,10 @@ async fn poll_and_record_session<F>(
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
-                last_alive_at: None,
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
@@ -3207,10 +3260,10 @@ pub(crate) fn record_pinned_session_open(
         finish_reason: None,
         finish_synced: false,
         finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
-        last_alive_at: None,
         gate_id,
         gate_consuming_device_id,
         gate_bound_boot_ms,
@@ -3496,6 +3549,32 @@ mod tests {
         );
     }
 
+    /// A gate continuation's PTY carries the gate pair AND an armed Stop-hook
+    /// mode when the flag is unset — the script short-circuits on that
+    /// variable, so without it the registered hook never reaches the verdict.
+    /// An explicit `off` is forwarded as `off`.
+    #[test]
+    fn gate_identity_env_arms_the_stop_hook_unless_the_flag_is_off() {
+        use crate::mcp::continuation_verdict::{FlagReading, Mode, FLAG_ENV};
+        let gate = GateIdentity {
+            gate_id: uuid::Uuid::new_v4(),
+            consuming_device_id: uuid::Uuid::new_v4(),
+        };
+        let get = |env: &[(String, String)], k: &str| {
+            env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        let env = gate_identity_env(gate, FlagReading::Unset);
+        assert_eq!(get(&env, GATE_ID_ENV), Some(gate.gate_id.to_string()));
+        assert_eq!(
+            get(&env, GATE_DEVICE_ID_ENV),
+            Some(gate.consuming_device_id.to_string())
+        );
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("on"));
+
+        let env = gate_identity_env(gate, FlagReading::Explicit(Mode::Off));
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("off"));
+    }
+
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.
     /// A typed fact flattened into a success-envelope string is exactly the
@@ -3555,6 +3634,10 @@ mod tests {
             CloseOutcome::TerminalSuperseded {
                 requested: "s".to_string(),
                 terminal_id: "t-old".to_string(),
+            },
+            CloseOutcome::HeldInFlight {
+                requested: "s".to_string(),
+                terminal_id: "t-new".to_string(),
             },
         ] {
             assert!(
@@ -3712,10 +3795,10 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,

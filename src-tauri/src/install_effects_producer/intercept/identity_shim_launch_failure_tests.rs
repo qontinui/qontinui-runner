@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::shim_test_support::{identity_shim_cmd, write_exe, EXE_LOCK};
-use crate::install_effects_producer::{note_shim_beacon, ShimBeaconRequest};
-use crate::terminal::launch_failure::{LaunchFailure, LaunchFailureRegistry};
+use super::shim_test_support::{
+    identity_shim_cmd, write_exe, EXEC_FAILED_BODY, EXE_LOCK, INVOKED_BODY, INVOKED_NO_HOOK_BODY,
+    RESOLVE_FAILED_BODY, RESOLVE_FAILED_NO_HOOK_BODY,
+};
 
 const BUDGET: Duration = Duration::from_secs(40);
 
@@ -28,13 +29,6 @@ const BUDGET: Duration = Duration::from_secs(40);
 const RESUME_ARGS: [&str; 2] = ["--resume", "sess-1"];
 
 const BEACON_PATH: &str = "/control/shim-beacon";
-
-const INVOKED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=true mcp_config=false pinned=true"}"#;
-const RESOLVE_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=true user_session_id=true"}"#;
-const EXEC_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"exec-failed","detail":"status=126 waited=1 settings=true user_session_id=true"}"#;
-/// The same two beacons from a shim that delivers NO SessionStart hook.
-const INVOKED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=false mcp_config=false pinned=true"}"#;
-const RESOLVE_FAILED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=false user_session_id=true"}"#;
 
 /// One request the listener received: its path and its body, verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,8 +271,8 @@ fn run_shim_with(real: Real, nested: bool, hook: bool) -> ShimRun {
 
 /// No `claude` resolves within the wait: the shim reports `resolve-failed`
 /// with the literal body BEFORE its fall-through exec (which still runs and
-/// exits 127), and the runner's route body records exactly the flags the
-/// `launch-failed` decider reads from that same literal.
+/// exits 127). What the runner RECORDS from that same literal is tested beside
+/// the registry (`terminal::launch_failure`'s tests).
 #[test]
 fn resolve_failed_is_reported_before_the_fall_through() {
     let run = run_shim(Real::Absent, false);
@@ -300,19 +294,6 @@ fn resolve_failed_is_reported_before_the_fall_through() {
         run.stderr
     );
     assert_eq!(run.beacon_bodies(), [INVOKED_BODY, RESOLVE_FAILED_BODY]);
-
-    let req: ShimBeaconRequest = serde_json::from_str(RESOLVE_FAILED_BODY).unwrap();
-    let registry = LaunchFailureRegistry::new();
-    let noted = note_shim_beacon(&registry, &req, 1_000);
-    let expected = LaunchFailure {
-        event: "resolve-failed".to_string(),
-        detail: "waited=1 stub=false settings=true user_session_id=true".to_string(),
-        settings: true,
-        user_chose_session: true,
-        at_ms: 1_000,
-    };
-    assert_eq!(noted.as_ref(), Some(&expected));
-    assert_eq!(registry.get("term-launch", 1_000), Some(expected));
 }
 
 /// A shim that delivers NO SessionStart hook (no `QONTINUI_CLAUDE_HOOK_SETTINGS`)

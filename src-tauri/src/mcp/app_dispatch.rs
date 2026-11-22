@@ -430,7 +430,7 @@ impl AppDispatcher {
         app_id: &str,
         app_url: &str,
         base_path: &str,
-        http_client: &reqwest::Client,
+        http_client: &crate::mcp::sdk_http::SdkHttpClient,
         http_method: Method,
         http_path: &str,
         payload: serde_json::Value,
@@ -450,7 +450,9 @@ impl AppDispatcher {
         // Refresh stale cache entries.
         if cached.1 >= RESPONSIVENESS_CACHE_MS {
             let health_url = format!("{}{}/health", app_url, base_path);
+            // Health is open on a phone: probe it unsigned (see `without_signer`).
             let responsive = match http_client
+                .without_signer()
                 .get(&health_url)
                 .timeout(Duration::from_secs(2))
                 .send()
@@ -684,7 +686,7 @@ pub(crate) mod test_support {
             app_url: url.to_string(),
             base_path: base_path.to_string(),
             app_info: info,
-            client: reqwest::Client::new(),
+            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,

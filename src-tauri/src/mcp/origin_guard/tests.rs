@@ -1751,6 +1751,8 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/agent-tokens/health"),
     ("GET", "/agent-worktrees/reclaimable"),
     ("GET", "/agent-worktrees/wip-orphans"),
+    // Test-only: the scripted coord stub in session/coord_sync.rs tests (spawn-failed spool replay).
+    ("POST", "/agents/{id}/spawn-failed"),
     ("GET", "/analytics/token-usage/by-model"),
     ("GET", "/analytics/token-usage/by-page"),
     ("GET", "/analytics/token-usage/by-phase"),
@@ -1835,6 +1837,10 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/ui-bridge/design/evaluate/contexts"),
     ("POST", "/ui-bridge/design/evaluate/diff"),
     ("GET", "/ui-bridge/diagnostics/readiness"),
+    // Not a runner route: a stand-in PHONE's pairing route in
+    // `device_pairing_door_tests`, which the runner calls and never serves. The
+    // runner's own pair route, `/ui-bridge/devices/{id}/pair`, is a credential door.
+    ("POST", "/ui-bridge/pair"),
     ("GET", "/ui-bridge/sdk/control/transition/{id}/can-execute"),
     ("POST", "/ui-bridge/sdk/design/evaluate"),
     ("POST", "/ui-bridge/sdk/design/evaluate/baseline"),

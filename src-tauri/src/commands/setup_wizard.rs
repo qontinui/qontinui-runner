@@ -1785,7 +1785,7 @@ pub async fn suggest_dev_services_for_setup(
     // setting to fix, and the input at fault when the operator set one — it
     // surfaces in the wizard where the old "Could not find qontinui workspace
     // root" string did, but is actionable.
-    let workspace = crate::workspace_paths::require_workspace_root()?;
+    let workspace = crate::workspace_paths::require_workspace_root().map_err(|e| e.to_string())?;
 
     let mut existing = settings::get_managed_process_configs();
 

@@ -117,6 +117,17 @@ struct WireRow {
     /// malformed body, settled as unresolved rather than guessed.
     #[serde(default)]
     coord_session_id: Option<String>,
+    /// The answering row's liveness axis (`active`, `closed`, ...). Served
+    /// since the route was created; a missing key reads as `None` (UNKNOWN).
+    #[serde(default)]
+    state: Option<String>,
+    /// When the answering row was REGISTERED (`coord.sessions.started_at`),
+    /// RFC 3339. Additive (plan
+    /// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`,
+    /// Phase 3); coord OMITS it when unread, and a coord predating the field
+    /// never sends it, so absence is UNKNOWN, never a value.
+    #[serde(default)]
+    started_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +221,14 @@ pub struct ObservedRow {
     pub since_ms: Option<i64>,
     /// WHICH `coord.sessions` row answered; `None` on a coord predating it.
     pub coord_session_id: Option<String>,
+    /// The answering row's liveness axis (`active`, `closed`, ...); `None`
+    /// when coord served none (UNKNOWN).
+    pub state: Option<String>,
+    /// When the answering row was registered (coord's `started_at`), verbatim
+    /// (RFC 3339); `None` when coord served none (UNKNOWN).
+    pub started_at: Option<String>,
+    /// [`Self::started_at`] as unix millis; `None` when absent or unparseable.
+    pub started_at_ms: Option<i64>,
 }
 
 impl StatusFetch {
@@ -380,6 +399,16 @@ fn rows_from_body(body: &WireResponse) -> HashMap<String, ObservedRow> {
                 .as_deref()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.timestamp_millis());
+            let started_at = row
+                .started_at
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let started_at_ms = started_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis());
             (
                 id.clone(),
                 ObservedRow {
@@ -397,6 +426,14 @@ fn rows_from_body(body: &WireResponse) -> HashMap<String, ObservedRow> {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string),
+                    state: row
+                        .state
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    started_at,
+                    started_at_ms,
                 },
             )
         })
@@ -708,6 +745,62 @@ pub async fn resolve_coord_row(csid: &str) -> RowResolution {
 }
 
 // ---------------------------------------------------------------------------
+// One session's raw work axis (the Stop-hook verdict's read)
+// ---------------------------------------------------------------------------
+
+/// What coord said about ONE harness session's work axis, with the raw status
+/// word kept (the verdict decides on the word, not on [`SessionWorkStatus`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneStatus {
+    /// coord has a row; `None` = its work axis is unset.
+    Row(Option<String>),
+    /// coord named the id in `unknown` — reachable, and no row.
+    NoRow,
+    /// coord could not be asked, or did not settle the id (degraded read,
+    /// bridge column absent, an `invalid` id, named in no bucket).
+    Unresolved(String),
+}
+
+/// Pure: settle `csid`'s raw work axis against a decoded body.
+fn one_status_from_body(body: &WireResponse, csid: &str) -> OneStatus {
+    if !body.session_bridge_column_present {
+        return OneStatus::Unresolved(
+            "coord reported sessionBridgeColumnPresent: false".to_string(),
+        );
+    }
+    if let Some(row) = body.statuses.get(csid) {
+        return OneStatus::Row(
+            row.session_status
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if body.unknown.iter().any(|u| u == csid) {
+        return OneStatus::NoRow;
+    }
+    OneStatus::Unresolved("coord named the id in neither `statuses` nor `unknown`".to_string())
+}
+
+/// Read ONE harness session's work axis over the same door, credential and
+/// timeouts as [`fetch`]. Never errors — see [`OneStatus`].
+pub async fn fetch_one(csid: &str) -> OneStatus {
+    // The id is interpolated into a CSV query parameter: only a UUID goes on
+    // the wire, so a `,` or `&` in a payload can never reshape the request.
+    // Normalised once (hyphenated lowercase), and the SAME string is both sent
+    // and looked up, so a braced or uppercase id cannot miss its own row.
+    let Ok(id) = uuid::Uuid::parse_str(csid.trim()) else {
+        return OneStatus::Unresolved(format!("`{csid}` is not a harness session UUID"));
+    };
+    let id = id.to_string();
+    match fetch_wire(std::slice::from_ref(&id)).await {
+        Ok((body, _)) => one_status_from_body(&body, &id),
+        Err(note) => OneStatus::Unresolved(note),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -788,6 +881,45 @@ mod tests {
         decode_off_contract(json)
     }
 
+    #[test]
+    fn one_status_keeps_the_raw_word_and_separates_no_row_from_unresolved() {
+        // Off contract on purpose: the rows omit `since`/`state` and the body
+        // omits `input_truncated`, to exercise the one-status reader alone.
+        let b = decode_off_contract(serde_json::json!({
+            "statuses": {
+                "a": {"session_status": "Working "},
+                "b": {"session_status": null},
+                "c": {"session_status": "  "}
+            },
+            "unknown": ["u"], "invalid": ["bad"], "accepted": 3,
+            "sessionBridgeColumnPresent": true
+        }));
+        assert_eq!(
+            one_status_from_body(&b, "a"),
+            OneStatus::Row(Some("Working".into()))
+        );
+        assert_eq!(one_status_from_body(&b, "b"), OneStatus::Row(None));
+        assert_eq!(one_status_from_body(&b, "c"), OneStatus::Row(None));
+        assert_eq!(one_status_from_body(&b, "u"), OneStatus::NoRow);
+        assert!(matches!(
+            one_status_from_body(&b, "bad"),
+            OneStatus::Unresolved(_)
+        ));
+        assert!(matches!(
+            one_status_from_body(&b, "zzz"),
+            OneStatus::Unresolved(_)
+        ));
+
+        let no_bridge = decode_off_contract(serde_json::json!({
+            "statuses": {"a": {"session_status": "working"}}, "unknown": [],
+            "sessionBridgeColumnPresent": false
+        }));
+        assert!(matches!(
+            one_status_from_body(&no_bridge, "a"),
+            OneStatus::Unresolved(_)
+        ));
+    }
+
     /// Decode with NO contract check. Only for a fixture that sends, on
     /// purpose, a body coord cannot (a missing, extra or retired key) to
     /// exercise a defensive arm. Every caller says why.
@@ -850,6 +982,32 @@ mod tests {
             "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         }));
+    }
+
+    /// The observed row carries coord's `state` and `started_at` (the finish
+    /// heal's re-address needs both); an omitted `started_at` reads `None`,
+    /// never a value.
+    #[test]
+    fn an_observed_row_carries_state_and_started_at() {
+        let b = body(json!({
+            "statuses": {
+                "a": {"session_status": null, "since": null, "coord_session_id": ROW,
+                      "state": "active", "started_at": "2026-11-05T11:00:00Z"},
+                "b": {"session_status": null, "since": null, "coord_session_id": ROW,
+                      "state": "closed"}
+            },
+            "unknown": [], "invalid": [], "accepted": 2, "input_truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        let rows = rows_from_body(&b);
+        let a = &rows["a"];
+        assert_eq!(a.state.as_deref(), Some("active"));
+        assert_eq!(a.started_at.as_deref(), Some("2026-11-05T11:00:00Z"));
+        assert_eq!(a.started_at_ms, Some(1_793_876_400_000));
+        let b = &rows["b"];
+        assert_eq!(b.state.as_deref(), Some("closed"));
+        assert_eq!(b.started_at, None);
+        assert_eq!(b.started_at_ms, None);
     }
 
     #[test]

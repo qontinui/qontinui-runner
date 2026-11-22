@@ -697,11 +697,21 @@ three ways relative to a whole-plan vet:
    status block.** Do not touch other phases' sections, and do not run the
    single-stamp-invariant full-block replace §5 describes for a whole-plan
    vet. Instead, splice that scoped entry into the existing status
-   blockquote using the same separate-index, pinned-`$BASE` push recipe
-   `CLAUDE.md` already documents for a shared checkout (`git hash-object -w`
-   → `GIT_INDEX_FILE=<tmp> git read-tree "$BASE"` → `update-index` →
-   `write-tree` → `commit-tree -p "$BASE"` → push), so a concurrent phase
-   session's own scoped edit is never clobbered by a full-block rewrite. The
+   blockquote and publish it with
+   `bash <workspace-root>/qontinui-claude-config/scripts/plumbing-push.sh --root <plans checkout> --branch main --put plans/<stem>.md=<edited file> --based-on plans/<stem>.md=<blob> --message "<subject>"`,
+   where `<blob>` is the `git rev-parse refs/remotes/origin/main:plans/<stem>.md`
+   you read (right after a fetch; the full ref, which a local branch named
+   `origin/main` cannot shadow) before splicing (its header carries the why: a
+   private index, a base pinned once, no empty sha ever pushed, the blob you
+   read compared with origin on every attempt, read-back), so a concurrent
+   phase session's own scoped edit is never clobbered by a full-block rewrite.
+   Exit 7 `CONFLICT` means origin no longer holds the blob you read — a peer
+   edited the plan after your read: re-read it, re-splice, re-run with the new
+   `--based-on`. Exit 5 `REFUSED` on `main` is a ruleset that requires a PR (push
+   a new branch with `--create` and open a PR) or a ruleset probe GitHub did not
+   answer — a rate limit or a transport failure (retry once the GitHub budget
+   resets or the network answers, or publish this single plan file through
+   `scripts/land-plan-stamp.sh`, which rides both). The
    scoped entry reads:
    ```
    Phase N: VETTED <date> (session <short-id>) — see § Phase N.
@@ -749,8 +759,9 @@ written.
 plans directory is inside a git repo, fetch
 (`git -C <plans-repo-root> fetch -q origin +refs/heads/main:refs/remotes/origin/main`,
 exit status read unpiped — a failed fetch is a STOP), record
-`BASED_ON=$(git -C <plans-repo-root> rev-parse -q --verify origin/main:<repo-relative plan path>)`
-(empty: the plan is not on origin — publish it with `--based-on new` first, per
+`BASED_ON=$(git -C <plans-repo-root> rev-parse -q --verify refs/remotes/origin/main:<repo-relative plan path>)`
+(the full ref, which a local branch named `origin/main` cannot shadow; empty:
+the plan is not on origin — publish it with `--based-on new` first, per
 the precondition above), and write `git -C <plans-repo-root> cat-file -p "$BASED_ON"`
 into a private scratch file (`mktemp -d`). **That scratch file is "the plan on
 disk" for every later step of this run** — the capture below, Step 1's `Read`,
@@ -1039,7 +1050,7 @@ construction (see above). A `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a
 foreign `IN PROGRESS` whose session left PRs (unless it is case 2b's
 gate-delegated stamp and this run is that hold gate's continuation), still
 stops there; a complete plan
-still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
+still stamped `VETTED` or `DRAFT` (including the `— partial` / `— not started` forms, or a legacy `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
 remaining MECHANICAL guard is `/implement-plan` Step 0.45 check 2 — a `git log
 origin/main -20` grep that misses anything older — though §2's claim
 verification may also notice the plan's premises are already met. It is accepted because a false *"do NOT
@@ -1099,7 +1110,9 @@ If, on the values captured above:
   positively attribute). **Run case 2's probes HERE to decide that** — they are
   the only thing separating "adopt" from "a peer is mid-flight", and every one of
   them is read-only: does the stamping session's transcript tail show it died;
-  are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
+  for a death read on this device, does no live successor carry its id (§5's
+  void rule: `claude-successor.sh <sid>` must answer 1, and a 0 or 2 is a
+  STOP); are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
   exist for the plan. If all of them hold this is case 2 (**adopt**) and you
   proceed — do not STOP. **Evaluate case 2b HERE too, before taking any STOP**:
   when `printenv QONTINUI_GATE_ID` names the gate in the captured block's last
@@ -1997,13 +2010,14 @@ and the body. Before writing your stamp:
    declaration, it counts.
 2. Use `Edit` to **delete every existing status-adjacent blockquote** —
    even if it came from a different skill (`/verify-plan-status` writes
-   `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
+   `VETTED/DRAFT <date> — not started` / `— partial: …`, and older runs
+   left legacy `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
    `SHIPPED`; older `/vet-plan` runs may have left `Status: VETTED ...`).
    Yours replaces all of them.
 3. Then `Edit` again to insert your single new `> **Status: VETTED …`
    block.
 4. If folding in history is useful (e.g., the plan was previously
-   `NOT STARTED` per a verify pass, or had earlier verifier findings
+   not started per a verify pass, or had earlier verifier findings
    in a separate `> **Edit:` block), include the salient info in
    **one trailing line inside your new block**, prefixed `History:` or
    `Previously:`. Never as a sibling blockquote. A re-vet that lifts a hold
@@ -2036,10 +2050,10 @@ and the body. Before writing your stamp:
    longer shows.
 
 When `/vet-plan` and `/verify-plan-status` disagree on what the status
-should be (the plan is both VETTED *and* NOT STARTED — a vetted plan
+should be (the plan is both vetted *and* not started — a vetted plan
 that nobody has implemented yet), consolidate: write the lifecycle
-stage in the heading (`Status: VETTED <date> — implementation not
-started.`) and put the verifier's findings in the body. The two
+stage in the heading with the verdict appended (`Status: VETTED <date> —
+not started (verified <date>).`, `/verify-plan-status` §5's form) and put the verifier's findings in the body. The two
 skills do NOT both stamp side-by-side.
 
 #### Lifecycle states
@@ -2047,20 +2061,23 @@ skills do NOT both stamp side-by-side.
 | State | Owner skill | Means |
 |---|---|---|
 | DRAFT | author | plan written, not yet vetted |
-| VETTED | `/vet-plan` | claims audited; ready to implement |
+| VETTED | `/vet-plan` (also carried by `/verify-plan-status`) | claims audited; ready to implement |
 | IN PROGRESS | `/implement-plan` | implementation underway |
 | SHIPPED | `/implement-plan` or `/verify-plan-status` | all phases live in code |
 | SHIPPED — UNCONFIRMED (<claim ids>) | `/implement-plan` or `/verify-plan-status` | all phases live in code, and the `## Done when` claims named do NOT read `confirmed` (or the section is unparseable — `done-when-unparseable`) — landed, not yet shown to work. Normalises to `shipped` in coord (the qualifier is for the human reader) |
-| PARTIAL | `/verify-plan-status` | some phases live, some open |
-| NOT STARTED | `/verify-plan-status` | no implementation evidence |
+| VETTED/DRAFT — partial | `/verify-plan-status` (lead word carried from the replaced stamp — `VETTED` only when that stamp led with `VETTED`, else `DRAFT`; never upgraded) | some phases live, some open |
+| VETTED/DRAFT — not started | `/verify-plan-status` (lead word carried, as above) | no implementation evidence |
+| PARTIAL / NOT STARTED (legacy) | none — no writer emits them as lead words now | read as above; overwritable |
 | SUPERSEDED / OBSOLETE | any | terminal states |
 
 `/vet-plan` writes only `VETTED` (on the self path qualified as
 `VETTED (self)`, still `VETTED` first — §5). If the existing block is `SHIPPED`
 (qualified `UNCONFIRMED` or not), `SUPERSEDED`, or `OBSOLETE`, do NOT overwrite — surface to the user
 that they're vetting a closed plan and confirm they actually want this
-rewrite. (`PARTIAL` and `NOT STARTED` are fine to overwrite — your vet
-pass produces fresher information.)
+rewrite. (The partial / not-started forms — `VETTED/DRAFT <date> — partial: …`,
+`VETTED/DRAFT <date> — not started …` — and the legacy `PARTIAL` and
+`NOT STARTED` are fine to overwrite — your vet pass produces fresher
+information.)
 
 ##### `IN PROGRESS` is CONDITIONALLY overwritable — consumes Step 0.25
 
@@ -2099,7 +2116,10 @@ inline.
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    products — transcript tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides), its worktrees clean and 0 ahead of
 >    `origin/main`, and no PRs and no branches for the plan — **or that it
 >    delegated the plan to a hold gate whose continuation you are (the arm
 >    table's case 2b)**. Only then adopt it and append your own marker.
@@ -2136,7 +2156,8 @@ unidentified default below, that run should have stopped at its capture step
 without editing anything.
 
 **The arms below are scoped to a status block that reads `IN PROGRESS`.** A
-`DRAFT`, absent, `PARTIAL` or `NOT STARTED` block is governed by the paragraph
+`DRAFT`, absent, `VETTED/DRAFT — partial` / `— not started`, or legacy
+`PARTIAL` / `NOT STARTED` block is governed by the paragraph
 above this section, not by this table — do not read the "anything else" row as
 refusing a first-time vet.
 
@@ -2144,10 +2165,35 @@ refusing a first-time vet.
 |---|---|---|---|
 | 0 | The marker **IS** your own current session id | a resume, or a Step 0.5 re-run | **Refresh**, never take over: update the date and keep the trail. |
 | 1 | Work has **landed** | delivery **arm 1** | **Refuse.** Do not overwrite; route to closeout. |
-| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
+| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND, when that death was read on THIS device (the ledger `.alert`, a transcript on this box, or a coord row for a session that last ran here), no live successor carries its id (the void rule below the table; a cross-machine death is decided by "Case 2 across machines" alone) — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
 | 2b | The stamping session **handed the rest to a hold gate, and you are that gate's continuation** (gate-delegated adoption) | the marker is a session id ≠ yours, AND `printenv QONTINUI_GATE_ID` (by NAME, never an `env` dump) names gate G, AND the **last** `Held behind gate` line in the captured block is literally `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` with G's **full** id (written only at the owner's closeout — `/implement-plan` Step 6.5), AND a FRESH `coord_gate_inspect {gate_id: G}` reads `verdict: cleared`, `continuation.consumed_by` equal to `$QONTINUI_GATE_DEVICE_ID` **and** to this device (`$QONTINUI_MACHINE_ID`, else `device_id` in `~/.qontinui/machine.json`), and an `anchor.work_unit_id` equal to this plan's unit or to the line's `anchor <work_unit_id>`. The `anchor <work_unit_id>` token is the last thing before the line's closing `)` — parse it from the RIGHT, so a predicate containing `;` or `)` cannot break the match. Case 2's zero-work-products checks do **not** apply: the predecessor's PRs are the expected state | **Adopt**, as case 2: keep the fresh write, and in place of the `Held behind gate` line (never keep it) write `History: adopted from <prior session id> via consumed hold <G full id>` **inside that one block** — a spelling that can never satisfy case 2b again. |
 | 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and neither case 2's nor case 2b's checks all hold | **STOP.** Do not vet and do not implement. |
 | — | **Anything else** — the stamp carries **no** session marker, or one you cannot positively attribute | no evidence of death, and no evidence it is yours | **STOP**, exactly as case 3. |
+
+**A live successor VOIDS every death signal on this device.** A live Claude
+process whose argv carries the stamping session's id is that session, resumed:
+an account migration restarts it as `claude --resume <sid>` under a new pid.
+It voids the ledger `.alert` `OWNER_GONE … pid_dead` / `pid_reused`, the tail
+of a transcript on this box, and a closed or finished coord row for a session
+that last ran here, and it forces STOP. A session that ran on another machine
+gets no scan here (its successor would run there): "Case 2 across machines"
+decides it. Probe it with
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>
+```
+
+Exit 0 prints the live successor pid(s): LIVE, so STOP. Exit 1 means none, and
+the death signal stands. Exit 2 is UNKNOWN, which makes the death clause
+UNKNOWN: STOP. On Git Bash the probe answers 2 (UNAVAILABLE), so a same-box
+death clause there reads UNKNOWN and STOPs until a Windows successor source
+exists. A substring `pgrep -af <sid>` or `ps … | grep <sid>` is never
+this probe, because it matches the probing shell (measured on nilan:
+`pgrep -af <an unused uuid>` from Claude Code's Bash tool returns rc 0). On
+2026-11-16 two migrated sessions logged `OWNER_GONE pid_dead` while their
+`--resume` successors were alive, the second's coord row read closed, and a net
+dispatched a duplicate onto each (findings `2a648c75` and `dd69d0ed`, dossier
+`implement-ship-net-fires-on-a-live-session`, mechanism 4).
 
 **Case 2b reads coord, never the environment alone.** `QONTINUI_GATE_ID` is
 injected by the runner into a gate continuation (`_gate-registration` →
@@ -2172,7 +2218,10 @@ D3)*. When the stamping session's transcript is not on this box, the death probe
 is **UNKNOWN**, and with it case 2 does not hold — the row is **STOP** unless one
 of these says dead-or-done. A signal stands in for the transcript-tail check
 ONLY; case 2's other three checks (worktrees clean and 0 ahead, no PRs, no
-branches) must still all hold beside it.
+branches) must still all hold beside it. Across machines no process scan can
+run, so where signal 3 is the stand-in it holds only if EVERY row matching the
+`claudeCodeSessionId`, in every tenant, reads closed or finished — one open row
+means LIVE. Signals 1 and 2 are unchanged.
 
 **Stage the credentials ONCE, first, and use them for all three signals.**
 §0.25 has already deleted its own bearers, and signals 2 and 3 need one (the
@@ -2237,8 +2286,12 @@ directory).
    the signal holds only if every bearer's walk completed AND every matched
    row, under any bearer, reads `finished` / closed. Rows
    that disagree (closed under one tenant, active or `working` under another)
-   are UNKNOWN, never dead. Stopping at the first `closed` row would adopt a
-   live peer.
+   read LIVE, never dead: one open row is enough. Stopping at the first
+   `closed` row would adopt a live peer. **The residual:** a migrated successor
+   whose only coord row reads closed still reads dead here, because no process
+   scan reaches another box (f51a0efc's row read `closed_at` while its
+   successor ran). That is a binding-drift dossier follow-up (finding
+   `dd69d0ed`), not something this signal can see.
 
 **Silence on the bus is never adoptable**, and an empty `coord_orient`
 `session_activity` is UNKNOWN by that tool's own contract (it lists live sessions
@@ -2380,13 +2433,14 @@ runs at most about 90 s, inside the Bash tool's 120 s default:
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --reason "<why>"
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "<why>"
 ```
 
 Quote its final verdict line in the §6 report (`RELEASED` is exit 0; a
-`NET_UNRETIRED`, `NET_MUTED` or `NET_FIRED` line names a net id to report, as
-does a `NET_CANCELLED` line whose mute did not land; `UNKNOWN` (2) and usage (64)
-released NOTHING, so run it again once the cause is fixed).
+`NET_UNRETIRED`, `NET_CANCELLED` or `NET_FIRED` line names a net id to report;
+`RELEASE_WITHHELD` (7), `UNKNOWN` (2) and usage (64) released NOTHING, so run it
+again once the cause is fixed, and do not stop the heartbeat loop after a 7 —
+`/implement-plan` Step 0.48 has the exit-7 remedies).
 The release MUST carry the SAME `agent_session_id` used at acquire — the owner
 token is the match key, so omitting it (or sending a different session) returns
 `"not_held"` and leaves the reservation to TTL out; the script resolves the pair
@@ -2879,6 +2933,18 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    work_unit_id=<uuid> plan_slug=<plan stem>`. It merges rather than replaces,
    so it will not erase the `plan_slug` / `intent` `/preflight` Step 5 wrote, and
    it exits 0 on every path.
+   **Then declare the plan's phases on the unit, best-effort:**
+   `bash <workspace-root>/qontinui-claude-config/scripts/declare-plan-phases.sh <plan stem> <plan file>`.
+   This upsert carries no `metadata`, and on a multi-bound device no scanner
+   writes `phases` either, so without it `coord_work_unit_attest_phase` refuses
+   every phase ("no established phase declaration"). The script skips a
+   plan-backed unit, patches only on a difference, refuses any declaration that
+   drops a phase coord has established (a narrowing is patched by hand), and
+   bounds its own run time; its header is the contract. Quote its one verdict
+   line in the vet report and continue whatever it says: it never blocks the vet.
+   Until the runner ships `qontinui-pr plan-phase-declaration` (that plan's
+   Phase 1), the verdict is `UNKNOWN` on every box: expected, not a fault.
+   `/implement-plan` Step 0.5 runs the same script.
 2. **Always: resolve the operator's `device_id` DYNAMICALLY** (never hardcode a
    UUID): env `QONTINUI_MACHINE_ID` first, else read `~/.qontinui/machine.json`
    and parse `"device_id"` (fall back to `"machine_id"` if present).
@@ -3068,9 +3134,10 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      `hint` field, so the brief goes into `initial_prompt` itself — coord would
      have produced the same text from a typed continuation's `hint`, plus a
      closing `/unattended` line it never adds to a legacy prompt. Without
-     it the spawned session's entire brief is `run /implement-plan <path>`: it
-     opens on a plan it has never read, with no idea why it was dispatched
-     instead of the vetting session finishing the work. Six labelled lines
+     it the spawned session gets `run /implement-plan <path>` and only what
+     coord's dispatch-time brief adds: it opens on a plan it has never read,
+     with no idea why it was dispatched instead of the vetting session finishing
+     the work. Six labelled lines
      (`Plan`/`Why`/`PR`/`Blocked`/`Resource-keys`/`Tried`), **references before
      bodies**, **≤2000 characters** — nothing enforces that cap and nothing
      truncates for you, so cut prose rather than references and end a cut brief

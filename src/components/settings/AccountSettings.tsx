@@ -61,14 +61,19 @@ import {
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useAuth } from "@/components/AuthProvider";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
 interface AccountSettingsProps {
   onLog: LogFunction;
+  /** Navigate to the Backend Connection tab, where the backend URL is edited. */
+  onOpenBackendConnection: () => void;
 }
-
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 // Wire shape of the `coord_doctor_run` Tauri command's `DoctorReport`
 // (serde-serialized snake_case from `qontinui_runner_lib::coord_doctor`).
@@ -87,7 +92,7 @@ interface DoctorReport {
   overall_ok: boolean;
 }
 
-export function AccountSettings({ onLog }: AccountSettingsProps) {
+export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSettingsProps) {
   const { tier, loading: tierLoading, refresh: refreshTier } = useRunnerTier();
   const { authStatus, signOutFull, logout } = useAuth();
   const [flowError, setFlowError] = useState<string | null>(null);
@@ -95,10 +100,15 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
   const [loggingOut, setLoggingOut] = useState(false);
 
   // --- Cognito Hosted-UI sign-in (RFC 8252 PKCE) ----------------------------
-  // Backend URL the Cognito-bound device JWT is minted against. The legacy
-  // email/password pairing was removed (web backend is Cognito-only); Cognito
-  // sign-in (and browser SSO) are the only sign-in paths.
-  const [credBackendUrl, setCredBackendUrl] = useState(DEFAULT_BACKEND_URL);
+  // Backend URL the Cognito-bound device JWT is minted against. It is the
+  // SAVED value from the Backend Connection tab (`get_web_integration_status`),
+  // shown read-only here: a local copy used to silently ignore a custom URL
+  // saved there. `null` = not loaded yet (or the read failed): sign-in is
+  // disabled rather than guessing the default. The legacy email/password
+  // pairing was removed (web backend is Cognito-only); Cognito sign-in (and
+  // browser SSO) are the only sign-in paths.
+  const [savedBackendUrl, setSavedBackendUrl] = useState<string | null>(null);
+  const [backendUrlLoadFailed, setBackendUrlLoadFailed] = useState(false);
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
 
   // --- Coord Doctor self-check (plan 2026-06-13 Phase 4) --------------------
@@ -201,10 +211,34 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
     };
   }, [refreshTier]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const st = await invoke<{ backendUrl: string }>("get_web_integration_status");
+        if (!cancelled) {
+          setSavedBackendUrl(st.backendUrl);
+          setBackendUrlLoadFailed(false);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setBackendUrlLoadFailed(true);
+          onLog("error", `Failed to load saved backend URL: ${err}`);
+        }
+      }
+    };
+    void load();
+    const unlistenPromise = listen("web-integration-changed", () => void load());
+    return () => {
+      cancelled = true;
+      void unlistenPromise.then((un) => un());
+    };
+  }, [onLog]);
+
   const handleCognitoSignIn = useCallback(async () => {
-    const backendUrl = credBackendUrl.trim();
+    const backendUrl = savedBackendUrl?.trim() ?? "";
     if (!backendUrl) {
-      setFlowError("Backend URL is required.");
+      setFlowError("Backend URL is not set. Set it on the Backend Connection tab.");
       return;
     }
     setCognitoState("signing-in");
@@ -227,12 +261,17 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       );
     } catch (err) {
       const msg = typeof err === "string" ? err : String(err);
-      setFlowError(msg);
-      onLog("error", `Qontinui sign-in failed: ${msg}`);
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (isSignInCancelled(err)) {
+        onLog("info", "Qontinui sign-in cancelled");
+      } else {
+        setFlowError(msg);
+        onLog("error", `Qontinui sign-in failed: ${msg}`);
+      }
     } finally {
       setCognitoState("idle");
     }
-  }, [credBackendUrl, onLog, refreshTier]);
+  }, [savedBackendUrl, onLog, refreshTier]);
 
   const handleSignOut = useCallback(async () => {
     setSigningOut(true);
@@ -473,6 +512,11 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
         )}
       </div>
 
+      <PendingSignInNotice
+        active={cognitoState === "signing-in"}
+        noBrowserHint={NO_BROWSER_HINT.settings}
+      />
+
       {flowError && (
         <div className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-200">
           <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
@@ -494,8 +538,9 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
         <SignedOutPanel
           cognitoSigningIn={cognitoState === "signing-in"}
           onCognitoSignIn={handleCognitoSignIn}
-          credBackendUrl={credBackendUrl}
-          onCredBackendUrlChange={setCredBackendUrl}
+          backendUrl={savedBackendUrl}
+          backendUrlLoadFailed={backendUrlLoadFailed}
+          onOpenBackendConnection={onOpenBackendConnection}
         />
       )}
     </div>
@@ -594,17 +639,20 @@ function SignedInPanel({
 interface SignedOutPanelProps {
   cognitoSigningIn: boolean;
   onCognitoSignIn: () => void;
-  credBackendUrl: string;
-  onCredBackendUrlChange: (v: string) => void;
+  /** Saved backend URL; `null` while unknown. */
+  backendUrl: string | null;
+  backendUrlLoadFailed: boolean;
+  onOpenBackendConnection: () => void;
 }
 
 function SignedOutPanel({
   cognitoSigningIn,
   onCognitoSignIn,
-  credBackendUrl,
-  onCredBackendUrlChange,
+  backendUrl,
+  backendUrlLoadFailed,
+  onOpenBackendConnection,
 }: SignedOutPanelProps) {
-  const cognitoDisabled = cognitoSigningIn || credBackendUrl.trim().length === 0;
+  const cognitoDisabled = cognitoSigningIn || !backendUrl || backendUrl.trim().length === 0;
 
   return (
     <div className="space-y-5">
@@ -621,20 +669,19 @@ function SignedOutPanel({
           </div>
         </div>
 
-        <div className="space-y-1.5">
-          <label htmlFor="account-cred-backend" className="text-xs font-medium">
-            Backend URL
-          </label>
-          <input
-            id="account-cred-backend"
-            type="url"
-            autoComplete="off"
-            spellCheck={false}
-            value={credBackendUrl}
-            onChange={(e) => onCredBackendUrlChange(e.target.value)}
-            placeholder="https://api.qontinui.io"
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
-          />
+        <div className="text-xs">
+          <span className="font-medium">Backend: </span>
+          <span id="account-saved-backend" className="font-mono break-all">
+            {backendUrl ??
+              (backendUrlLoadFailed ? "Could not read the saved backend URL" : "loading…")}
+          </span>{" "}
+          <button
+            type="button"
+            onClick={onOpenBackendConnection}
+            className="text-primary hover:underline"
+          >
+            Change on Backend Connection
+          </button>
         </div>
 
         <button

@@ -3322,6 +3322,150 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// N pane lifecycles release every pane thread. A holder-backed pane
+        /// runs two threads of its own — `pty-holder-ctl-*` and
+        /// `pty-holder-pump-*` — and each owns a clone of the pane's
+        /// `control` and `link` `Arc`s. So the strong count those handles
+        /// report, beyond the struct's own, IS the number of pane threads
+        /// still alive, counted per pane and immune to every other test
+        /// spawning threads in this process (a process-wide thread count, or
+        /// a `/proc/self/task` name census, is neither: comm names truncate
+        /// to 15 bytes and the other holder tests use the same names).
+        ///
+        /// Field evidence this pins (plan
+        /// `2026-11-17-runner-thread-growth-is-open-pane-accumulation-not-a-leak`):
+        /// runner threads on the Linux fleet boxes were a flat base plus 4
+        /// per OPEN holder pane (2 per in-process pane on Windows), and fell
+        /// when a pane closed.
+        ///
+        /// Two checks, so both exit paths are pinned:
+        /// * after the child EXITS and before `release`, each pane must fall
+        ///   back to the struct's own reference alone. That is the pump's own
+        ///   exit handling: it closes the control queue on `Exit` (or on a
+        ///   final end of stream), which ends the control thread. `release` and `Drop` also
+        ///   close the queue, so only this pre-release check sees that path
+        ///   regress;
+        /// * after `release` and drop, no pane-thread reference may remain.
+        #[test]
+        fn pty_holder_n_lifecycles_release_their_pane_threads() {
+            use std::sync::Weak;
+            const LIFECYCLES: usize = 12;
+            let mut handles: Vec<(Weak<ControlQueue>, Weak<dyn HolderLink>)> = Vec::new();
+            let mut dirs = Vec::new();
+            // The child has exited: both pane threads must end on their own,
+            // BEFORE `release`, leaving only the struct's reference (1, 1).
+            let threads_end_on_exit =
+                |ctl: &Weak<ControlQueue>, link: &Weak<dyn HolderLink>, pane: &str| {
+                    let refs = || (Weak::strong_count(ctl), Weak::strong_count(link));
+                    let end = Instant::now() + Duration::from_secs(10);
+                    while refs() != (1, 1) && Instant::now() < end {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert_eq!(
+                        refs(),
+                        (1, 1),
+                        "pane {pane}: (control, link) strong counts after the child \
+                         exited, before release: a pane thread did not end on exit"
+                    );
+                };
+
+            // Guard pane, first: its child blocks on `read`, so both pane
+            // threads are provably alive when the counts are read. 3 = the
+            // struct + the control thread + the pump. This is what makes the
+            // final zero non-vacuous: the handles DO see live pane threads.
+            {
+                let dir = pane_dir("thr-guard");
+                let pane = Arc::new(
+                    DaemonPaneIo::spawn(
+                        &holder(),
+                        &dir,
+                        &PaneId::new("thr-guard").unwrap(),
+                        &sh("stty -echo; printf UP; read x; exit 0"),
+                        80,
+                        24,
+                    )
+                    .expect("spawn + attach"),
+                );
+                let (collected, t) = drain(&pane);
+                until(&collected, Duration::from_secs(10), |c| contains(c, b"UP"));
+                let ctl = Arc::downgrade(&pane.control);
+                let link = Arc::downgrade(&pane.link);
+                assert_eq!(
+                    Weak::strong_count(&ctl),
+                    3,
+                    "control held by the struct, the control thread and the pump"
+                );
+                assert_eq!(
+                    Weak::strong_count(&link),
+                    3,
+                    "link held by the struct, the control thread and the pump"
+                );
+                // `writer()` clones `link`, so it is taken only after the count.
+                {
+                    let mut w = pane.writer().unwrap();
+                    w.write_all(b"go\r").unwrap();
+                }
+                assert_eq!(wait_within(&pane, Duration::from_secs(10)), Ok(0));
+                t.join().expect("the reader reached EOF");
+                threads_end_on_exit(&ctl, &link, "thr-guard");
+                pane.release(Duration::from_secs(1)).unwrap();
+                drop(pane);
+                handles.push((ctl, link));
+                dirs.push(dir);
+            }
+
+            for i in 0..LIFECYCLES {
+                let tag = format!("thr-{i}");
+                let dir = pane_dir(&tag);
+                let pane = Arc::new(
+                    DaemonPaneIo::spawn(
+                        &holder(),
+                        &dir,
+                        &PaneId::new(&tag).unwrap(),
+                        &sh("printf UP; exit 0"),
+                        80,
+                        24,
+                    )
+                    .expect("spawn + attach"),
+                );
+                let (_collected, t) = drain(&pane);
+                let (ctl, link) = (Arc::downgrade(&pane.control), Arc::downgrade(&pane.link));
+                assert_eq!(wait_within(&pane, Duration::from_secs(10)), Ok(0));
+                t.join().expect("the reader reached EOF");
+                threads_end_on_exit(&ctl, &link, tag.as_str());
+                handles.push((ctl, link));
+                pane.release(Duration::from_secs(1)).unwrap();
+                drop(pane);
+                dirs.push(dir);
+            }
+
+            // Every pane is released and dropped; only a still-running pane
+            // thread can hold a strong reference now. (`wait_within`'s
+            // helper thread may hold a pane `Arc` for an instant after it
+            // sends; the poll absorbs that.)
+            let live_refs = || -> usize {
+                handles
+                    .iter()
+                    .map(|(c, l)| Weak::strong_count(c) + Weak::strong_count(l))
+                    .sum()
+            };
+            let end = Instant::now() + Duration::from_secs(10);
+            while live_refs() > 0 && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                live_refs(),
+                0,
+                "{} pane-thread references still alive across {} pane lifecycles \
+                 — a pty-holder-ctl or pty-holder-pump thread outlived its pane",
+                live_refs(),
+                LIFECYCLES + 1
+            );
+            for dir in dirs {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
         /// `release` without `kill` detaches: `wait` reports the detach code,
         /// the child keeps running in its holder, and a FRESH `DaemonPaneIo`
         /// reattaches at the offset the first one reached — input still reaches

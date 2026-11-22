@@ -244,7 +244,12 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
   const settingsContent = (() => {
     switch (activeTab) {
       case "account":
-        return <AccountSettings onLog={onLog} />;
+        return (
+          <AccountSettings
+            onLog={onLog}
+            onOpenBackendConnection={() => setActiveTab("backend-connection")}
+          />
+        );
       case "dev-loop":
         return <DevLoopSettings onLog={onLog} />;
       case "backend-connection":

@@ -439,8 +439,9 @@ pub fn merge_worktree(
 ///   - files that would change in `git merge <source_branch>` against
 ///     `repo_path`'s current HEAD (`git diff --name-only HEAD..<branch>`)
 ///   - files dirty in `repo_path`'s working tree right now
-///     (`git status --porcelain` parsed for modified-tracked, plus optionally
-///     untracked when `include_untracked` is true)
+///     (`git status --porcelain --untracked-files=all` parsed for
+///     modified-tracked, plus optionally untracked when `include_untracked`
+///     is true)
 ///
 /// "Modified tracked" means the porcelain entry has `M` or `D` in either the
 /// index or working-tree column. This catches `M `, ` M`, `MM`, `AM`, ` D`,
@@ -474,8 +475,18 @@ pub(crate) fn compute_premerge_conflicts(
         return Ok(Vec::new());
     }
 
-    // (b) dirty paths in destination working tree.
-    let status_output = run_git_command(repo_path, &["status", "--porcelain"])?;
+    // (b) dirty paths in destination working tree. Every untracked FILE is
+    // listed (`--untracked-files=all`): plain porcelain prints nothing for an
+    // untracked file under `status.showUntrackedFiles=no`, and under the
+    // default `normal` it collapses a new directory to `dir/`, which never
+    // intersects the per-file incoming set. Either way a scratch file the
+    // merge would overwrite read as no conflict, so the caller got git's raw
+    // merge refusal instead of the typed `blocked` report (and the force path
+    // never stashed it).
+    let status_output = run_git_command(
+        repo_path,
+        crate::agent_worktree::dirty::STATUS_PORCELAIN_ALL_UNTRACKED,
+    )?;
     let dirty: std::collections::HashSet<String> =
         parse_dirty_paths(&status_output, include_untracked);
 
@@ -1248,6 +1259,51 @@ mod tests {
             foo_now.contains("SIBLING"),
             "sibling edit must survive guard"
         );
+    }
+
+    /// Main + a branch `feat-new` that ADDS `newdir/added.rs` and `added.rs`.
+    /// Returns to main clean; the caller drops untracked copies of those paths.
+    fn init_repo_with_adding_branch() -> (TempDir, PathBuf, String) {
+        let (dir, path, _) = init_repo_with_branch();
+        run(&path, &["checkout", "-q", "-b", "feat-new"]);
+        fs::create_dir_all(path.join("newdir")).unwrap();
+        fs::write(path.join("newdir/added.rs"), "// branch\n").unwrap();
+        fs::write(path.join("added.rs"), "// branch\n").unwrap();
+        run(&path, &["add", "."]);
+        run(&path, &["commit", "-q", "-m", "feat-new: add files"]);
+        run(&path, &["checkout", "-q", "main"]);
+        (dir, path, "feat-new".to_string())
+    }
+
+    #[test]
+    fn test_premerge_conflicts_see_untracked_under_show_untracked_no() {
+        let (_dir, repo, branch) = init_repo_with_adding_branch();
+        run(&repo, &["config", "status.showUntrackedFiles", "no"]);
+        fs::write(repo.join("added.rs"), "// operator scratch\n").unwrap();
+        // The fixture measures the blinded case: plain porcelain is silent.
+        assert_eq!(run(&repo, &["status", "--porcelain"]), "");
+
+        let got = compute_premerge_conflicts(&repo, &branch, true).expect("conflicts");
+        assert_eq!(got, vec!["added.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_premerge_conflicts_see_untracked_file_in_new_directory() {
+        let (_dir, repo, branch) = init_repo_with_adding_branch();
+        // Pin the default so a global `status.showUntrackedFiles` cannot
+        // change what this test measures.
+        run(&repo, &["config", "status.showUntrackedFiles", "normal"]);
+        fs::create_dir_all(repo.join("newdir")).unwrap();
+        fs::write(repo.join("newdir/added.rs"), "// operator scratch\n").unwrap();
+        // Default `normal` collapses the directory to `newdir/`.
+        assert_eq!(run(&repo, &["status", "--porcelain"]), "?? newdir/\n");
+
+        let got = compute_premerge_conflicts(&repo, &branch, true).expect("conflicts");
+        assert_eq!(got, vec!["newdir/added.rs".to_string()]);
+        // include_untracked=false still ignores untracked entries.
+        assert!(compute_premerge_conflicts(&repo, &branch, false)
+            .expect("conflicts")
+            .is_empty());
     }
 
     #[test]

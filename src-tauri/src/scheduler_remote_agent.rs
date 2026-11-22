@@ -107,6 +107,61 @@ pub(crate) struct RemoteAgentOutcome {
     pub error: Option<String>,
     pub exit_code: Option<i64>,
     pub timed_out: bool,
+    /// The child exited non-zero and its own log ends on an account-limit
+    /// answer (plan
+    /// `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`).
+    /// The scheduler cools that account and relaunches the slot elsewhere;
+    /// it never answers this with an auto-fix session.
+    pub rate_limited: Option<RateLimited>,
+}
+
+/// A run that died on an account limit, and the account it ran under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RateLimited {
+    /// The config dir the CHILD resolved — its spawn preconditions' own
+    /// `account_config_dir`, never the shared global, which a sibling spawn
+    /// may have repointed since. `None` when the child ran under the ambient
+    /// account (no `CLAUDE_CONFIG_DIR`), which nothing can cool.
+    pub account: Option<String>,
+    /// The matched pattern and the banner's own reset, if it stated one.
+    pub hit: crate::ai_provider::limit_hit::LimitHit,
+}
+
+/// The history-row error for a limit hit. An unknown reset renders
+/// `UNKNOWN`, never a guess.
+pub(crate) fn limit_error(
+    account: Option<&str>,
+    resets: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    format!(
+        "scheduled session hit the usage limit of {} (resets {})",
+        account.unwrap_or("<ambient account>"),
+        crate::ai_provider::limit_hit::render_reset(resets)
+    )
+}
+
+/// The account a limit hit on THIS child cools: the config dir its own spawn
+/// resolved, from its `SpawnPreconditions` snapshot. Never the shared
+/// resolved dir (`ai_provider::get_resolved_config_dir`), which a sibling
+/// spawn may have repointed by the time this child exits.
+pub(crate) fn limited_account_dir(
+    preconditions: &crate::claude_session::spawn_preconditions::SpawnPreconditions,
+) -> Option<String> {
+    preconditions.snapshot().account_config_dir
+}
+
+/// The last [`LIMIT_TAIL_BYTES`](crate::ai_provider::limit_hit::LIMIT_TAIL_BYTES)
+/// of this attempt's log, decoded lossily. `None` when it cannot be read.
+pub(crate) async fn read_log_tail(path: &std::path::Path, max: u64) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(path).await.ok()?;
+    let len = f.metadata().await.ok()?.len();
+    f.seek(std::io::SeekFrom::Start(len.saturating_sub(max)))
+        .await
+        .ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).await.ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// A launched run: the identity the scheduler records, plus the future that
@@ -245,10 +300,17 @@ pub(crate) fn claude_args(
 }
 
 /// Classify a child's end into the scheduler's `(success, error)` pair.
+///
+/// `log_tail` is the end of THIS attempt's log and `account_dir` the config
+/// dir the child resolved. A non-zero exit whose tail carries a limit answer
+/// is `rate_limited`, with an error naming the account and its reset; any
+/// other non-zero exit keeps `"scheduled session exited with code N"`.
 pub(crate) fn classify_exit(
     status: Result<Option<i32>, String>,
     timed_out: bool,
     timeout: Duration,
+    log_tail: Option<&str>,
+    account_dir: Option<&str>,
 ) -> RemoteAgentOutcome {
     if timed_out {
         return RemoteAgentOutcome {
@@ -259,6 +321,7 @@ pub(crate) fn classify_exit(
             )),
             exit_code: None,
             timed_out: true,
+            rate_limited: None,
         };
     }
     match status {
@@ -267,24 +330,43 @@ pub(crate) fn classify_exit(
             error: None,
             exit_code: Some(0),
             timed_out: false,
+            rate_limited: None,
         },
-        Ok(Some(code)) => RemoteAgentOutcome {
-            success: false,
-            error: Some(format!("scheduled session exited with code {code}")),
-            exit_code: Some(i64::from(code)),
-            timed_out: false,
-        },
+        Ok(Some(code)) => {
+            let hit = log_tail.and_then(crate::ai_provider::limit_hit::classify_limit_tail);
+            match hit {
+                Some(hit) => RemoteAgentOutcome {
+                    success: false,
+                    error: Some(limit_error(account_dir, hit.banner_reset)),
+                    exit_code: Some(i64::from(code)),
+                    timed_out: false,
+                    rate_limited: Some(RateLimited {
+                        account: account_dir.map(str::to_string),
+                        hit,
+                    }),
+                },
+                None => RemoteAgentOutcome {
+                    success: false,
+                    error: Some(format!("scheduled session exited with code {code}")),
+                    exit_code: Some(i64::from(code)),
+                    timed_out: false,
+                    rate_limited: None,
+                },
+            }
+        }
         Ok(None) => RemoteAgentOutcome {
             success: false,
             error: Some("scheduled session was terminated by a signal".to_string()),
             exit_code: None,
             timed_out: false,
+            rate_limited: None,
         },
         Err(e) => RemoteAgentOutcome {
             success: false,
             error: Some(format!("waiting on the scheduled session failed: {e}")),
             exit_code: None,
             timed_out: false,
+            rate_limited: None,
         },
     }
 }
@@ -305,13 +387,20 @@ pub(crate) async fn launch(
     crate::resource_guard::precheck_spawn("scheduled remote agent", false)?;
 
     // Provision what a session on a runner-only device has no other source
-    // for: the coord-mcp door, the bundled fleet commands and the bundled
-    // fleet skills (`/return-to-main` among them). Every one of these skips a
-    // destination the enclosing repo tracks, so a workspace root whose
-    // `.claude/` is a checkout is left alone.
+    // for: the coord-mcp door, the bundled fleet commands, the bundled fleet
+    // skills (`/return-to-main` among them) and the bundled subagent
+    // definitions.
+    //
+    // The working directory is the OPERATOR's choice, so the fleet trees go
+    // through the same gate the terminal chokepoint uses
+    // (`isolated_edit::provision_fleet_for_cwd`): where the cwd's `.claude/` is
+    // tracked by its repository, commands and skills are skipped whole-tree,
+    // and agent definitions are written only into an allocated agent worktree
+    // — an operator's checkout gets no untracked agent files. Elsewhere all
+    // three are provisioned as before, each skipping a destination the
+    // enclosing repo tracks.
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir_s, bound_port, None);
-    crate::fleet_commands::provision_fleet_commands_for_session(&workdir_s);
-    crate::fleet_skills::provision_fleet_skills_for_session(&workdir_s);
+    crate::agent_worktree::isolated_edit::provision_fleet_for_cwd(&workdir_s);
 
     // Most-available account, so the child does not spawn under a
     // quota-exhausted default and die on its first request.
@@ -330,10 +419,14 @@ pub(crate) async fn launch(
         &crate::settings::get_claude_session_permission(),
     )?;
 
-    let (mut child, _preconditions) =
+    let (mut child, preconditions) =
         crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
             .await
             .map_err(|e| format!("spawn scheduled session: {e:#}"))?;
+    // The account THIS child resolved, read from its own spawn preconditions:
+    // the dir a limit hit cools. Never the shared resolved dir, which a
+    // sibling spawn may have repointed by the time this child exits.
+    let account_dir = limited_account_dir(&preconditions);
     // The whole tree, addressable by one kill (see the module doc).
     let tree = crate::process_helpers::ChildTreeGuard::attach_armed_tokio(&child);
 
@@ -359,6 +452,7 @@ pub(crate) async fn launch(
     let stderr = child.stderr.take();
     let timeout = spec.timeout;
     let task_name = spec.task_name.clone();
+    let tail_path = log_path.clone();
 
     let completion = Box::pin(async move {
         let pump = tokio::spawn(pump_to_log(stdout, stderr, pump_log));
@@ -398,7 +492,21 @@ pub(crate) async fn launch(
         if let Some(p) = pid {
             crate::session::tracking_health::unregister_headless_claude_pid(p);
         }
-        classify_exit(status, timed_out, timeout)
+        // A non-zero exit: read the end of THIS attempt's log (one file per
+        // execution) for an account-limit answer.
+        let tail = match (&status, &tail_path) {
+            (Ok(Some(code)), Some(p)) if *code != 0 && !timed_out => {
+                read_log_tail(p, crate::ai_provider::limit_hit::LIMIT_TAIL_BYTES).await
+            }
+            _ => None,
+        };
+        classify_exit(
+            status,
+            timed_out,
+            timeout,
+            tail.as_deref(),
+            account_dir.as_deref(),
+        )
     });
 
     Ok(RemoteAgentLaunch {
@@ -497,6 +605,97 @@ pub(crate) async fn pump_to_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A3: the launch provisions the fleet trees through the operator-cwd gate,
+    /// never through the ungated per-provisioner calls. Pinned on the source,
+    /// because `launch` spawns a real `claude`.
+    #[test]
+    fn scheduler_launch_provisions_through_the_operator_cwd_gate() {
+        // CRLF-normalised (a Windows checkout may carry `\r\n`), and split rather
+        // than sliced so `clippy::string_slice` holds.
+        let src = include_str!("scheduler_remote_agent.rs").replace("\r\n", "\n");
+        let (_, launch) = src
+            .split_once("pub(crate) async fn launch(")
+            .expect("launch");
+        let (launch, _) = launch.split_once("\n}\n").expect("end of launch");
+        assert!(launch.contains("isolated_edit::provision_fleet_for_cwd(&workdir_s)"));
+        for ungated in [
+            "provision_agent_definitions_recorded(",
+            "provision_fleet_commands_for_session(",
+            "provision_fleet_skills_for_session(",
+        ] {
+            assert!(!launch.contains(ungated), "launch calls {ungated} ungated");
+        }
+    }
+
+    /// A3: through that gate, an operator's checkout whose `.claude/` the
+    /// repository tracks (not an allocated worktree) receives no agent files.
+    #[test]
+    fn scheduler_gate_writes_no_agent_files_into_a_tracked_operator_checkout() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        crate::provision_guard::test_support::git_init(root);
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        std::fs::write(root.join(".claude/commands/own.md"), b"own").unwrap();
+        crate::provision_guard::test_support::git_add(
+            root,
+            std::path::Path::new(".claude/commands/own.md"),
+        );
+
+        crate::agent_worktree::isolated_edit::provision_fleet_for_cwd(root.to_str().unwrap());
+
+        let agents = root.join(".claude/agents");
+        let written = std::fs::read_dir(&agents).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(
+            written, 0,
+            "no agent file lands in an operator's tracked checkout"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".claude/commands/own.md")).unwrap(),
+            b"own",
+            "the checkout's own tracked command is byte-unchanged"
+        );
+        let commands = std::fs::read_dir(root.join(".claude/commands"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec!["own.md".to_string()], "no command was added");
+
+        // The skip is RECORDED, not silent: the ledger holds the operator-checkout
+        // agent row, and the commands pass as repo-authored.
+        let ledger = crate::capability_manifest::session_provision_ledger(root.to_str().unwrap())
+            .expect("the gate records its skips against this workdir");
+        let agent_rows: Vec<_> = ledger
+            .reports
+            .iter()
+            .filter(|r| r.capability == "agent_definitions")
+            .collect();
+        assert_eq!(agent_rows.len(), 1, "{agent_rows:?}");
+        assert_eq!(agent_rows[0].written, 0);
+        assert!(
+            agent_rows[0].skipped.iter().any(|u| matches!(
+                &u.reason,
+                crate::capability_manifest::SkipReason::Unresolved(why)
+                    if why.contains("not an allocated agent worktree")
+            )),
+            "{:?}",
+            agent_rows[0].skipped
+        );
+        assert!(
+            ledger
+                .reports
+                .iter()
+                .any(|r| r.capability == "fleet_commands"
+                    && r.written == 0
+                    && !r.skipped.is_empty()
+                    && r.skipped
+                        .iter()
+                        .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored)),
+            "the commands pass is recorded as repo-authored: {:?}",
+            ledger.reports
+        );
+    }
 
     #[tokio::test]
     async fn read_lossy_lines_survives_non_utf8_and_keeps_draining() {
@@ -626,21 +825,165 @@ mod tests {
     #[test]
     fn exit_zero_is_the_only_success() {
         let t = Duration::from_secs(60);
-        assert!(classify_exit(Ok(Some(0)), false, t).success);
-        let non_zero = classify_exit(Ok(Some(3)), false, t);
+        assert!(classify_exit(Ok(Some(0)), false, t, None, None).success);
+        let non_zero = classify_exit(Ok(Some(3)), false, t, None, None);
         assert!(!non_zero.success);
         assert_eq!(non_zero.exit_code, Some(3));
         assert!(non_zero.error.as_deref().unwrap().contains("code 3"));
-        let signalled = classify_exit(Ok(None), false, t);
+        let signalled = classify_exit(Ok(None), false, t, None, None);
         assert!(!signalled.success);
         assert!(signalled.error.as_deref().unwrap().contains("signal"));
-        let failed = classify_exit(Err("boom".into()), false, t);
+        let failed = classify_exit(Err("boom".into()), false, t, None, None);
         assert!(failed.error.as_deref().unwrap().contains("boom"));
+    }
+
+    /// Plan `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`
+    /// test (a): each limit shape in the child's own log tail is
+    /// `rate_limited`, naming the account the child ran under and the reset.
+    #[test]
+    fn a_limit_banner_in_the_log_tail_is_rate_limited_with_account_and_reset() {
+        let t = Duration::from_secs(600);
+        let cases = [
+            (
+                // Time-only resets: `classify_exit` reads the real clock, and a
+                // dated banner goes stale (UNKNOWN) a month after it was written.
+                "You've hit your weekly limit \u{b7} resets 10pm (Europe/Berlin)",
+                "hit your weekly limit",
+            ),
+            (
+                "You've hit your 5-hour limit \u{b7} resets 3am (UTC)",
+                "hit your 5-hour limit",
+            ),
+            (
+                "You've hit your org's monthly spend limit \u{b7} resets 12am (UTC)",
+                "spend limit",
+            ),
+        ];
+        for (banner, pattern) in cases {
+            let tail = format!("[stderr] starting\n{banner}\n");
+            let out = classify_exit(
+                Ok(Some(1)),
+                false,
+                t,
+                Some(&tail),
+                Some("/home/u/.claude-paktis"),
+            );
+            assert!(!out.success);
+            assert_eq!(out.exit_code, Some(1));
+            let rl = out.rate_limited.as_ref().expect(banner);
+            assert_eq!(rl.account.as_deref(), Some("/home/u/.claude-paktis"));
+            assert_eq!(rl.hit.pattern, pattern);
+            let reset = rl.hit.banner_reset.expect("the banner's reset parses");
+            let err = out.error.as_deref().unwrap();
+            assert!(
+                err.starts_with(
+                    "scheduled session hit the usage limit of /home/u/.claude-paktis (resets "
+                ),
+                "{err}"
+            );
+            assert!(err.contains(&crate::ai_provider::limit_hit::render_reset(Some(reset))));
+        }
+
+        // A banner with no reset renders UNKNOWN, never a guess.
+        let out = classify_exit(
+            Ok(Some(1)),
+            false,
+            t,
+            Some("Claude usage limit reached"),
+            None,
+        );
+        assert_eq!(
+            out.error.as_deref(),
+            Some("scheduled session hit the usage limit of <ambient account> (resets UNKNOWN)")
+        );
+    }
+
+    /// Test (b): a plain exit 1 with no limit text keeps the old message.
+    #[test]
+    fn a_plain_exit_one_keeps_the_unchanged_message() {
+        let out = classify_exit(
+            Ok(Some(1)),
+            false,
+            Duration::from_secs(600),
+            Some("error[E0425]: cannot find value\nexiting\n"),
+            Some("/home/u/.claude-paktis"),
+        );
+        assert_eq!(out.rate_limited, None);
+        assert_eq!(
+            out.error.as_deref(),
+            Some("scheduled session exited with code 1")
+        );
+        // Exit 0 is never limited, whatever the transcript quoted.
+        let ok = classify_exit(
+            Ok(Some(0)),
+            false,
+            Duration::from_secs(600),
+            Some("You've hit your weekly limit"),
+            Some("/d"),
+        );
+        assert!(ok.success && ok.rate_limited.is_none());
+    }
+
+    /// Test (d) / A8: the account a limit hit cools is the one the child's
+    /// OWN `SpawnPreconditions` resolved, even while the shared resolved dir
+    /// names another account (a sibling spawn's draw).
+    #[test]
+    fn the_limited_account_is_the_spawns_own_not_the_global() {
+        use crate::claude_session::spawn_preconditions::SpawnPreconditions;
+        let _pin = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = crate::ai_provider::ResolvedConfigDirRestore::capture();
+        crate::ai_provider::set_resolved_config_dir(Some("/h/.claude-sibling-draw".to_string()));
+
+        // A plain (non-tokio) test: the credential ladder records NotRun
+        // instead of making network calls.
+        let cwd = std::env::temp_dir();
+        let pre = SpawnPreconditions::evaluate(
+            cwd.to_str().unwrap(),
+            Some("paktis"),
+            Some("/h/.claude-paktis"),
+            "test",
+        );
+        assert_eq!(
+            crate::ai_provider::get_resolved_config_dir().as_deref(),
+            Some("/h/.claude-sibling-draw")
+        );
+        assert_eq!(
+            limited_account_dir(&pre).as_deref(),
+            Some("/h/.claude-paktis")
+        );
+
+        // And that dir is what `classify_exit` carries on the outcome.
+        let out = classify_exit(
+            Ok(Some(1)),
+            false,
+            Duration::from_secs(600),
+            Some("You've hit your weekly limit"),
+            limited_account_dir(&pre).as_deref(),
+        );
+        assert_eq!(
+            out.rate_limited.unwrap().account.as_deref(),
+            Some("/h/.claude-paktis")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_log_tail_is_only_the_end_of_this_attempts_file() {
+        let dir = std::env::temp_dir().join(format!("qontinui-tail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("exec.log");
+        let mut body = "x".repeat(20_000);
+        body.push_str("\nYou've hit your weekly limit\n");
+        std::fs::write(&p, &body).unwrap();
+        let tail = read_log_tail(&p, 64).await.unwrap();
+        assert_eq!(tail.len(), 64);
+        assert!(tail.ends_with("You've hit your weekly limit\n"));
+        assert!(read_log_tail(&dir.join("missing.log"), 64).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn timeout_wins_over_whatever_the_status_says() {
-        let out = classify_exit(Ok(Some(0)), true, Duration::from_secs(3600));
+        let out = classify_exit(Ok(Some(0)), true, Duration::from_secs(3600), None, None);
         assert!(!out.success);
         assert!(out.timed_out);
         assert!(out

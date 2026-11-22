@@ -18,7 +18,9 @@ use qontinui_runner_lib::wedge_diagnostics::{capture_thread_name_census, ThreadN
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 60;
 
 /// Resident-memory threshold in MiB above which the health loop WARNs
-/// "possible memory leak" and `/health` reports `memory_warning: true`.
+/// "possible memory leak". A log line only: no route serves a verdict from
+/// this threshold. `/health`'s memory verdict is `spawnAdmission.memory`, from
+/// `resource_guard`'s free-commit lane — a different quantity and limit.
 ///
 /// 8 GiB, calibrated 2026-11-11: healthy runners plateau at 3.1-3.6 GiB
 /// resident (`qontinui-dev-notes`
@@ -33,8 +35,11 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 60;
 /// Slow leaks below this level are coord's sustained-slope arm's to catch.
 const MEMORY_WARNING_THRESHOLD_MB: u64 = 8 * 1024;
 
-/// The one memory-warning predicate, shared by the log loop and
-/// [`HealthStatus::from_metrics`] so the two can never disagree.
+/// The memory-warning predicate the 60 s log loop applies. Its only consumer
+/// is that `warn!` line, so this is a leak breadcrumb, not a health verdict:
+/// the runner's in-process memory verdict is `resource_guard`'s free-commit
+/// lane (on `/health` as `spawnAdmission.memory` while the session guard is
+/// enabled), and coord's S12 arm grades the runner's resident memory fleet-side.
 fn memory_exceeds_warning(memory_mb: u64) -> bool {
     memory_mb > MEMORY_WARNING_THRESHOLD_MB
 }
@@ -1988,8 +1993,8 @@ const LEAK_WARN_TOP_ROWS: usize = 3;
 
 /// Get current thread count, with an unreadable sensor rendered as `0`.
 ///
-/// The health monitor's own surfaces ([`HealthMetrics`], [`HealthStatus`]) are
-/// a `usize` on the wire and compare against a warning threshold, where a `0`
+/// The health monitor's own surface ([`HealthMetrics`]) is a `usize` and
+/// compares against a warning threshold, where a `0`
 /// on a failed read is merely a missing warning. Anything making a DECISION
 /// from this number must use [`thread_count_reading`] instead and handle the
 /// `None`.
@@ -2035,6 +2040,7 @@ fn log_metrics(metrics: &HealthMetrics) {
     debug!(
         memory_mb = memory_mb,
         threads = threads,
+        agent_log_emitter_agents = metrics.agent_log_emitter_agents,
         uptime_secs = metrics.uptime_secs,
         "Health check"
     );
@@ -2179,6 +2185,11 @@ pub fn start_health_monitor() {
             METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
             let metrics = collect_metrics();
             log_metrics(&metrics);
+            // glibc allocator: a reading every tick (served on `/health`),
+            // `malloc_trim(0)` hourly, an INFO `allocator` line every 10 min.
+            // A no-op off linux-gnu. Plan
+            // `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail` Phase 3.
+            qontinui_runner_lib::malloc_tuning::on_metrics_tick(get_memory_usage);
             METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
 
             let mut slept = 0;
@@ -2219,45 +2230,6 @@ pub fn is_running() -> bool {
     MONITOR_RUNNING.load(Ordering::SeqCst)
 }
 
-/// Get the current health status as a JSON-serializable struct
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HealthStatus {
-    pub healthy: bool,
-    pub memory_mb: u64,
-    pub memory_warning: bool,
-    pub thread_count: usize,
-    pub thread_warning: bool,
-    pub agent_log_emitter_agents: usize,
-    pub uptime_secs: u64,
-    pub monitor_running: bool,
-}
-
-impl HealthStatus {
-    /// Create a health status from metrics
-    pub fn from_metrics(metrics: &HealthMetrics) -> Self {
-        let memory_mb = metrics.memory_mb();
-        let memory_warning = memory_exceeds_warning(memory_mb);
-        let thread_warning = metrics.thread_count > THREAD_WARNING_THRESHOLD;
-
-        Self {
-            healthy: !memory_warning && !thread_warning,
-            memory_mb,
-            memory_warning,
-            thread_count: metrics.thread_count,
-            thread_warning,
-            agent_log_emitter_agents: metrics.agent_log_emitter_agents,
-            uptime_secs: metrics.uptime_secs,
-            monitor_running: is_running(),
-        }
-    }
-}
-
-/// Get the current health status
-pub fn get_health_status() -> HealthStatus {
-    let metrics = collect_metrics();
-    HealthStatus::from_metrics(&metrics)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2270,19 +2242,6 @@ mod tests {
     /// that `stopping_the_monitor_clears_the_wedge_latches` had just stored.
     static WEDGE_ATOMS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    fn metrics_with_memory(memory_bytes: u64) -> HealthMetrics {
-        HealthMetrics {
-            timestamp: chrono::Utc::now(),
-            memory_bytes,
-            thread_count: 0,
-            agent_log_emitter_agents: 0,
-            uptime_secs: 0,
-            cpu_percent: None,
-        }
-    }
-
     /// Pins the calibrated value (fit.md: 8 GiB) so a change to it is a
     /// deliberate re-calibration; the behaviour is pinned by the two below.
     #[test]
@@ -2293,9 +2252,10 @@ mod tests {
     #[test]
     fn a_healthy_plateau_does_not_raise_the_memory_warning() {
         // The highest healthy plateau measured (3.6 GiB), rounded up.
-        let status = HealthStatus::from_metrics(&metrics_with_memory(3_687 * 1024 * 1024));
-        assert!(!status.memory_warning, "a 3.6 GiB healthy runner warned");
-        assert!(status.healthy);
+        assert!(
+            !memory_exceeds_warning(3_687),
+            "a 3.6 GiB healthy runner warned"
+        );
         // And the old 1 GiB threshold's territory is quiet too.
         assert!(!memory_exceeds_warning(1025));
         assert!(!memory_exceeds_warning(4 * 1024));
@@ -2303,14 +2263,36 @@ mod tests {
 
     #[test]
     fn the_memory_warning_boundary_is_exclusive_at_8_gib() {
-        let at = HealthStatus::from_metrics(&metrics_with_memory(8 * GIB));
-        assert!(!at.memory_warning, "exactly 8 GiB must not warn");
-        let over = HealthStatus::from_metrics(&metrics_with_memory(8 * GIB + 1024 * 1024));
-        assert!(over.memory_warning, "8 GiB + 1 MiB must warn");
         assert!(
-            !over.healthy,
-            "a memory warning must mark the runner unhealthy"
+            !memory_exceeds_warning(8 * 1024),
+            "exactly 8 GiB must not warn"
         );
+        assert!(
+            memory_exceeds_warning(8 * 1024 + 1),
+            "8 GiB + 1 MiB must warn"
+        );
+    }
+
+    /// The loop feeds the predicate `memory_mb()`, which truncates bytes to
+    /// whole MiB: a byte count just under 8 GiB + 1 MiB must still read as
+    /// 8 GiB and stay quiet, and 8 GiB + 1 MiB in bytes must warn.
+    #[test]
+    fn the_memory_warning_reads_bytes_through_memory_mb() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let at = |memory_bytes| HealthMetrics {
+            timestamp: chrono::Utc::now(),
+            memory_bytes,
+            thread_count: 0,
+            agent_log_emitter_agents: 0,
+            uptime_secs: 0,
+            cpu_percent: None,
+        };
+        assert!(!memory_exceeds_warning(
+            at(8 * GIB + 1024 * 1024 - 1).memory_mb()
+        ));
+        assert!(memory_exceeds_warning(
+            at(8 * GIB + 1024 * 1024).memory_mb()
+        ));
     }
 
     // sysinfo's per-process introspection (memory + thread count) returns 0
@@ -2348,14 +2330,6 @@ mod tests {
         assert_eq!(resident_bytes_from_statm("23898211", 4096), None);
         assert_eq!(resident_bytes_from_statm("23898211 lots", 4096), None);
         assert_eq!(resident_bytes_from_statm("", 4096), None);
-    }
-
-    #[test]
-    #[cfg_attr(target_os = "macos", ignore = "sysinfo returns 0 on macOS CI runners")]
-    fn test_health_status() {
-        let status = get_health_status();
-        assert!(status.memory_mb > 0);
-        assert!(status.thread_count >= 1);
     }
 
     // ---- The thread-reading memo (`2026-08-30-load-aware-spawn-admission-control`) ----

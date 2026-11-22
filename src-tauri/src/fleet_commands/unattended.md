@@ -48,7 +48,37 @@ run. Each line gives a document's `current_version`. Then decide, per document:
   again returns the same text, so it adds nothing. There are two ways to hold a
   body:
   - an earlier fetch by this session (`coord_get_prompt_document`, `/policy
-    get`, or the HTTP door), at the same version the listing shows now;
+    get`, or the HTTP door), at the same version the listing shows now.
+
+    The fetch must also have been made for the same tenant as this run's
+    listing. Doors can act for different tenants. A sibling `.mcp.json` nonce
+    on the loopback rung, the bootstrap credential, or a hand HTTP fetch on
+    another JWT can each serve another tenant's document at the same version
+    number. So call `coord_query_identity` over the door, and with the
+    credential, that carried the fetch. Call it again over the door that
+    carried this run's listing. Either call may be made in the same turn as
+    the fetch or the listing, or now. Each answer's TOP-LEVEL `tenant_id`
+    counts, never an entry of `device_tenant_bindings.tenant_ids[]`. The fetch
+    establishes held only when the two uuids are equal, compared
+    case-insensitively. It cannot establish held when:
+    - either door cannot answer `coord_query_identity` with that same
+      credential (including a door that no longer answers), or answers it
+      with a null top-level `tenant_id`. This covers the hand-written HTTP
+      routes and the file mirrors: the mirrors carry no tenant at all;
+    - the two uuids differ (the body is ANOTHER tenant's document, whatever
+      its version says);
+    - either answer carries a `TENANT MISMATCH:` or `TENANT UNVERIFIED:`
+      notice. The runner's coord-mcp proxy adds these to `coord_query_identity`
+      answers when the answering tenant is not the tenant of the repo the
+      session was spawned in (or the tenant named at spawn), or when it could
+      not tell.
+
+    A notice refuses held; its absence proves nothing. Only a call that passed
+    through the runner's coord-mcp proxy can carry one, and many calls do not.
+    The generic remote `/mcp` door never does. A stdio `coord-mcp-shim.py`
+    entry can fall through to it per call, and says so only in `_meta`, which
+    the model does not see. A runner build without `coord_mcp_tenant.rs` emits
+    none at all. So when no notice appears, the uuid equality alone decides.
   - a body the runner injected at spawn or resume, under a header naming the
     document and version (the `===== policy/<name> (v<N>) =====` block). In
     practice this covers `session-protocol`. Compare the header's version with
@@ -75,7 +105,13 @@ run. Each line gives a document's `current_version`. Then decide, per document:
       (the block is ANOTHER tenant's document, whatever its version says);
     - the block has no tenant line at all. A runner without that plan fills
       the block from its own credential's tenant, and this rule does not try
-      to reconstruct which tenant that was; fetch the body instead.
+      to reconstruct which tenant that was; fetch the body instead;
+    - that `coord_query_identity` answer carries a `TENANT MISMATCH:` or
+      `TENANT UNVERIFIED:` notice. Even when the uuids match, that notice means
+      the acting tenant is not the tenant of the repo the session was spawned
+      in (or the tenant named at spawn), or the proxy could not tell. As in
+      the earlier-fetch arm, the notice's absence proves nothing, and the uuid
+      comparison above still decides.
 
   A served version number is treated as naming fixed content: an edit to a
   document's body bumps its version. "Held" needs a pointer, which the Step 4
@@ -2956,11 +2992,19 @@ verdict:
 Each `<s>` is one of the Step 0 states:
 
 - `<v> fetched`;
-- `<v> held (<where>)`, where `<where>` points to the earlier fetch (the tool
-  call and roughly when) or names
-  `runner-injected (tenant <uuid> = acting tenant <uuid>, listing over /policy Step 1)`.
-  A `runner-injected` pointer that does not show two EQUAL uuids and a
-  listing over `/policy` Step 1 is not held: write `NOT READ`;
+- `<v> held (<where>)`, where `<where>` is one of two pointers:
+  - for an earlier fetch, the tool call and roughly when, then
+    `fetch tenant <uuid> over <door> = listing tenant <uuid> over <door>, no tenant notice`;
+  - for a runner-injected block,
+    `runner-injected (tenant <uuid> = acting tenant <uuid>, listing over /policy Step 1, no tenant notice)`.
+
+  `no tenant notice` records only what was seen: no `TENANT MISMATCH:` or
+  `TENANT UNVERIFIED:` block appeared in any identity answer the pointer rests
+  on. It is not a
+  claim that a proxy checked (Step 0 says why its absence proves nothing).
+  A pointer that is missing either the two EQUAL uuids or `no tenant notice`
+  is not held: write `NOT READ`. Neither is a `runner-injected` pointer that
+  does not show a listing over `/policy` Step 1;
 - `NOT READ`.
 
 `<v>` is always the `current_version` from this run's listing.
@@ -3326,6 +3370,31 @@ for wording that says work remains or asks the operator to act ("next step"
 among it, and either spelling in the policy footer), and a note is made of
 that wording on purpose.
 
+**Then re-tag the subproject's topics.** Follow `/finish-session` Part A step
+4's "Then re-tag the subproject's topics" paragraph over the same door: read
+the current topics, confirm or add through `coord_subproject_update
+{"topics": [...]}` (ADD only, slugs from this session's `coord_declare_intent`
+`topic_suggestions` first), remove a wrong one through `coord_topic_member
+{"action": "remove", ...}`, record each kept topic's one-line contribution as
+its `note`, and read the membership back. The recipe and its outcome lines
+live there, once. The contribution line projects Step 1's classification
+(what LANDED or is WATCHED for that topic), not a second judgement. The
+subagent rule above covers it: in a subagent, re-tag nothing. Best-effort and
+never blocking, like the note. Add that paragraph's `topics re-tag:` line to
+the Step 4 report, after the subproject note:
+
+> **Topics re-tag:** `<n>` confirmed/added, `<m>` removed — read back.
+
+or, when it did not land, `/finish-session`'s `UNKNOWN (<code>)` or
+`NOT written: <code>` form of that line. In a subagent, where nothing is
+written, render instead:
+
+> **Topics re-tag — OWED BY THE PARENT.** This `/unattended` ran in a
+> subagent context; the parent's own `/unattended` re-tags the topics.
+
+A subagent's skipped re-tag is neither `UNKNOWN` nor `NOT written`: nothing was
+attempted, and the row says who owes it.
+
 ---
 
 ## Step 5 — record the session as finished
@@ -3457,9 +3526,11 @@ never recorded as finished.
 > `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
 A plan reserve this session still holds is released by the closeout that took
-it, through `scripts/plan-reserve-release.sh release`, which withdraws the plan's
-`implement→ship safety net` first (at most about 90 s); never by a hand-rolled
-`/claims/release`.
+it, through `scripts/plan-reserve-release.sh release --repo <owner/name>`, which
+withdraws the plan's `implement→ship safety net` first, under the tenant proven
+to own the repo (at most about 90 s); never by a hand-rolled `/claims/release`.
+Exit 7 `RELEASE_WITHHELD` released nothing: the net it names is still armed, so
+fix the cause and release again before finishing (`/implement-plan` Step 0.48).
 
 Run **`/finish-session`** with a reason naming the audit result, e.g.
 `--reason "unattended: 7 units, all landed"`, and enter it at **Part A** —

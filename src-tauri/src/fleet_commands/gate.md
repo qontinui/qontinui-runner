@@ -436,12 +436,16 @@ them permanently — so treat any spawn as best-effort and read
 actually ran (a **null** outcome means never claimed, which is worse than a
 recorded `spawn_failed`).
 
-**And populate `hint` — it is the spawned agent's ONLY context.** coord flattens
-the continuation to `run /<skill> <args>` and appends `\n\n<hint>` **only if a
-hint is present**; no other key in the published frame carries a plan body, a PR
-body, prior findings or the gate's own predicate, so a hintless continuation
-spawns an agent whose entire brief is that command line. Six labelled lines,
-**references before bodies**, **≤2000 characters**:
+**And populate `hint` — it is the only field that can carry *why*.** coord
+flattens the continuation to `run /<skill> <args>`, appends `\n\n<hint>` **only
+if a hint is present**, then (for any skill but `unattended`) a closing line to
+run `/unattended`. Beside it coord attaches its own dispatch-time `brief`, which
+holds only references coord can resolve — the work unit's slug, the PR the
+predicate names, its block reason, finding ids — plus a fixed end-of-session
+step, never a plan body, a PR body or what this session tried. So a hintless
+continuation spawns an agent that may learn which plan and PR, but not why this
+session stopped. Six labelled lines, **references before bodies**, **≤2000
+characters**:
 
 ```
 Plan: <plan-stem>

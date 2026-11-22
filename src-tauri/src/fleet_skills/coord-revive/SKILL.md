@@ -1144,7 +1144,12 @@ classifier that only ever answers "yes" is indistinguishable from one that
 cannot answer "no" — a disable list naming *another* server must not reject, a
 string-valued `enabledMcpjsonServers` must report `badtype` rather than approve,
 and two runs differing only in the approval fixture must agree on the `VERDICT`
-line and the exit code.
+line and the exit code. It runs only from a `qontinui-claude-config` checkout:
+it reads the shared isolation helper `scripts/lib/coord-revive-test-isolation.sh`
+from that checkout, which the skill bundle does not carry, and refuses to run
+without it. So does every other suite beside this file that runs the script as a
+process: `floor-claim-test.sh`, `tenant-arg-test.sh`, `interrupt-verdict-test.sh`
+and `call-verdict-honesty-test.sh`.
 
 It also pins **the table above against the script, in both directions** — a
 token the script can emit with no row here is an undocumented output, and a row

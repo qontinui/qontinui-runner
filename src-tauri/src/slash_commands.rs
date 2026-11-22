@@ -57,19 +57,21 @@ pub struct SyncResult {
 /// makes it a stated [`Rung::Unresolved`](crate::capability_manifest::Rung)
 /// finding instead.
 ///
-/// The `Err` half is unchanged, deliberately: every existing caller still gets
-/// exactly the error it got before, so nothing about the control flow moves.
+/// The workspace root comes from the runner's one resolver
+/// ([`crate::workspace_paths::runner_workspace_root`]), so an unresolved root is
+/// its typed `WorkspaceRootUnresolved`, rendered into both the `Err` and the
+/// report — never a sentence of this module's own.
 fn find_commands_directory_reported() -> (Result<(PathBuf, PathBuf), String>, ProvisionReport) {
-    let workspace_root = match crate::mcp::shared::get_workspace_paths_internal() {
-        Ok((root, _, _)) => root,
-        Err(e) => {
+    let workspace_root = match crate::workspace_paths::runner_workspace_root().require() {
+        Ok(root) => root,
+        Err(unresolved) => {
             return (
-                Err(e.clone()),
+                Err(unresolved.to_string()),
                 ProvisionReport::unresolved(
                     "slash_commands",
                     0,
                     "<workspace-root>/qontinui-claude-config/.claude/commands",
-                    format!("no workspace root resolved: {e}"),
+                    unresolved.to_string(),
                 ),
             );
         }

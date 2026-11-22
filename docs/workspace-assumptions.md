@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 70 | 83 | 56 | 12 | 2 | 0 |
+| `repo_layout` | 66 | 79 | 54 | 10 | 2 | 0 |
 | `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -16,17 +16,15 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 106 | 107 | 96 | 10 | 0 | 0 |
+| `os_bound_tooling` | 111 | 112 | 96 | 15 | 0 | 0 |
 
-## `repo_layout` (70 rows)
+## `repo_layout` (66 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
 | `src/agent_runtime.rs` | `overlay_absent_statement` | `const SIBLING: &str = "qontinui-claude-config";` | 1 | fallback_correct — The sibling repository NAME the agent_definitions row's sibling_checkout_absent statement carries as its discriminator. It is rendered only after the overlay was found absent, together with what serves instead (the built-in copy, the repository's own tracked definitions, a named write failure, or unsupported), so it is the statement of a fallback, never a path the runner resolves. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3. | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"agent_runtime: no qontinui-root resolved; skipping .claude/agents \` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3). | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"no qontinui-root resolved ({why}), so \` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3). | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `<root>/qontinui-claude-config/.claude/agents cannot be located — {state}"` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3). | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions_retiring` | `.join("qontinui-claude-config")` | 1 | fallback_correct — The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only after a root resolved. A missing dir makes read_dir fail and the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6). | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions` | `{worktree_cwd} without the qontinui-claude-config overlay ({})",` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3). Re-reviewed when the no-root arm stopped skipping and started writing the embedded floor (and running the retirement pass) without the qontinui-claude-config overlay, its warning rendering the typed WorkspaceRootUnresolved (runner#2978). | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions_layers` | `root.join("qontinui-claude-config")` | 1 | fallback_correct — The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only when a root resolved (overlay_root is Ok). With no root, or a missing dir, the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6), and again when it moved from provision_agent_definitions_retiring to provision_agent_definitions_layers, which both the rooted and the no-root arm now share (runner#2978). | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `self_path_hit` | `"reaches its own tree through a 'qontinui-claude-config' checkout".to_string(),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `static CONFIG_REPO_CLAUDE_RE` | `Lazy::new(\|\| Regex::new(r"qontinui-claude-config[/\\]+\.claude\b").expect("arm A regex"));` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `static ROOTED_TOKEN_RE` | `r"^(?:<workspace-root>",` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
@@ -45,7 +43,6 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/capability_manifest.rs` | `Rung::describe` | `'qontinui-claude-config') — answers only where that repo exists"` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `Rung::from_command_source` | `qontinui-claude-config origin/main), not an account-layer arm",` | 1 | fallback_correct — A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk. | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `copy is a no-op that logs \"no qontinui-root resolved; skipping \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `qontinui-claude-config's hourly 'fleet-agents-parity' gate \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -59,7 +56,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/context/builtins.rs` | `get_builtin_contexts` | `file_patterns: Some(vec!["**/qontinui-mobile/**".to_string()]),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/context/builtins.rs` | `get_builtin_contexts` | `file_patterns: Some(vec!["**/qontinui-web/**".to_string()]),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/coord_doctor.rs` | `render_onboarding_doc` | `consts, and 'coord-gates-and-access.md' in 'qontinui-claude-config'.\n\n",` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
-| `src/coord_mcp.rs` | `probe_stdio_shim` | `"no workspace root resolved, so <root>/qontinui-claude-config/scripts/\` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/coord_mcp.rs` | `probe_stdio_shim` | `"{unresolved} <root>/qontinui-claude-config/scripts/\` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/coord_mcp.rs` | `resolve_stdio_shim_path` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-supervisor",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-web",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -77,7 +74,6 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/fleet.rs` | `const SKILL_SOURCE_REL` | `const SKILL_SOURCE_REL: &[&str] = &["qontinui-claude-config", ".claude", "skills"];` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet_commands.rs` | `const FLEET_COMMANDS` | `("ui-bridge", UI_BRIDGE),` | 1 | unreviewed | `fleet_commands` |
 | `src/mcp/plan_library.rs` | `const WRITE_CONTRACT` | `with (a runner scan uses '<repo>/<dir>', e.g. 'qontinui-dev-notes/prompts'). \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
-| `src/mcp/session_recap.rs` | `analyze_handler` | `Json(api_error(format!("Cannot find qontinui-root: {}", e))),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/mcp/shared.rs` | `get_workspace_paths_internal` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/online_learning/context.rs` | `normalize_domain` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/orchestrator/learning_recorder.rs` | `infer_domain_tags` | `tags.insert("ui-bridge".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -249,7 +245,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (106 rows)
+## `os_bound_tooling` (111 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -280,6 +276,11 @@ _No hits._
 | `src/crash_observability.rs` | `read_exception` | `cfg(windows)-only fn 'read_exception' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/crash_observability.rs` | `run_bounded` | `cfg(windows)-only fn 'run_bounded' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/crash_observability.rs` | `top_level_filter` | `cfg(windows)-only fn 'top_level_filter' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::created` | `cfg(windows)-only fn 'created' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Reads the held process handle's creation time (GetProcessTimes) to tie the harness's identity proof to that handle. Windows arm of embedded_pg::test_harness::end_postmaster; Linux makes its sysinfo identity proof while holding a pidfd; other Unix falls back to pid signalling. |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::drop` | `cfg(windows)-only fn 'drop' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Closes the held process handle. Windows arm of the test harness's held-handle teardown; Linux closes its pidfd, other Unix holds nothing. |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::image` | `cfg(windows)-only fn 'image' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Reads the held handle's image path (QueryFullProcessImageNameW) as the second identity check. Windows arm of the test harness's end_postmaster; Linux makes its sysinfo identity proof while holding a pidfd. |
+| `src/embedded_pg/test_harness.rs` | `ProcessHandle::terminate` | `cfg(windows)-only fn 'terminate' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — TerminateProcess + WaitForSingleObject on the same held handle. Windows arm of end_postmaster; Linux sends SIGQUIT then SIGKILL through a pidfd, other Unix through the pid. |
+| `src/embedded_pg/test_harness.rs` | `unix_seconds_of_filetime` | `cfg(windows)-only fn 'unix_seconds_of_filetime' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Converts a Windows FILETIME (100 ns ticks since 1601) to Unix seconds so the owner record's start time compares with sysinfo's. Linux reads /proc/<pid>/stat starttime instead. |
 | `src/env_agent/collectors.rs` | `collect_harness_under` | `"dev-start.ps1",` | 1 | unreviewed |
 | `src/env_agent/collectors.rs` | `collect_harness_under` | `config_repo.join("scripts").join("dev-start.ps1"),` | 1 | unreviewed |
 | `src/env_agent/collectors.rs` | `dev_start_plain_ok` | `rest.contains("qontinui-claude-config\\scripts\\dev-start.ps1")` | 1 | unreviewed |

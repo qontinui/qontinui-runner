@@ -235,8 +235,9 @@ means no account is known-healthy but none is known-exhausted either — place
 the spawn in one of the listed ids and say so. `ALL_EXHAUSTED
 earliest_reset=<iso>` (exit 3): do not spawn into a limit and do not narrow
 the work — schedule the replay against that reset with
-`scripts/rate-limit-reset.sh schedule`, passing `--hint` (the resumed agent's
-only context is what you put there; shape and cap: `/vet-imp-sweep` Step 6), and
+`scripts/rate-limit-reset.sh schedule`, passing `--hint` (the only place the
+resumed agent learns what it was doing and why; shape and cap: `/vet-imp-sweep`
+Step 6), and
 report the `gate_id`. `NO_ACCOUNTS` (exit 2) means the roster resolved to
 nothing — a configuration fault to report, not a reason to spawn unrouted.
 

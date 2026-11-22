@@ -76,11 +76,15 @@ use crate::session::SessionEventKind;
 
 use super::pane_row_owner::{BindDoor, PaneRowLookup, PaneRowOwners};
 
+/// The finish re-offer after a move (same plan, D5) — a child module for the
+/// same reason.
+mod finish_reoffer;
 /// The pane-row transfer (plan
 /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
 /// D4) — a child module so it reaches [`Inner`]'s private maps without
 /// widening them.
 mod pane_transfer;
+pub(crate) use finish_reoffer::registrar_finish_reoffers;
 pub(crate) use pane_transfer::{
     pane_row_moves_not_owner, pin_seed_takes_ever_deferred, registrar_terminal_row_disagreements,
     MoveOutcome, Mover,
@@ -520,16 +524,50 @@ impl AiCoordRegistrar {
         // The finish-time repair (plan D4): an auto-bind entry that disagrees
         // with the session's live pane row is moved onto it first, so this
         // write and every one after it address the pane row.
-        self.repair_onto_live_pane(&rec.claude_session_id);
+        let repaired = self.repair_onto_live_pane(&rec.claude_session_id);
         let resolved =
             self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None);
+        // A mark the finish heal RE-ADDRESSED (plan
+        // `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+        // Phase 4) goes to the row coord named as live while it is unsynced —
+        // never back to the stale row the in-process resolvers may still name,
+        // whose ack would stamp the mark synced on it.
+        let resolved = match (
+            rec.finished_at,
+            rec.finish_synced,
+            rec.finish_coord_readdressed,
+            rec.finish_coord_session_id,
+        ) {
+            (Some(_), false, true, Some(sent)) => {
+                if resolved.is_some_and(|r| r != sent) {
+                    info!(
+                        "ai_coord_register: {}'s finish was re-addressed to coord session {} — \
+                         sending it there, not to {:?}",
+                        rec.claude_session_id, sent, resolved
+                    );
+                }
+                Some(sent)
+            }
+            _ => resolved,
+        };
         match rec.finished_at {
-            Some(at) => self.finish_session_on(
-                &rec.claude_session_id,
-                resolved,
-                Some(at),
-                rec.finish_reason.as_deref(),
-            ),
+            Some(at) => {
+                let sync = self.finish_session_on(
+                    &rec.claude_session_id,
+                    resolved,
+                    Some(at),
+                    rec.finish_reason.as_deref(),
+                );
+                // D5 for the repair: this forward IS the re-offer to the pane
+                // row (`finish_forward` is held here, so the door cannot be
+                // taken); record the row it went to.
+                if let (Some(row), FinishSync::Queued { coord_session_id }) = (repaired, &sync) {
+                    if *coord_session_id == row {
+                        self.note_repaired_finish_row(&rec.claude_session_id, at, row);
+                    }
+                }
+                sync
+            }
             None => self.unfinish_session_on(&rec.claude_session_id, resolved),
         }
     }
@@ -782,6 +820,11 @@ impl AiCoordRegistrar {
     /// alone, refuses [`TranscriptBindRefusal::CoordSessionInUse`] (auto-bind
     /// defers and retries). An R6 hit returns the
     /// existing id, as every registration does.
+    ///
+    /// Once the key is on `row`, a finish another row ACKed is re-offered to
+    /// it ([`Self::reoffer_finish_to`], plan D5) — after `register_inner`'s
+    /// own late delivery, whose pending row the re-offer does not duplicate.
+    /// Same lock rules as [`Self::deliver_owed_finish`].
     pub fn bind_transcript_session_on_live_pane(
         &self,
         claude_session_id: &str,
@@ -789,7 +832,7 @@ impl AiCoordRegistrar {
         tenant: NewSessionTenant,
         resume: ResumeParams,
     ) -> Result<Uuid, TranscriptBindRefusal> {
-        self.register_inner(
+        let bound = self.register_inner(
             claude_session_id,
             None,
             "Claude Code session (transcript bind)",
@@ -802,7 +845,11 @@ impl AiCoordRegistrar {
                 door: Some(BindDoor::Transcript),
                 take_from_live_pane: true,
             },
-        )
+        )?;
+        if bound == row {
+            self.reoffer_finish_to(claude_session_id, row);
+        }
+        Ok(bound)
     }
 
     /// Shared register core for the pinned (`task_run_id = Some`) and sniffed
@@ -5475,10 +5522,10 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
-                last_alive_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
@@ -5584,10 +5631,10 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
-                last_alive_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
@@ -6405,5 +6452,828 @@ mod tests {
         assert!(reg.session_id_for(&trid).is_none());
 
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+    }
+
+    // ------------------------------------------------------------------
+    // Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-
+    // a-live-pane-has-replaced` D5 (Phase 3): a move re-offers a finish
+    // another row ACKed, on #2704's record.
+    // ------------------------------------------------------------------
+
+    use super::finish_reoffer::{race_after_decision, ReofferOutcome};
+
+    /// A registrar and store wired as main.rs wires them (the store's finish
+    /// observer forwards to the registrar), with mutable live pane rows
+    /// (row → the pane's bind instant, unix ms) and pinned panes.
+    struct ReofferRig {
+        reg: Arc<AiCoordRegistrar>,
+        store: Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+        live: Arc<Mutex<HashMap<Uuid, i64>>>,
+        panes: Panes,
+        dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    fn reoffer_rig() -> ReofferRig {
+        let (reg, dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, sdir) = attach_store(&reg);
+        let weak = Arc::downgrade(&reg);
+        store.attach_finish_observer(move |rec| match weak.upgrade() {
+            Some(r) => r.forward_finish_change(rec),
+            None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+        });
+        let live: Arc<Mutex<HashMap<Uuid, i64>>> = Default::default();
+        let l = live.clone();
+        reg.attach_pane_row_tenant(move |row| {
+            l.lock().unwrap().get(&row).map(|at| PaneRowFacts {
+                tenant: NewSessionTenant::Undetermined,
+                bound_at_ms: Some(*at),
+                bind_seq: Some(1),
+            })
+        });
+        let panes = attach_panes(&reg);
+        ReofferRig {
+            reg,
+            store,
+            live,
+            panes,
+            dirs: (dir, sdir),
+        }
+    }
+
+    impl ReofferRig {
+        /// The drain delivered every pending row, and `row` was OBSERVED
+        /// reading `finished` for `x`'s mark at `at` (#2704's ACK stamp).
+        fn ack(&self, x: &str, at: i64, row: Uuid) {
+            let keys: Vec<(Uuid, i64)> = self
+                .reg
+                .inner
+                .outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.session_id, r.seq))
+                .collect();
+            self.reg.inner.outbox.ack(&keys).unwrap();
+            self.store.mark_finish_synced_on(x, Some(at), Some(row));
+        }
+
+        /// `x` adopts the stale row R′ through auto-bind, is marked finished
+        /// there, and R′ ACKs it. Returns `(R′, finished_at)`.
+        fn finished_on_stale(&self, x: &str) -> (Uuid, i64) {
+            open_on(&self.store, x, "term-pane", None);
+            let stale = Uuid::new_v4();
+            self.reg
+                .bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+                .unwrap();
+            let out = self.store.set_finished(x, true, None).unwrap();
+            assert_eq!(
+                out.coord,
+                FinishSync::Queued {
+                    coord_session_id: stale
+                }
+            );
+            let at = out.record.finished_at.unwrap();
+            self.ack(x, at, stale);
+            let rec = self.store.get(x).unwrap();
+            assert!(rec.finish_synced);
+            assert_eq!(rec.finish_coord_session_id, Some(stale));
+            (stale, at)
+        }
+
+        /// A live pane pinned to `x`, bound to `row` at `bound_at_ms`.
+        fn show_pane(&self, x: &str, row: Uuid, bound_at_ms: i64) {
+            self.live.lock().unwrap().insert(row, bound_at_ms);
+            self.panes
+                .lock()
+                .unwrap()
+                .push((x.to_string(), Some((row, 1))));
+        }
+
+        /// The mark's `(finish_synced, finish_coord_session_id)`.
+        fn mark(&self, x: &str) -> (bool, Option<Uuid>) {
+            let rec = self.store.get(x).unwrap();
+            (rec.finish_synced, rec.finish_coord_session_id)
+        }
+    }
+
+    /// D5 through the seam: X's finish was ACKed by the stale row R′ its
+    /// auto-bind adopted; the seam then repoints X onto its pane row R. One
+    /// `Finished` is queued to R, and the mark reads unsynced — naming R as
+    /// the row it was sent to — until R's own observed ACK stamps it.
+    #[test]
+    fn a_finish_acked_by_a_stale_row_is_re_offered_to_the_pane_row_on_repoint() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-seam-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        let before = registrar_finish_reoffers();
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert!(registrar_finish_reoffers() > before, "counted");
+        assert_eq!(rig.mark(x), (false, Some(r)), "unsynced until R ACKs");
+
+        // The next tick finds the mark already sent to R: nothing more.
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(finished_rows(&rig.reg).len(), 1);
+
+        rig.ack(x, at, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// D5 review (MAJOR 1): the bind trigger on the REAL timestamp path. A
+    /// pane pinned to X is bound to R after R′ ACKed X's finish, through
+    /// `TerminalManager::bind_coord_session` wired as main.rs wires it. The
+    /// bind stamps the pane's bind instant at the bind itself, so X's
+    /// ownership of R begins after the finish: the bind moves the entry, but
+    /// neither it nor any later seam tick re-offers the finish (the bind
+    /// trigger is not a re-offer caller for exactly this reason).
+    #[test]
+    fn a_pane_bound_after_the_finish_never_has_it_re_offered() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, _sdir) = attach_store(&reg);
+        {
+            let weak = Arc::downgrade(&reg);
+            store.attach_finish_observer(move |rec| match weak.upgrade() {
+                Some(r) => r.forward_finish_change(rec),
+                None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+            });
+        }
+        let tm = Arc::new(crate::terminal::manager::TerminalManager::new());
+        {
+            let tm = Arc::downgrade(&tm);
+            reg.attach_terminal_coord_lookup(move |csid| {
+                tm.upgrade()?.coord_session_id_for_pinned(csid)
+            });
+        }
+        {
+            let tm = Arc::downgrade(&tm);
+            reg.attach_pane_row_tenant(move |row| {
+                let Some(binding) = tm.upgrade().and_then(|t| t.coord_row_bound_at(row)) else {
+                    return PaneRowLookup::Unknown;
+                };
+                let Some((bound_at_ms, bind_seq)) = binding else {
+                    return PaneRowLookup::Gone;
+                };
+                PaneRowLookup::Live(PaneRowFacts {
+                    tenant: NewSessionTenant::Undetermined,
+                    bound_at_ms: Some(bound_at_ms),
+                    bind_seq: Some(bind_seq),
+                })
+            });
+        }
+        {
+            let weak = Arc::downgrade(&reg);
+            tm.attach_coord_bind_observer(move |pinned, terminal_id, coord_id| {
+                if let Some(r) = weak.upgrade() {
+                    r.on_terminal_coord_bind(pinned, terminal_id, coord_id);
+                }
+            });
+        }
+        // `make_test_session`'s spawn-time pin.
+        let x = "test-pinned-session";
+        open_on(&store, x, "term-x", None);
+        let stale = Uuid::new_v4();
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        let keys: Vec<(Uuid, i64)> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.session_id, r.seq))
+            .collect();
+        reg.inner.outbox.ack(&keys).unwrap();
+        store.mark_finish_synced_on(x, Some(at), Some(stale));
+
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        tm.insert_for_test("term-x", session.clone());
+        let r = Uuid::new_v4();
+        tm.bind_coord_session(&session, r);
+        assert_eq!(reg.session_id_for(x), Some(r), "the bind moved the entry");
+        let owned = reg
+            .live_terminal_row(x)
+            .and_then(|l| l.owned_since_ms)
+            .expect("the pin seed carries the real bind instant");
+        assert!(owned >= at, "stamped at the bind: {owned} < {at}");
+
+        for source in [RekeySource::Rung2, RekeySource::Hook] {
+            assert_eq!(reg.note_pane_row(r, x, source), MoveOutcome::Unchanged);
+        }
+        assert_eq!(
+            reg.reoffer_finish_to(x, r),
+            ReofferOutcome::OwnedAfterFinish
+        );
+        assert!(finished_rows(&reg).is_empty());
+        let rec = store.get(x).unwrap();
+        assert!(rec.finish_synced, "the mark keeps R′'s ACK");
+        assert_eq!(rec.finish_coord_session_id, Some(stale));
+    }
+
+    /// D5 review (MAJOR 2): a hook-grade source first confirms X on the row of
+    /// the pane PINNED to X only after X's finish. The pane has run X since
+    /// it was bound (no other id was ever seen there), so ownership dates
+    /// from the bind and the finish R′ ACKed is re-offered to R.
+    #[test]
+    fn a_hook_confirming_x_on_its_own_pinned_row_after_the_finish_still_re_offers() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-hook-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Hook),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        rig.ack(x, at, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// Round-2 review: X is pinned and bound before its finish, R′ ACKs it;
+    /// an in-pane `/clear` successor P is seen on R through rung 2 ONLY;
+    /// then `/resume X` and the hook confirms X. X runs again, so the finish
+    /// R′ ACKed must not be re-offered to R — the row's history carries P
+    /// although P never advanced the owner.
+    #[test]
+    fn a_clear_successor_seen_only_through_rung2_keeps_a_resumed_finish_off_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-clear-resume-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        let p = "clear-successor-p";
+        rig.reg.note_pane_row(r, p, RekeySource::Rung2);
+        assert_eq!(
+            rig.reg.inner.pane_rows.owner_of(r),
+            None,
+            "rung 2 never advances the owner"
+        );
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Hook),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(
+            finished_rows(&rig.reg).is_empty(),
+            "no finish onto a resumed session"
+        );
+        assert_eq!(rig.mark(x), (true, Some(stale)));
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::OwnedAfterFinish
+        );
+    }
+
+    /// One re-address target, two triggers (D5 beside the finish heal's
+    /// re-address, plan `2026-11-07-...` Phase 4): a mark the heal
+    /// re-addressed to the row coord OBSERVED as live is never re-offered to
+    /// the pane row — not while the heal's re-send is in flight, and not after
+    /// that row confirms — so the two cannot ping-pong. The registrar's
+    /// unsynced routing keeps sending it to the heal's row.
+    #[test]
+    fn a_heal_readdressed_finish_is_never_re_offered_to_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        // The heal re-addresses the synced mark to C, coord's live row.
+        let c = Uuid::new_v4();
+        assert!(rig
+            .store
+            .note_finish_readdressed(x, at, c, true, Some(stale)));
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(
+            finished_rows(&rig.reg).is_empty(),
+            "nothing re-offered to R"
+        );
+        assert_eq!(rig.mark(x), (false, Some(c)));
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::HealReaddressed
+        );
+
+        // The retry door (a reason-less re-finish of the unsynced mark) sends
+        // to the heal's row, although the registrar's entry is on R.
+        assert_eq!(
+            rig.store.set_finished(x, true, None).unwrap().coord,
+            FinishSync::Queued {
+                coord_session_id: c
+            }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(c, x.to_string())]);
+
+        // C confirms. Later ticks still leave the heal's row alone.
+        rig.ack(x, at, c);
+        assert_eq!(rig.mark(x), (true, Some(c)));
+        for _ in 0..2 {
+            assert_eq!(
+                rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+                MoveOutcome::Unchanged
+            );
+        }
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x), (true, Some(c)));
+    }
+
+    /// A heal re-address that lands between the re-offer's decision and its
+    /// door wins: the door re-reads the flag under `finish_forward`.
+    #[test]
+    fn a_heal_readdress_racing_the_re_offer_wins() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-race-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let c = Uuid::new_v4();
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            assert!(store.note_finish_readdressed(x, at, c, true, Some(stale)));
+        });
+
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::HealReaddressed
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x), (false, Some(c)));
+    }
+
+    /// Round-3 review: the boot sweep's UNSYNCED path. The heal reads the mark
+    /// (its own row the stale R′, a drop left it unsynced) and decides to
+    /// re-address it to H, the row coord names; before its re-address lands,
+    /// the pane-row re-offer queues the finish to R. The heal's compare-and-
+    /// set on the row it read refuses (`MarkChanged`): nothing is sent to H,
+    /// the mark keeps R, and no `Finished` is left pending to two rows.
+    #[test]
+    fn a_heal_re_address_over_a_mark_the_re_offer_moved_is_refused() {
+        use crate::session::finish_heal::{apply_heal_observed, HealOutcome, Observations};
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-interleave-x";
+        open_on(&rig.store, x, "term-pane", None);
+        let stale = Uuid::new_v4();
+        rig.reg
+            .bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = rig
+            .store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        // The drain delivered it, coord's row never read `finished`: the
+        // unconfirmed drop records R′ as the sent row and leaves it unsynced.
+        let keys: Vec<(Uuid, i64)> = rig
+            .reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.session_id, o.seq))
+            .collect();
+        rig.reg.inner.outbox.ack(&keys).unwrap();
+        rig.store.note_finish_sent_row(x, Some(at), stale);
+        assert_eq!(rig.mark(x), (false, Some(stale)));
+
+        // 1. The boot sweep reads the mark.
+        let snapshot = rig.store.get(x).unwrap();
+
+        // 2. The pane-row re-offer moves it onto R and queues the finish.
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+
+        // 3. The heal, over its earlier snapshot, finds coord naming H —
+        // active, NULL, registered before the finish — and re-addresses.
+        let h = Uuid::new_v4();
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at - 60_000)
+            .unwrap()
+            .to_rfc3339();
+        let fetch = crate::mcp::session_work_status::fetch_from_body_for_test(
+            json!({
+                "statuses": {x: {"session_status": null, "since": null,
+                                 "coord_session_id": h.to_string(), "state": "active",
+                                 "started_at": before}},
+                "unknown": [], "invalid": [], "input_truncated": false,
+                "sessionBridgeColumnPresent": true
+            }),
+            1,
+        );
+        let ids = vec![x.to_string()];
+        let port: &dyn crate::session::finish_heal::HealPort = rig.reg.as_ref();
+        let out = apply_heal_observed(
+            &rig.store,
+            Some(port),
+            std::slice::from_ref(&snapshot),
+            &Observations::from_fetch(&ids, &fetch),
+            at + 1_000,
+            true,
+        );
+        assert_eq!(out, vec![(x.to_string(), HealOutcome::MarkChanged)]);
+
+        // 4. Nothing went to H; the mark keeps R, and is not flagged.
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        assert!(!rig.store.get(x).unwrap().finish_coord_readdressed);
+        // A heal that read the CURRENT target would still be allowed.
+        assert!(rig.store.note_finish_readdressed(x, at, h, false, Some(r)));
+    }
+
+    /// The other direction: after a re-offer moved the mark onto R, the
+    /// registrar's unsynced routing (the retry door) sends to R through the
+    /// in-process resolution — the re-offer sets no override flag — and a
+    /// later heal re-address to coord's row replaces it, after which the
+    /// re-offer stands aside.
+    #[test]
+    fn a_re_offered_finish_routes_to_the_pane_row_until_the_heal_names_another() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-then-heal-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(!rig.store.get(x).unwrap().finish_coord_readdressed);
+        assert_eq!(
+            rig.store.set_finished(x, true, None).unwrap().coord,
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+
+        // The heal later finds coord naming C as the live row.
+        let c = Uuid::new_v4();
+        assert!(rig.store.note_finish_readdressed(x, at, c, false, Some(r)));
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(rig.mark(x), (false, Some(c)), "the heal's row stands");
+        assert!(finished_rows(&rig.reg).iter().all(|(row, _)| *row == r));
+    }
+
+    /// D5 through the finish-time repair: the operator re-states X's finish
+    /// (a restamp) after R′ ACKed it. The repair moves X onto R inside the
+    /// finish observer, the forward itself is the one `Finished` to R, and
+    /// R is recorded as the row it was sent to — so the next seam tick
+    /// queues nothing more.
+    #[test]
+    fn a_finish_acked_by_a_stale_row_reaches_the_pane_row_through_the_finish_time_repair() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-repair-x";
+        let (_stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        let before = registrar_terminal_row_disagreements();
+        let out = rig
+            .store
+            .set_finished(x, true, Some("restated".into()))
+            .unwrap();
+        assert_eq!(
+            out.coord,
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+        assert!(registrar_terminal_row_disagreements() > before, "repaired");
+        let at2 = out.record.finished_at.unwrap();
+        assert_ne!(at2, at, "a restamp");
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(finished_rows(&rig.reg).len(), 1, "no second Finished");
+
+        rig.ack(x, at2, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// D5 through the live-pane adoption: after a restart the registrar knows
+    /// nothing of X, while its durable mark reads synced by R′. Auto-bind
+    /// adopts the pane row R and re-offers the finish there.
+    #[test]
+    fn a_finish_acked_by_a_stale_row_is_re_offered_on_a_live_pane_adoption() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-adopt-x";
+        open_on(&rig.store, x, "term-pane", None);
+        let out = rig.store.set_finished(x, true, None).unwrap();
+        let at = out.record.finished_at.unwrap();
+        let stale = Uuid::new_v4();
+        rig.store.mark_finish_synced_on(x, Some(at), Some(stale));
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.bind_transcript_session_on_live_pane(
+                x,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Ok(r)
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+    }
+
+    /// A stale row's ACK that drains AFTER the move: the move's own re-offer
+    /// finds the finish still in flight and does nothing; the next
+    /// `AlreadyCurrent` tick re-offers it, exactly once over two ticks.
+    #[test]
+    fn a_stale_rows_ack_draining_after_the_move_is_re_offered_once() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-late-ack-x";
+        open_on(&rig.store, x, "term-pane", None);
+        let stale = Uuid::new_v4();
+        rig.reg
+            .bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = rig
+            .store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(rig.mark(x), (false, None), "still in flight to R′");
+        assert_eq!(
+            finished_rows(&rig.reg),
+            vec![(stale, x.to_string())],
+            "nothing re-offered while in flight"
+        );
+
+        rig.ack(x, at, stale);
+        for _ in 0..2 {
+            assert_eq!(
+                rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+                MoveOutcome::Unchanged
+            );
+        }
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+    }
+
+    /// The revival guard: a mark whose `finished_at` precedes X's ownership
+    /// of R is not re-offered — neither for an in-pane `/resume` (a
+    /// running-id source advances R's owner to X only now) nor for a pane
+    /// bound to R after the finish. The mark keeps its ACK.
+    #[test]
+    fn a_finish_that_precedes_the_ownership_of_the_pane_row_is_not_re_offered() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+
+        // In-pane resume: R's pane runs another pin; the hook-grade source
+        // names X there only after X's finish.
+        let x1 = "revived-in-pane";
+        let (stale1, _) = rig.finished_on_stale(x1);
+        let r1 = Uuid::new_v4();
+        rig.show_pane("the-panes-own-pin", r1, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r1, x1, RekeySource::ProviderRegistry),
+            MoveOutcome::Moved { from: stale1 }
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x1), (true, Some(stale1)));
+
+        // Resumed into a new pane, bound after the finish.
+        let x2 = "revived-into-a-new-pane";
+        let (stale2, at2) = rig.finished_on_stale(x2);
+        let r2 = Uuid::new_v4();
+        rig.show_pane(x2, r2, at2 + 60_000);
+        rig.reg.on_terminal_coord_bind(x2, "term-new", r2);
+        assert_eq!(rig.reg.session_id_for(x2), Some(r2));
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x2), (true, Some(stale2)));
+
+        // An ownership instant the owner rule cannot state is never read as
+        // "before the finish".
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x2, Uuid::new_v4()),
+            super::finish_reoffer::ReofferOutcome::OwnershipUnknown
+        );
+    }
+
+    /// An unmark racing the re-offer — landing after its decision, before its
+    /// door — leaves no `Finished` queued: the door re-reads the mark under
+    /// `finish_forward`. Only the unmark's own `working` is queued, and a
+    /// later tick queues nothing. An unmark-and-re-mark in the same window
+    /// leaves only the new mark's own forward.
+    #[test]
+    fn an_unmark_racing_the_re_offer_leaves_nothing_queued() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-race-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            store.set_finished(x, false, None).unwrap();
+        });
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        let working = rows_of_kind(&rig.reg, SessionEventKind::Progress);
+        assert_eq!(working.len(), 1, "{working:?}");
+        assert_eq!(working[0].session_id, r);
+        assert_eq!(working[0].payload["session_status"], json!("working"));
+        assert_eq!(rig.store.get(x).unwrap().finished_at, None);
+        assert_eq!(rig.mark(x), (false, None));
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+
+        // Unmark and re-mark between the decision and the door.
+        let rig = reoffer_rig();
+        let y = "reoffer-race-y";
+        let (stale, at) = rig.finished_on_stale(y);
+        let r = Uuid::new_v4();
+        rig.show_pane(y, r, 1_000);
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            store.set_finished(y, false, None).unwrap();
+            store.set_finished(y, true, None).unwrap();
+        });
+        assert_eq!(
+            rig.reg.note_pane_row(r, y, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        let rows = rig.reg.inner.outbox.pending().unwrap();
+        let finishes: Vec<_> = rows
+            .iter()
+            .filter(|o| o.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(finishes.len(), 1, "only the new mark's own: {rows:?}");
+        assert_eq!(finishes[0].session_id, r);
+        assert_ne!(finishes[0].payload["finished_at"], json!(at));
+    }
+
+    /// The re-offer's dedupe: a `Finished` for this very mark already pending
+    /// to the pane row is not queued again; the stamp is withdrawn and R is
+    /// recorded, so R's ACK of the pending row stamps it.
+    #[test]
+    fn a_finish_already_pending_to_the_pane_row_is_not_queued_twice() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-pending-x";
+        let (_stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        rig.reg.enqueue_finished(x, r, Some(at), None);
+
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::AlreadyQueued
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        rig.ack(x, at, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// A failed outbox write: the stamp is withdrawn but R is NOT recorded,
+    /// so the next attempt re-offers once the outbox writes again.
+    #[test]
+    fn a_failed_outbox_write_leaves_the_re_offer_for_the_next_tick() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-outbox-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        // A directory where the outbox file belongs: every append fails.
+        let path = rig.dirs.0.path().join("outbox.jsonl");
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).unwrap();
+
+        assert_eq!(rig.reg.reoffer_finish_to(x, r), ReofferOutcome::NotQueued);
+        assert_eq!(
+            rig.mark(x),
+            (false, Some(stale)),
+            "the stamp is withdrawn, the row not recorded"
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::Reoffered { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+    }
+
+    /// Two re-offers of one mark that both pass their decision at once queue
+    /// exactly one `Finished`: the door is one `finish_forward` section, and
+    /// the loser re-reads the mark naming R.
+    #[test]
+    fn two_concurrent_re_offers_of_one_mark_queue_one_finish() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-concurrent-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let outcomes: Vec<ReofferOutcome> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let b = barrier.clone();
+                    let reg = &rig.reg;
+                    s.spawn(move || {
+                        // Both threads hold their decision until both have one.
+                        race_after_decision(move || {
+                            b.wait();
+                        });
+                        reg.reoffer_finish_to(x, r)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            outcomes.contains(&ReofferOutcome::Reoffered { from: stale })
+                && outcomes.contains(&ReofferOutcome::AlreadyOnRow),
+            "{outcomes:?}"
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
     }
 }
