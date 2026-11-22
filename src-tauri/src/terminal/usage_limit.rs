@@ -76,6 +76,12 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     // /usage-credits to continue or switch models".
     "reached your fable limit",
     "hit your limit",
+    // An org/account monthly SPEND cap: "You've hit your org's monthly spend
+    // limit". No "… limit reached" / "hit your limit" spelling matches it
+    // (nilan, 2026-11-12: seven hourly scheduled cycles died on it and nothing
+    // cooled the account). The usage probe cannot see a spend cap, so this
+    // banner is the only signal there is.
+    "spend limit",
     // Generic catch-alls LAST (specific patterns above win the label). The
     // CLI's phrasing shifts across releases ("Opus weekly limit reached",
     // "limit reached ∙ resets 3am", "You're out of usage until…") — a missed
@@ -458,6 +464,18 @@ mod tests {
         assert_eq!(
             window_indicates_usage_limit("You've used 82% of your Fable limit"),
             None
+        );
+    }
+
+    #[test]
+    fn spend_limit_banner_matches() {
+        // Plan `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`
+        // test (f): the monthly spend-cap banner matched none of the patterns.
+        assert_eq!(
+            window_indicates_usage_limit(
+                "You've hit your org's monthly spend limit \u{b7} resets Dec 1, 12am (UTC)"
+            ),
+            Some("spend limit")
         );
     }
 

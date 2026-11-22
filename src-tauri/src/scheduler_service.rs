@@ -246,6 +246,24 @@ pub struct SchedulerService {
     /// and two concurrent passes would each evaluate — and could each fire —
     /// the same due task.
     pass_lock: tokio::sync::Mutex<()>,
+    /// Cool / roster / relaunch for a `RemoteAgent` run that died on an
+    /// account limit (plan
+    /// `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`).
+    /// The production probe, picker and spawn; a fake in tests.
+    limit_recovery: Arc<dyn crate::scheduler_limit_relaunch::LimitRecovery>,
+}
+
+/// What one settled slot did — every history row it wrote, in order, and the
+/// `next_run` it set when every account was exhausted. The detached settle
+/// task drops it; tests await it.
+#[derive(Debug, Default)]
+pub(crate) struct Settlement {
+    pub rows: Vec<TaskExecutionRecord>,
+    /// The decision that ended a limited slot without a relaunch; it is what
+    /// [`next_run_after_limit`] reads to choose the stored `next_run`.
+    pub decision: Option<crate::scheduler_limit_relaunch::RelaunchDecision>,
+    /// The config dirs cooled, in order.
+    pub cooled: Vec<String>,
 }
 
 impl SchedulerService {
@@ -259,6 +277,7 @@ impl SchedulerService {
             check_interval_secs: 60, // Check every minute
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
             pass_lock: tokio::sync::Mutex::new(()),
+            limit_recovery: Arc::new(crate::scheduler_limit_relaunch::ProductionLimitRecovery),
         }
     }
 
@@ -272,6 +291,7 @@ impl SchedulerService {
             check_interval_secs: 60,
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
             pass_lock: tokio::sync::Mutex::new(()),
+            limit_recovery: Arc::new(crate::scheduler_limit_relaunch::ProductionLimitRecovery),
         }
     }
 
@@ -1310,14 +1330,21 @@ impl SchedulerService {
             .as_ref()
             .map(|s| crate::mcp::types::runner_api_port(s));
 
+        let relaunch = crate::scheduler_limit_relaunch::RelaunchCtx {
+            spec: spec.clone(),
+            bound_port,
+            catch_up,
+        };
         let launched = crate::scheduler_remote_agent::launch(spec, bound_port).await;
-        self.settle_launched_child(
+        Self::settle_launched_child(
+            self,
             "RemoteAgent",
             task_id,
             task_name,
             auto_fix_on_failure,
             record,
             launched,
+            Some(relaunch),
         )
         .await;
     }
@@ -1341,13 +1368,15 @@ impl SchedulerService {
         }
         spec.execution_id = record.execution_id.clone();
         let launched = crate::scheduler_script::launch(spec).await;
-        self.settle_launched_child(
+        Self::settle_launched_child(
+            self,
             "Script",
             task_id,
             task_name,
             auto_fix_on_failure,
             record,
             launched,
+            None,
         )
         .await;
     }
@@ -1355,7 +1384,12 @@ impl SchedulerService {
     /// Shared tail of the in-binary child launchers (`RemoteAgent`, `Script`):
     /// record the `Running` row the moment the child exists, clear the
     /// launch-failure streak, and settle the row from the child's outcome via
-    /// [`Self::finalize_async_execution`]. A launch `Err` is a LaunchFailed.
+    /// [`Self::settle_attempts`]. A launch `Err` is a LaunchFailed.
+    ///
+    /// `relaunch` is `Some` for a `RemoteAgent` run: what a limit-hit relaunch
+    /// needs. Returns the detached settle task's handle (the scheduler drops
+    /// it; tests await it), `None` on a launch failure.
+    #[allow(clippy::too_many_arguments)]
     async fn settle_launched_child(
         self: Arc<Self>,
         kind: &'static str,
@@ -1364,65 +1398,368 @@ impl SchedulerService {
         auto_fix_on_failure: bool,
         mut record: TaskExecutionRecord,
         launched: Result<crate::scheduler_remote_agent::RemoteAgentLaunch, String>,
-    ) {
-        let execution_id = record.execution_id.clone();
+        relaunch: Option<crate::scheduler_limit_relaunch::RelaunchCtx>,
+    ) -> Option<tokio::task::JoinHandle<Settlement>> {
         match launched {
             Ok(launch) => {
-                if !launch.session_id.is_empty() {
-                    record.session_id = Some(launch.session_id.clone());
-                }
-                info!(
-                    "Scheduler: launched {} task '{}' in-binary (session_id={:?}, cwd={}, log={:?})",
-                    kind, task_name, launch.session_id, launch.workdir, launch.log_path
-                );
-
-                if let Ok(pg) = self.pg() {
-                    if let Err(e) = pg.insert_execution_record(&task_id, &record).await {
-                        error!("Failed to insert initial running execution record: {}", e);
-                    }
-                    if let Err(e) = pg
-                        .update_task_last_run(&task_id, Some(&record.execution_id))
-                        .await
-                    {
-                        error!("Failed to update task last_run: {}", e);
-                    }
-                }
-
-                // The child exists — that is "first successful start".
-                self.clear_launch_failure_counter(&task_id).await;
-
+                self.record_child_started(
+                    kind,
+                    &task_id,
+                    &task_name,
+                    &mut record,
+                    &launch.session_id,
+                    &launch.workdir,
+                    launch.log_path.as_deref(),
+                )
+                .await;
                 let service = self.clone();
-                let completion = launch.completion;
-                tokio::spawn(async move {
-                    let started = tokio::time::Instant::now();
-                    let outcome = completion.await;
-                    info!(
-                        "Scheduler: {} task '{}' child ended (success={}, exit_code={:?}, timed_out={}, took {:?})",
-                        kind,
-                        task_name,
-                        outcome.success,
-                        outcome.exit_code,
-                        outcome.timed_out,
-                        started.elapsed()
-                    );
+                Some(tokio::spawn(async move {
                     service
-                        .finalize_async_execution(
+                        .settle_attempts(
+                            kind,
                             task_id,
                             task_name,
-                            execution_id,
-                            record,
-                            outcome.success,
-                            outcome.error,
                             auto_fix_on_failure,
+                            record,
+                            launch,
+                            relaunch,
                         )
-                        .await;
-                });
+                        .await
+                }))
             }
             Err(e) => {
                 self.record_launch_failure(&task_id, &task_name, record, auto_fix_on_failure, e)
                     .await;
+                None
             }
         }
+    }
+
+    /// The child exists: insert its `Running` row, stamp `last_run`, and clear
+    /// the launch-failure streak ("first successful start").
+    async fn record_child_started(
+        &self,
+        kind: &'static str,
+        task_id: &str,
+        task_name: &str,
+        record: &mut TaskExecutionRecord,
+        // The launch's identity, by its fields: a `&RemoteAgentLaunch` held
+        // across an await would make the settle task non-`Send` (its
+        // completion future is `Send` but not `Sync`).
+        session_id: &str,
+        workdir: &str,
+        log_path: Option<&std::path::Path>,
+    ) {
+        if !session_id.is_empty() {
+            record.session_id = Some(session_id.to_string());
+        }
+        info!(
+            "Scheduler: launched {} task '{}' in-binary (session_id={:?}, cwd={}, log={:?})",
+            kind, task_name, session_id, workdir, log_path
+        );
+
+        if let Ok(pg) = self.pg() {
+            if let Err(e) = pg.insert_execution_record(task_id, record).await {
+                error!("Failed to insert initial running execution record: {}", e);
+            }
+            if let Err(e) = pg
+                .update_task_last_run(task_id, Some(&record.execution_id))
+                .await
+            {
+                error!("Failed to update task last_run: {}", e);
+            }
+        }
+
+        self.clear_launch_failure_counter(task_id).await;
+    }
+
+    /// Await the child and settle its row. A `RemoteAgent` attempt that died
+    /// on a CONFIRMED account limit (`outcome.rate_limited`, and a cooldown
+    /// the probe, a banner reset or a specific banner vouches for) is NOT
+    /// handed to [`Self::finalize_async_execution`]: its account is cooled
+    /// until its reset, its row is closed with the limit error, and the slot
+    /// is relaunched as a NEW execution (own row, own log) under a fresh pick
+    /// — or, when no account remains, the row also says why
+    /// ([`RelaunchDecision::message`]) and `next_run` moves only to a KNOWN
+    /// reset ([`next_run_after_limit`]). A limited attempt never launches an
+    /// auto-fix session: auto-fix would spawn into the same exhausted pool.
+    ///
+    /// A catch-all limit phrase nothing confirms is a plain failure: nothing
+    /// cooled, nothing relaunched, and the row says the phrase was seen.
+    ///
+    /// [`RelaunchDecision::message`]: crate::scheduler_limit_relaunch::RelaunchDecision::message
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_attempts(
+        self: Arc<Self>,
+        kind: &'static str,
+        task_id: String,
+        task_name: String,
+        auto_fix_on_failure: bool,
+        mut record: TaskExecutionRecord,
+        mut launch: crate::scheduler_remote_agent::RemoteAgentLaunch,
+        relaunch: Option<crate::scheduler_limit_relaunch::RelaunchCtx>,
+    ) -> Settlement {
+        use crate::scheduler_limit_relaunch::{decide, RelaunchDecision};
+
+        let mut settlement = Settlement::default();
+        let mut tried: Vec<String> = Vec::new();
+        let mut known_resets: std::collections::HashMap<String, DateTime<Utc>> =
+            std::collections::HashMap::new();
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let started = tokio::time::Instant::now();
+            let outcome = launch.completion.await;
+            info!(
+                "Scheduler: {} task '{}' child ended (success={}, exit_code={:?}, timed_out={}, rate_limited={}, took {:?})",
+                kind,
+                task_name,
+                outcome.success,
+                outcome.exit_code,
+                outcome.timed_out,
+                outcome.rate_limited.is_some(),
+                started.elapsed()
+            );
+            let execution_id = record.execution_id.clone();
+
+            let Some(limited) = outcome.rate_limited.clone() else {
+                let row = self
+                    .finalize_async_execution(
+                        task_id,
+                        task_name,
+                        execution_id,
+                        record,
+                        outcome.success,
+                        outcome.error,
+                        auto_fix_on_failure,
+                    )
+                    .await;
+                settlement.rows.push(row);
+                return settlement;
+            };
+
+            // Cool the account THIS child ran under, until its real reset.
+            let cooled = match limited.account.as_deref() {
+                Some(dir) => Some(self.limit_recovery.cool(dir, &limited.hit).await),
+                None => None,
+            };
+            let confirmed = match &cooled {
+                Some(c) => c.cooling.is_some(),
+                // Nothing to probe: only the banner itself can confirm.
+                None => limited.hit.is_specific() || limited.hit.banner_reset.is_some(),
+            };
+            if !confirmed {
+                let error = format!(
+                    "scheduled session exited with code {} (the usage-limit phrase '{}' appeared \
+                     in its log, but neither the usage probe nor a banner reset confirmed it)",
+                    outcome
+                        .exit_code
+                        .map_or_else(|| "UNKNOWN".to_string(), |c| c.to_string()),
+                    limited.hit.pattern
+                );
+                let row = self
+                    .finalize_async_execution(
+                        task_id,
+                        task_name,
+                        execution_id,
+                        record,
+                        false,
+                        Some(error),
+                        auto_fix_on_failure,
+                    )
+                    .await;
+                settlement.rows.push(row);
+                return settlement;
+            }
+            let known = cooled
+                .as_ref()
+                .and_then(|c| c.cooling.as_ref())
+                .and_then(|c| c.known_reset());
+            if let Some(dir) = limited.account.as_deref() {
+                settlement.cooled.push(dir.to_string());
+                if !tried.iter().any(|t| t == dir) {
+                    tried.push(dir.to_string());
+                }
+                if let Some(t) = known {
+                    known_resets.insert(dir.to_string(), t);
+                }
+            }
+            let mut error = crate::scheduler_remote_agent::limit_error(
+                limited.account.as_deref(),
+                known.or(limited.hit.banner_reset),
+            );
+
+            let (ctx, probe, dir) = match (&relaunch, cooled, limited.account.as_deref()) {
+                (Some(ctx), Some(cooled), Some(dir)) => (ctx, cooled.probe, dir),
+                // An ambient-account child cooled nothing, so a relaunch
+                // would land on the same account: the slot ends here, on its
+                // cron cadence (no known reset to schedule against).
+                _ => {
+                    warn!("Scheduler: {} task '{}': {}", kind, task_name, error);
+                    let row = self
+                        .finalize_limited_execution(&task_id, &execution_id, record, error, None)
+                        .await;
+                    settlement.rows.push(row);
+                    return settlement;
+                }
+            };
+
+            let roster = self.limit_recovery.roster(&probe, &tried);
+            let decision = decide(&roster, &tried, attempts, &known_resets, Utc::now());
+            if let RelaunchDecision::Relaunch { account } = &decision {
+                record.complete(false, Some(error));
+                self.write_completed_row(&execution_id, &record).await;
+                settlement.rows.push(record);
+
+                let mut next = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+                if let Some(ref c) = ctx.catch_up {
+                    c.apply(&mut next);
+                }
+                let mut spec = ctx.spec.clone();
+                spec.execution_id = next.execution_id.clone();
+                info!(
+                    "Scheduler: {} task '{}' hit an account limit; relaunching the slot on {} (attempt {}, tried: {:?})",
+                    kind,
+                    task_name,
+                    account,
+                    attempts + 1,
+                    tried
+                );
+                match self
+                    .limit_recovery
+                    .relaunch_on(spec, ctx.bound_port, account.clone())
+                    .await
+                {
+                    Ok(l) => {
+                        self.record_child_started(
+                            kind,
+                            &task_id,
+                            &task_name,
+                            &mut next,
+                            &l.session_id,
+                            &l.workdir,
+                            l.log_path.as_deref(),
+                        )
+                        .await;
+                        record = next;
+                        launch = l;
+                        continue;
+                    }
+                    Err(e) => {
+                        // A relaunch that cannot start is a LaunchFailed,
+                        // backed off as any other. No auto-fix: the cause is a
+                        // starved account pool, not a code defect.
+                        let mut failed = next.clone();
+                        failed.mark_launch_failed(Some(e.clone()));
+                        settlement.rows.push(failed);
+                        self.record_launch_failure(&task_id, &task_name, next, false, e)
+                            .await;
+                        return settlement;
+                    }
+                }
+            }
+
+            let row = self
+                .finalize_limited_execution(
+                    &task_id,
+                    &execution_id,
+                    record,
+                    error,
+                    Some((&decision, dir)),
+                )
+                .await;
+            settlement.rows.push(row);
+            settlement.decision = Some(decision);
+            return settlement;
+        }
+    }
+
+    /// UPDATE a settled row (no-op without PG).
+    async fn write_completed_row(&self, execution_id: &str, record: &TaskExecutionRecord) {
+        if let Ok(pg) = self.pg() {
+            if let Err(e) = pg.update_execution_record(execution_id, record).await {
+                error!("Failed to update execution record on completion: {}", e);
+            }
+        }
+    }
+
+    /// Close the LAST attempt of a limited slot: `next_run` per
+    /// [`next_run_after_limit`] FIRST, then the row as a failure with `error`
+    /// plus the decision's suffix rendered against the override actually
+    /// stored (so the row and `next_run` never disagree), no auto-fix, and
+    /// the running slot released. `limited` is the decision and the dir the
+    /// last attempt ran under.
+    async fn finalize_limited_execution(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+        mut record: TaskExecutionRecord,
+        mut error: String,
+        limited: Option<(&crate::scheduler_limit_relaunch::RelaunchDecision, &str)>,
+    ) -> TaskExecutionRecord {
+        let decision = limited.map(|(d, _)| d);
+        let applied = self.write_next_run_after_limit(task_id, decision).await;
+        if let Some((d, dir)) = limited {
+            // `None`: the task could not be read or the write did not land, so
+            // nothing of ours is in `next_run` and the row claims no time
+            // (review round 4 A1).
+            let applied = applied.flatten();
+            if let Some(suffix) = d.message(dir, applied) {
+                error.push_str("; ");
+                error.push_str(&suffix);
+            }
+            warn!("Scheduler: task {}: {}", task_id, error);
+        }
+        record.complete(false, Some(error));
+        self.write_completed_row(execution_id, &record).await;
+        let mut running = self.running_tasks.write().await;
+        running.retain(|id| id != task_id);
+        record
+    }
+
+    /// Store [`next_run_after_limit`]'s value as the task's `next_run`
+    /// (conditional on the task's `modified_at`, like every other next_run
+    /// write). Returns the override that value carries
+    /// ([`limit_override`]: `Some(None)` means the cron slot stands) only when
+    /// the write LANDED; `None` when the task could not be read or the write
+    /// did not land ([`override_if_stored`]), so the caller renders only what
+    /// it can vouch for.
+    async fn write_next_run_after_limit(
+        &self,
+        task_id: &str,
+        decision: Option<&crate::scheduler_limit_relaunch::RelaunchDecision>,
+    ) -> Option<Option<DateTime<Utc>>> {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(e) => {
+                error!("write_next_run_after_limit: {}", e);
+                return None;
+            }
+        };
+        let task = match pg.get_scheduled_task(task_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                error!("Task not found for next_run update: {}", task_id);
+                return None;
+            }
+            Err(e) => {
+                error!("Failed to load task for next_run update: {}", e);
+                return None;
+            }
+        };
+        let zone = self.schedule_zone().await;
+        let now = Utc::now();
+        let applied = limit_override(&task, decision, now, zone);
+        let next = next_run_after_limit(&task, decision, now, zone);
+        let written = pg
+            .update_task_next_run(task_id, next.as_deref(), &task.modified_at)
+            .await;
+        match &written {
+            Ok(true) => {}
+            Ok(false) => debug!("next_run for task {task_id} left to a concurrent edit"),
+            Err(e) => error!("Failed to update task next_run: {}", e),
+        }
+        override_if_stored(&written, applied)
     }
 
     /// Poll `task_runs` until the given workflow leaves the `running` state,
@@ -1546,7 +1883,7 @@ impl SchedulerService {
         success: bool,
         error_message: Option<String>,
         auto_fix_on_failure: bool,
-    ) {
+    ) -> TaskExecutionRecord {
         record.complete(success, error_message);
 
         if !success && auto_fix_on_failure {
@@ -1563,16 +1900,13 @@ impl SchedulerService {
             }
         }
 
-        if let Ok(pg) = self.pg() {
-            if let Err(e) = pg.update_execution_record(&execution_id, &record).await {
-                error!("Failed to update execution record on completion: {}", e);
-            }
-        }
+        self.write_completed_row(&execution_id, &record).await;
 
         self.update_task_next_run_db(&task_id).await;
 
         let mut running = self.running_tasks.write().await;
         running.retain(|id| id != &task_id);
+        record
     }
 
     /// Update the next_run time for a task (DB-backed)
@@ -1969,6 +2303,48 @@ After making fixes, run tests if applicable to verify the fixes work."#
     // ========================================================================
     // Condition Checking
     // ========================================================================
+}
+
+/// The `next_run` a limited slot that was not relaunched stores — the value
+/// [`SchedulerService::write_next_run_after_limit`] hands verbatim to
+/// `update_task_next_run`. A KNOWN reset from the decision overrides the cron
+/// slot ([`crate::scheduler_limit_relaunch::NextAttempt::override_for`]);
+/// otherwise the cron slot stands. Never a guessed cooldown expiry.
+fn next_run_after_limit(
+    task: &ScheduledTask,
+    decision: Option<&crate::scheduler_limit_relaunch::RelaunchDecision>,
+    now: DateTime<Utc>,
+    zone: ScheduleZone,
+) -> Option<String> {
+    match limit_override(task, decision, now, zone) {
+        Some(at) => Some(at.to_rfc3339()),
+        None => task_next_run_rfc3339(task, now, zone),
+    }
+}
+
+/// What [`SchedulerService::write_next_run_after_limit`] may report as stored:
+/// `Some(applied)` only when `update_task_next_run` answered `Ok(true)`. A
+/// concurrent edit that kept its own value (`Ok(false)`) or a failed write
+/// (`Err`) stored nothing of ours, so the answer is `None` and the row says
+/// the next attempt is UNKNOWN (review round 3 A2, round 4 A1).
+fn override_if_stored<E>(
+    written: &Result<bool, E>,
+    applied: Option<DateTime<Utc>>,
+) -> Option<Option<DateTime<Utc>>> {
+    matches!(written, Ok(true)).then_some(applied)
+}
+
+/// The KNOWN reset that replaces `task`'s cron slot after a limit, if any
+/// ([`crate::scheduler_limit_relaunch::RelaunchDecision::next_run_override`]
+/// against the cron slot as of `now`). `None`: the cron slot stands.
+fn limit_override(
+    task: &ScheduledTask,
+    decision: Option<&crate::scheduler_limit_relaunch::RelaunchDecision>,
+    now: DateTime<Utc>,
+    zone: ScheduleZone,
+) -> Option<DateTime<Utc>> {
+    let cron = compute_task_next_run(task, now, zone).ok().flatten();
+    decision.and_then(|d| d.next_run_override(cron))
 }
 
 /// Combine the schedule's natural next-run time with a launch-failure
@@ -3047,7 +3423,7 @@ mod tests {
     /// is on localhost (sub-ms), so the extra serialization against other env
     /// tests in the binary is negligible — and correctness (no cross-module
     /// env race) is worth it.
-    fn restore_port() -> EnvVarRestore {
+    pub(super) fn restore_port() -> EnvVarRestore {
         EnvVarRestore::capture(&["QONTINUI_PORT"])
     }
 
@@ -3055,7 +3431,7 @@ mod tests {
     /// the most recent `/prompts/run` body and replies with `response`.
     /// Returns `(port, captured_body)` so the test can assert on the body
     /// after `launch_prompt` returns.
-    async fn spawn_prompts_run_mock(
+    pub(super) async fn spawn_prompts_run_mock(
         response: axum::response::Response,
     ) -> (u16, Arc<tokio::sync::Mutex<Option<serde_json::Value>>>) {
         use axum::{extract::State, routing::post, Router};
@@ -3098,7 +3474,7 @@ mod tests {
         (port, captured)
     }
 
-    fn ok_response(body: serde_json::Value) -> axum::response::Response {
+    pub(super) fn ok_response(body: serde_json::Value) -> axum::response::Response {
         axum::response::Response::builder()
             .status(200)
             .header("content-type", "application/json")
@@ -3548,7 +3924,7 @@ mod tests {
         compute_next_run, schedule_expression_default, scheduled_task_type_default,
     };
 
-    fn fixture_task(base_backoff: u32) -> ScheduledTask {
+    pub(super) fn fixture_task(base_backoff: u32) -> ScheduledTask {
         let mut task = ScheduledTask::new(
             "Phase C fixture".to_string(),
             None,
@@ -4399,5 +4775,641 @@ mod tests {
             lost_race.contains("return;"),
             "a lost race must record nothing"
         );
+    }
+
+    // ========================================================================
+    // Plan `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`:
+    // a RemoteAgent attempt that dies on an account limit cools the account
+    // it ran under and relaunches the slot, through the real settle path
+    // (`settle_launched_child` → `settle_attempts`) with a fake
+    // `LimitRecovery` in place of the probe, picker and spawn. Outcomes are
+    // struct literals, so these tests enter only through the settle path;
+    // `classify_exit`'s own grammar is pinned in `scheduler_remote_agent`.
+    // ========================================================================
+}
+
+/// Phase 1 limit-relaunch tests. A top-level test module (not nested in
+/// `tests`) so the arming check can attribute its entry call to
+/// `settle_launched_child`.
+#[cfg(test)]
+mod limit_relaunch {
+    use super::tests::{fixture_task, ok_response, restore_port, spawn_prompts_run_mock};
+    use super::*;
+    use crate::ai_provider::limit_hit::{CoolOutcome, Cooling, LimitHit, ResetSource};
+    use crate::commands::ai_settings::AccountUsageInfo;
+    use crate::scheduler_limit_relaunch::{
+        AccountAvailability, LimitRecovery, RelaunchCtx, Roster,
+    };
+    use crate::scheduler_remote_agent::{
+        RateLimited, RemoteAgentLaunch, RemoteAgentOutcome, RemoteAgentSpec,
+    };
+    use crate::test_env::env_lock;
+    use chrono::TimeZone;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const PAKTIS: &str = "/h/.claude-paktis";
+    const BEN: &str = "/h/.claude-ben";
+
+    fn weekly_reset() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2099, 11, 18, 21, 0, 0).unwrap()
+    }
+
+    /// A child that exited 1 on a weekly-limit banner, run under `dir`.
+    /// Built as a literal, not through `classify_exit`, so the arming
+    /// test enters only where the population does: `settle_launched_child`.
+    /// `classify_exit`'s own grammar is pinned in `scheduler_remote_agent`.
+    fn limited(dir: &str) -> RemoteAgentOutcome {
+        RemoteAgentOutcome {
+            success: false,
+            error: Some(format!(
+                "scheduled session hit the usage limit of {dir} (resets 2099-11-18T21:00:00Z)"
+            )),
+            exit_code: Some(1),
+            timed_out: false,
+            rate_limited: Some(RateLimited {
+                account: Some(dir.to_string()),
+                hit: crate::ai_provider::limit_hit::LimitHit {
+                    pattern: "hit your weekly limit",
+                    banner_reset: Some(weekly_reset()),
+                },
+            }),
+        }
+    }
+
+    fn plain_failure() -> RemoteAgentOutcome {
+        RemoteAgentOutcome {
+            success: false,
+            error: Some("scheduled session exited with code 1".into()),
+            exit_code: Some(1),
+            timed_out: false,
+            rate_limited: None,
+        }
+    }
+
+    fn success() -> RemoteAgentOutcome {
+        RemoteAgentOutcome {
+            success: true,
+            error: None,
+            exit_code: Some(0),
+            timed_out: false,
+            rate_limited: None,
+        }
+    }
+
+    fn launch_of(outcome: RemoteAgentOutcome) -> RemoteAgentLaunch {
+        RemoteAgentLaunch {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            workdir: "/tmp".into(),
+            log_path: None,
+            completion: Box::pin(async move { outcome }),
+        }
+    }
+
+    fn spec() -> RemoteAgentSpec {
+        RemoteAgentSpec {
+            task_name: "dev-ops-steward".into(),
+            execution_id: String::new(),
+            prompt: "/dev-ops-steward --scheduled".into(),
+            working_directory: None,
+            model: None,
+            allowed_tools: vec![],
+            mcp_connections: vec![],
+            max_turns: 50,
+            timeout: Duration::from_secs(600),
+        }
+    }
+
+    /// A roster of accounts that start usable unless named exhausted
+    /// (with a probe reset); `cool` marks the dir cooled until
+    /// `weekly_reset()`; `relaunch` replays queued outcomes.
+    struct Fake {
+        dirs: Vec<&'static str>,
+        probe_exhausted: Vec<(&'static str, DateTime<Utc>)>,
+        /// `false`: the probe confirms nothing, so `cool` cools nothing.
+        confirms: bool,
+        cool_calls: Mutex<Vec<String>>,
+        cooled: Mutex<Vec<String>>,
+        relaunched: Mutex<Vec<RemoteAgentSpec>>,
+        queued: Mutex<VecDeque<RemoteAgentOutcome>>,
+    }
+
+    impl Fake {
+        fn new(dirs: Vec<&'static str>) -> Self {
+            Self {
+                dirs,
+                probe_exhausted: vec![],
+                confirms: true,
+                cool_calls: Mutex::new(vec![]),
+                cooled: Mutex::new(vec![]),
+                relaunched: Mutex::new(vec![]),
+                queued: Mutex::new(VecDeque::new()),
+            }
+        }
+    }
+
+    impl LimitRecovery for Fake {
+        fn cool<'a>(
+            &'a self,
+            dir: &'a str,
+            _hit: &'a LimitHit,
+        ) -> futures::future::BoxFuture<'a, CoolOutcome> {
+            self.cool_calls.lock().unwrap().push(dir.to_string());
+            let until = weekly_reset();
+            let cooling = self.confirms.then(|| {
+                self.cooled.lock().unwrap().push(dir.to_string());
+                Cooling {
+                    duration: (until - Utc::now()).to_std().unwrap(),
+                    until,
+                    source: ResetSource::SevenDayProbe,
+                }
+            });
+            Box::pin(async move {
+                CoolOutcome {
+                    cooling,
+                    probe: Vec::<AccountUsageInfo>::new(),
+                }
+            })
+        }
+
+        fn roster(&self, _probe: &[AccountUsageInfo], _tried: &[String]) -> Roster {
+            let cooled = self.cooled.lock().unwrap().clone();
+            Roster {
+                accounts: self
+                    .dirs
+                    .iter()
+                    .map(|d| {
+                        let probe_reset = self
+                            .probe_exhausted
+                            .iter()
+                            .find(|(x, _)| x == d)
+                            .map(|(_, t)| *t);
+                        AccountAvailability {
+                            dir: d.to_string(),
+                            valid_credentials: true,
+                            cooled_for: cooled
+                                .iter()
+                                .any(|c| c == d)
+                                .then(|| (weekly_reset() - Utc::now()).to_std().unwrap()),
+                            known_exhausted: probe_reset.is_some(),
+                            probe_failed: false,
+                            known_reset: probe_reset,
+                        }
+                    })
+                    .collect(),
+                picker_block: None,
+            }
+        }
+
+        fn relaunch_on(
+            &self,
+            spec: RemoteAgentSpec,
+            _bound_port: Option<u16>,
+            _account: String,
+        ) -> futures::future::BoxFuture<'static, Result<RemoteAgentLaunch, String>> {
+            self.relaunched.lock().unwrap().push(spec);
+            let next = self
+                .queued
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a relaunch nobody queued an outcome for");
+            Box::pin(async move { Ok(launch_of(next)) })
+        }
+    }
+
+    async fn settle(
+        fake: Arc<Fake>,
+        first: RemoteAgentOutcome,
+        auto_fix_on_failure: bool,
+    ) -> Settlement {
+        let mut service = SchedulerService::new(None);
+        service.limit_recovery = fake;
+        let service = Arc::new(service);
+        assert!(service.try_mark_running("task-1").await);
+        let record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        // Qualified call: the production entry, attributable by path.
+        let handle = SchedulerService::settle_launched_child(
+            service.clone(),
+            "RemoteAgent",
+            "task-1".into(),
+            "dev-ops-steward".into(),
+            auto_fix_on_failure,
+            record,
+            Ok(launch_of(first)),
+            Some(RelaunchCtx {
+                spec: spec(),
+                bound_port: None,
+                catch_up: None,
+            }),
+        )
+        .await
+        .expect("a launched child is settled by a detached task");
+        let settlement = handle.await.expect("settle task panicked");
+        assert!(
+            !service.is_task_running("task-1").await,
+            "the slot is released once settled"
+        );
+        settlement
+    }
+
+    /// THE ARMING TEST: red against `main`, where a limited child is just
+    /// "exited with code 1", nothing is cooled and nothing relaunched.
+    #[tokio::test]
+    async fn a_limited_attempt_cools_its_own_dir_and_relaunches_the_slot_elsewhere() {
+        let fake = Arc::new(Fake::new(vec![PAKTIS, BEN]));
+        fake.queued.lock().unwrap().push_back(success());
+        let s = settle(fake.clone(), limited(PAKTIS), false).await;
+
+        // (d) the dir cooled is the one the CHILD ran under — carried on
+        // its outcome from its own spawn preconditions, not the global.
+        assert_eq!(*fake.cooled.lock().unwrap(), vec![PAKTIS.to_string()]);
+        assert_eq!(s.cooled, vec![PAKTIS.to_string()]);
+
+        // One relaunch, as a NEW execution with its own row.
+        let relaunched = fake.relaunched.lock().unwrap().clone();
+        assert_eq!(relaunched.len(), 1);
+        assert_eq!(s.rows.len(), 2);
+        assert_ne!(s.rows[0].execution_id, s.rows[1].execution_id);
+        assert_eq!(relaunched[0].execution_id, s.rows[1].execution_id);
+
+        assert!(!s.rows[0].success);
+        assert_eq!(
+            s.rows[0].error_message.as_deref(),
+            Some("scheduled session hit the usage limit of /h/.claude-paktis (resets 2099-11-18T21:00:00Z)")
+        );
+        assert!(s.rows[1].success);
+        assert_eq!(s.decision, None, "a relaunched slot moves no next_run");
+    }
+
+    /// (c) Relaunch excludes the cooled dir; when the relaunch ALSO hits
+    /// a limit, no account remains and the slot waits for the soonest reset.
+    #[tokio::test]
+    async fn every_account_limited_stops_with_all_n_exhausted_and_the_soonest_reset() {
+        let fake = Arc::new(Fake::new(vec![PAKTIS, BEN]));
+        fake.queued.lock().unwrap().push_back(limited(BEN));
+        let s = settle(fake.clone(), limited(PAKTIS), false).await;
+
+        assert_eq!(
+            *fake.cooled.lock().unwrap(),
+            vec![PAKTIS.to_string(), BEN.to_string()]
+        );
+        assert_eq!(
+            fake.relaunched.lock().unwrap().len(),
+            1,
+            "bounded: no third attempt"
+        );
+        assert_eq!(s.rows.len(), 2);
+        let last = s.rows[1].error_message.as_deref().unwrap();
+        assert!(
+            last.ends_with(
+                "; all 2 accounts exhausted (tried: .claude-paktis, .claude-ben); next attempt at 2099-11-18T21:00:00Z"
+            ),
+            "{last}"
+        );
+        let decision = s.decision.expect("the slot ended on a decision");
+        assert_eq!(
+            decision.next_run_override(Some(Utc::now())),
+            Some(weekly_reset()),
+            "next_run moves to the soonest KNOWN reset, even past the cron slot"
+        );
+    }
+
+    /// Phase 0 (nawa): a pool the probe already shows exhausted is not
+    /// relaunched into at all — the record goes straight to "all N
+    /// accounts exhausted", next_run at the soonest PROBE reset.
+    #[tokio::test]
+    async fn a_probe_exhausted_pool_is_not_relaunched_and_waits_for_its_soonest_reset() {
+        let ben_reset = Utc.with_ymd_and_hms(2099, 11, 14, 20, 0, 0).unwrap();
+        let mut fake = Fake::new(vec![PAKTIS, BEN]);
+        fake.probe_exhausted = vec![(BEN, ben_reset)];
+        let fake = Arc::new(fake);
+        let s = settle(fake.clone(), limited(PAKTIS), false).await;
+
+        assert!(fake.relaunched.lock().unwrap().is_empty());
+        assert_eq!(s.rows.len(), 1);
+        assert!(s.rows[0]
+            .error_message
+            .as_deref()
+            .unwrap()
+            .ends_with("; all 2 accounts exhausted (tried: .claude-paktis); next attempt at 2099-11-14T20:00:00Z"));
+        assert_eq!(
+            s.decision.unwrap().next_run_override(Some(Utc::now())),
+            Some(ben_reset)
+        );
+    }
+
+    /// (b) A plain non-zero exit is settled as before: unchanged message,
+    /// nothing cooled, nothing relaunched.
+    #[tokio::test]
+    async fn a_plain_failure_is_unchanged_and_neither_cools_nor_relaunches() {
+        let fake = Arc::new(Fake::new(vec![PAKTIS, BEN]));
+        let s = settle(fake.clone(), plain_failure(), false).await;
+        assert!(fake.cooled.lock().unwrap().is_empty());
+        assert!(fake.relaunched.lock().unwrap().is_empty());
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(
+            s.rows[0].error_message.as_deref(),
+            Some("scheduled session exited with code 1")
+        );
+    }
+
+    /// A1: a catch-all phrase ("limit reached") in an unrelated failure's
+    /// stderr that the probe does not confirm and that states no reset is
+    /// a plain failure: nothing cooled, nothing relaunched.
+    #[tokio::test]
+    async fn an_unconfirmed_catch_all_phrase_neither_cools_nor_relaunches() {
+        let out = crate::scheduler_remote_agent::classify_exit(
+            Ok(Some(1)),
+            false,
+            Duration::from_secs(600),
+            Some("error: retry limit reached while fetching origin\n"),
+            Some(PAKTIS),
+        );
+        assert_eq!(
+            out.rate_limited.as_ref().unwrap().hit.pattern,
+            "limit reached"
+        );
+        let mut fake = Fake::new(vec![PAKTIS, BEN]);
+        fake.confirms = false;
+        let fake = Arc::new(fake);
+        fake.queued.lock().unwrap().push_back(success());
+        let s = settle(fake.clone(), out, false).await;
+
+        assert_eq!(*fake.cool_calls.lock().unwrap(), vec![PAKTIS.to_string()]);
+        assert!(fake.cooled.lock().unwrap().is_empty(), "nothing cooled");
+        assert!(s.cooled.is_empty());
+        assert!(
+            fake.relaunched.lock().unwrap().is_empty(),
+            "nothing relaunched"
+        );
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(
+            s.rows[0].error_message.as_deref(),
+            Some(
+                "scheduled session exited with code 1 (the usage-limit phrase 'limit reached' \
+                 appeared in its log, but neither the usage probe nor a banner reset confirmed it)"
+            )
+        );
+        assert_eq!(s.decision, None);
+    }
+
+    /// (e) A limited outcome never launches auto-fix, even with
+    /// `auto_fix_on_failure` set; a plain failure still does (control).
+    /// The auto-fix door is the real `/prompts/run`, mocked.
+    #[tokio::test]
+    async fn a_limited_outcome_never_launches_auto_fix() {
+        let _env_lock = env_lock();
+        let _env = restore_port();
+
+        let envelope = serde_json::to_value(crate::mcp::types::ApiResponse::success(
+            serde_json::json!({ "session_id": "sid-fix" }),
+        ))
+        .unwrap();
+        let (port, captured) = spawn_prompts_run_mock(ok_response(envelope.clone())).await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        // Pool exhausted after the first limit: the slot ends here.
+        let mut fake = Fake::new(vec![PAKTIS]);
+        fake.probe_exhausted = vec![];
+        let s = settle(Arc::new(fake), limited(PAKTIS), true).await;
+        assert!(
+            captured.lock().await.is_none(),
+            "auto-fix was launched for a limit hit"
+        );
+        assert!(s.rows[0].auto_fix_session_id.is_none());
+
+        // Control: the same task failing for a non-limit reason does.
+        let (port, captured) = spawn_prompts_run_mock(ok_response(envelope)).await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+        let s = settle(Arc::new(Fake::new(vec![PAKTIS])), plain_failure(), true).await;
+        assert!(
+            captured.lock().await.is_some(),
+            "control: a plain failure fires auto-fix"
+        );
+        assert_eq!(s.rows[0].auto_fix_session_id.as_deref(), Some("sid-fix"));
+    }
+
+    /// A2/A3/A8: the value the limited slot's writer hands verbatim to
+    /// `update_task_next_run`. A known reset overrides the cron slot; a
+    /// guess never does; a partly-known pool keeps only an earlier reset.
+    #[test]
+    fn the_next_run_written_after_a_limit_is_a_known_reset_or_the_cron_slot() {
+        use crate::scheduler_limit_relaunch::{NextAttempt, RelaunchDecision};
+        let mut task = fixture_task(0);
+        task.schedule = ScheduleExpression::Interval(3600);
+        let now = Utc::now();
+        let zone = ScheduleZone::Utc;
+        let cron = compute_task_next_run(&task, now, zone)
+            .unwrap()
+            .expect("an interval task has a next run");
+        let exhausted = |soonest_known, unknown_for: Vec<String>| RelaunchDecision::Exhausted {
+            exhausted: vec!["/a".into()],
+            tried: vec!["/a".into()],
+            probe_failed: vec![],
+            next_attempt: NextAttempt {
+                soonest_known,
+                unknown_for,
+            },
+        };
+        let cron_s = Some(cron.to_rfc3339());
+
+        // Every return known: the known reset, even days past the cron slot.
+        let later = cron + chrono::Duration::days(4);
+        assert_eq!(
+            next_run_after_limit(&task, Some(&exhausted(Some(later), vec![])), now, zone),
+            Some(later.to_rfc3339())
+        );
+        // Nothing known (a floor or unrelated cooldown): the cron slot.
+        assert_eq!(
+            next_run_after_limit(&task, Some(&exhausted(None, vec!["/a".into()])), now, zone),
+            cron_s
+        );
+        // Partly known: only an EARLIER-than-cron known reset is kept.
+        let earlier = cron - chrono::Duration::minutes(10);
+        assert_eq!(
+            next_run_after_limit(
+                &task,
+                Some(&exhausted(Some(earlier), vec!["/b".into()])),
+                now,
+                zone
+            ),
+            Some(earlier.to_rfc3339())
+        );
+        assert_eq!(
+            next_run_after_limit(
+                &task,
+                Some(&exhausted(Some(later), vec!["/b".into()])),
+                now,
+                zone
+            ),
+            cron_s
+        );
+        // No decision (an ambient-account hit): the cron slot.
+        assert_eq!(next_run_after_limit(&task, None, now, zone), cron_s);
+    }
+
+    /// [`Fake`] with some accounts' probes FAILED, recording the account
+    /// each relaunch was pinned to.
+    struct Pinning {
+        inner: Arc<Fake>,
+        failed: Vec<&'static str>,
+        pinned: Mutex<Vec<String>>,
+    }
+
+    impl LimitRecovery for Pinning {
+        fn cool<'a>(
+            &'a self,
+            dir: &'a str,
+            hit: &'a LimitHit,
+        ) -> futures::future::BoxFuture<'a, CoolOutcome> {
+            self.inner.cool(dir, hit)
+        }
+
+        fn roster(&self, probe: &[AccountUsageInfo], tried: &[String]) -> Roster {
+            let mut r = self.inner.roster(probe, tried);
+            for a in &mut r.accounts {
+                a.probe_failed = self.failed.contains(&a.dir.as_str());
+            }
+            r
+        }
+
+        fn relaunch_on(
+            &self,
+            spec: RemoteAgentSpec,
+            bound_port: Option<u16>,
+            account: String,
+        ) -> futures::future::BoxFuture<'static, Result<RemoteAgentLaunch, String>> {
+            self.pinned.lock().unwrap().push(account.clone());
+            self.inner.relaunch_on(spec, bound_port, account)
+        }
+    }
+
+    /// Review round 2 A1, through the settle path: with one probe-FAILED
+    /// account among uncooled probe-EXHAUSTED ones, the relaunch is
+    /// pinned to the failed one — never left to a picker whose snapshot
+    /// reads a failed probe as exhausted and falls back to an exhausted
+    /// account.
+    #[tokio::test]
+    async fn a_relaunch_is_pinned_to_the_probe_failed_account_not_an_exhausted_one() {
+        const HOTMAIL: &str = "/h/.claude-hotmail";
+        const NIKLAS: &str = "/h/.claude-niklas";
+        let reset = Utc.with_ymd_and_hms(2099, 11, 14, 20, 0, 0).unwrap();
+        let mut fake = Fake::new(vec![PAKTIS, BEN, HOTMAIL, NIKLAS]);
+        fake.probe_exhausted = vec![(BEN, reset), (HOTMAIL, reset)];
+        fake.queued.lock().unwrap().push_back(success());
+        let pinning = Arc::new(Pinning {
+            inner: Arc::new(fake),
+            failed: vec![NIKLAS],
+            pinned: Mutex::new(vec![]),
+        });
+
+        let mut service = SchedulerService::new(None);
+        service.limit_recovery = pinning.clone();
+        let service = Arc::new(service);
+        assert!(service.try_mark_running("task-1").await);
+        let s = service
+            .clone()
+            .settle_launched_child(
+                "RemoteAgent",
+                "task-1".into(),
+                "dev-ops-steward".into(),
+                false,
+                <TaskExecutionRecord as TaskExecutionRecordExt>::new(),
+                Ok(launch_of(limited(PAKTIS))),
+                Some(RelaunchCtx {
+                    spec: spec(),
+                    bound_port: None,
+                    catch_up: None,
+                }),
+            )
+            .await
+            .expect("a launched child is settled by a detached task")
+            .await
+            .expect("settle task panicked");
+
+        assert_eq!(*pinning.pinned.lock().unwrap(), vec![NIKLAS.to_string()]);
+        assert_eq!(s.rows.len(), 2);
+        assert!(s.rows[1].success);
+    }
+
+    /// Review round 3 A2: only a write that LANDED is reported as stored.
+    /// A lost race or a failed write stores nothing of ours, so the row
+    /// must not claim "next attempt at T" for it.
+    #[test]
+    fn only_a_landed_next_run_write_is_reported_as_stored() {
+        let t = Utc.with_ymd_and_hms(2099, 11, 14, 20, 0, 0).unwrap();
+        assert_eq!(
+            override_if_stored::<String>(&Ok(true), Some(t)),
+            Some(Some(t))
+        );
+        assert_eq!(override_if_stored::<String>(&Ok(true), None), Some(None));
+        assert_eq!(override_if_stored::<String>(&Ok(false), Some(t)), None);
+        assert_eq!(
+            override_if_stored(&Err("db down".to_string()), Some(t)),
+            None
+        );
+
+        // And what the row then says: a lost write renders UNKNOWN, not
+        // "at T", for a partly-known pool and an all-known one alike.
+        let d = crate::scheduler_limit_relaunch::RelaunchDecision::Exhausted {
+            exhausted: vec!["/a".into()],
+            tried: vec!["/a".into()],
+            probe_failed: vec![],
+            next_attempt: crate::scheduler_limit_relaunch::NextAttempt {
+                soonest_known: Some(t),
+                unknown_for: vec!["/b".into()],
+            },
+        };
+        let shown = override_if_stored::<String>(&Ok(false), Some(t)).flatten();
+        assert!(d
+            .message("/a", shown)
+            .unwrap()
+            .contains("next attempt UNKNOWN (no known reset for: b"));
+        let all_known = crate::scheduler_limit_relaunch::RelaunchDecision::Exhausted {
+            exhausted: vec!["/a".into()],
+            tried: vec!["/a".into()],
+            probe_failed: vec![],
+            next_attempt: crate::scheduler_limit_relaunch::NextAttempt {
+                soonest_known: Some(t),
+                unknown_for: vec![],
+            },
+        };
+        let lost = all_known
+            .message(
+                "/a",
+                override_if_stored(&Err("db down".to_string()), Some(t)).flatten(),
+            )
+            .unwrap();
+        assert!(lost.ends_with("; next attempt UNKNOWN"), "{lost}");
+    }
+
+    /// A8: the limited slot's DB path is `write_next_run_after_limit`,
+    /// which writes exactly `next_run_after_limit`'s value. Pinned at the
+    /// source so a refactor cannot route the settle path past it.
+    #[test]
+    fn the_limited_settle_path_writes_next_run_through_next_run_after_limit() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, writer) = src
+            .split_once("async fn write_next_run_after_limit(")
+            .expect("writer");
+        let writer = writer.split_once("\n    }\n").expect("writer body").0;
+        assert!(writer.contains("let next = next_run_after_limit(&task, decision, now, zone);"));
+        assert!(writer.contains("let applied = limit_override(&task, decision, now, zone);"));
+        assert!(
+            writer.contains(".update_task_next_run(task_id, next.as_deref(), &task.modified_at)")
+        );
+        assert!(writer.contains("override_if_stored(&written, applied)"));
+        let (_, fin) = src
+            .split_once("async fn finalize_limited_execution(")
+            .expect("finalize");
+        let fin = fin.split_once("\n    }\n").expect("finalize body").0;
+        assert!(fin.contains("self.write_next_run_after_limit(task_id, decision).await;"));
+        // The row's suffix is rendered against the override just stored,
+        // and nothing else: no fallback may claim a time never stored.
+        assert!(fin.contains("let applied = applied.flatten();"));
+        assert!(fin.contains("d.message(dir, applied)"));
+        assert!(!fin.contains("certain_override"));
     }
 }
