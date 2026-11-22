@@ -144,7 +144,7 @@ fn evaluate_ir_classified(
     ir: &qontinui_types::ir::IrPageSpec,
     fingerprint: qontinui_types::spec_check::BridgeFingerprint,
     snapshot_id: String,
-    content_sha256: String,
+    content_sha256: Option<String>,
     app_option: Option<&qontinui_types::apps::App>,
 ) -> SpecCheckResult {
     let mut result =
@@ -222,7 +222,7 @@ pub(crate) fn evaluate_loaded(
         &loaded.ir,
         fingerprint,
         format!("scs_inproc_{}", uuid::Uuid::now_v7()),
-        String::new(),
+        None,
         loaded.app.as_ref(),
     )
 }
@@ -240,7 +240,9 @@ pub(crate) fn evaluate_loaded(
 /// `spec_check::wrap_snapshot` (which mints `snapshot_id = "scs_" + UUIDv7()`
 /// plus a content sha256 and a `BridgeFingerprint`).
 ///
-/// Return: `(snapshot, fingerprint, snapshot_id, content_sha256)`.
+/// Return: `(snapshot, fingerprint, snapshot_id, content_sha256)`, where
+/// `content_sha256` is `None` when the canonical hasher refused the body
+/// (non-fatal: telemetry only) or the path hashes nothing.
 pub(crate) async fn fetch_fresh_snapshot(
     state: &Arc<ApiState>,
 ) -> Result<
@@ -248,7 +250,7 @@ pub(crate) async fn fetch_fresh_snapshot(
         UIBridgeSnapshot,
         qontinui_types::spec_check::BridgeFingerprint,
         String,
-        String,
+        Option<String>,
     ),
     spec_check::SnapshotFetchError,
 > {
@@ -300,10 +302,9 @@ pub(crate) async fn fetch_fresh_snapshot(
             let snapshot = parse_supplied_snapshot(inner).map_err(|e| {
                 spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot parse: {e}"))
             })?;
-            let content_sha256 =
-                qontinui_types::canonical_hash::canonical_hash(&value).map_err(|e| {
-                    spec_check::SnapshotFetchError::Malformed(format!("canonical hash: {e}"))
-                })?;
+            // Telemetry only: a canonicalisation refusal yields `None` (and
+            // a warn!), never a failed fetch.
+            let content_sha256 = spec_check::snapshot_telemetry_hash(&value);
             let snapshot_timestamp =
                 chrono::DateTime::<chrono::Utc>::from_timestamp_millis(snapshot.timestamp)
                     .ok_or_else(|| {
@@ -340,7 +341,7 @@ async fn fetch_self_snapshot() -> Result<
         UIBridgeSnapshot,
         qontinui_types::spec_check::BridgeFingerprint,
         String,
-        String,
+        Option<String>,
     ),
     spec_check::SnapshotFetchError,
 > {
@@ -397,7 +398,7 @@ async fn fetch_self_snapshot() -> Result<
         snapshot,
         fingerprint,
         format!("scs_self_{}", uuid::Uuid::now_v7()),
-        String::new(),
+        None,
     ))
 }
 
@@ -595,7 +596,7 @@ pub async fn post_spec_check(
                 s,
                 fp,
                 format!("scs_supplied_{}", uuid::Uuid::now_v7()),
-                String::new(),
+                None,
             )
         }
         None => match fetch_fresh_snapshot(&state).await {
@@ -745,7 +746,7 @@ pub async fn post_spec_check_batch(
                     (
                         Arc::new(s),
                         fp,
-                        String::new(),
+                        None,
                         format!("scs_supplied_{}", uuid::Uuid::now_v7()),
                     )
                 }
@@ -882,7 +883,7 @@ pub async fn post_spec_check_batch(
                 &snapshot,
                 &snapshot_id_owned,
                 &fingerprint_owned,
-                &content_hash_owned,
+                content_hash_owned.as_deref(),
                 shared_policy.as_ref(),
                 (*app_owned).as_ref(),
                 registrar_owned.as_ref(),
@@ -1040,7 +1041,7 @@ async fn evaluate_one(
     snapshot: &Arc<UIBridgeSnapshot>,
     snapshot_id: &str,
     fingerprint: &qontinui_types::spec_check::BridgeFingerprint,
-    content_sha256: &str,
+    content_sha256: Option<&str>,
     shared_policy: Option<&SpecCheckPolicy>,
     app_option: Option<&qontinui_types::apps::App>,
     helper_registrar: Option<&crate::helper_tasks::HelperTaskRegistrar>,
@@ -1064,7 +1065,7 @@ async fn evaluate_one(
         &ir,
         fingerprint.clone(),
         snapshot_id.to_string(),
-        content_sha256.to_string(),
+        content_sha256.map(str::to_string),
         app_option,
     );
 
@@ -1103,7 +1104,7 @@ async fn stream_batch_results(
     snapshot: Arc<UIBridgeSnapshot>,
     snapshot_id: String,
     fingerprint: qontinui_types::spec_check::BridgeFingerprint,
-    content_hash: String,
+    content_hash: Option<String>,
     root: Arc<std::path::PathBuf>,
     pages: Vec<BatchPageEntry>,
     shared_policy: Option<SpecCheckPolicy>,
@@ -1185,7 +1186,7 @@ async fn stream_batch_results(
                 &snapshot,
                 &snap_id,
                 &fingerprint,
-                &content_hash,
+                content_hash.as_deref(),
                 shared_policy.as_ref(),
                 (*app_option).as_ref(),
                 helper_registrar.as_ref(),
@@ -1364,7 +1365,7 @@ mod tests {
             &snapshot,
             "scs_test",
             &fp,
-            "",
+            None,
             None,
             None,
             None,
@@ -1393,7 +1394,7 @@ mod tests {
             &snapshot,
             "scs_test",
             &fp,
-            "",
+            None,
             None,
             None,
             None,
@@ -1463,7 +1464,7 @@ mod tests {
             &snapshot,
             "scs_test",
             &fp,
-            "",
+            None,
             None,
             None,
             None,
@@ -1477,7 +1478,7 @@ mod tests {
         // instead of the in-process sentinel.
         assert_eq!(result.bridge_fingerprint.app_id, "test-app");
         assert_eq!(result.snapshot_id, "scs_test");
-        // Empty content_sha256 ("") leaves snapshot_sha256 as None.
+        // No content_sha256 (None) leaves snapshot_sha256 as None.
         assert_eq!(result.snapshot_sha256, None);
     }
 
@@ -1549,7 +1550,7 @@ mod tests {
             &snapshot,
             marker,
             &fp,
-            "",
+            None,
             Some(&policy),
             None,
             None,
