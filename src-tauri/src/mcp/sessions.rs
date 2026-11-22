@@ -2973,9 +2973,10 @@ mod close_session_route_tests {
         .await
         .map(|Json(v)| v)
         .map_err(|(status, _)| status);
-        // No `ClaudeSession` is live in these tests (one needs a real child),
-        // so no close here is of a live session: nothing is marked `stopped`
-        // and no closed state is emitted, however often the id is closed.
+        // No `ClaudeSession` is registered in these tests (one needs a real
+        // child), so no close here removes one: no closed state is emitted,
+        // however often the id is closed. (The `stopped` write is SQL-guarded
+        // and needs a database; these tests pass none.)
         assert!(
             !emitted.get(),
             "only a close of a LIVE session emits the closed state"

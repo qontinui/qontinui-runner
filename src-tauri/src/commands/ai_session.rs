@@ -729,8 +729,10 @@ pub async fn close_ai_session(
 /// What closing one AI session did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AiSessionClose {
-    /// A live session was registered under the id and has been closed (`false`:
-    /// it had already gone — a repeat close, or a child that exited).
+    /// A session was registered under the id and has been removed and closed
+    /// (`false`: none was — a repeat close, or an id never registered). Its
+    /// child may already have exited: nothing removes a chat session from the
+    /// manager on child exit.
     pub(crate) was_live: bool,
     /// A coord-mcp delivery was still live under the id and has been retired.
     pub(crate) coord_mcp_retired: bool,
@@ -767,10 +769,15 @@ pub(crate) async fn close_ai_session_in(
 ///    child's exit being observed.
 /// 3. Session-automation Phase 0 (R5): emit the coord `closed` event and evict
 ///    the R4 index, so coord.sessions doesn't leak a ghost row. Best-effort.
-/// 4. Only when a live session was closed: mark the task run `stopped` and
-///    emit the closed state. A repeat close (or a close of a session whose
-///    child already ended) writes and emits nothing, so it cannot overwrite a
-///    terminal status the run reached on its own, or announce a close twice.
+/// 4. Mark the task run `stopped` — in SQL, only while it is still
+///    non-terminal ([`crate::database::pg::PgDb::stop_task_run_if_active`]), so
+///    a close never rewrites a `complete` or `failed` the run reached on its
+///    own, and a repeat close changes no row. The write is unconditional on
+///    this side because a closed session can still be registered after its
+///    child ended: nothing removes a chat session from the manager when its
+///    child exits, so "was registered" is not "was running".
+/// 5. Emit the closed state only when a registered session was closed here,
+///    so a repeat close does not announce a second close.
 pub(crate) async fn close_ai_session_with(
     session_manager: &SessionManager,
     registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -793,10 +800,10 @@ pub(crate) async fn close_ai_session_with(
     if let Some(registrar) = registrar {
         registrar.close_session(task_run_id);
     }
+    if let Some(pg) = pg {
+        let _ = pg.stop_task_run_if_active(task_run_id).await;
+    }
     if was_live {
-        if let Some(pg) = pg {
-            let _ = pg.update_task_run_status(task_run_id, "stopped").await;
-        }
         emit_closed(task_run_id);
     }
     AiSessionClose {

@@ -363,6 +363,12 @@ impl ClaudeSession {
         let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );
+        // The mode the spec below RENDERS with (the operator's posture may make
+        // it an allow-list), so the tail folds template settings only where the
+        // launch seam would have let them through.
+        let permission = launch_cfg
+            .session_permission
+            .apply(crate::claude_session::launch_spec::PermissionMode::BypassPermissions);
         let extras = crate::claude_session::launch_extras::compose_launch_extras(
             crate::claude_session::launch_extras::LaunchExtrasInputs {
                 working_dir,
@@ -376,6 +382,8 @@ impl ClaudeSession {
                 ),
                 scratch_dir: &std::env::temp_dir(),
                 launch_cfg: &launch_cfg,
+                permission: &permission,
+                template_pin: resume_id_pin.as_deref().or(session_id_pin.as_deref()),
             },
             |delivery| {
                 // WHOSE policy body: the tenant a new session in this cwd
@@ -401,6 +409,7 @@ impl ClaudeSession {
             env: extras_env,
             prompt_carrier,
             coord_mcp,
+            owned_flags,
         } = extras;
 
         // Compose the flag vector through the shared launch seam, then let
@@ -416,6 +425,7 @@ impl ClaudeSession {
             resume_id: resume_id_pin,
             model: model_override.map(|m| m.to_string()),
             extra_required,
+            owned_flags,
             ..Default::default()
         };
         let (program, cli_args) =

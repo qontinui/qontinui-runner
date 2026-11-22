@@ -59,6 +59,16 @@ pub(crate) struct LaunchExtrasInputs<'a> {
     /// template `--mcp-config` stays dropped — the runner's coord-mcp is
     /// authoritative (plan D1).
     pub(crate) launch_cfg: &'a super::launch_spec::LaunchConfig,
+    /// The permission mode the spawn will RENDER — the spec's site default
+    /// after the operator's posture ([`super::launch_spec::SessionPermissionSetting::apply`]).
+    /// Under an allow-list no template settings are folded: the launch seam
+    /// drops a template `--settings` there because its `permissions.allow` and
+    /// hooks can pre-approve tools past the list, and folding it would undo
+    /// that.
+    pub(crate) permission: &'a super::launch_spec::PermissionMode,
+    /// The session id the template's `{sessionId}` is substituted with (the
+    /// resume id, else the new-session id) — the same pin the launch seam uses.
+    pub(crate) template_pin: Option<&'a str>,
 }
 
 /// What a stream-json spawn adds to its launch.
@@ -75,6 +85,10 @@ pub(crate) struct LaunchExtras {
     /// The coord-mcp delivery, whose lease the spawn hands to the child's
     /// waiter. Dropping it (any error before the child exists) retires it.
     pub(crate) coord_mcp: AiSessionCoordMcp,
+    /// Template flags the spawn owns on every arm
+    /// ([`super::launch_spec::LaunchSpec::owned_flags`]): the template's MCP
+    /// flags never reach the argv, whatever the coord-mcp arm.
+    pub(crate) owned_flags: Vec<String>,
 }
 
 /// Compose the tail and env. `prompt` turns the session's coord-mcp outcome
@@ -116,27 +130,29 @@ pub(crate) fn compose_launch_extras(
         }
         None => None,
     };
-    let template_settings: Vec<String> =
-        super::launch_spec::template_flag_values(inputs.launch_cfg, &["--settings"])
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect();
+    let template_settings = template_settings_to_fold(&inputs);
     extra_required.extend(settings_args(
         inputs.hook_settings.as_deref(),
         tool_policy_settings.as_deref(),
         &template_settings,
+        Path::new(inputs.working_dir),
         inputs.scratch_dir,
         inputs.session_id,
     )?);
 
     let template_prompts = super::launch_spec::template_flag_values(
         inputs.launch_cfg,
+        inputs.template_pin,
         &[
             crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FLAG,
             crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FILE_FLAG,
         ],
     );
-    let prompt_carrier = fold_template_prompts(prompt(coord_mcp.delivery()), &template_prompts);
+    let prompt_carrier = fold_template_prompts(
+        prompt(coord_mcp.delivery()),
+        &template_prompts,
+        Path::new(inputs.working_dir),
+    );
     if let Some(carrier) = &prompt_carrier {
         extra_required.extend(carrier.argv());
     }
@@ -147,7 +163,48 @@ pub(crate) fn compose_launch_extras(
         env,
         prompt_carrier,
         coord_mcp,
+        owned_flags: super::coord_mcp_delivery::OWNED_TEMPLATE_FLAGS
+            .iter()
+            .map(|f| f.to_string())
+            .collect(),
     })
+}
+
+/// The template `--settings` values to fold into the one settings file —
+/// none under an allow-list (see [`LaunchExtrasInputs::permission`]).
+fn template_settings_to_fold(inputs: &LaunchExtrasInputs<'_>) -> Vec<String> {
+    let values: Vec<String> = super::launch_spec::template_flag_values(
+        inputs.launch_cfg,
+        inputs.template_pin,
+        &["--settings"],
+    )
+    .into_iter()
+    .map(|(_, value)| value)
+    .collect();
+    if !values.is_empty()
+        && matches!(
+            inputs.permission,
+            super::launch_spec::PermissionMode::AllowList { .. }
+        )
+    {
+        warn!(
+            "launch template --settings not merged: the session runs under the allow-list \
+             permission mode, which a template's settings layer (permissions, hooks) could widen"
+        );
+        return Vec::new();
+    }
+    values
+}
+
+/// `value` as a path, resolved against the session's cwd when relative — the
+/// directory Claude Code itself resolves it from.
+fn resolve_against(base: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 /// The ONE `--settings` pair: the hook carrier alone, or — when the tool policy
@@ -162,19 +219,16 @@ fn settings_args(
     hook_settings: Option<&Path>,
     tool_policy_settings: Option<&str>,
     template_settings: &[String],
+    working_dir: &Path,
     scratch_dir: &Path,
     session_id: &str,
 ) -> Result<Vec<String>, String> {
     let template_docs: Vec<(String, serde_json::Value)> = template_settings
         .iter()
-        .filter_map(|value| match read_settings_value(value) {
-            Ok(doc) => Some((settings_source(value), doc)),
+        .filter_map(|value| match read_settings_value(value, working_dir) {
+            Ok(doc) => Some((settings_source(value), strip_template_permissions(doc))),
             Err(e) => {
-                let value = settings_source(value);
-                warn!(
-                    "launch template --settings {value} unreadable ({e}) — not merged; the \
-                     session runs without it"
-                );
+                warn!("{}", template_settings_unreadable_line(value, &e));
                 None
             }
         })
@@ -207,13 +261,9 @@ fn settings_args(
     });
     let mut merged = serde_json::json!({});
     for (source, doc) in template_docs {
-        let keys: Vec<String> = doc
-            .as_object()
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default();
         info!(
-            "merging launch template --settings {source} (keys {keys:?}) into interactive session \
-             {session_id}'s settings; the runner's own keys win on a conflict"
+            "{}",
+            template_settings_merge_line(&source, &doc, session_id)
         );
         merge_settings(&mut merged, doc);
     }
@@ -237,10 +287,52 @@ fn settings_args(
     ])
 }
 
+/// A template settings layer with its `permissions` key removed, in every
+/// permission mode: a template's `permissions.allow` would pre-approve tools
+/// the runner's own posture did not, and its `deny` rules belong to the
+/// operator's settings files, not to a launch template folded into the
+/// runner's layer.
+fn strip_template_permissions(mut doc: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = doc.as_object_mut() {
+        object.remove("permissions");
+    }
+    doc
+}
+
+/// The info line for folding one template settings layer: its source (never
+/// an inline value) and the keys it contributes.
+fn template_settings_merge_line(source: &str, doc: &serde_json::Value, session_id: &str) -> String {
+    let keys: Vec<&String> = doc
+        .as_object()
+        .map(|o| o.keys().collect())
+        .unwrap_or_default();
+    format!(
+        "merging launch template --settings {source} (keys {keys:?}) into interactive session \
+         {session_id}'s settings; the runner's own keys win on a conflict, and a template's \
+         `permissions` is never merged"
+    )
+}
+
+/// The warn line for a template settings value that could not be read. The
+/// error text is NOT included for an inline value: a JSON parse error can quote
+/// the input it failed on.
+fn template_settings_unreadable_line(value: &str, error: &str) -> String {
+    let source = settings_source(value);
+    if is_inline_settings(value) {
+        format!("launch template --settings {source} is not a JSON object — not merged")
+    } else {
+        format!("launch template --settings {source} unreadable ({error}) — not merged")
+    }
+}
+
+fn is_inline_settings(value: &str) -> bool {
+    value.trim_start().starts_with('{')
+}
+
 /// How a template `--settings` value is named in a log line: its path, or
 /// `<inline JSON>` — an inline object may carry a secret and is never logged.
 fn settings_source(value: &str) -> String {
-    if value.trim_start().starts_with('{') {
+    if is_inline_settings(value) {
         "<inline JSON>".to_string()
     } else {
         value.to_string()
@@ -248,12 +340,12 @@ fn settings_source(value: &str) -> String {
 }
 
 /// A `--settings` value as Claude Code reads it: an inline JSON object, or a
-/// path to a JSON file.
-fn read_settings_value(value: &str) -> Result<serde_json::Value, String> {
-    let text = if value.trim_start().starts_with('{') {
+/// path to a JSON file (relative to the session's cwd).
+fn read_settings_value(value: &str, working_dir: &Path) -> Result<serde_json::Value, String> {
+    let text = if is_inline_settings(value) {
         value.to_string()
     } else {
-        std::fs::read_to_string(value).map_err(|e| e.to_string())?
+        std::fs::read_to_string(resolve_against(working_dir, value)).map_err(|e| e.to_string())?
     };
     let doc: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     if doc.is_object() {
@@ -275,12 +367,13 @@ fn read_settings_value(value: &str) -> Result<serde_json::Value, String> {
 fn fold_template_prompts(
     carrier: Option<SystemPromptCarrier>,
     template_prompts: &[(String, String)],
+    working_dir: &Path,
 ) -> Option<SystemPromptCarrier> {
     let texts: Vec<String> = template_prompts
         .iter()
         .filter_map(|(flag, value)| {
             if flag == crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FILE_FLAG {
-                match std::fs::read_to_string(value) {
+                match std::fs::read_to_string(resolve_against(working_dir, value)) {
                     Ok(text) => Some(text),
                     Err(e) => {
                         warn!(

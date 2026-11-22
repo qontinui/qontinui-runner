@@ -305,7 +305,7 @@ fn carry_through_respects_the_accounts_project_server_approvals() {
         .unwrap();
     };
     let names = || {
-        let mut n: Vec<String> = carry_through_servers(&cwd, Some(&account_file))
+        let mut n: Vec<String> = carry_through_servers(&cwd, Some(&account_file), None)
             .keys()
             .cloned()
             .collect();
@@ -328,6 +328,62 @@ fn carry_through_respects_the_accounts_project_server_approvals() {
 
     write_account(serde_json::json!({ "enabledMcpjsonServers": ["b"] }));
     assert_eq!(names(), vec!["b", "user-tool"]);
+}
+
+/// Approvals also come from the settings layers Claude Code reads them from:
+/// the project's `.claude/settings.json` and `.claude/settings.local.json`, and
+/// the user's `settings.json`. A server disabled in ANY layer stays out, even
+/// where another layer enables it.
+#[test]
+fn carry_through_reads_approvals_from_the_settings_layers_and_disabled_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": {
+            "a": { "command": "a" },
+            "b": { "command": "b" },
+            "c": { "command": "c" }
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    // Project settings enable a and b; the local layer enables c.
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        serde_json::json!({ "enabledMcpjsonServers": ["a", "b"] }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        serde_json::json!({ "enabledMcpjsonServers": ["c"] }).to_string(),
+    )
+    .unwrap();
+    // The user layer disables b — and disabled wins over the project's enable.
+    let user_settings = tmp.path().join("user-settings.json");
+    std::fs::write(
+        &user_settings,
+        serde_json::json!({ "disabledMcpjsonServers": ["b"] }).to_string(),
+    )
+    .unwrap();
+
+    let mut names: Vec<String> = carry_through_servers(&cwd, None, Some(&user_settings))
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["a", "c"]);
+
+    // With no layer approving anything, no project server is carried.
+    let bare = tmp.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(
+        bare.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "a": { "command": "a" } } }).to_string(),
+    )
+    .unwrap();
+    assert!(carry_through_servers(&bare, None, None).is_empty());
 }
 
 /// Two sessions in one cwd get two files and two live nonces — never one

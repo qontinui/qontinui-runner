@@ -13202,12 +13202,19 @@ fn provision_coord_mcp_config_file(
         );
     }
     let file = dir.join(mcp_config_file_name(workdir, terminal_id));
-    match crate::fs_perms::write_owner_only(
-        &file,
-        serde_json::to_string_pretty(&mcp_config)
-            .unwrap_or_default()
-            .as_bytes(),
-    ) {
+    // Under the config-file lock, so a predecessor's compare-and-remove of the
+    // same path (`claude_session::coord_mcp_delivery`) sees either the old
+    // file or this one whole — never deletes this one after reading the old.
+    let written = {
+        let _guard = app_data_config_lock();
+        crate::fs_perms::write_owner_only(
+            &file,
+            serde_json::to_string_pretty(&mcp_config)
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+    };
+    match written {
         Ok(()) => {
             info!(
                 "coord_mcp: wrote --mcp-config file {} for workdir {workdir}",
@@ -13240,6 +13247,24 @@ fn provision_coord_mcp_config_file(
             Ok(None)
         }
     }
+}
+
+/// The lock that orders every write of a runner app-data `--mcp-config` file
+/// ([`provision_coord_mcp_config_file`]) against every compare-and-remove of
+/// one (`claude_session::coord_mcp_delivery`'s retire). A file's name is a
+/// function of (workdir, session key), so a successor delivered under the same
+/// key rewrites its predecessor's path; holding this across the successor's
+/// write AND the predecessor's read-compare-remove means the predecessor can
+/// only ever delete a file that still carries ITS nonce.
+///
+/// One lock for the whole directory rather than one per path: a per-path lock
+/// needs a map with an entry per (workdir, key), and an AI session's key is
+/// never reused, so that map would grow by one entry per session for the life
+/// of the process. Both critical sections are a single small file write or
+/// read-and-unlink, so the serialization costs nothing measurable.
+pub(crate) fn app_data_config_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The identity seam's mint: a PERSISTENT DEVICE-principal nonce bound to

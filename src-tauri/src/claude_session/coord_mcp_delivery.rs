@@ -81,6 +81,15 @@ const COORD_MCP_SERVER: &str = "coord-mcp";
 /// none.
 const STRICT_CONFIG_DIR: &str = "claude-session-mcp";
 
+/// The template flags a stream-json spawn OWNS on every coord-mcp arm
+/// ([`super::launch_spec::LaunchSpec::owned_flags`]): a template's copy never
+/// reaches the argv. On the provisioned and strict arms the runner supplies its
+/// own; on the declared arm it supplies none because the cwd's `.mcp.json` IS
+/// the session's config (a cwd file beats the ancestor, finding `a1a66bfe`
+/// case f) — and a template `--mcp-config` or `--strict-mcp-config` would
+/// override or discard it.
+pub(crate) const OWNED_TEMPLATE_FLAGS: [&str; 2] = ["--mcp-config", "--strict-mcp-config"];
+
 /// What one stream-json spawn was given for coord-mcp.
 #[derive(Debug)]
 pub(crate) struct AiSessionCoordMcp {
@@ -366,24 +375,21 @@ fn retire(key: &str, record: &LeaseRecord) {
     if let Some(path) = &record.strict_config {
         remove_quietly(path);
     }
-    let forgot = crate::coord_mcp::forget_session_coord_mcp_delivery(key, record.generation);
-    let mut leases = leases().lock().unwrap_or_else(|e| e.into_inner());
-    // The runner file's compare-and-remove runs under the lease lock, and only
-    // while no successor's lease is registered under this key: a successor in
-    // the same cwd rewrites the SAME path, so once its lease exists the file is
-    // its own. The window this cannot close: a successor's delivery writes the
-    // file BEFORE it registers its lease (the write happens inside
-    // `coord_mcp::deliver_session_coord_mcp`, outside this lock), so a retire
-    // landing between that write and that registration still reads the
-    // successor's nonce, sees a mismatch, and keeps the file — the safe side.
+    // The runner file's compare-and-remove runs under the SAME lock as every
+    // write of such a file (`coord_mcp::app_data_config_lock`). A successor
+    // under this key in the same cwd rewrites this exact path; with the lock,
+    // its write lands either before the read below (the file then carries the
+    // successor's nonce, which is not ours, and is kept) or after the unlink
+    // (and recreates it). So a retire only ever deletes a file still carrying
+    // the nonce THIS delivery minted.
     if let (Some(path), Some(nonce)) = (&record.runner_config, &record.nonce) {
-        let successor_owns_path = leases.get(key).is_some_and(|r| {
-            r.generation != record.generation && r.runner_config.as_ref() == Some(path)
-        });
-        if !successor_owns_path && read_config_nonce(path).as_deref() == Some(nonce.as_str()) {
+        let _guard = crate::coord_mcp::app_data_config_lock();
+        if read_config_nonce(path).as_deref() == Some(nonce.as_str()) {
             remove_quietly(path);
         }
     }
+    let forgot = crate::coord_mcp::forget_session_coord_mcp_delivery(key, record.generation);
+    let mut leases = leases().lock().unwrap_or_else(|e| e.into_inner());
     if leases
         .get(key)
         .is_some_and(|r| r.generation == record.generation)
@@ -428,7 +434,11 @@ fn write_strict_config(
     generation: u64,
     config_dir: Option<&str>,
 ) -> std::io::Result<PathBuf> {
-    let servers = carry_through_servers(Path::new(cwd), user_config_file(config_dir).as_deref());
+    let servers = carry_through_servers(
+        Path::new(cwd),
+        user_config_file(config_dir).as_deref(),
+        user_settings_file(config_dir).as_deref(),
+    );
     let dir = crate::session::claude_hook::session_restore_dir().join(STRICT_CONFIG_DIR);
     std::fs::create_dir_all(&dir)?;
     if let Err(e) = crate::fs_perms::restrict_dir_to_owner(&dir) {
@@ -468,6 +478,45 @@ fn user_config_file(config_dir: Option<&str>) -> Option<PathBuf> {
     }
 }
 
+/// The user-scope settings file Claude Code reads approvals from:
+/// `<config_dir>/settings.json`, else `~/.claude/settings.json`.
+fn user_settings_file(config_dir: Option<&str>) -> Option<PathBuf> {
+    match config_dir {
+        Some(dir) => Some(Path::new(dir).join("settings.json")),
+        None => dirs::home_dir().map(|home| home.join(".claude").join("settings.json")),
+    }
+}
+
+/// The project-scope settings files that can carry approvals for `cwd`:
+/// `.claude/settings.json` and `.claude/settings.local.json` in the cwd and in
+/// its project root (the enclosing git root), each read once.
+fn project_settings_files(cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![cwd.to_path_buf()];
+    if let Some(root) = std::fs::canonicalize(cwd)
+        .ok()
+        .and_then(|c| super::workspace_trust::git_root(&c))
+    {
+        let canonical_cwd = std::fs::canonicalize(cwd).ok();
+        if canonical_cwd.as_ref() != Some(&root) {
+            dirs.push(root);
+        }
+    }
+    dirs.iter()
+        .flat_map(|d| {
+            [
+                d.join(".claude").join("settings.json"),
+                d.join(".claude").join("settings.local.json"),
+            ]
+        })
+        .collect()
+}
+
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
 /// Every non-coord MCP server a session in `cwd` loads without
 /// `--strict-mcp-config`, in Claude Code's scope precedence: local
 /// (`projects[<project>].mcpServers` in the account file) over project (the
@@ -476,6 +525,7 @@ fn user_config_file(config_dir: Option<&str>) -> Option<PathBuf> {
 fn carry_through_servers(
     cwd: &Path,
     user_config: Option<&Path>,
+    user_settings: Option<&Path>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::new();
     let account: Option<serde_json::Value> = user_config
@@ -488,7 +538,13 @@ fn carry_through_servers(
     // This project's entry: what local-scope servers it adds, and which
     // project-scope (`.mcp.json`) servers the account approved for it.
     let project = projects.and_then(|p| keys.iter().find_map(|k| p.get(k)));
-    let approval = ProjectApproval::of(project);
+    let settings_layers: Vec<serde_json::Value> = project_settings_files(cwd)
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(user_settings)
+        .filter_map(read_json)
+        .collect();
+    let approval = ProjectApproval::of(project.into_iter().chain(settings_layers.iter()));
     let mut take = |servers: Option<&serde_json::Value>, admit: &dyn Fn(&str) -> bool| {
         let Some(servers) = servers.and_then(|v| v.as_object()) else {
             return;
@@ -513,7 +569,7 @@ fn carry_through_servers(
             .and_then(|s| serde_json::from_str(&s).ok());
         take(
             doc.as_ref().and_then(|d| d.get("mcpServers")),
-            &|name: &str| approval.admits(name),
+            &|name: &str| approval.admits(name, &dir.join(".mcp.json")),
         );
     }
     take(
@@ -523,13 +579,14 @@ fn carry_through_servers(
     out
 }
 
-/// The account's approval state for one project's `.mcp.json` servers, from
-/// `projects[<key>]` in the account config: a server named in
-/// `disabledMcpjsonServers` never loads; otherwise it loads only when
-/// `enableAllProjectMcpServers` is true or it is named in
-/// `enabledMcpjsonServers`. The strict file carries exactly what the account
-/// approved — never a project server the operator declined, nor one never
-/// approved.
+/// The approval state for one project's `.mcp.json` servers, read from every
+/// layer Claude Code reads it from: the account config's `projects[<key>]`
+/// entry, the project's `.claude/settings.json` and `.claude/settings.local.json`,
+/// and the user's `settings.json`. A server named in `disabledMcpjsonServers`
+/// in ANY layer never loads (disabled wins over enabled anywhere); otherwise it
+/// loads only when some layer sets `enableAllProjectMcpServers` or names it in
+/// `enabledMcpjsonServers`. The strict file carries exactly what was approved —
+/// never a project server the operator declined, nor one never approved.
 struct ProjectApproval {
     enable_all: bool,
     enabled: Vec<String>,
@@ -537,33 +594,48 @@ struct ProjectApproval {
 }
 
 impl ProjectApproval {
-    fn of(project: Option<&serde_json::Value>) -> Self {
+    fn of<'a>(layers: impl Iterator<Item = &'a serde_json::Value> + Clone) -> Self {
         let names = |key: &str| -> Vec<String> {
-            project
-                .and_then(|p| p.get(key))
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|n| n.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default()
+            layers
+                .clone()
+                .filter_map(|l| l.get(key).and_then(|v| v.as_array()))
+                .flatten()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
         };
         Self {
-            enable_all: project
-                .and_then(|p| p.get("enableAllProjectMcpServers"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            enable_all: layers.clone().any(|l| {
+                l.get("enableAllProjectMcpServers")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            }),
             enabled: names("enabledMcpjsonServers"),
             disabled: names("disabledMcpjsonServers"),
         }
     }
 
-    fn admits(&self, name: &str) -> bool {
+    /// Does the approval state admit `name`, a server `source` declares?
+    /// Every exclusion is logged at info: a project server the strict file
+    /// leaves out is a capability the session will not have.
+    fn admits(&self, name: &str, source: &Path) -> bool {
         if self.disabled.iter().any(|d| d == name) {
+            info!(
+                "coord-mcp: strict carry-through excludes project MCP server {name} ({}): it is \
+                 disabled",
+                source.display()
+            );
             return false;
         }
-        self.enable_all || self.enabled.iter().any(|e| e == name)
+        let approved = self.enable_all || self.enabled.iter().any(|e| e == name);
+        if !approved {
+            info!(
+                "coord-mcp: strict carry-through excludes project MCP server {name} ({}): it has \
+                 no approval (not in enabledMcpjsonServers, and enableAllProjectMcpServers is not \
+                 set)",
+                source.display()
+            );
+        }
+        approved
     }
 }
 

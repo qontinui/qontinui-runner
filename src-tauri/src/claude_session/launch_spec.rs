@@ -244,6 +244,12 @@ pub struct LaunchSpec {
     /// `--append-system-prompt <s>`, `--add-dir <d>`, and the trailing
     /// `-- <prompt>` positional. Never reordered or deduped within.
     pub extra_required: Vec<String>,
+    /// Template flags the caller OWNS even where it supplies none, in either
+    /// spelling: a template's copy is always dropped. The stream-json spawn owns
+    /// `--mcp-config` and `--strict-mcp-config` on every coord-mcp arm,
+    /// including the one where the session's own config is its cwd's
+    /// `.mcp.json` and the runner passes no MCP flag at all.
+    pub owned_flags: Vec<String>,
 }
 
 /// Maximum length (chars) of a `--name` value.
@@ -557,7 +563,12 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 _ => {
                     // By NAME, whatever the spelling: `--mcp-config=/x` from a
                     // template is the same flag as the caller's spaced one.
-                    if provided.contains(flag_name_only(&unit.name)) {
+                    if provided.contains(flag_name_only(&unit.name))
+                        || spec
+                            .owned_flags
+                            .iter()
+                            .any(|f| f == flag_name_only(&unit.name))
+                    {
                         if flag_name_only(&unit.name) == "--mcp-config" {
                             // The runner's coord-mcp is authoritative (plan
                             // 2026-11-21-…-acts-as-the-default-tenant D1). A
@@ -819,11 +830,19 @@ fn is_permitted_under_allow_list(token: &str) -> bool {
 /// stream-json spawn folds a template `--settings` into its one merged settings
 /// file and a template append prompt into its one prompt carrier. Read-only —
 /// the composed argv is unaffected.
-pub(crate) fn template_flag_values(cfg: &LaunchConfig, names: &[&str]) -> Vec<(String, String)> {
+///
+/// `pin` is the session id [`compose_flags`] substitutes for `{sessionId}`
+/// (the resume id, else the new-session id), so a value that embeds the
+/// placeholder reads exactly as the composed argv would carry it.
+pub(crate) fn template_flag_values(
+    cfg: &LaunchConfig,
+    pin: Option<&str>,
+    names: &[&str],
+) -> Vec<(String, String)> {
     let Some(template) = claude_template(cfg) else {
         return Vec::new();
     };
-    let tokens = shell_tokenize(&template.replace(SESSION_ID_PLACEHOLDER, ""));
+    let tokens = shell_tokenize(&template.replace(SESSION_ID_PLACEHOLDER, pin.unwrap_or("")));
     parse_units(tokens.get(1..).unwrap_or(&[]))
         .into_iter()
         .filter_map(|unit| {
@@ -1089,7 +1108,7 @@ mod tests {
              --settings=/op/b.json --verbose",
         );
         assert_eq!(
-            template_flag_values(&cfg, &["--settings"]),
+            template_flag_values(&cfg, None, &["--settings"]),
             vec![
                 ("--settings".to_string(), "/op/a.json".to_string()),
                 ("--settings".to_string(), "/op/b.json".to_string()),
@@ -1098,12 +1117,50 @@ mod tests {
         assert_eq!(
             template_flag_values(
                 &cfg,
+                None,
                 &["--append-system-prompt", "--append-system-prompt-file"]
             ),
             vec![("--append-system-prompt".to_string(), "be terse".to_string())]
         );
-        assert!(template_flag_values(&cfg, &["--mcp-config"]).is_empty());
-        assert!(template_flag_values(&LaunchConfig::default(), &["--settings"]).is_empty());
+        assert!(template_flag_values(&cfg, None, &["--mcp-config"]).is_empty());
+        assert!(template_flag_values(&LaunchConfig::default(), None, &["--settings"]).is_empty());
+    }
+
+    /// `{sessionId}` reads as the pin [`compose_flags`] substitutes.
+    #[test]
+    fn template_flag_values_substitutes_the_session_pin() {
+        let cfg = tmpl("claude --settings /op/{sessionId}.json");
+        assert_eq!(
+            template_flag_values(&cfg, Some("abc-123"), &["--settings"]),
+            vec![("--settings".to_string(), "/op/abc-123.json".to_string())]
+        );
+    }
+
+    /// An owned flag is dropped from the template even when the caller does not
+    /// supply it — in either spelling — and nothing else is.
+    #[test]
+    fn an_owned_flag_is_dropped_from_the_template_although_the_caller_supplies_none() {
+        let mut s = spec();
+        s.owned_flags = vec![
+            "--mcp-config".to_string(),
+            "--strict-mcp-config".to_string(),
+        ];
+        for template in [
+            "claude --mcp-config /operator/mcp.json --strict-mcp-config --verbose",
+            "claude --mcp-config=/operator/mcp.json --strict-mcp-config --verbose",
+        ] {
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| flag_name_only(a) == "--mcp-config" || a == "--strict-mcp-config"),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+        }
     }
 
     /// The same rule holds for every flag, not only `--mcp-config`: a caller's

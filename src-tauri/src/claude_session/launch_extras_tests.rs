@@ -67,6 +67,8 @@ fn inputs<'a>(
         hook_settings,
         scratch_dir: scratch,
         launch_cfg: no_template(),
+        permission: &PermissionMode::BypassPermissions,
+        template_pin: None,
     }
 }
 
@@ -429,8 +431,8 @@ fn a_template_settings_file_is_merged_into_the_one_settings_and_the_runner_wins(
     );
     let deny = doc["permissions"]["deny"].as_array().unwrap();
     assert!(
-        deny.contains(&serde_json::json!("Read(./secrets/**)")),
-        "{doc}"
+        !deny.contains(&serde_json::json!("Read(./secrets/**)")),
+        "a template's `permissions` never reaches the merged file: {doc}"
     );
     assert!(
         deny.contains(&serde_json::json!("Bash(git push --force:*)")),
@@ -553,4 +555,189 @@ fn a_template_mcp_config_stays_dropped_beside_the_runners() {
     let configs = flag_values(&argv, "--mcp-config");
     assert_eq!(configs.len(), 1, "{argv:?}");
     assert_ne!(configs[0], "/operator/mcp.json");
+}
+
+/// The rendered argv for `extras` under `cfg`, with the permission and the
+/// owned flags `spawn_body` passes.
+fn render(extras: &LaunchExtras, cfg: &LaunchConfig, permission: PermissionMode) -> Vec<String> {
+    let spec = LaunchSpec {
+        permission,
+        extra_required: extras.extra_required.clone(),
+        owned_flags: extras.owned_flags.clone(),
+        ..Default::default()
+    };
+    render_argv(&spec, cfg, "claude")
+}
+
+/// A template whose settings could widen an allow-list — `permissions.allow`
+/// and its own hooks — contributes NOTHING under the allow-list posture: the
+/// one `--settings` is the runner's hook carrier, byte for byte, and neither
+/// the template's allow rule nor its hook reaches the session. (On 86d49ebd9
+/// the fold ignored the posture and merged both.)
+#[test]
+fn under_an_allow_list_a_template_settings_contributes_nothing() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    let hooks_dir = tempfile::tempdir().unwrap();
+    let hook_settings = crate::session::claude_hook::materialize(hooks_dir.path()).unwrap();
+    let operator = scratch.path().join("operator-settings.json");
+    std::fs::write(
+        &operator,
+        serde_json::json!({
+            "permissions": { "allow": ["Bash(*)"] },
+            "hooks": { "PreToolUse": [{ "hooks": [{ "type": "command", "command": "operator-allow-hook" }] }] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some(format!("claude --settings {}", operator.display())),
+        session_permission:
+            crate::claude_session::launch_spec::SessionPermissionSetting::AllowList {
+                tools: vec!["Read".to_string()],
+            },
+        ..Default::default()
+    };
+    let permission = cfg
+        .session_permission
+        .apply(PermissionMode::BypassPermissions);
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(
+        &wd,
+        &session_id,
+        None,
+        Some(hook_settings.clone()),
+        scratch.path(),
+    );
+    input.launch_cfg = &cfg;
+    input.permission = &permission;
+
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+
+    let argv = render(&extras, &cfg, PermissionMode::BypassPermissions);
+    let settings = flag_values(&argv, "--settings");
+    assert_eq!(
+        settings,
+        vec![hook_settings.to_string_lossy().as_ref()],
+        "only the runner's hook carrier: {argv:?}"
+    );
+    let text = std::fs::read_to_string(settings[0]).unwrap();
+    assert!(!text.contains("operator-allow-hook"), "{text}");
+    assert!(!text.contains("Bash(*)"), "{text}");
+}
+
+/// Under bypass the template layer is folded, but its `permissions` key is
+/// stripped: an `allow` rule never reaches the merged file in any mode.
+#[test]
+fn under_bypass_a_template_permissions_key_is_stripped_but_the_rest_is_folded() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    // A RELATIVE template path, resolved against the session's cwd.
+    std::fs::write(
+        Path::new(&wd).join("operator-settings.json"),
+        serde_json::json!({
+            "permissions": { "allow": ["Bash(*)"] },
+            "model": "operator-model"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some("claude --settings operator-settings.json".to_string()),
+        ..Default::default()
+    };
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(&wd, &session_id, None, None, scratch.path());
+    input.launch_cfg = &cfg;
+
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+
+    let argv = render(&extras, &cfg, PermissionMode::BypassPermissions);
+    let settings = flag_values(&argv, "--settings");
+    assert_eq!(settings.len(), 1, "{argv:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings[0]).unwrap()).unwrap();
+    assert_eq!(
+        doc["model"], "operator-model",
+        "the relative path resolved: {doc}"
+    );
+    assert!(doc.get("permissions").is_none(), "{doc}");
+}
+
+/// An INLINE-JSON template `--settings` is folded like a file, and its value —
+/// which can carry a secret — never reaches either log line the fold writes.
+#[test]
+fn an_inline_template_settings_is_folded_and_its_value_never_logged() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    const SECRET: &str = "sk-inline-secret-value";
+    let inline = serde_json::json!({ "env": { "API_KEY": SECRET } }).to_string();
+    let cfg = LaunchConfig {
+        default_template: Some(format!("claude --settings '{inline}'")),
+        ..Default::default()
+    };
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(&wd, &session_id, None, None, scratch.path());
+    input.launch_cfg = &cfg;
+
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+
+    let argv = render(&extras, &cfg, PermissionMode::BypassPermissions);
+    let settings = flag_values(&argv, "--settings");
+    assert_eq!(settings.len(), 1, "{argv:?}");
+    assert!(!argv.iter().any(|a| a.contains(SECRET)), "{argv:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings[0]).unwrap()).unwrap();
+    assert_eq!(doc["env"]["API_KEY"], SECRET, "the inline layer was folded");
+
+    let merge_line = template_settings_merge_line(
+        &settings_source(&inline),
+        &serde_json::from_str(&inline).unwrap(),
+        &session_id,
+    );
+    assert!(!merge_line.contains(SECRET), "{merge_line}");
+    assert!(merge_line.contains("<inline JSON>"), "{merge_line}");
+    let unreadable = template_settings_unreadable_line(
+        &format!("{{\"token\": \"{SECRET}\""),
+        &format!("EOF while parsing near {SECRET}"),
+    );
+    assert!(!unreadable.contains(SECRET), "{unreadable}");
+}
+
+/// On the DECLARED arm the runner passes no MCP flag — the cwd's `.mcp.json`
+/// is the session's config — and a template's `--mcp-config` and
+/// `--strict-mcp-config` are dropped all the same, so neither can override or
+/// discard it.
+#[test]
+fn on_the_declared_arm_a_templates_mcp_flags_are_dropped_too() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    crate::coord_mcp::write_coord_mcp_proxy_config(&wd, PORT, None);
+    let scratch = tempfile::tempdir().unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some(
+            "claude --mcp-config /operator/mcp.json --strict-mcp-config --verbose".to_string(),
+        ),
+        ..Default::default()
+    };
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(&wd, &session_id, None, None, scratch.path());
+    input.launch_cfg = &cfg;
+
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+
+    assert_eq!(
+        extras.coord_mcp.delivery(),
+        CoordMcpDelivery::WorkdirDeclared
+    );
+    let argv = render(&extras, &cfg, PermissionMode::BypassPermissions);
+    assert!(flag_values(&argv, "--mcp-config").is_empty(), "{argv:?}");
+    assert!(!argv.iter().any(|a| a == "--strict-mcp-config"), "{argv:?}");
 }
