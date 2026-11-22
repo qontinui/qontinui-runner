@@ -2470,6 +2470,8 @@ mod tests {
             target_bytes: 4096,
             build_target_dir: None,
             build_slot: None,
+            build_target_volume_path: None,
+            worktree_volume_path: None,
             last_access_mtime: None,
             attributable_bytes: 4096,
             landed_in_main: Some(true),

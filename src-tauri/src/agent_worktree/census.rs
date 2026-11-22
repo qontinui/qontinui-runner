@@ -1083,6 +1083,25 @@ pub struct WorktreeCensus {
     /// the wire.
     pub build_slot: Option<String>,
 
+    /// [`build_target_dir`](Self::build_target_dir) with every symlink and
+    /// junction in its existing prefix resolved ([`resolved_volume_path`]):
+    /// the path the build's bytes actually land under, from which coord
+    /// derives the volume to CHARGE a build to. `build_target_dir` itself
+    /// stays unresolved — it is the identity other consumers compare against.
+    ///
+    /// `None` when `build_target_dir` is `None`, or when no ancestor of it
+    /// could be canonicalised — NOT OBSERVED, never "on the root volume".
+    /// Persisted as `build_target_volume_path TEXT NULL` on the three coord
+    /// census tables (web migration `wtcensus_volpath_01_resolved_volume_paths`).
+    /// Always serialized, like `build_target_dir`; an old coord ignores it.
+    pub build_target_volume_path: Option<String>,
+
+    /// [`path`](Self::path) resolved the same way: the path this checkout's
+    /// bytes actually live under (a symlinked `agent-worktrees/<id>` resolves
+    /// to its target, e.g. under `/data`). `path` itself stays unresolved.
+    /// `None` = NOT OBSERVED. Persisted as `worktree_volume_path TEXT NULL`.
+    pub worktree_volume_path: Option<String>,
+
     /// RFC3339 mtime of the worktree dir itself, `None` if unreadable.
     pub last_access_mtime: Option<String>,
     /// Sum of the non-junction real bytes attributable to this worktree
@@ -1491,6 +1510,11 @@ pub(super) fn target_dir_for(worktree: &Path) -> PathBuf {
 pub(crate) struct BuildTarget {
     pub dir: Option<String>,
     pub slot: Option<String>,
+    /// [`dir`](Self::dir) with every symlink and junction in its existing
+    /// prefix resolved ([`resolved_volume_path`]) — the path the build's bytes
+    /// actually land under. `None` whenever `dir` is, or when no ancestor of
+    /// it could be canonicalised.
+    pub volume_path: Option<String>,
 }
 
 /// The directory a `cargo` invocation for this worktree runs FROM, which is
@@ -1731,7 +1755,29 @@ pub(crate) fn resolve_build_target(worktree: &Path, env_target_dir: Option<&str>
     BuildTarget {
         dir: Some(normalize_path_str(&dir)),
         slot: build_slot_for(&dir),
+        volume_path: resolved_volume_path(&dir),
     }
+}
+
+/// `path` resolved through its nearest EXISTING ancestor
+/// ([`crate::util::existing_ancestor::resolve_through_existing_ancestor`]),
+/// in the census's forward-slashed form with a Windows verbatim prefix
+/// stripped ([`comparable_path`]) — the path coord derives a VOLUME from.
+///
+/// This is the deliberate counterpart of [`lexical_normalize`]: the IDENTITY
+/// fields (`path`, `build_target_dir`) stay unresolved because other consumers
+/// compare against them, while this one answers "which disk do the bytes land
+/// on". On a box where `agent-worktrees/<id>` is a symlink into
+/// `/data/qontinui/agent-worktrees/<id>`, the unresolved path prefix-matches
+/// `/` while the bytes are on `/data` (plan
+/// `2026-11-22-coord-charges-a-build-in-a-symlinked-agent-worktree-to-root`).
+/// The target dir may not exist yet, hence the nearest-existing-ancestor walk
+/// rather than `canonicalize`. `None` = NOT OBSERVED (no ancestor exists, or it
+/// could not be canonicalised); coord then falls back to the unresolved path.
+pub(crate) fn resolved_volume_path(path: &Path) -> Option<String> {
+    crate::util::existing_ancestor::resolve_through_existing_ancestor(path)
+        .ok()
+        .map(|resolved| comparable_path(&resolved))
 }
 
 /// [`resolve_build_target`] against the live process environment.
@@ -2531,6 +2577,8 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         target_bytes,
         build_target_dir: build_target.dir,
         build_slot: build_target.slot,
+        build_target_volume_path: build_target.volume_path,
+        worktree_volume_path: resolved_volume_path(worktree),
         last_access_mtime,
         attributable_bytes,
         landed_in_main,
@@ -3029,12 +3077,22 @@ fn essential_paths() -> Vec<PathBuf> {
 /// effective cargo target dir (`build_target_dir`). A `CARGO_TARGET_DIR` on a
 /// removable volume makes that volume the runner's even when no worktree is on
 /// it.
+///
+/// Each row contributes its symlink-RESOLVED path when the census observed one
+/// (`worktree_volume_path` / `build_target_volume_path`), because that is the
+/// volume the bytes are on; the unresolved path is the fallback.
 fn in_use_paths(root: Option<PathBuf>, snapshot: Option<&WorktreeCensusReq>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = root.into_iter().collect();
     if let Some(req) = snapshot {
         for w in &req.worktrees {
-            paths.push(PathBuf::from(&w.path));
-            if let Some(dir) = &w.build_target_dir {
+            paths.push(PathBuf::from(
+                w.worktree_volume_path.as_ref().unwrap_or(&w.path),
+            ));
+            if let Some(dir) = w
+                .build_target_volume_path
+                .as_ref()
+                .or(w.build_target_dir.as_ref())
+            {
                 paths.push(PathBuf::from(dir));
             }
         }
@@ -4459,6 +4517,95 @@ mod tests {",
         dir
     }
 
+    // --- symlink-resolved volume paths (plan
+    // `2026-11-22-coord-charges-a-build-in-a-symlinked-agent-worktree-to-root`).
+
+    /// A symlinked worktree dir resolves to its TARGET's path, while the
+    /// identity field stays the unresolved link path.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_worktree_resolves_to_the_link_targets_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("data").join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("agent-worktrees-01a");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon_real = std::fs::canonicalize(&real).unwrap();
+
+        assert_eq!(
+            resolved_volume_path(&link).as_deref(),
+            Some(comparable_path(&canon_real).as_str())
+        );
+        assert_ne!(resolved_volume_path(&link), Some(normalize_path_str(&link)));
+    }
+
+    /// The census case the plan is about: a cargo worktree reached through a
+    /// symlinked parent, whose in-tree `target/` does NOT exist yet. The
+    /// target resolves through its nearest existing ancestor (the repo dir,
+    /// under the link) to the link target's volume, and `dir` stays
+    /// unresolved.
+    #[cfg(unix)]
+    #[test]
+    fn a_not_yet_built_target_under_a_symlinked_parent_resolves_through_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_id = tmp.path().join("data").join("01a");
+        let real_repo = real_id.join("qontinui-runner");
+        std::fs::create_dir_all(real_repo.join("src-tauri")).unwrap();
+        std::fs::write(real_repo.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        let link_id = tmp.path().join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(link_id.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_id, &link_id).unwrap();
+        let worktree = link_id.join("qontinui-runner");
+
+        let bt = resolve_build_target(&worktree, None);
+        let unresolved_target = lexical_normalize(&target_dir_for(&worktree));
+        assert!(!unresolved_target.exists(), "the target must not exist yet");
+        assert_eq!(
+            bt.dir.as_deref(),
+            Some(normalize_path_str(&unresolved_target).as_str())
+        );
+
+        let canon_repo = std::fs::canonicalize(&real_repo).unwrap();
+        let rel = unresolved_target.strip_prefix(&worktree).unwrap();
+        let expect = comparable_path(&canon_repo.join(rel));
+        assert_eq!(bt.volume_path.as_deref(), Some(expect.as_str()));
+        let canon_data = comparable_path(&std::fs::canonicalize(tmp.path().join("data")).unwrap());
+        assert!(
+            bt.volume_path.as_deref().unwrap().starts_with(&canon_data),
+            "{:?} is not under the link target {canon_data}",
+            bt.volume_path
+        );
+    }
+
+    /// A plain (non-symlinked) dir is unchanged, modulo canonicalisation of
+    /// the temp root itself (macOS `/var` -> `/private/var`).
+    #[test]
+    fn a_plain_dir_resolves_to_itself() {
+        let wt = tauri_worktree();
+        let canon = std::fs::canonicalize(wt.path()).unwrap();
+        assert_eq!(
+            resolved_volume_path(wt.path()).as_deref(),
+            Some(comparable_path(&canon).as_str())
+        );
+        let bt = resolve_build_target(wt.path(), None);
+        let rel = lexical_normalize(&target_dir_for(wt.path()));
+        let rel = rel.strip_prefix(wt.path()).unwrap();
+        assert_eq!(
+            bt.volume_path.as_deref(),
+            Some(comparable_path(&canon.join(rel)).as_str())
+        );
+    }
+
+    /// No build target, no resolved build-target path.
+    #[test]
+    fn a_non_cargo_worktree_has_no_build_target_volume_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_build_target(dir.path(), None),
+            BuildTarget::default()
+        );
+    }
+
     /// Rule 1 — an ABSOLUTE `CARGO_TARGET_DIR` wins over everything, and a
     /// pool path yields the bare slot id.
     #[test]
@@ -5406,6 +5553,25 @@ mod tests {",
             in_use_paths(None, None),
             Vec::<PathBuf>::new(),
             "no root and no snapshot: nothing"
+        );
+    }
+
+    /// A row's symlink-RESOLVED paths, when observed, are what put a volume
+    /// in use: the bytes are on the link target's volume, not the link's.
+    #[test]
+    fn in_use_paths_prefers_the_resolved_volume_paths() {
+        let mut resolved = row_building_into("/home/w/a", Some("/home/w/a/target"));
+        resolved.worktree_volume_path = Some("/data/w/a".to_string());
+        resolved.build_target_volume_path = Some("/data/w/a/target".to_string());
+        let snapshot = snapshot_of(vec![resolved, row_building_into("/home/w/b", Some("/t/b"))]);
+        assert_eq!(
+            in_use_paths(None, Some(snapshot.req.as_ref())),
+            vec![
+                PathBuf::from("/data/w/a"),
+                PathBuf::from("/data/w/a/target"),
+                PathBuf::from("/home/w/b"),
+                PathBuf::from("/t/b"),
+            ]
         );
     }
 
@@ -6646,6 +6812,8 @@ mod tests {",
             target_bytes: 0,
             build_target_dir: None,
             build_slot: None,
+            build_target_volume_path: None,
+            worktree_volume_path: None,
             last_access_mtime: None,
             attributable_bytes: bytes,
             landed_in_main: None,
