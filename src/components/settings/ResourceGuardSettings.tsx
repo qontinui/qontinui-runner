@@ -421,10 +421,17 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             setHostSuggestion(host_suggestion ?? null);
             setAllowlistText(c.repo_allowlist.join("\n"));
             setBuildsDraft(null);
-            onLog("warning", "CI-node settings reloaded: a remote directive changed them");
+            onLog(
+              "warning",
+              "CI-node settings reloaded: a remote directive changed them, so your unsaved " +
+                "CI-node edit was discarded. Re-apply it and save again.",
+            );
+          } else {
+            onLog("warning", "CI-node settings could not be reloaded; leave and reopen the panel");
           }
         } catch (reloadErr) {
           console.error("Failed to reload CI-node settings:", reloadErr);
+          onLog("warning", "CI-node settings could not be reloaded; leave and reopen the panel");
         }
       }
     }

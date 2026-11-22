@@ -671,7 +671,11 @@ mod tests {
         // The panel loaded before the directive: it saw no id.
         let err = save_ci_node_settings_impl(false, None, vec!["old/repo".to_string()], 20, None)
             .expect_err("a stale panel must not revert the directive");
-        assert!(String::from(err).contains("reload"));
+        let msg = String::from(err);
+        assert!(msg.contains("reload"), "{msg}");
+        // ResourceGuardSettings.tsx keys its automatic re-read on this exact
+        // phrase; rewording it silently disables that reload.
+        assert!(msg.contains("remote configuration directive"), "{msg}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         // A panel that loaded after it saves normally.
