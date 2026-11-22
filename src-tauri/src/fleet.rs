@@ -1044,7 +1044,8 @@ pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> boo
 /// own it stays silent, because under `COALESCE($n, column)` a value on the
 /// wire overwrites and a `0` is a write of zero — the 2026-07-28 mechanism.
 ///
-/// `role` is consumed here (it decides the agent cap) but deliberately never
+/// `role` is consumed here (Build asserts `max_concurrent_agents = 0`, Agent
+/// leaves the count to coord) but deliberately never
 /// reaches the payload — see [`DeviceBudgetRequest`] for why the supervisor
 /// owns that column.
 ///
@@ -1105,8 +1106,8 @@ fn build_budget_request(
 }
 
 /// Publish this runner's owned budget columns to `coord.devices` via `POST
-/// /coord/devices/{device_id}/budget`. The `role` argument shapes the agent
-/// cap but is NOT published — see [`DeviceBudgetRequest`].
+/// /coord/devices/{device_id}/budget`. The `role` argument decides whether
+/// the publish asserts `max_concurrent_agents = 0` but is NOT published — see [`DeviceBudgetRequest`].
 ///
 /// Best-effort: failures log a warning and return Ok(()) so they don't break
 /// startup.
