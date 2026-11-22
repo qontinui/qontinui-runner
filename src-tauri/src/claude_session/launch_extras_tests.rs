@@ -630,8 +630,8 @@ fn under_an_allow_list_a_template_settings_contributes_nothing() {
 
 /// Under bypass the template layer is folded, but only its NARROWING
 /// permissions survive: `allow`, `defaultMode` and `additionalDirectories` are
-/// stripped in every mode, while `deny` and `ask` are kept (Claude Code honours
-/// `deny` even under bypass).
+/// stripped, while `deny` and `ask` are kept because they only narrow the
+/// session.
 #[test]
 fn under_bypass_only_a_templates_narrowing_permissions_are_folded() {
     let amb = crate::test_env::isolated_ambient();
@@ -736,7 +736,7 @@ fn an_unreadable_template_settings_never_passes_through_to_the_argv() {
     let cfg = LaunchConfig {
         default_template: Some(
             "claude --settings /no/such/operator-settings.json \
-             --append-system-prompt-file /no/such/prompt.md --verbose"
+             --append-system-prompt-file /no/such/prompt.md --max-turns 7"
                 .to_string(),
         ),
         ..Default::default()
@@ -753,7 +753,9 @@ fn an_unreadable_template_settings_never_passes_through_to_the_argv() {
         flag_values(&argv, "--append-system-prompt-file").is_empty(),
         "{argv:?}"
     );
-    assert!(argv.iter().any(|a| a == "--verbose"), "{argv:?}");
+    // A template flag the tail never supplies still layers in: only the owned
+    // flags were dropped.
+    assert_eq!(flag_values(&argv, "--max-turns"), vec!["7"], "{argv:?}");
 }
 
 /// An INLINE-JSON template `--settings` is folded like a file, and its value —

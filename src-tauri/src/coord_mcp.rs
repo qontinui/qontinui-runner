@@ -9449,7 +9449,7 @@ fn reap_configs_for_revoked_nonces(dir: &Path, revoked: &[String]) -> usize {
         if !revoked.contains(&nonce) {
             continue;
         }
-        match remove_config_if_nonce_unchanged(&path, Some(&nonce)) {
+        match remove_config_if_nonce_unchanged(&path, Some(nonce.as_str())) {
             Ok(true) => removed += 1,
             Ok(false) => {}
             Err(e) => warn!(
@@ -9531,8 +9531,8 @@ fn reap_stale_session_restore_configs_in(
         }
         let port = read_proxy_port_from(&path);
         let nonce = read_proxy_nonce(&path);
-        let keep = match (port, nonce) {
-            (Some(p), Some(n)) if p == bound_port => proxy_nonce_is_valid(&n),
+        let keep = match (port, nonce.as_deref()) {
+            (Some(p), Some(n)) if p == bound_port => proxy_nonce_is_valid(n),
             (Some(p), Some(_)) => port_alive(p),
             // No parseable proxy port/nonce: not a working credential file.
             _ => false,
@@ -26429,6 +26429,60 @@ mod spawn_tenant_credential_tests {
         assert_eq!(
             session_tenant_or_refuse(Some(&unchosen)),
             Ok(Some(tenant_a()))
+        );
+    }
+
+    /// `remove_config_if_nonce_unchanged` removes a file only while it still
+    /// carries exactly what the caller decided on: a stale expectation keeps
+    /// the file, a matching one removes it, `None` removes only a file with no
+    /// readable nonce, and an absent file is `Ok(false)`.
+    #[test]
+    fn remove_config_if_nonce_unchanged_removes_only_what_the_caller_read() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "cas-remove");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        let path = Path::new(&wd).join(".mcp.json");
+        let nonce = read_proxy_nonce(&path).expect("the written config carries a nonce");
+
+        assert!(matches!(
+            remove_config_if_nonce_unchanged(&path, Some("a-key-this-file-no-longer-holds")),
+            Ok(false)
+        ));
+        assert!(path.exists(), "a stale expectation keeps the file");
+        assert!(matches!(
+            remove_config_if_nonce_unchanged(&path, None),
+            Ok(false)
+        ));
+        assert!(
+            path.exists(),
+            "None never removes a file that carries a nonce"
+        );
+
+        assert!(matches!(
+            remove_config_if_nonce_unchanged(&path, Some(nonce.as_str())),
+            Ok(true)
+        ));
+        assert!(!path.exists(), "a matching expectation removes the file");
+        assert!(matches!(
+            remove_config_if_nonce_unchanged(&path, Some(nonce.as_str())),
+            Ok(false)
+        ));
+
+        let unparseable = Path::new(&wd).join("unparseable.json");
+        std::fs::write(&unparseable, b"not json at all").unwrap();
+        assert!(matches!(
+            remove_config_if_nonce_unchanged(&unparseable, Some(nonce.as_str())),
+            Ok(false)
+        ));
+        assert!(unparseable.exists());
+        assert!(matches!(
+            remove_config_if_nonce_unchanged(&unparseable, None),
+            Ok(true)
+        ));
+        assert!(
+            !unparseable.exists(),
+            "None removes a file with no readable nonce"
         );
     }
 

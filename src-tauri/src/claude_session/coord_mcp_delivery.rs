@@ -383,7 +383,9 @@ fn retire(key: &str, record: &LeaseRecord) {
     // (and recreates it). So a retire only ever deletes a file still carrying
     // the nonce THIS delivery minted.
     if let (Some(path), Some(nonce)) = (&record.runner_config, &record.nonce) {
-        if let Err(e) = crate::coord_mcp::remove_config_if_nonce_unchanged(path, Some(nonce)) {
+        if let Err(e) =
+            crate::coord_mcp::remove_config_if_nonce_unchanged(path, Some(nonce.as_str()))
+        {
             warn!(
                 "coord-mcp: could not remove {} on retire: {e}",
                 path.display()
@@ -534,7 +536,8 @@ fn carry_through_servers(
     // project-scope (`.mcp.json`) servers the account approved for it.
     let project = projects.and_then(|p| keys.iter().find_map(|k| p.get(k)));
     // Highest precedence first: local settings, project settings, the account
-    // file's projects entry, user settings.
+    // file's projects entry, user settings. (The projects entry's place between
+    // project and user is an assumption, unmeasured — see `ProjectApproval`.)
     let (local_files, project_files) = project_settings_files(cwd);
     let local: Vec<serde_json::Value> = local_files.iter().filter_map(|p| read_json(p)).collect();
     let shared: Vec<serde_json::Value> =
@@ -584,7 +587,10 @@ fn carry_through_servers(
 /// The approval state for one project's `.mcp.json` servers, from the layers
 /// this function reads: `.claude/settings.local.json`, `.claude/settings.json`,
 /// the account config's `projects[<key>]` entry and the user's `settings.json`,
-/// in that order of precedence. A server named in `disabledMcpjsonServers` in
+/// in that order of precedence. Local > project > user is Claude Code's
+/// documented settings order; the account file's projects entry is placed
+/// between project and user by assumption, unmeasured. A server named in
+/// `disabledMcpjsonServers` in
 /// ANY layer never loads (disabled wins over any enable). Otherwise it loads
 /// when it is named in `enabledMcpjsonServers` in any layer, or when
 /// `enableAllProjectMcpServers` is true in the HIGHEST-precedence layer that

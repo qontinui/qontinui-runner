@@ -246,9 +246,10 @@ pub struct LaunchSpec {
     pub extra_required: Vec<String>,
     /// Template flags the caller OWNS even where it supplies none, in either
     /// spelling: a template's copy is always dropped. The stream-json spawn owns
-    /// `--mcp-config` and `--strict-mcp-config` on every coord-mcp arm,
-    /// including the one where the session's own config is its cwd's
-    /// `.mcp.json` and the runner passes no MCP flag at all.
+    /// `--mcp-config`, `--strict-mcp-config`, `--settings`,
+    /// `--append-system-prompt` and `--append-system-prompt-file` on every
+    /// coord-mcp arm — including the one where the session's own config is its
+    /// cwd's `.mcp.json` and the runner passes no MCP flag at all.
     pub owned_flags: Vec<String>,
 }
 

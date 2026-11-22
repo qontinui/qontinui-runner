@@ -86,8 +86,11 @@ pub(crate) struct LaunchExtras {
     /// waiter. Dropping it (any error before the child exists) retires it.
     pub(crate) coord_mcp: AiSessionCoordMcp,
     /// Template flags the spawn owns on every arm
-    /// ([`super::launch_spec::LaunchSpec::owned_flags`]): the template's MCP
-    /// flags never reach the argv, whatever the coord-mcp arm.
+    /// ([`super::launch_spec::LaunchSpec::owned_flags`]): `--mcp-config`,
+    /// `--strict-mcp-config`, `--settings`, `--append-system-prompt` and
+    /// `--append-system-prompt-file`. A template copy of any of them never
+    /// reaches the argv, whatever the coord-mcp arm; the settings and prompts
+    /// reach the session only through the fold.
     pub(crate) owned_flags: Vec<String>,
 }
 
@@ -300,16 +303,18 @@ fn settings_args(
 /// The `permissions` keys that WIDEN what a session may do: an `allow` rule
 /// pre-approves a tool, `defaultMode` can switch the posture, and
 /// `additionalDirectories` grants paths outside the cwd. A template's `deny`
-/// and `ask` rules only narrow, and Claude Code honours `deny` even under
-/// bypass, so they are kept.
+/// and `ask` rules are kept because they only narrow the session.
 const WIDENING_PERMISSION_KEYS: [&str; 3] = ["allow", "defaultMode", "additionalDirectories"];
 
-/// A template settings layer with everything removed that could widen the
-/// session or switch off the runner's own layer, in every permission mode:
-/// - the [`WIDENING_PERMISSION_KEYS`] under `permissions` (an emptied
-///   `permissions` object is dropped);
-/// - `disableAllHooks`, which would disable the runner's hook carrier — its
-///   SessionStart policy hook included.
+/// A template settings layer with exactly four keys removed:
+/// `permissions.allow`, `permissions.defaultMode` and
+/// `permissions.additionalDirectories` (the [`WIDENING_PERMISSION_KEYS`]; a
+/// `permissions` object left empty is dropped), and the top-level
+/// `disableAllHooks`, which would disable the runner's hook carrier — its
+/// SessionStart policy hook included. Everything else in the layer is kept.
+///
+/// The fold only runs under the bypass modes: under an allow-list no template
+/// settings are folded at all ([`template_settings_to_fold`]).
 fn strip_widening_template_keys(mut doc: serde_json::Value) -> serde_json::Value {
     if let Some(object) = doc.as_object_mut() {
         object.remove("disableAllHooks");

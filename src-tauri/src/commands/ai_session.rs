@@ -713,7 +713,7 @@ pub async fn close_ai_session(
     close_ai_session_in(
         &app_handle,
         session_manager.inner(),
-        Some(app_state.pg_db()),
+        Some(app_state.pg_db().as_ref()),
         &task_run_id,
     )
     .await;
