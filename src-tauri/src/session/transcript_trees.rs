@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde::de::{Deserializer, SeqAccess, Visitor};
+use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
 use super::transcript_facts::{find_copies, newest_copy};
@@ -91,6 +91,18 @@ pub const READ_ONLY_TOOLS: [&str; 14] = [
 pub fn is_read_only_tool(tool: &str) -> bool {
     READ_ONLY_TOOLS.contains(&tool)
 }
+
+/// The content-block kinds that are not tool calls. A block of any other kind
+/// (including one with no `type`) may be a call this scan cannot read, so it
+/// breaks the no-write proof rather than being skipped.
+pub const NON_CALL_BLOCKS: [&str; 6] = [
+    "text",
+    "thinking",
+    "redacted_thinking",
+    "tool_result",
+    "image",
+    "document",
+];
 
 /// The write tools whose input names the file they write, and the input key
 /// that carries it.
@@ -200,18 +212,91 @@ struct Block {
     input: Option<ToolInput>,
 }
 
-#[derive(Deserialize)]
+/// A `tool_use` input, read leniently: only the two path keys are kept, and an
+/// input of any shape parses, so a tool whose input is not an object cannot
+/// make the whole line unreadable. Only the write tools' targets are checked,
+/// in [`FileScan::fold`].
+#[derive(Default)]
 struct ToolInput {
-    file_path: Option<String>,
-    notebook_path: Option<String>,
+    /// The input was not a JSON object.
+    not_an_object: bool,
+    file_path: Option<serde_json::Value>,
+    notebook_path: Option<serde_json::Value>,
 }
 
 impl ToolInput {
-    fn get(&self, key: &str) -> Option<&str> {
-        match key {
-            "file_path" => self.file_path.as_deref(),
-            "notebook_path" => self.notebook_path.as_deref(),
-            _ => None,
+    /// The path under `key`: `Ok(None)` when absent, `Err` when the input is
+    /// not an object or the value is not a string.
+    fn path(&self, key: &str) -> Result<Option<&str>, ()> {
+        if self.not_an_object {
+            return Err(());
+        }
+        let value = match key {
+            "file_path" => &self.file_path,
+            "notebook_path" => &self.notebook_path,
+            _ => return Ok(None),
+        };
+        match value {
+            None => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
+        impl<'de> Visitor<'de> for InputVisitor {
+            type Value = ToolInput;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a tool input of any shape")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ToolInput, A::Error> {
+                let mut input = ToolInput::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "file_path" => input.file_path = Some(map.next_value()?),
+                        "notebook_path" => input.notebook_path = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(input)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ToolInput, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_i64<E: serde::de::Error>(self, _v: i64) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_u64<E: serde::de::Error>(self, _v: u64) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+        }
+        deserializer.deserialize_any(InputVisitor)
+    }
+}
+
+impl ToolInput {
+    fn not_an_object() -> Self {
+        Self {
+            not_an_object: true,
+            ..Self::default()
         }
     }
 }
@@ -242,22 +327,42 @@ impl FileScan {
             .and_then(|m| m.content)
             .map_or_else(Vec::new, |b| b.0);
         for block in blocks {
-            if block.kind.as_deref() != Some("tool_use") {
-                continue;
+            match block.kind.as_deref() {
+                Some("tool_use") => {}
+                Some(kind) if NON_CALL_BLOCKS.contains(&kind) => continue,
+                other => {
+                    if self.write_call.is_none() {
+                        self.write_call = Some(format!(
+                            "{label} line {line} holds a {:?} block, which may be a call",
+                            other.unwrap_or("")
+                        ));
+                    }
+                    continue;
+                }
             }
             let name = block.name.unwrap_or_default();
             if self.write_call.is_none() && !is_read_only_tool(&name) {
                 self.write_call = Some(format!("{label} line {line} calls {name:?}"));
             }
-            let Some(target) = WRITE_TARGETS
-                .iter()
-                .find(|(tool, _)| *tool == name)
-                .and_then(|(_, key)| block.input.as_ref()?.get(key))
-                .map(|t| PathBuf::from(t.trim()))
-                .filter(|t| !t.as_os_str().is_empty())
-            else {
+            let Some((_, key)) = WRITE_TARGETS.iter().find(|(tool, _)| *tool == name) else {
                 continue;
             };
+            let raw = match block.input.as_ref().map(|i| i.path(key)) {
+                Some(Ok(Some(raw))) => raw,
+                _ => {
+                    self.note_incomplete(format!(
+                        "{label} line {line}: the {name} call names no readable {key}"
+                    ));
+                    continue;
+                }
+            };
+            let target = PathBuf::from(raw.trim());
+            if target.as_os_str().is_empty() {
+                self.note_incomplete(format!(
+                    "{label} line {line}: the {name} call names an empty {key}"
+                ));
+                continue;
+            }
             let absolute = if target.is_absolute() {
                 Some(target.clone())
             } else {
@@ -366,9 +471,11 @@ fn scan_file(path: &Path, remaining: &mut u64, deadline: Instant) -> FileScan {
         return scan;
     }
     // Stat again after the read: a file written meanwhile was not read as
-    // stamped, so the result is used but not cached.
-    let unchanged = std::fs::metadata(path).is_ok_and(|m| FileStamp::of(&m) == stamp);
-    if scan.reached_end && unchanged {
+    // stamped. The bounded reader can stop exactly on a line boundary of a
+    // file that grew, which would otherwise read as whole.
+    let after = std::fs::metadata(path).ok().map(|m| FileStamp::of(&m));
+    let scan = settle_read(scan, stamp, after, &label);
+    if scan.reached_end {
         if let Ok(mut guard) = cache().lock() {
             if guard.len() >= CACHE_CAP {
                 guard.clear();
@@ -379,8 +486,25 @@ fn scan_file(path: &Path, remaining: &mut u64, deadline: Instant) -> FileScan {
     scan
 }
 
+/// PURE: a read stands as whole only when the file's stamp after the read
+/// equals the stamp before it. Otherwise it is incomplete, and never cached.
+fn settle_read(
+    mut scan: FileScan,
+    before: FileStamp,
+    after: Option<FileStamp>,
+    label: &str,
+) -> FileScan {
+    if after != Some(before) {
+        scan.reached_end = false;
+        scan.note_incomplete(format!("{label} changed while it was read"));
+    }
+    scan
+}
+
 /// Every `*.jsonl` under `dir`, down to `depth` levels. A `dir` that does not
-/// exist holds none. `Err` when a directory that exists could not be listed.
+/// exist holds none. `Err` when a directory that exists could not be listed,
+/// when the tree is nested deeper than `depth`, or when it holds a symlink
+/// (not followed, so what lies behind it is unread).
 fn sidechain_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -393,6 +517,12 @@ fn sidechain_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(
         let kind = entry
             .file_type()
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "{} is a symlink, which the scan does not follow",
+                path.display()
+            ));
+        }
         if kind.is_dir() {
             if depth == 0 {
                 return Err(format!(
@@ -700,6 +830,164 @@ mod tests {
             unranked.dirs,
             vec![PathBuf::from("/ws/wt/a"), PathBuf::from("/ws/wt/b")]
         );
+    }
+
+    /// Review A1: a read is whole only when the file's stamp did not move
+    /// across it — a bounded read can end on a line boundary of a file that
+    /// grew meanwhile.
+    #[test]
+    fn a_file_that_changed_while_it_was_read_is_incomplete() {
+        let before = FileStamp {
+            len: 10,
+            modified_ms: Some(1),
+        };
+        let whole = || FileScan {
+            reached_end: true,
+            ..FileScan::default()
+        };
+        let same = settle_read(whole(), before, Some(before), "t.jsonl");
+        assert!(same.reached_end && same.incomplete.is_none());
+        for after in [
+            Some(FileStamp {
+                len: 20,
+                modified_ms: Some(2),
+            }),
+            None,
+        ] {
+            let moved = settle_read(whole(), before, after, "t.jsonl");
+            assert!(!moved.reached_end, "{after:?}");
+            assert!(moved
+                .incomplete
+                .unwrap()
+                .contains("changed while it was read"));
+        }
+    }
+
+    /// Review A5: a block kind the scan does not know may be a call, so it
+    /// breaks the proof; the known non-call kinds do not.
+    #[test]
+    fn an_unknown_block_kind_breaks_the_proof() {
+        let line = |blocks: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "cwd": "/ws",
+                               "message": {"content": blocks}})
+            .to_string()
+        };
+        let known = scan(&[line(serde_json::json!([
+            {"type": "text", "text": "x"},
+            {"type": "thinking", "thinking": "y"},
+            {"type": "redacted_thinking", "data": "z"},
+            {"type": "image", "source": {}},
+        ]))]);
+        assert_eq!(known.write_call, None);
+        assert_eq!(known.incomplete, None);
+        for block in [
+            serde_json::json!({"type": "server_tool_use", "name": "web_search"}),
+            serde_json::json!({"name": "Bash"}),
+        ] {
+            let s = scan(&[line(serde_json::json!([block]))]);
+            assert!(s.write_call.is_some(), "{block}");
+        }
+    }
+
+    /// Review A6: only the write tools' inputs are type-checked. A tool whose
+    /// input is not an object leaves the line readable; a write tool whose
+    /// target cannot be read leaves the file incomplete.
+    #[test]
+    fn only_a_write_tools_input_is_type_checked() {
+        let odd = scan(&[
+            call("/ws", "mcp__x__y", serde_json::json!("not an object")),
+            call("/ws", "mcp__x__z", serde_json::json!({"file_path": 7})),
+            said("/ws/wt/a", serde_json::json!("go")),
+        ]);
+        assert_eq!(odd.incomplete, None);
+        assert_eq!(dirs(&odd), vec!["/ws", "/ws/wt/a"]);
+        for input in [
+            serde_json::json!(["x"]),
+            serde_json::json!({"file_path": 7}),
+            serde_json::json!({}),
+        ] {
+            let s = scan(&[call("/ws", "Edit", input.clone())]);
+            assert!(s.incomplete.is_some(), "{input}");
+        }
+    }
+
+    /// Review A9: the cache is keyed on mtime as well as length — a rewrite
+    /// of the same length is read again.
+    #[test]
+    fn a_same_length_rewrite_is_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000004";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        let roots = vec![root];
+        let bash = call("/ws", "Bash", serde_json::json!({"command": "true"}));
+        let mut quiet = said("/ws", serde_json::json!("go"));
+        let pad = bash.len().checked_sub(quiet.len()).unwrap();
+        quiet = said(
+            &format!("/ws/{}", "p".repeat(pad - 1)),
+            serde_json::json!("go"),
+        );
+        assert_eq!(quiet.len(), bash.len());
+        write(&main, &[quiet]);
+        let first = std::fs::metadata(&main).unwrap().modified().unwrap();
+        assert_eq!(
+            scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)
+                .read
+                .no_write_proof(),
+            Ok(())
+        );
+        write(&main, &[bash]);
+        let f = std::fs::OpenOptions::new().write(true).open(&main).unwrap();
+        f.set_modified(first + Duration::from_secs(10)).unwrap();
+        drop(f);
+        assert!(scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)
+            .read
+            .write_call
+            .unwrap()
+            .contains("\"Bash\""));
+    }
+
+    /// Review A9: sidechains nested past the depth bound are not read, so the
+    /// transcript is incomplete.
+    #[test]
+    fn a_sidechain_nested_too_deep_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000005";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        let subagents = main.with_extension("").join("subagents");
+        let mut deep = subagents.clone();
+        for level in 0..=SIDECHAIN_MAX_DEPTH {
+            deep = deep.join(format!("d{level}"));
+        }
+        write(
+            &deep.join("agent-x.jsonl"),
+            &[said("/ws", serde_json::json!("go"))],
+        );
+        let roots = vec![root];
+        let too_deep = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert!(too_deep.read.incomplete.unwrap().contains("nested deeper"));
+    }
+
+    /// Review A10: a symlink under `subagents/` is not followed, so what lies
+    /// behind it is unread and the transcript is incomplete.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sidechain_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000006";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        let subagents = main.with_extension("").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let roots = vec![root];
+        let elsewhere = tmp.path().join("elsewhere.jsonl");
+        write(&elsewhere, &[said("/ws", serde_json::json!("go"))]);
+        std::os::unix::fs::symlink(&elsewhere, subagents.join("agent-y.jsonl")).unwrap();
+        let linked = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert!(linked.read.incomplete.unwrap().contains("symlink"));
     }
 
     /// The cache must never serve a stale "no write": a file the session

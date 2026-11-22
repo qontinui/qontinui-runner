@@ -939,16 +939,27 @@ pub trait CustodyProbe: Send + Sync {
 
 /// The worktree holding a directory the transcript names, found through its
 /// nearest EXISTING ancestor. A transcript can name a directory that has
-/// since been removed. `Ok(None)` when that ancestor is in no repository.
-/// `Err` when an existence check could not be answered, or no ancestor
-/// exists.
+/// since been removed. `Ok(None)` only when the directory itself still exists
+/// and is in no repository (a scratch dir). A directory that is GONE and whose
+/// walk-up finds no repository is `Err`: it may have been a worktree outside
+/// any layout this gather knows, removed with its work, so "no repository" is
+/// not established. Also `Err` when an existence check could not be answered,
+/// or no ancestor exists.
 async fn transcript_dir_root<P: CustodyProbe + ?Sized>(
     probe: &P,
     dir: &Path,
 ) -> Result<Option<PathBuf>, String> {
     for ancestor in dir.ancestors().filter(|a| !a.as_os_str().is_empty()) {
         if probe.exists(ancestor).await? {
-            return probe.worktree_root(ancestor).await;
+            let root = probe.worktree_root(ancestor).await?;
+            if root.is_none() && ancestor != dir {
+                return Err(format!(
+                    "{} no longer exists and no repository holds it, so the tree it was in is \
+                     not known",
+                    dir.display()
+                ));
+            }
+            return Ok(root);
         }
     }
     Err(format!("no ancestor of {} exists", dir.display()))
@@ -1013,14 +1024,13 @@ pub fn reaped_allocation_origin(tree: &Path) -> Result<(PathBuf, String), String
 }
 
 /// PURE: is `refname` a branch of the allocation whose id starts `id12` —
-/// `refs/heads/agent/<…>-<id12>/<slug>`?
+/// `refs/heads/agent/<…>-<id12>/<slug>`, or `refs/heads/agent/<…>-<id12>`
+/// with no slug?
 pub fn allocation_branch_matches(refname: &str, id12: &str) -> bool {
     refname
         .strip_prefix("refs/heads/agent/")
-        .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(owner, slug)| {
-            !slug.is_empty() && owner.to_ascii_lowercase().ends_with(&format!("-{id12}"))
-        })
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|owner| owner.to_ascii_lowercase().ends_with(&format!("-{id12}")))
 }
 
 /// Gather [`CustodyInputs`] for one candidate (D2b).
@@ -2029,7 +2039,7 @@ mod tests {
             "refs/heads/agent/eb2155ed4152-01a1fd707e46/2026-11-20-triage",
             id12
         ));
-        assert!(!allocation_branch_matches(
+        assert!(allocation_branch_matches(
             "refs/heads/agent/eb2155ed4152-01a1fd707e45",
             id12
         ));
@@ -2055,6 +2065,30 @@ mod tests {
             custody_gate(&inputs).reason(),
             Some("transcript_unreadable")
         );
+    }
+
+    /// Review A2: a transcript directory that is GONE, and whose walk-up finds
+    /// no repository, is a failed probe — it may have been a worktree outside
+    /// every known layout. One that still exists in no repository (a scratch
+    /// dir) adds nothing.
+    #[tokio::test]
+    async fn a_gone_transcript_directory_in_no_repository_is_a_failed_probe() {
+        let mut gone = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .transcript(&["/ws/qontinui-runner-wt-x/src"], None, None);
+        gone.missing
+            .insert(PathBuf::from("/ws/qontinui-runner-wt-x/src"));
+        gone.missing
+            .insert(PathBuf::from("/ws/qontinui-runner-wt-x"));
+        let inputs = gather_custody(&gone, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("probe_failed"));
+
+        let scratch = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .transcript(&["/home/u/.qontinui/scratch/s"], None, None);
+        let inputs =
+            gather_custody(&scratch, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs), CustodyVerdict::Clean);
     }
 
     /// A transcript directory whose existence cannot be checked is a failed

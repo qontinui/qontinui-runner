@@ -709,7 +709,13 @@ impl CustodyVerdict {
 ///    ([`TranscriptRead::no_write_proof`]): `Clean` when it was read whole and
 ///    holds no write-capable call, otherwise `Unknown(NoTreeUnproven)` (plan
 ///    `2026-11-20-triage-sessions-custody-reads-the-sessions-recorded-trees-not-its-cwd`,
-///    D2 and D6).
+///    D2 and D6). A set that covers a reaped tree and probes nothing is NOT
+///    empty: the session named a tree, and its ledger row says that tree's
+///    work is over. What the proof guards against, a write by `Bash` into a
+///    tree no source recorded, is equally possible beside a live clean member,
+///    and the plan accepts that residual for every non-empty set (Risks).
+///    Demanding the proof only when nothing was probed would make a reaped
+///    tree count for less than a clean live one, with no gain in safety.
 /// 6. **A transcript that could not be read whole → `Unknown`**
 ///    (`TranscriptUnreadable`), however clean the other members are: the
 ///    unread part may name a dirty tree.
