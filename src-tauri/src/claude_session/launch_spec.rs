@@ -513,7 +513,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
                 n if n.starts_with("--model=") => {
-                    template_model = Some(n["--model=".len()..].to_string())
+                    template_model = n.strip_prefix("--model=").map(str::to_string)
                 }
                 // Effort is spec-owned when the caller supplies one.
                 "--effort" if spec.effort.is_some() => {}
