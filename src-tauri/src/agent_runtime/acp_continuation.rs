@@ -429,9 +429,9 @@ async fn read_gate_outcome(gate_id: uuid::Uuid) -> GateRead {
         client.get(&url),
         crate::auth::TenantScope::Unresolved,
     )
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
+    .timeout(Duration::from_secs(10))
+    .send()
+    .await
     {
         Ok(r) => r,
         Err(e) => return GateRead::Unknown(format!("gate read failed: {e}")),
