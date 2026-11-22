@@ -1054,7 +1054,8 @@ pub struct WorktreeCensus {
     /// The bytes removing `node_modules` frees: each inode once, and an inode
     /// still linked from outside the tree (the pnpm content-addressed store)
     /// not at all. `Some(0)` when junctioned or absent. `None` = UNKNOWN —
-    /// off unix there is no link count, or the tree could not be read.
+    /// off unix (no link count in the directory record), or the tree could
+    /// not be read in full.
     /// Additive on the wire: coord's `WorktreeItem` ignores unknown keys, and
     /// any coord adoption must be `#[serde(default)]` reading a missing value
     /// as UNKNOWN. Plan
@@ -1124,12 +1125,17 @@ pub struct WorktreeCensus {
     /// measured ([`nm_exclusive_bytes`](Self::nm_exclusive_bytes),
     /// [`target_exclusive_bytes`](Self::target_exclusive_bytes)), else its
     /// apparent bytes (`nm_bytes` / `target_bytes`) where exclusivity is
-    /// `None` (Windows). A junctioned dir contributes 0. A pnpm tree
+    /// `None` (off unix, or a walk that could not read every sub-directory).
+    /// An apparent fallback still counts store-hardlinked bytes in full, so it
+    /// can OVERSTATE what removal frees. A junctioned dir contributes 0. A pnpm tree
     /// hardlinked from the store therefore contributes only its unshared
     /// bytes, not its apparent size. Each dir is measured on its own, so an
     /// inode linked from BOTH `node_modules` and `target`, or from several
     /// worktrees once the store copy is pruned, counts 0 in each: summed
-    /// across rows this is a lower bound on what removing them all frees.
+    /// across rows whose exclusivity was measured, this is a lower bound on
+    /// what removing them all frees. A runner predating the exclusive fields
+    /// sent the apparent figure here; a row carrying `nm_exclusive_bytes` (even
+    /// as `null`) is from a runner that computes it this way.
     pub attributable_bytes: u64,
 
     /// G2 "work landed" — whether this worktree's HEAD is already
