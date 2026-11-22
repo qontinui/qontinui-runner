@@ -7779,7 +7779,8 @@ pub(crate) mod tests {
     }
 
     /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
-    /// Phase 2, route (c) — regression test only (measured 0 on both boxes):
+    /// Phase 2, route (c) — regression test only (measured 0 on nilan and
+    /// spaceship, coord finding `69c07716-f7f2-41ec-8f25-3c5e4c47c607`):
     /// with no identity shim the pane still spawns, and the seam warns exactly
     /// for the panes that would have taken their `--session-id` from the shim.
     #[test]

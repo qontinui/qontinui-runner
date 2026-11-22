@@ -40,22 +40,20 @@ pub fn should_rebuild(fixes: &[serde_json::Value]) -> bool {
 /// logs, so an `env` dump here is doubly persisted.
 ///
 /// Returned by value so the constructed environment is unit-testable without
-/// spawning `claude`.
-pub(crate) fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::process::Command {
+/// spawning `claude`. `session_id` is the one id the process runs under; the
+/// caller mints it at the spawn site ([`run_fix_agent`]), so a caller that only
+/// probes the command (the config report's env-seam probe) mints and logs
+/// nothing.
+pub(crate) fn build_fix_agent_command(
+    prompt_file: &str,
+    model: &str,
+    session_id: &str,
+) -> tokio::process::Command {
     // The operator's session posture (review M2): bypass by default, `dontAsk`
     // plus the allow-list when selected.
     let permission = crate::settings::get_claude_session_permission()
         .apply(crate::claude_session::launch_spec::PermissionMode::BypassPermissions);
-    // The one id this process runs under, in argv where the session census
-    // reads it — the CLI would otherwise pick its own and leave argv id-less
-    // (plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
-    // Phase 2; `claude_session::runner::CliPin` documents the mint).
-    let session_id = crate::claude_session::runner::mint_cli_session_id();
-    info!(
-        "Fix agent: claude --print pinned to session id {}",
-        session_id
-    );
-    build_fix_agent_command_with(prompt_file, model, &permission, &session_id)
+    build_fix_agent_command_with(prompt_file, model, &permission, session_id)
 }
 
 /// [`build_fix_agent_command`] with an explicit permission mode and session id
@@ -173,7 +171,14 @@ pub async fn run_fix_agent(
         model, timeout_secs
     );
 
-    let mut cmd = build_fix_agent_command(&prompt_file.display().to_string(), model);
+    // The one id this process runs under, in argv where the session census
+    // reads it — the CLI would otherwise pick its own and leave argv id-less
+    // (plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    // Phase 2; `claude_session::runner::CliPin` documents the mint). Minted
+    // here, at the spawn, so only a fix agent that actually starts gets one.
+    let session_id = crate::claude_session::runner::mint_cli_session_id();
+    info!(session_id = %session_id, "fix agent: claude --print pinned to session id");
+    let mut cmd = build_fix_agent_command(&prompt_file.display().to_string(), model, &session_id);
 
     // Retries a transient launch failure (the CLI mid-reinstall by its own
     // auto-updater) before reporting it.
@@ -337,36 +342,55 @@ mod tests {
         );
     }
 
-    /// The production builder mints the id: one `--session-id` with a fresh
-    /// uuid, and a different one per command.
+    /// The production builder carries the id it is given — exactly one
+    /// `--session-id` with that value — and the spawn site mints a fresh one
+    /// per run (`mint_cli_session_id`, a v4 uuid).
     #[test]
-    fn build_fix_agent_command_mints_a_fresh_session_id_per_command() {
-        let id_of = |cmd: &tokio::process::Command| -> String {
-            let args: Vec<String> = cmd
-                .as_std()
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            assert_eq!(
-                args.iter().filter(|a| a.as_str() == "--session-id").count(),
-                1,
-                "args: {args:?}"
-            );
-            let i = args.iter().position(|a| a == "--session-id").unwrap();
-            args[i + 1].clone()
-        };
-        let first = id_of(&build_fix_agent_command("/tmp/p.txt", "sonnet"));
-        let second = id_of(&build_fix_agent_command("/tmp/p.txt", "sonnet"));
-        assert!(
-            uuid::Uuid::parse_str(&first).is_ok(),
-            "not a uuid: {first:?}"
+    fn build_fix_agent_command_carries_the_session_id_it_is_given() {
+        let id = crate::claude_session::runner::mint_cli_session_id();
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "not a uuid: {id:?}");
+        assert_ne!(id, crate::claude_session::runner::mint_cli_session_id());
+        let cmd = build_fix_agent_command("/tmp/p.txt", "sonnet", &id);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "--session-id").count(),
+            1,
+            "args: {args:?}"
         );
-        assert_ne!(first, second);
+        let i = args.iter().position(|a| a == "--session-id").unwrap();
+        assert_eq!(args[i + 1], id, "args: {args:?}");
+    }
+
+    /// The spawn site mints the id and hands it to the builder: a mutant that
+    /// builds with a constant or skips the mint reddens this.
+    #[test]
+    fn run_fix_agent_mints_the_session_id_at_the_spawn() {
+        let src = include_str!("fix_agent.rs");
+        let body = &src[src
+            .find(concat!("pub async fn ", "run_fix_agent"))
+            .expect("run_fix_agent")..];
+        let mint = body
+            .find(concat!(
+                "let session_id = crate::claude_session::runner::",
+                "mint_cli_session_id();"
+            ))
+            .expect("run_fix_agent mints the id");
+        let build = body
+            .find(concat!(
+                "build_fix_agent_command(&prompt_file.display().to_string(), model, ",
+                "&session_id)"
+            ))
+            .expect("run_fix_agent passes the minted id to the builder");
+        assert!(mint < build);
     }
 
     #[test]
     fn fix_agent_command_applies_non_interactive_git_posture() {
-        let cmd = build_fix_agent_command("/tmp/prompt.txt", "sonnet");
+        let cmd = build_fix_agent_command("/tmp/prompt.txt", "sonnet", "(test)");
         crate::credential_helper::assert_non_interactive_git_posture_tokio(
             &cmd,
             "build_fix_agent_command",
