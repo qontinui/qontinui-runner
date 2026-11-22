@@ -121,6 +121,15 @@
     },
     {
       "class": "dev_ports",
+      "file": "src/validation/structured_output.rs",
+      "symbol": "detect_backend",
+      "excerpt": "base_url: \"http://localhost:8000\".to_string(),",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Moved key, not a new assumption: the same row stood unreviewed under src/workflow_generation/structured_output.rs until plan 2026-11-19-delete-the-runner-ai-workflow-loop-engine Phase 1 moved the file verbatim (R100) to src/validation/. Not yet triaged; unreviewed count unchanged."
+    },
+    {
+      "class": "dev_ports",
       "file": "src/workflow_generation/discovery_tools.rs",
       "symbol": "execute_test_api",
       "excerpt": "test_urls.push(format!(\"http://localhost:8000{}\", endpoint));",
@@ -220,14 +229,6 @@
       "file": "src/workflow_generation/specification.rs",
       "symbol": "build_specification_prompt",
       "excerpt": "- `assumptions`: list of assumptions you're making (e.g., \"Project uses TypeScript\", \"Frontend runs on localhost:3001\")",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "dev_ports",
-      "file": "src/validation/structured_output.rs",
-      "symbol": "detect_backend",
-      "excerpt": "base_url: \"http://localhost:8000\".to_string(),",
       "count": 1,
       "disposition": "unreviewed"
     },
