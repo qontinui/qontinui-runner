@@ -444,9 +444,12 @@ jobs:
           # cargo's own exit status is kept, not discarded. A non-zero status
           # with a WORKSPACE ERROR line (`<relative path>:<line>:<col>: error`,
           # src-tauri/... or any crates/... member src-tauri path-depends on;
-          # a deny lint and a compile error both print `error`) is a verdict on
-          # this PR's code, and its failure IS that error, so it goes on to
-          # reviewdog. A non-zero status with no such line is not-a-verdict:
+          # a deny lint prints `error:`, a compile error `error[E0425]:`) is
+          # a lint or compile verdict on the workspace's code, so it goes on to
+          # reviewdog, whose diff_context filter decides whether it is this
+          # PR's (an off-diff error, e.g. a broken main, is filtered out; the
+          # required clippy gate, not this advisory step, owns that case). A
+          # non-zero status with no such line is not-a-verdict:
           # cargo failed for another reason (a build.rs failure, a dependency
           # outside the workspace -- an absolute or ../ path), and any
           # warnings it printed before failing are not a lint of src-tauri.
