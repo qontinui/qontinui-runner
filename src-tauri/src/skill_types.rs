@@ -312,8 +312,7 @@ pub enum SkillTemplate {
 /// on a NAMED variant rather than on an unbounded string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSource {
-    /// Compiled into the binary: `BUILTIN_SKILLS_JSON` is
-    /// `include_str!("builtin.json")`.
+    /// Compiled into the binary: `BUILTIN_SKILLS_JSON` embeds `builtin.json`.
     Builtin,
     /// Authored on this device and stored in its own `user_skills` table.
     User,
@@ -547,4 +546,3 @@ impl SkillIntakeRefusal {
         }
     }
 }
-

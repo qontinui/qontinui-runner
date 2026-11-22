@@ -873,7 +873,7 @@ pub fn export_all_schemas() -> Value {
     // 2026-08-31-runner-publishes-embedded-command-defaults Phase 1). The
     // corpus resolves `account override → fleet default → embedded default`,
     // and the store has never held a row for that third rung — the bodies
-    // exist only inside THIS binary (`fleet_commands.rs`, `fleet_skills.rs`,
+    // exist only inside THIS binary (`fleet_commands.rs`, the fleet skills module,
     // `fleet_agents.rs`), so qontinui-web has no baseline to diff an override
     // against. This is the type the runner publishes to close that gap.
     // Registered HERE, beside `AgentTextUnit*`, and deliberately NOT beside

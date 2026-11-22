@@ -552,7 +552,8 @@ async fn ui_bridge_execute_action_plan_handler_dispatch(
                 // Strict: an absent `success` is INDETERMINATE, never a success.
                 let outcome = super::request::action_outcome(&data);
                 let action_success = outcome.succeeded();
-                let element_state = qontinui_runner_lib::ui_bridge_action_plan::element_state_of(&data);
+                let element_state =
+                    qontinui_runner_lib::ui_bridge_action_plan::element_state_of(&data);
                 let action_error = outcome.error_message();
 
                 if !action_success {

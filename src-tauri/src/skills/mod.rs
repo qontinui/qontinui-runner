@@ -58,7 +58,6 @@ pub fn refuse_retired_template(skill: &Value) -> Option<SkillIntakeRefusal> {
     })
 }
 
-
 /// Compute a SHA-256 checksum of a skill's content for integrity verification.
 pub fn compute_skill_checksum(skill: &SkillDefinition) -> String {
     use sha2::{Digest, Sha256};
