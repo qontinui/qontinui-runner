@@ -1560,7 +1560,9 @@ impl std::fmt::Display for DiscoveryError {
             Self::EnvFileUnreadable { path, error } => write!(
                 f,
                 "${MCP_CONFIG_ENV} names {} but it cannot be read ({error}) — \
-                 typically because the runner retired it or never wrote it — so \
+                 typically because the runner retired it or never wrote it, or \
+                 because it was the identity shim's self-provisioned temp config, \
+                 deleted when its `claude` exited — so \
                  there is no session credential. The `.mcp.json` \
                  walk-up is deliberately NOT tried: an ancestor's file belongs to a \
                  different session and possibly a different tenant. Fallback: \

@@ -11437,9 +11437,11 @@ pub(crate) fn probe_and_breadcrumb_proxy_with_policy(
 /// back to a `.mcp.json` walk-up from cwd (`find_session_mcp_config`) ONLY when
 /// the variable is unset or empty — so this in-workdir file is still what
 /// `qontinui-pr` finds in a session spawned WITHOUT that export, which is why
-/// it is not deleted yet. Its remaining READER is `qontinui-pr` in those
-/// sessions. Headless agent spawns and the boot root/session reconcile are
-/// other WRITERS through this function (plan
+/// it is not deleted yet. Its readers include `qontinui-pr` in those sessions,
+/// the vendored coord-revive skill's L1/L2 doors and `call`/`tools` verbs, and
+/// a `claude` launched there without `--mcp-config`. Headless agent spawns
+/// and the boot root/session reconcile are other WRITERS through this
+/// function (plan
 /// `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
 /// Phase 2 moves the direct-exec paths onto the env delivery). The nonce
 /// travels with the port in the same file on both arms, so they can never
