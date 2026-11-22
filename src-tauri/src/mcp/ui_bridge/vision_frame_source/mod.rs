@@ -357,9 +357,14 @@ impl DeviceScreenshotSource {
                         .map(str::to_string)
                 }) {
                     Some(reason) => {
-                        format!("device screenshot {url} returned HTTP {status}: {reason}")
+                        format!(
+                            "device screenshot {url} returned HTTP {}: {reason}",
+                            status.as_u16()
+                        )
                     }
-                    None => format!("device screenshot {url} returned HTTP {status}"),
+                    // The bare number, as `device_refusal` renders it, so every
+                    // device-status message reads the same way.
+                    None => format!("device screenshot {url} returned HTTP {}", status.as_u16()),
                 }
             });
             return Err(if gateway {
@@ -1145,10 +1150,7 @@ mod tests {
                 .await;
         assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
         let text = err.to_string();
-        assert!(
-            text.ends_with("returned HTTP 503 Service Unavailable"),
-            "{text}"
-        );
+        assert!(text.ends_with("returned HTTP 503"), "{text}");
     }
 
     /// Fetch at 503 and return the reported code.
@@ -1198,6 +1200,26 @@ mod tests {
         );
     }
 
+    /// The gateway override arm keeps the envelope's top-level `retryable`
+    /// (it wins over the object's) and message, while reporting the string
+    /// code rather than the numeric one `from_wire` read first.
+    #[tokio::test]
+    async fn the_gateway_override_keeps_the_envelopes_retry_verdict_and_message() {
+        let body = serde_json::json!({
+            "success": false,
+            "retryable": true,
+            "error": {"code": 502, "errorCode": "X", "message": "m", "retryable": false},
+        });
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "X", "{err:?}");
+        let hint = err.to_json_err().1 .0.hint.expect("hint");
+        assert_eq!(hint["failure_origin"], "app");
+        assert_eq!(hint["retryable"], true, "{err:?}");
+        assert!(err.to_string().ends_with(": m"), "{err}");
+    }
+
     /// A coded refusal with a blank `error` ends at the status line.
     #[tokio::test]
     async fn a_coded_refusal_with_a_blank_error_adds_no_suffix() {
@@ -1221,10 +1243,7 @@ mod tests {
                 .await;
         assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
         let text = err.to_string();
-        assert!(
-            text.ends_with("returned HTTP 503 Service Unavailable"),
-            "{text}"
-        );
+        assert!(text.ends_with("returned HTTP 503"), "{text}");
         assert!(!text.contains("Unknown error"), "{text}");
     }
 
