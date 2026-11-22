@@ -30,6 +30,7 @@ pub mod holder_census;
 mod idle_chrome_replay;
 pub mod interceptor;
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
+pub mod limit_reprobe; // deferred re-check of an unconfirmed usage-limit hint (plan 2026-11-14-account-migration-herding-and-unconfirmed-limit-reprobe)
 pub(crate) mod limit_stop; // transcript-read usage-limit stop classifier (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 1); first caller lands in Phase 2
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
