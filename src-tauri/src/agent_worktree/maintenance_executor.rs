@@ -2025,16 +2025,14 @@ const WINDOWS_LAUNCH_EXTENSIONS: [&str; 12] = [
 ];
 
 /// Whether `name` would shadow one of [`SHADOWING_PROGRAM_STEMS`] when found in
-/// the working directory — `claude.cmd`, `GIT.EXE`, and an extension-less
-/// `claude` alike (case-insensitive, as Windows compares names).
+/// the working directory: one of those stems with a launchable extension
+/// (`claude.cmd`, `GIT.EXE`), compared case-insensitively as Windows does. An
+/// extension-less name is not launchable by a bare-name lookup.
 fn is_shadowing_program_name(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy().to_ascii_lowercase();
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) => (stem, Some(ext)),
-        None => (name.as_str(), None),
-    };
-    SHADOWING_PROGRAM_STEMS.contains(&stem)
-        && ext.is_none_or(|e| WINDOWS_LAUNCH_EXTENSIONS.contains(&e))
+    name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        SHADOWING_PROGRAM_STEMS.contains(&stem) && WINDOWS_LAUNCH_EXTENSIONS.contains(&ext)
+    })
 }
 
 /// Refuse a checkout whose ROOT holds a file that a Windows child started in
@@ -2047,7 +2045,16 @@ fn refuse_root_programs_shadowing_path(root: &Path) -> Result<(), String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot list {}: {e}", root.display()))?;
         let name = entry.file_name();
-        if is_shadowing_program_name(&name) {
+        if !is_shadowing_program_name(&name) {
+            continue;
+        }
+        // A directory is not launchable; anything else (a file, or a link the
+        // launcher would follow) is refused.
+        let is_dir = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat {}: {e}", entry.path().display()))?
+            .is_dir();
+        if !is_dir {
             return Err(format!(
                 "the checkout root holds {}, which a child started there could run \
                  instead of the program on PATH",
@@ -3507,17 +3514,12 @@ mod agent_request_tests {
     #[test]
     fn shadowing_program_names_are_recognised() {
         use std::ffi::OsStr;
-        for bad in [
-            "claude",
-            "claude.cmd",
-            "CLAUDE.EXE",
-            "git.exe",
-            "Git.Bat",
-            "git.ps1",
-        ] {
+        for bad in ["claude.cmd", "CLAUDE.EXE", "git.exe", "Git.Bat", "git.ps1"] {
             assert!(is_shadowing_program_name(OsStr::new(bad)), "{bad}");
         }
         for ok in [
+            "claude",
+            "git",
             "claude.md",
             "git.txt",
             ".git",
@@ -3536,9 +3538,10 @@ mod agent_request_tests {
     fn a_planted_root_program_is_refused_on_windows() {
         let dir = tempfile::tempdir().unwrap();
         drop(init_repo(dir.path()));
+        std::fs::create_dir_all(dir.path().join("claude.exe")).unwrap();
         assert!(
             prepare_checkout(dir.path()).is_ok(),
-            "clean checkout passes"
+            "a clean checkout passes, a directory named like a program included"
         );
         std::fs::write(dir.path().join("claude.cmd"), "@echo pwned\r\n").unwrap();
         let err = prepare_checkout(dir.path()).err().expect("refused");
