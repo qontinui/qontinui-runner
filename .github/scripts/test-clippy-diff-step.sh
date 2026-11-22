@@ -56,7 +56,10 @@
 #      src-tauri): a verdict on the PR's code, so reviewdog runs on it and no
 #      not-a-verdict annotation appears;
 #   14. cargo killed by a signal (exit 137) after printing lines: a partial
-#      capture, so reviewdog is not run and the step says clippy did not lint.
+#      capture, so reviewdog is not run and the step says clippy did not lint;
+#   15-17. cargo exit 101 with no workspace ERROR line (a crates/* warning
+#      before a build.rs failure, a ../ error, a drive-letter error): not a
+#      verdict, so reviewdog is not run.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,13 +121,24 @@ cat >"$W/stub/cargo" <<'STUB'
 # WORKSPACE root (the repo root, whose Cargo.toml lists src-tauri as a member),
 # which is what real cargo prints even when run from src-tauri.
 # CARGO_MODE (set per case): unset or `ok` exits 0; `buildfail` writes what a
-# build.rs failure writes -- no workspace `<relative path>:L:C: ` line, only
-# out-of-workspace (absolute and ../) positions -- and exits 101; `deny`
-# writes the findings and exits 101, as a deny lint does; `memberdeny` writes
-# an error in a crates/* member src-tauri path-depends on and exits 101 (cargo
-# stops before src-tauri); `killed` writes the findings and exits 137 (SIGKILL).
+# build.rs failure writes -- no workspace error line, only out-of-workspace
+# (absolute) positions -- and exits 101; `deny` writes the findings plus the
+# `error:` line a deny lint prints and exits 101; `memberdeny` writes an error
+# in a crates/* member src-tauri path-depends on and exits 101 (cargo stops
+# before src-tauri); `killed` writes the findings and exits 137 (SIGKILL);
+# `memberwarnfail` writes a crates/* WARNING then a build.rs failure, exit
+# 101; `relerr` and `driveerr` write only a `../` or a drive-letter error
+# position, exit 101.
 echo "$*" >>"$CARGO_ARGS"
 [ -n "${CARGO_CWD:-}" ] && pwd >"$CARGO_CWD"
+case "${CARGO_MODE:-ok}" in
+  memberwarnfail)
+    { echo 'crates/runner-stats/src/lib.rs:2:5: warning: unused import: `std::fmt`'
+      echo 'error: failed to run custom build command for `qontinui-runner v0.1.0 (/w/src-tauri)`'; } >&2
+    exit 101 ;;
+  relerr) echo '../qontinui-schemas/rust/src/lib.rs:9:1: error: unresolved import `y`' >&2; exit 101 ;;
+  driveerr) echo 'C:\a\qontinui-schemas\rust\src\lib.rs:9:1: error: unresolved import `y`' >&2; exit 101 ;;
+esac
 if [ "${CARGO_MODE:-ok}" = memberdeny ]; then
   echo 'crates/runner-stats/src/lib.rs:3:5: error: this comparison involving the minimum or maximum element for this type contains a case that is always true or always false' >&2
   exit 101
@@ -132,7 +146,7 @@ fi
 if [ "${CARGO_MODE:-ok}" = buildfail ]; then
   {
     echo '/home/runner/.cargo/registry/src/index.crates.io-0/somedep-1.0.0/src/lib.rs:4:2: error: cannot find type `X` in this scope'
-    echo '../qontinui-schemas/rust/src/lib.rs:9:1: error: unresolved import `y`'
+    echo '/home/runner/work/qontinui-runner/qontinui-schemas/rust/src/lib.rs:9:1: error[E0432]: unresolved import `y`'
     echo 'error: failed to run custom build command for `qontinui-runner v0.1.0 (/w/src-tauri)`'
     echo ''
     echo 'Caused by:'
@@ -151,7 +165,10 @@ case " $* " in
     ;;
   *) printf '{"reason":"compiler-message","n":%s}\n' $(seq 1 50) ;;
 esac
-[ "${CARGO_MODE:-ok}" = deny ] && exit 101
+if [ "${CARGO_MODE:-ok}" = deny ]; then
+  echo 'src-tauri/src/lib.rs:51:5: error: this looks like a denied stub finding' >&2
+  exit 101
+fi
 [ "${CARGO_MODE:-ok}" = killed ] && exit 137
 exit 0
 STUB
@@ -403,8 +420,8 @@ fi
 # 12. a deny lint: cargo exits non-zero WITH diagnostic lines. That is a lint
 #     result, so reviewdog runs as before, from the whole report.
 CARGO_MODE=deny run_step clippy-deny findings
-if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] && whole_report 1 \
-  && ! any_no_verdict; then
+if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] \
+  && grep -q '^src-tauri/src/lib\.rs:51:5: error: ' "$C/rd.stdin.1" && ! any_no_verdict; then
   ok "cargo exits non-zero with diagnostics (deny lints): reviewdog runs as normal and its finding is the verdict"
 else bad "clippy deny lints" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
 
@@ -424,6 +441,18 @@ if [ "$RC" -ne 0 ] && [ "$(attempts)" -eq 0 ] && [ "$(val rc)" = not-run-clippy-
   && printf '%s\n' "$OUT" | grep -F "$NO_LINT" | grep -qF 'exited 137'; then
   ok "cargo killed by a signal: reviewdog is not run and the step says clippy did not lint"
 else bad "clippy killed" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
+
+# 15-17. cargo fails (exit 101) with no workspace ERROR line explaining it:
+#     not a verdict, reviewdog not run. One case per form the guard rejects:
+#     a crates/* member WARNING before a build.rs failure (a warning is not
+#     why cargo failed), a ../ error position, a drive-letter error position.
+for mode in memberwarnfail relerr driveerr; do
+  CARGO_MODE=$mode run_step "clippy-$mode" ok
+  if [ "$RC" -ne 0 ] && [ "$(attempts)" -eq 0 ] && [ "$(val rc)" = not-run-clippy-failed ] \
+    && printf '%s\n' "$OUT" | grep -qF "$NO_LINT"; then
+    ok "cargo exit 101 with only a $mode capture: reviewdog is not run and the step says clippy did not lint"
+  else bad "clippy $mode" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
+done
 
 if [ "$fail" -ne 0 ]; then
   echo "clippy-diff step tests: FAILED"
