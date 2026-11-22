@@ -489,6 +489,140 @@ mod tests {
         }
     }
 
+    /// ARMING (plan `2026-11-22-ci-node-directive-replays-on-connect`, Phase 3,
+    /// detect_deliver): enter where the population enters, the `device_ci`
+    /// connect, against a fake coord that stores a directive only AFTER the
+    /// runner's first read of its store and then confirms its subscription. The
+    /// directive's live frame never arrives (its publish preceded PSUBSCRIBE),
+    /// so the only way it reaches `settings.json` is the fetch the runner makes
+    /// on coord's `_control`/`subscribed` frame. Bounded under the 5 s legacy
+    /// re-fetch, so that path cannot satisfy it.
+    ///
+    /// Written against what the pre-change runner already had
+    /// (`connect_and_pump_ci`, `get_ci_node_settings`, the credential store),
+    /// so with the change reverted it builds and goes RED: the directive is
+    /// never applied.
+    #[tokio::test]
+    async fn a_directive_stored_while_offline_is_applied_on_connect() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_settings_json(
+            r#"{"ci_node":{"enabled":false,"repo_allowlist":["seed/repo"],"min_free_disk_gb":33}}"#,
+        );
+        // A usable device JWT in the fixture's credential store. Never the real
+        // OS keychain: the fixture captured this key and restores it.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let jwt = {
+            use base64::Engine as _;
+            let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let exp = chrono::Utc::now().timestamp() + 3600;
+            format!(
+                "{}.{}.sig",
+                enc(br#"{"alg":"none"}"#),
+                enc(format!(r#"{{"exp":{exp}}}"#).as_bytes())
+            )
+        };
+        crate::auth::AuthManager::new()
+            .store_tokens(&jwt, "")
+            .expect("fixture credential store must take a token");
+
+        let stored = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let directive_id = uuid::Uuid::now_v7().to_string();
+        let body = serde_json::json!({
+            "directive": {
+                "enabled": true,
+                "max_concurrent_builds": 2,
+                "repo_allowlist": ["offline/sent"],
+                "min_free_disk_gb": 20,
+                "machine_id": "m-offline",
+                "requested_at": "2026-11-22T10:00:00.123456Z",
+                "directive_id": directive_id,
+            }
+        })
+        .to_string();
+
+        let (s_get, r_get) = (stored.clone(), reads.clone());
+        let (s_ws, r_ws) = (stored.clone(), reads.clone());
+        let app = axum::Router::new()
+            .route(
+                "/devenv/agent-ci-node-directive",
+                axum::routing::get(move || {
+                    let (s, r, body) = (s_get.clone(), r_get.clone(), body.clone());
+                    async move {
+                        r.fetch_add(1, Ordering::SeqCst);
+                        let out = if s.load(Ordering::SeqCst) {
+                            body
+                        } else {
+                            r#"{"directive":null}"#.to_string()
+                        };
+                        ([("content-type", "application/json")], out)
+                    }
+                }),
+            )
+            .route(
+                "/ws",
+                axum::routing::get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+                    let (s, r) = (s_ws.clone(), r_ws.clone());
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            // Store the directive only after the runner's
+                            // first read of the store (or 2 s, whichever is
+                            // first), then confirm the subscription.
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            while r.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            s.store(true, Ordering::SeqCst);
+                            let _ = socket
+                                .send(axum::extract::ws::Message::Text(
+                                    r#"{"channel":"_control","type":"subscribed"}"#.into(),
+                                ))
+                                .await;
+                            // Hold the socket open; reading keeps pings answered.
+                            while let Some(Ok(_)) = socket.recv().await {}
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        std::env::set_var("COORD_HTTP_URL", format!("http://{addr}"));
+
+        let ws_url = format!("ws://{addr}/ws?subscribe=device_ci");
+        let device = uuid::Uuid::now_v7();
+        let mut connected_at = None;
+        let started = Instant::now();
+        let applied = async {
+            while started.elapsed() < Duration::from_millis(4500) {
+                let ci = crate::settings::get_ci_node_settings();
+                if ci.enabled && ci.repo_allowlist == vec!["offline/sent".to_string()] {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        };
+        let outcome = tokio::select! {
+            r = connect_and_pump_ci(&ws_url, device, &mut connected_at) => {
+                panic!("the pump ended before the directive applied: {r:?}")
+            }
+            ok = applied => ok,
+        };
+        assert!(
+            outcome,
+            "a directive stored while the device was offline must be applied on connect \
+             (store reads: {})",
+            reads.load(Ordering::SeqCst)
+        );
+    }
+
     /// Coord's `subscribed` control frame is recognised — it is what triggers
     /// the replay fetch that closes the offline-directive race — and nothing
     /// else on `_control`, or on any real channel, is mistaken for it.

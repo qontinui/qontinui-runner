@@ -127,6 +127,13 @@ export interface CiNodeSettingsValue {
   max_concurrent_builds: number | null;
   repo_allowlist: string[];
   min_free_disk_gb: number;
+  /**
+   * The coord directive last applied to this device (absent = none). Read-only
+   * here: it is sent back on save so the runner can refuse a save made against
+   * a stale read, which would otherwise revert a directive applied while this
+   * panel was open.
+   */
+  last_directive_id?: string | null;
 }
 
 interface ResourceGuardSettingsProps {
@@ -381,6 +388,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         maxConcurrentBuilds: builds,
         repoAllowlist: allowlist,
         minFreeDiskGb: ciNode.min_free_disk_gb,
+        expectedLastDirectiveId: ciNode.last_directive_id ?? null,
       });
       if (!ciResult?.success) {
         throw new Error(ciResult?.message || "Unknown error saving CI-node settings");

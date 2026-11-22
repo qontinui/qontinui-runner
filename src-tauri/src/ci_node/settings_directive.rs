@@ -405,8 +405,7 @@ pub(crate) fn decide(
     {
         return Some(ApplyOutcome::Superseded);
     }
-    if source == DirectiveSource::Fetched
-        && current.local_edited_at.is_some_and(|local| at < local)
+    if source == DirectiveSource::Fetched && current.local_edited_at.is_some_and(|local| at < local)
     {
         return Some(ApplyOutcome::SupersededByLocal);
     }
@@ -475,9 +474,7 @@ fn apply(directive: CiSettingsDirective, source: DirectiveSource) -> ApplyOutcom
         // win newest-wins against nothing.
         *ci = CiNodeSettings {
             last_directive_id: directive.directive_id.or(ci.last_directive_id),
-            last_directive_requested_at: directive
-                .requested_at
-                .max(ci.last_directive_requested_at),
+            last_directive_requested_at: directive.requested_at.max(ci.last_directive_requested_at),
             local_edited_at: ci.local_edited_at,
             ..validated
         };
@@ -495,6 +492,14 @@ fn apply(directive: CiSettingsDirective, source: DirectiveSource) -> ApplyOutcom
         ApplyOutcome::AlreadyApplied => info!(
             "ci_node: settings directive already applied, no-op replay \
              (source={src}, directive_id={id})"
+        ),
+        // A LIVE frame losing newest-wins means coord's clock is not
+        // monotonic (a step back across a redeploy, or instances disagreeing):
+        // a genuinely new owner statement was dropped, so it is a warning.
+        ApplyOutcome::Superseded if source == DirectiveSource::Live => warn!(
+            "ci_node: LIVE settings directive is not newer than the last applied one, not \
+             applied (source={src}, directive_id={id}, requested_at={at}); coord's clock may \
+             have stepped back. Re-send the directive to apply it"
         ),
         ApplyOutcome::Superseded => info!(
             "ci_node: settings directive superseded by a newer applied directive, not applied \
@@ -944,7 +949,10 @@ mod tests {
         let before = on_disk();
         let stale = identified(Uuid::now_v7(), "2026-11-22T10:00:09Z", true, "a/stale");
 
-        assert_eq!(apply_fetched(stale.clone()), ApplyOutcome::SupersededByLocal);
+        assert_eq!(
+            apply_fetched(stale.clone()),
+            ApplyOutcome::SupersededByLocal
+        );
         assert_eq!(on_disk(), before, "the local edit must stand");
 
         assert_eq!(apply_live(stale), ApplyOutcome::Applied);
@@ -1066,6 +1074,7 @@ mod tests {
             None,
             vec!["local/edit".to_string()],
             20,
+            directive.directive_id.map(|u| u.to_string()),
         )
         .expect("a valid local save");
         let ci = on_disk();

@@ -86,8 +86,8 @@ pub(crate) fn interpret_response(
         401 | 403 => return Err(FetchOutcome::Unauthorized(status)),
         other => return Err(FetchOutcome::HttpError(other)),
     }
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| FetchOutcome::BadBody(format!("not JSON: {e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| FetchOutcome::BadBody(format!("not JSON: {e}")))?;
     match value.get("directive") {
         None => Err(FetchOutcome::BadBody("no `directive` key".to_string())),
         Some(serde_json::Value::Null) => Err(FetchOutcome::NoDirective),
@@ -172,9 +172,9 @@ pub(crate) async fn fetch_and_apply_from(base: &str, bearer: &str) -> FetchOutco
 /// with its `directive_id` and `source=fetched`; this names the fetch itself.
 fn log_outcome(device_id: uuid::Uuid, trigger: &str, outcome: &FetchOutcome) {
     match outcome {
-        FetchOutcome::Received(applied) => debug!(
-            "ci_node: directive fetch ({trigger}) for device_id={device_id}: {applied:?}"
-        ),
+        FetchOutcome::Received(applied) => {
+            debug!("ci_node: directive fetch ({trigger}) for device_id={device_id}: {applied:?}")
+        }
         FetchOutcome::NoDirective => info!(
             "ci_node: directive fetch ({trigger}): coord holds no directive for \
              device_id={device_id}; settings untouched"
@@ -183,9 +183,9 @@ fn log_outcome(device_id: uuid::Uuid, trigger: &str, outcome: &FetchOutcome) {
             "ci_node: directive fetch ({trigger}): coord answered 404 (it predates the \
              directive store); settings untouched"
         ),
-        FetchOutcome::NoCoord => debug!(
-            "ci_node: directive fetch ({trigger}): runner is isolated; settings untouched"
-        ),
+        FetchOutcome::NoCoord => {
+            debug!("ci_node: directive fetch ({trigger}): runner is isolated; settings untouched")
+        }
         other => warn!(
             "ci_node: directive fetch ({trigger}) FAILED for device_id={device_id}: {other:?}; \
              settings untouched, retried on the next connect"
@@ -263,7 +263,8 @@ mod tests {
 
     /// A settings.json carrying a known, non-default `ci_node` section, so
     /// "untouched" is a real comparison and not "still the default".
-    const SEEDED: &str = r#"{"ci_node":{"enabled":false,"repo_allowlist":["seed/repo"],"min_free_disk_gb":33}}"#;
+    const SEEDED: &str =
+        r#"{"ci_node":{"enabled":false,"repo_allowlist":["seed/repo"],"min_free_disk_gb":33}}"#;
 
     /// (a) THE incident: nothing ever applied, `enabled = true` was stored
     /// while the box was offline, and the connect fetch turns the lane on.
@@ -300,11 +301,23 @@ mod tests {
         let cases: [(u16, &str, FetchOutcome); 7] = [
             (200, r#"{"directive":null}"#, FetchOutcome::NoDirective),
             (404, r#"{"error":"not found"}"#, FetchOutcome::NotServed),
-            (401, r#"{"error":"unauthorized"}"#, FetchOutcome::Unauthorized(401)),
+            (
+                401,
+                r#"{"error":"unauthorized"}"#,
+                FetchOutcome::Unauthorized(401),
+            ),
             (403, "", FetchOutcome::Unauthorized(403)),
             (500, "boom", FetchOutcome::HttpError(500)),
-            (503, r#"{"error":"schema_migration_pending"}"#, FetchOutcome::HttpError(503)),
-            (200, "{}", FetchOutcome::BadBody("no `directive` key".to_string())),
+            (
+                503,
+                r#"{"error":"schema_migration_pending"}"#,
+                FetchOutcome::HttpError(503),
+            ),
+            (
+                200,
+                "{}",
+                FetchOutcome::BadBody("no `directive` key".to_string()),
+            ),
         ];
         for (status, body, expected) in cases {
             coord.set(status, body);
@@ -355,7 +368,10 @@ mod tests {
             interpret_response(200, r#"{"directive":"x"}"#).unwrap_err(),
             FetchOutcome::BadBody(_)
         ));
-        assert_eq!(interpret_response(404, "").unwrap_err(), FetchOutcome::NotServed);
+        assert_eq!(
+            interpret_response(404, "").unwrap_err(),
+            FetchOutcome::NotServed
+        );
         assert_eq!(
             interpret_response(502, "").unwrap_err(),
             FetchOutcome::HttpError(502)
