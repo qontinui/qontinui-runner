@@ -59,7 +59,8 @@
 #      capture, so reviewdog is not run and the step says clippy did not lint;
 #   15-17. cargo exit 101 with no workspace ERROR line (a crates/* warning
 #      before a build.rs failure, a ../ error, a drive-letter error): not a
-#      verdict, so reviewdog is not run.
+#      verdict, so reviewdog is not run;
+#   18. a workspace compile error (`error[E0425]:`): a verdict, reviewdog runs.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -128,7 +129,8 @@ cat >"$W/stub/cargo" <<'STUB'
 # before src-tauri); `killed` writes the findings and exits 137 (SIGKILL);
 # `memberwarnfail` writes a crates/* WARNING then a build.rs failure, exit
 # 101; `relerr` and `driveerr` write only a `../` or a drive-letter error
-# position, exit 101.
+# position, exit 101; `compileerr` writes a workspace compile error in
+# rustc's `error[E0425]:` form, exit 101.
 echo "$*" >>"$CARGO_ARGS"
 [ -n "${CARGO_CWD:-}" ] && pwd >"$CARGO_CWD"
 case "${CARGO_MODE:-ok}" in
@@ -136,6 +138,7 @@ case "${CARGO_MODE:-ok}" in
     { echo 'crates/runner-stats/src/lib.rs:2:5: warning: unused import: `std::fmt`'
       echo 'error: failed to run custom build command for `qontinui-runner v0.1.0 (/w/src-tauri)`'; } >&2
     exit 101 ;;
+  compileerr) echo 'src-tauri/src/lib.rs:7:9: error[E0425]: cannot find value `zz` in this scope' >&2; exit 101 ;;
   relerr) echo '../qontinui-schemas/rust/src/lib.rs:9:1: error: unresolved import `y`' >&2; exit 101 ;;
   driveerr) echo 'C:\a\qontinui-schemas\rust\src\lib.rs:9:1: error: unresolved import `y`' >&2; exit 101 ;;
 esac
@@ -421,7 +424,8 @@ fi
 #     result, so reviewdog runs as before, from the whole report.
 CARGO_MODE=deny run_step clippy-deny findings
 if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] \
-  && grep -q '^src-tauri/src/lib\.rs:51:5: error: ' "$C/rd.stdin.1" && ! any_no_verdict; then
+  && grep -q '^src-tauri/src/lib\.rs:51:5: error: ' "$C/rd.stdin.1" \
+  && grep -q -- '-name=clippy-diff' "$C/rd.args.1" && ! any_no_verdict; then
   ok "cargo exits non-zero with diagnostics (deny lints): reviewdog runs as normal and its finding is the verdict"
 else bad "clippy deny lints" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
 
@@ -453,6 +457,15 @@ for mode in memberwarnfail relerr driveerr; do
     ok "cargo exit 101 with only a $mode capture: reviewdog is not run and the step says clippy did not lint"
   else bad "clippy $mode" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
 done
+
+# 18. a workspace compile error in rustc's `error[E0425]:` form, exit 101:
+#     the shape of every compile error, so a verdict -- reviewdog runs on it.
+CARGO_MODE=compileerr run_step clippy-compileerr findings
+if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] \
+  && grep -q '^src-tauri/src/lib\.rs:7:9: error\[E0425\]: ' "$C/rd.stdin.1" \
+  && ! any_no_verdict && ! printf '%s\n' "$OUT" | grep -qF "$NO_LINT"; then
+  ok "a compile error (error[E0425]:) is a verdict: reviewdog runs on it and no not-a-verdict annotation appears"
+else bad "clippy compile error" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
 
 if [ "$fail" -ne 0 ]; then
   echo "clippy-diff step tests: FAILED"
