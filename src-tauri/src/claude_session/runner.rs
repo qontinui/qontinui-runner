@@ -157,8 +157,11 @@ pub(crate) fn cli_session_pin(cli_session_ctx: Option<&CliSessionContext>) -> Cl
 /// bypass permissions, the pin's ONE session flag (`--session-id` or
 /// `--resume`, from [`CliPin::into_spec_ids`]), the model override, and the
 /// caller's verbatim tail. [`crate::claude_session::ClaudeSession::spawn`] and
-/// the inline runner both build their spec here, so neither can render a
-/// spawn whose argv carries no id.
+/// the inline runner both build their spec here, and `compose_flags` appends
+/// the spec's session flag unless a template session-naming flag it KEPT
+/// already carries the same id — so neither can render a spawn whose argv
+/// carries no id (pinned by
+/// `a_placeholder_outside_a_kept_session_flag_still_gets_the_spec_session_id`).
 pub(crate) fn stream_json_launch_spec(
     pin: CliPin,
     model_override: Option<&str>,

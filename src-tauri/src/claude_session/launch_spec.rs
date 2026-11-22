@@ -484,8 +484,13 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let mut session_via_placeholder = false;
 
     if let Some(t) = &template {
+        // `had_placeholder` only says the template MENTIONS `{sessionId}`.
+        // Whether the spec's own session flag is suppressed is decided per
+        // unit below: only a KEPT session-naming flag that carries the pin
+        // positions it. A placeholder anywhere else (`--name {sessionId}`, or
+        // `-c {sessionId}`, whose unit is dropped) leaves argv without an id
+        // unless the spec's flag is still appended.
         let had_placeholder = t.contains(SESSION_ID_PLACEHOLDER);
-        session_via_placeholder = had_placeholder;
         let substituted = t.replace(SESSION_ID_PLACEHOLDER, pin.unwrap_or(""));
         let tokens = shell_tokenize(&substituted);
         // Drop the `claude` head token (guaranteed present — `claude_template`
@@ -528,6 +533,11 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // session and we drop the template's.
                 n if names_session_id(n) => {
                     if had_placeholder {
+                        let carries_pin = match pin {
+                            Some(p) => unit.name.contains(p) || unit.values.iter().any(|v| v == p),
+                            None => true,
+                        };
+                        session_via_placeholder |= carries_pin;
                         other_units.push(unit);
                     }
                 }
@@ -1383,9 +1393,12 @@ mod tests {
         assert!(argv.iter().any(|a| a == "--continue"), "{argv:?}");
     }
 
-    /// The drop covers every spelling of a session choice, not only exact
-    /// names: `-r <id>`, `--resume=<id>`, `--session-id=<id>` and the `resume`
-    /// subcommand in a template never ride beside the spec's own id.
+    /// The drop covers every spelling of a session choice in flag (or leading
+    /// subcommand) position, not only exact names: `-r <id>`, `--resume=<id>`,
+    /// `--session-id=<id>` and a leading `resume` subcommand in a template never
+    /// ride beside the spec's own id. (A bare `resume` that `parse_units` folds
+    /// in as the VALUE of a preceding flag is judged as that flag's value, not
+    /// as a session choice; that shape is not covered here.)
     #[test]
     fn spec_owned_session_drops_every_spelling_of_a_template_session_choice() {
         const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
@@ -1432,6 +1445,53 @@ mod tests {
         let inline = format!("--session-id={ID}");
         assert_eq!(argv.iter().filter(|a| **a == inline).count(), 1, "{argv:?}");
         assert!(!argv.iter().any(|a| a == "--session-id"), "{argv:?}");
+    }
+
+    /// A `{sessionId}` placeholder that does not sit in a kept session-naming
+    /// flag must not suppress the spec's own `--session-id`: argv still
+    /// carries exactly one id (review round 4, A1).
+    #[test]
+    fn a_placeholder_outside_a_kept_session_flag_still_gets_the_spec_session_id() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        for template in ["claude --name {sessionId}", "claude -c {sessionId}"] {
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(!argv.iter().any(|a| a == "-c"), "{template}: {argv:?}");
+        }
+    }
+
+    /// `names_session_id` is a hand-spelled subset of the shared session-choice
+    /// set: every spelling it matches must also be a
+    /// `claude_env::claude_argv_chooses_session` match, so the two cannot drift
+    /// apart silently (review round 4, A3).
+    #[test]
+    fn names_session_id_is_a_subset_of_the_shared_session_choice_set() {
+        for name in [
+            "--session-id",
+            "--resume",
+            "-r",
+            "--session-id=x",
+            "--resume=x",
+            "--SESSION-ID",
+            "--Resume=x",
+        ] {
+            assert!(names_session_id(name), "{name}");
+            assert!(
+                qontinui_runner_lib::claude_env::claude_argv_chooses_session(&[name]),
+                "{name} names a session id but the shared set does not choose a session"
+            );
+        }
     }
 
     #[test]
