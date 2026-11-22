@@ -2268,32 +2268,10 @@ impl CloseEffects for LiveCloseEffects<'_> {
         session_id: &str,
     ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
         use tauri::Manager;
-        // The key is coord's `agent_sessions` id from the keyed ownership read,
-        // never the Claude UUID. Unresolvable (the read failed, or coord has no
-        // entry) sends no `session`, so the page is the device's and the arm
-        // reads a full one UNKNOWN.
-        let coord_session_id = {
-            let reused = self
-                .pass_ownership
-                .filter(|(_, read_at)| ownership_reusable(*read_at, Instant::now()))
-                .map(|(read, _)| read);
-            let fetched;
-            let ownership = match reused {
-                Some(read) => read,
-                None => {
-                    fetched = wind_down_observer::fetch_ownership(&[session_id.to_string()]).await;
-                    &fetched
-                }
-            };
-            ownership
-                .as_ref()
-                .ok()
-                .and_then(|index| index.coord_session_for_claude(session_id))
-                .map(str::to_string)
-        };
-        let page =
-            wind_down_observer::fetch_pending_messages(session_id, coord_session_id.as_deref())
-                .await?;
+        // `to_session` is in coord's agent_sessions id space, which in production
+        // IS the Claude session UUID (`claude_code_session_id`), so the Claude id
+        // itself is the `session` filter. A non-UUID id sends no filter.
+        let page = wind_down_observer::fetch_pending_messages(session_id).await?;
         let session_filtered = page.session_filter_applied;
         let rows = page.rows;
         // Attribution needs both resolvers. Without one, a row that IS for
