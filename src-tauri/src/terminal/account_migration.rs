@@ -487,9 +487,10 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return;
     };
 
-    // A respawn is already moving this session (a migration proving its new
-    // pane alive — whose `--resume` repaint can re-render the old limit
-    // banner — the resume door, the respawn receiver). Stand down before the
+    // Another mover holds this session (a migration proving its new pane
+    // alive — whose `--resume` repaint can re-render the old limit banner —
+    // the resume door, the respawn receiver, or a reset-continue typing into
+    // the pane). Stand down before the
     // usage probe below marks an account rate-limited and the cap charges a
     // slot. This read is the cheap early exit only; the race-free decision is
     // the claim inside [`begin_migration`], whose refusal gives the slot back
@@ -498,7 +499,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         info!(
             terminal_id,
             session = %record.claude_session_id,
-            "usage-limit hint on a session a respawn is already moving — ignoring"
+            "usage-limit hint on a session another mover (a respawn or a reset-continue) holds — ignoring"
         );
         return;
     }
@@ -846,8 +847,8 @@ async fn continue_after_reset(
                 holder,
                 "limit-reset-continue not started — another mover holds this session; re-parked"
             );
-            let due_at_ms = chrono::Utc::now().timestamp_millis()
-                + super::limit_reset::LIMIT_RESET_MARGIN_MS;
+            let due_at_ms =
+                chrono::Utc::now().timestamp_millis() + super::limit_reset::LIMIT_RESET_MARGIN_MS;
             park_stop(app, record, src, due_at_ms, ParkReason::ContinueRetry);
             return;
         }
@@ -2959,18 +2960,14 @@ mod tests {
             .expect("a char boundary")
     }
 
-    /// Source pins on wiring no unit test reaches (plan 2026-11-05 Phase 2):
-    /// the migration records when it moved a session, and the usage-limit
-    /// handler leaves every gate to `limit_hint::run_hint` (which a fake env
-    /// tests) and parks a refused stop instead of reporting it as skipped.
     /// A reset-continue holds the session in the ONE in-flight registry: it
     /// does not start while another mover holds the session, and while it
     /// holds it no mover (a migration, the resume door) can start.
     #[test]
     fn a_reset_continue_and_a_mover_exclude_each_other() {
         let sid = "test/account_migration/continue-vs-mover";
-        let door = crate::session::in_flight::SessionInFlight::claim(sid, "resume-door")
-            .expect("free");
+        let door =
+            crate::session::in_flight::SessionInFlight::claim(sid, "resume-door").expect("free");
         assert_eq!(claim_for_continue(sid).unwrap_err(), "resume-door");
         drop(door);
         let continuing = claim_for_continue(sid).expect("free again");
@@ -2983,15 +2980,37 @@ mod tests {
         assert!(!crate::session::in_flight::is_in_flight(sid));
     }
 
-    /// The continue path takes that claim before it touches the pane.
+    /// The continue path holds that claim for the whole function, taken
+    /// before it touches the pane, and a refused claim re-parks and returns.
     #[test]
     fn the_continue_claims_the_session_before_it_touches_the_pane() {
-        let body = source_between("\nasync fn continue_after_reset(", "\n/// The in-flight registry holder");
-        let claim = body.find("claim_for_continue(").expect("the continue claims");
+        let body = source_between(
+            "\nasync fn continue_after_reset(",
+            "\n/// The in-flight registry holder",
+        );
+        let claim = body
+            .find("let _in_flight = match claim_for_continue(")
+            .expect("the continue binds its claim for the whole function");
         let menu = body.find("close_rate_limit_menu(").expect("the menu Esc");
         assert!(claim < menu, "the claim comes before the first keystroke");
+        let (_, refused) = body.split_once("Err(holder)").expect("the refusal arm");
+        let refused = refused
+            .split_once("\n        }\n    };")
+            .map_or(refused, |(arm, _)| arm);
+        assert!(
+            refused.contains("park_stop("),
+            "a refused continue re-parks"
+        );
+        assert!(
+            refused.contains("return;"),
+            "a refused continue stops there"
+        );
     }
 
+    /// Source pins on wiring no unit test reaches (plan 2026-11-05 Phase 2):
+    /// the migration records when it moved a session, and the usage-limit
+    /// handler leaves every gate to `limit_hint::run_hint` (which a fake env
+    /// tests) and parks a refused stop instead of reporting it as skipped.
     #[test]
     fn the_hint_handler_keeps_no_gate_of_its_own_and_the_migration_stamps_itself() {
         let migrate = source_between("\nasync fn confirm_migration(\n", "\nfn emit_skipped(");
