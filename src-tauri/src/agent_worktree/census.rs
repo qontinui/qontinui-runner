@@ -6983,6 +6983,38 @@ mod tests {",
         );
     }
 
+    /// The same property, entered the way the census population is: the
+    /// workspace walk (`enumerate_worktrees_with`) that `spawn_census`'s feed
+    /// runs, over a canonical `qontinui-*` checkout whose own `node_modules`
+    /// is hardlinked to a store outside it.
+    #[cfg(unix)]
+    #[test]
+    fn the_census_walk_reports_store_hardlinked_node_modules_as_unreclaimable() {
+        let _amb = crate::test_env::isolated_ambient();
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("qontinui-web");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let nm = repo.join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        let stored = store.path().join("pkg.js");
+        std::fs::write(&stored, vec![0u8; 5000]).unwrap();
+        std::fs::hard_link(&stored, nm.join("pkg.js")).unwrap();
+        std::fs::write(nm.join("own.json"), vec![0u8; 12]).unwrap();
+
+        let mut rows = Vec::new();
+        enumerate_worktrees_with(root.path(), &mut |row| rows.push(row));
+        let row = rows
+            .iter()
+            .find(|r| r.repo == "qontinui-web")
+            .expect("the canonical checkout is reported");
+        assert_eq!(row.nm_bytes, 5012, "apparent size counts the store file");
+        assert_eq!(
+            row.attributable_bytes, 12,
+            "the walk reports only the unshared bytes as reclaimable"
+        );
+    }
+
     #[test]
     fn attributable_bytes_fall_back_to_apparent_where_exclusivity_is_unknown() {
         assert_eq!(attributable_bytes(10, None, 20, None), 30);
