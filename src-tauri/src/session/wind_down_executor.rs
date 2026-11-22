@@ -1098,6 +1098,9 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration, share: DrainSha
 pub(crate) struct CustodyJudged {
     pub verdict: CustodyVerdict,
     pub covered: Vec<String>,
+    /// How each coord ledger path was resolved, for `/restart-readiness`
+    /// `windDown.custody.worktrees` (reporting only).
+    pub resolutions: Vec<wind_down::WorktreeResolution>,
 }
 
 impl From<CustodyVerdict> for CustodyJudged {
@@ -1108,6 +1111,7 @@ impl From<CustodyVerdict> for CustodyJudged {
         Self {
             verdict,
             covered: Vec::new(),
+            resolutions: Vec::new(),
         }
     }
 }
@@ -1137,6 +1141,7 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
     CustodyJudged {
         verdict,
         covered: inputs.covered,
+        resolutions: inputs.resolutions,
     }
 }
 
@@ -1232,6 +1237,14 @@ pub(crate) trait FinishedCloseWorld: Sync {
     fn probe(&self) -> &dyn CustodyProbe;
     /// Publish this pass's custody verdicts for `/restart-readiness`.
     fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]);
+    /// Attach how each ledger path was resolved to the verdicts
+    /// [`Self::publish_custody`] just published. Reporting only, so a world
+    /// with nothing to report keeps the no-op default.
+    fn publish_custody_resolutions(
+        &self,
+        _resolutions: &[(String, Vec<wind_down::WorktreeResolution>)],
+    ) {
+    }
     /// Publish the close guard's verdicts for `/restart-readiness` — called
     /// with an empty set on every pass that runs no close batch, so a verdict
     /// never outlives the pass that reached it.
@@ -1365,6 +1378,7 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     let ownership_read_at = Instant::now();
     let workspace_root = world.workspace_root();
     let mut judged: Vec<(String, CustodyVerdict)> = Vec::new();
+    let mut resolutions_judged: Vec<(String, Vec<wind_down::WorktreeResolution>)> = Vec::new();
     let mut obligations_judged: Vec<(String, ObligationsVerdict)> = Vec::new();
     let mut clean: Vec<(String, String)> = Vec::new();
     // Set by the first obligations read of this pass that could not be made.
@@ -1376,7 +1390,11 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
             break;
         }
         let context = world.custody_context(&pass, &session_id, &terminal_id);
-        let CustodyJudged { verdict, covered } = judge_custody(
+        let CustodyJudged {
+            verdict,
+            covered,
+            resolutions,
+        } = judge_custody(
             world.probe(),
             &context,
             &ownership,
@@ -1434,9 +1452,11 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
                 "wind_down_executor: finished and idle past grace, but custody is not clean — not closed"
             );
         }
+        resolutions_judged.push((session_id.clone(), resolutions));
         judged.push((session_id, verdict));
     }
     world.publish_custody(&judged);
+    world.publish_custody_resolutions(&resolutions_judged);
     world.publish_obligations(&obligations_judged);
 
     if clean.is_empty() {
@@ -1556,6 +1576,13 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
 
     fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]) {
         finished_close::publish_custody(verdicts, Utc::now().timestamp_millis());
+    }
+
+    fn publish_custody_resolutions(
+        &self,
+        resolutions: &[(String, Vec<wind_down::WorktreeResolution>)],
+    ) {
+        finished_close::publish_custody_resolutions(resolutions);
     }
 
     async fn obligations(&self, claude_session_id: &str) -> ObligationsRead {
@@ -2241,7 +2268,34 @@ impl CloseEffects for LiveCloseEffects<'_> {
         session_id: &str,
     ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
         use tauri::Manager;
-        let rows = wind_down_observer::fetch_pending_messages(session_id).await?;
+        // The key is coord's `agent_sessions` id from the keyed ownership read,
+        // never the Claude UUID. Unresolvable (the read failed, or coord has no
+        // entry) sends no `session`, so the page is the device's and the arm
+        // reads a full one UNKNOWN.
+        let coord_session_id = {
+            let reused = self
+                .pass_ownership
+                .filter(|(_, read_at)| ownership_reusable(*read_at, Instant::now()))
+                .map(|(read, _)| read);
+            let fetched;
+            let ownership = match reused {
+                Some(read) => read,
+                None => {
+                    fetched = wind_down_observer::fetch_ownership(&[session_id.to_string()]).await;
+                    &fetched
+                }
+            };
+            ownership
+                .as_ref()
+                .ok()
+                .and_then(|index| index.coord_session_for_claude(session_id))
+                .map(str::to_string)
+        };
+        let page =
+            wind_down_observer::fetch_pending_messages(session_id, coord_session_id.as_deref())
+                .await?;
+        let session_filtered = page.session_filter_applied;
+        let rows = page.rows;
         // Attribution needs both resolvers. Without one, a row that IS for
         // this session could read as nobody's, so the read is refused instead.
         let Some(store) = self.store.as_ref() else {
@@ -2282,6 +2336,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
                     message_id,
                     to_session,
                     owner,
+                    session_filtered,
                 }
             })
             .collect())
@@ -5831,6 +5886,7 @@ mod tests {
                     message_id: "m1".to_string(),
                     to_session: "s-t3".to_string(),
                     owner: Some("s-t3".to_string()),
+                    session_filtered: false,
                 }]),
             )
             .transcript("t4", Err("no transcript".to_string()));
