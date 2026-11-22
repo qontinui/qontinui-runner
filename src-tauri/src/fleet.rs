@@ -758,7 +758,7 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// | `role` | supervisor (publishes `build`) | **absent — see below** |
 /// | `max_concurrent_builds` | supervisor | **absent — see the capacity split below** |
 /// | `max_concurrent_ci_jobs` | runner | always sent |
-/// | `max_concurrent_agents` | runner | always sent |
+/// | `max_concurrent_agents` | **coord** (for a non-zero value it stores its own derivation from this payload's `memory_gb`/`cpu_cores`/`ci_reserved_gib`, or keeps the last stored value when `ci_reserved_gib` is absent; see the per-session cost-model note above `SESSION_COST_MEM_MIB`) | always sent: an advisory derived value for the Agent role, an explicit `0` (stored verbatim) for the Build role |
 /// | `cpu_cores`, `memory_gb`, `disk_*` | neither — they describe the BOX | always sent by both |
 ///
 /// Scoped to THIS payload. `ci_runner_labels` is also supervisor-owned but
