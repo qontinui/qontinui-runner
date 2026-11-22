@@ -289,6 +289,11 @@ $SKIP_ROUTES = @{
 # longer declares -- is refused before any probe, -DryRun included.
 # ---------------------------------------------------------------------------
 $SDK_AHEAD_ROUTES = @{
+    # ui-bridge 0.57.0 declares element/component capture; the runner has not
+    # wired either handler. Mirrors sdk_only_baseline in
+    # src-tauri/src/mcp/ui_bridge/mod.rs. Delete both when the handlers land.
+    "GET /control/element/:id/capture"       = "SDK declares it (0.57.0); the runner has not wired the handler"
+    "GET /control/component/:id/capture"     = "SDK declares it (0.57.0); the runner has not wired the handler"
 }
 
 # ---------------------------------------------------------------------------
