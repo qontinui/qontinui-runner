@@ -196,7 +196,7 @@ pub(crate) struct CognitoCallbackQuery {
 
 /// Bind the loopback callback port with `SO_REUSEADDR` so a lingering
 /// `TIME_WAIT` socket from a just-completed sign-in never blocks a fresh
-/// rebind on Windows (`os error 10048`). Mirrors `mcp_api::try_bind_port`.
+/// rebind on Windows (`os error 10048`). Mirrors `mcp_api::serve::try_bind_port`.
 fn bind_loopback_reuseaddr(port: u16) -> std::io::Result<std::net::TcpListener> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,

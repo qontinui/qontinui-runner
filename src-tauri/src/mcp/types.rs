@@ -70,7 +70,7 @@ pub fn get_mcp_api_port() -> u16 {
 
 /// The ONE address the runner's HTTP API listens on: the IPv4 loopback.
 ///
-/// `mcp_api::try_bind_port` binds exactly this address, and every URL the
+/// `mcp_api::serve::try_bind_port` binds exactly this address, and every URL the
 /// runner builds for its own API (or a sibling runner's) names it through
 /// [`runner_loopback_base`] — so the address a self-call dials IS the address
 /// the listener binds, and the two cannot drift apart.

@@ -89,6 +89,8 @@ mod serve;
 mod vcs_pr;
 
 use drain::drain_handler;
+// Test-only: heartbeat.rs tests derive `lan_reachable` through the same seam.
+#[cfg(test)]
 pub(crate) use serve::lan_reachable_for_bound_addr;
 pub use serve::start_server;
 use serve::{not_found_handler, runner_panic_handler};

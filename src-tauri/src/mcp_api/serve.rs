@@ -140,7 +140,7 @@ pub(crate) fn lan_reachable_for_bound_addr(addr: &std::net::SocketAddr) -> bool 
 }
 
 /// Try to bind to a port with SO_REUSEADDR
-pub(super) fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
+fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
     // Create socket with SO_REUSEADDR to allow binding even if there are zombie connections
     // This is necessary on Windows where TIME_WAIT/CLOSE_WAIT sockets can block port binding
     let socket = socket2::Socket::new(
