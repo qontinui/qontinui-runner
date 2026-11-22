@@ -2068,6 +2068,7 @@ async fn spawn_looping_agent_terminal(
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
         None,
+        None,
     );
     // Withheld when an operator template adds a replacement prompt.
     let policy_delivery =
