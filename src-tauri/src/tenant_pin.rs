@@ -4,7 +4,7 @@
 //!
 //! ## Why a type and not an `Option<Uuid>`
 //!
-//! `session::dual_write::resolve_active_tenant_id` collapses **five**
+//! An `Option<Uuid>` pin read collapses **five**
 //! distinct outcomes into one `None`: no home dir, missing file, unparseable
 //! JSON, missing `active_tenant_id` field, unparseable UUID. Two of those are a
 //! correctly-configured single-tenant install (its `machine.json` legitimately
@@ -42,12 +42,14 @@
 //! `machine.json` at all, whose runner still served the correct tenant); that
 //! behavior moved, it was not removed.
 //!
-//! ## Deliberately NOT in `dual_write`
+//! ## Callers that only need an `Option<Uuid>`
 //!
-//! The old resolver lives in `session::dual_write`, which is Phase-10
-//! cutover scaffolding kept "self-contained for Phase 9 deletion". This type is
-//! an authorization primitive that must outlive that scaffolding, so it lives
-//! here and `dual_write`'s function delegates to it.
+//! Call [`resolve_tenant_pin`] and take [`TenantPin::pinned`]. That collapse is
+//! lossy BY DESIGN — it cannot distinguish "no tenant stated" from "cannot state
+//! a tenant" — so a fail-closed credential decision must match on the typed
+//! value instead. (The one-line `Option` adapter that used to wrap this was
+//! deleted with the never-wired Phase-10 cutover scaffolding, plan
+//! `2026-11-20-coord-native-sessions-phase-9-reverified-cleanup` Phase 2.)
 
 use uuid::Uuid;
 

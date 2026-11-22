@@ -363,21 +363,6 @@ mod tests {
             ],
             "exactly the startup readers are next_start"
         );
-        let gate = surfaces
-            .iter()
-            .find(|s| s["surface"] == "session_coordination_dual_write_gate")
-            .expect("the dual-write gate is a reported surface");
-        assert_eq!(
-            gate["timing"], "live",
-            "the dual-write flag poll re-reads the pin each tick, so a PUT reaches it live"
-        );
-        assert!(
-            gate["evidence"].as_array().is_some_and(|e| e
-                .iter()
-                .any(|r| r == "session/coord_sync.rs::run_flag_poll_loop")),
-            "the gate's reader is the flag poll loop: {gate}"
-        );
-
         let existing = &data["existing_sessions"];
         for group in ["pinned_at_creation", "follows_machine_pin"] {
             assert!(existing[group]["count"].is_u64(), "{group}.count");

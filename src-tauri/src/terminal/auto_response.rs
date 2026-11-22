@@ -866,7 +866,7 @@ mod resolve {
         // tenancy input — so the bearer is the only thing that decides which
         // tenant's policy set answers. `coord_session_id` here IS a registry id
         // (`TerminalSession::coord_session_id`, set from
-        // `SessionRegistry::register_external`), so the registry can answer.
+        // `SessionRegistry::register_external_with_lineage`), so the registry can answer.
         //
         // `crate::auth`, not `qontinui_runner_lib::auth`: this module compiles
         // into the bin target only, so the lib path would bump the lib crate's

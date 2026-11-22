@@ -115,7 +115,7 @@ pub struct Intent {
     /// creation: the SPAWN INPUT when the caller supplied one, else the
     /// device's default (`machine.json::active_tenant_id`,
     /// default-for-new-sessions), stamped by `SessionRegistry::start`/
-    /// `register_external`. Immutable for the session's life. Drives BOTH
+    /// `register_external_with_lineage`. Immutable for the session's life. Drives BOTH
     /// the `POST /sessions` body's `tenant_id` and which device-JWT slot the
     /// coord-sync loop presents for this session's writes. `None` only on
     /// single-tenant installs with no configured default (coord then

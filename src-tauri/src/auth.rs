@@ -2700,7 +2700,7 @@ impl TenantScope {
 
     /// Classify a tenant read from the DEVICE's own default binding
     /// (`machine.json::active_tenant_id` via
-    /// `crate::session::dual_write::resolve_active_tenant_id` /
+    /// `crate::session::tenant_pin::resolve_tenant_pin().pinned()` /
     /// `fleet::resolve_tenant_id`).
     ///
     /// Absence is [`TenantScope::Device`], not `Unresolved`: the machine
@@ -4907,17 +4907,16 @@ mod bearer_selection_tests {
         assert_eq!(TenantScope::Unresolved.declared_tenant(), None);
     }
 
-    /// THE TENANT-POLICY POLL'S SITUATION, as measured on the operator box on
-    /// 2026-09-17: a device bound to several tenants, whose legacy
-    /// `access_token` slot holds the DEFAULT binding's JWT, polling
-    /// `/tenant-policy?tenant_id=<a NON-default tenant>`.
+    /// A tenant-STATING read on a multi-bound device — first measured on the
+    /// operator box on 2026-09-17 for the (since deleted) tenant-policy poll,
+    /// and still the situation of every `coord_get_for(.., Owned(t))` caller
+    /// (`commands/fleet_sessions.rs`, `session/transcript_autobind.rs`): the
+    /// legacy `access_token` slot holds the DEFAULT binding's JWT while the
+    /// request names a NON-default tenant.
     ///
     /// `Device` — what the defaulting `coord_get` wrapper asserts — hands back
     /// the default binding's credential, so the request names one tenant and
-    /// carries another's. Coord's `sessions::get_tenant_policy` requires those
-    /// to be EQUAL, so it answers `403 auth_required` — the same body an
-    /// unauthenticated caller gets, which is why the runner read it for months
-    /// as "not paired yet" and advised a pairing flow it cannot reach.
+    /// carries another's; a route that requires those to be EQUAL refuses it.
     ///
     /// `Owned(queried)` is the fix, and this pins BOTH of its arms: the hit
     /// presents the queried tenant's own slot, and the MISS presents NOTHING
@@ -4929,8 +4928,8 @@ mod bearer_selection_tests {
     /// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
     /// P3.
     #[test]
-    fn the_tenant_policy_polls_scope_diverges_from_the_default_slot() {
-        let mgr = create_test_auth_manager("scope_tenant_policy_poll");
+    fn an_owned_scope_diverges_from_the_default_slot() {
+        let mgr = create_test_auth_manager("scope_owned_vs_default");
         let default_tenant = tenant(0xD1);
         let default_jwt = live_jwt("default.binding.jwt");
         mgr.store_tokens(&default_jwt, "").unwrap();
@@ -4948,7 +4947,7 @@ mod bearer_selection_tests {
             "TenantScope::Device presents the legacy/default slot regardless of the query"
         );
 
-        // The poll's scope: the credential for the tenant being asked about.
+        // The owned scope: the credential for the tenant being asked about.
         assert_eq!(
             select_scoped_bearer(&mgr, TenantScope::Owned(held), Some(default_tenant), 3)
                 .as_deref(),

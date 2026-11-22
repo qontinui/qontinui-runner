@@ -3,7 +3,7 @@
 //! ## Problem
 //!
 //! Every runner restart re-creates terminal panes, and the legacy
-//! `terminal_create` → [`crate::session::SessionRegistry::register_external`]
+//! `terminal_create` → [`crate::session::SessionRegistry::register_external_with_lineage`]
 //! path mints a **fresh** `uuid_v7` per pane each time. The old coord
 //! `coord.sessions` rows orphan and accumulate — the dashboard fills with
 //! duplicate "Terminal shell session" rows, one per (restart × pane).

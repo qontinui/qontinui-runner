@@ -189,7 +189,7 @@ use tracing::{error, info, warn};
 /// 90s sits in the middle of the plan's "cached with TTL" band: long enough
 /// that a burst of spawns costs one coord round-trip, short enough that a user
 /// toggling an agent off in the web settings page sees it take effect on the
-/// fleet within about a minute (the same order as the tenant-policy poll).
+/// fleet within about a minute.
 pub const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(90);
 
 /// Hard ceiling on how old a last-known-good snapshot may be and still decide.

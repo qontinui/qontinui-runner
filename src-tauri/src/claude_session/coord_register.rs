@@ -6,7 +6,7 @@
 //! 2026-06-04-session-automation-injection-engine-design.md` §0/F1 +
 //! `2026-06-04-session-automation-phase0-checklist.md` §3 (R1–R6).
 //!
-//! ## Why a dedicated registrar (not `SessionRegistry::register_external`)
+//! ## Why a dedicated registrar (not `SessionRegistry::register_external_with_lineage`)
 //!
 //! The operator's authenticated AI sessions live in
 //! [`crate::claude_session::manager::SessionManager`], keyed by `task_run_id`
@@ -26,7 +26,7 @@
 //!    `send_user_message`). An idle session therefore ages to `stale`, which is
 //!    the entire point of Phase 0.
 //!
-//! 2. **`register_external` has no usable inject transport (P0.4).** It backs
+//! 2. **`register_external_with_lineage` has no usable inject transport (P0.4).** It backs
 //!    the mirror with the no-op `ExternalTransport` — `write_input` does
 //!    nothing. Inject (Phase 1) must route to the live `ClaudeSession` via
 //!    `SessionManager.get(task_run_id)`. So coord stores the durable
@@ -54,10 +54,9 @@
 //! ## Gating (P0.3)
 //!
 //! Registration is gated on `QONTINUI_SESSION_AUTOMATION_REGISTER` (default
-//! **ON**) — **independent** of the dormant per-tenant
-//! `session_coordination_enabled` dual-write burn-in. Coupling the automation
-//! foundation to that unrelated rollout knob would make Phase 0 inert in prod
-//! (the flag is dormant). Setting the env to `0`/`false`/`off` disables
+//! **ON**) — its own kill switch, coupled to no per-tenant rollout flag (the
+//! Phase-10 cutover flag it was once contrasted with was deleted as never
+//! wired). Setting the env to `0`/`false`/`off` disables
 //! registration cleanly (a kill switch); the AI session itself is never
 //! affected — every coord write here is best-effort and swallows errors.
 
