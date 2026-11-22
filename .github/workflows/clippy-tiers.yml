@@ -442,27 +442,30 @@ jobs:
           rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
           # cargo's own exit status is kept, not discarded. A non-zero status
-          # with a WORKSPACE diagnostic line (`<relative path>:<line>:<col>: `,
-          # src-tauri/... or any crates/... member src-tauri path-depends on)
-          # is a lint or compile verdict on this PR's code, and goes on to
-          # reviewdog. It is not-a-verdict only when cargo produced no
-          # workspace diagnostic at all (a build.rs failure, a dependency
-          # outside the workspace -- an absolute or ../ path), or was killed by
-          # a signal (exit above 128, e.g. OOM), when even the lines it printed
-          # are a partial capture. reviewdog would read either as zero findings
-          # and exit 0, green having inspected nothing, so it is not run:
-          # rc=not-run-clippy-failed (the completion step reads any not-run-*
-          # as "reviewdog never ran"), one not-a-verdict ::error, a non-zero
-          # exit.
+          # with a WORKSPACE ERROR line (`<relative path>:<line>:<col>: error`,
+          # src-tauri/... or any crates/... member src-tauri path-depends on;
+          # a deny lint and a compile error both print `error`) is a verdict on
+          # this PR's code, and its failure IS that error, so it goes on to
+          # reviewdog. A non-zero status with no such line is not-a-verdict:
+          # cargo failed for another reason (a build.rs failure, a dependency
+          # outside the workspace -- an absolute or ../ path), and any
+          # warnings it printed before failing are not a lint of src-tauri.
+          # So is cargo ITSELF killed by a signal (exit above 128), when even
+          # the lines it printed are a partial capture; a killed rustc child
+          # makes cargo exit 101 and is judged by the error-line rule. reviewdog
+          # would read any of these as zero findings and exit 0, green having
+          # inspected nothing, so it is not run: rc=not-run-clippy-failed (the
+          # completion step reads any not-run-* as "reviewdog never ran"), one
+          # not-a-verdict ::error, a non-zero exit.
           cargo_rc=0
           cargo clippy -q --message-format=short 2> clippy-report.txt || cargo_rc=$?
-          ws_diag=0
-          if awk '/^[^ ]+:[0-9]+:[0-9]+: / && !/^(\/|\.\.\/|[A-Za-z]:)/ { f = 1 } END { exit !f }' clippy-report.txt; then
-            ws_diag=1
+          ws_err=0
+          if awk '/^[^ ]+:[0-9]+:[0-9]+: error(\[E[0-9]+\])?: / && !/^(\/|\.\.\/|[A-Za-z]:)/ { f = 1 } END { exit !f }' clippy-report.txt; then
+            ws_err=1
           fi
-          if [ "$cargo_rc" -gt 128 ] || { [ "$cargo_rc" -ne 0 ] && [ "$ws_diag" -eq 0 ]; }; then
+          if [ "$cargo_rc" -gt 128 ] || { [ "$cargo_rc" -ne 0 ] && [ "$ws_err" -eq 0 ]; }; then
             rc=not-run-clippy-failed
-            echo "::error title=Clippy diff-scoped (advisory): clippy did not lint (not a verdict on this PR)::cargo clippy exited ${cargo_rc} before producing a complete workspace lint (killed by a signal, or no workspace diagnostic line), so reviewdog was not run. No lint verdict reached this diff: see this job's log for cargo's build failure."
+            echo "::error title=Clippy diff-scoped (advisory): clippy did not lint (not a verdict on this PR)::cargo clippy exited ${cargo_rc} without a workspace error line explaining it (cargo killed by a signal, or a failure outside the lint), so reviewdog was not run. No lint verdict reached this diff: see this job's log for cargo's build failure."
             exit 1
           fi
           # Back to the git root for reviewdog. cargo prints paths relative to
