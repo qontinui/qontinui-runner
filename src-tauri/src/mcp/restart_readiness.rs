@@ -788,6 +788,13 @@ pub fn record_waiting_read(
         Some(RecordReading::PidReused) => RecordWaitingRead::Unreadable(
             "the record belongs to an earlier process that held this pid".to_string(),
         ),
+        Some(RecordReading::Unlisted) => RecordWaitingRead::Unreadable(
+            "a `sessions/` dir could not be listed, so this pid's record is unknown".to_string(),
+        ),
+        Some(RecordReading::LateStamp) => RecordWaitingRead::Unreadable(
+            "the record's start stamp is later than the process's: not provably this process's"
+                .to_string(),
+        ),
         None => RecordWaitingRead::Unreadable(
             "the record was not read — the read timed out, was skipped while an earlier read \
              was in flight, or was not requested"
@@ -1745,7 +1752,7 @@ async fn gather_resume(
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     {
         Some(store) => {
-            let records = store.restorable_records(now_ms, Some(now_ms), true);
+            let records = store.restorable_records(Some(now_ms), true);
             let probe = crate::session::reconcile::DiskTranscriptIndex::discover();
             Ok(
                 crate::session::restore_census::expected_rows(records, &probe)
@@ -1780,7 +1787,11 @@ async fn gather_resume(
     let cmdlines = if pids.is_empty() {
         HashMap::new()
     } else {
-        crate::process_capture::process_tree::command_lines_for_pids(&pids).await
+        crate::process_capture::process_tree::command_lines_for_pids(&pids)
+            .await
+            // `None` = the query degraded: no command lines, so every MCP-server
+            // lookup below sees nothing and the straggler stays unresolved.
+            .unwrap_or_default()
     };
     let manager = app
         .try_state::<Arc<crate::terminal::TerminalManager>>()

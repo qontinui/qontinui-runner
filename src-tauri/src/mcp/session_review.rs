@@ -727,6 +727,8 @@ impl PromptDoor for LiveDoor {
                     &self.state.app_handle,
                     id,
                     text,
+                    // The operator's composed review notes: an operator turn.
+                    crate::quiet_barrier::SdkMessageCaller::HttpTaskRunMessage,
                 )
                 .await
                 .map_err(DeliveryError::Failed)?;

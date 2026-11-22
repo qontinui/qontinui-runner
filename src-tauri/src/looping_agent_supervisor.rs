@@ -1335,7 +1335,8 @@ fn barrier_rewrite(action: Action, barrier: Option<&str>) -> Action {
     }
     match action {
         Action::Spawn(_) | Action::Relaunch(_) | Action::Nudge => Action::None,
-        Action::None => Action::None,
+        // Neither starts nor continues work: a retire closes a tab.
+        Action::None | Action::Retire => action,
     }
 }
 

@@ -1199,6 +1199,8 @@ impl PtyWriteCaller {
             Self::AccountMigration => WakeClass::Autonomous,
             Self::LoopingAgentNudge => WakeClass::Autonomous,
             Self::WorkerSession => WakeClass::Autonomous,
+            // The operator's composed review notes — a human's turn, never swallowed.
+            Self::ReviewNotes => WakeClass::Operator,
             // The session's own launch / transport / exit plumbing. Spawn-time
             // writes are governed at spawn by the drain, and `GracefulExit` is
             // wind-down's own `/exit`, which must never be barrier-blocked.
