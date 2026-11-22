@@ -66,6 +66,8 @@ pub mod reasoning_traces;
 pub mod recordings;
 pub mod reflection;
 mod reflection_unknown_self_heal;
+#[cfg(test)]
+pub(crate) mod schema_oracle;
 pub mod regression;
 pub mod restate;
 pub mod reviews;
