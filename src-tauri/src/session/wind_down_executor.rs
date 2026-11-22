@@ -3634,9 +3634,13 @@ mod tests {
         let start = executable
             .find(head)
             .unwrap_or_else(|| panic!("`{head}` is gone from the executor"));
-        let rest = &executable[start..];
+        // `str::get` rather than indexing: both offsets come from `find`, so
+        // they sit on char boundaries, but `clippy::string_slice` is denied.
+        let rest = executable
+            .get(start..)
+            .expect("`find` returns a char boundary");
         let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
-        &rest[..end]
+        rest.get(..end).expect("`find` returns a char boundary")
     }
 
     fn exited() -> GracefulExitOutcome {
