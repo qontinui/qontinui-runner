@@ -9449,8 +9449,9 @@ fn reap_configs_for_revoked_nonces(dir: &Path, revoked: &[String]) -> usize {
         if !revoked.contains(&nonce) {
             continue;
         }
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed += 1,
+        match remove_config_if_nonce_unchanged(&path, Some(&nonce)) {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
             Err(e) => warn!(
                 "coord_mcp: failed to reap session-restore config {}: {e}",
                 path.display()
@@ -9458,6 +9459,28 @@ fn reap_configs_for_revoked_nonces(dir: &Path, revoked: &[String]) -> usize {
         }
     }
     removed
+}
+
+/// Remove the app-data config at `path` only if it still carries `expected`
+/// (`None`: still carries no readable nonce) — the re-read and the unlink both
+/// under [`app_data_config_lock`]. Every deleter of a file in that directory
+/// decides from a read taken earlier; a provision for the same (workdir, key)
+/// may have rewritten the path since with a FRESH key, and deleting that file
+/// would strand a live session's credential. `Ok(false)`: the file changed
+/// (or is gone) and was kept.
+pub(crate) fn remove_config_if_nonce_unchanged(
+    path: &Path,
+    expected: Option<&str>,
+) -> std::io::Result<bool> {
+    let _guard = app_data_config_lock();
+    if !path.exists() || read_proxy_nonce(path).as_deref() != expected {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// True iff something is LISTENING on `127.0.0.1:port` (a short connect probe).
@@ -9517,8 +9540,12 @@ fn reap_stale_session_restore_configs_in(
         if keep {
             continue;
         }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
+        // The decision above is taken outside the lock (it can probe a port);
+        // the removal re-reads under it and keeps a file a provision has
+        // rewritten since.
+        match remove_config_if_nonce_unchanged(&path, nonce.as_deref()) {
+            Ok(false) => {}
+            Ok(true) => {
                 reaped += 1;
                 info!(
                     "coord_mcp: reaped stale session-restore config {}",
@@ -13250,12 +13277,15 @@ fn provision_coord_mcp_config_file(
 }
 
 /// The lock that orders every write of a runner app-data `--mcp-config` file
-/// ([`provision_coord_mcp_config_file`]) against every compare-and-remove of
-/// one (`claude_session::coord_mcp_delivery`'s retire). A file's name is a
+/// ([`provision_coord_mcp_config_file`]) against every removal of one: the
+/// stream-json retire (`claude_session::coord_mcp_delivery`), the revoked-nonce
+/// reaper ([`reap_configs_for_revoked_nonces`]) and the stale-config reaper
+/// ([`reap_stale_session_restore_configs_in`]), all three through
+/// [`remove_config_if_nonce_unchanged`]. A file's name is a
 /// function of (workdir, session key), so a successor delivered under the same
 /// key rewrites its predecessor's path; holding this across the successor's
-/// write AND the predecessor's read-compare-remove means the predecessor can
-/// only ever delete a file that still carries ITS nonce.
+/// write AND every deleter's re-read-compare-remove means a deleter can only
+/// ever remove a file that still carries the nonce it decided on.
 ///
 /// One lock for the whole directory rather than one per path: a per-path lock
 /// needs a map with an entry per (workdir, key), and an AI session's key is

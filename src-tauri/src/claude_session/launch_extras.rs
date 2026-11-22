@@ -163,12 +163,22 @@ pub(crate) fn compose_launch_extras(
         env,
         prompt_carrier,
         coord_mcp,
-        owned_flags: super::coord_mcp_delivery::OWNED_TEMPLATE_FLAGS
-            .iter()
-            .map(|f| f.to_string())
-            .collect(),
+        owned_flags: OWNED_TEMPLATE_FLAGS.iter().map(|f| f.to_string()).collect(),
     })
 }
+
+/// Every template flag the stream-json spawn owns on every arm, so the fold is
+/// the ONLY route a template's settings, prompt or MCP config can take: a
+/// template copy never reaches the argv, even when the fold consumed nothing
+/// (an unreadable settings file, an empty prompt) and the tail supplies no flag
+/// of that name for the name-only dedup to match.
+const OWNED_TEMPLATE_FLAGS: [&str; 5] = [
+    super::coord_mcp_delivery::OWNED_MCP_TEMPLATE_FLAGS[0],
+    super::coord_mcp_delivery::OWNED_MCP_TEMPLATE_FLAGS[1],
+    "--settings",
+    crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FLAG,
+    crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FILE_FLAG,
+];
 
 /// The template `--settings` values to fold into the one settings file —
 /// none under an allow-list (see [`LaunchExtrasInputs::permission`]).
@@ -226,7 +236,7 @@ fn settings_args(
     let template_docs: Vec<(String, serde_json::Value)> = template_settings
         .iter()
         .filter_map(|value| match read_settings_value(value, working_dir) {
-            Ok(doc) => Some((settings_source(value), strip_template_permissions(doc))),
+            Ok(doc) => Some((settings_source(value), strip_widening_template_keys(doc))),
             Err(e) => {
                 warn!("{}", template_settings_unreadable_line(value, &e));
                 None
@@ -287,14 +297,33 @@ fn settings_args(
     ])
 }
 
-/// A template settings layer with its `permissions` key removed, in every
-/// permission mode: a template's `permissions.allow` would pre-approve tools
-/// the runner's own posture did not, and its `deny` rules belong to the
-/// operator's settings files, not to a launch template folded into the
-/// runner's layer.
-fn strip_template_permissions(mut doc: serde_json::Value) -> serde_json::Value {
+/// The `permissions` keys that WIDEN what a session may do: an `allow` rule
+/// pre-approves a tool, `defaultMode` can switch the posture, and
+/// `additionalDirectories` grants paths outside the cwd. A template's `deny`
+/// and `ask` rules only narrow, and Claude Code honours `deny` even under
+/// bypass, so they are kept.
+const WIDENING_PERMISSION_KEYS: [&str; 3] = ["allow", "defaultMode", "additionalDirectories"];
+
+/// A template settings layer with everything removed that could widen the
+/// session or switch off the runner's own layer, in every permission mode:
+/// - the [`WIDENING_PERMISSION_KEYS`] under `permissions` (an emptied
+///   `permissions` object is dropped);
+/// - `disableAllHooks`, which would disable the runner's hook carrier — its
+///   SessionStart policy hook included.
+fn strip_widening_template_keys(mut doc: serde_json::Value) -> serde_json::Value {
     if let Some(object) = doc.as_object_mut() {
-        object.remove("permissions");
+        object.remove("disableAllHooks");
+        if let Some(permissions) = object
+            .get_mut("permissions")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in WIDENING_PERMISSION_KEYS {
+                permissions.remove(key);
+            }
+            if permissions.is_empty() {
+                object.remove("permissions");
+            }
+        }
     }
     doc
 }
@@ -309,7 +338,7 @@ fn template_settings_merge_line(source: &str, doc: &serde_json::Value, session_i
     format!(
         "merging launch template --settings {source} (keys {keys:?}) into interactive session \
          {session_id}'s settings; the runner's own keys win on a conflict, and a template's \
-         `permissions` is never merged"
+         widening permissions and disableAllHooks are never merged"
     )
 }
 

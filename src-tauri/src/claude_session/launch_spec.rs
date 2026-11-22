@@ -563,12 +563,21 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 _ => {
                     // By NAME, whatever the spelling: `--mcp-config=/x` from a
                     // template is the same flag as the caller's spaced one.
-                    if provided.contains(flag_name_only(&unit.name))
-                        || spec
-                            .owned_flags
-                            .iter()
-                            .any(|f| f == flag_name_only(&unit.name))
-                    {
+                    let supplied = provided.contains(flag_name_only(&unit.name));
+                    let owned = spec
+                        .owned_flags
+                        .iter()
+                        .any(|f| f == flag_name_only(&unit.name));
+                    if owned && !supplied {
+                        // Its own line: the caller passes no such flag, so the
+                        // "supplies the same flag" wording would be false.
+                        tracing::warn!(
+                            flag = %flag_name_only(&unit.name),
+                            "launch template flag dropped: the runner owns this flag for this \
+                             spawn (it composes the value itself, or deliberately passes none), \
+                             so a template copy never reaches the argv"
+                        );
+                    } else if supplied {
                         if flag_name_only(&unit.name) == "--mcp-config" {
                             // The runner's coord-mcp is authoritative (plan
                             // 2026-11-21-…-acts-as-the-default-tenant D1). A

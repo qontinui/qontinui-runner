@@ -88,7 +88,7 @@ const STRICT_CONFIG_DIR: &str = "claude-session-mcp";
 /// the session's config (a cwd file beats the ancestor, finding `a1a66bfe`
 /// case f) — and a template `--mcp-config` or `--strict-mcp-config` would
 /// override or discard it.
-pub(crate) const OWNED_TEMPLATE_FLAGS: [&str; 2] = ["--mcp-config", "--strict-mcp-config"];
+pub(crate) const OWNED_MCP_TEMPLATE_FLAGS: [&str; 2] = ["--mcp-config", "--strict-mcp-config"];
 
 /// What one stream-json spawn was given for coord-mcp.
 #[derive(Debug)]
@@ -383,9 +383,11 @@ fn retire(key: &str, record: &LeaseRecord) {
     // (and recreates it). So a retire only ever deletes a file still carrying
     // the nonce THIS delivery minted.
     if let (Some(path), Some(nonce)) = (&record.runner_config, &record.nonce) {
-        let _guard = crate::coord_mcp::app_data_config_lock();
-        if read_config_nonce(path).as_deref() == Some(nonce.as_str()) {
-            remove_quietly(path);
+        if let Err(e) = crate::coord_mcp::remove_config_if_nonce_unchanged(path, Some(nonce)) {
+            warn!(
+                "coord-mcp: could not remove {} on retire: {e}",
+                path.display()
+            );
         }
     }
     let forgot = crate::coord_mcp::forget_session_coord_mcp_delivery(key, record.generation);
@@ -411,14 +413,6 @@ fn remove_quietly(path: &Path) {
             path.display()
         ),
     }
-}
-
-/// The proxy nonce a runner config file carries, read the way every other
-/// reader resolves it (never by a hardcoded header name).
-fn read_config_nonce(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
-    crate::coord_mcp_config::proxy_nonce_from_config_doc(&doc)
 }
 
 // ===========================================================================
@@ -487,10 +481,11 @@ fn user_settings_file(config_dir: Option<&str>) -> Option<PathBuf> {
     }
 }
 
-/// The project-scope settings files that can carry approvals for `cwd`:
-/// `.claude/settings.json` and `.claude/settings.local.json` in the cwd and in
-/// its project root (the enclosing git root), each read once.
-fn project_settings_files(cwd: &Path) -> Vec<PathBuf> {
+/// The project-scope settings files that can carry approvals for `cwd`, as
+/// `(local, project)`: `.claude/settings.local.json` and `.claude/settings.json`
+/// in the cwd and in its project root (the enclosing git root), each read once,
+/// nearest directory first.
+fn project_settings_files(cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut dirs = vec![cwd.to_path_buf()];
     if let Some(root) = std::fs::canonicalize(cwd)
         .ok()
@@ -501,14 +496,14 @@ fn project_settings_files(cwd: &Path) -> Vec<PathBuf> {
             dirs.push(root);
         }
     }
-    dirs.iter()
-        .flat_map(|d| {
-            [
-                d.join(".claude").join("settings.json"),
-                d.join(".claude").join("settings.local.json"),
-            ]
-        })
-        .collect()
+    (
+        dirs.iter()
+            .map(|d| d.join(".claude").join("settings.local.json"))
+            .collect(),
+        dirs.iter()
+            .map(|d| d.join(".claude").join("settings.json"))
+            .collect(),
+    )
 }
 
 fn read_json(path: &Path) -> Option<serde_json::Value> {
@@ -538,13 +533,20 @@ fn carry_through_servers(
     // This project's entry: what local-scope servers it adds, and which
     // project-scope (`.mcp.json`) servers the account approved for it.
     let project = projects.and_then(|p| keys.iter().find_map(|k| p.get(k)));
-    let settings_layers: Vec<serde_json::Value> = project_settings_files(cwd)
-        .iter()
-        .map(PathBuf::as_path)
-        .chain(user_settings)
-        .filter_map(read_json)
-        .collect();
-    let approval = ProjectApproval::of(project.into_iter().chain(settings_layers.iter()));
+    // Highest precedence first: local settings, project settings, the account
+    // file's projects entry, user settings.
+    let (local_files, project_files) = project_settings_files(cwd);
+    let local: Vec<serde_json::Value> = local_files.iter().filter_map(|p| read_json(p)).collect();
+    let shared: Vec<serde_json::Value> =
+        project_files.iter().filter_map(|p| read_json(p)).collect();
+    let user: Option<serde_json::Value> = user_settings.and_then(read_json);
+    let approval = ProjectApproval::of(
+        local
+            .iter()
+            .chain(shared.iter())
+            .chain(project)
+            .chain(user.iter()),
+    );
     let mut take = |servers: Option<&serde_json::Value>, admit: &dyn Fn(&str) -> bool| {
         let Some(servers) = servers.and_then(|v| v.as_object()) else {
             return;
@@ -579,14 +581,15 @@ fn carry_through_servers(
     out
 }
 
-/// The approval state for one project's `.mcp.json` servers, read from every
-/// layer Claude Code reads it from: the account config's `projects[<key>]`
-/// entry, the project's `.claude/settings.json` and `.claude/settings.local.json`,
-/// and the user's `settings.json`. A server named in `disabledMcpjsonServers`
-/// in ANY layer never loads (disabled wins over enabled anywhere); otherwise it
-/// loads only when some layer sets `enableAllProjectMcpServers` or names it in
-/// `enabledMcpjsonServers`. The strict file carries exactly what was approved —
-/// never a project server the operator declined, nor one never approved.
+/// The approval state for one project's `.mcp.json` servers, from the layers
+/// this function reads: `.claude/settings.local.json`, `.claude/settings.json`,
+/// the account config's `projects[<key>]` entry and the user's `settings.json`,
+/// in that order of precedence. A server named in `disabledMcpjsonServers` in
+/// ANY layer never loads (disabled wins over any enable). Otherwise it loads
+/// when it is named in `enabledMcpjsonServers` in any layer, or when
+/// `enableAllProjectMcpServers` is true in the HIGHEST-precedence layer that
+/// sets it — a `false` there beats a `true` below it. The strict file carries
+/// exactly what was approved.
 struct ProjectApproval {
     enable_all: bool,
     enabled: Vec<String>,
@@ -594,6 +597,7 @@ struct ProjectApproval {
 }
 
 impl ProjectApproval {
+    /// `layers` highest precedence first.
     fn of<'a>(layers: impl Iterator<Item = &'a serde_json::Value> + Clone) -> Self {
         let names = |key: &str| -> Vec<String> {
             layers
@@ -604,11 +608,14 @@ impl ProjectApproval {
                 .collect()
         };
         Self {
-            enable_all: layers.clone().any(|l| {
-                l.get("enableAllProjectMcpServers")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            }),
+            // The first (highest-precedence) layer that sets it decides.
+            enable_all: layers
+                .clone()
+                .find_map(|l| {
+                    l.get("enableAllProjectMcpServers")
+                        .and_then(|v| v.as_bool())
+                })
+                .unwrap_or(false),
             enabled: names("enabledMcpjsonServers"),
             disabled: names("disabledMcpjsonServers"),
         }

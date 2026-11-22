@@ -431,8 +431,8 @@ fn a_template_settings_file_is_merged_into_the_one_settings_and_the_runner_wins(
     );
     let deny = doc["permissions"]["deny"].as_array().unwrap();
     assert!(
-        !deny.contains(&serde_json::json!("Read(./secrets/**)")),
-        "a template's `permissions` never reaches the merged file: {doc}"
+        deny.contains(&serde_json::json!("Read(./secrets/**)")),
+        "a template's deny rule only narrows, and is kept: {doc}"
     );
     assert!(
         deny.contains(&serde_json::json!("Bash(git push --force:*)")),
@@ -628,10 +628,12 @@ fn under_an_allow_list_a_template_settings_contributes_nothing() {
     assert!(!text.contains("Bash(*)"), "{text}");
 }
 
-/// Under bypass the template layer is folded, but its `permissions` key is
-/// stripped: an `allow` rule never reaches the merged file in any mode.
+/// Under bypass the template layer is folded, but only its NARROWING
+/// permissions survive: `allow`, `defaultMode` and `additionalDirectories` are
+/// stripped in every mode, while `deny` and `ask` are kept (Claude Code honours
+/// `deny` even under bypass).
 #[test]
-fn under_bypass_a_template_permissions_key_is_stripped_but_the_rest_is_folded() {
+fn under_bypass_only_a_templates_narrowing_permissions_are_folded() {
     let amb = crate::test_env::isolated_ambient();
     amb.write_active_tenant_id(tenant_a());
     let wd = worktree_under(&amb.root());
@@ -640,7 +642,13 @@ fn under_bypass_a_template_permissions_key_is_stripped_but_the_rest_is_folded() 
     std::fs::write(
         Path::new(&wd).join("operator-settings.json"),
         serde_json::json!({
-            "permissions": { "allow": ["Bash(*)"] },
+            "permissions": {
+                "allow": ["Bash(*)"],
+                "defaultMode": "bypassPermissions",
+                "additionalDirectories": ["/"],
+                "deny": ["Read(./secrets/**)"],
+                "ask": ["Bash(rm:*)"]
+            },
             "model": "operator-model"
         })
         .to_string(),
@@ -665,7 +673,87 @@ fn under_bypass_a_template_permissions_key_is_stripped_but_the_rest_is_folded() 
         doc["model"], "operator-model",
         "the relative path resolved: {doc}"
     );
-    assert!(doc.get("permissions").is_none(), "{doc}");
+    let permissions = doc["permissions"]
+        .as_object()
+        .expect("deny and ask survive");
+    let mut keys: Vec<&String> = permissions.keys().collect();
+    keys.sort();
+    assert_eq!(keys, vec!["ask", "deny"], "{doc}");
+    assert_eq!(
+        permissions["deny"],
+        serde_json::json!(["Read(./secrets/**)"])
+    );
+    assert_eq!(permissions["ask"], serde_json::json!(["Bash(rm:*)"]));
+}
+
+/// A template can never switch the runner's hooks off: its `disableAllHooks`
+/// is stripped, so the hook carrier's SessionStart hook stays live.
+#[test]
+fn a_template_cannot_disable_the_runners_hooks() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    let hooks_dir = tempfile::tempdir().unwrap();
+    let hook_settings = crate::session::claude_hook::materialize(hooks_dir.path()).unwrap();
+    let operator = scratch.path().join("operator-settings.json");
+    std::fs::write(
+        &operator,
+        serde_json::json!({ "disableAllHooks": true, "model": "operator-model" }).to_string(),
+    )
+    .unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some(format!("claude --settings {}", operator.display())),
+        ..Default::default()
+    };
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(&wd, &session_id, None, Some(hook_settings), scratch.path());
+    input.launch_cfg = &cfg;
+
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+
+    let argv = render(&extras, &cfg, PermissionMode::BypassPermissions);
+    let settings = flag_values(&argv, "--settings");
+    assert_eq!(settings.len(), 1, "{argv:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings[0]).unwrap()).unwrap();
+    assert!(doc.get("disableAllHooks").is_none(), "{doc}");
+    assert!(doc["hooks"]["SessionStart"].is_array(), "{doc}");
+    assert_eq!(doc["model"], "operator-model", "the rest is folded: {doc}");
+}
+
+/// The fold is the only route a template's settings can take. A template
+/// `--settings` that cannot be read — with no hook carrier and no tool policy,
+/// so the tail passes no `--settings` of its own for the name-only dedup to
+/// match — still never reaches the argv, and nor does a template append prompt
+/// whose file cannot be read.
+#[test]
+fn an_unreadable_template_settings_never_passes_through_to_the_argv() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some(
+            "claude --settings /no/such/operator-settings.json \
+             --append-system-prompt-file /no/such/prompt.md --verbose"
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(&wd, &session_id, None, None, scratch.path());
+    input.launch_cfg = &cfg;
+
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+
+    let argv = render(&extras, &cfg, PermissionMode::BypassPermissions);
+    assert!(flag_values(&argv, "--settings").is_empty(), "{argv:?}");
+    assert!(
+        flag_values(&argv, "--append-system-prompt-file").is_empty(),
+        "{argv:?}"
+    );
+    assert!(argv.iter().any(|a| a == "--verbose"), "{argv:?}");
 }
 
 /// An INLINE-JSON template `--settings` is folded like a file, and its value —

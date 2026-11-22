@@ -386,6 +386,60 @@ fn carry_through_reads_approvals_from_the_settings_layers_and_disabled_wins() {
     assert!(carry_through_servers(&bare, None, None).is_empty());
 }
 
+/// `enableAllProjectMcpServers` is decided by the highest-precedence layer that
+/// sets it, not by any layer saying `true`: a local `false` beats a user
+/// `true`. An explicit enable still admits its server, and a disable anywhere
+/// still wins.
+#[test]
+fn enable_all_is_decided_by_the_highest_precedence_layer_that_sets_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": {
+            "a": { "command": "a" },
+            "b": { "command": "b" },
+            "c": { "command": "c" }
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let user_settings = tmp.path().join("user-settings.json");
+    std::fs::write(
+        &user_settings,
+        serde_json::json!({ "enableAllProjectMcpServers": true, "disabledMcpjsonServers": ["c"] })
+            .to_string(),
+    )
+    .unwrap();
+    let names = || {
+        let mut n: Vec<String> = carry_through_servers(&cwd, None, Some(&user_settings))
+            .keys()
+            .cloned()
+            .collect();
+        n.sort();
+        n
+    };
+
+    // Only the user layer speaks: its `true` admits everything but disabled c.
+    assert_eq!(names(), vec!["a", "b"]);
+
+    // A higher-precedence local `false` overrides it; an explicit enable of b
+    // in the project layer still admits b.
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        serde_json::json!({ "enableAllProjectMcpServers": false }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        serde_json::json!({ "enableAllProjectMcpServers": true, "enabledMcpjsonServers": ["b", "c"] })
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(names(), vec!["b"]);
+}
+
 /// Two sessions in one cwd get two files and two live nonces — never one
 /// shared credential.
 #[test]
