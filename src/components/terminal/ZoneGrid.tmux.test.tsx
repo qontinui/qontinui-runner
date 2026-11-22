@@ -136,7 +136,7 @@ vi.mock("./TerminalInstance", () => {
 });
 
 vi.mock("./PlanViewer", () => ({ PlanViewer: () => null }));
-vi.mock("./WorkerSessionCell", () => ({ WorkerSessionCell: () => null }));
+vi.mock("./StructuredSessionCell", () => ({ StructuredSessionCell: () => null }));
 vi.mock("./suggestions", () => ({ SuggestionChip: () => null }));
 vi.mock("./zone-grid/MaximizedHeader", () => ({
   MaximizedHeader: () => createElement("div", { "data-maximized-header": true }),

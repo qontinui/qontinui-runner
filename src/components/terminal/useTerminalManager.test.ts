@@ -394,7 +394,11 @@ describe("reconcileTabsWithBackend", () => {
 
   it("adds a backend terminal that has no local tab (missed terminal-created)", () => {
     const tabs = [tab("a", old)];
-    const next = reconcileTabsWithBackend(tabs, [createdEvent("a", "p"), createdEvent("b", "p")], NOW);
+    const next = reconcileTabsWithBackend(
+      tabs,
+      [createdEvent("a", "p"), createdEvent("b", "p")],
+      NOW,
+    );
     expect(next.map((t) => t.id)).toEqual(["a", "b"]);
   });
 
@@ -427,7 +431,11 @@ describe("reconcileTabsWithBackend", () => {
 
   it("preserves per-tab state on surviving tabs", () => {
     const tabs = [tab("a", { ...old, claudeSessionId: "sid", taskRunId: "run-1" })];
-    const next = reconcileTabsWithBackend(tabs, [createdEvent("a", "p"), createdEvent("b", "p")], NOW);
+    const next = reconcileTabsWithBackend(
+      tabs,
+      [createdEvent("a", "p"), createdEvent("b", "p")],
+      NOW,
+    );
     expect(next[0]).toBe(tabs[0]);
     expect(next[0].claudeSessionId).toBe("sid");
     expect(next[0].taskRunId).toBe("run-1");
@@ -517,6 +525,13 @@ describe("Conductor worker tabs", () => {
       taskRunId: "trid-1",
       sessionBacked: true,
     });
+  });
+
+  it("workerTabFromRecord carries the record's provider onto the tab", () => {
+    expect(workerTabFromRecord(workerRecord({ provider: "claude" }))?.sessionProvider).toBe(
+      "claude",
+    );
+    expect(workerTabFromRecord(workerRecord())?.sessionProvider).toBeUndefined();
   });
 
   it("workerTabFromRecord returns null for a non-worker record and defaults a blank title", () => {

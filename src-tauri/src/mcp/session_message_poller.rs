@@ -2834,6 +2834,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             awaiting_account_since: None,
@@ -3445,6 +3446,7 @@ mod tests {
         use crate::terminal::graceful_exit::{ClaudeProbe, PaneProcesses, ProcIdentity};
         let no_claude = ClaudeProbe::Readable(PaneProcesses {
             subtree_claude: vec![],
+            provider: None,
             top_level_children: 0,
             exempted_children: Vec::new(),
             tracked_alive: vec![],
@@ -3463,6 +3465,7 @@ mod tests {
                 pid: 42,
                 started_at: 1,
             }],
+            provider: Some("claude".to_string()),
             top_level_children: 0,
             exempted_children: Vec::new(),
             tracked_alive: vec![],

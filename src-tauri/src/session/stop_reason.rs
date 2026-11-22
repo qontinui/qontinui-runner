@@ -532,6 +532,7 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
         }
     }
 
@@ -1529,6 +1530,11 @@ mod tests {
         const MINTS: &[(&str, &str, &str)] = &[
             ("main.rs", "run_app", "CLOSE_REASON_NEVER_STARTED"),
             ("main.rs", "run_app", "CLOSE_REASON_NO_TERMINAL"),
+            (
+                "session/codex_capture.rs",
+                "record_captured_session",
+                "CLOSE_REASON_SUPERSEDED",
+            ),
             (
                 "orchestration_loop/ai_session_executor.rs",
                 "teardown_unbound_worker",

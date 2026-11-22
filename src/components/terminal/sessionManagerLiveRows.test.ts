@@ -83,6 +83,7 @@ describe("buildTabRows", () => {
       {
         source: "tab",
         sessionId: "t-shell",
+        provider: "claude",
         accountLabel: "default",
         configDir: "",
         projectPath: "/work/qontinui-web",

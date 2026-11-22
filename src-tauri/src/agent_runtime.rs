@@ -7868,7 +7868,7 @@ pub(crate) fn build_continuation_claude_command(
     // and it keeps this builder pure so the argv-shape regressions below assert
     // against a fixed vector instead of whatever is on the machine's disk.
     hook_settings_args: Vec<String>,
-    launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    launch_cfg: &crate::session::launch_spec::LaunchConfig,
     // The model family coord decided for this spawn (`launch_model`, validated
     // by [`LaunchFrame::resolve`]). Bound into `LaunchSpec.model`, which
     // renders exactly one `--model` and drops any template `--model`, in
@@ -7878,7 +7878,7 @@ pub(crate) fn build_continuation_claude_command(
     // `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V8).
     launch_model: Option<String>,
 ) -> Vec<String> {
-    use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
+    use crate::session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
 
     // `extra_required` is the caller-authoritative, verbatim tail — never
     // reordered or deduped by the seam. It carries, IN ORDER:
@@ -8043,7 +8043,7 @@ async fn run_continuation_terminal(
     let spawn_name = payload
         .session_name
         .as_deref()
-        .and_then(crate::claude_session::launch_spec::sanitize_session_name);
+        .and_then(crate::session::launch_spec::sanitize_session_name);
     let title = spawn_name.clone().unwrap_or_else(|| {
         payload
             .anchor_key
@@ -8097,9 +8097,8 @@ async fn run_continuation_terminal(
     // carries the runner-context briefing and that briefing's memory clause is
     // gated on the per-session provisioning OUTCOME (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
-    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
@@ -8672,7 +8671,9 @@ fn continuation_transcript_paths(
     selected_config_dir
         .map(std::path::PathBuf::from)
         .into_iter()
-        .chain(crate::terminal::transcript::find_claude_config_dirs())
+        .chain(crate::terminal::transcript::find_transcript_config_dirs(
+            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+        ))
         .map(|dir| {
             crate::terminal::transcript::session_transcript_path(&dir, workdir, pinned_session_id)
         })
@@ -9257,9 +9258,10 @@ async fn run_condition_check_terminal(
     // Title from a short run-id prefix: "Condition check <8 chars>".
     let run_id_short: String = payload.run_id.chars().take(8).collect();
     // `check-<condition name>` when coord supplies one, else the run-id label.
-    let spawn_name = payload.condition_name.as_deref().and_then(|n| {
-        crate::claude_session::launch_spec::sanitize_session_name(&format!("check-{n}"))
-    });
+    let spawn_name = payload
+        .condition_name
+        .as_deref()
+        .and_then(|n| crate::session::launch_spec::sanitize_session_name(&format!("check-{n}")));
     let title = spawn_name
         .clone()
         .unwrap_or_else(|| format!("Condition check {run_id_short}"));
@@ -9298,9 +9300,8 @@ async fn run_condition_check_terminal(
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
-    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
     // coord's launch decision for this check (`conditions/dispatch.rs`
     // `spawn_frame` stamps the same `launch_*` keys): model via
     // `LaunchSpec.model`; effort waits on qontinui-runner#2569.
@@ -12593,13 +12594,13 @@ fn pinned_session_args(session_id: uuid::Uuid) -> Vec<String> {
 /// flag and neither is ever emitted twice (plan
 /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V7).
 ///
-/// [`PermissionMode::DangerouslySkip`]: crate::claude_session::launch_spec::PermissionMode::DangerouslySkip
+/// [`PermissionMode::DangerouslySkip`]: crate::session::launch_spec::PermissionMode::DangerouslySkip
 fn headless_agent_args(
-    permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
+    permission: &crate::session::launch_spec::SessionPermissionSetting,
     launch: &AppliedLaunch,
     session_args: Vec<String>,
 ) -> Vec<String> {
-    use crate::claude_session::launch_spec::PermissionMode;
+    use crate::session::launch_spec::PermissionMode;
     let mut args = permission.apply(PermissionMode::DangerouslySkip).render();
     args.extend(launch.headless_args());
     args.extend(session_args);
@@ -14750,7 +14751,7 @@ mod tests {
                 "-p do \"it\"".to_string(),
                 None,
                 Vec::new(),
-                &crate::claude_session::launch_spec::LaunchConfig::default(),
+                &crate::session::launch_spec::LaunchConfig::default(),
                 None,
             )
         };
@@ -14778,7 +14779,7 @@ mod tests {
             "do the thing".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         assert_eq!(
@@ -14806,7 +14807,7 @@ mod tests {
             "run /implement-plan plans/x.md".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         assert_eq!(
@@ -14837,7 +14838,7 @@ mod tests {
             "-prompt with dash".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         assert_eq!(
@@ -14863,7 +14864,7 @@ mod tests {
                 "You are inside the Qontinui Runner.".to_string(),
             )),
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         // The prompt stays the trailing positional behind `--`.
@@ -14920,7 +14921,7 @@ mod tests {
                 briefing,
             )),
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         let flag = cmd
@@ -14961,7 +14962,7 @@ mod tests {
                 "--settings".to_string(),
                 "C:/hooks/claude_hook_settings.json".to_string(),
             ],
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
@@ -14994,7 +14995,7 @@ mod tests {
             "do the thing".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         assert_eq!(
@@ -15020,7 +15021,7 @@ mod tests {
                 "briefing".to_string(),
             )),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         assert_eq!(
@@ -15052,7 +15053,7 @@ mod tests {
             "do the thing".to_string(),
             Some(carrier),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         assert_eq!(
@@ -15088,7 +15089,7 @@ mod tests {
                 "do the thing".to_string(),
                 Some(carrier.clone()),
                 vec![],
-                &crate::claude_session::launch_spec::LaunchConfig {
+                &crate::session::launch_spec::LaunchConfig {
                     default_template: template.map(str::to_string),
                     account_command: None,
                     ..Default::default()
@@ -15131,7 +15132,7 @@ mod tests {
                 "do the thing".to_string(),
                 None,
                 vec![],
-                &crate::claude_session::launch_spec::LaunchConfig {
+                &crate::session::launch_spec::LaunchConfig {
                     default_template: Some("claude --model opus".to_string()),
                     account_command: None,
                     ..Default::default()
@@ -15245,7 +15246,7 @@ mod tests {
                 "do the thing".to_string(),
                 carrier.clone(),
                 vec!["--settings".to_string(), "/h/s.json".to_string()],
-                &crate::claude_session::launch_spec::LaunchConfig::default(),
+                &crate::session::launch_spec::LaunchConfig::default(),
                 None,
             );
             let flags: Vec<usize> = cmd
@@ -16468,7 +16469,7 @@ mod tests {
                 compose_continuation_system_prompt("RUNNER CONTEXT".to_string(), Some(&brief)),
             )),
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
             None,
         );
         let flag = cmd
@@ -18815,7 +18816,7 @@ mod tests {
     /// terminal seam passes — so it never stalls on a prompt it cannot answer.
     #[test]
     fn headless_agent_args_skip_permissions_by_default() {
-        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        use crate::session::launch_spec::SessionPermissionSetting;
         let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
         assert_eq!(
             headless_agent_args(
@@ -18835,7 +18836,7 @@ mod tests {
     /// `dontAsk` with exactly the configured tools, never the bypass flag.
     #[test]
     fn headless_agent_args_follow_an_allow_list_posture() {
-        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        use crate::session::launch_spec::SessionPermissionSetting;
         let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
         let posture = SessionPermissionSetting::AllowList {
             tools: vec!["Read".to_string(), "Bash(git status)".to_string()],
@@ -18863,7 +18864,7 @@ mod tests {
     /// the permission posture and the session pin.
     #[test]
     fn headless_agent_args_carry_the_frames_launch_decision() {
-        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        use crate::session::launch_spec::SessionPermissionSetting;
         let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
         let launch: LaunchFrame = serde_json::from_value(serde_json::json!({
             "launch_model": "sonnet",
@@ -18893,7 +18894,7 @@ mod tests {
     /// while a valid `launch_model` beside it still applies.
     #[test]
     fn headless_agent_args_drop_an_invalid_launch_effort() {
-        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        use crate::session::launch_spec::SessionPermissionSetting;
         let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
         let launch: LaunchFrame = serde_json::from_value(serde_json::json!({
             "launch_model": "opus",
@@ -19141,7 +19142,7 @@ mod tests {
             // ahead of the session pin, so the headless child never runs in
             // `default` mode and stalls on a prompt it cannot answer.
             let expected = crate::settings::get_claude_session_permission()
-                .apply(crate::claude_session::launch_spec::PermissionMode::DangerouslySkip)
+                .apply(crate::session::launch_spec::PermissionMode::DangerouslySkip)
                 .render();
             let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
             assert!(

@@ -16,11 +16,37 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+/**
+ * The provider every {@link ZoneSessionInfo} belongs to. A zone profile's
+ * format predates providers — its sessions are Claude Code session ids
+ * (`claudeSessionId`), the same assumption the runner's lifecycle store makes
+ * for a record saved before it carried a provider (`DEFAULT_PROVIDER`).
+ */
+export const ZONE_SESSION_PROVIDER = "claude";
+
 /** A Claude session pinned to a zone index by a saved profile. */
 export interface ZoneSessionInfo {
   zoneIndex: number;
   claudeSessionId: string;
   claudeConfigDir?: string;
+}
+
+/**
+ * The tab fields a profile resume stamps when it types `s`'s resume line: the
+ * session, its account, and its provider — the provider is what a later
+ * retry (the failure banner's Resume) resolves the CLI profile from, so a tab
+ * without it cannot be retried. Pure.
+ */
+export function profileResumeTabFields(s: ZoneSessionInfo): {
+  claudeSessionId: string;
+  claudeConfigDir: string | undefined;
+  sessionProvider: string;
+} {
+  return {
+    claudeSessionId: s.claudeSessionId,
+    claudeConfigDir: s.claudeConfigDir,
+    sessionProvider: ZONE_SESSION_PROVIDER,
+  };
 }
 
 export interface ZoneProfile {
