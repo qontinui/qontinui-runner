@@ -404,6 +404,29 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
     } catch (err) {
       console.error("Failed to save CI-node settings:", err);
       failures.push(`CI-node settings — ${String(err)}`);
+      // A remote directive changed the section after this panel loaded, and
+      // the runner refused to revert it. Re-read the section so the panel
+      // shows what is in force now (and carries the new directive id); the
+      // owner can then re-apply their edit deliberately and save again.
+      if (String(err).includes("remote configuration directive")) {
+        try {
+          const fresh =
+            await invoke<
+              TauriResult<CiNodeSettingsValue & { host_suggestion?: CiNodeHostSuggestion | null }>
+            >("get_ci_node_settings");
+          if (fresh?.success && fresh.data) {
+            const { host_suggestion, ...persisted } = fresh.data;
+            const c = { ...DEFAULT_CI_NODE, ...persisted };
+            setCiNode(c);
+            setHostSuggestion(host_suggestion ?? null);
+            setAllowlistText(c.repo_allowlist.join("\n"));
+            setBuildsDraft(null);
+            onLog("warning", "CI-node settings reloaded: a remote directive changed them");
+          }
+        } catch (reloadErr) {
+          console.error("Failed to reload CI-node settings:", reloadErr);
+        }
+      }
     }
 
     setSaving(false);
