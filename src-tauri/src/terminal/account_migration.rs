@@ -895,8 +895,11 @@ async fn continue_after_reset(
     .await;
     match run {
         ContinueRun::NotClaimed(claim) => {
-            // Another run owns this stop, or it is answered or out of
-            // attempts: nothing for a re-entry's retry park to do.
+            // The stop is answered (`Done`) or out of attempts. (`InFlight`
+            // cannot reach here: a run holds the session's in-flight claim
+            // for as long as it holds the ledger claim, so a second run is
+            // refused at the session claim first.) Nothing for a re-entry's
+            // retry park to do.
             super::limit_stop::with_parks(|p| p.forget(&terminal_id));
             info!(
                 terminal_id,
