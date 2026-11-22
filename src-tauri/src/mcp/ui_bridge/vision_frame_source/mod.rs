@@ -301,41 +301,43 @@ impl DeviceScreenshotSource {
                     ),
                 });
             }
-            // Read the body FIRST: a UI Bridge envelope carrying a `code` means
-            // the device itself answered — e.g. ui-bridge-native's own 503
-            // `PAIRING_UNAVAILABLE` refusal — so it is the app's failure,
-            // with its code, whatever the status.
+            // Read the body FIRST. A UI Bridge `{success:false, ...}` envelope
+            // means the device itself answered — e.g. ui-bridge-native's own
+            // 503 `PAIRING_UNAVAILABLE` refusal — so it is the app's failure,
+            // with its code and retry verdict, whatever the status.
             let body = resp.json::<serde_json::Value>().await.ok();
-            // A pairing refusal's `error` says what to do; keep it.
+            if let Some(refusal) = body
+                .as_ref()
+                .and_then(|b| device_refusal(&url, status.as_u16(), b))
+            {
+                return Err(refusal);
+            }
+            // A non-envelope body may still carry an `error` string; keep it.
             let reason = body
                 .as_ref()
                 .and_then(|b| b.get("error")?.as_str().map(str::to_string));
-            let app_code = body.as_ref().and_then(envelope_code);
             let message = match reason {
                 Some(reason) => format!("device screenshot {url} returned HTTP {status}: {reason}"),
                 None => format!("device screenshot {url} returned HTTP {status}"),
             };
             // With no such envelope, a gateway status (bad gateway,
             // unavailable, gateway timeout) is most likely a proxy answering
-            // for a device it could not reach: the transport's failure.
+            // for a device it could not reach — even a proxy's own JSON error
+            // with a `code` — so it is the transport's failure.
             let gateway = matches!(
                 status,
                 reqwest::StatusCode::BAD_GATEWAY
                     | reqwest::StatusCode::SERVICE_UNAVAILABLE
                     | reqwest::StatusCode::GATEWAY_TIMEOUT
             );
-            return Err(match app_code {
-                Some(code) => FrameSourceError::CaptureFailed {
-                    message,
-                    code: Some(code),
-                    retryable: body.as_ref().and_then(|b| b.get("retryable")?.as_bool()),
-                },
-                None if gateway => unreachable(message, None),
-                None => FrameSourceError::CaptureFailed {
+            return Err(if gateway {
+                unreachable(message, None)
+            } else {
+                FrameSourceError::CaptureFailed {
                     message,
                     code: None,
                     retryable: None,
-                },
+                }
             });
         }
         let body: serde_json::Value =
@@ -366,18 +368,28 @@ impl FrameProvider for DeviceScreenshotSource {
     }
 }
 
-/// The machine-readable code of a UI Bridge `{success:false, error, code}`
-/// envelope (`code`, else `errorCode`; at the top level or inside an object
-/// `error`), when the body is one. `None` for any other body.
-fn envelope_code(body: &serde_json::Value) -> Option<String> {
-    let text = |v: &serde_json::Value| {
-        ["code", "errorCode"]
-            .into_iter()
-            .find_map(|k| v.get(k)?.as_str())
-            .filter(|c| !c.trim().is_empty())
-            .map(str::to_string)
-    };
-    text(body).or_else(|| body.get("error").filter(|e| e.is_object()).and_then(text))
+/// The device's own refusal, when `body` is a UI Bridge `{success:false, ...}`
+/// envelope: read by the SAME parser `/ui-bridge/apps/{id}/dispatch` uses
+/// ([`crate::mcp::app_dispatch::app_answered_failure`], itself on
+/// `WrapperFailure::from_wire`), so a string or object `error`, `code` /
+/// `errorCode` and `retryable` all read the same way there and here, top-level
+/// values winning. `None` for any body without `success: false` — a proxy's
+/// JSON error included. Pure, so the envelope reading is unit-testable.
+fn device_refusal(url: &str, status: u16, body: &serde_json::Value) -> Option<FrameSourceError> {
+    match crate::mcp::app_dispatch::app_answered_failure(url, status, body)? {
+        crate::mcp::app_dispatch::DispatchError::AppAnswered {
+            error,
+            code,
+            retryable,
+            ..
+        } => Some(FrameSourceError::CaptureFailed {
+            message: format!("device screenshot {url} returned HTTP {status}: {error}"),
+            code,
+            retryable,
+        }),
+        // `app_answered_failure` builds only `AppAnswered`.
+        _ => None,
+    }
 }
 
 /// Decode a `control/screenshot` JSON body into a [`Frame`]. Pure (no I/O) so
@@ -931,17 +943,75 @@ mod tests {
             "success": false,
             "error": "The pairing store is not available yet. Try again.",
             "code": "PAIRING_UNAVAILABLE",
+            "retryable": true,
         });
         let err =
             fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
                 .await;
         assert_eq!(err.code(), "PAIRING_UNAVAILABLE", "{err:?}");
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
-            "app"
-        );
+        let hint = err.to_json_err().1 .0.hint.expect("hint");
+        assert_eq!(hint["failure_origin"], "app");
+        assert_eq!(hint["retryable"], true);
         assert!(err.to_string().contains("pairing store"), "{err}");
+    }
+
+    /// A proxy's own JSON error with a `code` but no `success: false` is not
+    /// the device's refusal: a gateway status there stays the transport's.
+    #[tokio::test]
+    async fn a_proxys_coded_json_503_without_success_false_is_unreachable() {
+        let body = serde_json::json!({"code": "UPSTREAM_DOWN", "error": "no upstream"});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+    }
+
+    /// The device-refusal reading, pure: the shared parser's grammar.
+    #[test]
+    fn device_refusal_reads_the_ui_bridge_envelope() {
+        let read = |body: serde_json::Value| match device_refusal("u", 503, &body) {
+            Some(FrameSourceError::CaptureFailed {
+                message,
+                code,
+                retryable,
+            }) => Some((message, code, retryable)),
+            Some(other) => panic!("expected CaptureFailed, got {other:?}"),
+            None => None,
+        };
+        // Nested `error` object: its message, code and retry verdict.
+        let (message, code, retryable) = read(serde_json::json!({
+            "success": false,
+            "error": {"code": "TAB_NOT_VISIBLE", "message": "tab hidden", "retryable": true},
+        }))
+        .expect("an envelope");
+        assert!(message.contains("tab hidden"), "{message}");
+        assert_eq!(code.as_deref(), Some("TAB_NOT_VISIBLE"));
+        assert_eq!(retryable, Some(true));
+        // `errorCode`, at the top level.
+        let (_, code, retryable) = read(serde_json::json!({
+            "success": false, "error": "boom", "errorCode": "ACTION_FAILED",
+        }))
+        .expect("an envelope");
+        assert_eq!(code.as_deref(), Some("ACTION_FAILED"));
+        assert_eq!(retryable, None, "no verdict sent is UNKNOWN, never false");
+        // A blank top-level code is no code; the object's code still reads.
+        let (_, code, _) = read(serde_json::json!({
+            "success": false, "code": "  ",
+            "error": {"code": "INNER", "message": "m"},
+        }))
+        .expect("an envelope");
+        assert_eq!(code.as_deref(), Some("INNER"));
+        // Top-level `retryable` wins over the object's.
+        let (_, _, retryable) = read(serde_json::json!({
+            "success": false, "retryable": false,
+            "error": {"code": "X", "message": "m", "retryable": true},
+        }))
+        .expect("an envelope");
+        assert_eq!(retryable, Some(false));
+        // The success:false gate: a coded body without it is not a refusal.
+        assert!(read(serde_json::json!({"code": "UPSTREAM_DOWN", "error": "x"})).is_none());
+        assert!(read(serde_json::json!({"success": true, "code": "X"})).is_none());
     }
 
     #[test]
