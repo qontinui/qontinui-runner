@@ -372,7 +372,7 @@ async fn the_route_addressed_by_the_exported_id_refuses_an_unbound_declared_tena
 }
 
 /// An operator template's `--settings` is not lost: the launch seam drops it
-/// from the argv (this tail supplies the one `--settings`), so its keys are
+/// from the argv (the spawn owns `--settings`), so its keys are
 /// MERGED into that one file — the runner's hooks and the tool policy win on a
 /// conflict, list entries are kept from every layer, and the template's own
 /// keys survive.

@@ -53,7 +53,8 @@ pub(crate) struct LaunchExtrasInputs<'a> {
     pub(crate) scratch_dir: &'a Path,
     /// The operator launch config the spawn renders with. Its template's own
     /// `--settings` and append-prompt flags are dropped from the argv because
-    /// this tail supplies both, so they are FOLDED IN here instead of lost: a
+    /// the spawn owns those flags (`OWNED_TEMPLATE_FLAGS`), so they are
+    /// FOLDED IN here instead of lost: a
     /// template settings file into the one merged settings file (runner keys
     /// win), a template prompt after the runner's in the one carrier. A
     /// template `--mcp-config` stays dropped — the runner's coord-mcp is
@@ -391,7 +392,8 @@ fn read_settings_value(value: &str, working_dir: &Path) -> Result<serde_json::Va
 
 /// Fold an operator template's append prompts into the ONE carrier, after the
 /// runner's composed text: Claude Code refuses two append flags, and the
-/// launch seam drops the template's because this tail supplies one, so without
+/// launch seam drops the template's because the spawn owns the flag
+/// (`OWNED_TEMPLATE_FLAGS`), so without
 /// this an operator's configured prompt would silently vanish.
 ///
 /// `--append-system-prompt <text>` contributes its text and

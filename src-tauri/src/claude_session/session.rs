@@ -359,7 +359,7 @@ impl ClaudeSession {
         let api_port = crate::terminal::spawn_seam_api_port();
         // Read BEFORE the tail is composed: the template's own `--settings` and
         // append prompt are folded into the tail's (the launch seam drops them
-        // from the argv because the tail supplies both).
+        // from the argv because the spawn owns those flags).
         let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );
@@ -417,8 +417,10 @@ impl ClaudeSession {
         // Windows (for npm's `claude.cmd` shim), a directly-executed resolved
         // `claude` everywhere else.
         // The operator's global template + per-account command layer in here;
-        // a template flag the runner's tail already supplies (`--mcp-config`,
-        // `--settings`, in either spelling) is dropped, so the runner's wins.
+        // a template flag the spawn owns (`--mcp-config`, `--strict-mcp-config`,
+        // `--settings`, both append-prompt flags, in either spelling) is
+        // dropped whether or not the tail supplies it; the fold is the only
+        // route a template's settings or prompt reach the session.
         let spec = crate::claude_session::launch_spec::LaunchSpec {
             permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
             session_id: session_id_pin,

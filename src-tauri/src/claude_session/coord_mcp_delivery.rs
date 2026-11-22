@@ -81,7 +81,8 @@ const COORD_MCP_SERVER: &str = "coord-mcp";
 /// none.
 const STRICT_CONFIG_DIR: &str = "claude-session-mcp";
 
-/// The template flags a stream-json spawn OWNS on every coord-mcp arm
+/// The MCP half of the template flags a stream-json spawn OWNS on every
+/// coord-mcp arm (the full set is `launch_extras::OWNED_TEMPLATE_FLAGS`)
 /// ([`super::launch_spec::LaunchSpec::owned_flags`]): a template's copy never
 /// reaches the argv. On the provisioned and strict arms the runner supplies its
 /// own; on the declared arm it supplies none because the cwd's `.mcp.json` IS
@@ -537,7 +538,12 @@ fn carry_through_servers(
     let project = projects.and_then(|p| keys.iter().find_map(|k| p.get(k)));
     // Highest precedence first: local settings, project settings, the account
     // file's projects entry, user settings. (The projects entry's place between
-    // project and user is an assumption, unmeasured — see `ProjectApproval`.)
+    // project and user is an assumption, unmeasured — see `ProjectApproval`.
+    // The command-line `--settings` layer the runner itself passes is NOT
+    // read here, so an approval only a folded template layer carries is
+    // missed, so the strict file can differ from what that layer approves in
+    // either direction: it can omit a server only that layer enables, or
+    // carry one only that layer disables. Tracked as a plan follow-up.)
     let (local_files, project_files) = project_settings_files(cwd);
     let local: Vec<serde_json::Value> = local_files.iter().filter_map(|p| read_json(p)).collect();
     let shared: Vec<serde_json::Value> =
