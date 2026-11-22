@@ -6713,10 +6713,10 @@ mod tests {",
             nm_is_junction: false,
             nm_bytes: 0,
             nm_exclusive_bytes: Some(0),
-            target_present: false,
+            target_present: bytes > 0,
             target_is_junction: false,
-            target_bytes: 0,
-            target_exclusive_bytes: Some(0),
+            target_bytes: bytes,
+            target_exclusive_bytes: Some(bytes),
             build_target_dir: None,
             build_slot: None,
             last_access_mtime: None,
@@ -7003,7 +7003,15 @@ mod tests {",
         let store = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("qontinui-web");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        // A real (empty) repo, so git's discovery stops here instead of
+        // walking up into whatever repo TMPDIR may sit inside.
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git runs");
+        assert!(init.success(), "git init succeeds");
         let nm = repo.join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         let stored = store.path().join("pkg.js");
@@ -7015,7 +7023,7 @@ mod tests {",
         enumerate_worktrees_with(root.path(), &mut |row| rows.push(row));
         let row = rows
             .iter()
-            .find(|r| r.repo == "qontinui-web")
+            .find(|r| std::fs::canonicalize(&r.path).ok() == std::fs::canonicalize(&repo).ok())
             .expect("the canonical checkout is reported");
         assert_eq!(row.nm_bytes, 5012, "apparent size counts the store file");
         assert_eq!(

@@ -1180,6 +1180,10 @@ pub struct SizeMeasurement {
     /// link count and the walk does not open files to read one,
     /// and a walk that hit an unreadable sub-directory (`unreadable_dirs > 0`)
     /// cannot tell an outside link from one hidden in the unread part.
+    /// It is exclusive by LENGTH: a reflink/CoW clone (pnpm's `clone` import
+    /// on btrfs or APFS) has one link yet shares its extents, and a sparse
+    /// file's length exceeds its blocks, so on such files it can overstate
+    /// what removal frees.
     /// Plan `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
     pub exclusive_bytes: Option<u64>,
 }
