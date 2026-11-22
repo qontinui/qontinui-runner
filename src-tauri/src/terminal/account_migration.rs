@@ -2364,6 +2364,12 @@ async fn confirm_migration(
                 record.claude_session_id.clone(),
                 carried,
             );
+            // The session moved, so its carried stop is not a fresh one on
+            // `dst`: stamp the move, as the proven arm does below.
+            note_migrated(
+                &record.claude_session_id,
+                chrono::Utc::now().timestamp_millis(),
+            );
             let err = MigrateError::Unconfirmed {
                 new_terminal_id: terminal_id,
                 rolled_back: false,
@@ -2924,10 +2930,10 @@ mod tests {
     /// tests) and parks a refused stop instead of reporting it as skipped.
     #[test]
     fn the_hint_handler_keeps_no_gate_of_its_own_and_the_migration_stamps_itself() {
-        let migrate = source_between("fn migrate_session(\n", "\nfn emit_skipped(");
+        let migrate = source_between("\nasync fn confirm_migration(\n", "\nfn emit_skipped(");
         assert!(
             migrate.contains("note_migrated("),
-            "migrate_session must stamp"
+            "confirm_migration must stamp"
         );
         let handler = source_between(
             "pub async fn handle_usage_limit_hint(",
