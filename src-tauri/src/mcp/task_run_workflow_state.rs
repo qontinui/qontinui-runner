@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use super::task_run_full_state::{pg_get_task_run, state_name_to_stage};
+use super::task_run_full_state::{extract_stage_index, pg_get_task_run, state_name_to_stage};
 use crate::database::TaskRun;
 use crate::mcp::types::ApiState;
 use crate::unified_workflows::UnifiedWorkflowExt;

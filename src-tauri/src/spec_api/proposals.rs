@@ -1108,7 +1108,7 @@ fn mint_proposal_id() -> String {
 /// routing is best-effort).
 ///
 /// Sibling-module symmetry: keeps the slug shape identical to the
-/// `pathname_to_spec_id` helper owned by `workflow_generation::spec_authoring`.
+/// `pathname_to_spec_id` helper owned by `spec_api::authoring`.
 /// If the sibling makes that helper `pub(crate)`, this should be deleted in
 /// favor of calling it directly.
 #[expect(

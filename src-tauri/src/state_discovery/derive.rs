@@ -330,7 +330,7 @@ fn derive_window_days() -> i32 {
 /// collapsing the page into one mega-state and duplicating shared chrome N
 /// times. The page label is a **selection key, not a partition key**; the
 /// per-page projection happens downstream in
-/// `workflow_generation::spec_authoring::load_and_project_skeleton`.
+/// `spec_api::authoring::load_and_project_skeleton`.
 ///
 /// So `spec_id` is deliberately `None`: the artifact is written with
 /// `spec_id IS NULL`, which is exactly what

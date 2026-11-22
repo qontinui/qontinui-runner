@@ -1,7 +1,7 @@
 //! Debug endpoint: assembled Builder recognition prompt (no LLM).
 //!
 //! Phase B1 observability: the wrapper manifest (built by
-//! `workflow_generation::wrapper_manifest::build_manifest`) is unit-tested
+//! `mcp::wrapper_manifest::build_manifest`) is unit-tested
 //! and the formatter is unit-tested, but until this endpoint existed there
 //! was no way to confirm the manifest actually appears in a Builder's
 //! assembled recognition prompt during a real generation run without

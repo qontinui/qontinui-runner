@@ -92,7 +92,7 @@ pub struct ExecutionStepConfig {
     #[serde(rename = "type", alias = "step_type")]
     pub step_type: String,
 
-    /// Set by a step-conversion seam (`unified_workflow_executor::step_conversion`)
+    /// Set by a step-conversion seam (`step_executor::step_conversion`)
     /// when the step could not be parsed and no faithful fallback exists
     /// (today: a `ui_bridge` step). A step carrying it FAILS at execution with
     /// this message (`DispatchRoute::ConversionFailed`) — it is never run as a

@@ -152,7 +152,7 @@ pub struct ResumePointData {
 /// The state_data is a serde internally-tagged enum (tag = "type", rename_all = "snake_case"),
 /// so the JSON looks like: `{ "type": "verification_running", "iteration": 1, "stage_index": 2 }`
 /// The stage_index field is at the top level of the object, not nested inside a variant key.
-fn extract_stage_index(state_data: &Option<serde_json::Value>) -> Option<u32> {
+pub(super) fn extract_stage_index(state_data: &Option<serde_json::Value>) -> Option<u32> {
     let data = state_data.as_ref()?;
     data.get("stage_index")
         .and_then(|v| v.as_u64())
