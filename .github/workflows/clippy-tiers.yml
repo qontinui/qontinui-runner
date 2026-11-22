@@ -345,31 +345,62 @@ jobs:
 
       - name: Clippy diff-scoped via reviewdog
         id: clippy
-        # Capture clippy JSON to a file first so cargo's non-zero exit (a deny
-        # lint) does NOT abort the step under `set -eo pipefail` before
+        # Capture clippy's diagnostics to a file first so cargo's non-zero exit
+        # (a deny lint) does NOT abort the step under `set -eo pipefail` before
         # reviewdog runs — reviewdog owns the pass/fail decision here, scoped to
         # the diff. `-filter-mode=diff_context` = fail only on findings on
         # changed lines; `-fail-on-error=true` makes those diff findings fail
         # THIS (advisory, non-required) check only.
         #
-        # reviewdog's exit 1 is ALSO what it returns when it fails to create or
-        # post its check run, and GitHub has answered the PATCH of a run created
-        # seconds earlier with `404 Not Found` (job 135103311891 of run
-        # 44389597385 on qontinui-runner#3025, coord finding
-        # 2f3d3b96-7bd6-420e-aff3-f20d29544b74; c58cd00f-7651-4dde-bd3d-d69fcc59f291
-        # on qontinui-coord#4159). That red parked #3025 ~45 h exactly as a
-        # lint finding would. So reviewdog runs through `rso_run_retrying`,
-        # which re-runs it from the same clippy-report.json (no recompile) when
-        # an attempt fails AND its stderr says it did not finish its run (the
-        # completion step's own markers), at most twice, 5 s then 10 s apart.
-        # A findings exit has no such line and is never retried. Whenever a
-        # retry happens, a `retry outcome:` notice in this job's annotations
-        # says whether it recovered (the measure of whether retrying helps
-        # against GitHub's lag at all). When every
-        # attempt still fails to post, the job stays red -- reviewdog's last
-        # rc -- and says, in the `(not a verdict on this PR)` phrase coord's
-        # repair classifier (author_feedback.rs is_no_verdict_annotation)
-        # matches, that this red is GitHub's, not the diff's.
+        # The capture is `--message-format=short` on cargo's STDERR, because
+        # `-f=clippy` is reviewdog's errorformat `%f:%l:%c: %m`
+        # (reviewdog/errorformat fmts/rust.go), the short format's shape,
+        # anchored at the line start. Until 2026-11-22 this step fed it
+        # `--message-format=json` on stdout, no line of which has that shape,
+        # so reviewdog parsed ZERO diagnostics on every PR and this lint
+        # inspected nothing (plan
+        # 2026-11-22-reviewdog-diff-and-parse-infra-exits-read-as-lint-findings,
+        # Phase 0). `-q` keeps cargo's progress lines out of the capture;
+        # its `generated N warnings` summaries match no errorformat line and
+        # are skipped. Nothing else in this job reads the capture, so clippy
+        # runs once, in the format reviewdog reads.
+        #
+        # reviewdog v0.21.2 exits 1 for EVERY error, not only for diff
+        # findings (cmd/reviewdog/main.go prints each as `reviewdog: <err>`).
+        # So reviewdog runs through `rso_run_retrying`, which classifies a
+        # failed attempt by a POSITIVE marker in that attempt's stderr into one
+        # of three no-verdict classes (the helper's header is the contract):
+        #   post        it did not finish its check run (`failed to create
+        #               check` / `failed to post` / `check-runs/<id>`, the
+        #               completion step's own markers): GitHub has answered the
+        #               PATCH of a run created seconds earlier with `404 Not
+        #               Found` (job 135103311891 of run 44389597385 on
+        #               qontinui-runner#3025, coord finding
+        #               2f3d3b96-7bd6-420e-aff3-f20d29544b74;
+        #               c58cd00f-7651-4dde-bd3d-d69fcc59f291 on
+        #               qontinui-coord#4159), and that red parked #3025 ~45 h
+        #               exactly as a lint finding would. RETRIED.
+        #   diff-fetch  a line beginning `reviewdog: fail to get diff: `: the PR
+        #               diff fetch failed. RETRIED (a 5xx or a rate limit can
+        #               clear).
+        #   diff-parse  a line beginning `reviewdog: fail to parse diff: `: the
+        #               fetched diff did not parse. NOT retried: the same bytes
+        #               parse the same way again.
+        # `reviewdog: parse error:` (reading stdin) has no class: an
+        # errorformat parser such as `-f=clippy` cannot return it in v0.21.2,
+        # so a class for it would be code no test could make fail. An exit
+        # matching no marker -- a findings exit however it is worded -- is the
+        # verdict and is never retried. A retried class re-runs reviewdog from
+        # the same clippy-report.txt (no recompile), at most twice, 5 s then
+        # 10 s apart. Whenever a retry happens, a `retry outcome:` notice in
+        # this job's annotations names the class and says whether it
+        # recovered. When the LAST attempt ended in a no-verdict class, the job
+        # stays red -- reviewdog's last rc -- and says, in the `(not a verdict
+        # on this PR)` phrase coord's repair classifier (author_feedback.rs
+        # is_no_verdict_annotation) matches in the title, that this red is not
+        # the diff's; the message names the class and whether a re-run can
+        # help. The marker literals were captured from v0.21.2: re-check them
+        # on a version bump (a reworded line falls back to "finding").
         #
         # Outputs whenever this shell exits (a normal end, a death under
         # `set -e`, a SIGTERM/SIGINT from a cancel; not a SIGKILL or a runner
@@ -403,21 +434,30 @@ jobs:
           }
           rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
-          cargo clippy --message-format=json > clippy-report.json 2>/dev/null || true
+          cargo clippy -q --message-format=short 2> clippy-report.txt || true
           # rso_run_retrying marks the window's start ONCE, before the first
           # attempt, appends every attempt's stderr to the log the completion
           # step reads (so each failed attempt's `check-runs/<id>` reaches it)
           # and replays each attempt's stderr into this log once it returns,
           # and sets rc only once the last attempt has returned -- a cancel
           # mid-attempt or mid-retry leaves `unknown`, never a pass.
-          rso_run_retrying clippy-report.json reviewdog \
+          rso_run_retrying clippy-report.txt reviewdog \
             -f=clippy \
             -name="clippy-diff" \
             -filter-mode=diff_context \
             -reporter=github-pr-check \
             -fail-on-error=true
-          if [ "${RSO_POST_FAILED:-0}" = 1 ]; then
-            echo "::error title=Clippy diff-scoped (advisory): reviewdog could not post its check run (not a verdict on this PR)::reviewdog reported a failed check create or post on all ${RSO_ATTEMPTS} attempt(s), last exit ${rc}, so no lint verdict reached this diff. That is a GitHub API failure, not a clippy finding: re-run this job."
+          # RSO_NO_VERDICT: the LAST attempt's no-verdict class, empty for a
+          # verdict. One message line per class; no newline (it would end the
+          # workflow command) and no percent sign.
+          if [ -n "${RSO_NO_VERDICT:-}" ]; then
+            case "$RSO_NO_VERDICT" in
+              post) nv_why="reviewdog reported a failed check create or post. That is a GitHub API failure, not a clippy finding: re-run this job." ;;
+              diff-fetch) nv_why="reviewdog could not fetch this PR's diff from GitHub. That is a GitHub API or git fetch failure, not a clippy finding: re-run this job." ;;
+              diff-parse) nv_why="reviewdog could not parse this PR's diff. A re-run will not help: the PR diff is unparseable by reviewdog v0.21.2, so investigate this job's log (the reviewdog: fail to parse diff line) rather than the code." ;;
+              *) nv_why="see .github/scripts/reviewdog-step-outputs.sh for this class." ;;
+            esac
+            echo "::error title=Clippy diff-scoped (advisory): reviewdog could not deliver a verdict (not a verdict on this PR)::no-verdict class ${RSO_NO_VERDICT} after ${RSO_ATTEMPTS} attempt(s), last exit ${rc}, so no lint verdict reached this diff. ${nv_why}"
           fi
           exit "$rc"
         shell: bash
@@ -519,9 +559,10 @@ jobs:
       # steps.clippy.outputs.* read in this file is one the helper writes),
       # then this repo's own test-clippy-diff-step.sh (NOT vendored or
       # pinned), which runs the `clippy` step's `run:` block above with stub
-      # cargo/reviewdog/curl: a failed post then success is green, a finding
-      # is red, and a post that keeps failing is red and says it is not a
-      # verdict.
+      # cargo/reviewdog/curl: a failed post or diff fetch then success is
+      # green, a finding (however worded) is red, and a post or diff fetch
+      # that keeps failing, or a diff that does not parse, is red and says it
+      # is not a verdict.
       # Hermetic (a stub gh and curl, an injected sleep), seconds on this
       # existing hosted job. All four files are checked against
       # complete-orphaned-check-runs.sha256 (see the step above for what that
@@ -549,9 +590,9 @@ jobs:
       # phrase "(not a verdict on this PR)" -- coord's repair classifier
       # (author_feedback.rs is_no_verdict_annotation) matches it byte-exact and
       # re-runs instead of blaming the PR's code. Emits nothing when the
-      # reviewdog step itself failed (a diff finding IS a verdict; a post
-      # failure that outlasts the retries declares itself not one, in that
-      # step) or no setup step did.
+      # reviewdog step itself failed (a diff finding IS a verdict; a
+      # no-verdict class -- post, diff-fetch, diff-parse -- declares itself
+      # not one, in that step) or no setup step did.
       # Outcomes arrive via env only; step names below are static literals.
       - name: Declare a setup death (not a verdict on this PR)
         if: failure()

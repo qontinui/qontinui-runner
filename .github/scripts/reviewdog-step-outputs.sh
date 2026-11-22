@@ -16,7 +16,7 @@
 #   ...an early exit sets rc=not-run-<why> first...
 #   rso_run reviewdog <args...> <"$INPUT"      # marks the start, runs it, sets rc
 # or, where reviewdog's exit status is the step's verdict:
-#   rso_run_retrying "$INPUT" reviewdog <args...>   # the same, retrying a failed post
+#   rso_run_retrying "$INPUT" reviewdog <args...>   # the same, classifying a no-verdict exit
 #
 # rso_run marks the window's start, runs the command with stderr captured to
 # $RSO_STDERR_LOG, then replays that file into the job log. rc stays `unknown`
@@ -24,33 +24,59 @@
 # reviewdog runs is recorded as `unknown`, never as a pass.
 #
 # rso_run_retrying does the same for a command that reads <input file> on stdin,
-# and runs it again when an attempt exits non-zero AND that attempt's stderr
-# matches RSO_UNFINISHED_RUN_RE: reviewdog reporting that it did not finish its
-# check run (`failed to create check`, `failed to post`, `check-runs/<id>`).
-# That is the grep complete-orphaned-check-runs.sh uses for the same question,
-# and the test checks the two still agree. Why: GitHub has answered reviewdog's
-# PATCH of a check run it created a second earlier with `404 Not Found` (coord
-# findings c58cd00f-7651-4dde-bd3d-d69fcc59f291, 2f3d3b96-7bd6-420e-aff3-f20d29544b74),
-# and a step whose verdict is reviewdog's exit status then reds on GitHub's lag
-# exactly as it would on a lint finding. Any other exit -- 0, a findings exit 1
-# with no such line, any failure with no such line -- returns at once, so a
-# finding is never retried and never read as a failed post. Each attempt reads
-# <input file> afresh. Between attempts it sleeps RSO_RETRY_DELAYS (default
-# "5 10", whole seconds: at most 3 attempts; empty means no retry) with
-# RSO_RETRY_SLEEP (default `sleep`). rc is the LAST attempt's status. What the
-# completion step depends on is kept for every attempt: the start is marked
-# once, before the first, so the window covers them all; each attempt's stderr
-# is APPENDED to $RSO_STDERR_LOG as it is written, so every attempt's
-# `check-runs/<id>` reaches the completion step, a cancel mid-attempt included;
-# and rc stays `unknown` until the last attempt returns, sleeps included. Each
-# attempt's stderr is replayed into the job log once it returns. It also sets
-# two shell variables for the step, which are not outputs: RSO_ATTEMPTS, the
-# attempts run, and RSO_POST_FAILED, 1 when the last attempt still reported an
-# unfinished run (the retries are spent) and 0 otherwise. Whenever a retry
-# happened, a `::notice` starting `retry outcome:` says how it ended, so the
-# job's annotations show whether retrying recovers from GitHub's lag. An unreadable
-# <input file> runs nothing: rc=not-run-input-unreadable, no start time, and a
-# non-zero return.
+# and classifies each attempt that exits NON-ZERO by a POSITIVE marker in that
+# attempt's own stderr (the bytes it appended to $RSO_STDERR_LOG), tried in
+# this order:
+#   post        RSO_UNFINISHED_RUN_RE: reviewdog reporting that it did not
+#               finish its check run (`failed to create check`, `failed to
+#               post`, `check-runs/<id>`). That is the grep
+#               complete-orphaned-check-runs.sh uses for the same question, and
+#               the test checks the two still agree. GitHub has answered
+#               reviewdog's PATCH of a check run it created a second earlier
+#               with `404 Not Found` (coord findings
+#               c58cd00f-7651-4dde-bd3d-d69fcc59f291,
+#               2f3d3b96-7bd6-420e-aff3-f20d29544b74). RETRIED.
+#   diff-fetch  RSO_DIFF_FETCH_RE, a stderr line BEGINNING
+#               `reviewdog: fail to get diff: `: the PR diff fetch (a GitHub
+#               API call, or on a 406 its `git fetch`/`git diff` fallback)
+#               failed, before any check run existed. RETRIED: a 5xx, a
+#               secondary rate limit or a reset can clear between attempts.
+#   diff-parse  RSO_DIFF_PARSE_RE, a stderr line BEGINNING
+#               `reviewdog: fail to parse diff: `: the fetched diff did not
+#               parse. NOT retried: the same bytes parse the same way again.
+# Every class means reviewdog delivered NO verdict on the PR. reviewdog v0.21.2
+# exits 1 for each of them and for a findings result alike (cmd/reviewdog/
+# main.go prints every error as `reviewdog: <err>` and exits 1), so a step whose
+# verdict is reviewdog's exit status would red on them exactly as on a lint
+# finding. The two diff markers are anchored at the start of a line, so a slog
+# line (`time=... level=... msg="reviewdog: ..."`) quoting one cannot classify.
+# `reviewdog: parse error:` (reading stdin) has no class: no errorformat parser
+# (`-f=clippy` included) can return it in v0.21.2. An exit matching no marker --
+# 0, a findings exit 1 however it is worded, any other failure -- is the verdict
+# and returns at once. Classification only ever widens "finding", never narrows
+# it, so a finding is never retried and never read as no verdict. The wording
+# was captured from the v0.21.2 binary; re-check it on any version bump (a
+# reworded line falls back to "finding", the safe direction).
+#
+# A retried class runs the command again. Each attempt reads <input file>
+# afresh. Between attempts it sleeps RSO_RETRY_DELAYS (default "5 10", whole
+# seconds: at most 3 attempts; empty means no retry) with RSO_RETRY_SLEEP
+# (default `sleep`). rc is the LAST attempt's status. What the completion step
+# depends on is kept for every attempt: the start is marked once, before the
+# first, so the window covers them all; each attempt's stderr is APPENDED to
+# $RSO_STDERR_LOG as it is written, so every attempt's `check-runs/<id>` reaches
+# the completion step, a cancel mid-attempt included; and rc stays `unknown`
+# until the last attempt returns, sleeps included. Each attempt's stderr is
+# replayed into the job log once it returns. It also sets two shell variables
+# for the step, which are not outputs: RSO_ATTEMPTS, the attempts run, and
+# RSO_NO_VERDICT, the LAST attempt's class name (`post`, `diff-fetch`,
+# `diff-parse`) when it ended with no verdict, and empty otherwise (so a failed
+# post followed by a findings exit is a finding). Before each retry a
+# `::warning` names the class, and whenever a retry happened a `::notice`
+# starting `retry outcome:` says how it ended and names every retried
+# attempt's class, so the job's annotations show which class a retry recovers
+# from. An unreadable <input file> runs nothing: rc=not-run-input-unreadable,
+# no start time, and a non-zero return.
 #
 # OUTPUTS, appended to $GITHUB_OUTPUT exactly once by the EXIT trap whenever
 # the step's shell runs it: a normal end, an `exit`, a death under `set -e`,
@@ -89,6 +115,12 @@ RSO_OUTPUT_NAMES="rc started_at ended_at clock stderr_log"
 # An attempt whose stderr matches this did not finish its check run. The same
 # pattern as complete-orphaned-check-runs.sh's own grep; the test compares them.
 RSO_UNFINISHED_RUN_RE='failed to create check|failed to post|check-runs/[0-9]+'
+# reviewdog v0.21.2's own `reviewdog: <err>` lines for the two diff failures
+# (reviewdog.go Run, printed by cmd/reviewdog/main.go), anchored at a line's
+# start. A class RSO_RETRIED_CLASSES names is retried; any other is not.
+RSO_DIFF_FETCH_RE='^reviewdog: fail to get diff: '
+RSO_DIFF_PARSE_RE='^reviewdog: fail to parse diff: '
+RSO_RETRIED_CLASSES="post diff-fetch"
 
 # rso_github_now [max seconds]: print "<github|runner> <RFC 3339 UTC>".
 rso_github_now() {
@@ -139,14 +171,26 @@ rso_run() {
   cat -- "$RSO_STDERR_LOG" >&2 || true
 }
 
-# rso_run_retrying <input file> <command...>: rso_run, plus a bounded retry of
-# an attempt that reported an unfinished check run (see the header).
+# rso_no_verdict_class <stderr slice>: print the no-verdict class the slice's
+# marker names (see the header), or nothing when it names none.
+rso_no_verdict_class() {
+  if grep -qE "$RSO_UNFINISHED_RUN_RE" -- "$1"; then
+    echo post
+  elif grep -qE "$RSO_DIFF_FETCH_RE" -- "$1"; then
+    echo diff-fetch
+  elif grep -qE "$RSO_DIFF_PARSE_RE" -- "$1"; then
+    echo diff-parse
+  fi
+}
+
+# rso_run_retrying <input file> <command...>: rso_run, plus classifying each
+# failed attempt and a bounded retry of a retried class (see the header).
 rso_run_retrying() {
-  local input="$1" n=1 max off arc slice d
+  local input="$1" n=1 max off arc slice d cls seen="" why
   local -a delays
   shift
   RSO_ATTEMPTS=0
-  RSO_POST_FAILED=0
+  RSO_NO_VERDICT=""
   if [ ! -r "$input" ]; then
     rc=not-run-input-unreadable
     echo "::warning title=reviewdog-step-outputs::the input '${input}' is not readable, so reviewdog did not run"
@@ -168,23 +212,34 @@ rso_run_retrying() {
     slice="${RSO_STDERR_LOG}.attempt"
     tail -c +"$((off + 1))" -- "$RSO_STDERR_LOG" >"$slice" || true
     cat -- "$slice" >&2 || true
-    if [ "$arc" -eq 0 ] || ! grep -qE "$RSO_UNFINISHED_RUN_RE" -- "$slice"; then
-      rm -f -- "$slice"
-      if [ "$n" -gt 1 ]; then
-        echo "::notice title=reviewdog-step-outputs::retry outcome: reviewdog finished its check run on attempt ${n}/${max} (exit ${arc}), after $((n - 1)) attempt(s) that did not"
+    cls=""
+    if [ "$arc" -ne 0 ]; then
+      cls="$(rso_no_verdict_class "$slice")"
+    fi
+    rm -f -- "$slice"
+    RSO_NO_VERDICT="$cls"
+    if [ -z "$cls" ] || [[ " ${RSO_RETRIED_CLASSES} " != *" ${cls} "* ]]; then
+      if [ "$n" -gt 1 ] && [ -z "$cls" ]; then
+        echo "::notice title=reviewdog-step-outputs::retry outcome: reviewdog reached a verdict on attempt ${n}/${max} (exit ${arc}), after $((n - 1)) attempt(s) with no verdict (${seen})"
+      elif [ "$n" -gt 1 ]; then
+        echo "::notice title=reviewdog-step-outputs::retry outcome: reviewdog ended with no verdict (${cls}, not retried) on attempt ${n}/${max} (exit ${arc}), after $((n - 1)) attempt(s) with no verdict (${seen})"
       fi
       rc="$arc"
       return 0
     fi
-    rm -f -- "$slice"
+    seen="${seen:+${seen},}${cls}"
     if [ "$n" -ge "$max" ]; then
-      RSO_POST_FAILED=1
-      echo "::notice title=reviewdog-step-outputs::retry outcome: reviewdog did not finish its check run on any of ${max} attempt(s) (last exit ${arc})"
+      echo "::notice title=reviewdog-step-outputs::retry outcome: reviewdog reached no verdict on any of ${max} attempt(s) (${seen}; last exit ${arc})"
       rc="$arc"
       return 0
     fi
+    case "$cls" in
+      post) why="it did not finish its check run: a failed check create or post" ;;
+      diff-fetch) why="it could not fetch the PR diff" ;;
+      *) why="see reviewdog-step-outputs.sh's header" ;;
+    esac
     d="${delays[$((n - 1))]}"
-    echo "::warning title=reviewdog-step-outputs::reviewdog attempt ${n}/${max} exited ${arc} and reported that it did not finish its check run (a failed check create or post, not a lint finding); retrying from the same input in ${d}s"
+    echo "::warning title=reviewdog-step-outputs::reviewdog attempt ${n}/${max} exited ${arc} with no verdict, class ${cls} (${why}, not a lint finding); retrying from the same input in ${d}s"
     "${RSO_RETRY_SLEEP:-sleep}" "$d" || true
     n=$((n + 1))
   done
