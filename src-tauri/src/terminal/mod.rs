@@ -29,6 +29,7 @@ pub mod holder_census;
 #[cfg(test)]
 mod idle_chrome_replay;
 pub mod interceptor;
+pub mod limit_reprobe; // deferred re-check of an unconfirmed usage-limit hint (plan 2026-11-14-account-migration-herding-and-unconfirmed-limit-reprobe)
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
 pub(crate) mod limit_stop; // transcript-read usage-limit stop classifier (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 1); first caller lands in Phase 2
 pub mod manager;
