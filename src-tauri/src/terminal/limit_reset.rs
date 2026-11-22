@@ -215,8 +215,9 @@ pub(crate) struct HintInputs {
     pub continue_after_migration: bool,
     /// How many Claude config dirs (accounts) are configured.
     pub config_dir_count: usize,
-    /// When this session last migrated in this process (its migration-cap
-    /// stamp), if it did. A migration carries the transcript, so the copy
+    /// When this session's last migration in this process left it on another
+    /// account (`account_migration::note_migrated`, stamped after the
+    /// respawn), if one did. A migration carries the transcript, so the copy
     /// still ends at the stop that caused it, with the OLD account's reset.
     pub migrated_at_ms: Option<i64>,
 }
