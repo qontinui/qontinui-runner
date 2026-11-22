@@ -889,7 +889,7 @@ export function useTerminalPages() {
    * reconcile). FAIL-CLOSED: an incomplete read — a source unreadable, or the
    * restorable set withheld by a drain — is UNKNOWN and removes nothing.
    * Record-only (`removeEmptyPage`): no PTY is closed. Returns the number of
-   * pages removed.
+   * pages removed, or `null` when the occupancy read was incomplete (UNKNOWN).
    */
   const closeEmptyPages = useCallback(
     () =>
