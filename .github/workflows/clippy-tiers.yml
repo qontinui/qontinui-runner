@@ -409,8 +409,11 @@ jobs:
         # Outputs whenever this shell exits (a normal end, a death under
         # `set -e`, a SIGTERM/SIGINT from a cancel; not a SIGKILL or a runner
         # death, which write nothing and read as unknown, while a helper that
-        # cannot be sourced writes rc=not-run-source-failed), for the completion
-        # step below: `rc`
+        # cannot be sourced writes rc=not-run-source-failed, and a cargo clippy
+        # that exits non-zero with no src-tauri diagnostic line -- it died
+        # before linting -- writes rc=not-run-clippy-failed and reds the job
+        # with a not-a-verdict annotation instead of letting reviewdog read an
+        # empty capture as clean), for the completion step below: `rc`
         # (reviewdog's exit status; `unknown` when the step dies before
         # reviewdog returns), `started_at` / `ended_at` (the window a
         # `clippy-diff` run of this job's reviewdog must have STARTED in, on
@@ -438,7 +441,23 @@ jobs:
           }
           rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
-          cargo clippy -q --message-format=short 2> clippy-report.txt || true
+          # cargo's own exit status is kept, not discarded: a non-zero status
+          # alone is the normal deny-lint red and goes on to reviewdog, but a
+          # non-zero status with NO `src-tauri/<path>:<line>:<col>: ` line in
+          # the capture means cargo died before it linted src-tauri (a build.rs
+          # failure, a dependency compile error, OOM). reviewdog would read
+          # that capture as zero findings and exit 0, so the advisory check
+          # would go green having inspected nothing. Instead reviewdog is not
+          # run: rc=not-run-clippy-failed (the completion step reads any
+          # not-run-* as "reviewdog never ran"), one not-a-verdict ::error, and
+          # a non-zero exit.
+          cargo_rc=0
+          cargo clippy -q --message-format=short 2> clippy-report.txt || cargo_rc=$?
+          if [ "$cargo_rc" -ne 0 ] && ! grep -qE '^src-tauri/[^ ]+:[0-9]+:[0-9]+: ' clippy-report.txt; then
+            rc=not-run-clippy-failed
+            echo "::error title=Clippy diff-scoped (advisory): clippy did not lint (not a verdict on this PR)::cargo clippy exited ${cargo_rc} and printed no src-tauri diagnostic line, so it failed before linting src-tauri and reviewdog was not run. No lint verdict reached this diff: see this job's log for cargo's build failure."
+            exit 1
+          fi
           # Back to the git root for reviewdog. cargo prints paths relative to
           # the WORKSPACE root (the repo root: src-tauri/src/...) even from
           # here, and github-pr-check prepends reviewdog's own git-relative
@@ -571,8 +590,8 @@ jobs:
       # pinned), which runs the `clippy` step's `run:` block above with stub
       # cargo/reviewdog/curl: a failed post or diff fetch then success is
       # green, a finding (however worded) is red, and a post or diff fetch
-      # that keeps failing, or a diff that does not parse, is red and says it
-      # is not a verdict.
+      # that keeps failing, a diff that does not parse, or a clippy that died
+      # before linting, is red and says it is not a verdict.
       # Hermetic (a stub gh and curl, an injected sleep), seconds on this
       # existing hosted job. All four files are checked against
       # complete-orphaned-check-runs.sha256 (see the step above for what that
@@ -601,8 +620,9 @@ jobs:
       # (author_feedback.rs is_no_verdict_annotation) matches it byte-exact and
       # re-runs instead of blaming the PR's code. Emits nothing when the
       # reviewdog step itself failed (a diff finding IS a verdict; a
-      # no-verdict class -- post, diff-fetch, diff-parse -- declares itself
-      # not one, in that step) or no setup step did.
+      # no-verdict class -- post, diff-fetch, diff-parse, or a clippy that
+      # did not lint -- declares itself not one, in that step) or no setup
+      # step did.
       # Outcomes arrive via env only; step names below are static literals.
       - name: Declare a setup death (not a verdict on this PR)
         if: failure()

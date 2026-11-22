@@ -120,9 +120,11 @@ RSO_UNFINISHED_RUN_RE='failed to create check|failed to post|check-runs/[0-9]+'
 # start. A class RSO_RETRIED_CLASSES names is retried; any other is not.
 # Run prints those lines only while reviewdog SKIPS its doghouse server:
 # GITHUB_ACTIONS set and REVIEWDOG_TOKEN unset (main.go skipDoghouseServer).
-# With REVIEWDOG_TOKEN set, runDoghouse reports both as `reviewdog: post
-# failed for <name>: fail to parse diff: ...`, which matches neither marker and
-# so reads as a finding (the safe direction). Re-check these literals on any
+# With REVIEWDOG_TOKEN set, the doghouse server fetches and parses the diff
+# and the client wraps its HTTP failure as `status=<code>: <body>`, so
+# runDoghouse reports both as `reviewdog: post failed for <name>:
+# status=<code>: <doghouse server body>`, which matches neither marker and so
+# reads as a finding (the safe direction). Re-check these literals on any
 # reviewdog version bump, and if REVIEWDOG_TOKEN is ever set.
 RSO_DIFF_FETCH_RE='^reviewdog: fail to get diff: '
 RSO_DIFF_PARSE_RE='^reviewdog: fail to parse diff: '
