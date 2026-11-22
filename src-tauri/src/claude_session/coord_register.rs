@@ -7164,7 +7164,7 @@ mod tests {
         let r = Uuid::new_v4();
         rig.show_pane(y, r, 1_000);
         // Belt and braces: the store already stamps a re-mark after an unmark
-        // past the cleared stamp (`remark_at`). Waiting for the wall clock to
+        // past the cleared stamp (`restamp_at`). Waiting for the wall clock to
         // pass `at` as well keeps this test about the re-offer race rather
         // than about the store's stamping, which its own tests cover.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
