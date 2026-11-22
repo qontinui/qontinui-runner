@@ -363,7 +363,11 @@ jobs:
         # Phase 0). `-q` keeps cargo's progress lines out of the capture;
         # its `generated N warnings` summaries match no errorformat line and
         # are skipped. Nothing else in this job reads the capture, so clippy
-        # runs once, in the format reviewdog reads.
+        # runs once, in the format reviewdog reads. The format alone is not
+        # enough: cargo's paths are WORKSPACE-root-relative (src-tauri/src/...),
+        # so reviewdog must run from the git root (see the `cd ..` below) or
+        # its github-pr-check path prefixing doubles src-tauri and diff_context
+        # drops every finding.
         #
         # reviewdog v0.21.2 exits 1 for EVERY error, not only for diff
         # findings (cmd/reviewdog/main.go prints each as `reviewdog: <err>`).
@@ -435,13 +439,19 @@ jobs:
           rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
           cargo clippy -q --message-format=short 2> clippy-report.txt || true
+          # Back to the git root for reviewdog. cargo prints paths relative to
+          # the WORKSPACE root (the repo root: src-tauri/src/...) even from
+          # here, and github-pr-check prepends reviewdog's own git-relative
+          # workdir to every path, so run from src-tauri every path would read
+          # src-tauri/src-tauri/... and diff_context would drop every finding.
+          cd ..
           # rso_run_retrying marks the window's start ONCE, before the first
           # attempt, appends every attempt's stderr to the log the completion
           # step reads (so each failed attempt's `check-runs/<id>` reaches it)
           # and replays each attempt's stderr into this log once it returns,
           # and sets rc only once the last attempt has returned -- a cancel
           # mid-attempt or mid-retry leaves `unknown`, never a pass.
-          rso_run_retrying clippy-report.txt reviewdog \
+          rso_run_retrying src-tauri/clippy-report.txt reviewdog \
             -f=clippy \
             -name="clippy-diff" \
             -filter-mode=diff_context \

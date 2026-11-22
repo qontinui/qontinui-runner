@@ -97,12 +97,15 @@ cat >"$W/stub/cargo" <<'STUB'
 #!/usr/bin/env bash
 # `cargo clippy`: records its arguments, then a fixed report -- short-format
 # lines on STDERR for `--message-format=short` (where cargo writes them), a
-# JSON stream on stdout for `--message-format=json`.
+# JSON stream on stdout for `--message-format=json`. Paths are relative to the
+# WORKSPACE root (the repo root, whose Cargo.toml lists src-tauri as a member),
+# which is what real cargo prints even when run from src-tauri.
 echo "$*" >>"$CARGO_ARGS"
+[ -n "${CARGO_CWD:-}" ] && pwd >"$CARGO_CWD"
 case " $* " in
   *" --message-format=short "*)
     for n in $(seq 1 50); do
-      printf 'src/lib.rs:%s:5: warning: this looks like a stub finding\n' "$n" >&2
+      printf 'src-tauri/src/lib.rs:%s:5: warning: this looks like a stub finding\n' "$n" >&2
     done
     ;;
   *) printf '{"reason":"compiler-message","n":%s}\n' $(seq 1 50) ;;
@@ -113,6 +116,7 @@ cat >"$W/stub/reviewdog" <<'STUB'
 n=$(( $(cat "$RD_STATE.n" 2>/dev/null || echo 0) + 1 ))
 echo "$n" >"$RD_STATE.n"
 echo "$*" >"$RD_STATE.args.$n"
+pwd >"$RD_STATE.cwd.$n"
 cat >"$RD_STATE.stdin.$n"
 what="$(sed -n "${n}p" "$RD_PLAN")"
 # What v0.21.2 prints on every run with -fail-on-error (job 135103311891).
@@ -155,7 +159,7 @@ run_step() {
   GHO="$C/gho"
   : >"$GHO"
   OUT="$(cd "$C/ws" && env PATH="$W/stub:$PATH" GITHUB_OUTPUT="$GHO" RUNNER_TEMP="$C/rt" \
-    CARGO_ARGS="$C/cargo.args" RD_PLAN="$C/plan" RD_STATE="$C/rd" RSO_RETRY_SLEEP="$W/stub/fake-sleep" SLEEP_LOG="$C/sleeps" \
+    CARGO_ARGS="$C/cargo.args" CARGO_CWD="$C/cargo.cwd" RD_PLAN="$C/plan" RD_STATE="$C/rd" RSO_RETRY_SLEEP="$W/stub/fake-sleep" SLEEP_LOG="$C/sleeps" \
     bash --noprofile --norc -eo pipefail "$W/step.sh" 2>&1)"
   RC=$?
 }
@@ -303,9 +307,21 @@ else bad "reworded findings" "rc=$RC attempts=$(attempts) sleeps='$(sleeps)'"; f
 run_step short-feed ok
 if grep -q -- '--message-format=short' "$W/step.sh" && ! grep -q -- '--message-format=json' "$W/step.sh" \
   && grep -q '^clippy .*--message-format=short' "$C/cargo.args" && [ "$(wc -l <"$C/cargo.args" | tr -d ' ')" -eq 1 ] \
-  && whole_report 1 && grep -qE '^src/lib\.rs:[0-9]+:[0-9]+: warning: ' "$C/rd.stdin.1"; then
+  && whole_report 1 && grep -qE '^src-tauri/src/lib\.rs:[0-9]+:[0-9]+: warning: ' "$C/rd.stdin.1"; then
   ok "the step runs clippy once with --message-format=short and feeds reviewdog that stderr capture"
 else bad "short-format feed" "cargo args='$(tr '\n' '|' <"$C/cargo.args")' stdin bytes=$(wc -c <"$C/rd.stdin.1" 2>/dev/null)"; fi
+
+# 10. reviewdog runs at the git root. cargo prints paths relative to the
+# WORKSPACE root (the repo root here, so `src-tauri/src/...`) even when run
+# from src-tauri, and reviewdog's github-pr-check reporter prepends its own
+# git-relative workdir to every parsed path: run from src-tauri, every path
+# would become src-tauri/src-tauri/... and -filter-mode=diff_context would drop
+# every finding. cargo itself still runs from src-tauri (it picks the package).
+run_step git-root-cwd ok
+if [ "$(cat "$C/rd.cwd.1" 2>/dev/null)" = "$(cd "$C/ws" && pwd)" ] \
+  && [ "$(cat "$C/cargo.cwd" 2>/dev/null)" = "$(cd "$C/ws/src-tauri" && pwd)" ]; then
+  ok "cargo runs from src-tauri and reviewdog from the git root, where cargo's workspace-relative paths match the PR diff"
+else bad "reviewdog cwd" "reviewdog cwd='$(cat "$C/rd.cwd.1" 2>/dev/null)' cargo cwd='$(cat "$C/cargo.cwd" 2>/dev/null)' ws='$C/ws'"; fi
 
 if [ "$fail" -ne 0 ]; then
   echo "clippy-diff step tests: FAILED"
