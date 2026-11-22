@@ -2217,3 +2217,36 @@ async fn a_foreign_origin_cannot_read_a_session_stop_reason() {
         assert_eq!(got, want, "origin {origin:?}");
     }
 }
+
+/// `GET /model-gateway` (`mcp::model_gateway_read`) is a door, through the
+/// guard LAYER: under the default `enforce-doors` policy a Foreign or a web
+/// origin is refused before the handler runs — not admitted as a shadow
+/// refusal with its origin echoed — while qontinui-studio's local CLI, which
+/// sends no `Origin`, reaches it.
+#[tokio::test]
+async fn a_browser_origin_cannot_read_the_model_gateway_state() {
+    const ROUTE: &str = "/model-gateway";
+    async fn reached() -> StatusCode {
+        StatusCode::OK
+    }
+    let h = harness("enforce-doors");
+    let router = apply(Router::new().route(ROUTE, get(reached)), h.guard.clone());
+    let host = host(&h);
+    for (origin, want) in [
+        (Some(EVIL), StatusCode::FORBIDDEN),
+        (Some(WEB), StatusCode::FORBIDDEN),
+        (None, StatusCode::OK),
+    ] {
+        let mut headers = vec![("host", host.as_str())];
+        if let Some(o) = origin {
+            headers.push(("origin", o));
+        }
+        let got = router
+            .clone()
+            .oneshot(req("GET", ROUTE, &headers, ""))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(got, want, "origin {origin:?}");
+    }
+}

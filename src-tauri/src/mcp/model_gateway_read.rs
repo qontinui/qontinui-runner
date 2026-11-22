@@ -28,13 +28,21 @@
 //!
 //! # No secret-adjacent material
 //!
-//! The route is unauthenticated (see the origin-guard note on
-//! [`routes`]), so it never emits the declaration's `base_url`, `headers`,
-//! `api_key_helper` (a command line that prints the key), `network_auth` or
-//! TTL. [`gateway_state_json`] takes the state by reference and reads only its
-//! variant (plus the `Unknown` reason text, which `classify_state` composes
-//! from fixed sentences and the settings read error); the tests pin that a
-//! fully populated declaration contributes nothing to the body.
+//! The route is unauthenticated for a local, non-browser caller (see the
+//! origin-guard note on [`routes`]), so it never emits the declaration's
+//! `base_url`, `headers`, `api_key_helper` (a command line that prints the
+//! key), `network_auth` or TTL. [`gateway_state_json`] takes the state by
+//! reference and reads only its variant (plus the `Unknown` reason text, which
+//! is passed through — next section); the tests pin that a fully populated
+//! declaration contributes nothing to the body.
+//!
+//! # Which reasons are fixed
+//!
+//! Only two: `declared` serves [`DECLARED_REASON`] and `not_declared` serves
+//! [`NOT_DECLARED_REASON`]. An `unknown` reason is passed through as composed,
+//! so it is not fixed: `classify_state`'s text (fixed sentences plus the
+//! settings read error), or the handler's own text carrying the join error when
+//! the blocking read could not finish.
 
 use std::sync::Arc;
 
@@ -68,33 +76,50 @@ pub fn gateway_state_json(state: &GatewayState) -> Value {
     })
 }
 
-/// `GET /model-gateway`.
-///
-/// `state()` reads `settings.json` and the gateway marker from disk, so it runs
-/// on the blocking pool. A failed join is reported as `unknown`, never as
-/// `not_declared`: an answer that could not be computed must not read as "no
-/// gateway".
+/// `GET /model-gateway`: [`serve_with`] over the live
+/// [`crate::model_gateway::state`]. The tests drive [`serve_with`]; this
+/// wrapper's one job, passing the LIVE reader, is not under test (proving it
+/// would mean writing a declared gateway into the process-global config dir).
+/// Never pass it a constant: an answer of `not_declared` that is not the
+/// reader's lets studio call vendors directly.
 pub async fn get_model_gateway(
     axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<Value> {
-    let state = tokio::task::spawn_blocking(crate::model_gateway::state)
-        .await
-        .unwrap_or_else(|e| {
-            GatewayState::Unknown(format!(
-                "the model gateway state could not be read ({e}); failing closed"
-            ))
-        });
+    serve_with(crate::model_gateway::state).await
+}
+
+/// The handler body with its state reader injected, so the tests can prove the
+/// served answer is the reader's and not a constant.
+///
+/// The live reader reads `settings.json` and the gateway marker from disk, so
+/// it runs on the blocking pool. A failed join (the reader panicked, or the
+/// task was cancelled) is reported as `unknown` carrying the join error, never
+/// as `not_declared`: an answer that could not be computed must not read as
+/// "no gateway", which studio would take as leave to call vendors directly.
+async fn serve_with<F>(read: F) -> Json<Value>
+where
+    F: FnOnce() -> GatewayState + Send + 'static,
+{
+    let state = tokio::task::spawn_blocking(read).await.unwrap_or_else(|e| {
+        GatewayState::Unknown(format!(
+            "the model gateway state could not be read ({e}); failing closed"
+        ))
+    });
     Json(gateway_state_json(&state))
 }
 
 /// Routes for this module.
 ///
-/// Origin guard: `/model-gateway` is on no route list, deliberately. It is not
-/// a door (it returns no secret, names no path or URL, spawns nothing), so it
-/// is not on `CREDENTIAL_DOORS`; its caller is a local CLI, which classifies
-/// `NonBrowser` and reaches every route under every route policy, so it needs
-/// no browser allowlist. A browser origin is admitted-and-counted under the
-/// default `EnforceDoors` and refused under `enforce` — no browser needs it.
+/// Origin guard: `GET /model-gateway` is a `CREDENTIAL_DOORS` entry. It
+/// returns no secret, but under the default `EnforceDoors` route policy a
+/// route on no list is only SHADOW-refused to a browser: a Foreign origin is
+/// admitted (and counted) and CORS echoes it, so a visited web page could read
+/// this install's gateway state wherever the browser does not enforce a
+/// private-network preflight. The door entry refuses every browser class
+/// (Trusted, Extension, Foreign) under every route policy. The caller,
+/// qontinui-studio's local CLI, sends no `Origin` and no cross-site
+/// `Sec-Fetch-Site`, so it classifies `NonBrowser` and is admitted before the
+/// door check, as is the webview (`FirstParty`).
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     axum::Router::new().route("/model-gateway", get(get_model_gateway))
 }
@@ -167,16 +192,97 @@ mod tests {
         }
     }
 
+    /// A settings value that is unmistakably a declaration.
+    fn declared_settings() -> ModelGatewaySettings {
+        ModelGatewaySettings {
+            base_url: Some("https://gw.example.com/anthropic".to_string()),
+            headers: BTreeMap::new(),
+            api_key_helper: None,
+            network_auth: false,
+            api_key_helper_ttl_secs: None,
+        }
+    }
+
+    /// The handler serves what its reader returned. A handler that ignored the
+    /// reader and always answered `not_declared` would make studio fail OPEN
+    /// (direct vendor image calls); this is the test that goes red for it.
+    #[tokio::test]
+    async fn the_handler_serves_a_declared_readers_state() {
+        let Json(v) = serve_with(|| GatewayState::Declared(declared_settings())).await;
+        assert_eq!(v["state"], "declared");
+        assert_eq!(v["reason"], DECLARED_REASON);
+    }
+
+    #[tokio::test]
+    async fn the_handler_serves_a_not_declared_readers_state() {
+        let Json(v) = serve_with(|| GatewayState::NotDeclared).await;
+        assert_eq!(v["state"], "not_declared");
+        assert_eq!(v["reason"], NOT_DECLARED_REASON);
+    }
+
+    /// A reader that panics on the blocking pool is a failed join, and a
+    /// failed join is `unknown` carrying the join error — never `not_declared`.
+    #[tokio::test]
+    async fn a_panicking_reader_is_unknown_with_the_join_error() {
+        let Json(v) = serve_with(|| -> GatewayState {
+            panic!("gateway-reader-panic-marker");
+        })
+        .await;
+        assert_eq!(keys(&v), ["reason", "routes", "state"]);
+        assert_eq!(v["state"], "unknown");
+        let reason = v["reason"].as_str().expect("reason is a string");
+        assert!(
+            reason.starts_with("the model gateway state could not be read (")
+                && reason.ends_with("); failing closed"),
+            "reason: {reason}"
+        );
+        assert!(
+            reason.contains("panicked") && reason.contains("gateway-reader-panic-marker"),
+            "the join error is carried: {reason}"
+        );
+        assert_eq!(v["routes"], json!({}));
+    }
+
+    /// The route is registered, and it is MOUNTED: `create_router` in
+    /// `mcp_api.rs` merges this module's router. `registered_routes()` alone
+    /// cannot pin the mount — it scans every source file, this one included,
+    /// so it reads the `.route("/model-gateway", …)` above whether or not
+    /// anything merges it. The mount is read from `create_router`'s own body
+    /// with comment lines dropped, so a commented-out merge does not count.
+    /// (`origin_guard::tests::no_route_registered_after_apply` separately pins
+    /// that every merge there sits before the guard is applied.)
     #[test]
-    fn route_is_registered_and_not_a_door() {
+    fn route_is_registered_and_mounted_in_create_router() {
         let registered = crate::mcp::relay_path_policy::tests::registered_routes();
         assert!(
             registered.contains(&("GET".to_string(), "/model-gateway".to_string())),
             "GET /model-gateway is not registered"
         );
-        assert!(!crate::mcp::origin_guard::is_credential_door(
+        let mounted = crate::mcp_api::mcp_api_item_source("fn create_router(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.trim() == ".merge(crate::mcp::model_gateway_read::routes())");
+        assert!(
+            mounted,
+            "create_router must merge crate::mcp::model_gateway_read::routes()"
+        );
+    }
+
+    /// The route is a credential door (see [`routes`]), and the entry is
+    /// route-exact: it widens nothing else.
+    #[test]
+    fn route_is_a_credential_door() {
+        assert!(crate::mcp::origin_guard::is_credential_door(
             "GET",
             "/model-gateway"
+        ));
+        assert!(!crate::mcp::origin_guard::is_credential_door(
+            "POST",
+            "/model-gateway"
+        ));
+        assert!(!crate::mcp::origin_guard::is_credential_door(
+            "GET",
+            "/model-gateway/x"
         ));
     }
 }
