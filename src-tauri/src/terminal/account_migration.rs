@@ -841,6 +841,14 @@ async fn continue_after_reset(
     let _in_flight = match claim_for_continue(&record.claude_session_id) {
         Ok(claim) => claim,
         Err(holder) => {
+            if !continue_refusal_reparks(holder) {
+                info!(
+                    terminal_id,
+                    session = %record.claude_session_id,
+                    "limit-reset-continue not started — another continue of this session is running and settles its stop"
+                );
+                return;
+            }
             info!(
                 terminal_id,
                 session = %record.claude_session_id,
@@ -950,6 +958,14 @@ fn claim_for_continue(
     claude_session_id: &str,
 ) -> Result<crate::session::in_flight::SessionInFlight, &'static str> {
     crate::session::in_flight::SessionInFlight::claim(claude_session_id, CONTINUE_IN_FLIGHT_HOLDER)
+}
+
+/// Whether a continue refused the session claim re-parks its stop. Not when
+/// the holder is another reset-continue of the same session (a screen hint and
+/// a re-entry arriving together): that run settles the stop itself, and a park
+/// here would report "parked" for a session being continued right now.
+fn continue_refusal_reparks(holder: &str) -> bool {
+    holder != CONTINUE_IN_FLIGHT_HOLDER
 }
 
 /// Send ONE `Esc` when the pane shows the `/rate-limit-options` menu
@@ -2978,6 +2994,16 @@ mod tests {
         );
         drop(continuing);
         assert!(!crate::session::in_flight::is_in_flight(sid));
+    }
+
+    /// A continue refused by a real mover re-parks its stop; one refused by
+    /// another continue of the same session leaves the stop to that run.
+    #[test]
+    fn only_a_mover_not_a_sibling_continue_makes_a_refused_continue_repark() {
+        assert!(continue_refusal_reparks("resume-door"));
+        assert!(continue_refusal_reparks("account-migration"));
+        assert!(continue_refusal_reparks("respawn-receiver"));
+        assert!(!continue_refusal_reparks(CONTINUE_IN_FLIGHT_HOLDER));
     }
 
     /// The continue path holds that claim for the whole function, taken
