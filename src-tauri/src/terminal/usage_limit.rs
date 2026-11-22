@@ -35,8 +35,10 @@
 //!
 //! A pane that keeps repainting a limit message therefore re-fires at most every
 //! 300s, while a message frozen on an idle screen, such as the limit menu, fires
-//! once: if that hint found the probe unconfirmed or no migration target, nothing
-//! retries until the pane's grid changes again.
+//! once. When that hint found the probe unconfirmed while the pane's bottom rows
+//! show the limit menu, [`super::limit_reprobe`] schedules a bounded set of
+//! deferred re-checks; a hint that found no migration target is not retried
+//! until the pane's grid changes again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

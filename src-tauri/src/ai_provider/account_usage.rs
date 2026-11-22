@@ -119,6 +119,22 @@ pub const HANDOFF_WINDOW: Duration = Duration::from_secs(3 * 3600);
 /// clock step neither drops nor keeps entries wrongly.
 static HANDOFFS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new());
 
+/// How far back [`pick_migration_target`] counts handoffs to a target as its
+/// current burst load. One hour: on 2026-11-12 each herded target ran dry
+/// about an hour after a burst of ~25 sessions landed on it.
+pub const BURST_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Handoffs one target may take inside [`BURST_WINDOW`] before
+/// [`pick_migration_target`] prefers another usable target. Counted from the
+/// ledger, so it covers in-flight migrations (recorded at pick time) as well as
+/// finished ones; a migration that never ran is withdrawn
+/// ([`unrecord_handoff`]) and stops counting.
+pub const BURST_CAP: usize = 3;
+
+// The ledger is pruned at HANDOFF_WINDOW, so a burst window longer than it
+// would silently count fewer handoffs than it claims to.
+const _: () = assert!(BURST_WINDOW.as_secs() <= HANDOFF_WINDOW.as_secs());
+
 /// Pin the most-available Claude config dir as the effective account for the
 /// current process. Call this once at the start of each logical unit of AI
 /// work (workflow run, prompt-home submission, AI chat session) — *not* per
@@ -366,10 +382,20 @@ fn pick_from_highest_expected<'a>(
 /// that strategy (module doc, "Handoff strategies") and the ranking above is
 /// only the fallback for when no account is under pace. The pick is recorded
 /// in the handoff ledger under the same lock that read it, so a burst of
-/// concurrent handoffs each sees the ones before it. A migration that fails
-/// after the pick still counts as a handoff in the ledger.
+/// concurrent handoffs each sees the ones before it. A migration that fails or
+/// is refused after the pick is withdrawn from the ledger by its caller
+/// ([`unrecord_handoff`]).
+///
+/// **Burst spreading.** The usage snapshot cannot see the sessions a burst has
+/// just sent to a target — they have spent nothing yet — so ranking on it alone
+/// sends a whole burst to one account (2026-11-12: 26, 19 and 14 migrations to
+/// three successive targets, each of which then ran dry). Every strategy above
+/// therefore runs over [`spread_pool`]: the usable targets with fewer than
+/// [`BURST_CAP`] handoffs inside [`BURST_WINDOW`], or, once every usable
+/// target is at the cap, the least-loaded ones — so a burst round-robins
+/// rather than strands. Traffic under the cap is unaffected.
 pub fn pick_migration_target(exclude_dir: &str) -> Option<String> {
-    let config_dirs: Vec<String> = settings::get_claude_config_dirs()
+    let all_dirs: Vec<String> = settings::get_claude_config_dirs()
         .into_iter()
         .filter(|d| d != exclude_dir)
         .collect();
@@ -377,6 +403,24 @@ pub fn pick_migration_target(exclude_dir: &str) -> Option<String> {
     let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     prune_handoffs(&mut ledger, now);
+    let loads = burst_loads(&ledger, now);
+    let config_dirs = spread_pool(
+        &all_dirs,
+        |d| {
+            super::oauth_refresh::has_valid_credentials(d)
+                && !super::config::is_account_cooled_down(d)
+                && !super::config::account_known_exhausted(d)
+        },
+        |d| loads.get(d).copied().unwrap_or(0),
+        BURST_CAP,
+    );
+    if config_dirs.len() < all_dirs.len() {
+        info!(
+            pool = config_dirs.len(),
+            roster = all_dirs.len(),
+            "pick_migration_target: burst spreading narrowed the target pool"
+        );
+    }
     let under = under_pace_candidates(&config_dirs, |d| {
         super::oauth_refresh::has_valid_credentials(d)
             && !super::config::is_account_cooled_down(d)
@@ -441,6 +485,52 @@ pub fn unrecord_handoff(config_dir: &str) {
     if let Some(i) = ledger.iter().rposition(|(_, d)| d == config_dir) {
         ledger.remove(i);
     }
+}
+
+/// Handoffs per target inside [`BURST_WINDOW`] ending at `now`.
+fn burst_loads(
+    ledger: &VecDeque<(Instant, String)>,
+    now: Instant,
+) -> std::collections::HashMap<String, usize> {
+    let mut loads = std::collections::HashMap::new();
+    for (at, dir) in ledger {
+        if now.saturating_duration_since(*at) <= BURST_WINDOW {
+            *loads.entry(dir.clone()).or_insert(0) += 1;
+        }
+    }
+    loads
+}
+
+/// The burst-spreading pool [`pick_migration_target`] chooses from, free of
+/// globals. Of the `config_dirs` that pass `usable`, those whose `load` is
+/// below `cap`, in roster order; when every usable dir is at or over the cap,
+/// the usable dirs sharing the lowest load (a round-robin, never a refusal —
+/// refusing would leave the session on the limit menu). With nothing usable,
+/// `config_dirs` unchanged, so the caller's own `None` path still decides.
+fn spread_pool(
+    config_dirs: &[String],
+    usable: impl Fn(&str) -> bool,
+    load: impl Fn(&str) -> usize,
+    cap: usize,
+) -> Vec<String> {
+    let usable: Vec<&String> = config_dirs.iter().filter(|d| usable(d)).collect();
+    if usable.is_empty() {
+        return config_dirs.to_vec();
+    }
+    let under: Vec<String> = usable
+        .iter()
+        .filter(|d| load(d) < cap)
+        .map(|d| (*d).clone())
+        .collect();
+    if !under.is_empty() {
+        return under;
+    }
+    let min = usable.iter().map(|d| load(d)).min().unwrap_or(0);
+    usable
+        .into_iter()
+        .filter(|d| load(d) == min)
+        .cloned()
+        .collect()
 }
 
 fn prune_handoffs(ledger: &mut VecDeque<(Instant, String)>, now: Instant) {
@@ -848,6 +938,94 @@ mod tests {
             weighted_pick(&ranked_under_pace(&[("a", 0.0, 0.3)]), 0.5),
             None
         );
+    }
+
+    #[test]
+    fn spread_pool_keeps_targets_under_the_cap_in_roster_order() {
+        let roster = dirs(&["a", "b", "c", "d"]);
+        let load = |d: &str| match d {
+            "a" => 3,
+            "b" => 1,
+            "c" => 0,
+            _ => 5,
+        };
+        assert_eq!(spread_pool(&roster, |_| true, load, 3), dirs(&["b", "c"]));
+    }
+
+    #[test]
+    fn spread_pool_round_robins_once_every_usable_target_is_at_the_cap() {
+        let roster = dirs(&["a", "b", "c"]);
+        let load = |d: &str| match d {
+            "a" => 4,
+            "b" => 3,
+            _ => 3,
+        };
+        assert_eq!(spread_pool(&roster, |_| true, load, 3), dirs(&["b", "c"]));
+    }
+
+    #[test]
+    fn spread_pool_ignores_unusable_targets_and_passes_through_when_none_is_usable() {
+        let roster = dirs(&["a", "b", "c"]);
+        // An unusable dir's low load never pulls the pool towards it.
+        assert_eq!(
+            spread_pool(&roster, |d| d != "c", |d| if d == "c" { 0 } else { 3 }, 3),
+            dirs(&["a", "b"])
+        );
+        assert_eq!(spread_pool(&roster, |_| false, |_| 0, 3), roster);
+        assert!(spread_pool(&[], |_| true, |_| 0, 3).is_empty());
+    }
+
+    #[test]
+    fn burst_loads_counts_only_handoffs_inside_the_window() {
+        let t0 = Instant::now();
+        let now = t0 + BURST_WINDOW + Duration::from_secs(60);
+        let ledger: VecDeque<(Instant, String)> = vec![
+            (t0, "a".to_string()),
+            (now - Duration::from_secs(10), "a".to_string()),
+            (now - Duration::from_secs(5), "b".to_string()),
+            (now, "b".to_string()),
+        ]
+        .into();
+        let loads = burst_loads(&ledger, now);
+        assert_eq!(loads.get("a"), Some(&1));
+        assert_eq!(loads.get("b"), Some(&2));
+    }
+
+    /// A burst whose every pick prefers the same account (the 2026-11-12
+    /// shape: one under-pace candidate, or the deterministic fallback) spreads:
+    /// no target gets more than BURST_CAP picks while another usable target has
+    /// fewer, and once all are full the picks round-robin.
+    #[test]
+    fn a_burst_that_always_prefers_one_account_is_spread_across_the_roster() {
+        let roster = dirs(&["ben", "lukas", "paktis", "iris"]);
+        let now = Instant::now();
+        let mut ledger: VecDeque<(Instant, String)> = VecDeque::new();
+        let mut picks = Vec::new();
+        for _ in 0..20 {
+            let loads = burst_loads(&ledger, now);
+            let pool = spread_pool(
+                &roster,
+                |_| true,
+                |d| loads.get(d).copied().unwrap_or(0),
+                BURST_CAP,
+            );
+            // The strategy's preference: "ben" whenever it is offered, else
+            // the first account in the pool.
+            let pick = pool
+                .iter()
+                .find(|d| *d == "ben")
+                .or_else(|| pool.first())
+                .cloned()
+                .expect("a usable roster always yields a pick");
+            ledger.push_back((now, pick.clone()));
+            picks.push(pick);
+        }
+        let count = |d: &str| picks.iter().filter(|p| *p == d).count();
+        // The first 3 * 4 picks fill every target to the cap, ben first.
+        assert_eq!(&picks[..3], &dirs(&["ben", "ben", "ben"])[..]);
+        for d in ["ben", "lukas", "paktis", "iris"] {
+            assert_eq!(count(d), 5, "{d} got {}", count(d));
+        }
     }
 
     #[test]
