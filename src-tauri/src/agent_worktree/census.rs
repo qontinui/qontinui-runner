@@ -2942,7 +2942,8 @@ fn comparable_path(path: &Path) -> String {
 /// Drop a Windows verbatim prefix from an already forward-slashed path.
 ///
 /// `canonicalize` on Windows yields `\\?\D:\...` for a drive path and
-/// `\\?\UNC\srv\share\...` for a UNC share or a mapped network drive.
+/// `\\?\UNC\srv\share\...` for a UNC share. (What it yields for a mapped
+/// network drive is unverified here.)
 /// Forward-slashed, those are `//?/D:/...` -> `D:/...`, and `//?/UNC/srv/share/...`
 /// -> `//srv/share/...` — the proper UNC form, which is how [`volume_key`]
 /// spells a share's mount. Stripping only `//?/` from the UNC form would leave
@@ -5970,7 +5971,7 @@ mod tests {",
         );
     }
 
-    /// A2: a verbatim UNC path (a share or a mapped network drive, as
+    /// A2: a verbatim UNC path (a share, as
     /// `canonicalize` returns it on Windows) becomes the proper `//srv/share`
     /// form, never the relative-looking `UNC/srv/share`. Pure string
     /// transform, so it runs on any OS.
