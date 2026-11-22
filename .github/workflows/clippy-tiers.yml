@@ -441,21 +441,28 @@ jobs:
           }
           rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
-          # cargo's own exit status is kept, not discarded: a non-zero status
-          # alone is the normal deny-lint red and goes on to reviewdog, but a
-          # non-zero status with NO `src-tauri/<path>:<line>:<col>: ` line in
-          # the capture means cargo died before it linted src-tauri (a build.rs
-          # failure, a dependency compile error, OOM). reviewdog would read
-          # that capture as zero findings and exit 0, so the advisory check
-          # would go green having inspected nothing. Instead reviewdog is not
-          # run: rc=not-run-clippy-failed (the completion step reads any
-          # not-run-* as "reviewdog never ran"), one not-a-verdict ::error, and
-          # a non-zero exit.
+          # cargo's own exit status is kept, not discarded. A non-zero status
+          # with a WORKSPACE diagnostic line (`<relative path>:<line>:<col>: `,
+          # src-tauri/... or any crates/... member src-tauri path-depends on)
+          # is a lint or compile verdict on this PR's code, and goes on to
+          # reviewdog. It is not-a-verdict only when cargo produced no
+          # workspace diagnostic at all (a build.rs failure, a dependency
+          # outside the workspace -- an absolute or ../ path), or was killed by
+          # a signal (exit above 128, e.g. OOM), when even the lines it printed
+          # are a partial capture. reviewdog would read either as zero findings
+          # and exit 0, green having inspected nothing, so it is not run:
+          # rc=not-run-clippy-failed (the completion step reads any not-run-*
+          # as "reviewdog never ran"), one not-a-verdict ::error, a non-zero
+          # exit.
           cargo_rc=0
           cargo clippy -q --message-format=short 2> clippy-report.txt || cargo_rc=$?
-          if [ "$cargo_rc" -ne 0 ] && ! grep -qE '^src-tauri/[^ ]+:[0-9]+:[0-9]+: ' clippy-report.txt; then
+          ws_diag=0
+          if awk '/^[^ ]+:[0-9]+:[0-9]+: / && !/^(\/|\.\.\/|[A-Za-z]:)/ { f = 1 } END { exit !f }' clippy-report.txt; then
+            ws_diag=1
+          fi
+          if [ "$cargo_rc" -gt 128 ] || { [ "$cargo_rc" -ne 0 ] && [ "$ws_diag" -eq 0 ]; }; then
             rc=not-run-clippy-failed
-            echo "::error title=Clippy diff-scoped (advisory): clippy did not lint (not a verdict on this PR)::cargo clippy exited ${cargo_rc} and printed no src-tauri diagnostic line, so it failed before linting src-tauri and reviewdog was not run. No lint verdict reached this diff: see this job's log for cargo's build failure."
+            echo "::error title=Clippy diff-scoped (advisory): clippy did not lint (not a verdict on this PR)::cargo clippy exited ${cargo_rc} before producing a complete workspace lint (killed by a signal, or no workspace diagnostic line), so reviewdog was not run. No lint verdict reached this diff: see this job's log for cargo's build failure."
             exit 1
           fi
           # Back to the git root for reviewdog. cargo prints paths relative to

@@ -43,14 +43,20 @@
 #      parses to zero diagnostics);
 #   10. cargo runs from src-tauri and reviewdog from the git root, where
 #      cargo's workspace-relative paths match the PR diff;
-#   11. cargo dies before linting (exit 101, no src-tauri diagnostic line):
+#   11. cargo dies before linting (exit 101, no workspace diagnostic line --
+#      only absolute and ../ positions outside the workspace):
 #      reviewdog is NOT run, the step exits non-zero with rc
 #      not-run-clippy-failed, and a comma-free `(not a verdict on this PR)`
 #      title says clippy did not lint -- an empty capture would otherwise
 #      read as a clean diff; the completion step, fed those outputs, reads
 #      it as "reviewdog never ran" and makes no API call;
 #   12. cargo exits non-zero WITH diagnostic lines (deny lints): reviewdog
-#      runs as normal from the whole report.
+#      runs as normal from the whole report;
+#   13. an error in a crates/* workspace member (cargo stops before
+#      src-tauri): a verdict on the PR's code, so reviewdog runs on it and no
+#      not-a-verdict annotation appears;
+#   14. cargo killed by a signal (exit 137) after printing lines: a partial
+#      capture, so reviewdog is not run and the step says clippy did not lint.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -112,12 +118,21 @@ cat >"$W/stub/cargo" <<'STUB'
 # WORKSPACE root (the repo root, whose Cargo.toml lists src-tauri as a member),
 # which is what real cargo prints even when run from src-tauri.
 # CARGO_MODE (set per case): unset or `ok` exits 0; `buildfail` writes what a
-# build.rs failure writes -- no `src-tauri/<path>:L:C: ` line -- and exits
-# 101; `deny` writes the findings and exits 101, as a deny lint does.
+# build.rs failure writes -- no workspace `<relative path>:L:C: ` line, only
+# out-of-workspace (absolute and ../) positions -- and exits 101; `deny`
+# writes the findings and exits 101, as a deny lint does; `memberdeny` writes
+# an error in a crates/* member src-tauri path-depends on and exits 101 (cargo
+# stops before src-tauri); `killed` writes the findings and exits 137 (SIGKILL).
 echo "$*" >>"$CARGO_ARGS"
 [ -n "${CARGO_CWD:-}" ] && pwd >"$CARGO_CWD"
+if [ "${CARGO_MODE:-ok}" = memberdeny ]; then
+  echo 'crates/runner-stats/src/lib.rs:3:5: error: this comparison involving the minimum or maximum element for this type contains a case that is always true or always false' >&2
+  exit 101
+fi
 if [ "${CARGO_MODE:-ok}" = buildfail ]; then
   {
+    echo '/home/runner/.cargo/registry/src/index.crates.io-0/somedep-1.0.0/src/lib.rs:4:2: error: cannot find type `X` in this scope'
+    echo '../qontinui-schemas/rust/src/lib.rs:9:1: error: unresolved import `y`'
     echo 'error: failed to run custom build command for `qontinui-runner v0.1.0 (/w/src-tauri)`'
     echo ''
     echo 'Caused by:'
@@ -137,6 +152,7 @@ case " $* " in
   *) printf '{"reason":"compiler-message","n":%s}\n' $(seq 1 50) ;;
 esac
 [ "${CARGO_MODE:-ok}" = deny ] && exit 101
+[ "${CARGO_MODE:-ok}" = killed ] && exit 137
 exit 0
 STUB
 cat >"$W/stub/reviewdog" <<'STUB'
@@ -391,6 +407,23 @@ if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] && whole_re
   && ! any_no_verdict; then
   ok "cargo exits non-zero with diagnostics (deny lints): reviewdog runs as normal and its finding is the verdict"
 else bad "clippy deny lints" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
+
+# 13. an error in a crates/* workspace member (cargo stops before src-tauri):
+#     still the PR's code, so a verdict -- reviewdog runs, no not-a-verdict.
+CARGO_MODE=memberdeny run_step clippy-memberdeny findings
+if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] \
+  && grep -q '^crates/runner-stats/src/lib\.rs:3:5: error: ' "$C/rd.stdin.1" \
+  && ! any_no_verdict && ! printf '%s\n' "$OUT" | grep -qF "$NO_LINT"; then
+  ok "an error in a crates/* member is a verdict: reviewdog runs on it and no not-a-verdict annotation appears"
+else bad "member crate error" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
+
+# 14. cargo killed by a signal (exit 137) after printing some lines: a partial
+#     capture, so not a verdict even though workspace lines are present.
+CARGO_MODE=killed run_step clippy-killed ok
+if [ "$RC" -ne 0 ] && [ "$(attempts)" -eq 0 ] && [ "$(val rc)" = not-run-clippy-failed ] \
+  && printf '%s\n' "$OUT" | grep -F "$NO_LINT" | grep -qF 'exited 137'; then
+  ok "cargo killed by a signal: reviewdog is not run and the step says clippy did not lint"
+else bad "clippy killed" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
 
 if [ "$fail" -ne 0 ]; then
   echo "clippy-diff step tests: FAILED"
