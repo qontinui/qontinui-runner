@@ -40,7 +40,17 @@
 #      finding -- exit 1 after one run, no not-a-verdict annotation;
 #   9. the step feeds reviewdog cargo's `--message-format=short` stderr, the
 #      `%f:%l:%c: %m` shape `-f=clippy` parses, not the JSON stream (which
-#      parses to zero diagnostics).
+#      parses to zero diagnostics);
+#   10. cargo runs from src-tauri and reviewdog from the git root, where
+#      cargo's workspace-relative paths match the PR diff;
+#   11. cargo dies before linting (exit 101, no src-tauri diagnostic line):
+#      reviewdog is NOT run, the step exits non-zero with rc
+#      not-run-clippy-failed, and a comma-free `(not a verdict on this PR)`
+#      title says clippy did not lint -- an empty capture would otherwise
+#      read as a clean diff; the completion step, fed those outputs, reads
+#      it as "reviewdog never ran" and makes no API call;
+#   12. cargo exits non-zero WITH diagnostic lines (deny lints): reviewdog
+#      runs as normal from the whole report.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +60,7 @@ trap 'rm -rf "$W"' EXIT
 fail=0
 unset RSO_RETRY_DELAYS RSO_RETRY_SLEEP
 NO_VERDICT='::error title=Clippy diff-scoped (advisory): reviewdog could not deliver a verdict (not a verdict on this PR)::'
+NO_LINT='::error title=Clippy diff-scoped (advisory): clippy did not lint (not a verdict on this PR)::'
 
 for f in "$WORKFLOW" "${HERE}/reviewdog-step-outputs.sh" "${HERE}/complete-orphaned-check-runs.sh"; do
   if [ ! -f "$f" ]; then
@@ -100,8 +111,23 @@ cat >"$W/stub/cargo" <<'STUB'
 # JSON stream on stdout for `--message-format=json`. Paths are relative to the
 # WORKSPACE root (the repo root, whose Cargo.toml lists src-tauri as a member),
 # which is what real cargo prints even when run from src-tauri.
+# CARGO_MODE (set per case): unset or `ok` exits 0; `buildfail` writes what a
+# build.rs failure writes -- no `src-tauri/<path>:L:C: ` line -- and exits
+# 101; `deny` writes the findings and exits 101, as a deny lint does.
 echo "$*" >>"$CARGO_ARGS"
 [ -n "${CARGO_CWD:-}" ] && pwd >"$CARGO_CWD"
+if [ "${CARGO_MODE:-ok}" = buildfail ]; then
+  {
+    echo 'error: failed to run custom build command for `qontinui-runner v0.1.0 (/w/src-tauri)`'
+    echo ''
+    echo 'Caused by:'
+    echo "  process didn't exit successfully: \`/w/target/debug/build/qontinui-runner-0/build-script-build\` (exit status: 101)"
+    echo '  --- stderr'
+    echo "  thread 'main' panicked at build.rs:12:5:"
+    echo '  frontend dist not found'
+  } >&2
+  exit 101
+fi
 case " $* " in
   *" --message-format=short "*)
     for n in $(seq 1 50); do
@@ -110,6 +136,8 @@ case " $* " in
     ;;
   *) printf '{"reason":"compiler-message","n":%s}\n' $(seq 1 50) ;;
 esac
+[ "${CARGO_MODE:-ok}" = deny ] && exit 101
+exit 0
 STUB
 cat >"$W/stub/reviewdog" <<'STUB'
 #!/usr/bin/env bash
@@ -159,7 +187,7 @@ run_step() {
   GHO="$C/gho"
   : >"$GHO"
   OUT="$(cd "$C/ws" && env PATH="$W/stub:$PATH" GITHUB_OUTPUT="$GHO" RUNNER_TEMP="$C/rt" \
-    CARGO_ARGS="$C/cargo.args" CARGO_CWD="$C/cargo.cwd" RD_PLAN="$C/plan" RD_STATE="$C/rd" RSO_RETRY_SLEEP="$W/stub/fake-sleep" SLEEP_LOG="$C/sleeps" \
+    CARGO_MODE="${CARGO_MODE:-ok}" CARGO_ARGS="$C/cargo.args" CARGO_CWD="$C/cargo.cwd" RD_PLAN="$C/plan" RD_STATE="$C/rd" RSO_RETRY_SLEEP="$W/stub/fake-sleep" SLEEP_LOG="$C/sleeps" \
     bash --noprofile --norc -eo pipefail "$W/step.sh" 2>&1)"
   RC=$?
 }
@@ -322,6 +350,47 @@ if [ "$(cat "$C/rd.cwd.1" 2>/dev/null)" = "$(cd "$C/ws" && pwd)" ] \
   && [ "$(cat "$C/cargo.cwd" 2>/dev/null)" = "$(cd "$C/ws/src-tauri" && pwd)" ]; then
   ok "cargo runs from src-tauri and reviewdog from the git root, where cargo's workspace-relative paths match the PR diff"
 else bad "reviewdog cwd" "reviewdog cwd='$(cat "$C/rd.cwd.1" 2>/dev/null)' cargo cwd='$(cat "$C/cargo.cwd" 2>/dev/null)' ws='$C/ws'"; fi
+
+# 11. cargo dies before linting src-tauri: no diagnostic line, exit 101.
+#     reviewdog would read that capture as zero findings and exit 0 -- green
+#     for a diff nothing inspected -- so it must not run at all.
+CARGO_MODE=buildfail run_step clippy-buildfail ok
+nl_line="$(printf '%s\n' "$OUT" | grep -F "$NO_LINT" | head -n 1)"
+nl_title="${nl_line#::error title=}"
+nl_title="${nl_title%%::*}"
+nl_msg="${nl_line#"$NO_LINT"}"
+if [ "$RC" -ne 0 ] && [ "$(attempts)" -eq 0 ] && [ "$(val rc)" = not-run-clippy-failed ] \
+  && [ -z "$(val started_at)" ] && [ -n "$nl_line" ] && [[ "$nl_title" != *,* ]] \
+  && [[ "$nl_title" == *"(not a verdict on this PR)"* ]] \
+  && [ "$(printf '%s\n' "$OUT" | grep -cF "$NO_LINT")" -eq 1 ] && ! no_verdict \
+  && [[ "$nl_msg" == *"exited 101"* ]] && [[ "$nl_msg" == *"job's log"* ]] && [[ "$nl_msg" != *%* ]]; then
+  ok "cargo dies before linting: reviewdog is not run, rc=not-run-clippy-failed, the step exits non-zero and says clippy did not lint (not a verdict)"
+else bad "clippy build failure" "rc=$RC step rc='$(val rc)' attempts=$(attempts) message='${nl_msg}'"; fi
+
+# 11b. ...and the completion step, fed those outputs, treats it as
+#      "reviewdog never ran": no API call at all.
+: >"$W/gh.log"
+COUT="$(env PATH="$W/gh:$W/stub:$PATH" GH_LOG="$W/gh.log" GH_TOKEN=stub RUNNER_TEMP="$C/rt" \
+  COMPLETE_ORPHANS_SLEEP="$W/stub/fake-sleep" SLEEP_LOG="$C/completer-sleeps" \
+  STEP_RC="$(val rc)" STEP_OUTCOME=failure REVIEWDOG_STARTED_AT="$(val started_at)" \
+  REVIEWDOG_ENDED_AT="$(val ended_at)" REVIEWDOG_CLOCK="$(val clock)" REVIEWDOG_STDERR_LOG="$(val stderr_log)" \
+  bash "${HERE}/complete-orphaned-check-runs.sh" o/r abc1234 clippy-diff \
+  "the reviewdog step ended with outcome 'failure'" 2>&1)"
+CRC=$?
+if [ "$CRC" -eq 0 ] && [ ! -s "$W/gh.log" ] && [[ "$COUT" == *"reviewdog never ran (not-run-clippy-failed)"* ]]; then
+  ok "the completion step reads rc=not-run-clippy-failed as reviewdog never ran and makes no API call"
+else
+  OUT="$COUT" GHO=/dev/null
+  bad "completion after a clippy build failure" "rc=$CRC calls=$(tr '\n' '|' <"$W/gh.log")"
+fi
+
+# 12. a deny lint: cargo exits non-zero WITH diagnostic lines. That is a lint
+#     result, so reviewdog runs as before, from the whole report.
+CARGO_MODE=deny run_step clippy-deny findings
+if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] && whole_report 1 \
+  && ! any_no_verdict; then
+  ok "cargo exits non-zero with diagnostics (deny lints): reviewdog runs as normal and its finding is the verdict"
+else bad "clippy deny lints" "rc=$RC step rc='$(val rc)' attempts=$(attempts)"; fi
 
 if [ "$fail" -ne 0 ]; then
   echo "clippy-diff step tests: FAILED"
