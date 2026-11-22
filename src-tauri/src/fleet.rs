@@ -7,10 +7,12 @@
 //!    (already minted by `qontinui_profile device init`).
 //! 2. Detects local resources (cpu_cores, memory_gb, disk_total_gb)
 //!    via `sysinfo`.
-//! 3. Derives the agent-side budget with [`derive_max_agents`] — the minimum
-//!    of a session-memory term and a CPU term, a mirror of coord's
-//!    `fleet::derive_agent_capacity` (coord stores its own derivation on
-//!    ingest, so this number is advisory).
+//! 3. Reads what this host's CI may take ([`CiReservation`]). The runner
+//!    publishes the hardware and that reservation, never an agent count of its
+//!    own: coord derives the legacy agent cap from them on ingest, and the
+//!    capacity model sizes sessions from them (plan
+//!    `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+//!    Phase 12 deleted the runner's mirror of coord's formula).
 //! 4. POSTs the budget columns it OWNS — not `role`, which the supervisor
 //!    owns; see [`DeviceBudgetRequest`] — to
 //!    `POST /coord/devices/{device_id}/budget` via coord HTTP. Phase 3
@@ -123,50 +125,9 @@ pub struct Resources {
     pub disk_total_gb: u64,
 }
 
-// Per-session cost model — a MIRROR of qontinui-coord `crates/coord/src/fleet.rs`
-// (plan `2026-11-04-worktree-cap-charges-4gb-per-allocation-so-a-503gb-box-caps-at-124`).
-// coord is the authority: its budget ingest replaces the `max_concurrent_agents`
-// this runner publishes with coord's own derivation from the same publish's
-// `memory_gb` / `cpu_cores`, so a drift here changes only this runner's own log
-// line and `last_budget.json`, never a cap. The worked-example test below is the
-// same table coord pins; keep the two in step.
-
-/// MiB of RAM one interactive agent session is charged.
-const SESSION_COST_MEM_MIB: u32 = 512;
-/// Milli-cores one interactive session is charged.
-const SESSION_COST_CPU_MILLI: u32 = 200;
-/// GiB no session may eat into (OS, runner, proxies).
-const OS_RESERVE_GIB: u32 = 8;
-/// GiB one build slot is charged.
-const BUILD_MEM_GIB: u32 = 4;
-/// The derivation never answers below this.
-const MIN_DEVICE_AGENTS: u32 = 3;
-
-/// `min(memory_gb / 4, cpu_cores / 4)` — coord's `derive_max_builds`.
-fn derive_max_builds(memory_gb: u32, cpu_cores: u32) -> u32 {
-    (memory_gb / BUILD_MEM_GIB).min(cpu_cores / 4)
-}
-
-/// How many concurrent agent sessions this machine can carry:
-/// `max(MIN_DEVICE_AGENTS, min(mem_term, cpu_term))`, where
-/// `mem_term = (memory_gb − 8 − builds × 4 − ci_reserved_gib) / 0.5 GiB` and
-/// `cpu_term = (cpu_cores − max(2, ceil(cores / 10))) / 0.2`.
-pub fn derive_max_agents(memory_gb: u32, cpu_cores: u32, ci_reserved_gib: u32) -> u32 {
-    let build_reserve = derive_max_builds(memory_gb, cpu_cores).saturating_mul(BUILD_MEM_GIB);
-    let session_mem_gib = memory_gb
-        .saturating_sub(OS_RESERVE_GIB)
-        .saturating_sub(build_reserve)
-        .saturating_sub(ci_reserved_gib);
-    let mem_term = u64::from(session_mem_gib) * 1024 / u64::from(SESSION_COST_MEM_MIB);
-    let session_cores = cpu_cores.saturating_sub(cpu_cores.div_ceil(10).max(2));
-    let cpu_term = u64::from(session_cores) * 1000 / u64::from(SESSION_COST_CPU_MILLI);
-    let derived = mem_term.min(cpu_term).min(u64::from(u32::MAX)) as u32;
-    derived.max(MIN_DEVICE_AGENTS)
-}
-
 /// GiB one CI job slot is charged off Linux, where no cgroup bound can be read:
 /// the 16 GB size of the hosted runner the CI jobs are written for (coord's
-/// `fleet_placement::C1_SLOT_MEM_GIB`).
+/// `fleet_placement::costs::C1_SLOT_MEM_GIB` seed).
 const CI_JOB_MEM_GIB: u32 = 16;
 
 /// What this host's cgroup tree says CI may take.
@@ -758,7 +719,7 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// | `role` | supervisor (publishes `build`) | **absent — see below** |
 /// | `max_concurrent_builds` | supervisor | **absent — see the capacity split below** |
 /// | `max_concurrent_ci_jobs` | runner | always sent |
-/// | `max_concurrent_agents` | runner | always sent |
+/// | `max_concurrent_agents` | runner | omitted for the Agent role (coord derives it); an explicit `0` for the Build role |
 /// | `cpu_cores`, `memory_gb`, `disk_*` | neither — they describe the BOX | always sent by both |
 ///
 /// Scoped to THIS payload. `ci_runner_labels` is also supervisor-owned but
@@ -793,8 +754,9 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// So the runner stops asserting `role` into the shared row. It is DELETED
 /// rather than made `Option`-always-`None`, because a field with one reachable
 /// value is dead weight that a future edit can silently re-arm. The local
-/// [`MachineRole`] argument stays — it still drives `derive_max_agents` — it
-/// simply no longer reaches the wire. Nothing in coord selects devices by
+/// [`MachineRole`] argument stays — it still decides whether the publish
+/// asserts `max_concurrent_agents = 0` (Build) or leaves the count to coord
+/// (Agent) — it simply no longer reaches the wire. Nothing in coord selects devices by
 /// `role = 'agent'` (verified against `qontinui-coord` `ca46b12d`: the only
 /// role predicates are `build_dispatcher`'s two `= 'build'` sites, and
 /// `FLEET_COLUMNS` renders a NULL role as `'unknown'` for display), so the
@@ -826,7 +788,14 @@ struct DeviceBudgetRequest {
     memory_gb: i32,
     disk_total_gb: i64,
     disk_reserved_gb: i64,
-    max_concurrent_agents: i32,
+    /// `Some(0)` for the Build role ("no agents here"); OMITTED for the Agent
+    /// role. coord derives the stored agent count from this publish's
+    /// `memory_gb`, `cpu_cores` and `ci_reserved_gib` whether or not a count is
+    /// sent, so the runner keeps no copy of coord's formula (plan
+    /// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+    /// Phase 12; coord's half is `fleet::stored_max_concurrent_agents`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    max_concurrent_agents: Option<i32>,
     /// GiB of host memory this host's CI may take ([`published_ci_reserved_gib`]).
     /// coord derives the stored `max_concurrent_agents` from it, and OMITTED
     /// (an unbounded CI slice) means "unknown": coord then keeps its last
@@ -983,7 +952,8 @@ fn write_last_budget_cache(body: &DeviceBudgetRequest, device_id: &str) {
 /// that struct's ordering constraint — it has NOT landed yet). **It will not
 /// retire this guard.** COALESCE only protects a column a publisher
 /// OMITS; a secondary still sends real values for every column it believes it
-/// owns (`cpu_cores`, `max_concurrent_agents`, and — if `ci_node` is
+/// owns (`cpu_cores`, the `ci_reserved_gib` coord derives `max_concurrent_agents`
+/// from, and — if `ci_node` is
 /// enabled in its own instance settings — `max_concurrent_builds` too). The
 /// two defences are complementary: omission says "not my column", the guard
 /// says "not my row".
@@ -1112,14 +1082,11 @@ fn build_budget_request(
         disk_total_gb: resources.disk_total_gb.min(i64::MAX as u64) as i64,
         disk_reserved_gb: disk_reserved_gb.min(i64::MAX as u64) as i64,
         max_concurrent_agents: match role {
-            // Advisory: coord stores its own derivation (and keeps its last
-            // stored value when `ci_reserved_gib` is omitted).
-            MachineRole::Agent => derive_max_agents(
-                resources.memory_gb,
-                resources.cpu_cores,
-                ci_reserved_gib.unwrap_or(0),
-            ) as i32,
-            MachineRole::Build => 0,
+            // coord derives the count from the sizes and `ci_reserved_gib`
+            // (and keeps its last stored value when the reservation is
+            // omitted), so the Agent role sends none.
+            MachineRole::Agent => None,
+            MachineRole::Build => Some(0),
         },
         ci_reserved_gib,
         // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
@@ -1265,7 +1232,8 @@ async fn publish_budget_with(
                 body.cpu_cores,
                 body.memory_gb,
                 body.disk_total_gb,
-                body.max_concurrent_agents,
+                body.max_concurrent_agents
+                    .map_or_else(|| "(coord derives)".to_string(), |n| n.to_string()),
                 body.max_concurrent_ci_jobs
             );
             Ok(())
@@ -8300,12 +8268,18 @@ mod tests {",
             "a disabled ci_node OWNS its CI slot count and must assert zero, \
              not omit it — omission would leave a stale non-zero standing: {json}"
         );
-        // The columns the runner DOES own must still be on the wire, or the
-        // fix inverts into the mirror-image outage.
+        // The agent count is coord's derivation from the sizes and the CI
+        // reservation below, so the Agent role sends none: an omitted field is
+        // what lets coord derive it, and a non-zero number here would be a
+        // second copy of coord's formula.
+        assert!(
+            json.get("max_concurrent_agents").is_none(),
+            "the Agent role leaves the agent count to coord: {json}"
+        );
         assert_eq!(
-            json.get("max_concurrent_agents").and_then(|v| v.as_i64()),
-            Some(derive_max_agents(32, 8, 0) as i64),
-            "the runner owns the agent cap and must keep publishing it"
+            json.get("ci_reserved_gib").and_then(|v| v.as_i64()),
+            Some(0),
+            "the CI reservation coord derives the agent count from must stay on the wire: {json}"
         );
         // Machine-resource fields describe the BOX, not this process — both
         // publishers mean the same thing by them, so there is nothing to
@@ -8828,25 +8802,6 @@ mod tests {",
         UNKNOWN_TENANT_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The same worked-example table coord's `fleet.rs` pins
-    /// (`derive_agent_capacity_matches_plan_examples`).
-    #[test]
-    fn derive_max_agents_examples() {
-        for (name, mem, cores, ci, want) in [
-            ("nawa", 503, 128, 327, 80),
-            ("nilan", 503, 128, 231, 272),
-            ("merytshost", 368, 48, 200, 215),
-            ("64 GB desktop, 16 threads, no CI", 64, 16, 0, 70),
-            ("monster", 31, 8, 0, 30),
-            ("MSI", 31, 16, 0, 14),
-            ("16 GB laptop, 8 threads", 16, 8, 0, 3),
-            ("nomad", 15, 8, 0, 3),
-            ("empty", 0, 0, 0, 3),
-        ] {
-            assert_eq!(derive_max_agents(mem, cores, ci), want, "{name}");
-        }
-    }
-
     /// A cgroup v2 fixture. An empty `high` / `max` string leaves that file
     /// ABSENT, so a slice missing one (or both) bound files can be built.
     fn cgroup_fixture(slices: &[(&str, &str, &str)]) -> tempfile::TempDir {
@@ -8973,10 +8928,9 @@ mod tests {",
         assert_eq!(idle["max_concurrent_ci_jobs"].as_i64(), Some(12));
         // 48c/368 GiB's static partition is 12 slots: 12 × 16 GiB either way.
         assert_eq!(busy["ci_reserved_gib"].as_i64(), Some(192));
-        assert_eq!(busy["ci_reserved_gib"], idle["ci_reserved_gib"]);
         assert_eq!(
-            busy["max_concurrent_agents"], idle["max_concurrent_agents"],
-            "the agent cap must not move with the model's answer"
+            busy["ci_reserved_gib"], idle["ci_reserved_gib"],
+            "the reservation coord derives the agent cap from must not move with the model's answer"
         );
     }
 
@@ -9050,7 +9004,7 @@ mod tests {",
         };
         let known = mk(CiReservation::Bounded(327));
         assert_eq!(known["ci_reserved_gib"].as_i64(), Some(327));
-        assert_eq!(known["max_concurrent_agents"].as_i64(), Some(80));
+        assert!(known.get("max_concurrent_agents").is_none());
         assert!(mk(CiReservation::Unbounded)
             .get("ci_reserved_gib")
             .is_none());

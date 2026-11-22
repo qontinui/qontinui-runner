@@ -1997,7 +1997,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Row 2 Phase 1: publish this runner's DeviceBudget to coord.devices
-    // (role = agent, max_concurrent_agents derived from RAM via §3.2 policy).
+    // (the box's hardware and CI reservation; coord derives the agent count).
     // Best-effort — failures log a warning and the runner still boots.
     // Phase 3 (Unified Devices Registry): now POSTs to coord HTTP rather
     // than direct-PG UPSERT, with exponential-backoff retry preserving the
