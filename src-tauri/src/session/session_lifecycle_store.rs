@@ -515,6 +515,21 @@ fn restamp_at(prev: i64, now: i64) -> i64 {
     }
 }
 
+/// The `finished_at` a RE-MARK after an unmark gets: `now`, unless `now` is at
+/// or within one second behind `hwm` (the highest stamp an unmark of this
+/// session cleared), in which case one past `hwm`. Unlike [`restamp_at`] this
+/// must clear EVERY earlier stamp, not only the last one: alternating
+/// unmark/re-mark inside one millisecond would otherwise cycle t, t+1, t and a
+/// late ACK of the first mark would sync the third. The one-second bound keeps
+/// a clock stepped well backwards from dating the mark in the future. Pure.
+fn remark_at(hwm: i64, now: i64) -> i64 {
+    if now <= hwm && hwm - now < 1_000 {
+        hwm.saturating_add(1)
+    } else {
+        now
+    }
+}
+
 /// Best-effort identity overlay for an existing record — the D1 "who is this
 /// session" fields that live outside the spawn-time record.
 ///
@@ -1362,6 +1377,14 @@ pub struct SessionLifecycleStore {
     /// this same lock, so a late delivery cannot land its `Finished` after a
     /// concurrent unmark's `working` either.
     finish_forward: Mutex<()>,
+    /// The highest `finished_at` an UNMARK cleared, per Claude session, so the
+    /// next mark of that session is stamped past it ([`remark_at`]). Without it an unmark and a re-mark inside one
+    /// millisecond give the new mark the OLD stamp, and a late ACK of the old
+    /// mark (the ACK matcher compares `finished_at`) would sync the new one.
+    /// Consumed by the next mark. Process-local by design: it only needs to
+    /// outlive a sub-millisecond window. Taken only while the `map` lock is
+    /// held (lock order `map` then this).
+    unmarked_stamps: Mutex<HashMap<String, i64>>,
 }
 
 /// What [`SessionLifecycleStore::redirect_finish`] did.
@@ -1586,6 +1609,7 @@ impl SessionLifecycleStore {
             finish_observer: OnceLock::new(),
             boot_ms: AtomicI64::new(default_boot_ms()),
             finish_forward: Mutex::new(()),
+            unmarked_stamps: Mutex::new(HashMap::new()),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -3370,10 +3394,20 @@ impl SessionLifecycleStore {
         }
 
         if finished {
-            rec.finished_at = Some(match rec.finished_at {
-                None => now,
+            // The stamp a preceding unmark cleared, if any: a re-mark after an
+            // unmark must differ from it just as a restamp must.
+            let unmarked = self
+                .unmarked_stamps
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(claude_session_id);
+            rec.finished_at = Some(match (rec.finished_at, unmarked) {
+                (None, None) => now,
                 // A RESTAMP (a re-finish that carried a reason).
-                Some(prev) => restamp_at(prev, now),
+                (Some(prev), _) => restamp_at(prev, now),
+                // A re-mark after an unmark: past every stamp an unmark of
+                // this session has cleared in this window.
+                (None, Some(hwm)) => remark_at(hwm, now),
             });
             // A fresh or restamped mark is unsynced by definition — the outbox
             // owes coord a write, and the boot reconcile must not revert it
@@ -3386,6 +3420,16 @@ impl SessionLifecycleStore {
             // for ([`awaiting_account_hold`] also refuses a finished row).
             rec.awaiting_account_since = None;
         } else {
+            if let Some(prev) = rec.finished_at {
+                // Keep the HIGHEST cleared stamp, so two unmark/re-mark cycles
+                // in one millisecond (t, t+1, ...) never come back to t.
+                let mut stamps = self
+                    .unmarked_stamps
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let hwm = stamps.entry(claude_session_id.to_string()).or_insert(prev);
+                *hwm = (*hwm).max(prev);
+            }
             rec.finished_at = None;
             rec.finish_reason = None;
             rec.finish_synced = false;
@@ -9410,6 +9454,44 @@ mod tests {
                 Err(SetFinishedError::UnknownSession)
             ),
             "an unknown session is UnknownSession, never a panic or a phantom record"
+        );
+    }
+
+    /// An unmark then a re-mark is stamped through `restamp_at` like a direct
+    /// re-finish, so the new mark never carries the stamp the unmark cleared.
+    #[test]
+    fn a_re_mark_after_an_unmark_never_reuses_the_cleared_stamp() {
+        // Back-to-back mark/unmark/re-mark lands inside one millisecond on most
+        // iterations, which is exactly the window where the re-mark used to
+        // take the cleared stamp again (CI, qontinui-runner#3139 run
+        // 44964663935). Many iterations make that window near-certain.
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("s"));
+        // Every stamp, not only the previous one: two cycles in one
+        // millisecond must not come back to an earlier mark's stamp.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let at = store
+                .set_finished("s", true, None)
+                .unwrap()
+                .record
+                .finished_at
+                .unwrap();
+            assert!(seen.insert(at), "a re-mark reused an earlier stamp {at}");
+            store.set_finished("s", false, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_re_mark_clears_every_cleared_stamp_and_never_runs_far_ahead() {
+        assert_eq!(remark_at(1_000, 1_000), 1_001, "equal-now moves past it");
+        assert_eq!(remark_at(1_001, 1_000), 1_002, "behind the high-water too");
+        assert_eq!(remark_at(1_000, 5_000), 5_000, "a later clock is taken as-is");
+        assert_eq!(
+            remark_at(10_000, 400),
+            400,
+            "a clock stepped far back is not dated into the future"
         );
     }
 
