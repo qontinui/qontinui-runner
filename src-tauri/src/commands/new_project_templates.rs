@@ -80,7 +80,7 @@ const REACT_PACKAGE_JSON: &str = r#"{
     "preview": "vite preview"
   },
   "dependencies": {
-    "@qontinui/ui-bridge": "^0.54.0",
+    "@qontinui/ui-bridge": "^0.55.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
