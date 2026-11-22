@@ -69,6 +69,8 @@ pub mod coord_sync;
 pub(crate) mod coord_sync_finish_ack; // What a coord answer to the runner's `finished` PATCH proves — finish_synced is stamped only on an observed `finished` row (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 4)
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
+#[cfg(test)]
+pub(crate) mod drain_probe; // Loopback coord that fails a test when a response body is left unread (lifecycle plan Phase 85)
 pub mod dual_write;
 pub mod handoff;
 pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
