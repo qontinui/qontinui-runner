@@ -2264,6 +2264,9 @@ def stranded_cases(bad):
     return n
 
 
+T0_CELLS = 1_790_000_000_000  # the t0 of finish_time_cases, stop_hook_transcript and opener_cases
+
+
 def finish_time_cases(bad):
     """classify() on an idle, bound pane (the process, screen and transcript
     reads stubbed) for each way coord's finish time (sessionStatusSince) and the
@@ -2775,7 +2778,7 @@ def finish_time_cases(bad):
         g.update(saved)
     # last_turn_open on written transcripts: (records, want offset from t0 in s, want text prefix,
     # want last_prompt offset or None). A wake never moves last_prompt.
-    t0 = 1_790_000_000_000
+    t0 = T0_CELLS
 
     def rec(kind, sec, content, **kw):
         stamp = dt.datetime.fromtimestamp((t0 + sec * 1000) / 1000, dt.timezone.utc).isoformat()
@@ -2865,7 +2868,118 @@ def finish_time_cases(bad):
         if got["last_activity"] != t0 + 90 * 1000:
             bad.append(f"a mid-turn compaction left last_activity at {got['last_activity']}, "
                        f"want {t0 + 90 * 1000} (the turn's reply after it)")
+        checks += stop_hook_cells(bad, d, rec, said, tool, result, wake, term)
     return len(cases) + 1 + len(turn_cases) + 2 + checks, len(condition_one)
+
+
+def stop_hook_transcript(rec, said, tool, result, wake, cell):
+    """The records of one Stop-hook continuation cell (plan
+    2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival,
+    Phase 1), SYNTHETIC and shaped on that plan's 2026-11-20 measurement: the
+    finishing turn ends with an end_turn reply, a Stop hook blocks the stop,
+    and Claude Code appends a META user record starting STOP_HOOK_FEEDBACK
+    that carries the turn opener's promptId, before the turn's one
+    system/turn_duration record. `cwd` is set on each user record by the
+    caller. Returns the record list."""
+    def sysrec(sec, subtype):  # a `system` record: no `message` dict
+        stamp = dt.datetime.fromtimestamp((T0_CELLS + sec * 1000) / 1000, dt.timezone.utc).isoformat()
+        return {"type": "system", "subtype": subtype, "timestamp": stamp}
+    fb = "Stop hook feedback:\nYou did not emit the closing footer."
+    head = [rec("user", 0, "fix the bug", promptId="p1"), said(5), sysrec(6, "stop_hook_summary")]
+    one = head + [rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")]
+    return {
+        1: one,
+        2: head + [rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "stop_hook_summary"),
+                   rec("user", 50, fb, isMeta=True, promptId="p1"), said(55), sysrec(56, "turn_duration")],
+        3: one + [rec("user", 120, SCHEDULED_WAKE, isMeta=True, promptId="p2"), said(125)],
+        4: one + [rec("user", 120, wake, promptId="p3"), said(125)],
+        5: head + [rec("user", 40, fb, isMeta=True), said(45), sysrec(46, "turn_duration")],
+        6: head + [rec("user", 40, fb, isMeta=True, promptId="p9"), said(45), sysrec(46, "turn_duration")],
+        7: [rec("user", 0, "fix the bug", promptId="p1"), said(5), sysrec(6, "turn_duration"),
+            rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+        # the continuation works on: a tool call, then a reply 11 minutes past the 30 s finish, no closeout
+        8: head + [rec("user", 40, fb, isMeta=True, promptId="p1"), rec("assistant", 41, tool, stop="tool_use"),
+                   rec("user", 42, result, promptId="p1"), said(30 + 11 * 60), sysrec(30 + 11 * 60 + 1, "turn_duration")],
+        # an EARLIER turn closed by its own turn_duration: the finishing turn's opener resets the tie
+        9: [rec("user", 0, "first task", promptId="p0"), said(1), sysrec(2, "turn_duration"),
+            rec("user", 3, "fix the bug", promptId="p1"), said(5), sysrec(6, "stop_hook_summary"),
+            rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+        # neither the opener nor the feedback carries a promptId: None never ties to None
+        10: [rec("user", 0, "fix the bug"), said(5), sysrec(6, "stop_hook_summary"),
+             rec("user", 40, fb, isMeta=True), said(45), sysrec(46, "turn_duration")],
+        # the prefix on a record that is NOT meta, and a meta record without the prefix: neither ties
+        11: head + [rec("user", 40, fb, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+        12: head + [rec("user", 40, SCHEDULED_WAKE, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+    }[cell]
+
+
+def stop_hook_cells(bad, d, rec, said, tool, result, wake, term):
+    """Plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival
+    Phase 1: a meta `Stop hook feedback:` continuation of the finishing turn
+    (the same promptId as the turn's opener, before its turn_duration) opens no
+    turn, so a session finished at 30 s reads FINISHED (a linked worktree) or
+    CUSTODY (no repository) on coord's arm and is never REVIVED on either arm;
+    a genuine wake or task notification after it still revives (condition 4);
+    an untied, mismatched or post-turn_duration feedback keeps the opener
+    reading; and continuation work long past the finish reopens it as
+    kept_working, not as a turn. Writes into `d`; the stubs are
+    opener_cases'. Appends failures; returns the check count."""
+    g = globals()
+    stubs = {"proc_facts": lambda table, pid, windows=WINDOWS: ([11], [], []),
+             "live_session_ids": lambda claudes: {"s1"}, "raw_tail": lambda tid, chars=30000: "screen",
+             "running_turn": lambda text: False, "prompt_state": lambda raw, *, cols: ("empty", ""),
+             "wrap_cols": lambda term, windows=None: None, "git_rev_parse_dirs": fake_git_dirs}
+    stamp = T0_CELLS + 30 * 1000
+    revived = ("REVIVED", "a turn opened")
+    # (cell, want last_turn_open offset in s, want last_activity offset or None,
+    #  {cwd: want coord-arm verdict and reason fragment}; None: same for both cwds)
+    cells = [(1, 0, 45, {LINKED_CWD: ("FINISHED", ""), "/w/no-repo": ("CUSTODY", "")}),
+             (2, 0, 55, {LINKED_CWD: ("FINISHED", ""), "/w/no-repo": ("CUSTODY", "")}),
+             (3, 120, None, None), (4, 120, None, None), (5, 40, None, None), (6, 40, None, None),
+             (7, 40, None, None),
+             (9, 3, 45, {LINKED_CWD: ("FINISHED", ""), "/w/no-repo": ("CUSTODY", "")}),
+             (10, 40, None, None),
+             # a non-meta record is a prompt, so it revives as one
+             (11, 40, None, {LINKED_CWD: ("REVIVED", "then prompted"), "/w/no-repo": ("REVIVED", "then prompted")}),
+             (12, 40, None, None),
+             (8, 0, None, {LINKED_CWD: ("REVIVED", "finish_stranded.kept_working"),
+                           "/w/no-repo": ("REVIVED", "finish_stranded.kept_working")})]
+    n = 0
+    for cell, want_open, want_act, wants in cells:
+        for cwd in (LINKED_CWD, "/w/no-repo"):
+            want_v, frag = (wants or {}).get(cwd, revived)
+            recs = [dict(r, cwd=cwd) if r.get("type") == "user" else r
+                    for r in stop_hook_transcript(rec, said, tool, result, wake, cell)]
+            with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in recs))
+            got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+            n += 1
+            if got["last_turn_open"] != T0_CELLS + want_open * 1000:
+                bad.append(f"stop-hook cell {cell} ({cwd}): last_turn_open={got['last_turn_open']} "
+                           f"({got['last_turn_open_text'][:30]!r}), want offset {want_open}")
+            if want_act is not None and got["last_activity"] != T0_CELLS + want_act * 1000:
+                bad.append(f"stop-hook cell {cell}: last_activity={got['last_activity']}, want offset {want_act} "
+                           "(a system record is no activity)")
+            for arm, row, rp in (("coord", {}, {"sessionStatus": "finished", "sessionStatusSince": stamp}),
+                                 ("marker", {"finished": True, "finishedAt": stamp}, {})):
+                saved = {k_: g[k_] for k_ in list(stubs) + ["transcript_facts"]}
+                try:
+                    g.update(stubs, transcript_facts=lambda r, got=got: dict(got))
+                    v, why = classify(term, dict(row, claudeSessionId="s1"), {10: (1, ["bash"])}, 15, "", {"s1": rp})
+                finally:
+                    g.update(saved)
+                said_ = "; ".join(why)
+                n += 1
+                if want_v == "REVIVED":
+                    ok = v == "REVIVED" and frag in said_ and (frag == "a turn opened" or "a turn opened" not in said_)
+                elif arm == "coord":
+                    ok = v == want_v
+                else:  # the runner mark alone is no FINISHED (condition 1), and never a revival here
+                    ok = v != "REVIVED"
+                if not ok:
+                    bad.append(f"stop-hook cell {cell} ({cwd}) on the {arm} arm = {v} {why}; want "
+                               f"{want_v if arm == 'coord' or want_v == 'REVIVED' else 'not REVIVED'} {frag!r}")
+    return n
 
 
 def opener_cases(bad):
@@ -2898,7 +3012,7 @@ def opener_cases(bad):
         n += 1
         if opener_class(flags, text) != want:
             bad.append(f"opener_class({flags}, {text[:40]!r}) = {opener_class(flags, text)}, want {want}")
-    t0 = 1_790_000_000_000
+    t0 = T0_CELLS
 
     def rec(kind, sec, content, **kw):
         stamp = dt.datetime.fromtimestamp((t0 + sec * 1000) / 1000, dt.timezone.utc).isoformat()
@@ -2968,6 +3082,36 @@ def opener_cases(bad):
                 if v != "REVIVED" or "finish_stranded" in said_ or not all(
                         (f[1:] not in said_) if f.startswith("!") else (f in said_) for f in frags):
                     bad.append(f"opener case {k} on the {arm} arm = {v} {why}; want REVIVED with {frags}")
+        # Plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival Phase 1: a meta
+        # `Stop hook feedback:` continuation of the running turn (the opener's promptId, no turn_duration
+        # between) opens no turn, so it has no class: the prompt's class stands. SYNTHETIC records.
+        with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in [
+                rec("user", 0, "fix the bug", promptId="p1"), said(5),
+                rec("user", 40, "Stop hook feedback:\nYou did not emit the closing footer.", isMeta=True,
+                    promptId="p1"), said(45)]))
+        got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+        n += 1
+        if (got["last_turn_open_class"], got["last_turn_open"]) != ("prompt", t0):
+            bad.append(f"a Stop-hook continuation left last_turn_open_class={got['last_turn_open_class']} at "
+                       f"{got['last_turn_open']}; want prompt at {t0} (it opens no turn)")
+        # The local-command rollback restores the opener's promptId: a /model command and its stdout between
+        # the end_turn and the feedback leave the feedback tied to p1, so it opens no turn. And a turn_duration
+        # read between the command and its stdout survives the rollback, so the feedback then opens one; and so
+        # does a turn_duration read BEFORE the command (the restored turn was already closed).
+        closed = [{"type": "system", "subtype": "turn_duration"}]
+        for k, (before_cmd, between, want_at) in enumerate((([], [], 0), ([], closed, 40), (closed, [], 40))):
+            with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in [
+                    rec("user", 0, "fix the bug", promptId="p1"), said(5), *before_cmd,
+                    rec("user", 10, "<command-name>/model</command-name>", promptId="p2"), *between,
+                    rec("user", 11, "<local-command-stdout>ok"),
+                    rec("user", 40, "Stop hook feedback:\nYou did not emit the closing footer.", isMeta=True,
+                        promptId="p1"), said(45)]))
+            got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+            n += 1
+            if got["last_turn_open"] != t0 + want_at * 1000:
+                bad.append(f"rollback case {k}: last_turn_open={got['last_turn_open']}, want {t0 + want_at * 1000}")
     return n
 
 
@@ -6201,8 +6345,17 @@ def subagent_work(path, segments):
 # User records that open no turn even outside one: a local command's caveat and
 # output, an interrupt, and a META system reminder (a /rename writes one). A
 # non-meta <system-reminder> record is a delivery that does open one: coord's
-# Session Bus `ci_rework` / `stuck_pr_nudge` messages arrive that way.
+# Session Bus `ci_rework` / `escalate_evidence` / `pr_blocked` / `stuck_pr_nudge`
+# messages arrive that way.
 NOT_A_TURN = ("<local-command", "Caveat:", "<system-reminder>", "[Request interrupted")
+# Claude Code's continuation of the running turn when a Stop hook blocks its end: a
+# META user record starting with this text, carrying the same promptId as the
+# record that opened the turn, written before that turn's one system/turn_duration
+# record (plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival,
+# measured 2026-11-20). Tied that way, it opens no turn (turn_open); untied (no
+# promptId on it or on the opener, another promptId, or a turn_duration since the
+# opener) it keeps the opener reading, the close screen's conservative side.
+STOP_HOOK_FEEDBACK = "Stop hook feedback:"
 # The three classes of turn opener (plan
 # 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, Phase 3). A
 # *prompt* is what `last_prompt` counts (a non-meta record whose text starts
@@ -6250,18 +6403,32 @@ def turn_open(f, turn, e, content, text, at):
     opener_class: its class into `last_turn_open_class`, and the newest prompt
     or delivery into `last_revive_open` (with its `_text` and `_class`), so a
     delivery is still named when a later wake opened the newest turn.
-    `turn` is {"in": a turn is running, "before": the OPEN_KEYS to restore}."""
+    A Stop-hook continuation of the running turn opens none either: a meta
+    record starting STOP_HOOK_FEEDBACK whose promptId equals the turn opener's,
+    with no turn_duration read since that opener. It is the rest of that turn,
+    so work it does long past a finish is judged as kept_working (finish_state).
+    `turn` is {"in": a turn is running, "before": the OPEN_KEYS (and "pid",
+    "closed") to restore, "pid": the turn opener's promptId, "closed": a
+    turn_duration was read since that opener}."""
     t = text.lstrip()
     if t.startswith(LOCAL_OUTPUT):
         if turn["before"] is not None and f["last_turn_open_text"].startswith("<command-name>"):
-            f.update(turn["before"])
+            before = dict(turn["before"])
+            # The command opener is rolled back, so its promptId goes too; but a turn_duration read since
+            # it still closed the restored turn, so `closed` is OR'd, never cleared (the conservative side:
+            # a later feedback record then opens a turn rather than tying to a turn that already ended).
+            turn["pid"], turn["closed"] = before.pop("pid"), before.pop("closed") or turn["closed"]
+            f.update(before)
         turn["before"] = None
     elif t.startswith("[Request interrupted"):
         turn["in"] = False  # the interrupted turn ended without an end_turn record
     elif not (turn["in"] or not t or e.get("isCompactSummary") or (
             t.startswith(NOT_A_TURN) and (e.get("isMeta") or not t.startswith("<system-reminder>"))) or (
-            isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content))):
-        turn["before"] = {k: f[k] for k in OPEN_KEYS}
+            isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content))
+            or (e.get("isMeta") and t.startswith(STOP_HOOK_FEEDBACK) and e.get("promptId")
+                and e.get("promptId") == turn["pid"] and not turn["closed"])):
+        turn["before"] = dict({k: f[k] for k in OPEN_KEYS}, pid=turn["pid"], closed=turn["closed"])
+        turn["pid"], turn["closed"] = e.get("promptId"), False
         cls = opener_class(e, text)
         f["last_turn_open"], f["last_turn_open_text"], f["last_turn_open_class"] = at, t, cls
         if cls != "self":
@@ -6306,18 +6473,23 @@ def transcript_facts(row):
     # `last_turn_open` is the newest record that opened a turn of any kind
     # (turn_open), so a wake that `last_prompt` ignores can still be read;
     # `last_turn_open_class` and `last_revive_open` name its class (opener_class).
+    # A Stop-hook continuation of the running turn (STOP_HOOK_FEEDBACK) opens no
+    # turn; the one `system` record read is turn_duration, which closes the turn
+    # for that test and changes no other fact.
     f = {"path": path, "last_activity": None, "last_prompt": None, "last_prompt_text": "",
          "last_asst": None, "final_text": "", "final_text_at": None, "pending_tool": False,
          "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "nudge_replied": False, "cwd": None,
          "last_turn_open": None, "last_turn_open_text": "", "last_turn_open_class": None,
          "last_revive_open": None, "last_revive_open_text": "", "last_revive_open_class": None}
     open_tools = set()
-    turn = {"in": False, "before": None}
+    turn = {"in": False, "before": None, "pid": None, "closed": False}
     segments = []
     before = None  # (last_prompt, last_prompt_text) as they stood before the newest prompt
     for line in open(path, encoding="utf-8", errors="replace"):  # never the locale codepage (cp1252 on Windows)
         try:
             e = json.loads(line)
+            if isinstance(e, dict) and e.get("type") == "system" and e.get("subtype") == "turn_duration":
+                turn["closed"] = True  # the running turn ended: no later feedback continues it (timestamp unread)
             ts = e.get("timestamp")
             if not ts or not isinstance(e.get("message"), dict):
                 continue
@@ -6635,8 +6807,11 @@ def finish_state(row, rp, tx, now_ms, hits=None):
                     that opens a turn (last_turn_open: a Session Bus delivery, a
                     /loop or ScheduleWakeup wake, a task notification), or
                     assistant work ran more than 10 minutes past it with no
-                    closeout. More than 1 s after the stamp, for coord's time and
-                    the runner mark alike (served finished-criteria condition 4).
+                    closeout. A Stop-hook continuation of the finishing turn
+                    (STOP_HOOK_FEEDBACK, tied to that turn's opener) opens no
+                    turn, so only its work, by that 10-minute rule, revives.
+                    More than 1 s after the stamp, for coord's time and the
+                    runner mark alike (served finished-criteria condition 4).
       in_band       a prompt or turn-opening record within 1 s either side of
                     coord's stamp (the runner mark's band is one-sided). close
                     keeps the tab (REVIVED); nudge holds it (HELD).

@@ -1143,7 +1143,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // Read before the request, as the hook's rule is: an `auto` request
       // takes the page only when it changes the layout id.
       const originBefore = reportLayoutOrigin(targetLayout.layoutOrigin);
-      const originAfter = predictLayoutOrigin(targetLayout, normalized, source);
+      const originAfter = predictLayoutOrigin(targetLayout, normalized, source, effective);
       targetLayout.setLayoutId(normalized, { source });
       const layoutDetail =
         grown !== null
@@ -1162,14 +1162,20 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // request over one changes nothing worth naming.
       const trimmableBefore = originBefore === "auto";
       const trimmableAfter = originAfter === "auto";
+      // A request auto-grow overrides is the third case: the grow is the
+      // runner's own `auto` request, so the page ends runner-owned whoever
+      // sent this one — said as such, so an operator does not read the grown
+      // grid as one they pinned.
       const ownership =
         source === "auto"
           ? trimmableAfter
             ? "; runner-owned (auto-trims)"
             : `; origin kept (${originAfter}) — an auto request does not take a layout it leaves unchanged`
-          : trimmableBefore
-            ? "; origin operator (no longer auto-trims)"
-            : "";
+          : trimmableAfter
+            ? "; runner-owned (auto-trims)"
+            : trimmableBefore
+              ? "; origin operator (no longer auto-trims)"
+              : "";
       const ownedDetail = `${layoutDetail}${ownership}`;
       const detail = leftTmux ? `left tmux mode — ${ownedDetail}` : ownedDetail;
       const handedOver = trimmableBefore !== trimmableAfter;

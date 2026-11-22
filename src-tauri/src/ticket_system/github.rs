@@ -233,6 +233,9 @@ impl GitHubTicketProvider {
             ex.reset_at_unix,
             now_unix(),
         );
+        // Every runner sharing this bucket computed the same wait; each adds its
+        // own jitter so they do not all re-send in the second the window opens.
+        let backoff = backoff.map(github_budget::resume_after);
         if let (Some(wait), SpendClass::Background) = (backoff, spend_class) {
             // Background spend is never slept on. The hold keeps the next poll
             // from re-sending inside GitHub's window.

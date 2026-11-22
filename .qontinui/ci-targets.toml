@@ -192,6 +192,17 @@ observes = [".github/scripts/route-ci-lane.py"]
 name = "route-windows"
 observes = [".github/scripts/route-ci-lane.py"]
 
+[[targets]]
+# design-guide: `design-kit compile --root . --check` over the design-language
+# source against the committed src/design-system/ outputs, then validate-guide
+# over the two fixtures. The kit is installed from design/kit/ outside the
+# app's pnpm tree, so no app manifest is read.
+name = "design-guide"
+observes = [
+  "design/**",
+  "src/design-system/**",
+]
+
 # ---------------------------------------------------------------------------
 # Unfiltered companion workflows
 # ---------------------------------------------------------------------------

@@ -10948,6 +10948,22 @@ pub(crate) fn write_degraded_breadcrumb(
     }
 }
 
+/// Name prefix of the breadcrumb's atomic-replace temp file. Its readers are
+/// the two rosters that must recognise a crash-left temp file:
+/// `fleet::MANAGED_REPO_EXCLUDES` (spelled there as the glob
+/// `.coord-mcp-status.tmp-*`) and `agent_worktree::dirty::is_scaffolding_path`.
+pub(crate) const COORD_MCP_STATUS_TMP_PREFIX: &str = ".coord-mcp-status.tmp-";
+
+/// A fresh, unique temp-file name for [`replace_breadcrumb`]: the prefix, then
+/// this process's id and a v7 uuid, so concurrent writers never share one.
+pub(crate) fn breadcrumb_tmp_name() -> String {
+    format!(
+        "{COORD_MCP_STATUS_TMP_PREFIX}{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7().simple()
+    )
+}
+
 /// Replace the breadcrumb at `path` with `body` ATOMICALLY: write a sibling
 /// temp file, then rename it over the breadcrumb. `std::fs::write` truncates
 /// before it writes, so a reader racing a rewrite (the probe re-stamping it,
@@ -10957,13 +10973,11 @@ pub(crate) fn write_degraded_breadcrumb(
 /// (Rust's own readers share delete; a .NET or CRT reader may not); the write
 /// then fails and is logged, leaving the previous breadcrumb in place. A temp
 /// file a crash leaves behind is excluded by the runner's managed excludes
-/// (`fleet::MANAGED_REPO_EXCLUDES`).
+/// (`fleet::MANAGED_REPO_EXCLUDES`) and is runner scaffolding to reclaim
+/// (`agent_worktree::dirty::is_scaffolding_path`), so it neither shows in a
+/// walked repo's `git status` nor pins an agent worktree unreclaimable.
 fn replace_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
-    let tmp = path.with_file_name(format!(
-        "{COORD_MCP_STATUS_FILE}.tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7().simple()
-    ));
+    let tmp = path.with_file_name(breadcrumb_tmp_name());
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -25786,14 +25800,25 @@ mod runner_credential_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut saw_probe_write = false;
         while std::time::Instant::now() < deadline {
-            let text =
-                std::fs::read_to_string(&crumb).expect("breadcrumb is written SYNCHRONOUSLY");
+            // The file exists from the synchronous write onward, but the probe
+            // replaces it by rename; on Windows a read that lands inside that
+            // replace can fail (access denied) or see nothing. That is the
+            // reader racing the writer, not a defect, so a failed read is
+            // retried. A read that SUCCEEDS must still hold the credential
+            // verdict.
+            let Ok(text) = std::fs::read_to_string(&crumb) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             assert!(
                 text.contains(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
                 "the breadcrumb must never become a stale-nonce story: {text}"
             );
             let line2 = text.lines().nth(1).unwrap_or_default();
-            let stamp: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
+            let Ok(stamp) = serde_json::from_str::<serde_json::Value>(line2.trim()) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             if stamp["port"].as_u64() == Some(port as u64) {
                 saw_probe_write = true;
                 break;

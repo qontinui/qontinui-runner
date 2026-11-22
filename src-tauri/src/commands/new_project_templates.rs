@@ -541,8 +541,9 @@ mod tests {
             mutate("package.json", &|c| {
                 let pin = format!("\"@qontinui/ui-bridge\": \"{}\"", "^0.21.1");
                 let at = c.find("\"@qontinui/ui-bridge\": \"").unwrap();
-                let end = at + c[at..].find(',').unwrap();
-                format!("{}{}{}", &c[..at], pin, &c[end..])
+                let (head, rest) = c.split_at(at);
+                let (_, tail) = rest.split_at(rest.find(',').unwrap());
+                format!("{head}{pin}{tail}")
             }),
             "is below the runner's",
         );
@@ -574,7 +575,8 @@ mod tests {
             mutate("package.json", &|c| {
                 let key = "\"@qontinui/ui-bridge\": \"";
                 let at = c.find(key).unwrap() + key.len();
-                format!("{}^{}", &c[..at], &c[at..])
+                let (head, tail) = c.split_at(at);
+                format!("{head}^{tail}")
             }),
             "is not an exact version",
         );
@@ -598,13 +600,11 @@ mod tests {
         // `imagery` disjunct has no seed here.
         reddens(
             mutate("design/language.dtcg.json", &|c| {
-                let first = c.find("\"source\": \"undeclared\"").unwrap() + 1;
-                let at = first + c[first..].find("\"source\": \"undeclared\"").unwrap();
-                format!(
-                    "{}\"source\": \"authored(x)\"{}",
-                    &c[..at],
-                    &c[at + "\"source\": \"undeclared\"".len()..]
-                )
+                let needle = "\"source\": \"undeclared\"";
+                let (at, _) = c.match_indices(needle).nth(1).unwrap();
+                let (head, rest) = c.split_at(at);
+                let tail = rest.strip_prefix(needle).unwrap();
+                format!("{head}\"source\": \"authored(x)\"{tail}")
             }),
             "identity leaf type.family.sans is agent-authored",
         );
@@ -680,6 +680,57 @@ mod tests {
                     c.replace(needle, replacement)
                 }),
                 expected,
+            );
+        }
+    }
+
+    /// Parse the lower bound of a `^X.Y.Z` / `~X.Y.Z` / `X.Y.Z` npm range.
+    fn range_floor(range: &str) -> semver::Version {
+        let bare = range.trim().trim_start_matches(['^', '~', '=']);
+        semver::Version::parse(bare)
+            .unwrap_or_else(|e| panic!("unparseable npm range {range:?}: {e}"))
+    }
+
+    fn dep_range(pkg: &serde_json::Value, name: &str) -> Option<String> {
+        ["dependencies", "devDependencies"]
+            .iter()
+            .find_map(|section| pkg.get(section)?.get(name)?.as_str())
+            .map(str::to_string)
+    }
+
+    /// The template's UI Bridge pins must never fall below the runner's own
+    /// pins for the same packages. Both are read at test time — the runner's
+    /// from the repo-root `package.json` — so the two cannot drift apart
+    /// again (the template once sat at `^0.21.1` while the runner shipped
+    /// `^0.53.0`) without this test going red.
+    #[test]
+    fn template_ui_bridge_pins_are_not_below_the_runners_own() {
+        let files = template_files(TEMPLATE_REACT_UI_BRIDGE, "My-App", "my-app").unwrap();
+        let template_pkg: serde_json::Value = serde_json::from_str(
+            &files
+                .iter()
+                .find(|f| f.path == "package.json")
+                .unwrap()
+                .content,
+        )
+        .expect("template package.json is valid JSON");
+
+        let runner_pkg_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../package.json");
+        let runner_pkg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&runner_pkg_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", runner_pkg_path.display())),
+        )
+        .expect("runner package.json is valid JSON");
+
+        for name in ["@qontinui/ui-bridge", "@qontinui/ui-bridge-auto"] {
+            let template = dep_range(&template_pkg, name)
+                .unwrap_or_else(|| panic!("template package.json does not pin {name}"));
+            let runner = dep_range(&runner_pkg, name)
+                .unwrap_or_else(|| panic!("runner package.json does not pin {name}"));
+            assert!(
+                range_floor(&template) >= range_floor(&runner),
+                "template pins {name} {template}, below the runner's own {runner}"
             );
         }
     }
