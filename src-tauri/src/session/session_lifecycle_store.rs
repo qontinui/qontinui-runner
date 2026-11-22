@@ -110,7 +110,7 @@ pub fn snapshot_history_path() -> PathBuf {
 }
 
 /// Closed records older than this are pruned (24h in millis).
-const CLOSED_RETENTION_MS: i64 = 86_400_000;
+pub(crate) const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).
 const OPEN_STALE_MS: i64 = 604_800_000;
 /// A record closed with reason `"pty-exit"` (its PTY died) is still restorable
@@ -239,6 +239,47 @@ fn normalize_origin(origin: Option<String>) -> Option<String> {
         _ => o,
     })
 }
+
+// ---------------------------------------------------------------------------
+// `close_reason` vocabulary — every value a runner writer records.
+//
+// The two FRONTEND reasons arrive through the `terminal_session_record_close`
+// Tauri command (`FrontendSessionCloseReason` in
+// `src/components/terminal/sessionRecordArgs.ts`); the rest are minted by the
+// backend alone. `crate::session::stop_reason` maps each of these to a stop
+// code, a next action and glossary terms, and renders any other string as
+// `unknown` with the raw value — so a writer that records a new reason must
+// add it here AND there, or it surfaces as `unknown`, never as a guess.
+// ---------------------------------------------------------------------------
+
+/// The operator closed the session's tab (frontend).
+pub const CLOSE_REASON_EXPLICIT: &str = "explicit";
+/// The session's process exited while its tab was live (frontend).
+pub const CLOSE_REASON_PTY_EXIT: &str = "pty-exit";
+/// The liveness poll found no agent in the terminal for the full debounce.
+pub const CLOSE_REASON_POLL_DEAD: &str = "poll-dead";
+/// A tile a restore brought back terminal-only idled out with no agent — see
+/// [`close_reason_for_dead_shell`].
+pub const CLOSE_REASON_TERMINAL_ONLY_IDLE: &str = "terminal-only-idle";
+/// A provisional record whose provider never started (a bare shell).
+pub const CLOSE_REASON_NEVER_STARTED: &str = "never-started";
+/// The record's terminal no longer exists (an orphan row).
+pub const CLOSE_REASON_NO_TERMINAL: &str = "no-terminal";
+/// An UNCONFIRMED record evicted when a new session bound its terminal.
+pub const CLOSE_REASON_SUPERSEDED: &str = "superseded";
+/// A CONFIRMED record retired because its terminal now hosts a newer
+/// confirmed session.
+pub const CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE: &str = "superseded-terminal-reuse";
+/// The orchestration loop could not bind its worker and tore it down
+/// (`orchestration_loop::ai_session_executor::teardown_unbound_worker`).
+pub const CLOSE_REASON_WORKER_BIND_FAILED: &str =
+    "orchestration dispatch could not bind the worker";
+/// A death close (`poll-dead` / `pty-exit`) of a pane whose Claude CLI never
+/// launched, rewritten on positive evidence by
+/// `terminal::launch_failure::close_reason_for_launch` (plan
+/// `2026-11-10-migration-holds-for-missing-claude-cli`, D3). Restorable.
+/// `terminal::launch_failure::LAUNCH_FAILED` is this constant.
+pub const CLOSE_REASON_LAUNCH_FAILED: &str = "launch-failed";
 
 /// [`TerminalSessionRecord::wind_down_outcome`] — the graceful exit landed and
 /// the pane was closed.
@@ -837,8 +878,10 @@ pub struct TerminalSessionRecord {
     /// different statement from "it tried and failed" and must not be collapsed
     /// into it.
     ///
-    /// Sticky, like every field around it. `#[serde(default)]`: every record
-    /// already on disk predates the field.
+    /// Sticky for the life of one run; cleared (with
+    /// [`Self::wind_down_at`]) when a CLOSED record re-opens, because a resumed
+    /// session is a new run. `#[serde(default)]`: every record already on disk
+    /// predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wind_down_outcome: Option<String>,
     /// Unix millis when [`Self::wind_down_outcome`] was recorded.
@@ -1423,6 +1466,11 @@ pub enum SetFinishedError {
     Unavailable,
 }
 
+/// The registry could not be read (its lock is poisoned) — returned by the
+/// `_checked` readers so "unreadable" is never collapsed into "no record".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryUnavailable;
+
 /// The result of a [`SessionLifecycleStore::set_finished`] call on a KNOWN
 /// session: the record as it now stands, what changed, and whether coord was
 /// told.
@@ -1986,6 +2034,16 @@ impl SessionLifecycleStore {
             if entry.spawn_device_default.is_none() {
                 entry.spawn_device_default = rec.spawn_device_default.or(inherited_spawn_default);
             }
+            // A CLOSED record re-opening (a resume under the same id) starts a
+            // new run: the previous run's wind-down outcome is not this run's,
+            // and leaving it would let a later close read as "wound down".
+            // An already-open record keeps it (`exit_stuck` / `not_attempted`
+            // are recorded on open records).
+            if entry.state == "closed" {
+                entry.wind_down_outcome = None;
+                entry.wind_down_at = None;
+                entry.wind_down_arm = None;
+            }
             entry.state = "open".to_string();
             entry.closed_at = None;
             entry.close_reason = None;
@@ -2051,7 +2109,7 @@ impl SessionLifecycleStore {
                     if other.confirmed_at.is_none() {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded".to_string());
+                        other.close_reason = Some(CLOSE_REASON_SUPERSEDED.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -2065,7 +2123,8 @@ impl SessionLifecycleStore {
                     } else if new_is_confirmed {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        other.close_reason =
+                            Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -4438,6 +4497,32 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// [`Self::all_records`] for a reader that must not answer "not found"
+    /// from an unreadable registry: a poisoned lock is
+    /// `Err(RegistryUnavailable)`, never an empty `Vec`. `GET
+    /// /sessions/{id}/stop-reason` reads through this so a poisoned lock is a
+    /// 503, not a 404 for a session that may well exist.
+    pub fn all_records_checked(&self) -> Result<Vec<TerminalSessionRecord>, RegistryUnavailable> {
+        match self.map.lock() {
+            Ok(m) => Ok(m.values().cloned().collect()),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on all_records_checked");
+                Err(RegistryUnavailable)
+            }
+        }
+    }
+
+    /// Poison the registry lock, for tests of a reader's unreadable-registry
+    /// arm.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = self.map.lock();
+            panic!("poisoning the session lifecycle registry for a test");
+        }));
+        assert!(self.map.is_poisoned());
+    }
+
     /// Run `f` over [`Self::unsynced_finished_records`] with `finish_forward`
     /// held for the read AND whatever `f` enqueues — the serialized door for
     /// the registrar's late-delivery paths. Without it a delivery could read a
@@ -4867,7 +4952,7 @@ impl SessionLifecycleStore {
                     if let Some(rec) = m.get_mut(id.as_str()) {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
-                        rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        rec.close_reason = Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(rec);
@@ -5132,7 +5217,8 @@ pub struct HeldClose {
 
 /// The close reason the frontend sends when the USER closes a tab
 /// (`FrontendSessionCloseReason` in `sessionRecordArgs.ts`).
-pub const USER_CLOSE_REASON: &str = "explicit";
+/// The same string as [`CLOSE_REASON_EXPLICIT`], by construction.
+pub const USER_CLOSE_REASON: &str = CLOSE_REASON_EXPLICIT;
 
 impl HeldClose {
     /// The user closed the pane — not a child exit, not a poll.
@@ -6630,9 +6716,9 @@ pub fn poll_holds_unmatched_row(
 /// rewrites `"terminal-only-idle"`.
 pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
     if restore_tier == Some(RESTORE_TIER_TERMINAL_ONLY) {
-        "terminal-only-idle"
+        CLOSE_REASON_TERMINAL_ONLY_IDLE
     } else {
-        "poll-dead"
+        CLOSE_REASON_POLL_DEAD
     }
 }
 
@@ -9052,6 +9138,35 @@ mod tests {
         store.record_open(rec("sess-1"));
         store.record_close("sess-1", "poll-dead");
         assert_eq!(fired.load(Ordering::SeqCst), 2);
+    }
+
+    /// A resume under the same id starts a new run: the previous run's
+    /// wind-down outcome is cleared when the CLOSED record re-opens, and kept
+    /// when an already-open record is re-recorded.
+    #[test]
+    fn reopening_a_closed_record_clears_its_wind_down_outcome() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("sess-1"));
+        store.set_wind_down_outcome("sess-1", WIND_DOWN_EXIT_STUCK, WIND_DOWN_ARM_DRAIN, 1_000);
+        store.record_open(rec("sess-1"));
+        assert_eq!(
+            store.get("sess-1").unwrap().wind_down_outcome.as_deref(),
+            Some(WIND_DOWN_EXIT_STUCK)
+        );
+        store.set_wind_down_outcome(
+            "sess-1",
+            WIND_DOWN_CLOSED,
+            WIND_DOWN_ARM_FINISHED_CLOSE,
+            2_000,
+        );
+        store.record_close("sess-1", CLOSE_REASON_EXPLICIT);
+        store.record_open(rec("sess-1"));
+        let r = store.get("sess-1").unwrap();
+        assert_eq!(r.wind_down_outcome, None);
+        assert_eq!(r.wind_down_at, None);
+        assert_eq!(r.wind_down_arm, None);
     }
 
     #[test]
