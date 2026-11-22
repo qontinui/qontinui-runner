@@ -625,6 +625,17 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     };
     if let Some(path) = minted_config.as_ref() {
         mcp_config = identity_mcp_config_args(tool, path.to_str());
+        // Re-export the minted path, so every consumer of MCP_CONFIG_ENV in the
+        // child tree reads the config `claude` was actually given. `qontinui-pr`
+        // takes MCP_CONFIG_ENV as authoritative and refuses a set-but-missing
+        // file rather than walking up to an ancestor `.mcp.json`; without this
+        // export a self-provisioned session would have a working coord-mcp
+        // while its `qontinui-pr` refused (or read a stale value).
+        if !mcp_config.is_empty() {
+            if let Some(p) = path.to_str() {
+                env::set_var(MCP_CONFIG_ENV, p);
+            }
+        }
     }
 
     // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
