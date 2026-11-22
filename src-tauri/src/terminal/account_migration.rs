@@ -823,6 +823,12 @@ fn report_migration_refused(
 /// stop, close the CLI's `/rate-limit-options` menu with its own one `Esc` if
 /// it is showing, then submit [`super::limit_reset::LIMIT_RESET_NUDGE`]
 /// through the idle watcher. No migration cap slot is spent.
+///
+/// The whole continue holds the session in the ONE in-flight registry
+/// ([`claim_for_continue`]), like every other mover: a migration, the resume
+/// door or the respawn receiver cannot start on this session while a prompt
+/// may still be typed into its pane, and a continue does not start while one
+/// of them is moving it (the stop is re-parked instead).
 async fn continue_after_reset(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
@@ -831,6 +837,21 @@ async fn continue_after_reset(
 ) {
     use super::limit_reset::{ContinueRun, ParkReason, Settled};
     let terminal_id = record.terminal_id.clone();
+    let _in_flight = match claim_for_continue(&record.claude_session_id) {
+        Ok(claim) => claim,
+        Err(holder) => {
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                holder,
+                "limit-reset-continue not started — another mover holds this session; re-parked"
+            );
+            let due_at_ms = chrono::Utc::now().timestamp_millis()
+                + super::limit_reset::LIMIT_RESET_MARGIN_MS;
+            park_stop(app, record, src, due_at_ms, ParkReason::ContinueRetry);
+            return;
+        }
+    };
     let run = super::limit_reset::run_continue(
         &super::limit_reset::LEDGER,
         &record.claude_session_id,
@@ -917,6 +938,17 @@ async fn continue_after_reset(
             }
         }
     }
+}
+
+/// The in-flight registry holder a reset-continue claims under.
+const CONTINUE_IN_FLIGHT_HOLDER: &str = "limit-reset-continue";
+
+/// Claim `claude_session_id` in the session in-flight registry for a
+/// reset-continue; `Err(current holder)` when another mover holds it.
+fn claim_for_continue(
+    claude_session_id: &str,
+) -> Result<crate::session::in_flight::SessionInFlight, &'static str> {
+    crate::session::in_flight::SessionInFlight::claim(claude_session_id, CONTINUE_IN_FLIGHT_HOLDER)
 }
 
 /// Send ONE `Esc` when the pane shows the `/rate-limit-options` menu
@@ -2365,7 +2397,10 @@ async fn confirm_migration(
                 carried,
             );
             // The session moved, so its carried stop is not a fresh one on
-            // `dst`: stamp the move, as the proven arm does below.
+            // `dst`: stamp the move, as the proven arm does below. No nudge is
+            // sent here, so the hint path waits out the migration-nudge window
+            // (`limit_reset::MIGRATION_NUDGE_WINDOW_MS`) before it continues
+            // the carried stop itself: a delay, accepted.
             note_migrated(
                 &record.claude_session_id,
                 chrono::Utc::now().timestamp_millis(),
@@ -2928,12 +2963,42 @@ mod tests {
     /// the migration records when it moved a session, and the usage-limit
     /// handler leaves every gate to `limit_hint::run_hint` (which a fake env
     /// tests) and parks a refused stop instead of reporting it as skipped.
+    /// A reset-continue holds the session in the ONE in-flight registry: it
+    /// does not start while another mover holds the session, and while it
+    /// holds it no mover (a migration, the resume door) can start.
+    #[test]
+    fn a_reset_continue_and_a_mover_exclude_each_other() {
+        let sid = "test/account_migration/continue-vs-mover";
+        let door = crate::session::in_flight::SessionInFlight::claim(sid, "resume-door")
+            .expect("free");
+        assert_eq!(claim_for_continue(sid).unwrap_err(), "resume-door");
+        drop(door);
+        let continuing = claim_for_continue(sid).expect("free again");
+        assert_eq!(
+            crate::session::in_flight::SessionInFlight::claim(sid, "account-migration")
+                .unwrap_err(),
+            CONTINUE_IN_FLIGHT_HOLDER
+        );
+        drop(continuing);
+        assert!(!crate::session::in_flight::is_in_flight(sid));
+    }
+
+    /// The continue path takes that claim before it touches the pane.
+    #[test]
+    fn the_continue_claims_the_session_before_it_touches_the_pane() {
+        let body = source_between("\nasync fn continue_after_reset(", "\n/// The in-flight registry holder");
+        let claim = body.find("claim_for_continue(").expect("the continue claims");
+        let menu = body.find("close_rate_limit_menu(").expect("the menu Esc");
+        assert!(claim < menu, "the claim comes before the first keystroke");
+    }
+
     #[test]
     fn the_hint_handler_keeps_no_gate_of_its_own_and_the_migration_stamps_itself() {
         let migrate = source_between("\nasync fn confirm_migration(\n", "\nfn emit_skipped(");
-        assert!(
-            migrate.contains("note_migrated("),
-            "confirm_migration must stamp"
+        assert_eq!(
+            migrate.matches("note_migrated(").count(),
+            2,
+            "confirm_migration stamps on the proven arm and the Unconfirmed arm"
         );
         let handler = source_between(
             "pub async fn handle_usage_limit_hint(",
