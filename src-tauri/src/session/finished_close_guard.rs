@@ -1271,7 +1271,9 @@ mod tests {
             Some("undelivered_message")
         );
         // The full-page reason names the older coord that never echoed the filter.
-        let ArmVerdict::Unknown { detail, .. } = messages_arm("s-1", &Ok(full_page(Some("s-other")))) else {
+        let ArmVerdict::Unknown { detail, .. } =
+            messages_arm("s-1", &Ok(full_page(Some("s-other"))))
+        else {
             panic!("a full unfiltered page is UNKNOWN for an unnamed session");
         };
         assert!(
