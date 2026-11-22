@@ -4176,7 +4176,10 @@ pub(crate) fn record_seed_outcome_at(
                     now.saturating_add(binding_gap_seed_backoff(rec.seed_unanswered));
             }
         }
-        rearmed = !rec.seed_attempted && save_gap_ask_state(path, &state);
+        // Save first, unconditionally: an answered outcome must be persisted
+        // too (it is what keeps a `not_bound` lapse silent).
+        let still_armed = !rec.seed_attempted;
+        rearmed = save_gap_ask_state(path, &state) && still_armed;
     }
     rearmed
 }
@@ -15536,6 +15539,12 @@ mod tenant_seed_arm_tests {
     }
 
     fn tenant(n: u8) -> uuid::Uuid {
+        // 0..=5 keep their repeated-letter form (`aaaaaaaa-…` … `ffffffff-…`);
+        // past that a letter is not hex, so the index itself is spelled out.
+        if n >= 6 {
+            return uuid::Uuid::parse_str(&format!("{n:08x}-0000-4000-8000-{n:012x}"))
+                .expect("valid uuid");
+        }
         uuid::Uuid::parse_str(&format!(
             "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
             c = (b'a' + n) as char
