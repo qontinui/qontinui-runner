@@ -3825,7 +3825,7 @@ mod console_window_guard {
         let raw = "fn f() {\n    let mut c = std::process::Command::new(\"x\");\n    \
                    c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);\n}\n";
         // An argument that spans lines is reported where the flag is named.
-        let multi_line = "fn f(c: &mut C) {\n    c.creation_flags(\n        CREATE_NEW_PROCESS_GROUP\n            \
+        let multi_line = "fn f(c: &mut C) {\n    c.creation_flags(\n        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP\n            \
                           | CREATE_NEW_CONSOLE,\n    );\n}\n";
         let alias =
             "const VISIBLE: u32 = 0x0000_0010;\nfn f(c: &mut C) { c.creation_flags(VISIBLE); }\n";
