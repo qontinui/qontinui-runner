@@ -810,6 +810,64 @@ async fn an_ignored_scaffolding_entry_is_deleted_and_the_tree_removed() {
     assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
 }
 
+/// The breadcrumb's crash-left temp file, under the managed exclude glob that
+/// `fleet::MANAGED_REPO_EXCLUDES` writes, reaches reclaim as an `!!` entry:
+/// it is runner scaffolding, so it is deleted and the tree goes.
+#[tokio::test]
+async fn a_crash_left_breadcrumb_temp_file_is_deleted_and_the_tree_removed() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    std::fs::create_dir_all(fx.canonical.join(".git/info")).unwrap();
+    std::fs::write(
+        fx.canonical.join(".git/info/exclude"),
+        ".coord-mcp-status.tmp-*\n",
+    )
+    .unwrap();
+    provision_scaffolding(&tree);
+    let name = crate::coord_mcp::breadcrumb_tmp_name();
+    std::fs::write(tree.join(&name), "degraded\n").unwrap();
+    assert!(git(&tree, &["status", "--porcelain", "--ignored"]).contains(&format!("!! {name}")));
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+}
+
+/// A DIRECTORY carrying the temp file's name is not the runner's: its content
+/// keeps the tree, as ignored non-scaffolding content, rather than being
+/// deleted. (Under `-uall` git lists the files inside it; the collapsed
+/// `name/` spelling is pinned by `dirty`'s unit tests.)
+#[tokio::test]
+async fn a_directory_named_like_the_breadcrumb_temp_keeps_the_tree() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    std::fs::create_dir_all(fx.canonical.join(".git/info")).unwrap();
+    std::fs::write(
+        fx.canonical.join(".git/info/exclude"),
+        ".coord-mcp-status.tmp-*\n",
+    )
+    .unwrap();
+    provision_scaffolding(&tree);
+    let dir = tree.join(".coord-mcp-status.tmp-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("notes.txt"), "operator work\n").unwrap();
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert!(
+        matches!(
+            only_outcome(&report),
+            TreeOutcome::Kept(KeepReason::IgnoredContent(p))
+                if p.starts_with(".coord-mcp-status.tmp-1")
+        ),
+        "{:?}",
+        only_outcome(&report)
+    );
+    assert!(dir.join("notes.txt").exists());
+}
+
 /// Review A5: an install past the bound is aborted (it was at an await
 /// point, so the abort lands) and the removal proceeds.
 #[tokio::test]

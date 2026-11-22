@@ -1512,9 +1512,15 @@ fn the_retry_door_does_not_resend_to_the_stale_row_after_a_readdress() {
 #[test]
 fn the_readdress_flag_follows_only_its_own_row() {
     let (_d, store, at) = unsynced_store("flag");
-    assert!(!store.note_finish_readdressed("flag", at + 1, other_row(), false));
-    assert!(!store.note_finish_readdressed("ghost", at, other_row(), false));
-    assert!(store.note_finish_readdressed("flag", at, other_row(), false));
+    assert!(!store.note_finish_readdressed("flag", at + 1, other_row(), false, None));
+    assert!(!store.note_finish_readdressed("ghost", at, other_row(), false, None));
+    assert!(store.note_finish_readdressed(
+        "flag",
+        at,
+        other_row(),
+        false,
+        store.get("flag").unwrap().finish_coord_session_id,
+    ));
     let rec = store.get("flag").unwrap();
     assert!(rec.finish_coord_readdressed);
     assert_eq!(rec.finish_coord_session_id, Some(other_row()));
@@ -1529,9 +1535,21 @@ fn the_readdress_flag_follows_only_its_own_row() {
 
     // A synced mark has its stamp withdrawn in the same step.
     let (_d2, synced, sat) = synced_store("flag-synced");
-    assert!(synced.note_finish_readdressed("flag-synced", sat, other_row(), true));
+    assert!(synced.note_finish_readdressed(
+        "flag-synced",
+        sat,
+        other_row(),
+        true,
+        synced.get("flag-synced").unwrap().finish_coord_session_id,
+    ));
     // A second heal over the same synced snapshot is refused: one re-send.
-    assert!(!synced.note_finish_readdressed("flag-synced", sat, other_row(), true));
+    assert!(!synced.note_finish_readdressed(
+        "flag-synced",
+        sat,
+        other_row(),
+        true,
+        synced.get("flag-synced").unwrap().finish_coord_session_id,
+    ));
     let rec = synced.get("flag-synced").unwrap();
     assert!(!rec.finish_synced);
     assert!(rec.finish_coord_readdressed);
@@ -1540,7 +1558,13 @@ fn the_readdress_flag_follows_only_its_own_row() {
     // keeps it.
     synced.mark_finish_synced_on("flag-synced", Some(sat), Some(other_row()));
     assert!(synced.get("flag-synced").unwrap().finish_coord_readdressed);
-    assert!(synced.note_finish_readdressed("flag-synced", sat, other_row(), true));
+    assert!(synced.note_finish_readdressed(
+        "flag-synced",
+        sat,
+        other_row(),
+        true,
+        synced.get("flag-synced").unwrap().finish_coord_session_id,
+    ));
     synced.mark_finish_synced_on("flag-synced", Some(sat), Some(row()));
     let rec = synced.get("flag-synced").unwrap();
     assert!(!rec.finish_coord_readdressed);

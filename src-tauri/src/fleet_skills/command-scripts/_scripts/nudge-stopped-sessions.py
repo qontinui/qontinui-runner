@@ -1103,6 +1103,79 @@ def cross_screen_selftest():
     return bad, 6
 
 
+def stop_hook_selftest():
+    """Plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival
+    Phase 1: a session coord finished at 30 s whose only later record is its
+    finishing turn's meta `Stop hook feedback:` continuation (close-screen cell
+    1, cfs.stop_hook_transcript) is never STOPPED. (a) end to end: the close
+    screen's own verdict through judge reads FINISHED (a linked worktree) or
+    CUSTODY (no repository), which judge passes through. (b) a stale ACTIVE
+    close verdict for the same facts is HELD, `no prompt since`. A genuine
+    wake after the continuation (cell 3) still reads STOPPED. Every runner read
+    but the transcript is stubbed. Returns (failures, checks, judge-hold pins)."""
+    import tempfile
+    bad, checks, pins = [], 0, 0
+    t0 = cfs.T0_CELLS
+
+    def rec(kind, sec, content, **kw):
+        stamp = dt.datetime.fromtimestamp((t0 + sec * 1000) / 1000, dt.timezone.utc).isoformat()
+        msg = {"role": kind, "content": content}
+        if "stop" in kw:
+            msg["stop_reason"] = kw.pop("stop")
+        return dict({"type": kind, "timestamp": stamp, "message": msg}, **kw)
+
+    def said(sec, stop="end_turn"):
+        return rec("assistant", sec, [{"type": "text", "text": "ok"}], stop=stop)
+    tool = [{"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": "ls"}}]
+    result = [{"type": "tool_result", "tool_use_id": "u1", "content": "x"}]
+    wake = "<task-notification><task-id>b1</task-id> background build finished"
+    reg = {"claudeSessionId": "s1"}
+    ready = {"s1": {"sessionStatus": "finished", "sessionStatusSince": t0 + 30 * 1000}}
+    facts = row_facts(reg, ready)
+    now = time.time() * 1000
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "projects", "x"))
+        for cell, cwd, want_close, want_nudge in ((1, cfs.LINKED_CWD, "FINISHED", "FINISHED"),
+                                                 (1, "/w/no-repo", "CUSTODY", "CUSTODY"),
+                                                 (3, cfs.LINKED_CWD, "REVIVED", "STOPPED")):
+            recs = [dict(r, cwd=cwd) if r.get("type") == "user" else r
+                    for r in cfs.stop_hook_transcript(rec, said, tool, result, wake, cell)]
+            with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in recs))
+            tx = cfs.transcript_facts({"configDir": d, "claudeSessionId": "s"})
+            stubs = {"proc_facts": lambda table, pid, windows=None: ([11], [], []),
+                     "live_session_ids": lambda claudes: {"s1"}, "raw_tail": lambda tid, chars=30000: "screen",
+                     "running_turn": lambda text: False, "prompt_state": lambda raw, *, cols: ("empty", ""),
+                     "wrap_cols": lambda term, windows=None: None, "transcript_facts": lambda row, tx=tx: dict(tx),
+                     "git_rev_parse_dirs": cfs.fake_git_dirs}
+            saved = {k: getattr(cfs, k) for k in stubs}
+            try:
+                for k, v in stubs.items():
+                    setattr(cfs, k, v)
+                verdict, why = cfs.classify({"id": "t1", "isAlive": True, "pid": 10}, reg, {10: (1, ["bash"])}, 15,
+                                            "", ready)
+            finally:
+                for k, v in saved.items():
+                    setattr(cfs, k, v)
+            judged, reasons = judge(verdict, why, facts, tx, now, None)
+            checks += 1
+            if (verdict, judged) != (want_close, want_nudge):
+                bad.append(f"stop-hook cell {cell} ({cwd}): close reads {verdict} {why}, nudge {judged} {reasons}; "
+                           f"want {want_close}, then {want_nudge}")
+            if cell == 1:
+                # (b) a close verdict read before the finish (ACTIVE) is held by the finish rule. It pins judge's
+                # existing hold, not the reader, so its facts are the case 1 facts as the reader should state
+                # them (the newest turn opener is the prompt), and it passes before the reader fix and after it.
+                tx_b = dict(tx, last_turn_open=tx["last_prompt"], last_turn_open_text=tx["last_prompt_text"],
+                            last_turn_open_class="prompt")
+                judged_b, reasons_b = judge("ACTIVE", [], facts, tx_b, now, None)
+                pins += 1
+                if judged_b != "HELD" or "no prompt since" not in "; ".join(reasons_b):
+                    bad.append(f"stop-hook cell 1 ({cwd}) from a stale ACTIVE verdict: nudge {judged_b} "
+                               f"{reasons_b}; want HELD, no prompt since")
+    return bad, checks, pins
+
+
 def trusted_finish_selftest():
     """Both screens hand cfs.finish_state the same inputs (pre-PR review of the
     triage ten-gaps branch): a runner mark /unattended set ("unattended: ...")
@@ -2101,6 +2174,8 @@ def selftest():
     bad += trusted_bad
     cross_bad, cross_checks = cross_screen_selftest()
     bad += cross_bad
+    stop_hook_bad, stop_hook_checks, stop_hook_pins = stop_hook_selftest()
+    bad += stop_hook_bad
     menu_bad, menu_checks = menu_limit_selftest()
     bad += menu_bad
     fit_bad, fit_checks = report_fit_selftest()
@@ -2112,7 +2187,7 @@ def selftest():
           f"{len(phase6_cases)} finish-rule cases, "
           f"{len(complete_cases)} completion cases, {len(transcript_cases) + 11} transcript cases, "
           f"2 send cases, {roster_checks} verdict-roster checks, {trusted_checks} trusted-finish checks, "
-          f"{cross_checks} cross-screen checks, "
+          f"{cross_checks} cross-screen checks, {stop_hook_checks} stop-hook checks + {stop_hook_pins} judge-hold pins, "
           f"{menu_checks} open-menu checks, {fit_checks} report-fit checks, "
           f"{len(bad)} failure(s)")
     return 1 if bad else 0

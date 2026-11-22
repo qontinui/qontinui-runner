@@ -1728,7 +1728,8 @@ an admin-merge happened — produces a plan so the defect class dies:
   no missing gate [policy:
   session-finished-at-green-not-at-merged, tightened by operator decision
   2026-10-17: checks still running no longer hold it open]. Shepherding them to merge is coord's
-  merge train, plus its `ci_rework` / `stuck_pr_nudge` dispatch [policy:
+  merge train, plus its `ci_rework` / `escalate_evidence` / `pr_blocked` /
+  `stuck_pr_nudge` dispatch [policy:
   finishing-is-a-handoff-not-an-abandonment]. That splits this command into two
   uses, and they stop at different points:
   - **Closeout of the authoring session** — the session that authored the PRs
