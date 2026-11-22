@@ -966,8 +966,12 @@ mod tests {
     /// A device screenshot server answering every request with `status` and
     /// `body` (`None` = an empty body). Returns its base url.
     async fn answering(status: axum::http::StatusCode, body: Option<serde_json::Value>) -> String {
+        // A named const, not a literal: `doc_route_agreement` reads every
+        // `.route("<literal>", …)` in the crate as a route the RUNNER serves,
+        // and this is a stand-in for a DEVICE's door, not the runner's.
+        const DEVICE_SCREENSHOT_PATH: &str = "/ui-bridge/control/screenshot";
         let app = axum::Router::new().route(
-            "/ui-bridge/control/screenshot",
+            DEVICE_SCREENSHOT_PATH,
             axum::routing::get(move || {
                 let body = body.clone();
                 async move {
