@@ -511,7 +511,10 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// differ from the last: a rule that only avoided equality with `prev` let a
 /// burst inside one millisecond cycle t, t+1, t, so a late ACK of the first
 /// mark synced the third. The one-second bound keeps a clock stepped well
-/// backwards from dating the new finish in the future. Pure.
+/// backwards from dating the new finish in the future. The accepted cost: a
+/// stamp may run up to ~1 s ahead of the wall clock, which can put a pane bound
+/// inside that window on the wrong side of a `finished_at` comparison such as
+/// the re-offer's revival guard. Pure.
 fn restamp_at(prev: i64, now: i64) -> i64 {
     if now <= prev && prev - now < 1_000 {
         prev.saturating_add(1)
@@ -9550,12 +9553,12 @@ mod tests {
         );
     }
 
-    /// A restamp only has to DIFFER from the old stamp (that is all the ACK
-    /// matcher needs): two finishes inside one millisecond still differ, and a
-    /// clock stepped backwards dates the new finish at `now` rather than
-    /// pushing it past the old one into the future.
+    /// A restamp always clears the old stamp: two finishes inside one
+    /// millisecond, or a clock less than a second behind, give one past it;
+    /// a clock stepped back a second or more dates the new finish at `now`
+    /// rather than pushing it far into the future.
     #[test]
-    fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
+    fn a_restamp_always_differs_and_never_runs_far_ahead_of_the_clock() {
         assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
         assert_eq!(
             restamp_at(1_000, 5_000),
