@@ -1174,7 +1174,9 @@ pub struct SizeMeasurement {
     /// once, and an inode that is still linked from outside the directory
     /// counted not at all (a pnpm `node_modules` hardlinks its packages from
     /// the content-addressed store, so its apparent size is mostly the
-    /// store's). `None` = UNKNOWN: off unix there is no link count to read.
+    /// store's). `None` = UNKNOWN: off unix there is no link count to read,
+    /// and a walk that hit an unreadable sub-directory (`unreadable_dirs > 0`)
+    /// cannot tell an outside link from one hidden in the unread part.
     /// Plan `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
     pub exclusive_bytes: Option<u64>,
 }
@@ -1197,7 +1199,11 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
             .values()
             .filter(|(_, nlink, seen)| seen >= nlink)
             .fold(0u64, |acc, (len, _, _)| acc.saturating_add(*len));
-        m.exclusive_bytes = Some(unique_bytes.saturating_add(shared_freed));
+        // A partial walk cannot tell an outside link from one in the unread
+        // part, so its figure is not exact: UNKNOWN, never a lower bound
+        // presented as a measurement.
+        m.exclusive_bytes =
+            (m.unreadable_dirs == 0).then(|| unique_bytes.saturating_add(shared_freed));
         Some(m)
     }
     #[cfg(not(unix))]
@@ -5546,6 +5552,40 @@ mod tests {",
         );
         #[cfg(not(unix))]
         assert_eq!(m.exclusive_bytes, None, "no link count off unix: UNKNOWN");
+    }
+
+    /// A walk that could not read a sub-directory reports exclusivity as
+    /// UNKNOWN: the hidden part may hold the other link of an inode it saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_walk_reports_exclusive_bytes_as_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("seen.bin"), vec![0u8; 10]).unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::hard_link(root.join("seen.bin"), locked.join("other.bin")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_dir(&locked).is_ok();
+        let m = measure_dir_size(root);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable_anyway {
+            // Running as root: permissions do not bind, nothing to observe.
+            return;
+        }
+        let m = m.expect("root is readable");
+        assert_eq!(m.unreadable_dirs, 1);
+        assert_eq!(
+            m.exclusive_bytes, None,
+            "a lower bound is not a measurement"
+        );
+        let full = measure_dir_size(root).expect("readable again");
+        assert_eq!(
+            full.exclusive_bytes,
+            Some(10),
+            "both links in-tree: freed once"
+        );
     }
 
     /// Exclusive bytes count each inode once and drop an inode still linked

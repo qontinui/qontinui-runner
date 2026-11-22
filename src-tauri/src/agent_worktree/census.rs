@@ -1107,7 +1107,10 @@ pub struct WorktreeCensus {
     /// apparent bytes (`nm_bytes` / `target_bytes`) where exclusivity is
     /// `None` (Windows). A junctioned dir contributes 0. A pnpm tree
     /// hardlinked from the store therefore contributes only its unshared
-    /// bytes, not its apparent size.
+    /// bytes, not its apparent size. Each dir is measured on its own, so an
+    /// inode linked from BOTH `node_modules` and `target`, or from several
+    /// worktrees once the store copy is pruned, counts 0 in each: summed
+    /// across rows this is a lower bound on what removing them all frees.
     pub attributable_bytes: u64,
 
     /// G2 "work landed" — whether this worktree's HEAD is already
@@ -1455,7 +1458,7 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64, Option<u64>) {
 
 /// [`WorktreeCensus::attributable_bytes`]: per dir, the exclusive bytes where
 /// measured, else the apparent bytes.
-fn attributable_bytes(
+fn reclaimable_footprint(
     nm_bytes: u64,
     nm_exclusive_bytes: Option<u64>,
     target_bytes: u64,
@@ -2531,7 +2534,7 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         .and_then(|m| m.modified().ok())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
 
-    let attributable_bytes = attributable_bytes(
+    let attributable_bytes = reclaimable_footprint(
         nm_bytes,
         nm_exclusive_bytes,
         target_bytes,
@@ -7016,10 +7019,10 @@ mod tests {",
     }
 
     #[test]
-    fn attributable_bytes_fall_back_to_apparent_where_exclusivity_is_unknown() {
-        assert_eq!(attributable_bytes(10, None, 20, None), 30);
-        assert_eq!(attributable_bytes(10, Some(1), 20, None), 21);
-        assert_eq!(attributable_bytes(10, Some(1), 20, Some(2)), 3);
+    fn reclaimable_footprint_falls_back_to_apparent_where_exclusivity_is_unknown() {
+        assert_eq!(reclaimable_footprint(10, None, 20, None), 30);
+        assert_eq!(reclaimable_footprint(10, Some(1), 20, None), 21);
+        assert_eq!(reclaimable_footprint(10, Some(1), 20, Some(2)), 3);
     }
 
     // ── CRITICAL-2 regression: a wedged git must not publish "clean" ────────
