@@ -1,6 +1,6 @@
 ---
 name: visual-audit
-description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the 20-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag, and eight L1 image assertions). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
+description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the assertion DSL, whose authority is vision-core's `enum Assertion` (qontinui-schemas `rust-vision-core/src/assertions/mod.rs`) — geometry and text (no_overlap, element_above, contains_text, text_fits_container, aligned_*, no_clipping, no_layout_shift_since), colour and type (color_within, typography_consistent, contrast_meets_wcag), the timeline assertions (animation_settled, settled_within, state_entered_within), the L1 image assertions over the frame, and the L0 image assertions over the page's media facts. Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
 user-invocable: true
 ---
 
@@ -16,8 +16,10 @@ that turn declarative visual questions into structured answers:
 | `POST /ui-bridge/vision/baseline` | Capture a baseline image + register the snapshot's element bboxes under `name`. |
 | `GET  /ui-bridge/vision/baselines` | List registered baselines. |
 
-`/control/visibility`, discussed later, is **not** among them — it lives on the
-web UI Bridge SDK, a different surface, and the runner 404s it.
+`/control/visibility`, discussed later, is **not** among them — it is a
+UI Bridge control route, served by the web UI Bridge SDK and, on the runner,
+by its own Rust twin — served (`screenshots.rs` `route_entries`, since
+2026-08-30).
 
 Both `analyze` and `assert` require a **caller-supplied ElementSnapshot**.
 > ### ⚠️ A raw `discover` payload is NOT a snapshot. Project it first.
@@ -53,10 +55,11 @@ Get the snapshot from the runner's own `discover` endpoint and run it through
 the projection script:
 
 ```bash
+# envelope-ok: discover is read by uibridge-to-elementsnapshot.py, whose unwrap() refuses an unrecognised shape (exit 1, stderr) rather than emit an empty snapshot. This fence-level waiver also clears the analyze/assert doors below; their direct reads stay baselined, to migrate separately
 # 1. Discover -> project into a real ElementSnapshot.
 #    --stats goes to stderr; READ IT (see below).
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
-     -H 'Content-Type: application/json' -d '{"interactive_only":false}' \
+     -H 'Content-Type: application/json' -d '{"interactive_only":false,"includeHidden":true,"includeMedia":true}' \
   | python3 "$ROOT/qontinui-claude-config/scripts/uibridge-to-elementsnapshot.py" \
       --stats > /tmp/snapshot.json
 
@@ -137,7 +140,8 @@ painted under an overlay.
 ### No runner window? The checks still run.
 
 `analyze` and `assert` capture a frame **best-effort**. Layout, typography and
-elements are pure geometry over the snapshot, and only the L1 image assertions
+elements are pure geometry over the snapshot, the L0 image assertions read
+`Element.media` and the facts saying what paints, and only the L1 image assertions
 read the frame, so a runner reporting `frontendState: "window_missing"` still
 answers every geometric question. A failed capture comes back as
 `frameError` in the response — check for it rather than assuming the pixels
@@ -204,7 +208,7 @@ the runner desktop. Omit `target` for the default runner-desktop behavior.
 |---|---|
 | **layout** | **Directed occlusion** (which element is on top and what it hides — see below), pairwise overlap among interactive elements (ignoring nested layouts), zero-area elements, alignment jitter on near-y-baseline groups (3+ elements within 3px). |
 | **typography** | Font-family + font-size cluster counts. Flags >3 distinct families or >8 distinct sizes (warning + info — usual sign of design-system drift). |
-| **color** | WCAG contrast for every text element with both `fg_color` and `bg_color` populated. Flags individual sub-AA (4.5:1) elements + a "contrast density" warning when ≥25% of text fails. |
+| **color** | WCAG contrast for every text element with both `fg_color` and `bg_color` populated. Flags individual sub-AA elements (4.5:1 for normal text, 3:1 for large text — ≥24px, or ≥18.66px at weight 700+; an unmeasured size or weight counts as normal) + a "contrast density" warning when ≥25% of text fails. |
 | **dynamic** | Two-frame pixel diff. Currently requires the caller to wire up a `prior_frame` source; this maps to `vision/diff` for now. |
 | **elements** | Empty-snapshot detection, no-interactive / no-text smell, sub-24×24 interactive targets (WCAG 2.5.8). |
 | **image** | Per-image pixel VALUES, never a verdict. For every snapshot element carrying `media`, read from its crop of the frame: effective resolution and aspect distortion (object-fit aware), sharpness and compression blockiness, an OKLab palette with a photographic/flat class, busyness (also under text laid over it), pHash and dHash, placeholder signals, edge contrast against the surround, the natural-image region left visible, and saliency; for the page, colourfulness, clutter and white space, plus near-duplicate pairs. Needs the frame (`Blocked` without one); an image-free snapshot is `Degraded`, which is green. |
@@ -273,7 +277,7 @@ bounding-box model cannot derive.
 |---|---|
 | Web SDK in-page (`@qontinui/ui-bridge` server handlers) | **served** |
 | qontinui-web relay (`:3001/api/ui-bridge`, `https://qontinui.io/api/ui-bridge`) | **served** — relay twin, hit-test half only, so findings are a SUBSET of the in-page endpoint's |
-| Runner `:9876` (Tauri WebView) | **404 — not served.** The runner has its own **Rust** route table (`qontinui-runner/src-tauri/src/mcp/ui_bridge/routing.rs`); the frontend's `@qontinui/ui-bridge` npm dependency does not put routes on that port |
+| Runner `:9876` (Tauri WebView) | **served** (`screenshots.rs` `route_entries`, since 2026-08-30) — `POST /ui-bridge/control/visibility`, the runner's own **Rust** twin (`qontinui-runner/src-tauri/src/mcp/ui_bridge/screenshots.rs` `ui_bridge_visibility_handler`), not the frontend's `@qontinui/ui-bridge` npm dependency. A runner build older than 2026-08-30 404s it |
 | React Native (`@qontinui/ui-bridge-native`) | **404 — not served**, pinned by `packages/ui-bridge-native/src/server/__tests__/http-status-mapping.test.ts` |
 
 ```bash
@@ -289,12 +293,14 @@ curl -fsS -X POST http://localhost:3001/api/ui-bridge/control/visibility \
 **Only ask this of the surface you are actually auditing.** The endpoint
 answers about the surface it is sent to, and `:3001` is qontinui-web — not the
 runner. This skill's own worked example is a *runner* page (the Terminal-page
-occlusion bug above), and for that page the command has no correct target:
+occlusion bug above), and for that page the `:3001` command is the wrong target:
 running it anyway returns a healthy-looking 200 about qontinui-web, which is
-worse than the 404 in the table, because nothing in the response marks it as
-off-target. **On the runner and on React Native there is no visibility endpoint
-to reach** — record occlusion as UNVERIFIED and use `analyze`'s `occlusion`
-finding, which reaches every surface that can produce a snapshot.
+worse than a 404, because nothing in the response marks it as off-target. For a
+runner page, send it to the runner's own route,
+`POST http://127.0.0.1:9876/ui-bridge/control/visibility`. **On React Native
+there is no visibility endpoint to reach** — record occlusion as UNVERIFIED and
+use `analyze`'s `occlusion` finding, which reaches every surface that can
+produce a snapshot.
 
 `verdict` is `clear`, `occlusions_found`, or `unknown_empty_registry` — the
 last of which is why an empty `occlusions` list is not automatically good
@@ -343,7 +349,9 @@ Each assertion is a tagged-JSON object:
 | `typography_consistent` | `{"type":"typography_consistent","elements":["h1","h2"],"dimensions":["font_family"]}` |
 | `no_layout_shift_since` | `{"type":"no_layout_shift_since","baseline":"v1.0-home","tolerance_px":2}` |
 | `no_clipping` | `{"type":"no_clipping","region":{"x":0,"y":0,"w":1280,"h":720}}` |
-| `animation_settled` | `{"type":"animation_settled","region":null,"settle_frames":3}` |
+| `animation_settled` | `{"type":"animation_settled","region":null}` — no CSS animation or transition is still running when the interaction's timeline ended. A `region` set while one is still running answers `unknown` (the timeline names targets by fingerprint, not geometry). A `settle_frames` key is ignored if sent. Reads the timeline. |
+| `settled_within` | `{"type":"settled_within","ms":500}` — the timeline's `summary.settleMs` is at most `ms`. A recording that covered `ms` and never settled fails; one that stopped short of `ms` without settling is `unknown`. `ms` is the caller's bound; there is no default. Reads the timeline. |
+| `state_entered_within` | `{"type":"state_entered_within","state":"saved-toast","ms":2000}` — the declared UI state became active within `ms` of the action (the timeline's `summary.expectedStates` entry, requested with `expectStates` + `withinMs`, else its `state-entered` events). A state already active throughout FAILS. Reads the timeline. |
 | `contrast_meets_wcag` | `{"type":"contrast_meets_wcag","element":"btn-save","level":"aa"}` |
 | `image_palette_within` | `{"type":"image_palette_within","element":"hero","palette":[{"r":20,"g":40,"b":90}],"max_delta_e":10,"min_coverage":0.6}` — at least `min_coverage` of the image's pixels lie within `max_delta_e` (CIEDE2000) of a palette colour. Reads the frame. |
 | `no_near_duplicate_images` | `{"type":"no_near_duplicate_images","max_hamming":6}` — no two images' pHashes within `max_hamming` bits. Reads the frame. |
@@ -353,6 +361,40 @@ Each assertion is a tagged-JSON object:
 | `salience_order` | `{"type":"salience_order","cta_id":"cta-signup"}` — the CTA is the most salient interactive or media element. Reads the frame. |
 | `image_sharpness_at_least` | `{"type":"image_sharpness_at_least","element":"hero","min_sharpness":50}` — variance of the Laplacian at the rendered scale. Reads the frame. |
 | `image_blockiness_within` | `{"type":"image_blockiness_within","element":"hero","max_blockiness":1.5}` — compression blockiness (~1.0 is clean). Reads the frame. |
+| `image_loaded` | `{"type":"image_loaded"}` (or `"element":"hero"`) — the image finished loading and painted. A failed load fails; still loading is `unknown`. Page-wide, an off-screen lazy image has not been asked to load and is left out. |
+| `image_resolution_sufficient` | `{"type":"image_resolution_sufficient","min_effective":1}` — source pixels per device pixel reach `min_effective`. Vectors, CSS backgrounds and `role=img` are left out. An `img` whose `format` names no raster may be a vector, so where it would fail it answers `unknown`. |
+| `image_not_distorted` | `{"type":"image_not_distorted","max_aspect_delta":0.02}` — only `object-fit: fill` can fail. `contain`, `cover`, `none` and `scale-down` hold without reading a size, so a non-uniform `transform` on one goes unseen. The rendered size is the border box after transforms, so under `fill` a transform, padding, a border or a rotation can read as distortion: set `max_aspect_delta` to suit. |
+| `image_dims_reserved` | `{"type":"image_dims_reserved"}` — the box is sized without waiting for the image. Judges `img`, `picture`, `video`. |
+| `lcp_image_prioritized` | `{"type":"lcp_image_prioritized"}` — the LCP image is not lazy and has `fetchpriority=high`. Any other image is left out. |
+| `image_has_text_alternative` | `{"type":"image_has_text_alternative"}` — decorative, or an alt that is not generic (`image`, `logo`, a bare number). Video and canvas are left out. |
+| `image_not_oversized` | `{"type":"image_not_oversized","max_effective":2.5}` — source pixels per device pixel are at most `max_effective`. Same exclusions as `image_resolution_sufficient`. |
+| `image_weight_within` | `{"type":"image_weight_within","max_bytes":500000}` — `transfer_bytes` is at most `max_bytes`. A hidden image is still weighed. An unfinished off-screen lazy image with a non-zero box is left out with its weight unseen; any other lazy image with no measured weight answers `unknown`. |
+| `offscreen_image_lazy` | `{"type":"offscreen_image_lazy"}` — an `img`/`picture` outside the viewport is lazy. The LCP element is left out. |
+| `no_duplicate_images` | `{"type":"no_duplicate_images"}` — no two rendered images display the same source (`src_digest`). Only valid against an SDK containing ui-bridge `1667c24`: an older one registers each `<picture>` twice, so every `<picture>` reads as a duplicate. Perceptual copies are `no_near_duplicate_images`. |
+
+The authority for the variant set is vision-core's `enum Assertion`
+(qontinui-schemas `rust-vision-core/src/assertions/mod.rs`); when the two
+disagree, the enum is right and this table is stale. The three timeline rows
+(`animation_settled`, `settled_within`, `state_entered_within`) read an
+interaction timeline, not the snapshot or the frame. With none supplied they
+answer `outcome: "unknown"`, and the detail names where one comes from: the UI
+Bridge SDK's `POST /ai/execute-with-diff` records it
+(`ActionDiffResult.timeline`), and the runner's `POST /ui-bridge/vision/assert`
+takes it as `timeline_ref` (a journey edge-observation id).
+
+The ten L0 rows above read `Element.media`, plus the box and `visibility_reason`
+to leave out what paints nothing. They need no frame. Ask for media, as the web
+discover calls here do with `includeMedia`: an older web SDK leaves media rows out
+otherwise. They fold page-wide: any failing image fails the assertion
+and its detail names each id; otherwise any unmeasured image answers
+`outcome: "unknown"`, and so does a snapshot with no rendered `media` at all,
+which cannot be told apart from a producer that was never asked
+(two exceptions: `image_weight_within` still weighs a hidden image, and
+`image_loaded` fails a broken zero-area image and answers `unknown` for
+one still loading). For a
+per-image outcome send one assertion per media id, as the example below does.
+Named explicitly, an image the check cannot judge answers `unknown`, not a pass.
+They need a runner that serves these variants.
 
 Every threshold on an image assertion is the CALLER's (a slot spec or the
 visual system); an omitted one answers `outcome: "unknown"`, never a pass.
@@ -378,10 +420,11 @@ with a disclosed count (a slot placeholder marker on one still fails).
 ### Example: audit the page for the kinds of bugs Phase 6 was designed to catch
 
 ```bash
+# envelope-ok: discover is read by uibridge-to-elementsnapshot.py, whose unwrap() refuses an unrecognised shape (exit 1, stderr) rather than emit an empty snapshot. This fence-level waiver also clears the analyze/assert doors below; their direct reads stay baselined, to migrate separately
 # PROJECT FIRST. `discover | jq '.data'` is not a snapshot — see the warning at
 # the top of this file; it returns zero findings on a broken page.
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
-     -H 'Content-Type: application/json' -d '{"interactive_only":false}' \
+     -H 'Content-Type: application/json' -d '{"interactive_only":false,"includeHidden":true,"includeMedia":true}' \
   | python3 "$ROOT/qontinui-claude-config/scripts/uibridge-to-elementsnapshot.py" \
       --stats > /tmp/snapshot.json
 SNAP=$(cat /tmp/snapshot.json)
@@ -465,6 +508,54 @@ even when you did, because the analyzer decides (`dynamic` never sets it).
 snapshot, so it does not tell you whether the input you posted was stale —
 nothing in either response does yet. `evaluatedAt` dates the answer.
 
+### Example: the page's image block
+
+```bash
+# envelope-ok: the assert reply is printed for a human to read per result, never parsed into a verdict here
+# Uses /tmp/snapshot.json from the block above, and a runner that serves the L0
+# variants. An older one answers 422 `unknown variant` for the whole list, in the
+# body that -f would discard, hence -sS.
+python3 -c '
+import json
+snap = json.load(open("/tmp/snapshot.json"))
+# PLACEHOLDERS, not defaults: replace each from the slot spec or visual system,
+# or drop a threshold you have none for, and that check answers unknown.
+checks = [
+    {"type": "image_loaded"},
+    {"type": "image_resolution_sufficient", "min_effective": 1},
+    {"type": "image_not_distorted", "max_aspect_delta": 0.02},
+    {"type": "image_dims_reserved"},
+    {"type": "lcp_image_prioritized"},
+    {"type": "image_has_text_alternative"},
+    {"type": "image_not_oversized", "max_effective": 2.5},
+    {"type": "image_weight_within", "max_bytes": 500000},
+    {"type": "offscreen_image_lazy"},
+    {"type": "no_duplicate_images"},
+]
+ids = [e["id"] for e in snap["elements"] if e.get("media")]
+per_image = [{**check, "element": id_} for id_ in ids for check in checks]
+# No media: ask page-wide so each check answers unknown. An empty list would
+# come back allPassed:true over nothing.
+print(json.dumps({"snapshot": snap, "assertions": per_image or checks}))
+' | curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
+      -H "Content-Type: application/json" -d @- \
+  | python3 -m json.tool
+```
+
+Read each result, not `allPassed`. Sent per image, `allPassed` is false on any
+page with an `img`: at least one of `lcp_image_prioritized` and
+`offscreen_image_lazy` cannot pass for it, and answers `unknown`. Read the detail,
+not the `code`. A check that does not apply says so in its detail and still carries
+`code: "input_missing"`, and so does a density check on a vector. Drop `element` for
+one page-wide answer per check, with a detail naming each failing id.
+
+Every check `unknown` means no media reached the snapshot, or media with no
+measured facts: read the `--stats` line (`N with media`) before reading that as a
+page with no images. Sent per image, a row whose facts could not be read keeps a
+kind from its tag and answers `unknown` on every check. Page-wide it can be left out
+of a check that then passes, so read this block per image when that matters. One whose tag names no kind (a `div role=img`,
+a CSS background) projects with no `media`, so this block does not name it.
+
 ## Baselines
 
 Register a "what good looks like" snapshot for a route:
@@ -493,10 +584,11 @@ artifacts. List with `GET /ui-bridge/vision/baselines`.
 After landing UI changes, run the full audit:
 
 ```bash
+# envelope-ok: discover is read by uibridge-to-elementsnapshot.py, whose unwrap() refuses an unrecognised shape (exit 1, stderr) rather than emit an empty snapshot. This fence-level waiver also clears the analyze/assert doors below; their direct reads stay baselined, to migrate separately
 # PROJECT FIRST — same reason as above. Read the --stats line on stderr:
 # `0 with geometry` is UNKNOWN, not a clean page.
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
-     -H 'Content-Type: application/json' -d '{"interactive_only":false}' \
+     -H 'Content-Type: application/json' -d '{"interactive_only":false,"includeHidden":true,"includeMedia":true}' \
   | python3 "$ROOT/qontinui-claude-config/scripts/uibridge-to-elementsnapshot.py" \
       --stats > /tmp/snapshot.json
 SNAP=$(cat /tmp/snapshot.json)

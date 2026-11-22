@@ -62,9 +62,13 @@ transitions with `<TransitionTo>` from `@qontinui/ui-bridge`; the
 `src/state-machine.derived.json` on every build.
 "#;
 
-/// Dependency versions pinned to the caret ranges the runner itself ships
-/// with (see the repo-root `package.json`) so a fresh scaffold and the
-/// runner agree on the UI Bridge contract.
+/// UI Bridge dependency versions are never below the caret ranges the
+/// runner itself ships with (see the repo-root `package.json`), so a fresh
+/// scaffold and the runner agree on the UI Bridge contract. Bump
+/// `@qontinui/ui-bridge` and `@qontinui/ui-bridge-auto` together: a caret on
+/// 0.x never crosses a minor, so moving one alone can leave an incompatible
+/// companion. `template_ui_bridge_pins_are_not_below_the_runners_own` keeps
+/// the floor.
 const REACT_PACKAGE_JSON: &str = r#"{
   "name": "{{app_id}}",
   "private": true,
@@ -76,12 +80,12 @@ const REACT_PACKAGE_JSON: &str = r#"{
     "preview": "vite preview"
   },
   "dependencies": {
-    "@qontinui/ui-bridge": "^0.21.1",
+    "@qontinui/ui-bridge": "^0.54.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
   "devDependencies": {
-    "@qontinui/ui-bridge-auto": "^0.1.7",
+    "@qontinui/ui-bridge-auto": "^0.4.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.0",
@@ -412,6 +416,57 @@ mod tests {
         assert!(!ci.content.contains("git diff"));
         // Keep Actions' expression syntax out of a file this module templates.
         assert!(!ci.content.contains("${{"));
+    }
+
+    /// Parse the lower bound of a `^X.Y.Z` / `~X.Y.Z` / `X.Y.Z` npm range.
+    fn range_floor(range: &str) -> semver::Version {
+        let bare = range.trim().trim_start_matches(['^', '~', '=']);
+        semver::Version::parse(bare)
+            .unwrap_or_else(|e| panic!("unparseable npm range {range:?}: {e}"))
+    }
+
+    fn dep_range(pkg: &serde_json::Value, name: &str) -> Option<String> {
+        ["dependencies", "devDependencies"]
+            .iter()
+            .find_map(|section| pkg.get(section)?.get(name)?.as_str())
+            .map(str::to_string)
+    }
+
+    /// The template's UI Bridge pins must never fall below the runner's own
+    /// pins for the same packages. Both are read at test time — the runner's
+    /// from the repo-root `package.json` — so the two cannot drift apart
+    /// again (the template once sat at `^0.21.1` while the runner shipped
+    /// `^0.53.0`) without this test going red.
+    #[test]
+    fn template_ui_bridge_pins_are_not_below_the_runners_own() {
+        let files = template_files(TEMPLATE_REACT_UI_BRIDGE, "My-App", "my-app").unwrap();
+        let template_pkg: serde_json::Value = serde_json::from_str(
+            &files
+                .iter()
+                .find(|f| f.path == "package.json")
+                .unwrap()
+                .content,
+        )
+        .expect("template package.json is valid JSON");
+
+        let runner_pkg_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../package.json");
+        let runner_pkg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&runner_pkg_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", runner_pkg_path.display())),
+        )
+        .expect("runner package.json is valid JSON");
+
+        for name in ["@qontinui/ui-bridge", "@qontinui/ui-bridge-auto"] {
+            let template = dep_range(&template_pkg, name)
+                .unwrap_or_else(|| panic!("template package.json does not pin {name}"));
+            let runner = dep_range(&runner_pkg, name)
+                .unwrap_or_else(|| panic!("runner package.json does not pin {name}"));
+            assert!(
+                range_floor(&template) >= range_floor(&runner),
+                "template pins {name} {template}, below the runner's own {runner}"
+            );
+        }
     }
 
     #[test]

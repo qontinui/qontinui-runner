@@ -591,7 +591,13 @@ fn resend(
     kind: Resend,
 ) -> HealOutcome {
     if matches!(kind, Resend::Readdressed { .. })
-        && !store.note_finish_readdressed(&rec.claude_session_id, at, row, rec.finish_synced)
+        && !store.note_finish_readdressed(
+            &rec.claude_session_id,
+            at,
+            row,
+            rec.finish_synced,
+            rec.finish_coord_session_id,
+        )
     {
         return HealOutcome::MarkChanged;
     }

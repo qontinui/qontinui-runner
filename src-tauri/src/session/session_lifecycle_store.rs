@@ -110,7 +110,7 @@ pub fn snapshot_history_path() -> PathBuf {
 }
 
 /// Closed records older than this are pruned (24h in millis).
-const CLOSED_RETENTION_MS: i64 = 86_400_000;
+pub(crate) const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).
 const OPEN_STALE_MS: i64 = 604_800_000;
 /// A record closed with reason `"pty-exit"` (its PTY died) is still restorable
@@ -239,6 +239,47 @@ fn normalize_origin(origin: Option<String>) -> Option<String> {
         _ => o,
     })
 }
+
+// ---------------------------------------------------------------------------
+// `close_reason` vocabulary — every value a runner writer records.
+//
+// The two FRONTEND reasons arrive through the `terminal_session_record_close`
+// Tauri command (`FrontendSessionCloseReason` in
+// `src/components/terminal/sessionRecordArgs.ts`); the rest are minted by the
+// backend alone. `crate::session::stop_reason` maps each of these to a stop
+// code, a next action and glossary terms, and renders any other string as
+// `unknown` with the raw value — so a writer that records a new reason must
+// add it here AND there, or it surfaces as `unknown`, never as a guess.
+// ---------------------------------------------------------------------------
+
+/// The operator closed the session's tab (frontend).
+pub const CLOSE_REASON_EXPLICIT: &str = "explicit";
+/// The session's process exited while its tab was live (frontend).
+pub const CLOSE_REASON_PTY_EXIT: &str = "pty-exit";
+/// The liveness poll found no agent in the terminal for the full debounce.
+pub const CLOSE_REASON_POLL_DEAD: &str = "poll-dead";
+/// A tile a restore brought back terminal-only idled out with no agent — see
+/// [`close_reason_for_dead_shell`].
+pub const CLOSE_REASON_TERMINAL_ONLY_IDLE: &str = "terminal-only-idle";
+/// A provisional record whose provider never started (a bare shell).
+pub const CLOSE_REASON_NEVER_STARTED: &str = "never-started";
+/// The record's terminal no longer exists (an orphan row).
+pub const CLOSE_REASON_NO_TERMINAL: &str = "no-terminal";
+/// An UNCONFIRMED record evicted when a new session bound its terminal.
+pub const CLOSE_REASON_SUPERSEDED: &str = "superseded";
+/// A CONFIRMED record retired because its terminal now hosts a newer
+/// confirmed session.
+pub const CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE: &str = "superseded-terminal-reuse";
+/// The orchestration loop could not bind its worker and tore it down
+/// (`orchestration_loop::ai_session_executor::teardown_unbound_worker`).
+pub const CLOSE_REASON_WORKER_BIND_FAILED: &str =
+    "orchestration dispatch could not bind the worker";
+/// A death close (`poll-dead` / `pty-exit`) of a pane whose Claude CLI never
+/// launched, rewritten on positive evidence by
+/// `terminal::launch_failure::close_reason_for_launch` (plan
+/// `2026-11-10-migration-holds-for-missing-claude-cli`, D3). Restorable.
+/// `terminal::launch_failure::LAUNCH_FAILED` is this constant.
+pub const CLOSE_REASON_LAUNCH_FAILED: &str = "launch-failed";
 
 /// [`TerminalSessionRecord::wind_down_outcome`] — the graceful exit landed and
 /// the pane was closed.
@@ -837,8 +878,10 @@ pub struct TerminalSessionRecord {
     /// different statement from "it tried and failed" and must not be collapsed
     /// into it.
     ///
-    /// Sticky, like every field around it. `#[serde(default)]`: every record
-    /// already on disk predates the field.
+    /// Sticky for the life of one run; cleared (with
+    /// [`Self::wind_down_at`]) when a CLOSED record re-opens, because a resumed
+    /// session is a new run. `#[serde(default)]`: every record already on disk
+    /// predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wind_down_outcome: Option<String>,
     /// Unix millis when [`Self::wind_down_outcome`] was recorded.
@@ -1321,6 +1364,22 @@ pub struct SessionLifecycleStore {
     finish_forward: Mutex<()>,
 }
 
+/// What [`SessionLifecycleStore::redirect_finish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectFinish<R> {
+    /// The mark is no longer finished at the caller's `finished_at` (unmarked,
+    /// restamped) or its finish is in flight again: nothing was sent.
+    MarkChanged,
+    /// The mark's row already is the target (a concurrent redirect won).
+    AlreadyOnRow,
+    /// The finish heal re-addressed the mark
+    /// ([`TerminalSessionRecord::finish_coord_readdressed`]): coord's observed
+    /// live row outranks the caller's local inference, so nothing was sent.
+    HealReaddressed,
+    /// The sender ran, under `finish_forward`; its verdict.
+    Ran(R),
+}
+
 /// Boxed close-observer callback (see `SessionLifecycleStore::close_observer`).
 /// Newtype so the store can keep `#[derive(Debug)]`.
 struct CloseObserver(Box<dyn Fn(&str) + Send + Sync>);
@@ -1406,6 +1465,11 @@ pub enum SetFinishedError {
     /// [`Self::UnknownSession`]: the finish route answers `500`.
     Unavailable,
 }
+
+/// The registry could not be read (its lock is poisoned) — returned by the
+/// `_checked` readers so "unreadable" is never collapsed into "no record".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryUnavailable;
 
 /// The result of a [`SessionLifecycleStore::set_finished`] call on a KNOWN
 /// session: the record as it now stands, what changed, and whether coord was
@@ -1970,6 +2034,16 @@ impl SessionLifecycleStore {
             if entry.spawn_device_default.is_none() {
                 entry.spawn_device_default = rec.spawn_device_default.or(inherited_spawn_default);
             }
+            // A CLOSED record re-opening (a resume under the same id) starts a
+            // new run: the previous run's wind-down outcome is not this run's,
+            // and leaving it would let a later close read as "wound down".
+            // An already-open record keeps it (`exit_stuck` / `not_attempted`
+            // are recorded on open records).
+            if entry.state == "closed" {
+                entry.wind_down_outcome = None;
+                entry.wind_down_at = None;
+                entry.wind_down_arm = None;
+            }
             entry.state = "open".to_string();
             entry.closed_at = None;
             entry.close_reason = None;
@@ -2035,7 +2109,7 @@ impl SessionLifecycleStore {
                     if other.confirmed_at.is_none() {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded".to_string());
+                        other.close_reason = Some(CLOSE_REASON_SUPERSEDED.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -2049,7 +2123,8 @@ impl SessionLifecycleStore {
                     } else if new_is_confirmed {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        other.close_reason =
+                            Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -3467,14 +3542,22 @@ impl SessionLifecycleStore {
     /// with the flag so no re-finish can see the mark unsynced but not yet
     /// re-addressed). `expect_synced` is the sync state the caller decided on:
     /// a mark whose state moved since (another heal withdrew the stamp first)
-    /// is refused, so two heals over one snapshot queue one re-send. Taken
-    /// under `finish_forward`. Returns whether it recorded.
+    /// is refused, so two heals over one snapshot queue one re-send.
+    /// `expect_row` is the [`TerminalSessionRecord::finish_coord_session_id`]
+    /// the caller read: a mark whose target moved since — another re-address,
+    /// or the pane-row re-offer (`AiCoordRegistrar::reoffer_finish_to`, plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D5) queueing it to a pane row after the heal read the mark — is
+    /// refused too, so the heal never overwrites a target it did not decide
+    /// on and leaves a `Finished` pending to two rows. Taken under
+    /// `finish_forward`. Returns whether it recorded.
     pub fn note_finish_readdressed(
         &self,
         claude_session_id: &str,
         finished_at: i64,
         coord_session_id: uuid::Uuid,
         expect_synced: bool,
+        expect_row: Option<uuid::Uuid>,
     ) -> bool {
         let _forward = self
             .finish_forward
@@ -3489,7 +3572,9 @@ impl SessionLifecycleStore {
         };
         let changed = match m.get_mut(claude_session_id) {
             Some(rec)
-                if rec.finished_at == Some(finished_at) && rec.finish_synced == expect_synced =>
+                if rec.finished_at == Some(finished_at)
+                    && rec.finish_synced == expect_synced
+                    && rec.finish_coord_session_id == expect_row =>
             {
                 rec.finish_synced = false;
                 rec.finish_coord_session_id = Some(coord_session_id);
@@ -3545,6 +3630,87 @@ impl SessionLifecycleStore {
             }],
         );
         true
+    }
+
+    /// Point a finished mark's finish at coord row `row` — the registrar's
+    /// re-offer after a move onto a pane row (plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D5) — as ONE critical section under `finish_forward`:
+    ///
+    /// 1. re-read the mark: it must still be finished at `finished_at`, its
+    ///    [`TerminalSessionRecord::finish_coord_session_id`] must name a row
+    ///    other than `row`, and the finish heal must not have re-addressed it
+    ///    ([`RedirectFinish::MarkChanged`] / [`RedirectFinish::AlreadyOnRow`] /
+    ///    [`RedirectFinish::HealReaddressed`] otherwise);
+    /// 2. withdraw its `finish_synced` stamp, if any;
+    /// 3. run `send` with the re-read record (it enqueues, or finds a pending
+    ///    row) — it answers its verdict and whether a finish for the mark now
+    ///    stands addressed to `row`;
+    /// 4. when it does, record `row` as the row the mark was sent to.
+    ///
+    /// Because the read, the clear, the send and the record share one hold of
+    /// `finish_forward`, an unmark either lands before (step 1 finds no mark,
+    /// nothing is queued) or after (its `working` follows the `Finished`), and
+    /// a second concurrent redirect to the same row finds step 1 answering
+    /// `AlreadyOnRow`. `send` must not call [`Self::set_finished`] or any other
+    /// `finish_forward` taker (the lock is not re-entrant).
+    pub fn redirect_finish<R>(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+        row: uuid::Uuid,
+        send: impl FnOnce(&TerminalSessionRecord) -> (R, bool),
+    ) -> RedirectFinish<R> {
+        let _forward = self
+            .finish_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on redirect_finish");
+                return RedirectFinish::MarkChanged;
+            }
+        };
+        let rec = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.finished_at == Some(finished_at) => rec,
+            _ => return RedirectFinish::MarkChanged,
+        };
+        match rec.finish_coord_session_id {
+            Some(r) if r == row => return RedirectFinish::AlreadyOnRow,
+            Some(_) => {}
+            // Its finish is in flight again (unmarked and re-marked since the
+            // caller read it): the caller's decision no longer applies.
+            None => return RedirectFinish::MarkChanged,
+        }
+        // Re-checked here, under `finish_forward`, because the heal records
+        // its re-address under the same lock (`note_finish_readdressed`): a
+        // heal that landed after the caller's decision wins.
+        if rec.finish_coord_readdressed {
+            return RedirectFinish::HealReaddressed;
+        }
+        let snapshot = if rec.finish_synced {
+            rec.finish_synced = false;
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
+        } else {
+            let snapshot = rec.clone();
+            drop(m);
+            snapshot
+        };
+        let (verdict, addressed) = send(&snapshot);
+        if addressed {
+            // Map lock only — `finish_forward` stays held, so no unmark can
+            // land between the send and this record.
+            self.note_finish_sent_row(claude_session_id, Some(finished_at), row);
+        }
+        RedirectFinish::Ran(verdict)
     }
 
     /// Record what the wind-down executor did to this session — one of the
@@ -4331,6 +4497,32 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// [`Self::all_records`] for a reader that must not answer "not found"
+    /// from an unreadable registry: a poisoned lock is
+    /// `Err(RegistryUnavailable)`, never an empty `Vec`. `GET
+    /// /sessions/{id}/stop-reason` reads through this so a poisoned lock is a
+    /// 503, not a 404 for a session that may well exist.
+    pub fn all_records_checked(&self) -> Result<Vec<TerminalSessionRecord>, RegistryUnavailable> {
+        match self.map.lock() {
+            Ok(m) => Ok(m.values().cloned().collect()),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on all_records_checked");
+                Err(RegistryUnavailable)
+            }
+        }
+    }
+
+    /// Poison the registry lock, for tests of a reader's unreadable-registry
+    /// arm.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = self.map.lock();
+            panic!("poisoning the session lifecycle registry for a test");
+        }));
+        assert!(self.map.is_poisoned());
+    }
+
     /// Run `f` over [`Self::unsynced_finished_records`] with `finish_forward`
     /// held for the read AND whatever `f` enqueues — the serialized door for
     /// the registrar's late-delivery paths. Without it a delivery could read a
@@ -4760,7 +4952,7 @@ impl SessionLifecycleStore {
                     if let Some(rec) = m.get_mut(id.as_str()) {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
-                        rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        rec.close_reason = Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(rec);
@@ -5025,7 +5217,8 @@ pub struct HeldClose {
 
 /// The close reason the frontend sends when the USER closes a tab
 /// (`FrontendSessionCloseReason` in `sessionRecordArgs.ts`).
-pub const USER_CLOSE_REASON: &str = "explicit";
+/// The same string as [`CLOSE_REASON_EXPLICIT`], by construction.
+pub const USER_CLOSE_REASON: &str = CLOSE_REASON_EXPLICIT;
 
 impl HeldClose {
     /// The user closed the pane — not a child exit, not a poll.
@@ -6523,9 +6716,9 @@ pub fn poll_holds_unmatched_row(
 /// rewrites `"terminal-only-idle"`.
 pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
     if restore_tier == Some(RESTORE_TIER_TERMINAL_ONLY) {
-        "terminal-only-idle"
+        CLOSE_REASON_TERMINAL_ONLY_IDLE
     } else {
-        "poll-dead"
+        CLOSE_REASON_POLL_DEAD
     }
 }
 
@@ -8945,6 +9138,35 @@ mod tests {
         store.record_open(rec("sess-1"));
         store.record_close("sess-1", "poll-dead");
         assert_eq!(fired.load(Ordering::SeqCst), 2);
+    }
+
+    /// A resume under the same id starts a new run: the previous run's
+    /// wind-down outcome is cleared when the CLOSED record re-opens, and kept
+    /// when an already-open record is re-recorded.
+    #[test]
+    fn reopening_a_closed_record_clears_its_wind_down_outcome() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("sess-1"));
+        store.set_wind_down_outcome("sess-1", WIND_DOWN_EXIT_STUCK, WIND_DOWN_ARM_DRAIN, 1_000);
+        store.record_open(rec("sess-1"));
+        assert_eq!(
+            store.get("sess-1").unwrap().wind_down_outcome.as_deref(),
+            Some(WIND_DOWN_EXIT_STUCK)
+        );
+        store.set_wind_down_outcome(
+            "sess-1",
+            WIND_DOWN_CLOSED,
+            WIND_DOWN_ARM_FINISHED_CLOSE,
+            2_000,
+        );
+        store.record_close("sess-1", CLOSE_REASON_EXPLICIT);
+        store.record_open(rec("sess-1"));
+        let r = store.get("sess-1").unwrap();
+        assert_eq!(r.wind_down_outcome, None);
+        assert_eq!(r.wind_down_at, None);
+        assert_eq!(r.wind_down_arm, None);
     }
 
     #[test]

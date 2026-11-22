@@ -435,6 +435,7 @@ GET /sessions/transcript-coverage transcript_coverage
 GET /sessions/tree-resets list_tree_resets
 GET /sessions/{id}/latest-review get_latest_review_for_session
 GET /sessions/{id}/policy-context policy_context
+GET /sessions/{id}/stop-reason get_stop_reason
 GET /sessions/{id}/touched-files get_touched_files
 GET /sessions/{id}/transcript get_transcript
 GET /sessions/{session_id}/file-changes file_changes_handler

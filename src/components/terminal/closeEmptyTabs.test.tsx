@@ -142,7 +142,7 @@ describe("closeEmptyPagesWith (the close loop)", () => {
 
   it("removes nothing when occupancy is unreadable", async () => {
     const remove = vi.fn(async () => "x");
-    expect(await closeEmptyPagesWith(pages, async () => UNKNOWN, remove)).toBe(0);
+    expect(await closeEmptyPagesWith(pages, async () => UNKNOWN, remove)).toBeNull();
     expect(remove).not.toHaveBeenCalled();
   });
 
@@ -153,7 +153,7 @@ describe("closeEmptyPagesWith (the close loop)", () => {
       data: { sessions: [], deferredByDrain: { state: "drained", reason: "x" } },
     });
     const r = recorder();
-    expect(await closeEmptyPagesWith(pages, readOccupiedPageIds, r.remove)).toBe(0);
+    expect(await closeEmptyPagesWith(pages, readOccupiedPageIds, r.remove)).toBeNull();
     expect(r.removed).toEqual([]);
   });
 

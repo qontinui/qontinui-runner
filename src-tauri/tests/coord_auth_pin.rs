@@ -224,7 +224,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // POST arm, one of which executes — spelled as two builder calls rather
     // than `client.request(method, url)` precisely so this scan can still see
     // them.
-    ("mcp_api.rs", "forwarder", 5),
+    //
+    // 5 -> 4 + 1 with the mcp_api split (plan
+    // `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    // Phase 2): the VCS-PR forwarder moved verbatim into `mcp_api/vcs_pr.rs`.
+    // Relocated, not added: the total stays 5.
+    ("mcp_api.rs", "forwarder", 4),
+    ("mcp_api/vcs_pr.rs", "forwarder", 1),
     ("memory/memory_synthesis.rs", "not-coord", 2),
     ("memory/tenant_sync.rs", "not-coord", 1),
     (
