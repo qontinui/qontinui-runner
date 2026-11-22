@@ -1048,14 +1048,29 @@ pub struct WorktreeCensus {
     pub nm_present: bool,
     pub nm_is_junction: bool,
     /// Real (non-junction) bytes of `node_modules`. 0 when junctioned or
-    /// absent.
+    /// absent. APPARENT size: a file hardlinked from the pnpm store counts in
+    /// full here though removing the tree frees none of it.
     pub nm_bytes: u64,
+    /// The bytes removing `node_modules` frees: each inode once, and an inode
+    /// still linked from outside the tree (the pnpm content-addressed store)
+    /// not at all. `Some(0)` when junctioned or absent. `None` = UNKNOWN —
+    /// off unix there is no link count, or the tree could not be read.
+    /// Additive on the wire: coord's `WorktreeItem` ignores unknown keys, and
+    /// any coord adoption must be `#[serde(default)]` reading a missing value
+    /// as UNKNOWN. Plan
+    /// `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    pub nm_exclusive_bytes: Option<u64>,
 
     pub target_present: bool,
     pub target_is_junction: bool,
     /// Real (non-junction) bytes of the build `target` dir. 0 when
-    /// junctioned or absent.
+    /// junctioned or absent. APPARENT size: an in-tree hardlink pair (a cargo
+    /// uplift) counts twice.
     pub target_bytes: u64,
+    /// The bytes removing the build `target` dir frees, measured as
+    /// [`nm_exclusive_bytes`](Self::nm_exclusive_bytes) is: an in-tree
+    /// hardlink pair counts once. Same `Some(0)` / `None` reading.
+    pub target_exclusive_bytes: Option<u64>,
 
     /// Run-provenance (plan `2026-08-16-plan-corpus-authority-and-run-
     /// provenance`, Phase 1): the **effective** cargo target directory this
@@ -1104,8 +1119,14 @@ pub struct WorktreeCensus {
 
     /// RFC3339 mtime of the worktree dir itself, `None` if unreadable.
     pub last_access_mtime: Option<String>,
-    /// Sum of the non-junction real bytes attributable to this worktree
-    /// (`nm_bytes + target_bytes`). A junctioned dir contributes 0.
+    /// The bytes the operator gets back by removing this worktree's
+    /// `node_modules` and `target`: per dir, its EXCLUSIVE bytes where
+    /// measured ([`nm_exclusive_bytes`](Self::nm_exclusive_bytes),
+    /// [`target_exclusive_bytes`](Self::target_exclusive_bytes)), else its
+    /// apparent bytes (`nm_bytes` / `target_bytes`) where exclusivity is
+    /// `None` (Windows). A junctioned dir contributes 0. A pnpm tree
+    /// hardlinked from the store therefore contributes only its unshared
+    /// bytes, not its apparent size.
     pub attributable_bytes: u64,
 
     /// G2 "work landed" — whether this worktree's HEAD is already
@@ -1425,14 +1446,16 @@ pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
 }
 
 /// Measure one candidate dir (`node_modules` / `target`):
-/// `(present, is_junction, bytes)`. A junction reports
-/// `(true, true, 0)` and is never walked.
-fn measure_dir(dir: &Path) -> (bool, bool, u64) {
+/// `(present, is_junction, bytes, exclusive_bytes)`. `bytes` is the apparent
+/// size; `exclusive_bytes` is what removing the dir frees, `None` when
+/// UNKNOWN (off unix, or the tree could not be read). A junction reports
+/// `(true, true, 0, Some(0))` and is never walked.
+fn measure_dir(dir: &Path) -> (bool, bool, u64, Option<u64>) {
     if !dir.exists() {
-        return (false, false, 0);
+        return (false, false, 0, Some(0));
     }
     if is_junction(dir) {
-        return (true, true, 0);
+        return (true, true, 0, Some(0));
     }
     // `present` and `is_junction` above are read live every time (one stat
     // each), so a removal or a junction swap shows at once; only the byte total
@@ -1440,10 +1463,26 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
     // census walk is now paced from its end and would otherwise size the same
     // trees several times as often as before (plan
     // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
-    let bytes = super::census_size_memo::bytes_or_measure(dir, || {
-        super::orphan_target_reaper::measure_dir_size(dir).map(|m| m.bytes)
-    });
-    (true, false, bytes)
+    // An unreadable tree reads 0 apparent bytes, as before, and UNKNOWN
+    // exclusivity — never a fabricated `Some(0)`.
+    let (bytes, exclusive) = super::census_size_memo::size_or_measure(dir, || {
+        super::orphan_target_reaper::measure_dir_size(dir).map(|m| (m.bytes, m.exclusive_bytes))
+    })
+    .unwrap_or((0, None));
+    (true, false, bytes, exclusive)
+}
+
+/// [`WorktreeCensus::attributable_bytes`]: per dir, the exclusive bytes where
+/// measured, else the apparent bytes.
+fn attributable_bytes(
+    nm_bytes: u64,
+    nm_exclusive_bytes: Option<u64>,
+    target_bytes: u64,
+    target_exclusive_bytes: Option<u64>,
+) -> u64 {
+    nm_exclusive_bytes
+        .unwrap_or(nm_bytes)
+        .saturating_add(target_exclusive_bytes.unwrap_or(target_bytes))
 }
 
 /// [`is_junction`]'s test applied to metadata already in hand — a directory
@@ -2527,8 +2566,10 @@ fn capture_worktree_with_build_target(
     let is_dirty = dirty_verdict.as_conservative_bool();
     let is_dirty_known = dirty_verdict.is_known();
 
-    let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
-    let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
+    let (nm_present, nm_is_junction, nm_bytes, nm_exclusive_bytes) =
+        measure_dir(&worktree.join("node_modules"));
+    let (target_present, target_is_junction, target_bytes, target_exclusive_bytes) =
+        measure_dir(&target_dir_for(worktree));
 
     // WIP custody (Phase 3). Two bounded FILE READS on the hit path, ONE on
     // the miss path, and no subprocess at any point — `$GIT_DIR` comes from
@@ -2546,7 +2587,12 @@ fn capture_worktree_with_build_target(
         .and_then(|m| m.modified().ok())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
 
-    let attributable_bytes = nm_bytes.saturating_add(target_bytes);
+    let attributable_bytes = attributable_bytes(
+        nm_bytes,
+        nm_exclusive_bytes,
+        target_bytes,
+        target_exclusive_bytes,
+    );
 
     // G2: ancestry/patch-id "landed in the repo's trunk" — local git only,
     // None when undeterminable (unresolvable trunk, git failure).
@@ -2582,9 +2628,11 @@ fn capture_worktree_with_build_target(
         nm_present,
         nm_is_junction,
         nm_bytes,
+        nm_exclusive_bytes,
         target_present,
         target_is_junction,
         target_bytes,
+        target_exclusive_bytes,
         build_target_dir: build_target.dir,
         build_slot: build_target.slot,
         build_target_volume_path: build_target.volume_path,
@@ -4376,14 +4424,25 @@ mod tests {",
         assert!(!is_junction(dir.path()));
     }
 
+    /// The exclusive bytes a hardlink-free tree of `n` bytes measures: all of
+    /// them on unix, UNKNOWN elsewhere.
+    fn ex(n: u64) -> Option<u64> {
+        if cfg!(unix) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     #[test]
     fn missing_dir_measures_as_absent() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("node_modules");
-        let (present, is_junction, bytes) = measure_dir(&missing);
+        let (present, is_junction, bytes, exclusive) = measure_dir(&missing);
         assert!(!present);
         assert!(!is_junction);
         assert_eq!(bytes, 0);
+        assert_eq!(exclusive, Some(0), "an absent dir frees nothing, known");
     }
 
     #[test]
@@ -4393,10 +4452,12 @@ mod tests {",
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(dir.path().join("a.bin"), vec![0u8; 100]).unwrap();
         std::fs::write(sub.join("b.bin"), vec![0u8; 250]).unwrap();
-        let total = super::super::orphan_target_reaper::measure_dir_size(dir.path())
-            .unwrap()
-            .bytes;
-        assert_eq!(total, 350, "should sum nested real files");
+        let m = super::super::orphan_target_reaper::measure_dir_size(dir.path()).unwrap();
+        assert_eq!(m.bytes, 350, "should sum nested real files");
+        #[cfg(unix)]
+        assert_eq!(m.exclusive_bytes, Some(350), "no hardlinks: all exclusive");
+        #[cfg(not(unix))]
+        assert_eq!(m.exclusive_bytes, None);
     }
 
     #[test]
@@ -4407,9 +4468,9 @@ mod tests {",
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
-        assert_eq!(measure_dir(&nm), (true, false, 42));
+        assert_eq!(measure_dir(&nm), (true, false, 42, ex(42)));
         std::fs::remove_dir_all(&nm).unwrap();
-        assert_eq!(measure_dir(&nm), (false, false, 0));
+        assert_eq!(measure_dir(&nm), (false, false, 0, Some(0)));
     }
 
     #[test]
@@ -4421,12 +4482,12 @@ mod tests {",
         let t = dir.path().join("target");
         std::fs::create_dir(&t).unwrap();
         std::fs::write(t.join("old.bin"), vec![0u8; 42]).unwrap();
-        assert_eq!(measure_dir(&t), (true, false, 42));
+        assert_eq!(measure_dir(&t), (true, false, 42, ex(42)));
         std::fs::remove_dir_all(&t).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         std::fs::create_dir(&t).unwrap();
         std::fs::write(t.join("new.bin"), vec![0u8; 9]).unwrap();
-        assert_eq!(measure_dir(&t), (true, false, 9));
+        assert_eq!(measure_dir(&t), (true, false, 9, ex(9)));
     }
 
     #[cfg(windows)]
@@ -4436,7 +4497,7 @@ mod tests {",
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
-        assert_eq!(measure_dir(&nm), (true, false, 42));
+        assert_eq!(measure_dir(&nm), (true, false, 42, ex(42)));
         std::fs::remove_dir_all(&nm).unwrap();
         let elsewhere = dir.path().join("elsewhere");
         std::fs::create_dir(&elsewhere).unwrap();
@@ -4454,7 +4515,7 @@ mod tests {",
         }
         assert_eq!(
             measure_dir(&nm),
-            (true, true, 0),
+            (true, true, 0, Some(0)),
             "the junction is read live"
         );
     }
@@ -4465,10 +4526,11 @@ mod tests {",
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
-        let (present, is_junction, bytes) = measure_dir(&nm);
+        let (present, is_junction, bytes, exclusive) = measure_dir(&nm);
         assert!(present);
         assert!(!is_junction);
         assert_eq!(bytes, 42);
+        assert_eq!(exclusive, ex(42));
     }
 
     #[test]
@@ -6949,9 +7011,11 @@ mod tests {",
             nm_present: false,
             nm_is_junction: false,
             nm_bytes: 0,
+            nm_exclusive_bytes: Some(0),
             target_present: false,
             target_is_junction: false,
             target_bytes: 0,
+            target_exclusive_bytes: Some(0),
             build_target_dir: None,
             build_slot: None,
             build_target_volume_path: None,
@@ -7201,6 +7265,39 @@ mod tests {",
         assert_eq!(row.nm_bytes, 10);
         assert_eq!(row.target_bytes, 20);
         assert_eq!(row.attributable_bytes, 30);
+    }
+
+    /// An own `node_modules` holding a file hardlinked from outside it (a pnpm
+    /// tree imported from the store): the file counts in `nm_bytes`, the
+    /// apparent size, and not in `attributable_bytes`, since removing the
+    /// worktree frees none of it. Plan
+    /// `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    #[cfg(unix)]
+    #[test]
+    fn attributable_bytes_exclude_a_store_hardlinked_node_modules_file() {
+        let _amb = crate::test_env::isolated_ambient();
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        let stored = store.path().join("pkg.js");
+        std::fs::write(&stored, vec![0u8; 5000]).unwrap();
+        std::fs::hard_link(&stored, nm.join("pkg.js")).unwrap();
+        std::fs::write(nm.join("own.json"), vec![0u8; 12]).unwrap();
+        let row = capture_worktree("qontinui-web", dir.path());
+        assert_eq!(row.nm_bytes, 5012, "apparent size counts the store file");
+        assert_eq!(row.nm_exclusive_bytes, Some(12));
+        assert_eq!(
+            row.attributable_bytes, 12,
+            "only the unshared bytes are reclaimable"
+        );
+    }
+
+    #[test]
+    fn attributable_bytes_fall_back_to_apparent_where_exclusivity_is_unknown() {
+        assert_eq!(attributable_bytes(10, None, 20, None), 30);
+        assert_eq!(attributable_bytes(10, Some(1), 20, None), 21);
+        assert_eq!(attributable_bytes(10, Some(1), 20, Some(2)), 3);
     }
 
     // ── CRITICAL-2 regression: a wedged git must not publish "clean" ────────
