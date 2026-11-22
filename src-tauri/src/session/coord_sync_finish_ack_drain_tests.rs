@@ -193,6 +193,11 @@ async fn a_409_whose_body_reads_finished_stamps_the_mark() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
+    // FINISHED_UNCONFIRMED_DROPPED is process-global, and
+    // `a_quarantined_sessions_unconfirmed_finish_still_reaches_the_bound`
+    // drives a finish to its bound too, so the two serialise on the drop
+    // counters' lock or this test's delta reads 2 under parallel load.
+    let _counter = drop_counter_lock().lock().await;
     let (_d, outbox, coord, rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
     let sent: Arc<std::sync::Mutex<Vec<(String, Option<i64>, Uuid)>>> = Default::default();
@@ -235,7 +240,8 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
         "the bound fired, not the quarantine"
     );
     assert!(!state.retry.contains_key(&s));
-    // Process-global: only this test drives a finish to its bound.
+    // Process-global: every test that drives a finish to its bound holds
+    // `drop_counter_lock`, so the delta is this test's alone.
     assert_eq!(
         FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed) - before,
         1
@@ -254,6 +260,10 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
 /// [`FINISHED_UNCONFIRMED_MIN_AGE`] old.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unconfirmed_answers_inside_the_age_floor_never_drop_the_finish() {
+    // Ends with a drop that bumps the process-global
+    // FINISHED_UNCONFIRMED_DROPPED; see
+    // `five_unconfirmed_answers_drop_the_row_unstamped_and_count_it`.
+    let _counter = drop_counter_lock().lock().await;
     let (_d, outbox, coord, rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
     let s = Uuid::new_v4();
@@ -287,6 +297,9 @@ async fn unconfirmed_answers_inside_the_age_floor_never_drop_the_finish() {
 /// the bound and is dropped unstamped — never retried forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_quarantined_sessions_unconfirmed_finish_still_reaches_the_bound() {
+    // Bumps the process-global FINISHED_UNCONFIRMED_DROPPED; see
+    // `five_unconfirmed_answers_drop_the_row_unstamped_and_count_it`.
+    let _counter = drop_counter_lock().lock().await;
     let (_d, outbox, coord, _rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
     let s = Uuid::new_v4();
@@ -382,7 +395,11 @@ async fn a_session_held_on_an_unconfirmed_finish_keeps_its_heartbeat_flowing() {
         .iter()
         .filter(|(id, _)| *id == s)
         .collect();
-    assert_eq!(sent.len(), 1, "exactly the newest heartbeat went out: {sent:?}");
+    assert_eq!(
+        sent.len(),
+        1,
+        "exactly the newest heartbeat went out: {sent:?}"
+    );
     assert_ne!(
         sent[0].1["progress"]["session_status"], "finished",
         "the finish was not retried inside its backoff"
@@ -408,7 +425,10 @@ async fn a_held_sessions_own_keepalive_is_not_serving_evidence() {
     queue_finish(&outbox, s, "csid-self-evidence", 42);
     let mut state = DrainState::default();
     drain_tick(&coord.inner, &mut state).await;
-    assert!(state.retry[&s].unconfirmed_finish.is_some(), "keep-alive is on");
+    assert!(
+        state.retry[&s].unconfirmed_finish.is_some(),
+        "keep-alive is on"
+    );
 
     rec.lock().await.finished_answer = Some((503, r#"{"error":"unavailable"}"#.to_string()));
     let machine = Uuid::from_u128(0xeb2155ed_4152_4a91_be82_5d4346f717fc);

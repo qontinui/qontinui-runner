@@ -34,9 +34,40 @@
 //! paints inside the window and then freezes still fires once the window ends.
 //!
 //! A pane that keeps repainting a limit message therefore re-fires at most every
-//! 300s, while a message frozen on an idle screen, such as the limit menu, fires
-//! once: if that hint found the probe unconfirmed or no migration target, nothing
-//! retries until the pane's grid changes again.
+//! 300s. A message frozen on an idle screen, such as the limit menu, fires once,
+//! and then the way that hint ended ([`HintOutcome`]) decides whether it fires
+//! again on the same grid ([`HintOutcome::retry`], applied by [`after_hint`]):
+//!
+//! - **Every debounce** — no usable target, a failed migration that started no
+//!   resumed `claude`, a respawn that died or never painted and was rolled back
+//!   onto the old pane (`RespawnDiedRolledBack`, `UnconfirmedRolledBack`), or
+//!   another migration of the session in flight.
+//!   The screen stays due and fires again
+//!   300s after the last hint, until a hint ends another way: the session
+//!   moves once a target frees, and failed attempts stop at the migration cap.
+//!   A no-target hint gives its cap slot back, so waiting for a target does
+//!   not use up the cap.
+//! - **Once per appearance** — the probe did not confirm exhaustion. One more
+//!   hint, 300s later, on the same grid generation: the probe's sample can be
+//!   up to 60s stale, the one cause of an unconfirmed probe that time fixes.
+//! - **Never** — migrated (or an unpainted resumed pane kept the session,
+//!   `UnconfirmedKept`), the migration cap reached, auto-migration disabled,
+//!   a pane the hint cannot apply to, a session that has already moved,
+//!   closed or ended with its respawn (`RespawnDiedEnded`), or a migration
+//!   the user declined by closing the resumed pane (`DeclinedByUser`). The
+//!   screen rests until its grid changes. A migration that failed after its
+//!   resumed `claude` may have started rests its SESSION longer, for the
+//!   migration cap's rolling 24h window: that child may still be running, and
+//!   a migration would resume the session again beside it. Every hint on that
+//!   session ends the same way without migrating, whatever this scanner
+//!   recorded in between.
+//!
+//! Each retry re-probes every configured account, but the probe's 60s usage
+//! cache bounds upstream traffic to at most one probe per account per minute
+//! for the whole runner, however many panes are stranded. A retried no-target
+//! or failed hint is reported to the UI once per episode, not on every retry:
+//! the episode ends when a scan finds no limit message on the screen, so the
+//! next stranding is reported afresh.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -45,7 +76,9 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use super::account_migration::{HintOutcome, Retry};
 use super::output_scan::normalize;
+use super::scan_gate::ScanGate;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Lowercased substrings that indicate the Claude CLI hit a usage limit.
@@ -131,17 +164,42 @@ pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
 
 // ── Firing policy (per-terminal debounce) ─────────────────────────────────────
 
-/// Per-terminal last-hint-fired instant (`None` = never fired). The outer
-/// `Option` makes the static const-initializable (mirrors the auto-response
-/// edge map).
-static FIRE_STATE: Mutex<Option<HashMap<String, Option<Instant>>>> = Mutex::new(None);
+/// One terminal's hint history.
+#[derive(Debug, Default)]
+struct FireState {
+    /// When its last hint fired (`None` = never).
+    last_fired: Option<Instant>,
+    /// How its last finished hint ended, with the grid generation of the screen
+    /// that raised it ([`after_hint`]). Cleared by a scan that finds no limit
+    /// message on the screen ([`scan_terminal`]): that stranding episode is
+    /// over, so the next one is reported afresh.
+    last_outcome: Option<(u64, HintOutcome)>,
+}
+
+/// Per-terminal hint history. The outer `Option` makes the static
+/// const-initializable (mirrors the auto-response edge map). Taken only through
+/// [`with_scan_state`].
+static FIRE_STATE: Mutex<Option<HashMap<String, FireState>>> = Mutex::new(None);
 
 /// Per-terminal grid-generation watermarks so a tick skips sessions whose rendered
 /// screen cannot have changed since the previous pass (see
 /// [`super::scan_gate`]). This scanner keeps its OWN gate — sharing one with
 /// `auto_response` would let whichever tick ran first consume the change on the
-/// other's behalf.
-static SCAN_GATE: Mutex<Option<super::scan_gate::ScanGate>> = Mutex::new(None);
+/// other's behalf. Taken only through [`with_scan_state`].
+static SCAN_GATE: Mutex<Option<ScanGate>> = Mutex::new(None);
+
+/// Run `f` on the scanner's state under both of its locks, taken in the one
+/// order every caller shares: [`FIRE_STATE`], then [`SCAN_GATE`]. They are std
+/// mutexes, and a scan pass holds them across every due terminal's grid
+/// render, so call this only off the async runtime.
+fn with_scan_state<R>(f: impl FnOnce(&mut HashMap<String, FireState>, &mut ScanGate) -> R) -> R {
+    let mut state = FIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gate = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    f(
+        state.get_or_insert_with(HashMap::new),
+        gate.get_or_insert_with(ScanGate::new),
+    )
+}
 
 /// Pure firing decision: given the matched pattern (if any), the terminal's
 /// last-fired time, and `now`, return the pattern iff a hint should fire and
@@ -171,7 +229,7 @@ fn fire_or_keep_due(
     terminal_id: &str,
     matched: Option<&'static str>,
     last_fired: &mut Option<Instant>,
-    gate: &mut super::scan_gate::ScanGate,
+    gate: &mut ScanGate,
     now: Instant,
     debounce: Duration,
 ) -> Option<&'static str> {
@@ -182,12 +240,136 @@ fn fire_or_keep_due(
     fired
 }
 
+/// Record how a hint on `terminal_id` ended, and keep the screen that raised it
+/// due when the outcome's retry rule says so ([`HintOutcome::retry`]).
+///
+/// [`scan_terminal`] recorded that screen (grid `generation`) as seen before
+/// the hint fired, so on a pane frozen at the limit menu nothing else would ever
+/// scan it again. Forgetting the watermark hands the screen to
+/// [`fire_or_keep_due`], which keeps it due on every tick, firing nothing, until
+/// the debounce lets it fire once more at the last hint + [`HINT_DEBOUNCE`].
+/// [`Retry::OncePerAppearance`] forgets only when this terminal's previous hint
+/// did not end the same way on the same generation. A terminal that went away
+/// while the hint ran has no entry left, and is skipped.
+///
+/// Blocks on the scanner's locks ([`with_scan_state`]), so [`dispatch_hint`]
+/// runs it on the blocking pool.
+fn after_hint(terminal_id: &str, generation: u64, outcome: HintOutcome) {
+    with_scan_state(|state, gate| {
+        let Some(entry) = state.get_mut(terminal_id) else {
+            return;
+        };
+        let rescan = match outcome.retry() {
+            Retry::EveryDebounce => true,
+            Retry::OncePerAppearance => entry.last_outcome != Some((generation, outcome)),
+            Retry::Never => false,
+        };
+        entry.last_outcome = Some((generation, outcome));
+        if rescan {
+            gate.forget(terminal_id);
+        }
+        debug!(
+            terminal_id,
+            generation,
+            ?outcome,
+            rescan,
+            "usage-limit hint ended"
+        );
+    });
+}
+
 // ── Grid scanner ─────────────────────────────────────────────────────────────
+
+/// A hint one scan pass decided to fire.
+#[derive(Debug)]
+struct DueHint {
+    terminal_id: String,
+    pattern: &'static str,
+    /// The grid generation of the screen it matched on, which the scan gate
+    /// recorded as seen.
+    generation: u64,
+    /// How the terminal's previous hint ended.
+    previous: Option<HintOutcome>,
+}
+
+/// One terminal's share of a scan pass, under [`with_scan_state`]'s locks: the
+/// whole per-terminal decision [`scan_grids_once`] makes, and the seam the tests
+/// drive. `screen` renders the terminal's screen text and is called only when
+/// the gate says the screen is due.
+///
+/// Skips a terminal whose grid has not been mutated since the last pass: the
+/// rendered screen is byte-identical, so a limit message frozen on an idle
+/// terminal is not re-detected once it has fired, unless its hint's outcome
+/// kept it due ([`after_hint`]). That costs one atomic load instead of a grid
+/// lock + full screen render. Otherwise it fires a hint, keeps a debounced
+/// match due ([`fire_or_keep_due`]), or — no limit message on screen — ends
+/// the terminal's stranding episode by clearing its last outcome, so the next
+/// episode's outcome is reported afresh.
+fn scan_terminal(
+    terminal_id: &str,
+    generation: u64,
+    screen: impl FnOnce() -> String,
+    state: &mut HashMap<String, FireState>,
+    gate: &mut ScanGate,
+    now: Instant,
+) -> Option<DueHint> {
+    if !gate.should_scan(terminal_id, generation) {
+        return None;
+    }
+    // The same matcher the unit tests enter through, so every fixture there
+    // is a statement about this scan's matcher.
+    let matched = window_indicates_usage_limit(&screen());
+    // `entry` defaults to "never fired" → the first appearance fires
+    // immediately; thereafter the debounce gates re-fires.
+    let entry = state.entry(terminal_id.to_string()).or_default();
+    if matched.is_none() {
+        entry.last_outcome = None;
+    }
+    let pattern = fire_or_keep_due(
+        terminal_id,
+        matched,
+        &mut entry.last_fired,
+        gate,
+        now,
+        HINT_DEBOUNCE,
+    )?;
+    Some(DueHint {
+        terminal_id: terminal_id.to_string(),
+        pattern,
+        generation,
+        previous: entry.last_outcome.map(|(_, outcome)| outcome),
+    })
+}
+
+/// The hint task [`scan_grids_once`] spawns for each [`DueHint`]: run it through
+/// `handler` — in production
+/// [`super::account_migration::handle_usage_limit_hint`] — then record how it
+/// ended ([`after_hint`]). `after_hint` waits on the scanner's std mutexes,
+/// which a scan pass holds across every due terminal's grid render, so it runs
+/// on the blocking pool rather than parking an async-runtime worker.
+async fn dispatch_hint<H, F>(hint: DueHint, handler: H)
+where
+    H: FnOnce(String, &'static str, Option<HintOutcome>) -> F,
+    F: std::future::Future<Output = HintOutcome>,
+{
+    let DueHint {
+        terminal_id,
+        pattern,
+        generation,
+        previous,
+    } = hint;
+    let outcome = handler(terminal_id.clone(), pattern, previous).await;
+    if let Err(e) =
+        spawn_blocking_tracked(move || after_hint(&terminal_id, generation, outcome)).await
+    {
+        warn!(error = %e, "usage_limit: recording a hint's outcome panicked");
+    }
+}
 
 /// One scan pass over every live terminal: read its rendered screen, and for
 /// any terminal showing a usage-limit message (debounce-permitting) spawn the
-/// account-migration hint. Cheap: one `text_snapshot` + substring scan per
-/// terminal the scan gate reports as due, per tick.
+/// account-migration hint ([`dispatch_hint`]). Cheap: one `text_snapshot` +
+/// substring scan per terminal the scan gate reports as due, per tick.
 pub fn scan_grids_once() {
     use tauri::Manager;
 
@@ -199,57 +381,43 @@ pub fn scan_grids_once() {
     };
     let sessions = tm.sessions_snapshot();
 
-    // Decide under the fire-state lock, then dispatch with NO lock held (the
-    // hint handler is async + re-locks its own state).
-    let mut to_fire: Vec<(String, &'static str)> = Vec::new();
-    {
-        let mut state = FIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        let map = state.get_or_insert_with(HashMap::new);
-        let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
-        let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
+    // Decide under the scanner's locks, then dispatch with NO lock held (the
+    // hint handler is async + re-locks its own state, and `after_hint` takes
+    // both of these locks when it ends).
+    let to_fire = with_scan_state(|state, gate| {
         let now = Instant::now();
+        let mut to_fire = Vec::new();
         for (tid, session) in &sessions {
-            // Skip sessions whose grid has not been mutated since the last
-            // pass — the rendered screen is byte-identical, so a limit message
-            // frozen on an idle terminal is not re-detected once it has fired.
-            // One atomic load
-            // instead of a grid lock + full screen render.
-            if !gate.should_scan(tid, session.grid_generation()) {
-                continue;
-            }
             // Read the *rendered* screen text (rows joined by `\n`). The grid is
             // the VT-parsed cell buffer, so this sees text inside a full-screen
             // TUI that synchronized-output batching hides from a byte scan.
-            let text = {
+            let screen = || {
                 let grid = session.grid();
                 let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
                 guard.text_snapshot().text
             };
-            // The same matcher the unit tests enter through, so every fixture
-            // there is a statement about this scan's matcher.
-            let matched = window_indicates_usage_limit(&text);
-            // `entry` defaults to "never fired" → the first appearance fires
-            // immediately; thereafter the debounce gates re-fires.
-            let last_fired = map.entry(tid.clone()).or_insert(None);
-            if let Some(pattern) =
-                fire_or_keep_due(tid, matched, last_fired, gate, now, HINT_DEBOUNCE)
+            if let Some(hint) =
+                scan_terminal(tid, session.grid_generation(), screen, state, gate, now)
             {
-                to_fire.push((tid.clone(), pattern));
+                to_fire.push(hint);
             }
         }
         // Drop state for terminals that have gone away.
         let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
-        map.retain(|tid, _| live.contains(tid));
+        state.retain(|tid, _| live.contains(tid));
         gate.retain_live(&live);
-    } // fire-state + scan-gate locks released
+        to_fire
+    });
 
-    for (tid, pattern) in to_fire {
+    for hint in to_fire {
         info!(
-            terminal_id = %tid,
-            pattern, "usage-limit message detected on terminal screen"
+            terminal_id = %hint.terminal_id,
+            pattern = hint.pattern,
+            "usage-limit message detected on terminal screen"
         );
-        tauri::async_runtime::spawn(super::account_migration::handle_usage_limit_hint(
-            tid, pattern,
+        tauri::async_runtime::spawn(dispatch_hint(
+            hint,
+            super::account_migration::handle_usage_limit_hint,
         ));
     }
 }
@@ -549,6 +717,292 @@ mod tests {
             hit
         );
         assert!(!gate.should_scan("t", 2));
+    }
+
+    // ---- a frozen screen whose hint did not migrate -------------------------
+    // Plan 2026-11-11-a-frozen-usage-limit-screen-whose-hint-did-not-migrate-is-never-rescanned.
+
+    /// A frozen limit menu, as the grid renders it.
+    const LIMIT_SCREEN: &str = "  You've hit your weekly limit · resets Oct 21, 10pm";
+
+    /// One scan pass's work for terminal `tid` showing `screen` on grid
+    /// `generation` at `now`: [`scan_terminal`] under [`with_scan_state`],
+    /// exactly as [`scan_grids_once`] runs it for each terminal, on the
+    /// scanner's own statics (the ones [`after_hint`] writes). Returns whether
+    /// the gate let the pass read the screen, and the hint it decided to fire.
+    /// No test process sets an app handle, so `scan_grids_once` itself never
+    /// runs here, and each test owns its terminal id.
+    fn scan(tid: &str, generation: u64, screen: &str, now: Instant) -> (bool, Option<DueHint>) {
+        let mut read = false;
+        let hint = with_scan_state(|state, gate| {
+            let render = || {
+                read = true;
+                screen.to_string()
+            };
+            scan_terminal(tid, generation, render, state, gate, now)
+        });
+        (read, hint)
+    }
+
+    /// What one scan tick did for a terminal showing a limit message.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Tick {
+        /// The scan gate skipped the screen: it is at rest.
+        Rest,
+        /// Scanned, and nothing fired.
+        Due,
+        /// Scanned, and a hint fired.
+        Fired,
+    }
+
+    /// [`scan`] of [`LIMIT_SCREEN`], as a [`Tick`].
+    fn tick(tid: &str, generation: u64, now: Instant) -> Tick {
+        match scan(tid, generation, LIMIT_SCREEN, now) {
+            (false, _) => Tick::Rest,
+            (true, None) => Tick::Due,
+            (true, Some(_)) => Tick::Fired,
+        }
+    }
+
+    /// The outcome `after_hint` last recorded for `tid`, if any.
+    fn recorded_outcome(tid: &str) -> Option<(u64, HintOutcome)> {
+        with_scan_state(|state, _| state.get(tid).and_then(|entry| entry.last_outcome))
+    }
+
+    /// The (terminal, `previous`) each stub handler call was handed.
+    type HandlerCalls = Arc<Mutex<Vec<(String, Option<HintOutcome>)>>>;
+
+    /// A stub for `handle_usage_limit_hint`: records what it was handed and
+    /// ends the hint in `outcome`.
+    fn stub_handler(
+        calls: &HandlerCalls,
+        outcome: HintOutcome,
+    ) -> impl FnOnce(String, &'static str, Option<HintOutcome>) -> std::future::Ready<HintOutcome>
+    {
+        let calls = Arc::clone(calls);
+        move |terminal_id: String, _pattern: &'static str, previous: Option<HintOutcome>| {
+            calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((terminal_id, previous));
+            std::future::ready(outcome)
+        }
+    }
+
+    /// The hint task as `scan_grids_once` spawns it, with a stub handler that
+    /// ends the first hint `NoUsableTarget`: the frozen screen is due again
+    /// afterwards, and the next hint carries the screen's real grid generation
+    /// and that outcome as its `previous`, which the handler is handed.
+    /// Mutations: drop the `after_hint` call from `dispatch_hint` (the screen
+    /// rests at 1.5 s), or build the `DueHint` with `previous: None` (the second
+    /// hint carries nothing).
+    #[tokio::test]
+    async fn a_dispatched_no_target_hint_keeps_its_screen_due_and_hands_its_outcome_on() {
+        let tid = "test/usage_limit/dispatch";
+        let calls = HandlerCalls::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let first = scan(tid, 9, LIMIT_SCREEN, at(0))
+            .1
+            .expect("the first appearance fires");
+        assert_eq!((first.generation, first.previous), (9, None));
+        dispatch_hint(first, stub_handler(&calls, HintOutcome::NoUsableTarget)).await;
+        assert_eq!(
+            recorded_outcome(tid),
+            Some((9, HintOutcome::NoUsableTarget))
+        );
+
+        assert_eq!(
+            tick(tid, 9, at(1_500)),
+            Tick::Due,
+            "the frozen screen is due again"
+        );
+        let second = scan(tid, 9, LIMIT_SCREEN, at(300_000))
+            .1
+            .expect("it fires again when the debounce ends");
+        assert_eq!(
+            (second.generation, second.previous),
+            (9, Some(HintOutcome::NoUsableTarget))
+        );
+        dispatch_hint(second, stub_handler(&calls, HintOutcome::CapReached)).await;
+
+        assert_eq!(tick(tid, 9, at(301_500)), Tick::Rest);
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|e| e.into_inner()),
+            [
+                (tid.to_string(), None),
+                (tid.to_string(), Some(HintOutcome::NoUsableTarget))
+            ]
+        );
+    }
+
+    /// Report once per episode: a scan that finds no limit message on the
+    /// screen ends the terminal's stranding episode, so the next no-target hint
+    /// is reported again. Mutation: keep `last_outcome` through a no-match scan
+    /// — the next hint then carries `NoUsableTarget` and is not reported.
+    #[test]
+    fn a_screen_without_the_limit_message_ends_the_stranding_episode() {
+        let tid = "test/usage_limit/episode";
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        assert_eq!(tick(tid, 1, at(0)), Tick::Fired);
+        after_hint(tid, 1, HintOutcome::NoUsableTarget);
+        assert_eq!(
+            recorded_outcome(tid),
+            Some((1, HintOutcome::NoUsableTarget))
+        );
+
+        // The pane moved on: a scan of its new screen finds no limit message.
+        let (read, hint) = scan(tid, 2, "cargo build finished in 12s", at(10_000));
+        assert!(read && hint.is_none());
+        assert_eq!(recorded_outcome(tid), None, "the no-match scan ended it");
+
+        // A later stranding is a new episode: its no-target outcome is news.
+        let next = scan(tid, 3, LIMIT_SCREEN, at(300_000))
+            .1
+            .expect("the new appearance fires");
+        assert_eq!(next.previous, None);
+        assert!(crate::terminal::account_migration::worth_reporting(
+            next.previous,
+            HintOutcome::NoUsableTarget
+        ));
+    }
+
+    /// A migration that failed after its resumed `claude` may have started
+    /// rests its session at the scanner too: its frozen screen is not kept
+    /// due, and a later repaint on a new grid generation — even after a scan
+    /// without the limit text cleared the terminal's last outcome — fires a
+    /// hint that ends `FailedAfterChild` with no migration target picked.
+    /// Mutation: neutralise the per-session rest check in `cap_then_pick` —
+    /// the repaint's hint then picks a target.
+    #[tokio::test]
+    async fn a_repaint_after_a_child_started_failure_picks_no_target() {
+        use crate::terminal::account_migration::{
+            cap_then_pick, settle_hint_migration, MigrateError,
+        };
+        let tid = "test/usage_limit/child-started";
+        let sid = "test/usage_limit/child-started-session";
+        let stamp = 1_797_000_000_000i64;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let first = scan(tid, 1, LIMIT_SCREEN, at(0))
+            .1
+            .expect("the first appearance fires");
+        dispatch_hint(first, move |_tid, _pattern, previous| {
+            // The migration rests the session under its claim, then settles.
+            crate::terminal::account_migration::rest_after_child_started(sid, stamp);
+            std::future::ready(settle_hint_migration(
+                sid,
+                stamp,
+                previous,
+                Err(MigrateError::FailedAfterChild(
+                    "reader wiring failed".to_string(),
+                )),
+                || {},
+                |_| {},
+            ))
+        })
+        .await;
+        assert_eq!(
+            recorded_outcome(tid),
+            Some((1, HintOutcome::FailedAfterChild))
+        );
+        assert_eq!(tick(tid, 1, at(1_500)), Tick::Rest, "not kept due");
+
+        // A scan without the limit text clears the terminal's outcome...
+        let (read, hint) = scan(tid, 2, "cargo build finished in 12s", at(10_000));
+        assert!(read && hint.is_none());
+        assert_eq!(recorded_outcome(tid), None);
+
+        // ...and the repaint on a new generation fires, with nothing behind it.
+        let repaint = scan(tid, 3, LIMIT_SCREEN, at(300_000))
+            .1
+            .expect("the repaint fires");
+        assert_eq!((repaint.generation, repaint.previous), (3, None));
+        let picked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let picked_in = Arc::clone(&picked);
+        dispatch_hint(repaint, move |_tid, _pattern, previous| {
+            let outcome = match cap_then_pick(
+                sid,
+                "C:/a",
+                stamp + 300_000,
+                previous,
+                move || {
+                    picked_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Some("C:/b".to_string())
+                },
+                |_| {},
+            ) {
+                Ok(_) => HintOutcome::Migrated,
+                Err(outcome) => outcome,
+            };
+            std::future::ready(outcome)
+        })
+        .await;
+        assert!(
+            !picked.load(std::sync::atomic::Ordering::SeqCst),
+            "no migration target is picked beside a child that may still run"
+        );
+        assert_eq!(
+            recorded_outcome(tid),
+            Some((3, HintOutcome::FailedAfterChild))
+        );
+    }
+
+    /// (c) A pane frozen on the limit menu whose hint found no usable target is
+    /// rescanned on every tick, fires its next hint at fired_at +
+    /// `HINT_DEBOUNCE` and not sooner, and rests once a hint ends for good.
+    /// Mutation: drop the `forget` in `after_hint` — the screen then rests at
+    /// 1.5 s and never fires again.
+    #[test]
+    fn a_no_target_hint_keeps_its_frozen_screen_due_until_the_debounce_ends() {
+        let tid = "test/usage_limit/no-target";
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        assert_eq!(tick(tid, 7, at(0)), Tick::Fired);
+        after_hint(tid, 7, HintOutcome::NoUsableTarget);
+
+        // Frozen on generation 7: due on every tick, nothing fired...
+        assert_eq!(tick(tid, 7, at(1_500)), Tick::Due);
+        assert_eq!(tick(tid, 7, at(298_500)), Tick::Due);
+        // ...until the debounce ends.
+        assert_eq!(tick(tid, 7, at(300_000)), Tick::Fired);
+
+        // A final outcome leaves the frozen screen at rest.
+        after_hint(tid, 7, HintOutcome::CapReached);
+        assert_eq!(tick(tid, 7, at(301_500)), Tick::Rest);
+    }
+
+    /// (d) An unconfirmed probe is retried once per appearance: the second
+    /// `NotConfirmed` on the same generation rests, and a new generation
+    /// restores the allowance. Mutation: treat `NotConfirmed` as
+    /// `Retry::EveryDebounce` — the second one then keeps the screen due.
+    #[test]
+    fn an_unconfirmed_hint_is_retried_once_per_appearance() {
+        let tid = "test/usage_limit/not-confirmed";
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        assert_eq!(tick(tid, 3, at(0)), Tick::Fired);
+        after_hint(tid, 3, HintOutcome::NotConfirmed);
+        assert_eq!(tick(tid, 3, at(1_500)), Tick::Due, "the first is retried");
+        assert_eq!(tick(tid, 3, at(300_000)), Tick::Fired);
+
+        after_hint(tid, 3, HintOutcome::NotConfirmed);
+        assert_eq!(
+            tick(tid, 3, at(301_500)),
+            Tick::Rest,
+            "the second on the same generation rests"
+        );
+
+        // The grid changed: a new appearance, with its own retry.
+        assert_eq!(tick(tid, 4, at(600_000)), Tick::Fired);
+        after_hint(tid, 4, HintOutcome::NotConfirmed);
+        assert_eq!(tick(tid, 4, at(601_500)), Tick::Due);
     }
 
     #[test]

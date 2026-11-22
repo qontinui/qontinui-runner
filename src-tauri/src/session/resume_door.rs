@@ -645,6 +645,15 @@ async fn resume_one(
     if let Some(why) = live_gateway_refusal() {
         return ResumeRow::skipped(&cand.id, why);
     }
+    // A session resting after a child-started failure (this door's, the
+    // respawn receiver's or an account migration's) may still have that
+    // `claude --resume` running even where the process read below cannot see
+    // it (an unreadable table, a pid the read misses): skipped, not resumed
+    // beside it, for the rest's 24 h window.
+    // (Under the door's claim, taken above.)
+    if let Some(row) = skip_if_resting(&cand.id, chrono::Utc::now().timestamp_millis()) {
+        return row;
+    }
     // A live claude already running this id: resuming would be a second
     // process on one transcript.
     match live_holder(&cand.id).await {
@@ -722,10 +731,13 @@ async fn resume_one(
         crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
     .await;
-    let terminal_id = match proven_terminal(&cand.id, outcome) {
-        Ok(terminal_id) => terminal_id,
-        Err(row) => return *row,
-    };
+    // Rested (when a child may run) while `_in_flight` still holds the id, so
+    // the next call skips it up front.
+    let terminal_id =
+        match proven_and_rested(&cand.id, outcome, chrono::Utc::now().timestamp_millis()) {
+            Ok(terminal_id) => terminal_id,
+            Err(row) => return *row,
+        };
     match verify(tm, &cand, &terminal_id).await {
         Ok(ev) => ResumeRow::resumed(&cand.id, ev),
         Err(reason) => ResumeRow::failed(
@@ -742,14 +754,53 @@ async fn resume_one(
     }
 }
 
+/// The id's `skipped` row when it rests after a child-started failure
+/// ([`crate::terminal::account_migration::resting_after_child_started`]).
+fn skip_if_resting(id: &str, now_ms: i64) -> Option<ResumeRow> {
+    crate::terminal::account_migration::resting_after_child_started(id, now_ms)
+        .then(|| ResumeRow::skipped(id, CHILD_MAY_RUN_SKIP))
+}
+
+/// [`proven_terminal`], after resting the id when a spawn failed after its
+/// resumed claude started
+/// ([`crate::terminal::account_migration::rest_if_child_may_run`]). Called
+/// while the door still holds the id's in-flight claim.
+fn proven_and_rested(
+    id: &str,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+    now_ms: i64,
+) -> Result<String, Box<ResumeRow>> {
+    crate::terminal::account_migration::rest_if_child_may_run(id, &outcome, now_ms);
+    proven_terminal(id, outcome)
+}
+
+/// The `skipped(<reason>)` of an id resting after a child-started failure.
+const CHILD_MAY_RUN_SKIP: &str = "child_may_run: an earlier resume, respawn or migration of this \
+     session failed after its resumed claude started";
+
 /// Pure: the terminal a proven respawn landed on, or the id's `failed` row.
 /// Only [`RespawnOutcome::Alive`] proceeds to the process read; a death is
-/// `failed(respawn-died: …)`, never `resumed`.
+/// `failed(respawn-died: …)`, never `resumed`. A spawn that failed after its
+/// resumed claude started is `failed(respawn-child-may-run: …)` whatever the
+/// respawn then ended as: that child may still run, so the id must not read as
+/// a plain spawn failure or a death that left nothing running, either of which
+/// a caller may retry.
 fn proven_terminal(
     id: &str,
     outcome: crate::terminal::respawn_liveness::RespawnOutcome,
 ) -> Result<String, Box<ResumeRow>> {
     use crate::terminal::respawn_liveness::RespawnOutcome;
+    if let Some(failure) = outcome.child_may_run() {
+        return Err(Box::new(ResumeRow::failed(
+            id,
+            format!(
+                "respawn-child-may-run: {} — {}",
+                failure.message,
+                crate::terminal::account_migration::CHILD_MAY_RUN_WARNING
+            ),
+            None,
+        )));
+    }
     match outcome {
         RespawnOutcome::Alive { terminal_id, .. } => Ok(terminal_id),
         RespawnOutcome::NotSpawned(e) => {
@@ -772,9 +823,14 @@ fn proven_terminal(
             exit_code,
             attempts,
             retry_spawn_error,
+            ..
         } => Err(Box::new(ResumeRow::failed(
             id,
-            RespawnOutcome::died_detail(exit_code, attempts, retry_spawn_error.as_deref()),
+            RespawnOutcome::died_detail(
+                exit_code,
+                attempts,
+                retry_spawn_error.as_ref().map(|f| f.message.as_str()),
+            ),
             None,
         ))),
         // The pane is LEFT RUNNING (it keeps the row): a caller must not read
@@ -811,17 +867,16 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
         &self.cand.id
     }
 
-    async fn spawn_next(&mut self) -> Result<String, String> {
+    async fn spawn_next(&mut self) -> Result<String, crate::terminal::spawn_refusal::SpawnFailure> {
         // The async pre-step: the ABSOLUTE binary, retried, never bare — the
         // one resolved before the cap check for the first spawn.
         let claude_bin = match self.first_bin.take() {
             Some(bin) => bin,
-            None => {
-                crate::claude_cli_spawn::resolve_resume_claude_bin(
-                    &crate::claude_cli_spawn::RETRY_DELAYS,
-                )
-                .await?
-            }
+            None => crate::claude_cli_spawn::resolve_resume_claude_bin(
+                &crate::claude_cli_spawn::RETRY_DELAYS,
+            )
+            .await
+            .map_err(crate::terminal::spawn_refusal::SpawnFailure::before_child)?,
         };
         let cand = &self.cand;
         // Model is sniffed off the row's transcript. The read is blocking
@@ -1284,6 +1339,7 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 retry_spawn_error: None,
+                rolled_back: false,
             },
         )
         .unwrap_err();
@@ -1297,7 +1353,10 @@ mod tests {
             RespawnOutcome::Died {
                 exit_code: Some(127),
                 attempts: 3,
-                retry_spawn_error: Some("claude not found".into()),
+                retry_spawn_error: Some(
+                    crate::terminal::spawn_refusal::SpawnFailure::before_child("claude not found"),
+                ),
+                rolled_back: false,
             },
         )
         .unwrap_err();
@@ -1329,6 +1388,96 @@ mod tests {
             .unwrap(),
             "t3"
         );
+    }
+
+    /// Tripwire on the door's rest WIRING in `resume_one` (the helpers
+    /// themselves have their own tests): the decisive re-check runs AFTER the
+    /// in-flight claim and before the respawn, and the outcome goes through
+    /// `proven_and_rested`, never a bare `proven_terminal`. Mutation: delete
+    /// the post-claim `skip_if_resting`, or call `proven_terminal` directly.
+    #[test]
+    fn resume_one_checks_the_rest_under_its_claim_and_rests_through_the_helper() {
+        let src = include_str!("resume_door.rs");
+        let start = src.find("async fn resume_one(").expect("the fn");
+        let body = src.get(start..).expect("a char boundary");
+        let body = body
+            .get(..body.find("\n}\n").expect("the fn's end"))
+            .expect("a char boundary");
+        let claim = body.find("claim_for_door(&cand.id").expect("the claim");
+        let recheck = body
+            .get(claim..)
+            .expect("a char boundary")
+            .find("skip_if_resting(&cand.id")
+            .map(|i| claim + i)
+            .expect("the rest is re-checked under the claim");
+        let respawn = body.find("confirm_respawn(").expect("the respawn");
+        assert!(recheck < respawn, "re-checked before anything spawns");
+        assert!(
+            body.get(respawn..)
+                .expect("a char boundary")
+                .contains("proven_and_rested("),
+            "the outcome rests the session through the helper"
+        );
+        assert!(
+            !body.contains("proven_terminal("),
+            "never a bare proven_terminal"
+        );
+    }
+
+    /// The rest WIRING: a child-started outcome rests the id
+    /// (`proven_and_rested`), and the door then skips it up front
+    /// (`skip_if_resting`); an id nobody rested is not skipped. Mutation: drop
+    /// the rest from `proven_and_rested`.
+    #[test]
+    fn a_child_started_resume_rests_the_id_and_skips_the_next_call() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        use crate::terminal::spawn_refusal::SpawnFailure;
+        let id = "test/resume_door/child-started-rest";
+        let now = 1_799_700_000_000i64;
+        assert!(skip_if_resting(id, now).is_none());
+        let row = proven_and_rested(
+            id,
+            RespawnOutcome::NotSpawned(SpawnFailure::after_child("wiring failed")),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(row.outcome, "failed");
+        let skipped = skip_if_resting(id, now + 1).expect("the next call is skipped");
+        assert_eq!(skipped.outcome, "skipped");
+        assert_eq!(skipped.reason.as_deref(), Some(CHILD_MAY_RUN_SKIP));
+        assert!(skip_if_resting("test/resume_door/never-rested", now).is_none());
+    }
+
+    /// A spawn that failed after its resumed claude started fails the id as
+    /// `respawn-child-may-run`, never as a plain spawn failure or a death.
+    /// Mutation: drop the `child_may_run` check from `proven_terminal`.
+    #[test]
+    fn the_door_never_reads_a_child_started_failure_as_a_spawn_failure_or_a_death() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        use crate::terminal::spawn_refusal::SpawnFailure;
+        let failure = SpawnFailure::after_child("terminal reader wiring failed");
+        for outcome in [
+            RespawnOutcome::NotSpawned(failure.clone()),
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 2,
+                retry_spawn_error: Some(failure.clone()),
+                rolled_back: false,
+            },
+            RespawnOutcome::ClosedByUser {
+                attempts: 2,
+                orphan: Some(failure.clone()),
+            },
+        ] {
+            let row = proven_terminal(ID, outcome.clone()).unwrap_err();
+            assert_eq!(row.outcome, "failed", "{outcome:?}");
+            let reason = row.reason.clone().unwrap_or_default();
+            assert!(
+                reason.starts_with("respawn-child-may-run: terminal reader wiring failed"),
+                "{outcome:?}: {reason}"
+            );
+            assert!(reason.contains("may still be"), "{reason}");
+        }
     }
 
     #[test]
