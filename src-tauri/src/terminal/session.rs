@@ -7877,11 +7877,15 @@ pub(crate) mod tests {
         let seam_start = src
             .find(&["fn apply_identity", "_seam("].concat())
             .expect("the identity seam exists");
-        let seam = &src[seam_start..];
+        let seam = src
+            .get(seam_start..)
+            .expect("`find` returns a char boundary");
         let match_at = seam
             .find(&["match &", "identity {"].concat())
             .expect("the seam matches on the materialized shim dir");
-        let after_match = &seam[match_at..];
+        let after_match = seam
+            .get(match_at..)
+            .expect("`find` returns a char boundary");
         let none_line = after_match
             .lines()
             .find(|l| l.trim_start().starts_with("None =>"))
