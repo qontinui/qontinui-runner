@@ -149,7 +149,11 @@ pub enum DispatchError {
 /// gives its message, code and retry verdict. A top-level `code` (else
 /// `errorCode`) wins over the object's, and a top-level boolean `retryable`
 /// wins over the object's.
-fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Option<DispatchError> {
+pub(crate) fn app_answered_failure(
+    url: &str,
+    status: u16,
+    json: &serde_json::Value,
+) -> Option<DispatchError> {
     if json.get("success").and_then(|v| v.as_bool()) != Some(false) {
         return None;
     }
@@ -157,9 +161,12 @@ fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Opt
         .get("error")
         .cloned()
         .and_then(WrapperFailure::from_wire);
+    // A blank top-level code is no code (never a code of `""`), so it does
+    // not shadow the object's own.
     let top_code = ["code", "errorCode"]
         .into_iter()
         .find_map(|k| json.get(k).and_then(|v| v.as_str()))
+        .filter(|c| !c.trim().is_empty())
         .map(String::from);
     let (error, code, retryable) = match failure {
         Some(failure) => (
