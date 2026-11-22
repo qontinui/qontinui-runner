@@ -320,17 +320,24 @@ impl DeviceScreenshotSource {
             // At a gateway status a code counts only when it was SENT as a
             // non-blank string (top level, or inside an object `error`): a
             // numeric code there is most likely a proxy echoing its status.
-            let string_coded = body.as_ref().is_some_and(has_string_code);
+            let string_code = body.as_ref().and_then(string_code);
             let refusal_message = match body
                 .as_ref()
                 .and_then(|b| device_refusal(&url, status.as_u16(), b))
             {
-                Some(refusal @ FrameSourceError::CaptureFailed { code: Some(_), .. })
-                    if !gateway || string_coded =>
-                {
-                    return Err(refusal)
-                }
                 Some(refusal) if !gateway => return Err(refusal),
+                // At a gateway status, a refusal carrying a STRING code is the
+                // device's — reported with that string, never a numeric code
+                // `from_wire` may have read first inside an object `error`.
+                Some(FrameSourceError::CaptureFailed {
+                    message, retryable, ..
+                }) if string_code.is_some() => {
+                    return Err(FrameSourceError::CaptureFailed {
+                        message,
+                        code: string_code,
+                        retryable,
+                    })
+                }
                 // An envelope at a gateway status with no string code: the
                 // transport's below, but its parsed message (a string or an
                 // object `error`) is kept — only when it actually carried a
@@ -399,18 +406,18 @@ impl FrameProvider for DeviceScreenshotSource {
     }
 }
 
-/// Whether `body` sent its code as a non-blank STRING: a top-level
-/// `code`/`errorCode`, or one inside an object `error`, both read by the
-/// shared [`crate::mcp::app_dispatch::top_level_code`]. A numeric code (which
-/// `WrapperFailure::from_wire` does read inside an object `error`) is not.
-fn has_string_code(body: &serde_json::Value) -> bool {
+/// The code `body` sent as a non-blank STRING, if any: the top-level
+/// `code`/`errorCode` first, else the one inside an object `error`, both read
+/// by the shared [`crate::mcp::app_dispatch::top_level_code`]. A numeric code
+/// (which `WrapperFailure::from_wire` does read inside an object `error`) is
+/// skipped, so `{"error":{"code":502,"errorCode":"X"}}` gives `X`.
+fn string_code(body: &serde_json::Value) -> Option<String> {
     use crate::mcp::app_dispatch::top_level_code;
-    top_level_code(body).is_some()
-        || body
-            .get("error")
+    top_level_code(body).or_else(|| {
+        body.get("error")
             .filter(|e| e.is_object())
             .and_then(top_level_code)
-            .is_some()
+    })
 }
 
 /// Whether `body` carries an `error` worth appending: anything but absent,
@@ -440,7 +447,12 @@ fn device_refusal(url: &str, status: u16, body: &serde_json::Value) -> Option<Fr
             retryable,
             ..
         } => Some(FrameSourceError::CaptureFailed {
-            message: format!("device screenshot {url} returned HTTP {status}: {error}"),
+            // A blank message adds no `: ` suffix.
+            message: if error.trim().is_empty() {
+                format!("device screenshot {url} returned HTTP {status}")
+            } else {
+                format!("device screenshot {url} returned HTTP {status}: {error}")
+            },
             code,
             retryable,
         }),
@@ -1137,6 +1149,66 @@ mod tests {
             text.ends_with("returned HTTP 503 Service Unavailable"),
             "{text}"
         );
+    }
+
+    /// Fetch at 503 and return the reported code.
+    async fn code_at_503(body: serde_json::Value) -> String {
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        err.code().to_string()
+    }
+
+    /// Which STRING code a gateway-status refusal reports, wherever it sat.
+    #[tokio::test]
+    async fn a_gateway_refusal_reports_its_string_code() {
+        // (a) A nested string code only: the device's refusal, that code.
+        assert_eq!(
+            code_at_503(serde_json::json!({
+                "success": false, "error": {"code": "PAIRING_UNAVAILABLE"},
+            }))
+            .await,
+            "PAIRING_UNAVAILABLE"
+        );
+        // (b) A string top-level code beside a numeric nested one: the top.
+        assert_eq!(
+            code_at_503(serde_json::json!({
+                "success": false, "code": "TOP", "error": {"code": 503, "message": "m"},
+            }))
+            .await,
+            "TOP"
+        );
+        // (c) A numeric top-level code beside a string nested one: the nested.
+        assert_eq!(
+            code_at_503(serde_json::json!({
+                "success": false, "code": 503, "error": {"code": "NESTED", "message": "m"},
+            }))
+            .await,
+            "NESTED"
+        );
+        // (d) A numeric nested `code` before a string nested `errorCode`:
+        // the string, never the numeric `code` `from_wire` reads first.
+        assert_eq!(
+            code_at_503(serde_json::json!({
+                "success": false,
+                "error": {"code": 502, "errorCode": "PAIRING_UNAVAILABLE"},
+            }))
+            .await,
+            "PAIRING_UNAVAILABLE"
+        );
+    }
+
+    /// A coded refusal with a blank `error` ends at the status line.
+    #[tokio::test]
+    async fn a_coded_refusal_with_a_blank_error_adds_no_suffix() {
+        let body = serde_json::json!({"success": false, "code": "X", "error": ""});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "X", "{err:?}");
+        // The envelope reader names the status by number (`503`).
+        let text = err.to_string();
+        assert!(text.ends_with("returned HTTP 503"), "{text}");
     }
 
     /// A bare `{success:false}` at a gateway status carries no message: the
