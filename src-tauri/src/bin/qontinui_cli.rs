@@ -19,7 +19,8 @@
 //! both are read here and the runner accepts either), discovered in this order:
 //!
 //! 1. **`$QONTINUI_MCP_CONFIG`** — the session's OWN `--mcp-config` file, which
-//!    the runner exports at spawn. When set and non-empty it is authoritative:
+//!    the runner (or the identity shim, for a config it self-provisions)
+//!    exports at spawn. When set and not blank it is authoritative:
 //!    a missing or credential-less file is an error, and the walk-up below is
 //!    NOT tried, because from a worktree with no `.mcp.json` the walk-up reaches
 //!    an ancestor's (another session's, possibly another tenant's) credential.
@@ -377,7 +378,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         Some(p) => p,
         None => {
             eprintln!(
-                "qontinui-pr: the session `.mcp.json` coord-mcp URL carries no \
+                "qontinui-pr: the discovered session config's coord-mcp URL carries no \
                  port and ${RUNNER_PORT_ENV} is not set — cannot pair the nonce with \
                  its issuing runner. Fallback: `gh pr create` works where a personal \
                  `gh auth login` exists."
@@ -1558,9 +1559,9 @@ impl std::fmt::Display for DiscoveryError {
         match self {
             Self::EnvFileUnreadable { path, error } => write!(
                 f,
-                "${MCP_CONFIG_ENV} names {} but it cannot be read ({error}). This \
-                 session's own coord-mcp config is gone (retired by the runner, or \
-                 never written), so there is no session credential. The `.mcp.json` \
+                "${MCP_CONFIG_ENV} names {} but it cannot be read ({error}) — \
+                 typically because the runner retired it or never wrote it — so \
+                 there is no session credential. The `.mcp.json` \
                  walk-up is deliberately NOT tried: an ancestor's file belongs to a \
                  different session and possibly a different tenant. Fallback: \
                  `gh pr create` works where a personal `gh auth login` exists.",
@@ -1579,7 +1580,7 @@ impl std::fmt::Display for DiscoveryError {
             ),
             Self::WalkUpFoundNothing { cwd } => write!(
                 f,
-                "no runner session credential found — ${MCP_CONFIG_ENV} is unset and \
+                "no runner session credential found — ${MCP_CONFIG_ENV} is unset or blank and \
                  no `.mcp.json` with a coord-mcp nonce entry lies between {} and the \
                  filesystem root. A stdio shim entry (`coord-mcp-shim.py`) whose \
                  `--credential` file is missing, unreadable, or not a JSON \
@@ -1614,12 +1615,11 @@ fn discover_session_mcp_config(
 ) -> Result<SessionMcpConfig, DiscoveryError> {
     if let Some(raw) = env_config.filter(|v| !v.to_string_lossy().trim().is_empty()) {
         let path = PathBuf::from(raw);
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            DiscoveryError::EnvFileUnreadable {
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| DiscoveryError::EnvFileUnreadable {
                 path: path.clone(),
                 error: e.to_string(),
-            }
-        })?;
+            })?;
         return parse_mcp_json(&text).ok_or(DiscoveryError::EnvFileNoCredential { path });
     }
     find_session_mcp_config(cwd).ok_or_else(|| DiscoveryError::WalkUpFoundNothing {
