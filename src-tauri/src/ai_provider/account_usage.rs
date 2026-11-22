@@ -949,10 +949,7 @@ mod tests {
             "c" => 0,
             _ => 5,
         };
-        assert_eq!(
-            spread_pool(&roster, |_| true, load, 3),
-            dirs(&["b", "c"])
-        );
+        assert_eq!(spread_pool(&roster, |_| true, load, 3), dirs(&["b", "c"]));
     }
 
     #[test]
@@ -963,10 +960,7 @@ mod tests {
             "b" => 3,
             _ => 3,
         };
-        assert_eq!(
-            spread_pool(&roster, |_| true, load, 3),
-            dirs(&["b", "c"])
-        );
+        assert_eq!(spread_pool(&roster, |_| true, load, 3), dirs(&["b", "c"]));
     }
 
     #[test]

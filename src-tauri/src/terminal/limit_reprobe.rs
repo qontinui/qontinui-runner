@@ -160,9 +160,11 @@ pub fn note_unconfirmed(terminal_id: &str, claude_session_id: &str) {
     }
     let delay = {
         let mut ledger = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
-        ledger
-            .get_or_insert_with(ReprobeLedger::default)
-            .admit(terminal_id, claude_session_id, Instant::now())
+        ledger.get_or_insert_with(ReprobeLedger::default).admit(
+            terminal_id,
+            claude_session_id,
+            Instant::now(),
+        )
     };
     let Some(delay) = delay else {
         info!(
