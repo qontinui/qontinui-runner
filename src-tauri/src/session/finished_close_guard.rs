@@ -502,12 +502,14 @@ pub fn revival_arm(
 /// (`wind_down_observer::fetch_pending_messages`), so a full page is UNKNOWN
 /// only for a session whose id is not one.
 ///
-///
 /// Session filter (plan `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`,
-/// D3): when coord echoed `session_filter_applied` the page holds ONLY this
-/// session's rows ([`PendingMessage::session_filtered`]). Such a page with no
-/// row clears whatever the device's backlog, a full one is never page-full
-/// UNKNOWN, and a row the runner cannot attribute is UNKNOWN.
+/// D3): the read sends the Claude session UUID as `session`, and when coord
+/// echoed `session_filter_applied` the page holds ONLY this session's rows
+/// ([`PendingMessage::session_filtered`]). On such a page every row is this
+/// session's by construction, so ANY row HOLDS, even one the runner cannot
+/// attribute, and a page with no row clears whatever the device's backlog. An
+/// unfiltered page (an older coord that ignores `session`) keeps the rules
+/// above.
 ///
 /// A message already delivered (injected) but not yet acked is not on the
 /// page — it reached the pane as a turn, which the revival arm catches.
@@ -533,19 +535,20 @@ pub fn messages_arm(
         );
     }
     let filtered = !rows.is_empty() && rows.iter().all(|r| r.session_filtered);
+    // On a filtered page every row is this session's by construction, so even
+    // a row the runner cannot attribute HOLDS.
     if filtered {
-        if let Some(row) = rows.iter().find(|r| r.owner.is_none()) {
-            return ArmVerdict::unknown(
-                "undelivered_messages_unattributable",
-                format!(
-                    "undelivered message {} is addressed to {}, which this runner cannot attribute",
-                    row.message_id, row.to_session
-                ),
-            );
-        }
+        let row = &rows[0];
+        return ArmVerdict::held(
+            "undelivered_message",
+            format!(
+                "coord holds undelivered message {} for this session",
+                row.message_id
+            ),
+        );
     }
     let named_in_live = session_id.trim().parse::<uuid::Uuid>().is_ok();
-    if rows.len() >= PENDING_PAGE_LIMIT && !filtered && !named_in_live {
+    if rows.len() >= PENDING_PAGE_LIMIT && !named_in_live {
         return ArmVerdict::unknown(
             "undelivered_messages_page_full",
             format!(
@@ -1291,16 +1294,14 @@ mod tests {
         let mut f = Fixture::ok();
         f.messages = Ok(Vec::new());
         assert_eq!(f.outcome(), CLOSE);
-        // An unattributable row stays UNKNOWN on a filtered page.
+        // On a filtered page an unattributable row is still this session's: HOLD.
         let mut f = Fixture::ok();
         f.messages = Ok(vec![filtered("who-knows", None)]);
         assert_eq!(
             f.outcome(),
-            unknown(
-                "undelivered_messages",
-                "undelivered_messages_unattributable"
-            )
+            held("undelivered_messages", "undelivered_message")
         );
+        // On an unfiltered page it is nobody's here (covered by the first test).
         // A FULL filtered page of this session's own rows still HOLDS...
         let mut f = Fixture::ok();
         f.messages = Ok((0..PENDING_PAGE_LIMIT)
@@ -1310,12 +1311,15 @@ mod tests {
             f.outcome(),
             held("undelivered_messages", "undelivered_message")
         );
-        // ...and a full filtered page naming only other owners is never page-full.
+        // ...and a full filtered page is never a page-full UNKNOWN.
         let mut f = Fixture::ok();
         f.messages = Ok((0..PENDING_PAGE_LIMIT)
             .map(|i| filtered(&format!("s-other-{i}"), Some("s-other")))
             .collect());
-        assert_eq!(f.outcome(), CLOSE);
+        assert_eq!(
+            f.outcome(),
+            held("undelivered_messages", "undelivered_message")
+        );
     }
 
     // ── Order and reporting ──────────────────────────────────────────────

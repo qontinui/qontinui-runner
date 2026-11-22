@@ -730,17 +730,15 @@ pub struct PendingPage {
 
 /// coord's undelivered, unacked, unexpired messages - `GET
 /// /coord/session-messages/pending`, the door the delivery poller pulls.
-/// `coord_session_id`, when known (from the ownership read, NOT the Claude
-/// UUID: coord compares `agent_sessions` ids), is sent as `?session=` so coord
-/// returns only that session's rows; `?live=` still names the Claude session
-/// when its id is a UUID. `Err` when there is no coord base, no shared client,
+/// A UUID-shaped Claude session id is sent as `?session=` (coord's
+/// `to_session` is the agent_sessions id, which in production IS the Claude
+/// session UUID; NOT `coord.sessions.id`, a different id space) so coord
+/// returns only that session's rows, and as `?live=`. A non-UUID id sends
+/// neither, so the page stays the device's. `Err` when there is no coord base, no shared client,
 /// no device credential (coord refuses an anonymous read), the read fails, or
 /// the body is not the shape coord serves: the close guard reads every `Err`
 /// as UNKNOWN.
-pub async fn fetch_pending_messages(
-    claude_session_id: &str,
-    coord_session_id: Option<&str>,
-) -> Result<PendingPage, String> {
+pub async fn fetch_pending_messages(claude_session_id: &str) -> Result<PendingPage, String> {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         return Err("no coord base is configured, so pending messages cannot be read".to_string());
     };
@@ -753,46 +751,29 @@ pub async fn fetch_pending_messages(
                 .to_string(),
         );
     }
-    let url = pending_url(&base, claude_session_id, coord_session_id);
+    let url = pending_url(&base, claude_session_id);
     let body = read_obligations(
         crate::coord_http::coord_get(client, &url),
         &url,
         PENDING_MESSAGES_TIMEOUT,
     )
     .await?;
-    pending_page(&body, coord_session_id.is_some())
+    pending_page(
+        &body,
+        claude_session_id.trim().parse::<uuid::Uuid>().is_ok(),
+    )
 }
 
 /// PURE: the pending-messages URL.
-pub fn pending_url(base: &str, claude_session_id: &str, coord_session_id: Option<&str>) -> String {
-    let mut params: Vec<String> = Vec::new();
-    if let Some(id) = coord_session_id.map(str::trim).filter(|s| !s.is_empty()) {
-        params.push(format!("session={}", encode_query_component(id)));
-    }
-    if let Ok(uuid) = claude_session_id.trim().parse::<uuid::Uuid>() {
-        params.push(format!("live={uuid}"));
-    }
+pub fn pending_url(base: &str, claude_session_id: &str) -> String {
     let mut url = format!(
         "{}/coord/session-messages/pending",
         base.trim_end_matches('/')
     );
-    if !params.is_empty() {
-        url.push('?');
-        url.push_str(&params.join("&"));
+    if let Ok(uuid) = claude_session_id.trim().parse::<uuid::Uuid>() {
+        url.push_str(&format!("?session={uuid}&live={uuid}"));
     }
     url
-}
-
-/// Percent-encode one query value (unreserved characters pass through).
-fn encode_query_component(raw: &str) -> String {
-    raw.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 /// PURE: a pending-message body as a [`PendingPage`]. The filter counts as
@@ -2546,17 +2527,16 @@ mod tests {
         );
         assert!(!pending_page(&silent, true).unwrap().session_filter_applied);
         assert!(!pending_page(&denied, true).unwrap().session_filter_applied);
+        let id = "0192aaaa-0000-7000-8000-000000000001";
         assert_eq!(
-            pending_url(
-                "http://h/",
-                "not-a-uuid",
-                Some("0192aaaa-0000-7000-8000-000000000001")
-            ),
-            "http://h/coord/session-messages/pending?session=0192aaaa-0000-7000-8000-000000000001"
+            pending_url("http://h/", id),
+            format!("http://h/coord/session-messages/pending?session={id}&live={id}"),
+            "the Claude session UUID itself is the filter"
         );
         assert_eq!(
-            pending_url("http://h", "not-a-uuid", None),
-            "http://h/coord/session-messages/pending"
+            pending_url("http://h", "not-a-uuid"),
+            "http://h/coord/session-messages/pending",
+            "a non-UUID id sends no `session` (no 400 risk; the page stays unfiltered)"
         );
     }
 
