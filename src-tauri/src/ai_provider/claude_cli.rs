@@ -326,6 +326,14 @@ pub(crate) fn build_print_command(
         let line = cmd_s_c_line(program, extra_args).map_err(PrintRunError::Spawn)?;
         let mut c = crate::process_helpers::cmd_no_window();
         c.raw_arg(line);
+        // cmd.exe (and launchers that follow the same Windows rule) look a
+        // bare program name up in the CURRENT DIRECTORY before PATH; the
+        // structured one-shot's cwd is an untrusted checkout, so a planted
+        // `claude.cmd` / `git.exe` there must not win. Setting this variable
+        // turns that lookup off for cmd.exe and everything it starts
+        // (`NeedCurrentDirectoryForExePathW`). The maintenance gate also
+        // refuses such files at the checkout root.
+        c.env("NoDefaultCurrentDirectoryInExePath", "1");
         c
     };
     #[cfg(not(windows))]
@@ -1151,6 +1159,13 @@ mod tests {
             );
             assert!(args[0].contains(" --safe-mode --restricted "), "{args:?}");
             assert!(args[0].contains(" --tools Read,Grep,Glob "), "{args:?}");
+            // Review round 7: no current-directory program lookup, so a
+            // planted `claude.cmd` in the checkout cwd cannot win over PATH.
+            let pinned = cmd
+                .get_envs()
+                .find(|(k, _)| *k == "NoDefaultCurrentDirectoryInExePath")
+                .and_then(|(_, v)| v);
+            assert_eq!(pinned, Some(std::ffi::OsStr::new("1")));
         } else {
             let print = args.iter().position(|a| a == "--print").unwrap();
             assert_eq!(args[print + 1], "--output-format");

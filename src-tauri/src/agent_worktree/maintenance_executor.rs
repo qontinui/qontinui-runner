@@ -1190,6 +1190,10 @@ const MAX_CHECKOUT_ENTRIES: usize = 50_000;
 /// Cap on files listed (and line-counted) in the diff-stat section.
 const MAX_DIFF_STAT_FILES: usize = 500;
 
+/// Blobs larger than this are counted as binary by the diff stat (libgit2's
+/// own default is 512 MiB), bounding what one stat row can load.
+const MAX_DIFF_BLOB_BYTES: i64 = 4 * 1024 * 1024;
+
 /// Git mode of a symbolic link in the index.
 const GIT_SYMLINK_MODE: u32 = 0o120_000;
 
@@ -1810,7 +1814,15 @@ fn diff_stat_vs_upstream(repo: &git2::Repository) -> (String, Result<String, Str
                 let stat = (|| -> Result<String, git2::Error> {
                     let base_tree = repo.find_commit(base)?.tree()?;
                     let head_tree = head.tree()?;
-                    let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
+                    // A blob over the cap is treated as binary, so a branch
+                    // committing huge files cannot make the stat load them.
+                    let mut opts = git2::DiffOptions::new();
+                    opts.max_size(MAX_DIFF_BLOB_BYTES);
+                    let diff = repo.diff_tree_to_tree(
+                        Some(&base_tree),
+                        Some(&head_tree),
+                        Some(&mut opts),
+                    )?;
                     let total = diff.deltas().len();
                     let mut rows: Vec<StatRow> = Vec::new();
                     for idx in 0..total.min(MAX_DIFF_STAT_FILES) {
@@ -1980,6 +1992,9 @@ fn prepare_checkout(repo_path: &Path) -> Result<PreparedCheckout, String> {
     }
     let repo = open_checkout_root(repo_path)?;
     let cwd = usable_canonical_dir(repo_path)?;
+    if cfg!(windows) {
+        refuse_root_programs_shadowing_path(&cwd)?;
+    }
     let index_len = repo
         .index()
         .map_err(|e| format!("cannot read the index: {}", e.message()))?
@@ -1995,6 +2010,52 @@ fn prepare_checkout(repo_path: &Path) -> Result<PreparedCheckout, String> {
     check_symlinks(&repo, &cwd, &status, MAX_CHECKOUT_ENTRIES)?;
     let context = gather_git_context(&repo, &status, &new_context_nonce());
     Ok(PreparedCheckout { cwd, context })
+}
+
+/// Program names a Windows child could resolve from its working directory
+/// before PATH: the CLI itself (cmd.exe looks up a bare `claude`) and the git
+/// the CLI runs on its own. The child's env sets
+/// `NoDefaultCurrentDirectoryInExePath` (see `claude_cli::build_print_command`);
+/// this gate does not rely on every launcher honoring it.
+const SHADOWING_PROGRAM_STEMS: [&str; 2] = ["claude", "git"];
+
+/// Extensions Windows can launch by bare name (the default `PATHEXT`).
+const WINDOWS_LAUNCH_EXTENSIONS: [&str; 12] = [
+    "com", "exe", "bat", "cmd", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msc", "ps1",
+];
+
+/// Whether `name` would shadow one of [`SHADOWING_PROGRAM_STEMS`] when found in
+/// the working directory — `claude.cmd`, `GIT.EXE`, and an extension-less
+/// `claude` alike (case-insensitive, as Windows compares names).
+fn is_shadowing_program_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem, Some(ext)),
+        None => (name.as_str(), None),
+    };
+    SHADOWING_PROGRAM_STEMS.contains(&stem)
+        && ext.is_none_or(|e| WINDOWS_LAUNCH_EXTENSIONS.contains(&e))
+}
+
+/// Refuse a checkout whose ROOT holds a file that a Windows child started in
+/// it could run instead of the real `claude` or `git` (cmd.exe and other
+/// launchers search the current directory before PATH). Only the root is
+/// searched that way, so only the root is listed.
+fn refuse_root_programs_shadowing_path(root: &Path) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(root).map_err(|e| format!("cannot list {}: {e}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot list {}: {e}", root.display()))?;
+        let name = entry.file_name();
+        if is_shadowing_program_name(&name) {
+            return Err(format!(
+                "the checkout root holds {}, which a child started there could run \
+                 instead of the program on PATH",
+                c_quote(name.to_string_lossy().as_bytes())
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The working directory for a no-repo compile: a private directory under the
@@ -3438,6 +3499,50 @@ mod agent_request_tests {
         }
         // Idempotent.
         assert_eq!(private_dir(&dir).unwrap(), got);
+    }
+
+    /// Review round 7: names that would shadow `claude` / `git` from the
+    /// working directory on Windows are recognised case-insensitively, with
+    /// any launchable extension or none; look-alikes are not.
+    #[test]
+    fn shadowing_program_names_are_recognised() {
+        use std::ffi::OsStr;
+        for bad in [
+            "claude",
+            "claude.cmd",
+            "CLAUDE.EXE",
+            "git.exe",
+            "Git.Bat",
+            "git.ps1",
+        ] {
+            assert!(is_shadowing_program_name(OsStr::new(bad)), "{bad}");
+        }
+        for ok in [
+            "claude.md",
+            "git.txt",
+            ".git",
+            "gitignore",
+            "claude-x.exe",
+            "README",
+        ] {
+            assert!(!is_shadowing_program_name(OsStr::new(ok)), "{ok}");
+        }
+    }
+
+    /// Review round 7: a planted `claude.cmd` at the checkout root is refused
+    /// on Windows, where cmd.exe would find it before PATH.
+    #[cfg(windows)]
+    #[test]
+    fn a_planted_root_program_is_refused_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(init_repo(dir.path()));
+        assert!(
+            prepare_checkout(dir.path()).is_ok(),
+            "clean checkout passes"
+        );
+        std::fs::write(dir.path().join("claude.cmd"), "@echo pwned\r\n").unwrap();
+        let err = prepare_checkout(dir.path()).err().expect("refused");
+        assert!(err.contains("claude.cmd"), "{err}");
     }
 
     /// Round-6 A4: the one-shot's `GIT_DIR` is an EMPTY private directory —
