@@ -1744,6 +1744,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refused_sdk_snapshot_hash_still_evaluates_with_snapshot_sha256_none() {
+        // Plan 2026-11-22-canonical-hash-genuine-rfc8785 Phase 2: a snapshot
+        // whose telemetry hash is refused still fetches AND evaluates, with
+        // `snapshot_sha256` absent. The fetch tuple is carried into
+        // `evaluate_one` exactly as `post_spec_check_batch` carries it.
+        // (Not entered through POST: the route reaches a live SDK client,
+        // and today's canonical_hash cannot refuse a serde_json::Value, so a
+        // refusal can only be injected at the `wrap_sdk_snapshot` seam.)
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let doc = minimal_ir_doc("refused-hash-page");
+        storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc).unwrap();
+
+        let envelope = json!({ "success": true, "data": minimal_snapshot_json() });
+        let (snapshot, fp, snapshot_id, hash) = wrap_sdk_snapshot(
+            envelope,
+            "qontinui-web".to_string(),
+            None,
+            None,
+            None,
+            |_: &serde_json::Value| {
+                Err(
+                    qontinui_types::canonical_hash::CanonicalHashError::Canonicalize(
+                        "refused for the test".to_string(),
+                    ),
+                )
+            },
+        )
+        .expect("a refused telemetry hash must not fail the SDK snapshot fetch");
+        assert_eq!(hash, None);
+
+        let entry = BatchPageEntry {
+            page_id: "refused-hash-page".to_string(),
+            policy_override: None,
+        };
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            root,
+            &entry,
+            &Arc::new(snapshot),
+            &snapshot_id,
+            &fp,
+            hash.as_deref(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, "ok");
+        let result = r.result.expect("ok status carries a result");
+        assert_eq!(result.snapshot_id, snapshot_id);
+        assert_eq!(result.bridge_fingerprint.app_id, "qontinui-web");
+        assert_eq!(result.snapshot_sha256, None);
+    }
+
     #[test]
     fn parse_supplied_snapshot_rejects_pre_0_22_control_mode_shape() {
         // The pre-0.22.0 SDK wire (no identifier/state/registeredAt/mounted,
