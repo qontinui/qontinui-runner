@@ -493,7 +493,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: Strin
             session = %record.claude_session_id,
             "usage-limit hint on a session a respawn is already moving — ignoring"
         );
-        return;
+        return HintOutcome::NotApplicable("a respawn is already moving this session");
     }
 
     // Source account: the dir the session launched under, else the runner's

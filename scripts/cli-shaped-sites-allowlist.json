@@ -51,6 +51,14 @@
     },
     {
       "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "account_hash_for",
+      "pattern": ".claude/",
+      "count": 1,
+      "class": "K",
+      "reason": "the default Claude account dir (~/.claude) keys the account hash; accounts are a Claude concept (CLAUDE_CONFIG_DIR)"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
       "item": "default_claude_config_dir",
       "pattern": ".claude/",
       "count": 1,
@@ -219,46 +227,6 @@
     },
     {
       "file": "src-tauri/src/install_effects_producer/intercept/identity_shim_launch_failure_tests.rs",
-      "item": "EXEC_FAILED_BODY",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "K",
-      "reason": "test support driving the Claude identity shim template"
-    },
-    {
-      "file": "src-tauri/src/install_effects_producer/intercept/identity_shim_launch_failure_tests.rs",
-      "item": "INVOKED_BODY",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "K",
-      "reason": "test support driving the Claude identity shim template"
-    },
-    {
-      "file": "src-tauri/src/install_effects_producer/intercept/identity_shim_launch_failure_tests.rs",
-      "item": "INVOKED_NO_HOOK_BODY",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "K",
-      "reason": "test support driving the Claude identity shim template"
-    },
-    {
-      "file": "src-tauri/src/install_effects_producer/intercept/identity_shim_launch_failure_tests.rs",
-      "item": "RESOLVE_FAILED_BODY",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "K",
-      "reason": "test support driving the Claude identity shim template"
-    },
-    {
-      "file": "src-tauri/src/install_effects_producer/intercept/identity_shim_launch_failure_tests.rs",
-      "item": "RESOLVE_FAILED_NO_HOOK_BODY",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "K",
-      "reason": "test support driving the Claude identity shim template"
-    },
-    {
-      "file": "src-tauri/src/install_effects_producer/intercept/identity_shim_launch_failure_tests.rs",
       "item": "run_shim_with",
       "pattern": "lit:claude",
       "count": 1,
@@ -280,6 +248,46 @@
       "count": 1,
       "class": "M",
       "reason": "persistent identity shim program; profile.programs"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/intercept/shim_test_support.rs",
+      "item": "EXEC_FAILED_BODY",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "test support driving the Claude identity shim template"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/intercept/shim_test_support.rs",
+      "item": "INVOKED_BODY",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "test support driving the Claude identity shim template"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/intercept/shim_test_support.rs",
+      "item": "INVOKED_NO_HOOK_BODY",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "test support driving the Claude identity shim template"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/intercept/shim_test_support.rs",
+      "item": "RESOLVE_FAILED_BODY",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "test support driving the Claude identity shim template"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/intercept/shim_test_support.rs",
+      "item": "RESOLVE_FAILED_NO_HOOK_BODY",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "test support driving the Claude identity shim template"
     },
     {
       "file": "src-tauri/src/install_effects_producer/intercept/shim_test_support.rs",
@@ -314,6 +322,22 @@
       "reason": "gates the transcript-driven phantom-turn watch to provider==claude; a profile.transcript capability check"
     },
     {
+      "file": "src-tauri/src/install_effects_producer/shim_beacon_route_tests.rs",
+      "item": "INVOKED",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "test support driving the Claude identity shim template"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/shim_beacon_route_tests.rs",
+      "item": "RESOLVE_FAILED",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "test support driving the Claude identity shim template"
+    },
+    {
       "file": "src-tauri/src/process_capture/agent_cli.rs",
       "item": "AGENT_IMAGES",
       "pattern": "lit:gemini",
@@ -339,6 +363,14 @@
     },
     {
       "file": "src-tauri/src/process_capture/agent_cli.rs",
+      "item": "agent_by_bin_entry",
+      "pattern": "lit:claude",
+      "count": 2,
+      "class": "M",
+      "reason": "binary-name to agent-CLI mapping for process capture; profile.programs"
+    },
+    {
+      "file": "src-tauri/src/process_capture/agent_cli.rs",
       "item": "agent_by_image",
       "pattern": "lit:claude",
       "count": 1,
@@ -360,6 +392,14 @@
       "count": 1,
       "class": "M",
       "reason": "--fork-session answers from the pin flag only; Claude-only fork spelling, profile pin flag"
+    },
+    {
+      "file": "src-tauri/src/session/census.rs",
+      "item": "CLAUDE_COMM",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "process comm of the Claude CLI for the session census; profile.programs"
     },
     {
       "file": "src-tauri/src/session/claude_hook.rs",
@@ -459,11 +499,27 @@
     },
     {
       "file": "src-tauri/src/session/resume_door.rs",
+      "item": "claude_pids_under",
+      "pattern": "ident:is_claude",
+      "count": 2,
+      "class": "B",
+      "reason": "the resume door's live-process duplicate check before a --resume spawn; resume_same_id is Claude-only, same census as graceful-exit"
+    },
+    {
+      "file": "src-tauri/src/session/resume_door.rs",
       "item": "gateway_refusal",
       "pattern": "CLAUDE_CONFIG_DIR",
       "count": 1,
       "class": "B",
       "reason": "the model-gateway refusal names the Claude config-dir var the gateway owns"
+    },
+    {
+      "file": "src-tauri/src/session/resume_door.rs",
+      "item": "read_claude_procs",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "B",
+      "reason": "the resume door's live-process duplicate check before a --resume spawn; resume_same_id is Claude-only, same census as graceful-exit"
     },
     {
       "file": "src-tauri/src/session/resume_door.rs",
@@ -523,7 +579,7 @@
     },
     {
       "file": "src-tauri/src/session/session_lifecycle_store.rs",
-      "item": "boot_restore_needs_account",
+      "item": "SessionLifecycleStore::SessionLifecycleStore::boot_restore_needs_account",
       "pattern": "DEFAULT_PROVIDER",
       "count": 1,
       "class": "B",
@@ -544,6 +600,30 @@
       "count": 1,
       "class": "M",
       "reason": "coverage report names the claude --resume sniffer; generalises with typed_resume_sniff (Phase 5)"
+    },
+    {
+      "file": "src-tauri/src/session/stop_reason.rs",
+      "item": "<module>",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "B",
+      "reason": "a resume command is composed only for the Claude provider (--resume is Claude's argv); other providers answer no resume command"
+    },
+    {
+      "file": "src-tauri/src/session/stop_reason.rs",
+      "item": "probe_resume",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "B",
+      "reason": "a resume command is composed only for the Claude provider (--resume is Claude's argv); other providers answer no resume command"
+    },
+    {
+      "file": "src-tauri/src/session/stop_reason.rs",
+      "item": "resume_or_nothing",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "B",
+      "reason": "a resume command is composed only for the Claude provider (--resume is Claude's argv); other providers answer no resume command"
     },
     {
       "file": "src-tauri/src/session/tracking_health.rs",
@@ -571,6 +651,14 @@
     },
     {
       "file": "src-tauri/src/session/tracking_health.rs",
+      "item": "UndecidedLog::observe_at",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "operator-facing message naming the npm-installed Claude CLI's process shape"
+    },
+    {
+      "file": "src-tauri/src/session/tracking_health.rs",
       "item": "compute",
       "pattern": "ident:is_claude",
       "count": 1,
@@ -592,6 +680,22 @@
       "count": 1,
       "class": "M",
       "reason": "Claude process census (claude_pids_in_inclusive_subtree) -> profile-driven ai_cli_pids_in_inclusive_subtree (Phase 5)"
+    },
+    {
+      "file": "src-tauri/src/session/tracking_health.rs",
+      "item": "run_once",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "operator-facing message naming the npm-installed Claude CLI's process shape"
+    },
+    {
+      "file": "src-tauri/src/session/transcript_autobind.rs",
+      "item": "lifecycle_transcript_targets",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "B",
+      "reason": "transcript autobind reads Claude's transcript layout, so it targets Claude-provider rows only"
     },
     {
       "file": "src-tauri/src/session/wind_down_executor.rs",
@@ -626,6 +730,14 @@
       "reason": "terminal-plane session-state census wording"
     },
     {
+      "file": "src-tauri/src/session/wind_down_observer.rs",
+      "item": "undecided_unknown",
+      "pattern": "lit:claude",
+      "count": 2,
+      "class": "K",
+      "reason": "operator-facing message naming the npm-installed Claude CLI's process shape"
+    },
+    {
       "file": "src-tauri/src/terminal/graceful_exit.rs",
       "item": "ChildExemption::GracefulExitOutcome",
       "pattern": "ident:is_claude",
@@ -643,11 +755,27 @@
     },
     {
       "file": "src-tauri/src/terminal/graceful_exit.rs",
-      "item": "PaneLook::probe_exempting",
+      "item": "PaneLook::claude_anchor",
       "pattern": "ident:is_claude",
       "count": 1,
       "class": "B",
-      "reason": "graceful-exit protocol pid bookkeeping; the exit command comes from the profile (exit_text_for)"
+      "reason": "graceful-exit protocol pid bookkeeping (main's PaneLook census); the exit command comes from the profile (exit_text_for); widening the census to every AI CLI is tracked in coord finding ea3f023e"
+    },
+    {
+      "file": "src-tauri/src/terminal/graceful_exit.rs",
+      "item": "PaneLook::claude_pids",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "B",
+      "reason": "graceful-exit protocol pid bookkeeping (main's PaneLook census); the exit command comes from the profile (exit_text_for); widening the census to every AI CLI is tracked in coord finding ea3f023e"
+    },
+    {
+      "file": "src-tauri/src/terminal/graceful_exit.rs",
+      "item": "PaneLook::probe_exempting",
+      "pattern": "ident:is_claude",
+      "count": 4,
+      "class": "B",
+      "reason": "graceful-exit protocol pid bookkeeping (main's PaneLook census); the exit command comes from the profile (exit_text_for); widening the census to every AI CLI is tracked in coord finding ea3f023e"
     },
     {
       "file": "src-tauri/src/terminal/graceful_exit.rs",
@@ -659,11 +787,11 @@
     },
     {
       "file": "src-tauri/src/terminal/graceful_exit.rs",
-      "item": "probe_from_snapshot_exempting",
+      "item": "probe_within",
       "pattern": "ident:is_claude",
       "count": 1,
       "class": "B",
-      "reason": "graceful-exit protocol pid bookkeeping; the exit command comes from the profile (exit_text_for)"
+      "reason": "graceful-exit protocol pid bookkeeping (main's PaneLook census); the exit command comes from the profile (exit_text_for); widening the census to every AI CLI is tracked in coord finding ea3f023e"
     },
     {
       "file": "src-tauri/src/terminal/graceful_exit.rs",

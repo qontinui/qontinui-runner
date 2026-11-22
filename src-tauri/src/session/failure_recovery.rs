@@ -842,7 +842,7 @@ fn carry_out(
             let id = failure.id.clone();
             tauri::async_runtime::spawn(async move {
                 let sink = TauriFailureSink;
-                match resume_in_place(&record) {
+                match resume_in_place(&record).await {
                     Ok(new_terminal_id) => {
                         info!(
                             terminal_id,
@@ -1184,7 +1184,7 @@ fn resume_in_place_supported(record: &TerminalSessionRecord) -> Result<(), Strin
 /// account migration and the cross-machine respawn use), then retire the dead
 /// pane the way the migration retires its old one. [`plan_for`] has already
 /// checked [`resume_in_place_supported`], the drain and the resume cap.
-fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
+async fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
     use tauri::Manager;
 
     resume_in_place_supported(record)?;
@@ -1196,6 +1196,26 @@ fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
         .working_dir
         .as_deref()
         .ok_or("session has no working dir")?;
+    // The async pre-steps the shared seam requires of every caller, the same
+    // three the resume door and the respawn receiver run: the ABSOLUTE binary
+    // (retried, never bare), the model sniffed off the session's own transcript
+    // (`--resume` alone falls back to the account's default model), and the
+    // tenant whose policy body the system-prompt file carries. The seam itself
+    // stays synchronous and inline, never on the blocking pool.
+    let claude_bin =
+        crate::claude_cli_spawn::resolve_resume_claude_bin(&crate::claude_cli_spawn::RETRY_DELAYS)
+            .await?;
+    let model = crate::terminal::account_migration::sniff_transcript_model(
+        crate::terminal::transcript::session_transcript_path(
+            std::path::Path::new(config_dir),
+            working_dir,
+            &record.claude_session_id,
+        ),
+    )
+    .await;
+    let policy_tenant =
+        crate::mcp::policy_tenant::new_session_policy_tenant(std::path::Path::new(working_dir))
+            .await;
     let app = crate::tauri_app_handle::current().ok_or("no app handle")?;
     let terminal_manager = app
         .try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -1222,13 +1242,10 @@ fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
         &terminal_manager,
         &session_registry,
         crate::terminal::account_migration::ResumeSpawn {
+            claude_bin,
             claude_session_id: &record.claude_session_id,
             working_dir,
-            model_transcript: crate::terminal::transcript::session_transcript_path(
-                std::path::Path::new(config_dir),
-                working_dir,
-                &record.claude_session_id,
-            ),
+            model,
             config_dir,
             title,
             page_id: record.page_id.clone(),
@@ -1246,8 +1263,7 @@ fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
             // The dead pane's exit hook already answered any gate it carried.
             gate_identity: None,
             origin: crate::coord_drain_state::SpawnOrigin::Respawn,
-            // Runs inside an async task, so it must never sleep.
-            claude_bin_wait: std::time::Duration::ZERO,
+            policy_tenant,
         },
     )?;
 

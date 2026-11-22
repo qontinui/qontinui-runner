@@ -445,7 +445,9 @@ pub fn facts_for_session(
     band_ms: i64,
 ) -> Result<TranscriptFacts, String> {
     facts_for_session_in(
-        &crate::terminal::transcript::find_claude_config_dirs(),
+        &crate::terminal::transcript::find_transcript_config_dirs(
+            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+        ),
         session_id,
         stamp_ms,
         band_ms,
