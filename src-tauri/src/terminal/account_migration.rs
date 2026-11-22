@@ -479,6 +479,9 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // Only sessions the lifecycle registry knows about can migrate — a plain
     // shell pane (or an unregistered session) has no transcript binding.
     let Some(record) = store.find_open_by_terminal(&terminal_id) else {
+        // No session to continue or migrate here: a pending park (a
+        // re-entry's retry) has nothing to come back for.
+        super::limit_stop::with_parks(|p| p.forget(&terminal_id));
         info!(
             terminal_id,
             matched_pattern,
@@ -711,23 +714,15 @@ impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
 }
 
 /// The session's transcript, classified ([`super::limit_stop`]), read off the
-/// async workers. A record with no working dir cannot be located: UNKNOWN.
+/// async workers ([`record_limit_stop`]).
 async fn read_limit_stop(
     record: &TerminalSessionRecord,
     src: &str,
 ) -> super::limit_stop::LimitStopRead {
-    let Some(working_dir) = record.working_dir.clone() else {
-        return super::limit_stop::LimitStopRead::Unreadable(
-            "session record has no working_dir — cannot locate transcript".to_string(),
-        );
-    };
-    let path = super::transcript::session_transcript_path(
-        Path::new(src),
-        &working_dir,
-        &record.claude_session_id,
-    );
+    let record = record.clone();
+    let src = src.to_string();
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-        super::limit_stop::transcript_limit_stop(&path)
+        record_limit_stop(&record, &src)
     })
     .await
     .unwrap_or_else(|e| {
@@ -735,6 +730,29 @@ async fn read_limit_stop(
             "transcript read task did not complete: {e}"
         ))
     })
+}
+
+/// Blocking: did the session on `record` (account `src`) stop at a usage
+/// limit? Its own transcript and its background subagents'
+/// ([`super::limit_stop::transcript_limit_stop`]). Every hint reads this, so a
+/// pane first sighted before its limit is re-checked when its hint fires; the
+/// first-sight check ([`super::limit_reentry`]) reads it too. A record with no
+/// working dir cannot be located: UNKNOWN.
+pub(crate) fn record_limit_stop(
+    record: &TerminalSessionRecord,
+    src: &str,
+) -> super::limit_stop::LimitStopRead {
+    let Some(working_dir) = record.working_dir.as_deref() else {
+        return super::limit_stop::LimitStopRead::Unreadable(
+            "session record has no working_dir — cannot locate transcript".to_string(),
+        );
+    };
+    let path = super::transcript::session_transcript_path(
+        Path::new(src),
+        working_dir,
+        &record.claude_session_id,
+    );
+    super::limit_stop::transcript_limit_stop(&path)
 }
 
 /// The log line for a hint that does nothing.
@@ -876,13 +894,21 @@ async fn continue_after_reset(
     )
     .await;
     match run {
-        ContinueRun::NotClaimed(claim) => info!(
-            terminal_id,
-            session = %record.claude_session_id,
-            entry_uuid = %stop.entry_uuid,
-            ?claim,
-            "limit-reset-continue not started — this stop's continue is in flight, done, or out of attempts"
-        ),
+        ContinueRun::NotClaimed(claim) => {
+            // The stop is answered (`Done`) or out of attempts. (`InFlight`
+            // cannot reach here: a run holds the session's in-flight claim
+            // for as long as it holds the ledger claim, so a second run is
+            // refused at the session claim first.) Nothing for a re-entry's
+            // retry park to do.
+            super::limit_stop::with_parks(|p| p.forget(&terminal_id));
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                entry_uuid = %stop.entry_uuid,
+                ?claim,
+                "limit-reset-continue not started — this stop's continue is in flight, done, or out of attempts"
+            )
+        }
         ContinueRun::Ran {
             outcome: IdlePromptOutcome::Submitted,
             ..
@@ -935,6 +961,8 @@ async fn continue_after_reset(
                     + super::limit_reset::LIMIT_RESET_MARGIN_MS;
                 park_stop(app, record, src, due_at_ms, ParkReason::ContinueRetry);
             } else {
+                // Out of attempts: told, and not tried again.
+                super::limit_stop::with_parks(|p| p.forget(&terminal_id));
                 let (event, payload) = super::limit_reset::gave_up_event(
                     &record.claude_session_id,
                     src,
@@ -3216,6 +3244,45 @@ mod tests {
         assert!(begin_migration(&seen, "C:/a", || Some(seen.clone())).is_ok());
         let unpinned = session_record(sid, "t-1", None);
         assert!(begin_migration(&unpinned, "C:/a", || Some(unpinned.clone())).is_ok());
+    }
+
+    // ---- the hint's transcript read sees a background subagent's stop -------
+    // (plan 2026-11-05 Phase 3, coord finding 1776d1cf)
+
+    /// The read every hint makes, through the session record the way the
+    /// handler resolves it: a stop recorded only in the session's background
+    /// subagent transcript, after its last main-thread turn, reads Stopped.
+    #[tokio::test]
+    async fn the_hint_read_sees_a_background_subagent_stop() {
+        let config = tempfile::tempdir().expect("tempdir");
+        let working_dir = "/work/limit-reentry-proj";
+        let sid = "0f1e2d3c-4b5a-4968-8776-655443322110";
+        let project = config
+            .path()
+            .join("projects")
+            .join(super::super::transcript::encode_project_path(working_dir));
+        let subagents = project.join(sid).join("subagents");
+        std::fs::create_dir_all(&subagents).expect("mkdir");
+        std::fs::write(
+            project.join(format!("{sid}.jsonl")),
+            include_str!("fixtures/limit_stop/subagent_parent.jsonl"),
+        )
+        .expect("write main");
+        std::fs::write(
+            subagents.join("agent-a0c1d2e3f4a5b6c7d.jsonl"),
+            include_str!("fixtures/limit_stop/subagent_stop.jsonl"),
+        )
+        .expect("write subagent");
+        let mut rec = session_record(sid, "t-1", None);
+        rec.working_dir = Some(working_dir.to_string());
+        let src = config.path().to_str().expect("utf-8 path");
+        match read_limit_stop(&rec, src).await {
+            super::super::limit_stop::LimitStopRead::Stopped(stop) => {
+                assert_eq!(stop.entry_uuid, "5a000004-0000-4000-8000-000000000004");
+                assert_eq!(stop.resets_at_ms, Some(1_795_032_000_000));
+            }
+            other => panic!("expected the subagent's stop, read {other:?}"),
+        }
     }
 
     // ---- the guard's async shape (S6) ---------------------------------------

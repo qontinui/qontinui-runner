@@ -20,6 +20,13 @@
 //! be read or parsed where the decision is made is [`LimitStopRead::Unreadable`]
 //! — UNKNOWN — and never [`LimitStopRead::NotStopped`].
 //!
+//! A limit hit by a BACKGROUND subagent is a conversation turn only in that
+//! subagent's own transcript, `<sid>/subagents/agent-*.jsonl`; the session's
+//! transcript does not record it as a turn until the `/rate-limit-options`
+//! menu is dismissed. So when the session's own thread did not stop, its
+//! subagents' transcripts written since its last turn are read too (plan
+//! Phase 3, coord finding `1776d1cf`).
+//!
 //! Interim arm: plan `2026-10-28-one-session-lifecycle-authority` Phase 99 (the
 //! Migrator) is to carry this classifier into its `decide()`.
 
@@ -86,29 +93,61 @@ enum ReadSpan {
     Whole,
 }
 
-/// Classify the session transcript at `path`. See the module docs.
+/// Classify the session transcript at `path`, and, when the session's own
+/// thread did not stop, its background subagents' transcripts beside it
+/// ([`subagent_limit_stop`]). See the module docs.
 pub(crate) fn transcript_limit_stop(path: &Path) -> LimitStopRead {
-    read_limit_stop(path).0
+    let main = read_thread(path, Thread::Main);
+    if !matches!(main.read, LimitStopRead::NotStopped) {
+        return main.read;
+    }
+    // No main-thread turn, or one with no time: nothing to order a subagent
+    // stop against, so the session's own read stands.
+    let Some(after_ms) = main.last_turn_ms else {
+        return main.read;
+    };
+    subagent_limit_stop(&subagents_dir(path), after_ms)
 }
 
+/// Which thread a transcript file records. The session's own transcript
+/// (`<sid>.jsonl`) is the main thread, where a subagent's entries
+/// (`isSidechain: true`) are not the session's conversation. A background
+/// subagent's own file (`<sid>/subagents/agent-*.jsonl`) holds nothing but
+/// sidechain entries, and those ARE its conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Thread {
+    Main,
+    Subagent,
+}
+
+/// One transcript file's read: the classification, the span it was decided
+/// on, and the deciding entry's `timestamp` in milliseconds (`None` when no
+/// entry decided, or it carries no parseable timestamp).
+struct ThreadRead {
+    read: LimitStopRead,
+    span: ReadSpan,
+    last_turn_ms: Option<i64>,
+}
+
+#[cfg(test)]
 fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
+    let t = read_thread(path, Thread::Main);
+    (t.read, t.span)
+}
+
+fn read_thread(path: &Path, thread: Thread) -> ThreadRead {
+    let unreadable = |why: String, span: ReadSpan| ThreadRead {
+        read: LimitStopRead::Unreadable(why),
+        span,
+        last_turn_ms: None,
+    };
     let mut file = match File::open(path) {
         Ok(f) => f,
-        Err(e) => {
-            return (
-                LimitStopRead::Unreadable(format!("cannot open transcript: {e}")),
-                ReadSpan::Whole,
-            )
-        }
+        Err(e) => return unreadable(format!("cannot open transcript: {e}"), ReadSpan::Whole),
     };
     let len = match file.metadata() {
         Ok(m) => m.len(),
-        Err(e) => {
-            return (
-                LimitStopRead::Unreadable(format!("cannot stat transcript: {e}")),
-                ReadSpan::Whole,
-            )
-        }
+        Err(e) => return unreadable(format!("cannot stat transcript: {e}"), ReadSpan::Whole),
     };
 
     for window in TAIL_WINDOWS.into_iter().take_while(|&w| w < len) {
@@ -123,15 +162,21 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
                     .iter()
                     .position(|&b| b == b'\n')
                     .map_or(bytes.len(), |i| i + 1);
-                match decide(&bytes[start..]) {
-                    Decision::Decided(read) => return (read, ReadSpan::Tail(window)),
+                match decide(&bytes[start..], thread) {
+                    Decision::Decided(read, last_turn_ms) => {
+                        return ThreadRead {
+                            read,
+                            span: ReadSpan::Tail(window),
+                            last_turn_ms,
+                        }
+                    }
                     // No conversational entry in this window: widen it.
                     Decision::NoConversation => {}
                 }
             }
             Err(e) => {
-                return (
-                    LimitStopRead::Unreadable(format!("cannot read transcript tail: {e}")),
+                return unreadable(
+                    format!("cannot read transcript tail: {e}"),
                     ReadSpan::Tail(window),
                 )
             }
@@ -140,26 +185,110 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
 
     let bytes = match read_span(&mut file, 0, len) {
         Ok(b) => b,
-        Err(e) => {
-            return (
-                LimitStopRead::Unreadable(format!("cannot read transcript: {e}")),
-                ReadSpan::Whole,
-            )
-        }
+        Err(e) => return unreadable(format!("cannot read transcript: {e}"), ReadSpan::Whole),
     };
     if bytes.iter().all(u8::is_ascii_whitespace) {
-        return (
-            LimitStopRead::Unreadable("transcript is empty".to_string()),
-            ReadSpan::Whole,
-        );
+        return unreadable("transcript is empty".to_string(), ReadSpan::Whole);
     }
-    let read = match decide(&bytes) {
-        Decision::Decided(read) => read,
+    let (read, last_turn_ms) = match decide(&bytes, thread) {
+        Decision::Decided(read, last_turn_ms) => (read, last_turn_ms),
         // Every line parsed and none is a conversational entry: the session
         // never exchanged a turn, so it did not stop at a limit.
-        Decision::NoConversation => LimitStopRead::NotStopped,
+        Decision::NoConversation => (LimitStopRead::NotStopped, None),
     };
-    (read, ReadSpan::Whole)
+    ThreadRead {
+        read,
+        span: ReadSpan::Whole,
+        last_turn_ms,
+    }
+}
+
+// ── Background subagents' transcripts (plan 2026-11-05 Phase 3) ─────────────
+
+/// `<dir>/<sid>.jsonl` → `<dir>/<sid>/subagents`.
+fn subagents_dir(transcript: &Path) -> std::path::PathBuf {
+    transcript.with_extension("").join("subagents")
+}
+
+/// The session's background subagents' stop, read when its own thread reads
+/// [`LimitStopRead::NotStopped`] (coord finding `1776d1cf`).
+///
+/// A limit hit by a background subagent is a conversation turn only in that
+/// subagent's `<sid>/subagents/agent-*.jsonl`. The session's own transcript
+/// records it only as a `queue-operation` line until its `/rate-limit-options`
+/// menu is dismissed (coord finding `1776d1cf`, merytshost 2026-11-12,
+/// session `fbb6a935`; the same shape read on nilan for this change on
+/// 2026-11-17, session `82ef8b01` under `~/.claude-ben`: its last main-thread
+/// turn 04:48:19Z, a subagent's stop 05:02:38Z, recorded in the fixtures). A subagent stop decides here only when it is
+/// LATER than the session's last main-thread turn: a stop the session has
+/// already answered, or that came before its latest turn, is history.
+///
+/// A subagent file whose mtime is not past that turn cannot hold a later entry
+/// and is not opened, so the read stays bounded by the files written since.
+/// A main-thread read that is [`LimitStopRead::Unreadable`] stays UNKNOWN, and
+/// so does a subagent file written since that cannot be read, unless another
+/// subagent's later stop decides. `after_ms` is the session's last
+/// main-thread turn.
+fn subagent_limit_stop(dir: &Path, after_ms: i64) -> LimitStopRead {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // No background subagent ever ran: there is no `<sid>/subagents`
+        // directory. ENOTDIR says the same thing one level up: `<sid>` is not
+        // a directory (a transcript with no `.jsonl` extension, or a stray
+        // file of that name), so nothing can be listed under it either.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return LimitStopRead::NotStopped
+        }
+        Err(e) => {
+            return LimitStopRead::Unreadable(format!("cannot list subagent transcripts: {e}"))
+        }
+    };
+    let mut latest: Option<LimitStop> = None;
+    let mut unreadable: Option<String> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_agent_transcript = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("agent-") && n.ends_with(".jsonl"));
+        if !is_agent_transcript {
+            continue;
+        }
+        let modified_ms = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_millis()).ok());
+        if modified_ms.is_some_and(|m| m <= after_ms) {
+            continue;
+        }
+        match read_thread(&path, Thread::Subagent).read {
+            LimitStopRead::Stopped(stop) => {
+                let later = stop.stopped_at_ms.is_some_and(|t| t > after_ms);
+                let latest_ms = latest.as_ref().and_then(|l| l.stopped_at_ms);
+                if later && stop.stopped_at_ms > latest_ms {
+                    latest = Some(stop);
+                }
+            }
+            LimitStopRead::NotStopped => {}
+            LimitStopRead::Unreadable(why) => {
+                unreadable.get_or_insert_with(|| {
+                    format!("subagent transcript {}: {why}", path.display())
+                });
+            }
+        }
+    }
+    match (latest, unreadable) {
+        (Some(stop), _) => LimitStopRead::Stopped(stop),
+        (None, Some(why)) => LimitStopRead::Unreadable(why),
+        (None, None) => LimitStopRead::NotStopped,
+    }
 }
 
 /// Bytes `offset..end` of `file`. Bounded at the `end` measured once, so a
@@ -174,17 +303,35 @@ fn read_span(file: &mut File, offset: u64, end: u64) -> std::io::Result<Vec<u8>>
 }
 
 enum Decision {
-    Decided(LimitStopRead),
+    /// The read, and the deciding entry's timestamp (milliseconds).
+    Decided(LimitStopRead, Option<i64>),
     NoConversation,
 }
 
-/// Walk `bytes` from the end and decide on the last conversational entry.
-fn decide(bytes: &[u8]) -> Decision {
+/// Walk `bytes` from the end and decide on the last conversational entry of
+/// `thread`.
+fn decide(bytes: &[u8], thread: Thread) -> Decision {
     // Lines are decoded one at a time, as they are visited: a bad byte above
     // the deciding entry does not make the read UNKNOWN, one at or below it
     // does.
     // A final newline ends the last line; it does not start an empty one, so
     // line numbers in the reasons below count real lines from the end.
+    // A subagent's transcript is often still being appended: a final line
+    // with no newline yet is a write in progress, not a corrupt record, so it
+    // is left out and the entry above it decides.
+    // A final line that already parses is complete, newline or not.
+    let unterminated_start = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(last_nl) => last_nl + 1,
+        None => 0,
+    };
+    let partial_tail = thread == Thread::Subagent
+        && unterminated_start < bytes.len()
+        && serde_json::from_slice::<Value>(&bytes[unterminated_start..]).is_err();
+    let bytes = if partial_tail {
+        &bytes[..unterminated_start]
+    } else {
+        bytes
+    };
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     // Set once a local command's output has been passed over, so the
     // `<command-name>` entry that ran it is passed over too (see
@@ -194,10 +341,13 @@ fn decide(bytes: &[u8]) -> Decision {
         let line = match std::str::from_utf8(raw) {
             Ok(l) => l.trim(),
             Err(e) => {
-                return Decision::Decided(LimitStopRead::Unreadable(format!(
-                    "transcript line {} from the end is not UTF-8: {e}",
-                    from_end + 1
-                )))
+                return Decision::Decided(
+                    LimitStopRead::Unreadable(format!(
+                        "transcript line {} from the end is not UTF-8: {e}",
+                        from_end + 1
+                    )),
+                    None,
+                )
             }
         };
         if line.is_empty() {
@@ -208,13 +358,16 @@ fn decide(bytes: &[u8]) -> Decision {
             // A line that does not parse may be the entry that decides (a
             // truncated final write, a corrupt record): that is UNKNOWN.
             Err(e) => {
-                return Decision::Decided(LimitStopRead::Unreadable(format!(
-                    "transcript line {} from the end does not parse: {e}",
-                    from_end + 1
-                )))
+                return Decision::Decided(
+                    LimitStopRead::Unreadable(format!(
+                        "transcript line {} from the end does not parse: {e}",
+                        from_end + 1
+                    )),
+                    None,
+                )
             }
         };
-        if !is_conversational(&entry) {
+        if !is_conversational(&entry, thread) {
             continue;
         }
         match local_command_part(&entry) {
@@ -229,7 +382,7 @@ fn decide(bytes: &[u8]) -> Decision {
             }
             Some(LocalCommandPart::Invocation) | None => {}
         }
-        return Decision::Decided(classify(&entry));
+        return Decision::Decided(classify(&entry), entry_timestamp_ms(&entry));
     }
     Decision::NoConversation
 }
@@ -276,15 +429,25 @@ fn local_command_part(entry: &Value) -> Option<LocalCommandPart> {
     }
 }
 
-/// A main-thread `user` or `assistant` entry. `system`, `summary`,
+/// A `user` or `assistant` entry of `thread`. `system`, `summary`,
 /// `last-prompt`, `cost-state`, `tools-used` and the other bookkeeping types
-/// are not, and neither is a subagent's (`isSidechain: true`) entry.
-fn is_conversational(entry: &Value) -> bool {
+/// are not, and in the main thread neither is a subagent's
+/// (`isSidechain: true`) entry.
+fn is_conversational(entry: &Value, thread: Thread) -> bool {
     let kind = entry.get("type").and_then(Value::as_str);
     if !matches!(kind, Some("user") | Some("assistant")) {
         return false;
     }
-    entry.get("isSidechain").and_then(Value::as_bool) != Some(true)
+    thread == Thread::Subagent || entry.get("isSidechain").and_then(Value::as_bool) != Some(true)
+}
+
+/// An entry's `timestamp` (RFC 3339) in milliseconds since the epoch.
+fn entry_timestamp_ms(entry: &Value) -> Option<i64> {
+    entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.timestamp_millis())
 }
 
 fn classify(entry: &Value) -> LimitStopRead {
@@ -307,11 +470,7 @@ fn classify(entry: &Value) -> LimitStopRead {
         .and_then(|q| q.get("rateLimitType"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let stopped_at_ms = entry
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.timestamp_millis());
+    let stopped_at_ms = entry_timestamp_ms(entry);
     LimitStopRead::Stopped(LimitStop {
         entry_uuid: entry_uuid.to_string(),
         resets_at_ms,
@@ -376,31 +535,58 @@ impl ParkList {
         self.reported.insert(terminal_id.to_string(), reason) != Some(reason)
     }
 
-    /// Remove and return every park due at `now_ms`, oldest due first.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "drained by the scan loop in plan 2026-11-05 Phase 3"
-        )
-    )]
-    pub(crate) fn take_due(&mut self, now_ms: i64) -> Vec<Park> {
-        let due: Vec<String> = self
+    /// Remove and return at most `max` of the parks due at `now_ms`, oldest
+    /// due first. The rest stay parked, still due, for a later take.
+    pub(crate) fn take_due(&mut self, now_ms: i64, max: usize) -> Vec<Park> {
+        let mut due: Vec<&Park> = self
             .by_terminal
-            .iter()
-            .filter(|(_, p)| p.due_at_ms <= now_ms)
-            .map(|(id, _)| id.clone())
+            .values()
+            .filter(|p| p.due_at_ms <= now_ms)
             .collect();
-        let mut taken: Vec<Park> = due
-            .iter()
-            .filter_map(|id| self.by_terminal.remove(id))
-            .collect();
-        taken.sort_by(|a, b| {
+        due.sort_by(|a, b| {
             a.due_at_ms
                 .cmp(&b.due_at_ms)
                 .then_with(|| a.terminal_id.cmp(&b.terminal_id))
         });
-        taken
+        let ids: Vec<String> = due
+            .into_iter()
+            .take(max)
+            .map(|p| p.terminal_id.clone())
+            .collect();
+        ids.iter()
+            .filter_map(|id| self.by_terminal.remove(id))
+            .collect()
+    }
+
+    /// Enrol `terminal_id` as due at `due_at_ms` unless it is already
+    /// parked: a park the handler decided keeps its own due time. Reports
+    /// nothing (the handler reports what it decides when the entry comes
+    /// due). Returns whether it was enrolled.
+    pub(crate) fn enrol(
+        &mut self,
+        terminal_id: &str,
+        claude_session_id: &str,
+        due_at_ms: i64,
+    ) -> bool {
+        if self.by_terminal.contains_key(terminal_id) {
+            return false;
+        }
+        self.by_terminal.insert(
+            terminal_id.to_string(),
+            Park {
+                terminal_id: terminal_id.to_string(),
+                claude_session_id: claude_session_id.to_string(),
+                due_at_ms,
+            },
+        );
+        true
+    }
+
+    /// Drop every park, and reported reason, of a terminal not in `live`: a
+    /// closed pane has nothing to re-enter.
+    pub(crate) fn retain_live(&mut self, live: &std::collections::HashSet<&str>) {
+        self.by_terminal.retain(|id, _| live.contains(id.as_str()));
+        self.reported.retain(|id, _| live.contains(id.as_str()));
     }
 
     /// Drop `terminal_id`'s pending park and its reported reason: its stop
@@ -413,10 +599,7 @@ impl ParkList {
     }
 
     /// The park on `terminal_id`, if any.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by plan 2026-11-05 Phase 3 and by tests")
-    )]
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by tests"))]
     pub(crate) fn get(&self, terminal_id: &str) -> Option<&Park> {
         self.by_terminal.get(terminal_id)
     }
@@ -861,15 +1044,204 @@ mod tests {
         assert!(matches!(read, LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID));
     }
 
+    // ── Background subagents (plan 2026-11-05 Phase 3) ───────────────────────
+
+    /// A background subagent's stop: its own transcript holds sidechain entries
+    /// only and ends at the limit error. The field set is copied from nilan
+    /// (`~/.claude-ben`, session `82ef8b01`, subagent `ad3de550`, CLI 2.1.322,
+    /// 2026-11-12); ids and text are edited.
+    const SUBAGENT_STOP: &str = include_str!("fixtures/limit_stop/subagent_stop.jsonl");
+    /// Its parent session: the last main-thread turn at 04:48:19Z, then only
+    /// bookkeeping, including the queued notice that quotes the limit.
+    const SUBAGENT_PARENT: &str = include_str!("fixtures/limit_stop/subagent_parent.jsonl");
+    const SUBAGENT_STOP_UUID: &str = "5a000004-0000-4000-8000-000000000004";
+    /// 2026-11-12T05:02:38.041Z.
+    const SUBAGENT_STOPPED_AT_MS: i64 = 1_794_459_758_041;
+
+    /// A session dir: `<dir>/<sid>.jsonl` holding `main`, and each
+    /// `(name, body)` under `<dir>/<sid>/subagents/`.
+    fn session(main: &str, subagents: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sid = "0f1e2d3c-4b5a-4968-8776-655443322110";
+        let main_path = dir.path().join(format!("{sid}.jsonl"));
+        std::fs::write(&main_path, main).expect("write main");
+        if !subagents.is_empty() {
+            let sub = dir.path().join(sid).join("subagents");
+            std::fs::create_dir_all(&sub).expect("mkdir");
+            for (name, body) in subagents {
+                std::fs::write(sub.join(name), body).expect("write subagent");
+            }
+        }
+        (dir, main_path)
+    }
+
+    /// `SUBAGENT_PARENT` with one more main-thread reply at `timestamp`.
+    fn parent_replying_at(timestamp: &str) -> String {
+        let reply = serde_json::json!({
+            "parentUuid": "6b000002-0000-4000-8000-000000000002", "isSidechain": false,
+            "type": "assistant", "uuid": "6b000009-0000-4000-8000-000000000009",
+            "timestamp": timestamp,
+            "message": {"role": "assistant", "model": "claude-opus-5-5",
+                        "content": [{"type": "text", "text": "The survey failed; resuming it."}]}
+        });
+        format!("{SUBAGENT_PARENT}{reply}\n")
+    }
+
+    #[test]
+    fn a_background_subagent_stop_after_the_last_main_turn_reads_stopped() {
+        let (_dir, main) = session(
+            SUBAGENT_PARENT,
+            &[
+                ("agent-a0c1d2e3f4a5b6c7d.jsonl", SUBAGENT_STOP),
+                (
+                    "agent-a0c1d2e3f4a5b6c7d.meta.json",
+                    "{\"agentType\":\"general-purpose\"}",
+                ),
+            ],
+        );
+        assert_eq!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Stopped(LimitStop {
+                entry_uuid: SUBAGENT_STOP_UUID.to_string(),
+                resets_at_ms: Some(1_795_032_000_000),
+                rate_limit_type: Some("seven_day".to_string()),
+                stopped_at_ms: Some(SUBAGENT_STOPPED_AT_MS),
+            })
+        );
+        // The main thread alone does not read the stop: it is not a turn there.
+        assert_eq!(read_limit_stop(&main).0, LimitStopRead::NotStopped);
+    }
+
+    #[test]
+    fn a_subagent_stop_before_the_last_main_turn_is_history() {
+        let (_dir, main) = session(
+            &parent_replying_at("2026-11-12T19:44:21.998Z"),
+            &[("agent-a0c1d2e3f4a5b6c7d.jsonl", SUBAGENT_STOP)],
+        );
+        assert_eq!(transcript_limit_stop(&main), LimitStopRead::NotStopped);
+    }
+
+    #[test]
+    fn a_subagent_that_continued_after_its_stop_is_not_stopped() {
+        let resumed = serde_json::json!({
+            "parentUuid": SUBAGENT_STOP_UUID, "isSidechain": true, "agentId": "a0c1d2e3f4a5b6c7d",
+            "type": "assistant", "uuid": "5a000005-0000-4000-8000-000000000005",
+            "timestamp": "2026-11-18T20:05:00.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Two PRs touch it."}]}
+        });
+        let body = format!("{SUBAGENT_STOP}{resumed}\n");
+        let (_dir, main) = session(SUBAGENT_PARENT, &[("agent-a0c1d2e3f4a5b6c7d.jsonl", &body)]);
+        assert_eq!(transcript_limit_stop(&main), LimitStopRead::NotStopped);
+    }
+
+    #[test]
+    fn the_main_threads_own_stop_decides_before_any_subagent() {
+        let (_dir, main) = session(
+            SEVEN_DAY_STOP,
+            &[("agent-a0c1d2e3f4a5b6c7d.jsonl", SUBAGENT_STOP)],
+        );
+        assert!(matches!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID
+        ));
+    }
+
+    #[test]
+    fn the_latest_of_two_later_subagent_stops_decides() {
+        let earlier = SUBAGENT_STOP
+            .replace(SUBAGENT_STOP_UUID, "5a0000ee-0000-4000-8000-0000000000ee")
+            .replace("2026-11-12T05:02:38.041Z", "2026-11-12T04:59:00.000Z");
+        let (_dir, main) = session(
+            SUBAGENT_PARENT,
+            &[
+                ("agent-b0000000000000001.jsonl", &earlier),
+                ("agent-a0c1d2e3f4a5b6c7d.jsonl", SUBAGENT_STOP),
+            ],
+        );
+        assert!(matches!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Stopped(ref s) if s.entry_uuid == SUBAGENT_STOP_UUID
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_subagent_file_written_since_the_last_turn_is_unknown() {
+        let (_dir, main) = session(
+            SUBAGENT_PARENT,
+            &[(
+                "agent-a0c1d2e3f4a5b6c7d.jsonl",
+                "{\"type\":\"assistant\",\"isSide\n",
+            )],
+        );
+        assert!(matches!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Unreadable(ref why) if why.contains("subagent transcript")
+        ));
+    }
+
+    #[test]
+    fn a_complete_subagent_stop_whose_newline_has_not_landed_reads_stopped() {
+        let body = SUBAGENT_STOP.trim_end();
+        let (_dir, main) = session(SUBAGENT_PARENT, &[("agent-a0c1d2e3f4a5b6c7d.jsonl", body)]);
+        assert!(matches!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Stopped(ref s) if s.entry_uuid == SUBAGENT_STOP_UUID
+        ));
+    }
+
+    #[test]
+    fn a_subagent_line_still_being_written_is_left_out() {
+        // The stop, then the start of a line the CLI has not finished: the
+        // partial line is a write in progress, and the stop above decides.
+        let body = format!("{SUBAGENT_STOP}{{\"type\":\"api-request\",\"sessi");
+        let (_dir, main) = session(SUBAGENT_PARENT, &[("agent-a0c1d2e3f4a5b6c7d.jsonl", &body)]);
+        assert!(matches!(
+            transcript_limit_stop(&main),
+            LimitStopRead::Stopped(ref s) if s.entry_uuid == SUBAGENT_STOP_UUID
+        ));
+    }
+
+    #[test]
+    fn a_session_dir_that_is_a_file_means_no_subagents() {
+        // `<sid>` beside `<sid>.jsonl` is a FILE here, so listing
+        // `<sid>/subagents` fails with ENOTDIR: there are no subagent
+        // transcripts, and the session's own read (a reply) stands.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sid = "0f1e2d3c-4b5a-4968-8776-655443322110";
+        let main = dir.path().join(format!("{sid}.jsonl"));
+        std::fs::write(&main, SUBAGENT_PARENT).expect("write main");
+        std::fs::write(dir.path().join(sid), "not a directory").expect("write file");
+        assert_eq!(transcript_limit_stop(&main), LimitStopRead::NotStopped);
+    }
+
+    #[test]
+    fn a_subagent_file_not_written_since_the_last_turn_is_not_opened() {
+        let (dir, main) = session(
+            SUBAGENT_PARENT,
+            &[("agent-a0c1d2e3f4a5b6c7d.jsonl", "not json at all")],
+        );
+        // Last written 2026-11-12T04:00:00Z, before the 04:48:19Z main turn:
+        // it cannot hold a later entry, so its garbage is never read.
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_794_456_000);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(
+                "0f1e2d3c-4b5a-4968-8776-655443322110/subagents/agent-a0c1d2e3f4a5b6c7d.jsonl",
+            ))
+            .and_then(|f| f.set_modified(old))
+            .expect("set mtime");
+        assert_eq!(transcript_limit_stop(&main), LimitStopRead::NotStopped);
+    }
+
     // ── The park list (plan 2026-11-05 Phase 2) ──────────────────────────────
 
     #[test]
     fn a_park_is_due_at_its_time_and_not_before() {
         let mut parks = ParkList::default();
         parks.park("t1", "s1", 1_000, "not-yet-reset");
-        assert!(parks.take_due(999).is_empty());
+        assert!(parks.take_due(999, usize::MAX).is_empty());
         assert_eq!(
-            parks.take_due(1_000),
+            parks.take_due(1_000, usize::MAX),
             vec![Park {
                 terminal_id: "t1".to_string(),
                 claude_session_id: "s1".to_string(),
@@ -887,7 +1259,7 @@ mod tests {
         parks.park("t1", "s1", 1_000, "not-yet-reset");
         parks.park("t3", "s3", 9_000, "not-yet-reset");
         let due: Vec<(String, i64)> = parks
-            .take_due(5_000)
+            .take_due(5_000, usize::MAX)
             .into_iter()
             .map(|p| (p.terminal_id, p.due_at_ms))
             .collect();
@@ -904,7 +1276,7 @@ mod tests {
         assert!(parks.park("t1", "s1", 1_000, "probe-unknown"));
         assert!(!parks.park("t1", "s1", 2_000, "probe-unknown"));
         // Taken by the re-entry and parked again for the same reason: quiet.
-        assert_eq!(parks.take_due(5_000).len(), 1);
+        assert_eq!(parks.take_due(5_000, usize::MAX).len(), 1);
         assert!(!parks.park("t1", "s1", 6_000, "probe-unknown"));
         // A new reason is reported.
         assert!(parks.park("t1", "s1", 7_000, "not-yet-reset"));

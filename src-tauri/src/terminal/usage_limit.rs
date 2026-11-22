@@ -36,7 +36,9 @@
 //! A pane that keeps repainting a limit message therefore re-fires at most every
 //! 300s, while a message frozen on an idle screen, such as the limit menu, fires
 //! once: if that hint found the probe unconfirmed or no migration target, nothing
-//! retries until the pane's grid changes again.
+//! retries until the pane's grid changes again. A session the handler PARKED
+//! (a limit stop it could not continue or migrate yet) is handed back at its
+//! due time by [`super::limit_reentry`] after each pass, with no screen needed.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -252,6 +254,11 @@ pub fn scan_grids_once() {
             tid, pattern,
         ));
     }
+
+    // Parked limit stops whose time has come, and the first-sight transcript
+    // check: neither needs the screen (plan 2026-11-05 Phase 3).
+    let live: Vec<String> = sessions.into_iter().map(|(tid, _)| tid).collect();
+    super::limit_reentry::after_screen_pass(&live);
 }
 
 /// Grid-scan interval. Resolved from `QONTINUI_USAGE_LIMIT_SCAN_INTERVAL_MS`

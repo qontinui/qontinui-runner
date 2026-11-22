@@ -187,6 +187,38 @@ async fn a_finished_session_is_never_continued() {
     let calls = env.calls();
     assert!(calls.continued.is_empty());
     assert_eq!(calls.skips, vec![SkipReason::Finished]);
+    // Final for this stop: a re-entry's retry park is dropped (plan Phase 3).
+    assert_eq!(calls.forgets, 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_transcript_keeps_the_pending_park() {
+    let env = Fake::new(LimitStopRead::Unreadable(
+        "cannot open transcript".to_string(),
+    ));
+    run_hint(&env, SRC).await;
+    let calls = env.calls();
+    assert_eq!(calls.skips, vec![SkipReason::TranscriptUnreadable]);
+    assert_eq!(calls.forgets, 0);
+}
+
+#[tokio::test]
+async fn an_unreadable_transcript_on_an_exhausted_account_keeps_the_pending_park() {
+    let mut env = Fake::new(LimitStopRead::Unreadable(
+        "cannot open transcript".to_string(),
+    ));
+    env.auto_migrate = false;
+    env.known_exhausted = true;
+    env.roster = vec![AccountUsageInfo {
+        config_dir: SRC.to_string(),
+        utilization: 1.0,
+        ..Default::default()
+    }];
+    env.own = env.roster[0].clone();
+    run_hint(&env, SRC).await;
+    let calls = env.calls();
+    assert_eq!(calls.skips, vec![SkipReason::MigrateDisabled]);
+    assert_eq!(calls.forgets, 0);
 }
 
 #[tokio::test]
