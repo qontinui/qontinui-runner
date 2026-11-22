@@ -1192,7 +1192,7 @@ mod tests {
         .expect("no refused character");
         assert_eq!(
             line,
-            r#"/d /s /c ""C:\Program Files\claude\claude.cmd" --print --tools "" Read(./.git/**) "x y\\" C:\plain\ "a&b""#
+            r#"/d /s /c ""C:\Program Files\claude\claude.cmd" --print --tools "" Read(./.git/**) "x y\\" C:\plain\ "a&b"""#
         );
     }
 
