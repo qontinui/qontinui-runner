@@ -9,11 +9,15 @@
 # scratch workspace holding this repo's .github/scripts/reviewdog-step-outputs.sh,
 # with stub `cargo`, `reviewdog` and `curl` first on PATH and the retry sleep
 # injected. The stub reviewdog does, on its Nth run, what line N of a plan
-# says. Why: reviewdog exits 1 both for a diff finding and when GitHub answers
-# the PATCH of its check run `404 Not Found` (job 135103311891 of run
-# 44389597385, qontinui-runner#3025; coord finding
-# 2f3d3b96-7bd6-420e-aff3-f20d29544b74), and before this step retried such a
-# post the second reded this advisory job exactly as the first does. Cases:
+# says. Why: reviewdog v0.21.2 exits 1 for every error -- a diff finding, a
+# check run GitHub answered `404 Not Found` on its PATCH (job 135103311891 of
+# run 44389597385, qontinui-runner#3025; coord finding
+# 2f3d3b96-7bd6-420e-aff3-f20d29544b74), a failed PR diff fetch, an unparseable
+# PR diff -- and before this step classified them, each of the others reded
+# this advisory job exactly as a finding does. The diff-fetch and diff-parse
+# stub lines are the stderr the pinned v0.21.2 binary printed (plan
+# 2026-11-22-reviewdog-diff-and-parse-infra-exits-read-as-lint-findings,
+# Phase 1 step 1). Cases:
 #   1. a failed post, then success: the step exits 0, from the same report;
 #      its outputs name the first attempt's check run, and the real
 #      complete-orphaned-check-runs.sh, fed those outputs, completes that run;
@@ -25,7 +29,18 @@
 #      `(not a verdict on this PR)` phrase coord's repair classifier matches,
 #      that the red is not the diff's, in an annotation title holding no comma
 #      (the workflow-command parser ends a property at a comma);
-#   4. a clean run: the step exits 0 after one run.
+#   4. a clean run: the step exits 0 after one run;
+#   5. a failed diff fetch, then success: the step exits 0 after two runs,
+#      each from the whole report;
+#   6. a diff fetch that fails on every attempt: the step exits 1 after three
+#      runs, with a not-a-verdict annotation whose message names diff-fetch;
+#   7. a diff that does not parse: the step exits 1 after ONE run (never
+#      retried), with a not-a-verdict annotation saying a re-run will not help;
+#   8. a findings line in other words (`reviewdog: 3 problems found`): still a
+#      finding -- exit 1 after one run, no not-a-verdict annotation;
+#   9. the step feeds reviewdog cargo's `--message-format=short` stderr, the
+#      `%f:%l:%c: %m` shape `-f=clippy` parses, not the JSON stream (which
+#      parses to zero diagnostics).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +49,7 @@ W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
 fail=0
 unset RSO_RETRY_DELAYS RSO_RETRY_SLEEP
-NO_VERDICT='::error title=Clippy diff-scoped (advisory): reviewdog could not post its check run (not a verdict on this PR)::'
+NO_VERDICT='::error title=Clippy diff-scoped (advisory): reviewdog could not deliver a verdict (not a verdict on this PR)::'
 
 for f in "$WORKFLOW" "${HERE}/reviewdog-step-outputs.sh" "${HERE}/complete-orphaned-check-runs.sh"; do
   if [ ! -f "$f" ]; then
@@ -80,15 +95,25 @@ fi
 mkdir -p "$W/stub"
 cat >"$W/stub/cargo" <<'STUB'
 #!/usr/bin/env bash
-# `cargo clippy --message-format=json`: a fixed report on stdout.
-printf '{"reason":"compiler-message","n":%s}\n' $(seq 1 50)
+# `cargo clippy`: records its arguments, then a fixed report -- short-format
+# lines on STDERR for `--message-format=short` (where cargo writes them), a
+# JSON stream on stdout for `--message-format=json`.
+echo "$*" >>"$CARGO_ARGS"
+case " $* " in
+  *" --message-format=short "*)
+    for n in $(seq 1 50); do
+      printf 'src/lib.rs:%s:5: warning: this looks like a stub finding\n' "$n" >&2
+    done
+    ;;
+  *) printf '{"reason":"compiler-message","n":%s}\n' $(seq 1 50) ;;
+esac
 STUB
 cat >"$W/stub/reviewdog" <<'STUB'
 #!/usr/bin/env bash
 n=$(( $(cat "$RD_STATE.n" 2>/dev/null || echo 0) + 1 ))
 echo "$n" >"$RD_STATE.n"
 echo "$*" >"$RD_STATE.args.$n"
-wc -c | tr -d ' ' >"$RD_STATE.stdin.$n"
+cat >"$RD_STATE.stdin.$n"
 what="$(sed -n "${n}p" "$RD_PLAN")"
 # What v0.21.2 prints on every run with -fail-on-error (job 135103311891).
 echo 'time=2026-11-18T21:33:24.874Z level=WARN msg="reviewdog: -fail-on-error is deprecated. Use -fail-level=any, or -fail-level=error for github-[pr-]check reporter instead. See also https://github.com/reviewdog/reviewdog/blob/master/CHANGELOG.md"' >&2
@@ -96,6 +121,11 @@ case "$what" in
   ok) exit 0 ;;
   findings) echo "reviewdog: found at least one issue with severity greater than or equal to the given level: error" >&2; exit 1 ;;
   post\ *) echo "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/${what#post }: 404 Not Found []" >&2; exit 1 ;;
+  # Captured from the pinned v0.21.2 binary (plan Phase 1 step 1).
+  difffetch) echo "reviewdog: fail to get diff: exit status 1" >&2; exit 1 ;;
+  diffparse) echo "reviewdog: fail to parse diff: invalid hunk range: @@ -x,y +z @@" >&2; exit 1 ;;
+  # A findings exit in words the classifier has never seen.
+  reworded) echo "reviewdog: 3 problems found" >&2; exit 1 ;;
   *) echo "stub reviewdog: no plan line ${n}" >&2; exit 99 ;;
 esac
 STUB
@@ -108,7 +138,8 @@ cat >"$W/stub/fake-sleep" <<'STUB'
 echo "$1" >>"$SLEEP_LOG"
 STUB
 chmod +x "$W/stub/cargo" "$W/stub/reviewdog" "$W/stub/curl" "$W/stub/fake-sleep"
-REPORT_BYTES="$("$W/stub/cargo" | wc -c | tr -d ' ')"
+# The report reviewdog must receive: exactly what cargo's short format writes.
+CARGO_ARGS=/dev/null "$W/stub/cargo" clippy -q --message-format=short 2>"$W/report.short" >/dev/null
 
 # run_step <case> <plan line>...: run the extracted block as the step; sets
 # RC, OUT, GHO and C (the case's state prefix).
@@ -120,10 +151,11 @@ run_step() {
   cp "${HERE}/reviewdog-step-outputs.sh" "$C/ws/.github/scripts/"
   printf '%s\n' "$@" >"$C/plan"
   : >"$C/sleeps"
+  : >"$C/cargo.args"
   GHO="$C/gho"
   : >"$GHO"
   OUT="$(cd "$C/ws" && env PATH="$W/stub:$PATH" GITHUB_OUTPUT="$GHO" RUNNER_TEMP="$C/rt" \
-    RD_PLAN="$C/plan" RD_STATE="$C/rd" RSO_RETRY_SLEEP="$W/stub/fake-sleep" SLEEP_LOG="$C/sleeps" \
+    CARGO_ARGS="$C/cargo.args" RD_PLAN="$C/plan" RD_STATE="$C/rd" RSO_RETRY_SLEEP="$W/stub/fake-sleep" SLEEP_LOG="$C/sleeps" \
     bash --noprofile --norc -eo pipefail "$W/step.sh" 2>&1)"
   RC=$?
 }
@@ -133,11 +165,15 @@ sleeps() { tr '\n' ' ' <"$C/sleeps" | sed 's/ $//'; }
 whole_report() {
   local k
   for k in $(seq 1 "$1"); do
-    [ "$(cat "$C/rd.stdin.$k" 2>/dev/null)" = "$REPORT_BYTES" ] || return 1
+    cmp -s "$C/rd.stdin.$k" "$W/report.short" || return 1
     grep -q -- '-name=clippy-diff' "$C/rd.args.$k" || return 1
   done
 }
 no_verdict() { printf '%s\n' "$OUT" | grep -qF "$NO_VERDICT"; }
+# the not-a-verdict annotation's message (everything after its title)
+nv_message() { printf '%s\n' "$OUT" | grep -F "$NO_VERDICT" | head -n 1 | sed 's/^.*(not a verdict on this PR):://'; }
+# any ::error carrying the marker, whatever its title
+any_no_verdict() { printf '%s\n' "$OUT" | grep '^::error' | grep -qF '(not a verdict on this PR)'; }
 # the not-a-verdict annotation's title= property holds the marker and no comma
 verdict_title_ok() {
   local line t
@@ -220,7 +256,8 @@ else bad "post then findings" "rc=$RC attempts=$(attempts) sleeps='$(sleeps)'"; 
 # 3. a post that fails on every attempt: red, and says it is not a verdict.
 run_step persist "post 11" "post 12" "post 13"
 if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 3 ] && [ "$(sleeps)" = "5 10" ] \
-  && no_verdict && verdict_title_ok && [ "$(grep -oE 'check-runs/[0-9]+' "$(val stderr_log)" | sort -u | wc -l | tr -d ' ')" -eq 3 ]; then
+  && no_verdict && verdict_title_ok && [ "$(grep -oE 'check-runs/[0-9]+' "$(val stderr_log)" | sort -u | wc -l | tr -d ' ')" -eq 3 ] \
+  && [[ "$(nv_message)" == *"class post after 3 attempt(s), last exit 1"* ]] && [[ "$(nv_message)" == *"re-run this job"* ]]; then
   ok "a post that keeps failing: the step exits 1 after 3 runs and declares the red not a verdict on this PR"
 else bad "persistent post failure" "rc=$RC attempts=$(attempts) sleeps='$(sleeps)'"; fi
 
@@ -229,6 +266,46 @@ run_step clean ok
 if [ "$RC" -eq 0 ] && [ "$(val rc)" = 0 ] && [ "$(attempts)" -eq 1 ] && [ ! -s "$C/sleeps" ] && ! no_verdict; then
   ok "a clean run: the step exits 0 after one run"
 else bad "clean" "rc=$RC attempts=$(attempts)"; fi
+
+# 5. a failed diff fetch, then success: retried, green, from the whole report.
+run_step difffetch-ok difffetch ok
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 0 ] && [ "$(attempts)" -eq 2 ] && whole_report 2 \
+  && [ "$(sleeps)" = 5 ] && ! any_no_verdict; then
+  ok "a failed diff fetch then success: the step exits 0 after two runs from the same report"
+else bad "diff fetch then ok" "rc=$RC attempts=$(attempts) sleeps='$(sleeps)'"; fi
+
+# 6. a diff fetch that fails on every attempt: red, and says it is not a verdict.
+run_step difffetch-persist difffetch difffetch difffetch
+if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 3 ] && whole_report 3 \
+  && [ "$(sleeps)" = "5 10" ] && no_verdict && verdict_title_ok \
+  && [[ "$(nv_message)" == *"class diff-fetch after 3 attempt(s), last exit 1"* ]] \
+  && [[ "$(nv_message)" == *"re-run this job"* ]]; then
+  ok "a diff fetch that keeps failing: the step exits 1 after 3 runs and declares the red not a verdict, naming diff-fetch"
+else bad "persistent diff fetch failure" "rc=$RC attempts=$(attempts) sleeps='$(sleeps)' message='$(nv_message)'"; fi
+
+# 7. a diff that does not parse: never retried, red, not a verdict, and a
+#    re-run will not help.
+run_step diffparse diffparse
+if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] && [ ! -s "$C/sleeps" ] \
+  && no_verdict && verdict_title_ok \
+  && [[ "$(nv_message)" == *"class diff-parse after 1 attempt(s), last exit 1"* ]] \
+  && [[ "$(nv_message)" == *"A re-run will not help"* ]] && [[ "$(nv_message)" != *"re-run this job"* ]]; then
+  ok "a diff that does not parse: the step exits 1 after one run, not retried, declares the red not a verdict and says a re-run will not help"
+else bad "diff parse failure" "rc=$RC attempts=$(attempts) sleeps='$(sleeps)' message='$(nv_message)'"; fi
+
+# 8. a findings exit in other words: still the verdict.
+run_step reworded reworded
+if [ "$RC" -eq 1 ] && [ "$(val rc)" = 1 ] && [ "$(attempts)" -eq 1 ] && [ ! -s "$C/sleeps" ] && ! any_no_verdict; then
+  ok "a reworded findings line: the step exits 1 after one run, not retried, no not-a-verdict annotation"
+else bad "reworded findings" "rc=$RC attempts=$(attempts) sleeps='$(sleeps)'"; fi
+
+# 9. the step feeds reviewdog the short format, not cargo's JSON stream.
+run_step short-feed ok
+if grep -q -- '--message-format=short' "$W/step.sh" && ! grep -q -- '--message-format=json' "$W/step.sh" \
+  && grep -q '^clippy .*--message-format=short' "$C/cargo.args" && [ "$(wc -l <"$C/cargo.args" | tr -d ' ')" -eq 1 ] \
+  && whole_report 1 && grep -qE '^src/lib\.rs:[0-9]+:[0-9]+: warning: ' "$C/rd.stdin.1"; then
+  ok "the step runs clippy once with --message-format=short and feeds reviewdog that stderr capture"
+else bad "short-format feed" "cargo args='$(tr '\n' '|' <"$C/cargo.args")' stdin bytes=$(wc -c <"$C/rd.stdin.1" 2>/dev/null)"; fi
 
 if [ "$fail" -ne 0 ]; then
   echo "clippy-diff step tests: FAILED"
