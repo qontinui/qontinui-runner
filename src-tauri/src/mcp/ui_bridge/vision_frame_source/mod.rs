@@ -301,18 +301,33 @@ impl DeviceScreenshotSource {
                     ),
                 });
             }
-            // Read the body FIRST. A UI Bridge `{success:false, ...}` envelope
-            // means the device itself answered — e.g. ui-bridge-native's own
-            // 503 `PAIRING_UNAVAILABLE` refusal — so it is the app's failure,
-            // with its code and retry verdict, whatever the status.
             let body = resp.json::<serde_json::Value>().await.ok();
-            if let Some(refusal) = body
+            // A gateway status (bad gateway, unavailable, gateway timeout) is
+            // most likely a proxy answering for a device it could not reach.
+            let gateway = matches!(
+                status,
+                reqwest::StatusCode::BAD_GATEWAY
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    | reqwest::StatusCode::GATEWAY_TIMEOUT
+            );
+            // Read the body FIRST. A UI Bridge `{success:false, ...}` envelope
+            // is the device's own failure, with its code and retry verdict:
+            // - CODED, at any status — ui-bridge-native's own 503
+            //   `PAIRING_UNAVAILABLE` refusal is a reached device refusing;
+            // - UNCODED, only off a gateway status: at 502/503/504 a proxy may
+            //   answer in the runner's own `{success:false, error}` shape, so
+            //   an uncoded envelope there stays the transport's.
+            match body
                 .as_ref()
                 .and_then(|b| device_refusal(&url, status.as_u16(), b))
             {
-                return Err(refusal);
+                Some(refusal @ FrameSourceError::CaptureFailed { code: Some(_), .. }) => {
+                    return Err(refusal)
+                }
+                Some(refusal) if !gateway => return Err(refusal),
+                _ => {}
             }
-            // A non-envelope body may still carry an `error` string; keep it.
+            // Anything else may still carry an `error` string; keep it.
             let reason = body
                 .as_ref()
                 .and_then(|b| b.get("error")?.as_str().map(str::to_string));
@@ -320,22 +335,18 @@ impl DeviceScreenshotSource {
                 Some(reason) => format!("device screenshot {url} returned HTTP {status}: {reason}"),
                 None => format!("device screenshot {url} returned HTTP {status}"),
             };
-            // With no such envelope, a gateway status (bad gateway,
-            // unavailable, gateway timeout) is most likely a proxy answering
-            // for a device it could not reach — even a proxy's own JSON error
-            // with a `code` — so it is the transport's failure.
-            let gateway = matches!(
-                status,
-                reqwest::StatusCode::BAD_GATEWAY
-                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
-                    | reqwest::StatusCode::GATEWAY_TIMEOUT
-            );
             return Err(if gateway {
+                // Even a proxy's own JSON error with a `code` (no
+                // `success:false`) is the transport's failure here.
                 unreachable(message, None)
             } else {
+                // Off a gateway status the device answered: keep a top-level
+                // `code` / `errorCode` it sent even without `success:false`.
                 FrameSourceError::CaptureFailed {
                     message,
-                    code: None,
+                    code: body
+                        .as_ref()
+                        .and_then(crate::mcp::app_dispatch::top_level_code),
                     retryable: None,
                 }
             });
@@ -374,7 +385,9 @@ impl FrameProvider for DeviceScreenshotSource {
 /// `WrapperFailure::from_wire`), so a string or object `error`, `code` /
 /// `errorCode` and `retryable` all read the same way there and here, top-level
 /// values winning. `None` for any body without `success: false` — a proxy's
-/// JSON error included. Pure, so the envelope reading is unit-testable.
+/// JSON error included. Pure, so the envelope reading is unit-testable. The
+/// caller decides whether an UNCODED envelope at a gateway status is the
+/// device's (it is not: see `DeviceScreenshotSource::fetch`).
 fn device_refusal(url: &str, status: u16, body: &serde_json::Value) -> Option<FrameSourceError> {
     match crate::mcp::app_dispatch::app_answered_failure(url, status, body)? {
         crate::mcp::app_dispatch::DispatchError::AppAnswered {
@@ -387,8 +400,18 @@ fn device_refusal(url: &str, status: u16, body: &serde_json::Value) -> Option<Fr
             code,
             retryable,
         }),
-        // `app_answered_failure` builds only `AppAnswered`.
-        _ => None,
+        other => {
+            // `app_answered_failure` builds only `AppAnswered`; any other
+            // variant is a change to it that this reader must be taught.
+            debug_assert!(
+                matches!(
+                    other,
+                    crate::mcp::app_dispatch::DispatchError::AppAnswered { .. }
+                ),
+                "app_answered_failure returned {other:?}, not AppAnswered"
+            );
+            None
+        }
     }
 }
 
@@ -965,6 +988,54 @@ mod tests {
             fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
                 .await;
         assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+    }
+
+    /// An UNCODED `{success:false, error}` at 502/503/504 may be a proxy in
+    /// the runner's own response shape: it stays the transport's failure.
+    #[tokio::test]
+    async fn an_uncoded_envelope_at_a_gateway_status_is_unreachable() {
+        use axum::http::StatusCode as S;
+        for status in [S::BAD_GATEWAY, S::SERVICE_UNAVAILABLE, S::GATEWAY_TIMEOUT] {
+            let body = serde_json::json!({"success": false, "error": "upstream gone"});
+            let err = fetch_from(answering(status, Some(body)).await).await;
+            assert_eq!(err.code(), "APP_UNREACHABLE", "{status}: {err:?}");
+            assert_eq!(
+                err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+                "transport",
+                "{status}"
+            );
+        }
+    }
+
+    /// Off a gateway status an uncoded `{success:false, error}` is the app's
+    /// failed capture, its message kept.
+    #[tokio::test]
+    async fn an_uncoded_envelope_off_a_gateway_status_is_the_apps_failure() {
+        let body = serde_json::json!({"success": false, "error": "renderer crashed"});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::INTERNAL_SERVER_ERROR, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "APP_CAPTURE_FAILED", "{err:?}");
+        assert_eq!(
+            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+            "app"
+        );
+        assert!(err.to_string().contains("renderer crashed"), "{err}");
+    }
+
+    /// Off a gateway status a top-level `code` is kept even without
+    /// `success:false`.
+    #[tokio::test]
+    async fn a_coded_500_without_success_false_keeps_its_code() {
+        let body = serde_json::json!({"code": "SCREENSHOT_TIMEOUT"});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::INTERNAL_SERVER_ERROR, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "SCREENSHOT_TIMEOUT", "{err:?}");
+        assert_eq!(
+            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+            "app"
+        );
     }
 
     /// The device-refusal reading, pure: the shared parser's grammar.

@@ -148,7 +148,10 @@ pub enum DispatchError {
 /// the message, and the wrapper's object shape `{code, message, retryable}`
 /// gives its message, code and retry verdict. A top-level `code` (else
 /// `errorCode`) wins over the object's, and a top-level boolean `retryable`
-/// wins over the object's.
+/// wins over the object's. A blank code is no code, per key
+/// ([`top_level_code`]): `{"code":"","errorCode":"X"}` reads `X`, as
+/// `WrapperFailure::from_wire` reads an object `error`, and a blank top-level
+/// code never shadows the object's own.
 pub(crate) fn app_answered_failure(
     url: &str,
     status: u16,
@@ -161,13 +164,7 @@ pub(crate) fn app_answered_failure(
         .get("error")
         .cloned()
         .and_then(WrapperFailure::from_wire);
-    // A blank top-level code is no code (never a code of `""`), so it does
-    // not shadow the object's own.
-    let top_code = ["code", "errorCode"]
-        .into_iter()
-        .find_map(|k| json.get(k).and_then(|v| v.as_str()))
-        .filter(|c| !c.trim().is_empty())
-        .map(String::from);
+    let top_code = top_level_code(json);
     let (error, code, retryable) = match failure {
         Some(failure) => (
             failure.message,
@@ -186,6 +183,21 @@ pub(crate) fn app_answered_failure(
             .and_then(serde_json::Value::as_bool)
             .or(retryable),
     })
+}
+
+/// A body's top-level machine-readable code: `code`, else `errorCode`, each
+/// key skipped when it is not a non-blank string (never a code of `""`). The
+/// one top-level reader [`app_answered_failure`] and the vision device arm
+/// share.
+pub(crate) fn top_level_code(json: &serde_json::Value) -> Option<String> {
+    ["code", "errorCode"]
+        .into_iter()
+        .find_map(|k| {
+            json.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|c| !c.trim().is_empty())
+        })
+        .map(String::from)
 }
 
 impl DispatchError {
@@ -1187,6 +1199,27 @@ mod tests {
         // `code` wins when both are present.
         let both = answered(json!({"success": false, "error": "x", "code": "A", "errorCode": "B"}));
         assert_eq!(both.and_then(|(_, c)| c), Some("A".to_string()));
+    }
+
+    /// A blank code is no code, per key: a blank `code` falls through to
+    /// `errorCode`, and a blank top-level code does not shadow the object's.
+    #[test]
+    fn app_answered_failure_skips_a_blank_code_per_key() {
+        assert_eq!(
+            answered(json!({"success": false, "error": "x", "code": "", "errorCode": "X"}))
+                .and_then(|(_, c)| c),
+            Some("X".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "code": "  ",
+                            "error": {"code": "INNER", "message": "m"}}))
+            .and_then(|(_, c)| c),
+            Some("INNER".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "error": "x", "code": ""})).and_then(|(_, c)| c),
+            None
+        );
     }
 
     #[test]
