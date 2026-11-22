@@ -100,7 +100,10 @@ export interface EffectivenessBucket {
   effective: number;
   ineffective: number;
   regression: number;
-  effectiveness_rate: number;
+  inconclusive: number;
+  unjudged: number;
+  /** Fraction (0-1) of judged fixes that were effective; null when none is judged. */
+  effectiveness_rate: number | null;
 }
 
 export interface EffectivenessOverTime {

@@ -9,7 +9,8 @@ import {
   BarChart,
 } from "recharts";
 import { useEffectivenessTrend } from "@/hooks/useArchitecture";
-import type { EffectivenessBucket } from "@/types/architecture";
+import { effectivenessChartData, formatRatePercent, trendEnds } from "@/lib/effectivenessRate";
+import type { EffectivenessChartPoint } from "@/lib/effectivenessRate";
 import type { TimeRange } from "@/types/performance-metrics";
 
 interface EffectivenessTrendWidgetProps {
@@ -22,7 +23,7 @@ function EffectivenessTooltip({
   payload,
 }: {
   active?: boolean;
-  payload?: { payload: EffectivenessBucket & { ratePercent: number } }[];
+  payload?: { payload: EffectivenessChartPoint }[];
 }) {
   if (active && payload && payload.length) {
     const d = payload[0].payload;
@@ -30,10 +31,12 @@ function EffectivenessTooltip({
       <div className="bg-popover border border-border rounded-lg p-2 shadow-lg text-xs">
         <p className="font-medium">{d.bucket}</p>
         <p className="text-green-400">
-          Effective: {d.effective}/{d.total} ({d.ratePercent.toFixed(1)}%)
+          Effective: {d.effective}/{d.total} ({formatRatePercent(d.ratePercent)})
         </p>
         {d.ineffective > 0 && <p className="text-yellow-400">Ineffective: {d.ineffective}</p>}
         {d.regression > 0 && <p className="text-red-400">Regression: {d.regression}</p>}
+        {d.inconclusive > 0 && <p className="text-zinc-400">Inconclusive: {d.inconclusive}</p>}
+        {d.unjudged > 0 && <p className="text-zinc-400">Unjudged: {d.unjudged}</p>}
       </div>
     );
   }
@@ -54,15 +57,12 @@ export function EffectivenessTrendWidget({
     return null;
   }
 
-  const chartData = data.buckets.map((b) => ({
-    ...b,
-    ratePercent: b.effectiveness_rate * 100,
-  }));
+  const chartData = effectivenessChartData(data.buckets);
 
   // Determine trend direction for color
-  const firstRate = chartData[0]?.ratePercent ?? 0;
-  const lastRate = chartData[chartData.length - 1]?.ratePercent ?? 0;
-  const trendColor = lastRate >= firstRate ? "#22c55e" : "#ef4444";
+  const { first: firstRate, last: lastRate } = trendEnds(chartData);
+  const trendColor =
+    firstRate == null || lastRate == null || lastRate >= firstRate ? "#22c55e" : "#ef4444";
 
   return (
     <div className="grid grid-cols-2 gap-2">

@@ -8,6 +8,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { formatRatePercent, ratePercentColor } from "@/lib/effectivenessRate";
 
 // ── Interfaces ──────────────────────────────────────────────────────────────
 
@@ -36,7 +37,10 @@ interface FixEffectivenessRecord {
   effective: number;
   ineffective: number;
   caused_regression: number;
-  effectiveness_rate: number;
+  inconclusive: number;
+  unjudged: number;
+  /** Percentage (0-100) of judged fixes that were effective; null when none is judged. */
+  effectiveness_rate: number | null;
   source_agent: string | null;
 }
 
@@ -93,13 +97,6 @@ function rateColor(rate: number): string {
   if (rate > 30) return "text-red-400";
   if (rate > 10) return "text-yellow-400";
   return "text-green-400";
-}
-
-function effectivenessColor(rate: number): string {
-  // rate is already in 0-100 scale from backend
-  if (rate >= 80) return "text-green-400";
-  if (rate >= 50) return "text-yellow-400";
-  return "text-red-400";
 }
 
 const SEVERITY_DOT: Record<string, string> = {
@@ -258,6 +255,8 @@ function FixEffectivenessTable({ records }: { records: FixEffectivenessRecord[] 
           <th className="text-right py-2 px-3">Effective</th>
           <th className="text-right py-2 px-3">Ineffective</th>
           <th className="text-right py-2 px-3">Regression</th>
+          <th className="text-right py-2 px-3">Inconclusive</th>
+          <th className="text-right py-2 px-3">Unjudged</th>
           <th className="text-right py-2 px-3">Rate</th>
         </tr>
       </thead>
@@ -275,8 +274,10 @@ function FixEffectivenessTable({ records }: { records: FixEffectivenessRecord[] 
             <td className="py-2 px-3 text-right text-zinc-300">{r.effective}</td>
             <td className="py-2 px-3 text-right text-zinc-300">{r.ineffective}</td>
             <td className="py-2 px-3 text-right text-zinc-300">{r.caused_regression}</td>
-            <td className={`py-2 px-3 text-right ${effectivenessColor(r.effectiveness_rate)}`}>
-              {r.effectiveness_rate.toFixed(1)}%
+            <td className="py-2 px-3 text-right text-zinc-300">{r.inconclusive}</td>
+            <td className="py-2 px-3 text-right text-zinc-300">{r.unjudged}</td>
+            <td className={`py-2 px-3 text-right ${ratePercentColor(r.effectiveness_rate)}`}>
+              {formatRatePercent(r.effectiveness_rate)}
             </td>
           </tr>
         ))}
