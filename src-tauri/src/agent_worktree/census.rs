@@ -1772,8 +1772,9 @@ pub(crate) fn resolve_build_target(worktree: &Path, env_target_dir: Option<&str>
 /// `/` while the bytes are on `/data` (plan
 /// `2026-11-22-coord-charges-a-build-in-a-symlinked-agent-worktree-to-root`).
 /// The target dir may not exist yet, hence the nearest-existing-ancestor walk
-/// rather than `canonicalize`. `None` = NOT OBSERVED (no ancestor exists, or it
-/// could not be canonicalised); coord then falls back to the unresolved path.
+/// rather than `canonicalize`. `None` = NOT OBSERVED (no ancestor exists, it
+/// could not be canonicalised, or a component is a symlink that cannot be
+/// followed, e.g. a dangling one); coord then falls back to the unresolved path.
 pub(crate) fn resolved_volume_path(path: &Path) -> Option<String> {
     crate::util::existing_ancestor::resolve_through_existing_ancestor(path)
         .ok()
@@ -2440,6 +2441,20 @@ fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
 
 /// Build the census row for a single worktree dir.
 fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
+    // Run provenance: WHICH dir this worktree's builds write to, and whether
+    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
+    // `is_file` probes plus at most one small TOML parse) — no git spawn.
+    capture_worktree_with_build_target(repo, worktree, resolve_build_target_live(worktree))
+}
+
+/// [`capture_worktree`] with the build target already resolved, so a test can
+/// drive the whole row builder without the live `CARGO_TARGET_DIR` (which a
+/// `cargo-guard.sh` test run sets for itself) leaking into the row.
+fn capture_worktree_with_build_target(
+    repo: &str,
+    worktree: &Path,
+    build_target: BuildTarget,
+) -> WorktreeCensus {
     let branch =
         git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
     let head_sha = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
@@ -2514,11 +2529,6 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
 
     let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
     let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
-
-    // Run provenance: WHICH dir this worktree's builds write to, and whether
-    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
-    // `is_file` probes plus at most one small TOML parse) — no git spawn.
-    let build_target = resolve_build_target_live(worktree);
 
     // WIP custody (Phase 3). Two bounded FILE READS on the hit path, ONE on
     // the miss path, and no subprocess at any point — `$GIT_DIR` comes from
@@ -2923,13 +2933,36 @@ fn volume_holding<'a>(volumes: &'a [VolumeReport], path: &Path) -> Option<&'a Vo
 }
 
 /// `path` in the separator-normalized form [`volume_key`] produces, with a
-/// Windows verbatim prefix (`\\?\`) dropped so a canonicalized path still
-/// compares against the plain drive-letter key.
+/// Windows verbatim prefix dropped so a canonicalized path still compares
+/// against the plain key ([`strip_verbatim_prefix`]).
 fn comparable_path(path: &Path) -> String {
-    let normalized = normalize_path_str(path);
+    strip_verbatim_prefix(&normalize_path_str(path))
+}
+
+/// Drop a Windows verbatim prefix from an already forward-slashed path.
+///
+/// `canonicalize` on Windows yields `\\?\D:\...` for a drive path and
+/// `\\?\UNC\srv\share\...` for a UNC share or a mapped network drive.
+/// Forward-slashed, those are `//?/D:/...` -> `D:/...`, and `//?/UNC/srv/share/...`
+/// -> `//srv/share/...` — the proper UNC form, which is how [`volume_key`]
+/// spells a share's mount. Stripping only `//?/` from the UNC form would leave
+/// `UNC/srv/share/...`, a relative-looking string that matches no volume key
+/// and that coord would still prefer over the lexical path. The `UNC` marker
+/// is matched case-insensitively, as Windows treats it.
+fn strip_verbatim_prefix(normalized: &str) -> String {
+    const VERBATIM_UNC: &str = "//?/UNC/";
+    let split = (
+        normalized.get(..VERBATIM_UNC.len()),
+        normalized.get(VERBATIM_UNC.len()..),
+    );
+    if let (Some(head), Some(rest)) = split {
+        if head.eq_ignore_ascii_case(VERBATIM_UNC) {
+            return format!("//{rest}");
+        }
+    }
     match normalized.strip_prefix("//?/") {
         Some(rest) => rest.to_string(),
-        None => normalized,
+        None => normalized.to_string(),
     }
 }
 
@@ -4606,6 +4639,87 @@ mod tests {",
         );
     }
 
+    /// ARMING test for the plan: the production row builder
+    /// ([`capture_worktree_with_build_target`], which `capture_worktree` calls
+    /// with the live `CARGO_TARGET_DIR`) run on a cargo worktree reached
+    /// through a symlinked `agent-worktrees/<id>`. BOTH volume fields must land
+    /// under the symlink TARGET, while the identity fields (`path`,
+    /// `build_target_dir`) stay spelled through the link.
+    #[cfg(unix)]
+    #[test]
+    fn capture_worktree_on_a_symlinked_worktree_reports_both_volume_paths_under_the_link_target() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        let real_id = tmp.path().join("data").join("01a");
+        let real_repo = real_id.join("qontinui-runner");
+        std::fs::create_dir_all(real_repo.join("src-tauri")).unwrap();
+        std::fs::write(real_repo.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        let link_id = tmp.path().join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(link_id.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_id, &link_id).unwrap();
+        let worktree = link_id.join("qontinui-runner");
+
+        let row = capture_worktree_with_build_target(
+            "qontinui-runner",
+            &worktree,
+            resolve_build_target(&worktree, None),
+        );
+
+        let canon_data = comparable_path(&std::fs::canonicalize(tmp.path().join("data")).unwrap());
+        let link_prefix = normalize_path_str(&link_id);
+
+        // Identity fields: unresolved, through the link.
+        assert_eq!(row.path, normalize_path_str(&worktree));
+        let target_dir = row
+            .build_target_dir
+            .as_deref()
+            .expect("a cargo worktree has a target");
+        assert!(
+            target_dir.starts_with(&link_prefix),
+            "{target_dir} not via the link"
+        );
+
+        // Volume fields: resolved, under the link target.
+        let wt_vol = row
+            .worktree_volume_path
+            .as_deref()
+            .expect("worktree volume observed");
+        assert_eq!(
+            wt_vol,
+            comparable_path(&std::fs::canonicalize(&real_repo).unwrap())
+        );
+        assert!(
+            wt_vol.starts_with(&canon_data),
+            "{wt_vol} not under {canon_data}"
+        );
+        let bt_vol = row
+            .build_target_volume_path
+            .as_deref()
+            .expect("build target volume observed");
+        assert!(
+            bt_vol.starts_with(&canon_data),
+            "{bt_vol} not under {canon_data}"
+        );
+        assert!(
+            !bt_vol.starts_with(&link_prefix),
+            "{bt_vol} still via the link"
+        );
+    }
+
+    /// A10 at the census: a worktree reached through a DANGLING symlink has no
+    /// observed volume path — coord falls back to the lexical path rather than
+    /// being handed the link's parent joined with the link's name as
+    /// "resolved".
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_worktree_has_no_volume_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("agent-worktrees-01a");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+        assert_eq!(resolved_volume_path(&link), None);
+        assert_eq!(resolved_volume_path(&link.join("qontinui-runner")), None);
+    }
+
     /// Rule 1 — an ABSOLUTE `CARGO_TARGET_DIR` wins over everything, and a
     /// pool path yields the bare slot id.
     #[test]
@@ -5854,6 +5968,33 @@ mod tests {",
             "E:/scratch",
             "a canonicalized (verbatim) path compares against the plain key"
         );
+    }
+
+    /// A2: a verbatim UNC path (a share or a mapped network drive, as
+    /// `canonicalize` returns it on Windows) becomes the proper `//srv/share`
+    /// form, never the relative-looking `UNC/srv/share`. Pure string
+    /// transform, so it runs on any OS.
+    #[test]
+    fn a_verbatim_unc_path_becomes_a_proper_unc_path() {
+        assert_eq!(
+            strip_verbatim_prefix("//?/UNC/srv/share/agent-worktrees/01a"),
+            "//srv/share/agent-worktrees/01a"
+        );
+        assert_eq!(strip_verbatim_prefix("//?/unc/srv/share"), "//srv/share");
+        assert_eq!(strip_verbatim_prefix("//?/E:/scratch"), "E:/scratch");
+        assert_eq!(strip_verbatim_prefix("//srv/share/x"), "//srv/share/x");
+        assert_eq!(strip_verbatim_prefix("/home/x"), "/home/x");
+        // The backslashed spelling, through the full comparable form.
+        assert_eq!(
+            comparable_path(Path::new(r"\\?\UNC\srv\share\wt")),
+            "//srv/share/wt"
+        );
+        // And it is held by the share's volume key, as `volume_key` spells it.
+        let key = volume_key(Path::new(r"\\srv\share"));
+        assert!(volume_key_holds(
+            &key,
+            &comparable_path(Path::new(r"\\?\UNC\srv\share\wt"))
+        ));
     }
 
     /// `removable` flows from the mount reading into the report, and rides the
