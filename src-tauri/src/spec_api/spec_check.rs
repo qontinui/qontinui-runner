@@ -1798,6 +1798,30 @@ mod tests {
         assert_eq!(result.snapshot_id, snapshot_id);
         assert_eq!(result.bridge_fingerprint.app_id, "qontinui-web");
         assert_eq!(result.snapshot_sha256, None);
+
+        // And an accepted hash is carried through evaluate_one, so a
+        // regression that always drops it cannot pass as the None case.
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            root,
+            &entry,
+            &Arc::new(serde_json::from_value(minimal_snapshot_json()).unwrap()),
+            &snapshot_id,
+            &fp,
+            Some("sha256-accepted"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, "ok");
+        assert_eq!(
+            r.result
+                .expect("ok status carries a result")
+                .snapshot_sha256
+                .as_deref(),
+            Some("sha256-accepted")
+        );
     }
 
     #[test]
