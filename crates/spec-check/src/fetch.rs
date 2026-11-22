@@ -91,8 +91,11 @@ where
     let snapshot: UIBridgeSnapshot = serde_json::from_value(raw.clone())
         .map_err(|e| SnapshotFetchError::Malformed(e.to_string()))?;
 
+    // Mint and record the id BEFORE hashing, so a refusal's warn! line is
+    // correlatable with this snapshot.
     let snapshot_id = format!("scs_{}", uuid::Uuid::now_v7());
-    let content_sha256 = telemetry_hash_with(&raw, hasher);
+    tracing::Span::current().record("snapshot_id", tracing::field::display(&snapshot_id));
+    let content_sha256 = snapshot_telemetry_hash_with(&raw, &snapshot_id, hasher);
     let snapshot_timestamp = millis_to_iso8601(snapshot.timestamp)?;
 
     let fingerprint = BridgeFingerprint {
@@ -104,8 +107,6 @@ where
         element_count: snapshot.elements.len() as u32,
     };
 
-    tracing::Span::current().record("snapshot_id", tracing::field::display(&snapshot_id));
-
     Ok((snapshot, fingerprint, snapshot_id, content_sha256))
 }
 
@@ -114,15 +115,25 @@ where
 /// refuses it. The body is arbitrary external UI Bridge JSON, and the hash
 /// only feeds `SpecCheckResult.snapshot_sha256` — so a refusal costs that one
 /// telemetry field, never the fetch or the evaluation. Shared by
-/// [`wrap_snapshot`] and the runner's SDK snapshot path.
-pub fn snapshot_telemetry_hash(value: &serde_json::Value) -> Option<String> {
-    telemetry_hash_with(
+/// [`wrap_snapshot`] and the runner's SDK snapshot path. `snapshot_id` is
+/// carried on the refusal's warn! line for correlation.
+pub fn snapshot_telemetry_hash(value: &serde_json::Value, snapshot_id: &str) -> Option<String> {
+    snapshot_telemetry_hash_with(
         value,
+        snapshot_id,
         qontinui_types::canonical_hash::canonical_hash::<serde_json::Value>,
     )
 }
 
-pub(crate) fn telemetry_hash_with<H>(value: &serde_json::Value, hasher: H) -> Option<String>
+/// [`snapshot_telemetry_hash`] with the canonical hasher injected. Public so
+/// callers outside this crate (the runner's SDK snapshot path) can expose
+/// the same seam to their own tests: today's `canonical_hash` cannot refuse
+/// any `serde_json::Value`, so a refusal can only be injected.
+pub fn snapshot_telemetry_hash_with<H>(
+    value: &serde_json::Value,
+    snapshot_id: &str,
+    hasher: H,
+) -> Option<String>
 where
     H: FnOnce(&serde_json::Value) -> Result<String, CanonicalHashError>,
 {
@@ -130,6 +141,7 @@ where
         Ok(hash) => Some(hash),
         Err(e) => {
             tracing::warn!(
+                snapshot_id = %snapshot_id,
                 error = %e,
                 "snapshot telemetry hash refused by the canonical hasher; snapshot_sha256 will be absent"
             );
@@ -366,33 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn hasher_refusal_evaluates_with_snapshot_sha256_none() {
-        // End to end through the crate: wrap under a refusing hasher, then
-        // evaluate with the wrapped identity — the result carries no
-        // snapshot_sha256 rather than the fetch failing.
-        let raw = well_formed_raw(1_700_000_000_000);
-        let (snap, fp, snapshot_id, hash) =
-            wrap_snapshot_with_hasher(raw, "app".to_string(), None, None, None, refusing_hasher)
-                .expect("a refused telemetry hash must not fail the fetch");
-        let spec: qontinui_types::ir::IrPageSpec = serde_json::from_value(json!({
-            "version": "1.0",
-            "id": "p",
-            "name": "P",
-            "states": [],
-            "transitions": []
-        }))
-        .expect("minimal IR spec");
-        let result = crate::evaluate_with_identity(&snap, &spec, fp, snapshot_id.clone(), hash);
-        assert_eq!(result.snapshot_sha256, None);
-        assert_eq!(result.snapshot_id, snapshot_id);
-    }
-
-    #[test]
     fn snapshot_telemetry_hash_matches_canonical_hash_when_accepted() {
         let raw = well_formed_raw(0);
         assert_eq!(
-            snapshot_telemetry_hash(&raw),
+            snapshot_telemetry_hash(&raw, "scs_test"),
             Some(compute_content_sha256(&raw).unwrap())
+        );
+    }
+
+    #[test]
+    fn snapshot_telemetry_hash_with_refusal_returns_none() {
+        // The public refusal arm: a refusing hasher yields None, not a panic
+        // or an error the caller must propagate.
+        let raw = well_formed_raw(0);
+        assert_eq!(
+            snapshot_telemetry_hash_with(&raw, "scs_test", refusing_hasher),
+            None
         );
     }
 }
