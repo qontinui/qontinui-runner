@@ -23,12 +23,13 @@
 //! level-1 dir that has no lock of its own (the `--target <triple>` layout).
 //! No deeper recursion, and at most [`MAX_CARGO_LOCK_ITEMS`] items.
 //!
-//! Idle locks are reported too (holder fields `null`, `waiters: 0`): the item
+//! Idle locks are reported too (holder fields `null`, `waiters: 0`; on Windows
+//! `waiters` is `0` for every item and means not observable): the item
 //! set is the census of shared targets, not only the busy ones.
 //!
 //! ## How
 //!
-//! Linux only. `/proc/locks` is read ONCE per tick and parsed by the pure
+//! Linux: `/proc/locks` is read ONCE per tick and parsed by the pure
 //! [`parse_proc_locks`] into `(major, minor, inode) → holders + waiters`; a
 //! plain row is a granted lock, a `->` row is a process BLOCKED on that same
 //! lock. Lock files are matched by `st_dev` / `st_ino` (with an inode-only
@@ -79,7 +80,8 @@
 //!
 //! ## Wire contract (UNKNOWN is not empty)
 //!
-//! [`probe_current`] answers `None` on a non-Linux host, when no workspace
+//! [`probe_current`] answers `None` on a host that is neither Linux nor Windows (the
+//! Windows arm is [`probe_workspace_windows`]: held/idle only, no holder pid), when no workspace
 //! root resolves, or when `/proc/locks` cannot be read — and the census body
 //! then OMITS `cargo_locks`, which coord reads as UNKNOWN. `Some(vec![])` is a
 //! measurement: the probe ran and found no shared target lock files.
@@ -147,6 +149,9 @@ pub struct CargoLockItem {
     pub holder_kind: Option<HolderKind>,
     pub holder_age_secs: Option<u64>,
     pub holder_cmd: Option<String>,
+    /// On Windows this is always `0` and means NOT OBSERVABLE, not an empty
+    /// queue (a held lock's waiters cannot be seen there).
+    ///
     /// Blocked rows (`->`) in `/proc/locks` — including rows whose pid could
     /// not be translated (`0`) or is an OFD lock (`-1`).
     pub waiters: u32,
@@ -528,7 +533,7 @@ pub fn enumerate_shared_lock_files(workspace_root: &Path, cap: usize) -> (Vec<Lo
 }
 
 // ---------------------------------------------------------------------------
-// The probe (Linux).
+// The probe (Linux and Windows).
 // ---------------------------------------------------------------------------
 
 /// Probe the workspace the census walks. `None` = UNKNOWN (omit the field).
@@ -539,10 +544,78 @@ pub fn probe_current() -> Option<Vec<CargoLockItem>> {
         let root = super::census::qontinui_root()?;
         probe_workspace(&root)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let root = super::census::qontinui_root()?;
+        Some(probe_workspace_windows(&root))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
     }
+}
+
+/// Is `lock` held by another process? `Some(true)` = held, `Some(false)` =
+/// free, `None` = could not tell (the file vanished or cannot be opened).
+///
+/// cargo takes its target-dir lock with an exclusive `LockFileEx` byte-range
+/// lock, NOT a sharing mode, so an ordinary open of a held `.cargo-lock`
+/// SUCCEEDS on Windows — an open-with-write test cannot see the holder. A
+/// non-blocking exclusive lock attempt can: it answers `WouldBlock` while
+/// cargo holds the lock. The attempt takes the lock for the instant it is
+/// held by this probe and releases it when the handle drops, so a cargo that
+/// arrives in that instant simply waits for it.
+#[cfg(windows)]
+pub fn lock_file_held(lock: &Path) -> Option<bool> {
+    let f = match std::fs::OpenOptions::new().read(true).open(lock) {
+        Ok(f) => f,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!("cargo_locks: cannot open {}: {e}", lock.display());
+            }
+            return None;
+        }
+    };
+    match f.try_lock() {
+        Ok(()) => Some(false),
+        Err(std::fs::TryLockError::WouldBlock) => Some(true),
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::debug!("cargo_locks: cannot lock-probe {}: {e}", lock.display());
+            None
+        }
+    }
+}
+
+/// Windows arm of the probe. A held lock is reported as `holder_kind: build`
+/// with no pid: only cargo takes a `.cargo-lock` here (the Linux sweeper's
+/// `flock` has no Windows counterpart), but the holder is not enumerated, so
+/// `holder_pid` / `holder_age_secs` / `holder_cmd` stay `null`. Waiters are not
+/// observable on Windows and are reported as `0` — a floor, never a
+/// measurement of an empty queue. A lock whose state could not be read is
+/// dropped, never reported idle.
+#[cfg(windows)]
+pub fn probe_workspace_windows(workspace_root: &Path) -> Vec<CargoLockItem> {
+    let (files, truncated) = enumerate_shared_lock_files(workspace_root, MAX_CARGO_LOCK_ITEMS);
+    if truncated {
+        tracing::warn!(
+            "cargo_locks: more than {MAX_CARGO_LOCK_ITEMS} shared-target lock files; the published list is TRUNCATED"
+        );
+    }
+    files
+        .iter()
+        .filter_map(|f| {
+            let held = lock_file_held(&f.path)?;
+            Some(CargoLockItem {
+                target_key: f.target_key.clone(),
+                holder_pid: None,
+                holder_kind: held.then_some(HolderKind::Build),
+                holder_age_secs: None,
+                holder_cmd: None,
+                waiters: 0,
+                oldest_wait_secs: None,
+            })
+        })
+        .collect()
 }
 
 /// Epoch of the last cap-truncation warning.
@@ -1189,6 +1262,42 @@ lock:\t1: FLOCK  ADVISORY  WRITE 1351229 08:01:16669579 0 EOF\n";
                 "qontinui-runner/target-pool/slot-1/debug",
                 "qontinui-runner/src-tauri/target/debug",
             ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_arm_sees_a_held_cargo_lock_that_an_open_cannot() {
+        let tmp = make_workspace();
+        let lock = tmp
+            .path()
+            .join("qontinui-coord/target-agent/debug/.cargo-lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .expect("open");
+        holder.lock().expect("exclusive lock, as cargo takes it");
+        // Falsifier for the old probe: an open-with-write of a LockFileEx-held
+        // file succeeds, so `reclaim::cargo_lock_held`'s test reads it as free.
+        assert!(std::fs::OpenOptions::new().write(true).open(&lock).is_ok());
+        let items = probe_workspace_windows(tmp.path());
+        let item = items
+            .iter()
+            .find(|i| i.target_key == "qontinui-coord/target-agent/debug")
+            .expect("item");
+        assert_eq!(item.holder_kind, Some(HolderKind::Build));
+        assert_eq!(item.holder_pid, None);
+        let idle = items
+            .iter()
+            .find(|i| i.target_key == "qontinui-coord/target/debug")
+            .expect("idle item");
+        assert_eq!(idle.holder_kind, None);
+        drop(holder);
+        let after = probe_workspace_windows(tmp.path());
+        assert!(
+            after.iter().all(|i| i.holder_kind.is_none()),
+            "released lock reads idle"
         );
     }
 
