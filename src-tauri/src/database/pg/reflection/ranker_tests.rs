@@ -431,9 +431,9 @@ async fn pg_both_reads_err_without_select_on_reflection_fixes() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (disposable_pg checked it)");
     let separator = if url.contains('?') { '&' } else { '?' };
     let as_role = format!("{url}{separator}options=-c%20role%3D{role}");
-    let limited = PgDb {
-        pool: PgDb::build_pool(&as_role).expect("a pool that connects as the role"),
-    };
+    let limited = PgDb::from_pool(
+        PgDb::build_pool(&as_role).expect("a pool that connects as the role"),
+    );
 
     let denied_rank = limited.score_knowledge_relevance(&wf, 10).await;
     let denied_velocity = limited.compute_change_velocity("src/x.rs", 5).await;
