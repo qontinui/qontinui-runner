@@ -1165,8 +1165,9 @@ pub(super) fn newest_artifact_age(target_root: &Path) -> Option<Duration> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SizeMeasurement {
     /// APPARENT size: the sum of every regular file's length, a hardlinked
-    /// file counted once per link. What `du --apparent-size --count-links`
-    /// would say (plain `du` counts each inode once).
+    /// file counted once per link (directory entries and symlinks are not
+    /// counted, so this is close to, not equal to, `du --apparent-size
+    /// --count-links`; plain `du` counts each inode once).
     pub bytes: u64,
     /// Sub-directories whose `read_dir` failed. `> 0` ⇒ `bytes` is a LOWER
     /// BOUND, and the caller must say so rather than present it as exact.
@@ -1194,7 +1195,7 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
     {
         let mut shared = SharedInodes::new();
         let mut unique_bytes = 0u64;
-        let mut m = measure_dir_size_walk(dir, &mut shared, &mut unique_bytes)?;
+        let mut m = measure_dir_size_walk(dir, &mut shared, &mut unique_bytes).ok()?;
         // An inode whose every link was seen inside the tree goes with it;
         // one with links elsewhere survives the removal and frees nothing.
         let shared_freed = shared
@@ -1210,19 +1211,21 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
     }
     #[cfg(not(unix))]
     {
-        measure_dir_size_walk(dir)
+        measure_dir_size_walk(dir).ok()
     }
 }
 
 /// The recursive walk behind [`measure_dir_size`]. On unix it records each
 /// regular file's identity so the caller can compute exclusive bytes; the
 /// returned measurement's `exclusive_bytes` is left `None` for the caller.
+/// `Err` carries `dir`'s own `read_dir` failure, so a parent can tell a
+/// sub-directory that vanished from one it could not read.
 fn measure_dir_size_walk(
     dir: &Path,
     #[cfg(unix)] shared: &mut SharedInodes,
     #[cfg(unix)] unique_bytes: &mut u64,
-) -> Option<SizeMeasurement> {
-    let read = std::fs::read_dir(dir).ok()?;
+) -> std::io::Result<SizeMeasurement> {
+    let read = std::fs::read_dir(dir)?;
     let mut m = SizeMeasurement::default();
     for entry in read {
         // An entry that errors after a successful open would otherwise be
@@ -1266,11 +1269,15 @@ fn measure_dir_size_walk(
             #[cfg(not(unix))]
             let child = measure_dir_size_walk(&path);
             match child {
-                Some(child) => {
+                Ok(child) => {
                     m.bytes = m.bytes.saturating_add(child.bytes);
                     m.unreadable_dirs += child.unreadable_dirs;
                 }
-                None => m.unreadable_dirs += 1,
+                // A sub-directory removed between this readdir and its own
+                // (a cargo incremental session dir mid-build) is gone, not
+                // unreadable: skip it as the lstat arm skips a vanished file.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => m.unreadable_dirs += 1,
             }
         } else if ft.is_file() {
             m.bytes = m.bytes.saturating_add(meta.len());
@@ -1290,7 +1297,7 @@ fn measure_dir_size_walk(
             }
         }
     }
-    Some(m)
+    Ok(m)
 }
 
 /// The reason a candidate was NOT reaped this tick (for shadow-mode logging and
