@@ -1125,6 +1125,63 @@ impl TrackingHealthReport {
         }
     }
 
+    /// Read a FINISHED terminal-hosted session's children through
+    /// `classify_child` instead of [`child_signals_work`]'s 60 s boot-window
+    /// rule (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`,
+    /// Phase 2b; served `finished-criteria` v11 condition 2).
+    ///
+    /// For each such session whose children were read at all, EVERY direct child
+    /// counts — whatever its image and however early it started — unless it is a
+    /// proven stray wait loop (`strays`) or `verdicts` classifies it
+    /// [`session_lifecycle::ChildClass::ShimOrPump`] for that session. So
+    /// `has_live_children` becomes `Some(false)` only when nothing but shims and
+    /// strays is attached, and `Some(true)` for a `Work` or `Unknown` child, a
+    /// session `verdicts` holds no verdict for (`None` is the whole read being
+    /// UNKNOWN), and a boot-time child the window rule used to wave through.
+    /// `stray_wait_shells` counts the strays among the children only while they
+    /// are all that holds the session. Any other session keeps the window rule.
+    /// Pure; no I/O.
+    pub fn replace_boot_window_for_finished(
+        &mut self,
+        snapshot: &ProcessSnapshot,
+        strays: &HashSet<u32>,
+        verdicts: Option<&HashMap<u32, session_lifecycle::SessionVerdict>>,
+    ) {
+        for p in self.terminal_hosted.iter_mut() {
+            if p.nested_under_claude
+                || p.session_status.as_deref()
+                    != Some(SessionWorkStatus::Finished.as_wire().as_str())
+                || p.has_live_children.is_none()
+            {
+                continue;
+            }
+            let Some(kids) = snapshot.parent_map.get(&p.pid).filter(|k| !k.is_empty()) else {
+                continue;
+            };
+            let verdict = verdicts.and_then(|v| v.get(&p.pid));
+            let held_by: Vec<u32> = kids
+                .iter()
+                .copied()
+                .filter(|kid| {
+                    !strays.contains(kid)
+                        && !verdict.is_some_and(|v| {
+                            v.children.iter().any(|c| {
+                                c.pid == *kid
+                                    && c.class == session_lifecycle::ChildClass::ShimOrPump
+                            })
+                        })
+                })
+                .collect();
+            if held_by.is_empty() {
+                p.has_live_children = Some(false);
+                p.stray_wait_shells = kids.iter().filter(|kid| strays.contains(kid)).count();
+            } else {
+                p.has_live_children = Some(true);
+                p.stray_wait_shells = 0;
+            }
+        }
+    }
+
     fn finished_with_live_children(&self) -> impl Iterator<Item = &LiveClaudeProcess> {
         self.terminal_hosted
             .iter()
@@ -1836,9 +1893,22 @@ pub async fn compute(
     // Only a finished session's work children, and only once it reads as held.
     // Bounded inside: a loop can name any path, and this route must still answer.
     let stray_candidates = report.stray_candidates(look.snapshot());
+    let mut strays: HashSet<u32> = HashSet::new();
     if !stray_candidates.is_empty() {
-        let strays = crate::session::stray_wait::stray_shells(stray_candidates).await;
+        strays = crate::session::stray_wait::stray_shells(stray_candidates).await;
         report.discount_stray_shells(look.snapshot(), &strays);
+    }
+    // Plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box` Phase 2b:
+    // where the `finished_close` arm runs, a finished terminal-hosted session's
+    // children are read through `classify_child`, not the 60 s boot-window rule.
+    if crate::session::finished_close::current_mode() != crate::settings::FinishedSessionClose::Off
+    {
+        let verdicts = crate::session::classify_finished::judge_finished(
+            &report.terminal_hosted,
+            look.snapshot(),
+        )
+        .await;
+        report.replace_boot_window_for_finished(look.snapshot(), &strays, verdicts.as_ref());
     }
 
     Some(TrackingHealthPass {
@@ -3882,6 +3952,210 @@ mod tests {
         let (snap, mut report) = stray_fixture();
         report.discount_stray_shells(&snap, &HashSet::new());
         assert_eq!(stray_row(&report, 20), (Some(true), 0));
+    }
+
+    /// Phase 2b's fixture: four panes whose `claude` holds children that all
+    /// started inside the 60 s boot window, so the window rule reads every one
+    /// as infrastructure. 20 holds one `python3` (21) and a late `bash` (22);
+    /// 30 a `python3` (31) and an early `rg` (32); 40 one `python3` (41); 50
+    /// (WORKING) one `python3` (51). 20, 30 and 40 are finished.
+    fn boot_window_fixture() -> (ProcessSnapshot, TrackingHealthReport) {
+        let now_ms = 1_800_000_000_000;
+        let t0 = now_ms / 1_000 - 1_800;
+        let snap = snap_with(
+            &[
+                (1, &[5, 6, 7, 8]),
+                (5, &[20]),
+                (20, &[21, 22]),
+                (6, &[30]),
+                (30, &[31, 32]),
+                (7, &[40]),
+                (40, &[41]),
+                (8, &[50]),
+                (50, &[51]),
+            ],
+            &[
+                (5, t0),
+                (6, t0),
+                (7, t0),
+                (8, t0),
+                (20, t0),
+                (30, t0),
+                (40, t0),
+                (50, t0),
+                (21, t0 + 1),
+                (22, t0 + 600),
+                (31, t0 + 1),
+                (32, t0 + 1),
+                (41, t0 + 1),
+                (51, t0 + 1),
+            ],
+            &[
+                (20, "claude"),
+                (21, "python3"),
+                (22, "bash"),
+                (30, "claude"),
+                (31, "python3"),
+                (32, "rg"),
+                (40, "claude"),
+                (41, "python3"),
+                (50, "claude"),
+                (51, "python3"),
+            ],
+        );
+        let records = vec![
+            record("sess-20", "t-5", now_ms - 60_000),
+            record("sess-30", "t-6", now_ms - 60_000),
+            record("sess-40", "t-7", now_ms - 60_000),
+            record("sess-50", "t-8", now_ms - 60_000),
+        ];
+        let terminal_pids: HashMap<String, u32> =
+            [("t-5", 5u32), ("t-6", 6), ("t-7", 7), ("t-8", 8)]
+                .into_iter()
+                .map(|(t, p)| (t.to_string(), p))
+                .collect();
+        let statuses: HashMap<String, SessionWorkStatus> = [
+            ("sess-20", SessionWorkStatus::Finished),
+            ("sess-30", SessionWorkStatus::Finished),
+            ("sess-40", SessionWorkStatus::Finished),
+            ("sess-50", SessionWorkStatus::Working),
+        ]
+        .into_iter()
+        .map(|(id, status)| (id.to_string(), status))
+        .collect();
+        let report = evaluate(
+            &PaneLook::image_only(&snap),
+            1,
+            &records,
+            &terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &statuses,
+            now_ms - 3_600_000,
+            now_ms,
+            &HolderCensus::default(),
+        );
+        (snap, report)
+    }
+
+    fn child_verdict(
+        pid: u32,
+        class: session_lifecycle::ChildClass,
+    ) -> session_lifecycle::ChildVerdict {
+        session_lifecycle::ChildVerdict {
+            pid,
+            class,
+            chain: None,
+            reason: String::new(),
+        }
+    }
+
+    fn session_verdict(
+        claude_pid: u32,
+        children: Vec<session_lifecycle::ChildVerdict>,
+    ) -> (u32, session_lifecycle::SessionVerdict) {
+        let admit = children
+            .iter()
+            .all(|c| c.class == session_lifecycle::ChildClass::ShimOrPump);
+        (
+            claude_pid,
+            session_lifecycle::SessionVerdict {
+                claude_pid,
+                admit,
+                children,
+                refusal: None,
+            },
+        )
+    }
+
+    /// The replacement, row by row: the window rule read 20 (but for its late
+    /// `bash`), 30, 40 and 50 as infrastructure-only; `classify_child` keeps
+    /// the proven shim out of the count and nothing it cannot prove.
+    #[test]
+    fn classify_child_replaces_the_boot_window_rule_for_a_finished_session() {
+        use session_lifecycle::ChildClass::{ShimOrPump, Unknown, Work};
+        let (snap, mut report) = boot_window_fixture();
+        // Before: the window rule — only 20's late bash is work.
+        assert_eq!(stray_row(&report, 20), (Some(true), 0));
+        assert_eq!(
+            stray_row(&report, 30),
+            (Some(false), 0),
+            "window: all boot-time"
+        );
+        assert_eq!(stray_row(&report, 40), (Some(false), 0));
+        assert_eq!(stray_row(&report, 50), (Some(false), 0));
+
+        let verdicts: HashMap<u32, session_lifecycle::SessionVerdict> = [
+            session_verdict(
+                20,
+                vec![child_verdict(21, ShimOrPump), child_verdict(22, Work)],
+            ),
+            session_verdict(
+                30,
+                vec![child_verdict(31, ShimOrPump), child_verdict(32, Work)],
+            ),
+            session_verdict(40, vec![child_verdict(41, Unknown)]),
+            session_verdict(50, vec![child_verdict(51, Work)]),
+        ]
+        .into_iter()
+        .collect();
+        // 22 is a proven stray: 20 is then held by a shim and a stray only.
+        report.replace_boot_window_for_finished(
+            &snap,
+            &[22u32].into_iter().collect(),
+            Some(&verdicts),
+        );
+        assert_eq!(stray_row(&report, 20), (Some(false), 1), "shim + stray");
+        assert_eq!(
+            stray_row(&report, 30),
+            (Some(true), 0),
+            "an early rg the window waved through is work"
+        );
+        assert_eq!(
+            stray_row(&report, 40),
+            (Some(true), 0),
+            "UNKNOWN keeps it open"
+        );
+        assert_eq!(
+            stray_row(&report, 50),
+            (Some(false), 0),
+            "an unfinished session keeps the window rule"
+        );
+    }
+
+    /// No verdict at all (the reads are off, stalled or out of time) is UNKNOWN:
+    /// every child of a finished session counts, a shim included.
+    #[test]
+    fn no_verdict_keeps_every_finished_session_with_a_child_held() {
+        let (snap, mut report) = boot_window_fixture();
+        report.replace_boot_window_for_finished(&snap, &HashSet::new(), None);
+        for pid in [20, 30, 40] {
+            assert_eq!(stray_row(&report, pid), (Some(true), 0), "pid {pid}");
+        }
+        assert_eq!(stray_row(&report, 50), (Some(false), 0));
+    }
+
+    /// A verdict for one `claude` says nothing about another's children, and a
+    /// verdict naming a pid that is not a child of this `claude` admits nothing.
+    #[test]
+    fn a_shim_verdict_admits_only_that_sessions_own_child() {
+        use session_lifecycle::ChildClass::ShimOrPump;
+        let (snap, mut report) = boot_window_fixture();
+        let verdicts: HashMap<u32, session_lifecycle::SessionVerdict> = [
+            session_verdict(40, vec![child_verdict(41, ShimOrPump)]),
+            // 31 is a child of 30, not of 20; 20 has no verdict.
+            session_verdict(
+                30,
+                vec![child_verdict(31, ShimOrPump), child_verdict(32, ShimOrPump)],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        report.replace_boot_window_for_finished(&snap, &HashSet::new(), Some(&verdicts));
+        assert_eq!(stray_row(&report, 40), (Some(false), 0));
+        assert_eq!(stray_row(&report, 30), (Some(false), 0));
+        assert_eq!(stray_row(&report, 20), (Some(true), 0), "no verdict for 20");
     }
 
     /// A nested `claude` is never discounted by its ancestor's declaration, and it

@@ -2302,7 +2302,11 @@ fn live_sessions_payload(
 /// to paint (`respawn_liveness::RESUME_LIVENESS_DEADLINE`). With
 /// `respawn_liveness::MAX_RESPAWN_ATTEMPTS` (3) attempts and the 1 s and 3 s
 /// pauses between them, that comes to about 11 minutes (3 × 225 s + 4 s =
-/// 679 s), plus the transcript carry before the first spawn. A caller with a
+/// 679 s), plus the transcript carry before the first spawn. While a
+/// runner-owned CLI install is running, each attempt first waits it out, for
+/// up to `claude_cli_spawn::CLI_UPDATE_WAIT` (120 s) more. Only an install
+/// running at the start of each of the three attempts reaches the full
+/// 3 × 345 s + 4 s = 1039 s, about 17 minutes. A caller with a
 /// UI should show the migration as pending for that long, and must not read a
 /// slow answer as a hang. Returning at the first spawn and reporting the
 /// verdict by event would take a new event contract with the webview. That is
@@ -3447,8 +3451,10 @@ mod tests {
         let start = src
             .find("pub async fn terminal_migrate_session_account(")
             .expect("the command");
-        let body = &src[start..];
-        let body = &body[..body.find("\n}\n").expect("the command's end")];
+        let body = src.get(start..).expect("a char boundary");
+        let body = body
+            .get(..body.find("\n}\n").expect("the command's end"))
+            .expect("a char boundary");
         let check = body
             .find("account_migration::child_started_rest_refusal(")
             .expect("the command checks the child-started rest");

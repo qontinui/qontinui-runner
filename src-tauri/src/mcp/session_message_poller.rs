@@ -1155,9 +1155,12 @@ fn resolve_target(
 /// otherwise have its messages held forever. The skip therefore holds only
 /// when `last_session_start_at` (the provider SessionStart hook stamp, set on
 /// startup AND resume) is absent or not newer than `finished_at`.
-/// `last_alive_at` is deliberately NOT used: the liveness poll touches it on
-/// every tick while the finished pane idles at its prompt, so it would be
-/// newer than `finished_at` for every live finished session and void the skip.
+/// Poll liveness is deliberately NOT used — neither the row's `last_seen_at`
+/// (bumped by `touch`) nor the in-memory KeepAlive stamp
+/// (`terminal::launch_failure::LaunchFailureRegistry::note_alive`): the
+/// liveness poll refreshes both on every tick while the finished pane idles at
+/// its prompt, so either would be newer than `finished_at` for every live
+/// finished session and void the skip.
 ///
 /// The record is looked up by the target's own key — the terminal's
 /// `claude_session_id`, or an SDK session's `task_run_id`. An SDK session with

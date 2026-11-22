@@ -632,6 +632,12 @@ async fn resume_one(
         Ok(claim) => claim,
         Err(why) => return ResumeRow::skipped(&cand.id, why),
     };
+    // Wait out a runner-owned CLI install FIRST, before the live-holder and
+    // drain checks below: the `--resume` resolver waits on the same flag, and
+    // a wait taken after those checks would leave them up to
+    // `claude_cli_spawn::CLI_UPDATE_WAIT` stale by spawn time. Returns at once
+    // when no install is running.
+    crate::claude_cli_spawn::await_cli_update_quiescent().await;
     // Under a model gateway the resumed pane runs with the gateway's
     // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
     // transcript does not exist, so `--resume` would find nothing. Refuse the
@@ -816,10 +822,15 @@ fn proven_terminal(
         RespawnOutcome::Died {
             exit_code,
             attempts,
+            retry_spawn_error,
             ..
         } => Err(Box::new(ResumeRow::failed(
             id,
-            RespawnOutcome::died_reason(exit_code, attempts),
+            RespawnOutcome::died_detail(
+                exit_code,
+                attempts,
+                retry_spawn_error.as_ref().map(|f| f.message.as_str()),
+            ),
             None,
         ))),
         // The pane is LEFT RUNNING (it keeps the row): a caller must not read
@@ -878,6 +889,14 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
             ),
         )
         .await;
+        // Whose policy body the respawn's system-prompt file carries: the
+        // tenant a session in its working dir resolves to, awaited HERE because
+        // the spawn seam below is synchronous (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Resolved per attempt: a retry spawns afresh.
+        let policy_tenant =
+            crate::mcp::policy_tenant::new_session_policy_tenant(Path::new(&cand.working_dir))
+                .await;
         // The seam is synchronous and runs here, on the async worker, NOT on
         // the blocking pool, exactly as the migration's and the respawn
         // receiver's `spawn_next` do: a spawn handed to `spawn_blocking` keeps
@@ -916,6 +935,7 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
                 // reopen under D3.
                 gate_identity: None,
                 origin: crate::coord_drain_state::SpawnOrigin::BootResume,
+                policy_tenant,
             },
         )
         .map(|(terminal_id, _coord_id)| terminal_id)
@@ -1328,6 +1348,23 @@ mod tests {
             died.verdict,
             "failed(respawn-died: exit 127 after 3 attempts)"
         );
+        let retry_unspawnable = proven_terminal(
+            ID,
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: Some(
+                    crate::terminal::spawn_refusal::SpawnFailure::before_child("claude not found"),
+                ),
+                rolled_back: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            retry_unspawnable.reason.as_deref(),
+            Some("respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"),
+            "a retry that never spawned must be named, not reported as a third death"
+        );
         let unconfirmed = proven_terminal(
             ID,
             RespawnOutcome::Unconfirmed {
@@ -1362,17 +1399,23 @@ mod tests {
     fn resume_one_checks_the_rest_under_its_claim_and_rests_through_the_helper() {
         let src = include_str!("resume_door.rs");
         let start = src.find("async fn resume_one(").expect("the fn");
-        let body = &src[start..];
-        let body = &body[..body.find("\n}\n").expect("the fn's end")];
+        let body = src.get(start..).expect("a char boundary");
+        let body = body
+            .get(..body.find("\n}\n").expect("the fn's end"))
+            .expect("a char boundary");
         let claim = body.find("claim_for_door(&cand.id").expect("the claim");
-        let recheck = body[claim..]
+        let recheck = body
+            .get(claim..)
+            .expect("a char boundary")
             .find("skip_if_resting(&cand.id")
             .map(|i| claim + i)
             .expect("the rest is re-checked under the claim");
         let respawn = body.find("confirm_respawn(").expect("the respawn");
         assert!(recheck < respawn, "re-checked before anything spawns");
         assert!(
-            body[respawn..].contains("proven_and_rested("),
+            body.get(respawn..)
+                .expect("a char boundary")
+                .contains("proven_and_rested("),
             "the outcome rests the session through the helper"
         );
         assert!(

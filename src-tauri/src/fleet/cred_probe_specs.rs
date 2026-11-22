@@ -383,6 +383,11 @@ pub(super) struct RegionalPlan {
     /// grammar are kept: anything else cannot match an earned token, and this list
     /// must not carry coord's raw bytes.
     pub(super) refused_tokens: Vec<String>,
+    /// Some row did not run for a reason of its own (unreadable, refused, a kind
+    /// this build does not know), whether or not its token was kept above. The
+    /// regional marker's promise is "every listed row was measured", which a
+    /// dropped off-grammar token must not be able to hide.
+    pub(super) skipped_rows: bool,
 }
 
 /// Filter one answered catalogue down to what may run.
@@ -469,6 +474,7 @@ pub(super) fn plan_regional_specs(specs: &[serde_json::Value]) -> RegionalPlan {
         not_run,
         unreadable_rows,
         refused_tokens,
+        skipped_rows: refused > 0,
     }
 }
 
@@ -526,6 +532,9 @@ pub(super) enum RegionalCycle {
         not_run: Vec<String>,
         unreadable_rows: bool,
         refused_tokens: Vec<String>,
+        /// Some listed row did not run ([`RegionalPlan::skipped_rows`]). Read only
+        /// by the regional marker; the token fold is unchanged by it.
+        skipped_rows: bool,
     },
 }
 
@@ -680,6 +689,7 @@ pub(super) fn run_regional_cycle(
         not_run: plan.not_run,
         unreadable_rows: plan.unreadable_rows,
         refused_tokens: plan.refused_tokens,
+        skipped_rows: plan.skipped_rows,
     }
 }
 
@@ -699,6 +709,11 @@ mod tests {
     const ECS_EU: &str = "cred:aws-ecs:eu-central-1";
     const CANARY: &str = "/qontinui/fleet/canary-marker";
 
+    /// `probes:cred-regional`: advertised while the last regional cycle measured
+    /// every catalogued token (no NoAnswer, unreadable or refused row, unrun spec or
+    /// Unknown verdict).
+    const REGIONAL_MARKER: &str = super::super::CRED_REGIONAL_PROBES_MARKER;
+
     fn ssm_spec(region: &str) -> serde_json::Value {
         json!({
             "token": format!("cred:aws-ssm:{region}"),
@@ -715,6 +730,7 @@ mod tests {
             not_run,
             unreadable_rows: false,
             refused_tokens: Vec::new(),
+            skipped_rows: false,
         }
     }
 
@@ -1110,6 +1126,7 @@ mod tests {
                 not_run: Vec::new(),
                 unreadable_rows: false,
                 refused_tokens: vec!["cred:aws-ssm:us-east-1".to_string()],
+                skipped_rows: true,
             }
         );
         assert_eq!(
@@ -1222,10 +1239,19 @@ mod tests {
             assert!(read().is_ok(), "the body check passes {shape}");
             let cache = Mutex::new(CredFamilyState::new());
             let t0 = Instant::now();
+            let measured = vec![
+                "os:linux",
+                "probes:cred",
+                REGIONAL_MARKER,
+                "cred:aws-sts",
+                ECS_EU,
+                SSM_EU,
+            ];
+            // An unreadable row leaves its catalogue unmeasured: no regional marker.
             let earned = vec!["os:linux", "probes:cred", "cred:aws-sts", ECS_EU, SSM_EU];
             let bare = vec!["os:linux", "probes:cred", "cred:aws-sts"];
             let both = vec![ssm_spec("eu-central-1"), ecs_spec("eu-central-1")];
-            assert_eq!(cycle(&cache, &env, Ok(both), t0), earned);
+            assert_eq!(cycle(&cache, &env, Ok(both), t0), measured);
 
             let t1 = t0 + CRED_TEST_TTL;
             assert_eq!(cycle(&cache, &env, read(), t1), earned, "{shape} holds");
@@ -1262,6 +1288,7 @@ mod tests {
             vec![
                 "os:linux",
                 "probes:cred",
+                REGIONAL_MARKER,
                 "cred:aws-sts",
                 ECS_EU,
                 "cred:aws-ecs:us-east-1",
@@ -1311,6 +1338,7 @@ mod tests {
         let earned = vec![
             "os:linux",
             "probes:cred",
+            REGIONAL_MARKER,
             "cred:aws-sts",
             ECS_EU,
             "cred:aws-ecs:us-east-1",
@@ -1758,7 +1786,14 @@ mod tests {
 
         assert_eq!(
             cycle(&cache, &env, Ok(both()), t0),
-            vec!["os:linux", "probes:cred", "cred:aws-sts", ECS_EU, SSM_EU]
+            vec![
+                "os:linux",
+                "probes:cred",
+                REGIONAL_MARKER,
+                "cred:aws-sts",
+                ECS_EU,
+                SSM_EU
+            ]
         );
         // Removed well inside one TTL's hold: no hold applies to an answer.
         assert_eq!(
@@ -1768,12 +1803,18 @@ mod tests {
                 Ok(vec![ssm_spec("eu-central-1")]),
                 t0 + Duration::from_secs(1)
             ),
-            vec!["os:linux", "probes:cred", "cred:aws-sts", SSM_EU],
+            vec![
+                "os:linux",
+                "probes:cred",
+                REGIONAL_MARKER,
+                "cred:aws-sts",
+                SSM_EU
+            ],
             "the removed ecs token must retract on this payload"
         );
         assert_eq!(
             cycle(&cache, &env, Ok(Vec::new()), t0 + Duration::from_secs(2)),
-            vec!["os:linux", "probes:cred", "cred:aws-sts"],
+            vec!["os:linux", "probes:cred", REGIONAL_MARKER, "cred:aws-sts"],
             "an answered empty catalogue retracts everything regional, nothing else"
         );
 
@@ -1813,12 +1854,20 @@ mod tests {
         for failure in failures {
             let cache = Mutex::new(CredFamilyState::new());
             let t0 = Instant::now();
+            let measured = vec![
+                "os:linux",
+                "probes:cred",
+                REGIONAL_MARKER,
+                "cred:aws-sts",
+                SSM_EU,
+            ];
+            // A failed fetch measured nothing: the token holds, the marker does not.
             let earned = vec!["os:linux", "probes:cred", "cred:aws-sts", SSM_EU];
             let bare = vec!["os:linux", "probes:cred", "cred:aws-sts"];
 
             assert_eq!(
                 cycle(&cache, &env, Ok(vec![ssm_spec("eu-central-1")]), t0),
-                earned
+                measured
             );
             let t1 = t0 + CRED_TEST_TTL;
             assert_eq!(
@@ -1845,7 +1894,7 @@ mod tests {
                     Ok(vec![ssm_spec("eu-central-1")]),
                     t1 + CRED_TEST_TTL * 2
                 ),
-                earned,
+                measured,
                 "{failure:?} recovers"
             );
         }
@@ -1863,6 +1912,35 @@ mod tests {
         );
     }
 
+    /// A multi-bound device fetches ONE binding's catalogue, but its capability
+    /// list is read under every tenant it is bound to, so the regional marker is
+    /// withheld there even after a fully measured cycle; the tokens fold as before.
+    #[test]
+    fn a_multi_bound_device_never_advertises_the_regional_marker() {
+        let (tmp, _bin) = tmp_with_bin();
+        let env = shim_env(tmp.path()); // no aws: a definitive Absent, fully measured
+        let run = |single_tenant: bool| {
+            let cache = Mutex::new(CredFamilyState::new());
+            super::super::run_cred_refresh_cycle_scoped(
+                &cache,
+                &env,
+                || Ok(vec![ssm_spec("eu-central-1")]),
+                Instant::now(),
+                CRED_TEST_TTL,
+                single_tenant,
+            );
+            let g = cache.lock().unwrap();
+            cred_payload_capabilities(&g).0
+        };
+        assert!(
+            run(true).contains(&REGIONAL_MARKER.to_string()),
+            "control: single-tenant"
+        );
+        let multi = run(false);
+        assert!(!multi.contains(&REGIONAL_MARKER.to_string()), "{multi:?}");
+        assert!(multi.contains(&CRED_PROBES_MARKER.to_string()), "{multi:?}");
+    }
+
     /// D2 per token: an Absent retracts on the next payload, an Unknown (the SSM
     /// canary's 254) holds for one TTL and then drops, and the built-in keeps its
     /// own answer through both.
@@ -1876,14 +1954,25 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(
             cycle(&cache, &env, Ok(specs()), t0),
-            vec!["os:linux", "probes:cred", "cred:aws-sts", SSM_EU]
+            vec![
+                "os:linux",
+                "probes:cred",
+                REGIONAL_MARKER,
+                "cred:aws-sts",
+                SSM_EU
+            ]
         );
 
         env.aws = Some(write_cred_shim(&bin, "aws-254", Shim::Exit(254)));
         let t1 = t0 + CRED_TEST_TTL;
+        let held = cycle(&cache, &env, Ok(specs()), t1);
         assert!(
-            cycle(&cache, &env, Ok(specs()), t1).contains(&SSM_EU.to_string()),
+            held.contains(&SSM_EU.to_string()),
             "254 is Unknown: the token holds"
+        );
+        assert!(
+            !held.contains(&REGIONAL_MARKER.to_string()),
+            "a held Unknown is not a measurement: the regional marker is withdrawn"
         );
         assert!(
             !cycle(&cache, &env, Ok(specs()), t1 + CRED_TEST_TTL).contains(&SSM_EU.to_string()),
@@ -1898,7 +1987,8 @@ mod tests {
         env.aws = None;
         assert_eq!(
             cycle(&cache, &env, Ok(specs()), t2 + Duration::from_secs(1)),
-            vec!["os:linux", "probes:cred"]
+            // An Absent is a measurement, so the catalogue was measured in full.
+            vec!["os:linux", "probes:cred", REGIONAL_MARKER]
         );
     }
 

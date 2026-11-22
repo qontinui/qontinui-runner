@@ -103,9 +103,11 @@ impl From<GhError> for String {
     }
 }
 
-/// Longest single back-off, in seconds. Preserved verbatim from the per-instance
-/// implementation: a GitHub reset can be an hour out, and blocking a poller for
-/// an hour is indistinguishable from the poller being dead.
+/// Longest single back-off GitHub's own wait is capped at, in seconds, BEFORE
+/// the resume jitter ([`github_budget::resume_after`]) adds up to
+/// [`github_budget::RESUME_JITTER_SECS`]. Preserved verbatim from the
+/// per-instance implementation: a GitHub reset can be an hour out, and blocking
+/// a poller for an hour is indistinguishable from the poller being dead.
 const MAX_BACKOFF_SECS: u64 = 300;
 
 /// Cache key under which a page's `Link: rel="next"` is stored beside its body.
@@ -171,6 +173,22 @@ pub(crate) fn retry_backoff_secs(
     Some(wait.min(MAX_BACKOFF_SECS))
 }
 
+/// How long [`interactive_floor`] sleeps BEFORE jitter, or `None` when it does
+/// not sleep: the bucket is above [`RATE_LIMIT_FLOOR`], the reset is unknown,
+/// or the window has already reset. Capped at [`MAX_BACKOFF_SECS`]. Pure,
+/// unit-tested.
+pub(crate) fn interactive_floor_wait_secs(
+    remaining: i64,
+    reset_at_unix: Option<i64>,
+    now: i64,
+) -> Option<u64> {
+    let reset = reset_at_unix?;
+    if remaining > RATE_LIMIT_FLOOR || now >= reset {
+        return None;
+    }
+    Some(((reset - now) as u64).min(MAX_BACKOFF_SECS))
+}
+
 /// INTERACTIVE only: sleep one chunk when `credential`'s own bucket is at or
 /// below [`RATE_LIMIT_FLOOR`] and its window has not reset — then let the caller
 /// send. Shared by [`GitHubClient`] and the ticket provider's writes so the two
@@ -183,17 +201,15 @@ pub(crate) async fn interactive_floor(credential: &CredentialKey) {
     let Some(obs) = github_budget::rate_limit_for(credential) else {
         return;
     };
-    let (Some(remaining), Some(reset)) = (obs.remaining, obs.reset_at_unix) else {
+    let Some(remaining) = obs.remaining else {
         return;
     };
-    if remaining > RATE_LIMIT_FLOOR {
+    let Some(wait) = interactive_floor_wait_secs(remaining, obs.reset_at_unix, now_unix()) else {
         return;
-    }
-    let now = now_unix();
-    if now >= reset {
-        return;
-    }
-    let wait = ((reset - now) as u64).min(MAX_BACKOFF_SECS);
+    };
+    // Jittered past the reset: every runner sharing the bucket computed the
+    // same reset, and resuming exactly there is the synchronized burst.
+    let wait = github_budget::resume_after(wait);
     warn!(
         "GitHub API rate limit low ({} remaining, credential {}), waiting {}s",
         remaining, credential, wait
@@ -356,6 +372,90 @@ fn pr_url(owner: &str, repo: &str, number: u64) -> String {
     format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}")
 }
 
+/// Maximum total results a paginated read accumulates before it stops. Shared by
+/// every `Link`-paged reader in the crate (the ticket provider's issue and
+/// comment lists, and [`GitHubClient::list_repo_prs`]) rather than copied.
+pub(crate) const PAGINATION_CAP: usize = 500;
+
+/// Which repo-wide PR listing [`GitHubClient::list_repo_prs`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoPrSlice<'a> {
+    /// Every open PR (`state=open&per_page=100`), paged to the end.
+    Open,
+    /// Closed PRs, most recently updated first
+    /// (`state=closed&sort=updated&direction=desc&per_page=30`), paged back
+    /// until a page reaches `since` — the caller's high-water `updated_at`.
+    /// `None` (no mark yet) reads the first page only: there is nothing to
+    /// page back to, and rows older than it are not this listing's job.
+    RecentlyClosed { since: Option<&'a str> },
+}
+
+/// The first page of a repo-wide PR listing, for
+/// [`GitHubClient::list_repo_prs`]. Later pages come from `Link`. Pure,
+/// unit-tested.
+fn repo_prs_url(owner: &str, repo: &str, slice: RepoPrSlice<'_>) -> String {
+    let query = match slice {
+        RepoPrSlice::Open => "state=open&per_page=100",
+        RepoPrSlice::RecentlyClosed { .. } => {
+            "state=closed&sort=updated&direction=desc&per_page=30"
+        }
+    };
+    format!(
+        "https://api.github.com/repos/{}/{}/pulls?{query}",
+        urlencoding::encode(owner),
+        urlencoding::encode(repo),
+    )
+}
+
+/// Does this page of an `updated`-descending closed listing reach the
+/// high-water `mark` — i.e. carry an item updated no later than it? Paging
+/// stops there: everything older was seen by an earlier read. An item whose
+/// `updated_at` does not parse proves nothing and does not stop the paging.
+/// Pure, unit-tested.
+pub(crate) fn closed_page_reaches_mark(page: &[HeadPr], mark: &str) -> bool {
+    let Ok(mark) = chrono::DateTime::parse_from_rfc3339(mark) else {
+        // An unreadable mark cannot bound anything: read one page, as for none.
+        return true;
+    };
+    page.iter().any(|pr| {
+        pr.updated_at
+            .as_deref()
+            .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok())
+            .is_some_and(|u| u <= mark)
+    })
+}
+
+/// One repo-wide PR listing from [`GitHubClient::list_repo_prs`].
+#[derive(Debug, Default)]
+pub struct RepoPrListing {
+    pub prs: Vec<HeadPr>,
+    /// The read stopped at [`PAGINATION_CAP`] with more pages left: the listing
+    /// is INCOMPLETE, and a PR's absence from it proves nothing.
+    pub overflow: bool,
+    /// Requests answered (charged or `304`), for the reconciler's
+    /// `discovery_calls` counter.
+    pub requests: usize,
+}
+
+/// Parse one PR object of a `pulls` list into a [`HeadPr`]. `None` when it
+/// carries no number.
+fn parse_head_pr(pr: &serde_json::Value) -> Option<HeadPr> {
+    let number = pr["number"].as_u64()?;
+    Some(HeadPr {
+        number,
+        state: pr["state"].as_str().unwrap_or("unknown").to_string(),
+        merged: pr["merged_at"].is_string(),
+        merged_at: pr["merged_at"].as_str().map(|s| s.to_string()),
+        closed_at: pr["closed_at"].as_str().map(|s| s.to_string()),
+        head_ref: pr["head"]["ref"].as_str().unwrap_or("").to_string(),
+        head_label: pr["head"]["label"].as_str().unwrap_or("").to_string(),
+        head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
+        base_ref: pr["base"]["ref"].as_str().unwrap_or("").to_string(),
+        updated_at: pr["updated_at"].as_str().map(|s| s.to_string()),
+        labels: parse_labels(pr),
+    })
+}
+
 /// The chip `qontinui-coord` applies to a PR it fast-forward-landed
 /// (`pr_merge::engine::FF_LAND_LABEL`, mirrored to GitHub by
 /// `announce_ff_land`). It is coord's own land verdict, delivered on the PR
@@ -390,7 +490,7 @@ pub fn has_coord_landed_label(labels: &[String]) -> bool {
 /// A PR resolved from a head branch by [`GitHubClient::list_prs_for_head`].
 /// Carries the head ref + sha so the attribution reconciler can verify the
 /// PR's head-commit `Session-Id` trailer before recording it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadPr {
     pub number: u64,
     /// `"open"` | `"closed"`.
@@ -403,11 +503,21 @@ pub struct HeadPr {
     /// land timestamp for a fast-forward land, which sets no `merged_at`.
     pub closed_at: Option<String>,
     pub head_ref: String,
+    /// `head.label` — `<owner>:<ref>` of the repo the head branch lives in. A
+    /// repo-wide listing also carries FORK PRs, whose `head_ref` can equal one
+    /// of ours, so attribution keys on this, never on `head_ref` alone. Empty
+    /// when the payload carried none (and for a [`GitHubClient::get_pr`]-built
+    /// value, which does not read it).
+    #[serde(default)]
+    pub head_label: String,
     pub head_sha: String,
     /// The PR's BASE branch name (e.g. `"main"`), unprefixed. The session-PR
     /// reconciler's content-proof land signal tests the head commit against
     /// `origin/<base_ref>`.
     pub base_ref: String,
+    /// RFC3339 `updated_at` — the closed listing's paging key.
+    #[serde(default)]
+    pub updated_at: Option<String>,
     /// Label names on the PR. Carries coord's [`COORD_LANDED_LABEL`] chip,
     /// which is the land signal that survives a rebase (see the constant).
     ///
@@ -653,6 +763,9 @@ impl GitHubClient {
             ex.reset_at_unix,
             now_unix(),
         );
+        // Every runner sharing this bucket computed the same wait; each adds its
+        // own jitter so they do not all re-send in the second the window opens.
+        let backoff = backoff.map(github_budget::resume_after);
         if let (Some(wait), SpendClass::Background) = (backoff, self.spend_class) {
             // A background poller is never slept on. The refusal is already on
             // the meter as `rate_limited`; the hold keeps the next tick or
@@ -824,23 +937,73 @@ impl GitHubClient {
             .json()
             .map_err(|e| GhError::Failed(format!("Failed to parse PR list response: {}", e)))?;
 
-        Ok(body
-            .iter()
-            .filter_map(|pr| {
-                let number = pr["number"].as_u64()?;
-                Some(HeadPr {
-                    number,
-                    state: pr["state"].as_str().unwrap_or("unknown").to_string(),
-                    merged: pr["merged_at"].is_string(),
-                    merged_at: pr["merged_at"].as_str().map(|s| s.to_string()),
-                    closed_at: pr["closed_at"].as_str().map(|s| s.to_string()),
-                    head_ref: pr["head"]["ref"].as_str().unwrap_or("").to_string(),
-                    head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
-                    base_ref: pr["base"]["ref"].as_str().unwrap_or("").to_string(),
-                    labels: parse_labels(pr),
-                })
-            })
-            .collect())
+        Ok(body.iter().filter_map(parse_head_pr).collect())
+    }
+
+    /// One repo-wide PR listing — the session-PR reconciler's per-repo
+    /// discovery (plan 2026-10-30-…, D3), which replaces a per-branch
+    /// [`Self::list_prs_for_head`] for every branch of every session.
+    ///
+    /// Conditional and `Link`-paged like `GitHubTicketProvider::fetch_actionable`
+    /// (the `304` replay keeps `Link`, see [`link_cache_key`]). Bounded by
+    /// [`PAGINATION_CAP`]; a read stopped there with pages left reports
+    /// `overflow`, and the caller must then treat absence as proving nothing.
+    /// A deferral on any page ends the read with [`GhError::Deferred`].
+    pub async fn list_repo_prs(
+        &self,
+        owner: &str,
+        repo: &str,
+        slice: RepoPrSlice<'_>,
+    ) -> Result<RepoPrListing, GhError> {
+        let mut out = RepoPrListing::default();
+        let mut next_url = Some(self.at_base(repo_prs_url(owner, repo, slice)));
+
+        while let Some(url) = next_url.take() {
+            let resp = self
+                .send_metered(
+                    &url,
+                    CacheMode::Cached,
+                    self.client.get(&url).headers(self.headers()),
+                )
+                .await?;
+            out.requests += 1;
+
+            if !resp.is_success() {
+                return Err(GhError::HttpStatus {
+                    status: resp.status().as_u16(),
+                    message: format!("GitHub API returned {}: {}", resp.status(), resp.text()),
+                });
+            }
+            let link_next = resp.next_page_url();
+            let body: Vec<serde_json::Value> = resp
+                .json()
+                .map_err(|e| GhError::Failed(format!("Failed to parse PR list response: {}", e)))?;
+            let page: Vec<HeadPr> = body.iter().filter_map(parse_head_pr).collect();
+
+            let reached_mark = match slice {
+                RepoPrSlice::Open => false,
+                RepoPrSlice::RecentlyClosed { since: None } => true,
+                RepoPrSlice::RecentlyClosed { since: Some(mark) } => {
+                    closed_page_reaches_mark(&page, mark)
+                }
+            };
+            out.prs.extend(page);
+
+            if reached_mark || link_next.is_none() {
+                break;
+            }
+            if out.prs.len() >= PAGINATION_CAP {
+                debug!(
+                    "list_repo_prs: pagination cap ({PAGINATION_CAP}) reached for {owner}/{repo} \
+                     ({slice:?}) — listing incomplete"
+                );
+                out.overflow = true;
+                break;
+            }
+            next_url = link_next;
+        }
+
+        Ok(out)
     }
 
     /// The login this client's token authenticates as — a conditional
@@ -935,6 +1098,33 @@ mod tests {
             }
             assert_eq!(retry_backoff_secs(status, Some(5), None, None, 1), None);
         }
+    }
+
+    #[test]
+    fn interactive_floor_sleeps_only_at_or_below_the_floor_before_the_reset() {
+        assert_eq!(
+            interactive_floor_wait_secs(RATE_LIMIT_FLOOR + 1, Some(1_120), 1_000),
+            None
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(RATE_LIMIT_FLOOR, Some(1_120), 1_000),
+            Some(120)
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(0, Some(1_000), 1_000),
+            None,
+            "already reset"
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(0, None, 1_000),
+            None,
+            "unknown reset is UNKNOWN"
+        );
+        assert_eq!(
+            interactive_floor_wait_secs(0, Some(1_000 + 3_600), 1_000),
+            Some(MAX_BACKOFF_SECS),
+            "an hour-out reset is capped"
+        );
     }
 
     #[test]
@@ -1275,8 +1465,10 @@ mod tests {
             ),
             "{err}"
         );
-        // The interactive retry goes to the (now closed) one-shot server.
-        let _ = pending.await;
+        // The interactive retry would go to the (now closed) one-shot server
+        // after a JITTERED sleep of up to `RESUME_JITTER_SECS` past the
+        // `Retry-After`; its outcome is not under test, so do not wait for it.
+        pending.abort();
     }
 
     /// On the background path a rate-limited refusal — a `429`, or a
@@ -1346,6 +1538,35 @@ mod tests {
         }
     }
 
+    /// The reconciler's discovery listing goes through the same gate: under
+    /// the headroom line it is a typed deferral with nothing sent, so the
+    /// cycle stops spending rather than paging on.
+    #[tokio::test]
+    async fn a_background_repo_listing_under_the_headroom_line_is_never_sent() {
+        let client = GitHubClient::new("budget-test-background-listing", "budget_test_bg_listing")
+            .expect("client builds")
+            .with_spend_class(SpendClass::Background)
+            .with_api_base("http://127.0.0.1:1");
+        github_budget::seed_reading_for_test(client.credential(), &one_percent_left());
+
+        for slice in [
+            RepoPrSlice::Open,
+            RepoPrSlice::RecentlyClosed {
+                since: Some("2026-11-19T10:00:00Z"),
+            },
+        ] {
+            let err = client
+                .list_repo_prs("o", "r", slice)
+                .await
+                .expect_err("a short window defers");
+            assert!(matches!(&err, GhError::Deferred(_)), "{err}");
+        }
+        let row = row_for("budget_test_bg_listing").expect("the deferrals were metered");
+        assert_eq!(row.deferred, 2);
+        assert_eq!(row.transport_error, 0, "nothing was put on the wire");
+        assert_eq!(row.charged + row.not_modified + row.rate_limited, 0);
+    }
+
     #[test]
     fn the_api_base_override_re_roots_every_route_and_is_the_identity_by_default() {
         let prod = GitHubClient::new("t", "c").expect("builds");
@@ -1367,6 +1588,78 @@ mod tests {
             client.credential(),
             &CredentialKey::of_token("budget-test-default-class")
         );
+    }
+
+    // -- Repo-wide PR discovery (plan 2026-10-30-…, D3) ----------------------
+
+    #[test]
+    fn repo_pr_listing_urls_are_open_by_100_and_closed_by_updated_desc_by_30() {
+        assert_eq!(
+            repo_prs_url("qontinui", "qontinui-runner", RepoPrSlice::Open),
+            "https://api.github.com/repos/qontinui/qontinui-runner/pulls?state=open&per_page=100"
+        );
+        assert_eq!(
+            repo_prs_url(
+                "qontinui",
+                "qontinui-runner",
+                RepoPrSlice::RecentlyClosed {
+                    since: Some("2026-11-19T10:00:00Z")
+                }
+            ),
+            "https://api.github.com/repos/qontinui/qontinui-runner/pulls\
+             ?state=closed&sort=updated&direction=desc&per_page=30"
+        );
+        // Not the per-branch route: no `head=` filter, so one read serves
+        // every branch of the repo.
+        assert!(!repo_prs_url("o", "r", RepoPrSlice::Open).contains("head="));
+    }
+
+    fn listed(updated_at: Option<&str>) -> HeadPr {
+        parse_head_pr(&serde_json::json!({
+            "number": 1,
+            "state": "closed",
+            "head": {"ref": "b", "label": "o:b", "sha": "s"},
+            "base": {"ref": "main"},
+            "updated_at": updated_at,
+        }))
+        .expect("parses")
+    }
+
+    #[test]
+    fn a_closed_page_reaches_the_mark_only_with_an_item_no_newer_than_it() {
+        let mark = "2026-11-19T10:00:00Z";
+        let newer = listed(Some("2026-11-19T10:00:01Z"));
+        let same = listed(Some("2026-11-19T10:00:00Z"));
+        let older = listed(Some("2026-11-19T09:59:59Z"));
+        assert!(
+            !closed_page_reaches_mark(std::slice::from_ref(&newer), mark),
+            "all newer: keep paging"
+        );
+        assert!(closed_page_reaches_mark(&[newer.clone(), same], mark));
+        assert!(closed_page_reaches_mark(&[newer, older], mark));
+        // An item with no readable `updated_at` proves nothing.
+        assert!(!closed_page_reaches_mark(&[listed(None)], mark));
+        assert!(
+            !closed_page_reaches_mark(&[], mark),
+            "an empty page is not the mark"
+        );
+    }
+
+    #[test]
+    fn a_listed_pr_carries_its_head_label_and_updated_at() {
+        let pr = parse_head_pr(&serde_json::json!({
+            "number": 7,
+            "state": "open",
+            "head": {"ref": "feat/x", "label": "someone-else:feat/x", "sha": "abc"},
+            "base": {"ref": "main"},
+            "updated_at": "2026-11-19T10:00:00Z",
+            "merged_at": null,
+        }))
+        .expect("parses");
+        assert_eq!(pr.head_label, "someone-else:feat/x");
+        assert_eq!(pr.head_ref, "feat/x");
+        assert_eq!(pr.updated_at.as_deref(), Some("2026-11-19T10:00:00Z"));
+        assert!(!pr.merged);
     }
 
     #[test]

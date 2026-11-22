@@ -3370,6 +3370,31 @@ for wording that says work remains or asks the operator to act ("next step"
 among it, and either spelling in the policy footer), and a note is made of
 that wording on purpose.
 
+**Then re-tag the subproject's topics.** Follow `/finish-session` Part A step
+4's "Then re-tag the subproject's topics" paragraph over the same door: read
+the current topics, confirm or add through `coord_subproject_update
+{"topics": [...]}` (ADD only, slugs from this session's `coord_declare_intent`
+`topic_suggestions` first), remove a wrong one through `coord_topic_member
+{"action": "remove", ...}`, record each kept topic's one-line contribution as
+its `note`, and read the membership back. The recipe and its outcome lines
+live there, once. The contribution line projects Step 1's classification
+(what LANDED or is WATCHED for that topic), not a second judgement. The
+subagent rule above covers it: in a subagent, re-tag nothing. Best-effort and
+never blocking, like the note. Add that paragraph's `topics re-tag:` line to
+the Step 4 report, after the subproject note:
+
+> **Topics re-tag:** `<n>` confirmed/added, `<m>` removed — read back.
+
+or, when it did not land, `/finish-session`'s `UNKNOWN (<code>)` or
+`NOT written: <code>` form of that line. In a subagent, where nothing is
+written, render instead:
+
+> **Topics re-tag — OWED BY THE PARENT.** This `/unattended` ran in a
+> subagent context; the parent's own `/unattended` re-tags the topics.
+
+A subagent's skipped re-tag is neither `UNKNOWN` nor `NOT written`: nothing was
+attempted, and the row says who owes it.
+
 ---
 
 ## Step 5 — record the session as finished

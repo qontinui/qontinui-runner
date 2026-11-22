@@ -58,7 +58,7 @@
 
 pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
 pub mod census; // Machine-wide live Claude session census → POST /coord/session-census/:device_id (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account, Phases 2+4)
-pub mod classify_child_shadow; // `classify_child` in SHADOW beside the finished_close census: logs would-admit/refuse, decides nothing (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a)
+pub mod classify_finished; // `classify_child` ARMED for the finished_close arm: the census replaces the 60 s boot-window rule with it and the close exempts a proven shim (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2b)
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
@@ -104,6 +104,7 @@ pub mod finish_heal; // Heal finished marks stamped synced over a write coord ne
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod finished_close_guard; // The finished_close arm's close guard: every served close condition judged fresh per close, SHADOW in Phase 1 (plan 2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions)
 pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6)
+pub mod stop_reason; // "Why did my session stop?" — the typed answer behind GET /sessions/{id}/stop-reason (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, C5)
 pub mod stray_wait; // Tells a wait loop that can never end from work, so a finished session it holds can close (plan 2026-10-23-finished-sessions-stay-busy-behind-background-wait-loops-that-can-never-exit, Phase 4)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
@@ -780,11 +781,28 @@ impl NewSessionTenant {
 pub(crate) async fn resolve_new_session_tenant_in(
     workdir: Option<&std::path::Path>,
 ) -> NewSessionTenant {
+    resolve_new_session_tenant_settled_in(workdir).await.0
+}
+
+/// [`resolve_new_session_tenant_in`], plus whether the repo answer SETTLED
+/// (`false` when the repo read was a transient unknown and the answer fell
+/// through to the machine rows; `true` with no `workdir`, where no repo read is
+/// made). A caller for whom a machine-row answer is not good enough on a
+/// multi-bound device — the spawn-time policy body, which must never brief a
+/// session under the default tenant's documents — reads the flag; recording
+/// callers keep the plain answer.
+pub(crate) async fn resolve_new_session_tenant_settled_in(
+    workdir: Option<&std::path::Path>,
+) -> (NewSessionTenant, bool) {
     let Some(workdir) = workdir else {
-        return NewSessionTenant::from_machine(resolve_new_session_tenant());
+        return (
+            NewSessionTenant::from_machine(resolve_new_session_tenant()),
+            true,
+        );
     };
     let repo = qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(workdir).await;
-    if repo.is_transient() {
+    let repo_settled = !repo.is_transient();
+    if !repo_settled {
         tracing::warn!(
             "new-session tenant: the repo in {} has not settled ({repo:?}); this session is \
              decided from the machine rows, as before the repo tier existed",
@@ -804,7 +822,7 @@ pub(crate) async fn resolve_new_session_tenant_in(
         (workdir, decision)
     })
     .await;
-    match decided {
+    let tenant = match decided {
         Ok((workdir, decision)) => new_session_tenant_from_decision(
             &workdir,
             decision,
@@ -819,7 +837,8 @@ pub(crate) async fn resolve_new_session_tenant_in(
             );
             NewSessionTenant::Undetermined
         }
-    }
+    };
+    (tenant, repo_settled)
 }
 
 /// The authority order for a NEW session, every input injected: a session

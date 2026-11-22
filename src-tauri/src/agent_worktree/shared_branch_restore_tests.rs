@@ -937,3 +937,72 @@ fn the_sweep_keeps_a_block_when_the_branch_probe_fails_fatally() {
         before
     );
 }
+
+/// The startup sweep visits every primary checkout under the workspace root,
+/// not only `qontinui-*` ones: a `shared_branch` allocation can switch a
+/// sibling such as `ui-bridge`, and a block a crash left there has no other
+/// reaper. The fixture's checkout is named `canon`, with no `qontinui-`
+/// prefix; its branch is gone, so the sweep reaps it with no coord at all.
+#[tokio::test]
+async fn the_startup_sweep_reaps_a_stale_block_in_a_checkout_of_any_name() {
+    let c = abandoned_block();
+    git(&c.path, &["checkout", "-q", "main"]);
+    git(&c.path, &["branch", "-q", "-D", AGENT_BRANCH]);
+    let root = c
+        .path
+        .parent()
+        .expect("the checkout has a parent")
+        .to_path_buf();
+    assert!(
+        !c.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("qontinui-")),
+        "fixture precondition: the checkout's name must not carry the qontinui- prefix"
+    );
+
+    sweep_workspace_at(&root, None, |_| true).await;
+
+    assert_block_removed_and_operator_visible(&c);
+}
+
+/// The publisher's per-cycle sweep reaches a checkout it does not publish
+/// (no `qontinui-` prefix), so a block startup kept is judged again. coord is
+/// unreachable here (holder UNKNOWN), and the block still goes because its
+/// branch is gone — the arm that needs no holder answer.
+#[tokio::test]
+async fn the_per_cycle_sweep_reaches_a_checkout_the_publisher_does_not_walk() {
+    let c = abandoned_block();
+    git(&c.path, &["checkout", "-q", "main"]);
+    git(&c.path, &["branch", "-q", "-D", AGENT_BRANCH]);
+    let root = c
+        .path
+        .parent()
+        .expect("the checkout has a parent")
+        .to_path_buf();
+
+    sweep_unpublished_checkouts(&root, "http://127.0.0.1:9".into()).await;
+
+    assert_block_removed_and_operator_visible(&c);
+}
+
+/// …and it leaves the `qontinui-*` checkouts to the publisher's own walk.
+#[tokio::test]
+async fn the_per_cycle_sweep_skips_a_qontinui_checkout() {
+    let c = abandoned_block();
+    git(&c.path, &["checkout", "-q", "main"]);
+    git(&c.path, &["branch", "-q", "-D", AGENT_BRANCH]);
+    let root = c
+        .path
+        .parent()
+        .expect("the checkout has a parent")
+        .to_path_buf();
+    let renamed = root.join("qontinui-canon");
+    std::fs::rename(&c.path, &renamed).expect("rename");
+    let exclude = renamed.join(".git").join("info").join("exclude");
+    let before = std::fs::read(&exclude).expect("exclude");
+
+    sweep_unpublished_checkouts(&root, "http://127.0.0.1:9".into()).await;
+
+    assert_eq!(std::fs::read(&exclude).expect("exclude"), before);
+}

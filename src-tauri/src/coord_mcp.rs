@@ -6956,7 +6956,12 @@ pub(crate) fn repo_unsettled_refusal(
 /// Does this device hold credentials for more than one tenant? An UNREADABLE
 /// store answers `true`: the conservative arm for a guard whose failure mode is
 /// a cross-tenant answer, and the refusal it produces is retryable.
-fn device_is_multi_bound() -> bool {
+///
+/// Also the SessionStart policy injection's "multi-bound" input
+/// ([`crate::mcp::policy_tenant::policy_tenant_decision`]), so the injection and
+/// the proxy's own row-1d guard agree on which devices can be answered by the
+/// wrong tenant.
+pub(crate) fn device_is_multi_bound() -> bool {
     crate::auth::HeldDeviceTenants::read(&crate::auth::AuthManager::new())
         .set()
         .map(|held| held.len() > 1)
@@ -7413,6 +7418,58 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
         })
         .await,
     )
+}
+
+/// What [`terminal_session_bearer_and_tenant`] found for one terminal.
+///
+/// Deliberately not `Debug`: [`Self::Answered`] carries a bearer token, and a
+/// `{:?}` of this value would put it in a log line.
+pub(crate) enum TerminalSessionTenant {
+    /// The terminal's session holds a nonce, and this is exactly what
+    /// [`session_bearer_and_tenant_or_refuse`] answered for it: the tenant the
+    /// session's own coord-mcp calls select (`None` = the default slot) and
+    /// that slot's bearer, or the proxy's refusal.
+    Answered(Result<(Option<Uuid>, Option<String>), ProxyRefusal>),
+    /// No nonce names the terminal's session, so the proxy has nothing to
+    /// decide for it. The reason is the session-tenancy census vocabulary
+    /// (`no_session_nonce` | `coord_mcp_delivery_unrecorded`).
+    NoNonce(&'static str),
+}
+
+/// The coord-mcp proxy's (tenant, bearer) decision for the session hosted in
+/// `terminal_id` — one minimal composition of [`session_nonce`] (the key the
+/// identity seam gave this terminal, or its cwd's `.mcp.json` key) and
+/// [`session_bearer_and_tenant_or_refuse`] (plan
+/// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+/// Design §1).
+///
+/// It adds no resolver: the answer is the one [`decide_session_tenant`] gives
+/// every coord-mcp call this session makes, so a reader using it (the
+/// SessionStart policy injection) acts as the tenant the session itself acts
+/// as. It goes through the AWAITING door on purpose — SessionStart is the
+/// session's FIRST call, and the read-only census paths
+/// ([`session_tenant_decision`], [`session_credential_tenant`]) do not wait
+/// for the repo expectation, so they would answer a repo-steered session from
+/// the machine rows.
+///
+/// A cwd `.mcp.json` that holds no runner nonce is [`TerminalSessionTenant::NoNonce`],
+/// not a decision for `None`: deciding for no nonce reads only the machine
+/// rows, which is the device default rather than this session.
+pub(crate) async fn terminal_session_bearer_and_tenant(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> TerminalSessionTenant {
+    match session_nonce(terminal_id, workdir) {
+        SessionNonce::Nonce(Some(nonce)) => {
+            TerminalSessionTenant::Answered(session_bearer_and_tenant_or_refuse(Some(nonce)).await)
+        }
+        SessionNonce::Nonce(None) | SessionNonce::NoNonce => {
+            TerminalSessionTenant::NoNonce("no_session_nonce")
+        }
+        SessionNonce::DeliveryUnrecorded => {
+            TerminalSessionTenant::NoNonce("coord_mcp_delivery_unrecorded")
+        }
+    }
 }
 
 /// The join-result half of [`session_bearer_and_tenant_or_refuse`], pure so the
@@ -10891,6 +10948,22 @@ pub(crate) fn write_degraded_breadcrumb(
     }
 }
 
+/// Name prefix of the breadcrumb's atomic-replace temp file. Its readers are
+/// the two rosters that must recognise a crash-left temp file:
+/// `fleet::MANAGED_REPO_EXCLUDES` (spelled there as the glob
+/// `.coord-mcp-status.tmp-*`) and `agent_worktree::dirty::is_scaffolding_path`.
+pub(crate) const COORD_MCP_STATUS_TMP_PREFIX: &str = ".coord-mcp-status.tmp-";
+
+/// A fresh, unique temp-file name for [`replace_breadcrumb`]: the prefix, then
+/// this process's id and a v7 uuid, so concurrent writers never share one.
+pub(crate) fn breadcrumb_tmp_name() -> String {
+    format!(
+        "{COORD_MCP_STATUS_TMP_PREFIX}{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7().simple()
+    )
+}
+
 /// Replace the breadcrumb at `path` with `body` ATOMICALLY: write a sibling
 /// temp file, then rename it over the breadcrumb. `std::fs::write` truncates
 /// before it writes, so a reader racing a rewrite (the probe re-stamping it,
@@ -10900,13 +10973,11 @@ pub(crate) fn write_degraded_breadcrumb(
 /// (Rust's own readers share delete; a .NET or CRT reader may not); the write
 /// then fails and is logged, leaving the previous breadcrumb in place. A temp
 /// file a crash leaves behind is excluded by the runner's managed excludes
-/// (`fleet::MANAGED_REPO_EXCLUDES`).
+/// (`fleet::MANAGED_REPO_EXCLUDES`) and is runner scaffolding to reclaim
+/// (`agent_worktree::dirty::is_scaffolding_path`), so it neither shows in a
+/// walked repo's `git status` nor pins an agent worktree unreclaimable.
 fn replace_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
-    let tmp = path.with_file_name(format!(
-        "{COORD_MCP_STATUS_FILE}.tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7().simple()
-    ));
+    let tmp = path.with_file_name(breadcrumb_tmp_name());
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -25729,14 +25800,25 @@ mod runner_credential_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut saw_probe_write = false;
         while std::time::Instant::now() < deadline {
-            let text =
-                std::fs::read_to_string(&crumb).expect("breadcrumb is written SYNCHRONOUSLY");
+            // The file exists from the synchronous write onward, but the probe
+            // replaces it by rename; on Windows a read that lands inside that
+            // replace can fail (access denied) or see nothing. That is the
+            // reader racing the writer, not a defect, so a failed read is
+            // retried. A read that SUCCEEDS must still hold the credential
+            // verdict.
+            let Ok(text) = std::fs::read_to_string(&crumb) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             assert!(
                 text.contains(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
                 "the breadcrumb must never become a stale-nonce story: {text}"
             );
             let line2 = text.lines().nth(1).unwrap_or_default();
-            let stamp: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
+            let Ok(stamp) = serde_json::from_str::<serde_json::Value>(line2.trim()) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             if stamp["port"].as_u64() == Some(port as u64) {
                 saw_probe_write = true;
                 break;

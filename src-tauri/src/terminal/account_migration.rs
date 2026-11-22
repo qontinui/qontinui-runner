@@ -356,6 +356,8 @@ pub(crate) enum MigrateError {
         exit_code: Option<i32>,
         attempts: usize,
         rolled_back: bool,
+        /// The last retry's spawn error, when a retry could not even spawn.
+        retry_spawn_error: Option<String>,
     },
     /// The resumed child runs but never painted by the deadline. With the old
     /// pane still running (its CLI seen, or its subtree unreadable) the
@@ -401,8 +403,13 @@ impl MigrateError {
             Self::RespawnDied {
                 exit_code,
                 attempts,
+                retry_spawn_error,
                 ..
-            } => super::respawn_liveness::RespawnOutcome::died_reason(*exit_code, *attempts),
+            } => super::respawn_liveness::RespawnOutcome::died_detail(
+                *exit_code,
+                *attempts,
+                retry_spawn_error.as_deref(),
+            ),
             Self::Unconfirmed { .. } => "migration-unconfirmed".to_string(),
         }
     }
@@ -437,9 +444,12 @@ impl std::fmt::Display for MigrateError {
             Self::RespawnDied {
                 exit_code,
                 attempts,
+                retry_spawn_error,
                 ..
-            } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_reason(
-                *exit_code, *attempts,
+            } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_detail(
+                *exit_code,
+                *attempts,
+                retry_spawn_error.as_deref(),
             )),
             Self::Unconfirmed {
                 new_terminal_id,
@@ -1646,6 +1656,13 @@ pub(crate) struct ResumeSpawn<'a> {
     /// Why this pane is being spawned — decides whether its tab is selected
     /// (`terminal-created` `surface`, [`crate::terminal::focus_coalescer`]).
     pub origin: crate::coord_drain_state::SpawnOrigin,
+    /// The tenant whose cached policy body the respawn's system-prompt file
+    /// composes: what [`crate::mcp::policy_tenant::new_session_policy_tenant`]
+    /// resolved for `working_dir`, awaited by the caller because this function
+    /// is synchronous (plan
+    /// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    /// Design §6). `None` composes no body — never the device default's.
+    pub policy_tenant: Option<uuid::Uuid>,
 }
 
 /// [`transcript_last_model`] off the async worker. It reads the WHOLE
@@ -1698,7 +1715,8 @@ pub(crate) fn spawn_resumed_pane(
     // plus the `--settings <hook file>` pair below.
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
-    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(None);
+    let prompt_carrier =
+        crate::session::spawn_prompt::resolve_system_prompt_carrier(None, spec.policy_tenant);
     let command = resume_respawn_argv(
         // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
         // `claude_bin_path()` cannot be the PTY child's program on Windows,
@@ -1721,7 +1739,7 @@ pub(crate) fn spawn_resumed_pane(
         // Plus the policy body at spawn (plan
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
         // this respawn has no briefing, so it carries a BODY-ONLY composed
-        // file when the tenant's cache exists, and nothing otherwise.
+        // file when `spec.policy_tenant`'s cache exists, and nothing otherwise.
         resume_respawn_extra_required(
             // A migrated GATE continuation keeps its Stop-armed carrier.
             crate::session::claude_hook::spawn_settings_args(spec.gate_identity.is_some()),
@@ -2148,6 +2166,13 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
             &self.record.claude_session_id,
         ))
         .await;
+        // Whose policy body the respawn's system-prompt file carries: the
+        // tenant a session in its working dir resolves to, awaited HERE because
+        // the spawn seam below is synchronous (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Resolved per attempt: a retry spawns afresh.
+        let policy_tenant =
+            crate::mcp::policy_tenant::new_session_policy_tenant(Path::new(self.working_dir)).await;
         // The seam is synchronous and runs here, on the async worker, NOT on
         // the blocking pool: a spawn handed to `spawn_blocking` keeps running
         // when this future is cancelled (task abort, shutdown), and would
@@ -2197,6 +2222,7 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
                 resource_override: true,
                 gate_identity: self.gate_identity,
                 origin: self.origin,
+                policy_tenant,
             },
         )
         .map(|(terminal_id, _coord_session_id)| terminal_id)
@@ -2433,10 +2459,12 @@ async fn confirm_migration(
                 exit_code,
                 attempts,
                 rolled_back,
+                // `child_may_run` above took every child-started failure, so
+                // only the message is left to report.
+                retry_spawn_error: retry_spawn_error.map(|f| f.message),
             };
             warn!(
                 session = %record.claude_session_id,
-                retry_spawn_error = ?retry_spawn_error,
                 "{err} — rolled back onto the old pane if it still runs, else the session ended"
             );
             emit_skipped(app, record, src_config_dir, &err.skip_reason());
@@ -3478,11 +3506,13 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 rolled_back: true,
+                retry_spawn_error: None,
             },
             MigrateError::RespawnDied {
                 exit_code: Some(127),
                 attempts: 3,
                 rolled_back: false,
+                retry_spawn_error: None,
             },
             MigrateError::Unconfirmed {
                 new_terminal_id: "new-1".into(),
@@ -3491,6 +3521,23 @@ mod tests {
         ] {
             assert!(!e.reached_destination(), "{e}");
         }
+    }
+
+    /// A died migration whose last retry could not spawn says so in its skip
+    /// reason, instead of reading as one more pane that exited.
+    #[test]
+    fn a_died_migration_names_a_retry_that_could_not_spawn() {
+        let e = MigrateError::RespawnDied {
+            exit_code: Some(127),
+            attempts: 3,
+            rolled_back: false,
+            retry_spawn_error: Some("claude not found".into()),
+        };
+        assert_eq!(
+            e.skip_reason(),
+            "respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"
+        );
+        assert_eq!(e.to_string(), e.skip_reason());
     }
 
     /// The died / unconfirmed arms reported themselves (they changed panes):
@@ -3510,6 +3557,7 @@ mod tests {
                     exit_code: Some(127),
                     attempts: 3,
                     rolled_back: true,
+                    retry_spawn_error: None,
                 },
                 true,
                 HintOutcome::RespawnDiedRolledBack,
@@ -3520,6 +3568,7 @@ mod tests {
                     exit_code: Some(127),
                     attempts: 3,
                     rolled_back: false,
+                    retry_spawn_error: None,
                 },
                 true,
                 HintOutcome::RespawnDiedEnded,

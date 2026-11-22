@@ -405,7 +405,8 @@ pub(super) fn replay_pending_with<M, F>(
 }
 
 /// Respawns this process may materialize at once. Each one can take minutes
-/// (the 180 s liveness proof per attempt, a 120 s CLI-install wait, retries),
+/// (the 180 s liveness proof per attempt, up to 120 s of CLI-install wait before
+/// the drain check and again before each resolve, retries),
 /// so a catch-up replaying many pending rows must not open every PTY at once.
 const MAX_CONCURRENT_RESPAWNS: usize = 4;
 
@@ -876,6 +877,12 @@ async fn materialize(
     coord_url: &str,
     respawn: &PendingRespawn,
 ) -> Result<String, RespawnError> {
+    // Wait out a runner-owned CLI install before step 0, so the drain check
+    // below is fresh when the spawn follows; the `--resume` resolver (step 4b)
+    // waits on the same flag and returns at once after this. The pending row
+    // is untouched by the wait.
+    crate::claude_cli_spawn::await_cli_update_quiescent().await;
+
     // 0. Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     //    D3). A respawn is autonomous. Coord already withholds respawn rows from
     //    a drained device; this is defence in depth for a push that raced the
@@ -1181,9 +1188,12 @@ fn proven_terminal(
         RespawnOutcome::Died {
             exit_code,
             attempts,
+            retry_spawn_error,
             ..
-        } => Err(RespawnError::Died(RespawnOutcome::died_reason(
-            exit_code, attempts,
+        } => Err(RespawnError::Died(RespawnOutcome::died_detail(
+            exit_code,
+            attempts,
+            retry_spawn_error.as_ref().map(|f| f.message.as_str()),
         ))),
     }
 }
@@ -1227,6 +1237,15 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
             .await
             .map_err(crate::terminal::spawn_refusal::SpawnFailure::before_child)?,
         };
+        // Whose policy body the respawn's system-prompt file carries: the
+        // tenant a session in its working dir resolves to, awaited HERE because
+        // the spawn seam below is synchronous (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Resolved per attempt: a retry spawns afresh.
+        let policy_tenant = crate::mcp::policy_tenant::new_session_policy_tenant(
+            std::path::Path::new(self.working_dir),
+        )
+        .await;
         crate::terminal::account_migration::spawn_resumed_pane(
             &self.app,
             &self.terminal_manager,
@@ -1258,6 +1277,7 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
                 // box's to carry.
                 gate_identity: None,
                 origin: crate::coord_drain_state::SpawnOrigin::Respawn,
+                policy_tenant,
             },
         )
         .map(|(terminal_id, _coord_id)| terminal_id)
@@ -1783,19 +1803,25 @@ mod tests {
     fn materialize_rechecks_the_rest_under_its_claim_and_rests_through_the_helper() {
         let src = include_str!("respawn.rs");
         let start = src.find("async fn materialize(").expect("the fn");
-        let body = &src[start..];
-        let body = &body[..body.find("\n}\n").expect("the fn's end")];
+        let body = src.get(start..).expect("a char boundary");
+        let body = body
+            .get(..body.find("\n}\n").expect("the fn's end"))
+            .expect("a char boundary");
         let claim = body
             .find("SessionInFlight::claim(&claude_session_id")
             .expect("the claim");
-        let recheck = body[claim..]
+        let recheck = body
+            .get(claim..)
+            .expect("a char boundary")
             .find("refuse_resting(&claude_session_id")
             .map(|i| claim + i)
             .expect("the rest is re-checked under the claim");
         let respawn = body.find("confirm_respawn(").expect("the respawn");
         assert!(recheck < respawn, "re-checked before anything spawns");
         assert!(
-            body[respawn..].contains("proven_and_rested("),
+            body.get(respawn..)
+                .expect("a char boundary")
+                .contains("proven_and_rested("),
             "the outcome rests the session through the helper"
         );
         assert!(
@@ -1899,6 +1925,25 @@ mod tests {
         assert!(
             msg.contains("not retried") && msg.contains("re-issue"),
             "a died respawn must not claim it stays pending: {msg}"
+        );
+        let msg = proven_terminal(
+            Uuid::nil(),
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: Some(
+                    crate::terminal::spawn_refusal::SpawnFailure::before_child("claude not found"),
+                ),
+                rolled_back: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.starts_with(
+                "respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"
+            ),
+            "{msg}"
         );
         assert!(matches!(
             proven_terminal(

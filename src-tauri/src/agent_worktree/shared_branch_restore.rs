@@ -675,23 +675,49 @@ pub(crate) async fn sweep_checkout(checkout: std::path::PathBuf, coord_base: Opt
     .await;
 }
 
-/// Run [`sweep_checkout`] over every `qontinui-*` primary checkout under the
-/// workspace root — at runner startup, before any allocation of this process
-/// can hold a block.
+/// Run [`sweep_checkout`] over every primary checkout under the workspace
+/// root — at runner startup, before any allocation of this process can hold a
+/// block.
 pub(crate) async fn sweep_workspace(coord_base: Option<String>) {
     let Some(root) = super::census::qontinui_root() else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&root) else {
+    sweep_workspace_at(&root, coord_base, |_| true).await;
+}
+
+/// The per-cycle sweep for the checkouts the tree publisher does NOT walk
+/// (every primary checkout whose name lacks the `qontinui-` prefix — the
+/// publisher sweeps those itself, one by one, inside its own walk). Without it
+/// a block in, say, `ui-bridge` that startup KEPT because coord did not answer
+/// would never be judged again until the next runner start.
+pub(crate) async fn sweep_unpublished_checkouts(root: &Path, coord_base: String) {
+    sweep_workspace_at(root, Some(coord_base), |name| {
+        !name.starts_with("qontinui-")
+    })
+    .await;
+}
+
+/// [`sweep_checkout`] over every directory directly under `root` whose `.git`
+/// is a directory (a primary checkout; a linked worktree's `.git` is a file)
+/// and whose name `include` accepts. Any name, not only `qontinui-*`: a
+/// `shared_branch` allocation can switch any repo coord allocates, siblings
+/// such as `ui-bridge` or `multistate` included. A checkout with no block
+/// costs a stat and a read of its `info/exclude`, and asks coord nothing.
+pub(crate) async fn sweep_workspace_at(
+    root: &Path,
+    coord_base: Option<String>,
+    include: impl Fn(&str) -> bool,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_repo = path
+        let wanted = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("qontinui-"));
-        if is_repo && path.join(".git").is_dir() {
+            .is_some_and(&include);
+        if wanted && path.join(".git").is_dir() {
             sweep_checkout(path, coord_base.clone()).await;
         }
     }

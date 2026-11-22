@@ -39,6 +39,18 @@ export interface SessionBoundPayload {
   providerReported?: boolean;
 }
 
+/**
+ * The form two spellings of one config dir share, mirroring Rust's
+ * `config_dir_compare_key` (`session_archive/discovery.rs`): trimmed,
+ * backslashes folded to `/`, trailing slashes dropped, and lowercased only for
+ * a Windows-style drive path (the frontend has no platform flag; a drive
+ * letter is the same evidence). Compare-only, never a path to open.
+ */
+export function configDirCompareKey(configDir: string): string {
+  const p = configDir.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[a-z]:(\/|$)/i.test(p) ? p.toLowerCase() : p;
+}
+
 /** The tab update a `session-bound` event resolves to. */
 export interface SessionBoundUpdate {
   tabId: string;
@@ -102,7 +114,13 @@ export function applySessionBound(
   const tab = tabs.find((t) => t.id === payload.terminalId);
   if (!tab) return null;
   if (tab.claudeSessionId === payload.sessionId) {
-    if (!payload.configDir || payload.configDir === tab.claudeConfigDir) return null;
+    if (!payload.configDir) return null;
+    if (
+      tab.claudeConfigDir &&
+      configDirCompareKey(payload.configDir) === configDirCompareKey(tab.claudeConfigDir)
+    ) {
+      return null;
+    }
     return {
       tabId: tab.id,
       claudeSessionId: tab.claudeSessionId,

@@ -687,7 +687,8 @@ fn tokio_seam(
 /// duplicated between the two would let the claim and the check drift apart.
 const G3_DESCRIBES: &str = "what a PTY child spawned RIGHT NOW inherits: the portable-pty base \
      env + `session::TerminalSession::apply_base_child_env` (the marker strips, TERM, the runner \
-     markers/port, the continuation-verdict forward, the non-interactive git posture) + the \
+     markers/port, the continuation-verdict forward, the non-interactive git posture, the Windows \
+     `PYTHONUTF8=1` default) + the \
      briefing, rendered here at the session-independent `CoordMcpDelivery::Unknown` because this \
      report provisions nothing and so cannot know what a real session would be given + the \
      identity-shim PATH prepend + `finalize_child_env` (account pin + credential scrub). NOT \

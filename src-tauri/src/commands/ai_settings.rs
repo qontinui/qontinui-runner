@@ -1110,6 +1110,12 @@ pub struct AccountUsageInfo {
     /// `"probe"` (Haiku header probe fallback).
     #[serde(default)]
     pub source: Option<String>,
+    /// Lowercase hex SHA-256 of the account's `oauthAccount.accountUuid`
+    /// ([`account_hash_for`]): the one identity equal across devices and
+    /// config-dir names for the same Claude account. `None` when no identity
+    /// was readable, which is UNKNOWN and never equal to another `None`.
+    #[serde(default)]
+    pub account_hash: Option<String>,
 }
 
 /// One per-model scoped weekly limit, mirrored to the frontend.
@@ -1244,6 +1250,64 @@ fn account_label(config_dir: &str) -> String {
         .unwrap_or_else(|| config_dir.to_string())
 }
 
+/// The account identity of a Claude config dir: lowercase hex SHA-256 of its
+/// `.claude.json` `oauthAccount.accountUuid`, trimmed and lowercased first.
+///
+/// `.claude.json` is resolved as:
+/// 1. `<config_dir>/.claude.json` — the `CLAUDE_CONFIG_DIR` layout, which every
+///    session the runner spawns uses (it pins `CLAUDE_CONFIG_DIR`).
+/// 2. Only when (1) is absent AND `config_dir` is the user's default home
+///    (`<home>/.claude`, compared as paths): `<home>/.claude.json`, where Claude
+///    Code keeps its global config when `CLAUDE_CONFIG_DIR` is unset.
+///
+/// `home` is the user's home dir (`dirs::home_dir()` at the call site). Returns
+/// `None` on any read or parse failure, or when no uuid is recorded: the home
+/// is not logged in, or its identity is unreadable. Never errors.
+pub(crate) fn account_hash_for(config_dir: &str, home: Option<&std::path::Path>) -> Option<String> {
+    use crate::claude_session::workspace_trust::CONFIG_FILE;
+    use sha2::{Digest, Sha256};
+
+    // Only the one field is deserialized: `.claude.json` also carries the CLI's
+    // whole per-project history and can run to megabytes.
+    #[derive(Deserialize)]
+    struct ClaudeJson {
+        #[serde(rename = "oauthAccount")]
+        oauth_account: Option<OauthAccount>,
+    }
+    #[derive(Deserialize)]
+    struct OauthAccount {
+        #[serde(rename = "accountUuid")]
+        account_uuid: Option<serde_json::Value>,
+    }
+
+    let dir = std::path::Path::new(config_dir);
+    let dir_local = dir.join(CONFIG_FILE);
+    let content = match std::fs::read_to_string(&dir_local) {
+        Ok(content) => content,
+        // Fallback only when the dir's own file is ABSENT — an unreadable one
+        // is an unknown identity, not a reason to borrow another file's.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let home = home?;
+            if dir != home.join(".claude") {
+                return None;
+            }
+            std::fs::read_to_string(home.join(CONFIG_FILE)).ok()?
+        }
+        Err(_) => return None,
+    };
+    let parsed: ClaudeJson = serde_json::from_str(&content).ok()?;
+    let uuid = parsed
+        .oauth_account?
+        .account_uuid?
+        .as_str()?
+        .trim()
+        .to_lowercase();
+    if uuid.is_empty() {
+        return None;
+    }
+    Some(hex::encode(Sha256::digest(uuid.as_bytes())))
+}
+
 /// Probe a single account for its weekly rate limit utilization.
 ///
 /// Reads through a shared single-flight + TTL cache
@@ -1265,16 +1329,27 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
     // outlives the switch.
     if crate::model_gateway::gateway_declared() {
         let label = account_label(&config_dir);
+        let account_hash = account_hash_for(&config_dir, dirs::home_dir().as_deref());
         return AccountUsageInfo {
             config_dir,
             label,
             error: Some(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string()),
+            account_hash,
             ..Default::default()
         };
     }
     let key = config_dir.clone();
     USAGE_PROBE_CACHE
-        .get_or_fetch(&key, move || probe_account_usage_uncached(config_dir))
+        .get_or_fetch(&key, move || async move {
+            // Identity is read here, after the probe, so every return path of
+            // the probe (token error, probe error, success) carries it: an
+            // errored row is exactly the one a consumer must collapse onto its
+            // healthy twin on another device.
+            let hash_dir = config_dir.clone();
+            let mut info = probe_account_usage_uncached(config_dir).await;
+            info.account_hash = account_hash_for(&hash_dir, dirs::home_dir().as_deref());
+            info
+        })
         .await
 }
 
@@ -1374,6 +1449,8 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
                         })
                         .collect(),
                     source: Some("oauth_usage".to_string()),
+                    // Filled by `probe_account_usage`'s cached closure.
+                    account_hash: None,
                 };
             }
             Err(e) => {
@@ -1730,6 +1807,48 @@ fn roster_scope() -> Option<RosterScope> {
     )
 }
 
+/// Whether this refresh's account rows are the DEVICE's whole roster, sent to
+/// coord as `roster_complete`. coord retires a label absent from a complete
+/// report (plan
+/// `2026-11-17-coord-retires-claude-account-usage-rows-a-device-stopped-reporting`),
+/// so this must be `true` only when nothing on the device is left out:
+///
+/// - only the PRIMARY: a Subject runner reports its own pin under the same
+///   device id, which is a partial view of the device, and any other runner
+///   sends no account rows at all;
+/// - only when the refresh probed the roster (`probe_configured`, every
+///   configured dir) or the one account a lone-account runner spends
+///   (`probe_spent`);
+/// - only when it carries at least one account row (`reported_any`): an
+///   empty report (a model gateway, no candidate dir) says nothing about the
+///   device, and must not retire everything it reported before;
+/// - and, on the roster path, only when the account the runner actually
+///   SPENDS is among the reported labels (`spent_label_reported`). A Manual
+///   `config_dir` pin, or an unpinned inherited `CLAUDE_CONFIG_DIR` /
+///   `~/.claude`, can sit outside the roster; leaving it out of a complete
+///   report would retire the account every spawn runs on.
+///
+/// A Subject's own pin is never in the primary's complete report. It stays
+/// live because the Subject reports it itself every refresh and coord retires
+/// only a label no reporter has refreshed for 30 minutes; a Subject that stops
+/// reporting for that long has its label retired until its next report.
+///
+/// Known bound: a session still running on an account that has since left the
+/// roster, and is no longer the resolved pick, is in use but neither probed nor
+/// spent, so a complete report lets coord retire its label. The roster is the
+/// operator's statement of what is in use; this function cannot see past it.
+fn roster_complete(
+    scope: Option<RosterScope>,
+    plan: UsageRefreshPlan,
+    reported_any: bool,
+    spent_label_reported: bool,
+) -> bool {
+    scope == Some(RosterScope::Primary)
+        && (plan.probe_configured || plan.probe_spent)
+        && reported_any
+        && spent_label_reported
+}
+
 /// Env-free core of [`roster_scope`].
 fn account_scope_from(is_primary: bool, has_instance_root: bool) -> Option<RosterScope> {
     if is_primary {
@@ -1787,8 +1906,17 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     // ([`roster_scope`]); a secondary on the primary's machine-global roster
     // would repeat them. Prepaid is not roster-owned and is sent regardless.
     let reported: &[AccountUsageInfo] = if scope.is_some() { &results } else { &[] };
+    // The roster path probes the configured dirs only; the account a spawn
+    // actually runs on may sit outside them ([`roster_complete`]). Compared by
+    // label, because that is coord's key.
+    let spent_label_reported =
+        !(scope == Some(RosterScope::Primary) && plan.probe_configured && !plan.probe_spent)
+            || spent_account_dir(true)
+                .map(|dir| account_label(&dir))
+                .is_none_or(|label| reported.iter().any(|r| r.label == label));
+    let complete = roster_complete(scope, plan, !reported.is_empty(), spent_label_reported);
     if let Some(base) = report_base.filter(|_| !reported.is_empty() || !prepaid.is_empty()) {
-        usage_twin_report::report_to_coord(&base, reported, &active_dirs, &prepaid).await;
+        usage_twin_report::report_to_coord(&base, reported, &active_dirs, &prepaid, complete).await;
     }
     results
 }
@@ -1805,8 +1933,9 @@ mod usage_twin_report {
     use tracing::{debug, warn};
 
     /// Wire shape — SHARED CONTRACT with coord's
-    /// `POST /coord/claude-accounts/usage` ingest. Account identity is the
-    /// config-dir basename (label), never the full local path. Utilizations
+    /// `POST /coord/claude-accounts/usage` ingest. The row's display name is
+    /// the config-dir basename (label), never the full local path; the
+    /// cross-device account identity is `account_hash`. Utilizations
     /// are 0.0–1.0 fractions; reset times unix seconds.
     #[derive(Serialize)]
     struct WireAccount<'a> {
@@ -1835,6 +1964,12 @@ mod usage_twin_report {
         /// which one runs?". At most one account is `true`; all-`false` is a
         /// legitimate state (no dir resolved yet on this machine).
         is_active: bool,
+        /// Lowercase hex SHA-256 of the account's `oauthAccount.accountUuid`
+        /// ([`super::account_hash_for`]): the identity equal across devices
+        /// and config-dir names, which `label` is not. `null` when the home's
+        /// identity was unreadable — UNKNOWN, never equal to another `null`.
+        /// Coord's ingest stores it as the launch-budget usage-history key.
+        account_hash: Option<&'a str>,
     }
 
     /// One prepaid provider balance — SHARED CONTRACT with coord's
@@ -1888,6 +2023,11 @@ mod usage_twin_report {
         /// This is what makes the operator string *"this machine will use:
         /// &lt;mode&gt;"* answerable from the feed alone.
         account_selection_mode: &'static str,
+        /// `true` only when `accounts` is this device's WHOLE roster
+        /// ([`super::roster_complete`]). coord retires labels a complete report
+        /// does not carry; `false`, like the key's absence from an older
+        /// runner, retires nothing.
+        roster_complete: bool,
     }
 
     /// The coord this runner reports to, or `None` when it reports nothing.
@@ -1925,9 +2065,10 @@ mod usage_twin_report {
         results: &[super::AccountUsageInfo],
         active_dirs: &std::collections::HashSet<String>,
         prepaid: &[crate::ai_provider::prepaid_balance::PrepaidBalanceInfo],
+        roster_complete: bool,
     ) {
         let url = format!("{}/coord/claude-accounts/usage", base.trim_end_matches('/'));
-        let body = WireBody {
+        let mut body = WireBody {
             accounts: results
                 .iter()
                 .filter_map(|r| {
@@ -1949,11 +2090,17 @@ mod usage_twin_report {
                     error: r.error.is_some(),
                     status: r.status.as_deref(),
                     is_active: active_dirs.contains(&r.config_dir),
+                    account_hash: r.account_hash.as_deref(),
                 })
                 .collect(),
             prepaid: prepaid.iter().map(WirePrepaid::from_info).collect(),
             account_selection_mode: crate::claude_accounts::effective_selection_mode().as_str(),
+            roster_complete,
         };
+        // Completeness is a claim about the rows actually SENT: when every row
+        // was dropped for a non-bare label, an empty body must not claim the
+        // whole roster.
+        body.roster_complete = body.roster_complete && !body.accounts.is_empty();
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -2085,6 +2232,7 @@ mod usage_twin_report {
         /// data loss (serde drops unknown keys on the ingest side). Pin them.
         #[test]
         fn wire_body_key_names_are_the_shared_contract() {
+            const HASH: &str = "5f0c4a0b4d1e4ad0b2b8b1c1d0e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9";
             let limits: Vec<super::super::ModelLimitInfo> = Vec::new();
             let body = WireBody {
                 accounts: vec![WireAccount {
@@ -2099,9 +2247,11 @@ mod usage_twin_report {
                     error: false,
                     status: None,
                     is_active: true,
+                    account_hash: Some(HASH),
                 }],
                 prepaid: Vec::new(),
                 account_selection_mode: "least_usage",
+                roster_complete: true,
             };
             let v = serde_json::to_value(&body).expect("serializes");
 
@@ -2110,6 +2260,9 @@ mod usage_twin_report {
                 v["account_selection_mode"],
                 serde_json::json!("least_usage")
             );
+            // Per-report too: coord's `UsageReport::roster_complete`.
+            assert_eq!(v["roster_complete"], serde_json::json!(true));
+            assert!(v["accounts"][0].get("roster_complete").is_none());
             let acct = &v["accounts"][0];
             assert_eq!(acct["is_active"], serde_json::json!(true));
             // Identity stays the config-dir basename — never a full local path.
@@ -2118,6 +2271,8 @@ mod usage_twin_report {
                 acct.get("config_dir").is_none(),
                 "the wire must never carry a local path"
             );
+            // coord's `WireAccount::account_hash` reads exactly this key.
+            assert_eq!(acct["account_hash"], serde_json::json!(HASH));
         }
 
         /// An expired credential against coord's uniform
@@ -2172,6 +2327,7 @@ mod usage_twin_report {
             let row = |label: &str| crate::commands::ai_settings::AccountUsageInfo {
                 config_dir: format!("/x/{label}"),
                 label: label.into(),
+                account_hash: Some(format!("hash-of-{label}")),
                 ..Default::default()
             };
             let rows = [
@@ -2182,7 +2338,7 @@ mod usage_twin_report {
                 row(r"C:\Users\someone\.claude"),
             ];
 
-            report_to_coord(&coord.base, &rows, &Default::default(), &[]).await;
+            report_to_coord(&coord.base, &rows, &Default::default(), &[], false).await;
 
             let bodies = coord.bodies();
             assert_eq!(bodies.len(), 1, "one report, one POST: {bodies:?}");
@@ -2193,6 +2349,11 @@ mod usage_twin_report {
                 "only the bare-name row is sent: {accounts:?}"
             );
             assert_eq!(accounts[0]["label"], serde_json::json!(".claude-silent"));
+            assert_eq!(
+                accounts[0]["account_hash"],
+                serde_json::json!("hash-of-.claude-silent"),
+                "the row's identity rides the report"
+            );
             assert!(
                 accounts[0].get("status").is_none(),
                 "no status means no key: {}",
@@ -2218,12 +2379,17 @@ mod usage_twin_report {
                     error: true,
                     status: None,
                     is_active: false,
+                    account_hash: None,
                 }],
                 prepaid: Vec::new(),
                 account_selection_mode: "manual",
+                roster_complete: false,
             };
             let v = serde_json::to_value(&body).expect("serializes");
             assert_eq!(v["accounts"][0]["is_active"], serde_json::json!(false));
+            // An unreadable identity is sent as an explicit `null` (UNKNOWN),
+            // not dropped.
+            assert_eq!(v["accounts"][0]["account_hash"], serde_json::Value::Null);
             assert_eq!(v["account_selection_mode"], serde_json::json!("manual"));
         }
 
@@ -2256,6 +2422,7 @@ mod usage_twin_report {
                 accounts: Vec::new(),
                 prepaid: vec![WirePrepaid::from_info(&info)],
                 account_selection_mode: "manual",
+                roster_complete: false,
             };
             let v = serde_json::to_value(&body).expect("serializes");
             let p = &v["prepaid"][0];
@@ -3301,6 +3468,53 @@ mod usage_report_scope_tests {
         refresh_fleet_usage_report().await;
 
         assert_eq!(coord.reported_labels(), vec![".claude-pinned".to_string()]);
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(true),
+            "a lone-account primary's spent account is its whole roster"
+        );
+    }
+
+    /// Two roster entries and a Manual pin outside them: the roster probe
+    /// leaves out the account every spawn runs on, so the report must not
+    /// claim the whole roster, or coord would retire that account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_roster_report_missing_the_spent_account_is_not_complete() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        let a = logged_in_dir(&amb, ".claude-a", None).await;
+        let b = logged_in_dir(&amb, ".claude-b", None).await;
+        let pinned = logged_in_dir(&amb, ".claude-pinned", None).await;
+        write_roster(
+            &amb,
+            vec![a.clone(), b.clone()],
+            AccountSelectionMode::Manual,
+            Some(pinned),
+        );
+
+        refresh_fleet_usage_report().await;
+        assert_eq!(coord.reported_labels().len(), 2, "{:?}", coord.bodies());
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(false),
+            "the pinned account is not in the report"
+        );
+
+        write_roster(
+            &amb,
+            vec![a, b.clone()],
+            AccountSelectionMode::Manual,
+            Some(b),
+        );
+        refresh_fleet_usage_report().await;
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(true),
+            "the pinned account is a roster entry, so the report is whole"
+        );
     }
 
     /// No list and no pin: a spawn inherits the runner's own environment, so
@@ -3369,6 +3583,11 @@ mod usage_report_scope_tests {
         refresh_fleet_usage_report().await;
         std::env::remove_var("QONTINUI_INSTANCE_ROOT");
         assert_eq!(coord.reported_labels(), vec![".claude-own".to_string()]);
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(false),
+            "a Subject's pin is a partial view of the device"
+        );
     }
 
     /// Ownership follows where the roster resolved, not the runner's name: a
@@ -3415,6 +3634,12 @@ mod usage_report_scope_tests {
 
         refresh_fleet_usage_report().await;
         assert_eq!(coord.reported_labels().len(), 2, "the primary reports both");
+        let bodies = coord.bodies();
+        assert_eq!(
+            bodies.last().expect("the primary's report")["roster_complete"],
+            serde_json::json!(true),
+            "the primary's full probe is the device's whole roster"
+        );
     }
 
     /// The ownership table, with no env or filesystem.
@@ -3424,6 +3649,62 @@ mod usage_report_scope_tests {
         assert_eq!(account_scope_from(true, false), Some(Primary));
         assert_eq!(account_scope_from(false, true), Some(Subject));
         assert_eq!(account_scope_from(false, false), None);
+    }
+
+    /// Only the primary's probe of the roster (or of its one spent account) is
+    /// the device's whole roster. A Subject's pin shares the device id with the
+    /// primary's roster, so marking it complete would make coord retire every
+    /// account the primary reports.
+    #[test]
+    fn only_the_primarys_probed_roster_is_complete() {
+        use super::{roster_complete, RosterScope::*, UsageRefreshPlan};
+        let plan = |probe_configured, probe_spent| UsageRefreshPlan {
+            probe_configured,
+            probe_spent,
+            record_snapshot: probe_configured,
+        };
+        assert!(roster_complete(
+            Some(Primary),
+            plan(true, false),
+            true,
+            true
+        ));
+        assert!(roster_complete(
+            Some(Primary),
+            plan(false, true),
+            true,
+            true
+        ));
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(false, false),
+            true,
+            true
+        ));
+        // An empty report never claims the whole roster.
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(true, false),
+            false,
+            true
+        ));
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(false, true),
+            false,
+            true
+        ));
+        // The spent account outside the probed roster makes it partial.
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(true, false),
+            true,
+            false
+        ));
+        for probed in [plan(true, false), plan(false, true), plan(false, false)] {
+            assert!(!roster_complete(Some(Subject), probed, true, true));
+            assert!(!roster_complete(None, probed, true, true));
+        }
     }
 
     /// A nameless secondary that only its ports give away (a primary to proxy
@@ -3578,5 +3859,146 @@ mod exhaustion_tests {
     fn rejected_status_is_exhausted() {
         assert!(probe_result_exhausted(&usage(0.50, Some("rejected"), None)));
         assert!(probe_result_exhausted(&usage(0.50, Some("BLOCKED"), None)));
+    }
+}
+
+#[cfg(test)]
+mod account_hash_tests {
+    use super::account_hash_for;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+
+    const UUID: &str = "5BB69DD9-1234-4ABC-8DEF-0123456789AB";
+
+    fn write_identity(path: &Path, uuid: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::json!({"oauthAccount": {"accountUuid": uuid}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn expected(uuid: &str) -> String {
+        hex::encode(Sha256::digest(uuid.trim().to_lowercase().as_bytes()))
+    }
+
+    #[test]
+    fn hash_is_lowercase_64_hex_of_the_trimmed_lowercased_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude-a");
+        write_identity(&dir.join(".claude.json"), &format!("  {UUID}\n"));
+
+        let h = account_hash_for(dir.to_str().unwrap(), None).expect("hash");
+        assert_eq!(h.len(), 64);
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert_eq!(h, expected(UUID));
+        assert_eq!(
+            h,
+            hex::encode(Sha256::digest(UUID.to_lowercase().as_bytes()))
+        );
+    }
+
+    #[test]
+    fn two_dirs_signed_into_one_account_hash_equal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join(".claude-gmail");
+        let b = tmp.path().join("elsewhere").join(".claude");
+        write_identity(&a.join(".claude.json"), UUID);
+        write_identity(&b.join(".claude.json"), &UUID.to_lowercase());
+        let c = tmp.path().join(".claude-other");
+        write_identity(
+            &c.join(".claude.json"),
+            "00000000-0000-4000-8000-000000000000",
+        );
+
+        let ha = account_hash_for(a.to_str().unwrap(), None).unwrap();
+        let hb = account_hash_for(b.to_str().unwrap(), None).unwrap();
+        let hc = account_hash_for(c.to_str().unwrap(), None).unwrap();
+        assert_eq!(ha, hb, "one account, two dir names, one key");
+        assert_ne!(ha, hc, "different accounts, different keys");
+    }
+
+    #[test]
+    fn dir_local_file_wins_over_the_default_home_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let default_home = home.join(".claude");
+        write_identity(&default_home.join(".claude.json"), UUID);
+        write_identity(
+            &home.join(".claude.json"),
+            "11111111-1111-4111-8111-111111111111",
+        );
+
+        assert_eq!(
+            account_hash_for(default_home.to_str().unwrap(), Some(home)),
+            Some(expected(UUID))
+        );
+    }
+
+    #[test]
+    fn default_home_falls_back_to_the_home_level_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let default_home = home.join(".claude");
+        std::fs::create_dir_all(&default_home).unwrap();
+        write_identity(&home.join(".claude.json"), UUID);
+
+        assert_eq!(
+            account_hash_for(default_home.to_str().unwrap(), Some(home)),
+            Some(expected(UUID))
+        );
+        // Compared as paths, not strings: a trailing separator is the same dir.
+        let with_sep = format!("{}/", default_home.to_str().unwrap());
+        assert_eq!(
+            account_hash_for(&with_sep, Some(home)),
+            Some(expected(UUID))
+        );
+        // No home known: no fallback.
+        assert_eq!(account_hash_for(default_home.to_str().unwrap(), None), None);
+    }
+
+    #[test]
+    fn a_non_default_home_never_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_identity(&home.join(".claude.json"), UUID);
+        // `C:/claude/.claude-x`-style homes and any other dir under home.
+        for dir in [
+            home.join(".claude-x"),
+            home.join("claude").join(".claude-x"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            assert_eq!(
+                account_hash_for(dir.to_str().unwrap(), Some(home)),
+                None,
+                "{} must not borrow the default home's identity",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_invalid_or_logged_out_identity_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude-a");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(".claude.json");
+        let d = dir.to_str().unwrap();
+
+        assert_eq!(account_hash_for(d, None), None, "no file");
+        for body in [
+            "not json",
+            "{}",
+            r#"{"oauthAccount":null}"#,
+            r#"{"oauthAccount":{}}"#,
+            r#"{"oauthAccount":{"accountUuid":42}}"#,
+            r#"{"oauthAccount":{"accountUuid":"   "}}"#,
+        ] {
+            std::fs::write(&file, body).unwrap();
+            assert_eq!(account_hash_for(d, None), None, "{body}");
+        }
     }
 }
