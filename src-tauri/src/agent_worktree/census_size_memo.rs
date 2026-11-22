@@ -19,7 +19,8 @@
 //!   can therefore serve exclusive bytes that lag such a change by up to the
 //!   TTL. That is accepted because the figure is reporting-only (plan
 //!   `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`).
-//! * An UNKNOWN exclusivity (`None`, off unix) is memoised as `None`, never as
+//! * An UNKNOWN exclusivity (`None`: off unix, or a walk that could not read
+//!   every sub-directory) is memoised as `None` for the TTL, never as
 //!   `Some(0)`.
 //! * An entry answers only while the directory's own modification time is
 //!   the one it was measured at. Adding or removing a direct child (a
