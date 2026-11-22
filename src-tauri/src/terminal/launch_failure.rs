@@ -86,7 +86,7 @@ pub const EVENT_EXEC_FAILED: &str = "exec-failed";
 /// exactly like `poll-dead` (`RESTORABLE_LAUNCH_FAILED_MS` in the lifecycle
 /// store) and deliberately absent from `NON_RESTORABLE_CLOSE_REASONS`: nothing
 /// ran, so the conversation is exactly as it was.
-pub const LAUNCH_FAILED: &str = "launch-failed";
+pub const LAUNCH_FAILED: &str = crate::session::session_lifecycle_store::CLOSE_REASON_LAUNCH_FAILED;
 
 /// The only close reasons the verdict may rewrite: the two restorable "the
 /// session died" closes.

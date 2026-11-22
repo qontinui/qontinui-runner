@@ -228,7 +228,9 @@ const START_ANCHOR_SKEW_SECS: i64 = 5;
 /// them lets two same-second launches converge across ticks (each terminal claims
 /// one, disambiguating the other). `cmdline_id_live_owner` is the terminal of the
 /// OPEN record for `cmdline_session_id`, when that terminal is live in this pass
-/// AND still hosts a claude anchor (a pane whose claude exited does not count).
+/// AND still hosts a claude anchor (a pane whose claude exited does not count)
+/// whose own argv does not name a DIFFERENT session (a pane reused for another
+/// session does not count either).
 pub fn decide_bind_for_live_pty(
     pty: &LivePty,
     existing: Option<&TerminalSessionRecord>,
@@ -516,10 +518,17 @@ pub fn run_reconcile<I: TranscriptIndex>(
     // can be the live OWNER the rung-2 guard defers to: a pane whose claude
     // exited (its shell lives on) no longer runs the session, so a real
     // `--resume` elsewhere must still be able to take the row.
-    let anchored_terminal_ids: HashSet<&str> = live
+    //
+    // Keyed to the anchor pid so the guard can also read the owner's OWN argv:
+    // a live, anchored owner whose claude now names a DIFFERENT session (the
+    // pane was reused for another `claude --resume`) no longer runs this one,
+    // and must not hold its row hostage. An owner whose argv names nothing
+    // (no typed id, or the cmdline query missed it) still counts as live —
+    // absence of evidence is not evidence of a switch, and the f0a0c310
+    // re-point is the costlier error.
+    let anchored_terminal_pids: HashMap<&str, u32> = live
         .iter()
-        .filter(|p| p.ai_pid.is_some())
-        .map(|p| p.terminal_id.as_str())
+        .filter_map(|p| p.ai_pid.map(|pid| (p.terminal_id.as_str(), pid)))
         .collect();
     // Session ids already owned by a CONFIRMED open row can't be re-bound to a
     // different live terminal — seed the claim set so the uniqueness gate sees
@@ -583,7 +592,16 @@ pub fn run_reconcile<I: TranscriptIndex>(
         // already have moved the row.
         let cmdline_id_live_owner: Option<String> = cmdline_sid
             .and_then(|sid| store.get(sid))
-            .filter(|r| r.state == "open" && anchored_terminal_ids.contains(r.terminal_id.as_str()))
+            .filter(|r| {
+                r.state == "open"
+                    && anchored_terminal_pids
+                        .get(r.terminal_id.as_str())
+                        .is_some_and(|owner_pid| {
+                            cmdline_ids
+                                .get(owner_pid)
+                                .is_none_or(|owner_sid| Some(owner_sid.as_str()) == cmdline_sid)
+                        })
+            })
             .map(|r| r.terminal_id);
         let action = decide_bind_for_live_pty(
             pty,
@@ -3196,6 +3214,69 @@ mod tests {
         );
 
         assert_eq!(store.get("d1-x").unwrap().terminal_id, "term-resume");
+    }
+
+    /// A row left open on a live, anchored pane whose claude now runs a
+    /// DIFFERENT session (its argv names another id) does not block a real
+    /// `claude --resume <sid>` in another pane: that owner no longer runs
+    /// `sid`, so the rung-2 bind moves the row to the resuming pane.
+    #[test]
+    fn a_row_on_a_pane_now_running_another_session_does_not_block_a_resume_elsewhere() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-y", "term-reused", ROOT_B, false));
+        let cmdlines: HashMap<u32, String> =
+            HashMap::from([(444, "d1-other".to_string()), (555, "d1-y".to_string())]);
+
+        run_reconcile(
+            &store,
+            // The resuming pane first: in the other order the reused pane's own
+            // rung-2 bind of `d1-other` supersedes the unconfirmed `d1-y` row
+            // before the guard is ever consulted, and the test would not reach
+            // the owner-argv check.
+            &[
+                pty_anchored("term-resume", 555, 1_000, "/repo"),
+                pty_anchored("term-reused", 444, 1_000, "/repo"),
+            ],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-y"),
+            &cmdlines,
+        );
+
+        assert_eq!(store.get("d1-y").unwrap().terminal_id, "term-resume");
+    }
+
+    /// An anchored owner whose argv names NO id (a bare `claude`, or a cmdline
+    /// the query missed) still counts as live: absence is not a switch, so a
+    /// rung-2 bind elsewhere leaves the row where it is. (The owner pane is
+    /// processed first and re-binds `d1-z` at rung 3 in the same pass; the
+    /// guard is what then refuses `term-other`, and the test fails if the guard
+    /// treats a missing owner argv as a switch.)
+    #[test]
+    fn an_anchored_owner_with_no_argv_id_still_holds_its_row() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-z", "term-owner", ROOT_B, false));
+        let cmdlines: HashMap<u32, String> = HashMap::from([(777, "d1-z".to_string())]);
+
+        let actions = run_reconcile(
+            &store,
+            &[
+                pty_anchored("term-owner", 666, 1_000, "/repo"),
+                pty_anchored("term-other", 777, 1_000, "/repo"),
+            ],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-z"),
+            &cmdlines,
+        );
+
+        assert!(
+            actions.contains(&ReconcileAction::LeaveAlone {
+                terminal_id: "term-other".to_string()
+            }),
+            "{actions:?}"
+        );
+        assert_eq!(store.get("d1-z").unwrap().terminal_id, "term-owner");
     }
 
     /// The boot replay up to the repair: the boot driver's snapshot holds
