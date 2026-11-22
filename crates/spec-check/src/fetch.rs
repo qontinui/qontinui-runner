@@ -44,7 +44,7 @@ pub enum SnapshotFetchError {
 /// - `content_sha256` is a separate return value for telemetry; it is NOT
 ///   embedded in `BridgeFingerprint`. The spec-content hash lives on
 ///   `SpecCheckResult.spec_content_hash`. It is `None` when the canonical
-///   hasher refuses the snapshot body (see [`snapshot_telemetry_hash`]): a
+///   hasher refuses the snapshot body (see [`snapshot_telemetry_hash_with`]): a
 ///   telemetry hash is never worth failing a fetch over.
 /// - `fingerprint.snapshot_timestamp` is the snapshot's Unix-epoch millis
 ///   converted to ISO-8601 UTC with millisecond precision.
@@ -92,7 +92,10 @@ where
         .map_err(|e| SnapshotFetchError::Malformed(e.to_string()))?;
 
     // Mint and record the id BEFORE hashing, so a refusal's warn! line is
-    // correlatable with this snapshot.
+    // correlatable with this snapshot. Trade-off, accepted: if the timestamp
+    // parse below then fails, the span carries an id for a snapshot that is
+    // never returned — harmless for a span field, and the warn! event also
+    // carries the id explicitly.
     let snapshot_id = format!("scs_{}", uuid::Uuid::now_v7());
     tracing::Span::current().record("snapshot_id", tracing::field::display(&snapshot_id));
     let content_sha256 = snapshot_telemetry_hash_with(&raw, &snapshot_id, hasher);
@@ -110,25 +113,18 @@ where
     Ok((snapshot, fingerprint, snapshot_id, content_sha256))
 }
 
-/// Non-fatal snapshot telemetry hash: the canonical content hash of a raw
-/// snapshot body, or `None` (with a `warn!`) when the canonical hasher
-/// refuses it. The body is arbitrary external UI Bridge JSON, and the hash
-/// only feeds `SpecCheckResult.snapshot_sha256` — so a refusal costs that one
-/// telemetry field, never the fetch or the evaluation. Shared by
-/// [`wrap_snapshot`] and the runner's SDK snapshot path. `snapshot_id` is
-/// carried on the refusal's warn! line for correlation.
-pub fn snapshot_telemetry_hash(value: &serde_json::Value, snapshot_id: &str) -> Option<String> {
-    snapshot_telemetry_hash_with(
-        value,
-        snapshot_id,
-        qontinui_types::canonical_hash::canonical_hash::<serde_json::Value>,
-    )
-}
-
-/// [`snapshot_telemetry_hash`] with the canonical hasher injected. Public so
-/// callers outside this crate (the runner's SDK snapshot path) can expose
-/// the same seam to their own tests: today's `canonical_hash` cannot refuse
-/// any `serde_json::Value`, so a refusal can only be injected.
+/// Non-fatal snapshot telemetry hash: the content hash `hasher` gives a raw
+/// snapshot body, or `None` (with a `warn!`) when it refuses. The body is
+/// arbitrary external UI Bridge JSON, and the hash only feeds
+/// `SpecCheckResult.snapshot_sha256` — so a refusal costs that one telemetry
+/// field, never the fetch or the evaluation. Shared by [`wrap_snapshot`]
+/// (via `wrap_snapshot_with_hasher`) and the runner's SDK snapshot path, each
+/// passing `qontinui_types::canonical_hash::canonical_hash` in production.
+/// `snapshot_id` is carried on the refusal's warn! line for correlation.
+///
+/// The hasher is a parameter, and the function public, so callers can inject
+/// a refusal in their own tests: today's `canonical_hash` cannot refuse any
+/// `serde_json::Value`.
 pub fn snapshot_telemetry_hash_with<H>(
     value: &serde_json::Value,
     snapshot_id: &str,
@@ -381,7 +377,11 @@ mod tests {
     fn snapshot_telemetry_hash_matches_canonical_hash_when_accepted() {
         let raw = well_formed_raw(0);
         assert_eq!(
-            snapshot_telemetry_hash(&raw, "scs_test"),
+            snapshot_telemetry_hash_with(
+                &raw,
+                "scs_test",
+                qontinui_types::canonical_hash::canonical_hash::<serde_json::Value>,
+            ),
             Some(compute_content_sha256(&raw).unwrap())
         );
     }
