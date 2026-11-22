@@ -940,11 +940,12 @@ pub trait CustodyProbe: Send + Sync {
 /// The worktree holding a directory the transcript names, found through its
 /// nearest EXISTING ancestor. A transcript can name a directory that has
 /// since been removed. `Ok(None)` only when the directory itself still exists
-/// and is in no repository (a scratch dir). A directory that is GONE and whose
-/// walk-up finds no repository is `Err`: it may have been a worktree outside
-/// any layout this gather knows, removed with its work, so "no repository" is
-/// not established. Also `Err` when an existence check could not be answered,
-/// or no ancestor exists.
+/// and is in no repository (a scratch dir). A directory that is GONE stands
+/// for itself only inside its own live allocation tree ([`allocation_tree`]):
+/// anywhere else the tree the walk lands on (none, a primary checkout, or a
+/// linked worktree it was nested in) is not the tree the directory was in,
+/// which may have been removed with its work, so it is `Err`. Also `Err` when
+/// an existence check could not be answered, or no ancestor exists.
 async fn transcript_dir_root<P: CustodyProbe + ?Sized>(
     probe: &P,
     dir: &Path,
@@ -952,12 +953,17 @@ async fn transcript_dir_root<P: CustodyProbe + ?Sized>(
     for ancestor in dir.ancestors().filter(|a| !a.as_os_str().is_empty()) {
         if probe.exists(ancestor).await? {
             let root = probe.worktree_root(ancestor).await?;
-            if root.is_none() && ancestor != dir {
-                return Err(format!(
-                    "{} no longer exists and no repository holds it, so the tree it was in is \
-                     not known",
-                    dir.display()
-                ));
+            if ancestor != dir {
+                let own = allocation_tree(dir);
+                let in_own_tree = matches!((&root, &own), (Some(r), Some(t))
+                    if custody::norm(&r.to_string_lossy()) == custody::norm(&t.to_string_lossy()));
+                if !in_own_tree {
+                    return Err(format!(
+                        "{} no longer exists and is not inside its own live allocation tree, so \
+                         the tree it was in is not known",
+                        dir.display()
+                    ));
+                }
             }
             return Ok(root);
         }
@@ -1485,8 +1491,8 @@ impl GitCustodyProbe {
             .collect();
         if branches.is_empty() {
             return Err(format!(
-                "{} was reaped and {} holds no branch refs/heads/agent/*-{id12}/*, so what it \
-                 left cannot be read",
+                "{} was reaped and {} holds no branch refs/heads/agent/*-{id12} or \
+                 refs/heads/agent/*-{id12}/*, so what it left cannot be read",
                 tree.display(),
                 primary.display()
             ));
@@ -2089,6 +2095,26 @@ mod tests {
         let inputs =
             gather_custody(&scratch, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
         assert_eq!(custody_gate(&inputs), CustodyVerdict::Clean);
+    }
+
+    /// Round-2 suggestion 5: a gone directory whose walk-up lands on a linked
+    /// worktree it was nested in (not its own allocation tree) is a failed
+    /// probe — the outer worktree's state does not stand for the gone one.
+    #[tokio::test]
+    async fn a_gone_directory_nested_in_another_linked_worktree_is_a_failed_probe() {
+        let mut nested = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .root("/ws/wt/a/.claude/worktrees", "/ws/wt/a")
+            .transcript(&["/ws/wt/a/.claude/worktrees/x/src"], None, None);
+        nested
+            .missing
+            .insert(PathBuf::from("/ws/wt/a/.claude/worktrees/x/src"));
+        nested
+            .missing
+            .insert(PathBuf::from("/ws/wt/a/.claude/worktrees/x"));
+        let inputs =
+            gather_custody(&nested, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("probe_failed"));
     }
 
     /// A transcript directory whose existence cannot be checked is a failed

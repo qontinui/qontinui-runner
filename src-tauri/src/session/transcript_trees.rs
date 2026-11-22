@@ -433,6 +433,19 @@ const CACHE_CAP: usize = 4096;
 /// Scan one file, from the cache when its stamp is unchanged. `remaining` is
 /// the byte budget left, and it is debited by what was read.
 fn scan_file(path: &Path, remaining: &mut u64, deadline: Instant) -> FileScan {
+    scan_file_with(path, remaining, deadline, &|p| {
+        std::fs::metadata(p).ok().map(|m| FileStamp::of(&m))
+    })
+}
+
+/// [`scan_file`] with the post-read stat injected, so a test can stage a
+/// file that changes between the two stats.
+fn scan_file_with(
+    path: &Path,
+    remaining: &mut u64,
+    deadline: Instant,
+    restat: &dyn Fn(&Path) -> Option<FileStamp>,
+) -> FileScan {
     let label = path.display().to_string();
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
@@ -443,10 +456,12 @@ fn scan_file(path: &Path, remaining: &mut u64, deadline: Instant) -> FileScan {
         }
     };
     let stamp = FileStamp::of(&meta);
-    if let Ok(guard) = cache().lock() {
-        if let Some((cached, scan)) = guard.get(path) {
-            if *cached == stamp {
-                return scan.clone();
+    if stamp.modified_ms.is_some() {
+        if let Ok(guard) = cache().lock() {
+            if let Some((cached, scan)) = guard.get(path) {
+                if *cached == stamp {
+                    return scan.clone();
+                }
             }
         }
     }
@@ -473,8 +488,7 @@ fn scan_file(path: &Path, remaining: &mut u64, deadline: Instant) -> FileScan {
     // Stat again after the read: a file written meanwhile was not read as
     // stamped. The bounded reader can stop exactly on a line boundary of a
     // file that grew, which would otherwise read as whole.
-    let after = std::fs::metadata(path).ok().map(|m| FileStamp::of(&m));
-    let scan = settle_read(scan, stamp, after, &label);
+    let scan = settle_read(scan, stamp, restat(path), &label);
     if scan.reached_end {
         if let Ok(mut guard) = cache().lock() {
             if guard.len() >= CACHE_CAP {
@@ -487,14 +501,24 @@ fn scan_file(path: &Path, remaining: &mut u64, deadline: Instant) -> FileScan {
 }
 
 /// PURE: a read stands as whole only when the file's stamp after the read
-/// equals the stamp before it. Otherwise it is incomplete, and never cached.
+/// equals the stamp before it, and that stamp carries a modification time.
+/// Otherwise it is incomplete, and never cached. A stamp with no modification
+/// time reduces the comparison to the length alone, which a same-length
+/// rewrite passes, so it never proves the read whole (as
+/// [`super::transcript_last_turn::FileStamp::of`] documents: an unstamped
+/// file is never cached).
 fn settle_read(
     mut scan: FileScan,
     before: FileStamp,
     after: Option<FileStamp>,
     label: &str,
 ) -> FileScan {
-    if after != Some(before) {
+    if before.modified_ms.is_none() {
+        scan.reached_end = false;
+        scan.note_incomplete(format!(
+            "{label} has no modification time, so a change during the read cannot be ruled out"
+        ));
+    } else if after != Some(before) {
         scan.reached_end = false;
         scan.note_incomplete(format!("{label} changed while it was read"));
     }
@@ -852,6 +876,11 @@ mod tests {
                 len: 20,
                 modified_ms: Some(2),
             }),
+            // Round-2 suggestion 1: the same length, a new mtime.
+            Some(FileStamp {
+                len: 10,
+                modified_ms: Some(2),
+            }),
             None,
         ] {
             let moved = settle_read(whole(), before, after, "t.jsonl");
@@ -861,6 +890,52 @@ mod tests {
                 .unwrap()
                 .contains("changed while it was read"));
         }
+    }
+
+    /// Round-2 suggestion 1: `scan_file` goes through the post-read check — a
+    /// file whose stamp moved between the two stats is incomplete and is not
+    /// cached.
+    #[test]
+    fn scan_file_marks_a_file_restamped_during_the_read_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("r.jsonl");
+        write(&p, &[said("/ws", serde_json::json!("go"))]);
+        let moved = |_: &Path| {
+            Some(FileStamp {
+                len: 1,
+                modified_ms: Some(1),
+            })
+        };
+        let mut left = SCAN_MAX_BYTES;
+        let far = Instant::now() + Duration::from_secs(60);
+        let s = scan_file_with(&p, &mut left, far, &moved);
+        assert!(!s.reached_end);
+        assert!(s.incomplete.unwrap().contains("changed while it was read"));
+        // Not cached: the honest re-read is whole.
+        let mut left = SCAN_MAX_BYTES;
+        let again = scan_file(&p, &mut left, far);
+        assert!(again.reached_end && again.incomplete.is_none());
+    }
+
+    /// Round-2 suggestion 2: a stamp with no modification time never proves a
+    /// read whole, even when it compares equal.
+    #[test]
+    fn a_stamp_without_a_modification_time_is_never_whole() {
+        let unstamped = FileStamp {
+            len: 10,
+            modified_ms: None,
+        };
+        let s = settle_read(
+            FileScan {
+                reached_end: true,
+                ..FileScan::default()
+            },
+            unstamped,
+            Some(unstamped),
+            "t.jsonl",
+        );
+        assert!(!s.reached_end);
+        assert!(s.incomplete.unwrap().contains("no modification time"));
     }
 
     /// Review A5: a block kind the scan does not know may be a call, so it
@@ -968,6 +1043,31 @@ mod tests {
         let roots = vec![root];
         let too_deep = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
         assert!(too_deep.read.incomplete.unwrap().contains("nested deeper"));
+    }
+
+    /// Round-2 suggestion 3: a sidechain at exactly the depth bound is read.
+    #[test]
+    fn a_sidechain_at_the_depth_bound_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000007";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        let mut deep = main.with_extension("").join("subagents");
+        for level in 0..SIDECHAIN_MAX_DEPTH {
+            deep = deep.join(format!("d{level}"));
+        }
+        write(
+            &deep.join("agent-x.jsonl"),
+            &[said("/ws/wt/deep", serde_json::json!("go"))],
+        );
+        let s = scan_session_in(&[root], sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert_eq!(s.read.incomplete, None);
+        assert!(
+            s.dirs.contains(&PathBuf::from("/ws/wt/deep")),
+            "{:?}",
+            s.dirs
+        );
     }
 
     /// Review A10: a symlink under `subagents/` is not followed, so what lies
