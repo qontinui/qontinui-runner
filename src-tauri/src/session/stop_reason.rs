@@ -1531,6 +1531,11 @@ mod tests {
             ("main.rs", "run_app", "CLOSE_REASON_NEVER_STARTED"),
             ("main.rs", "run_app", "CLOSE_REASON_NO_TERMINAL"),
             (
+                "session/codex_capture.rs",
+                "record_captured_session",
+                "CLOSE_REASON_SUPERSEDED",
+            ),
+            (
                 "orchestration_loop/ai_session_executor.rs",
                 "teardown_unbound_worker",
                 "CLOSE_REASON_WORKER_BIND_FAILED",

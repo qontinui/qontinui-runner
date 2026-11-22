@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use qontinui_runner_lib::cli_profile::codex;
 
-use crate::session::session_lifecycle_store::SessionLifecycleStore;
+use crate::session::session_lifecycle_store::{SessionLifecycleStore, CLOSE_REASON_SUPERSEDED};
 
 /// Poll interval while waiting for the rollout file to appear.
 pub const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -75,9 +75,6 @@ const CREATED_SKEW_MS: i64 = 5_000;
 /// skipped without opening it. A day covers any offset between the local time
 /// the stamp may be written in and UTC.
 const FILENAME_PREFILTER_MS: i64 = 24 * 60 * 60 * 1000;
-/// The close reason stamped on the terminal's other open records once the
-/// Codex session is captured.
-const SUPERSEDED_REASON: &str = "superseded-by-codex";
 
 /// The Codex home to scan, resolved the way the CLI resolves it for the
 /// session being captured: the `CODEX_HOME` that session ran under (posted by
@@ -328,7 +325,8 @@ pub fn capture_resumed_session_id(
 /// record the identity seam wrote at spawn, so a restore puts the Codex
 /// session back where it ran. That spawn-time record is a speculative pin for
 /// a Claude launch that did not happen; it is closed as
-/// [`SUPERSEDED_REASON`]. Every other open record of the terminal is closed
+/// [`CLOSE_REASON_SUPERSEDED`] (a provisional record replaced by the session
+/// that actually bound the terminal), so its stop reads as a known code. Every other open record of the terminal is closed
 /// too — iterating them all, because the store's single-record lookup scans a
 /// hash map in arbitrary order and could return the Codex record itself
 /// (#651's Windows-only flake).
@@ -381,7 +379,7 @@ pub fn record_captured_session(
 
     for other in terminal_open {
         if other.claude_session_id != session_id {
-            store.record_close(&other.claude_session_id, SUPERSEDED_REASON);
+            store.record_close(&other.claude_session_id, CLOSE_REASON_SUPERSEDED);
             tracing::info!(
                 terminal_id = %terminal_id,
                 superseded = %other.claude_session_id,
