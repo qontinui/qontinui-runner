@@ -955,10 +955,13 @@ fn candidate_paths(
             path: workspace.join(&raw),
         }]);
     };
-    let script_root = workspace.join(crate::agent_worktree::canonical_paths::SCRIPT_WORKTREE_ROOT_DIRNAME);
+    let script_root =
+        workspace.join(crate::agent_worktree::canonical_paths::SCRIPT_WORKTREE_ROOT_DIRNAME);
     let mut roots = vec![script_root];
     if let Some(second) = worktree_root {
-        if !roots.iter().any(|r| custody::norm(&r.to_string_lossy()) == custody::norm(&second.to_string_lossy())) {
+        if !roots.iter().any(|r| {
+            custody::norm(&r.to_string_lossy()) == custody::norm(&second.to_string_lossy())
+        }) {
             roots.push(second.to_path_buf());
         }
     }
@@ -1230,17 +1233,17 @@ async fn resolve_attributed<P: CustodyProbe + ?Sized>(
         .iter()
         .map(|c| c.root.display().to_string())
         .collect();
-    let finish = |found: Vec<PathBuf>,
-                  failure: Option<CustodyMember>,
-                  outcome: &'static str| ResolvedWorktree {
-        resolution: WorktreeResolution {
-            ledger_path: ledger.clone(),
-            roots_tried: roots_tried.clone(),
-            resolved: found.iter().map(|p| p.display().to_string()).collect(),
-            outcome,
-        },
-        found,
-        failure,
+    let finish = |found: Vec<PathBuf>, failure: Option<CustodyMember>, outcome: &'static str| {
+        ResolvedWorktree {
+            resolution: WorktreeResolution {
+                ledger_path: ledger.clone(),
+                roots_tried: roots_tried.clone(),
+                resolved: found.iter().map(|p| p.display().to_string()).collect(),
+                outcome,
+            },
+            found,
+            failure,
+        }
     };
     let failed = |path: &Path, detail: String| CustodyMember {
         path: path.display().to_string(),
@@ -1960,7 +1963,10 @@ mod tests {
         );
         for (present, path) in [
             (script, PathBuf::from("/ws/agent-worktrees").join("a/repo")),
-            (second, PathBuf::from("/ws/qontinui-worktrees").join("a/repo")),
+            (
+                second,
+                PathBuf::from("/ws/qontinui-worktrees").join("a/repo"),
+            ),
         ] {
             if !present {
                 probe.missing.insert(path);
@@ -2002,7 +2008,9 @@ mod tests {
         assert_eq!(denied.resolutions[0].outcome, "root_unreadable");
 
         let mut probe = FakeProbe::default();
-        probe.missing.insert(PathBuf::from("/ws/qontinui-worktrees"));
+        probe
+            .missing
+            .insert(PathBuf::from("/ws/qontinui-worktrees"));
         probe.missing.insert(PathBuf::from("/ws"));
         probe.missing.insert(PathBuf::from("/ws/agent-worktrees"));
         let (unmounted, _) = gather_relative(probe, false, false, false).await;
@@ -2086,10 +2094,17 @@ mod tests {
             &[],
         );
         let attributed = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws")));
-        let mut probe = FakeProbe::default().root("/ws/qontinui-worktrees/a/repo", "/ws/qontinui-worktrees/a/repo");
+        let mut probe = FakeProbe::default().root(
+            "/ws/qontinui-worktrees/a/repo",
+            "/ws/qontinui-worktrees/a/repo",
+        );
         // Nothing lives under `<ws>/agent-worktrees/` for this session.
-        probe.missing.insert(PathBuf::from("/ws/agent-worktrees/a/repo"));
-        probe.unreadable.insert(PathBuf::from("/ws/agent-worktrees/a/repo"));
+        probe
+            .missing
+            .insert(PathBuf::from("/ws/agent-worktrees/a/repo"));
+        probe
+            .unreadable
+            .insert(PathBuf::from("/ws/agent-worktrees/a/repo"));
         let inputs = gather_custody(&probe, &context(Some("/ws"), &[]), attributed, "s").await;
         assert_eq!(
             custody_gate(&inputs),

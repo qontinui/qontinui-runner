@@ -234,7 +234,10 @@ pub fn publish_custody(verdicts: &[(String, CustodyVerdict)], judged_at_ms: i64)
 /// `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`).
 /// A session with no published view gets nothing.
 pub fn publish_custody_resolutions(
-    resolutions: &[(String, Vec<qontinui_runner_lib::wind_down::WorktreeResolution>)],
+    resolutions: &[(
+        String,
+        Vec<qontinui_runner_lib::wind_down::WorktreeResolution>,
+    )],
 ) {
     let mut map = match last_custody_map().lock() {
         Ok(m) => m,
@@ -566,7 +569,10 @@ mod tests {
                 "fc-b".to_string(),
                 vec![qontinui_runner_lib::wind_down::WorktreeResolution {
                     ledger_path: "agent-worktrees/a/repo".to_string(),
-                    roots_tried: vec!["/ws/agent-worktrees".to_string(), "/ws/qontinui-worktrees".to_string()],
+                    roots_tried: vec![
+                        "/ws/agent-worktrees".to_string(),
+                        "/ws/qontinui-worktrees".to_string(),
+                    ],
                     resolved: vec!["/ws/qontinui-worktrees/a/repo".to_string()],
                     outcome: "found",
                 }],
