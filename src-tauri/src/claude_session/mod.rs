@@ -17,6 +17,7 @@ pub(crate) mod heartbeat;
 pub mod launch_spec;
 pub mod manager;
 pub(crate) mod pane_row_owner;
+pub mod queued;
 pub mod resume;
 pub mod runner;
 pub mod session;

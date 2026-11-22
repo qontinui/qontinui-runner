@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "id": "repo-20260929T091500Z-f6a7b8",
+  "scope": "repo:qontinui-schemas",
+  "purpose": "hand-edited past its cap",
+  "requester": {"session_id": "aaaaaaaa-0000-4000-8000-000000000006", "device": "11111111-2222-3333-4444-555555555555"},
+  "opened_at": "2026-09-29T09:15:00Z",
+  "until": "2026-09-29T12:00:00Z",
+  "max_until": "2026-09-29T10:15:00Z",
+  "straggler_policy": "wait",
+  "state": "open"
+}

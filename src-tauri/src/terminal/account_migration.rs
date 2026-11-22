@@ -91,7 +91,7 @@ use std::sync::Mutex;
 
 use serde_json::json;
 use tauri::Emitter;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::terminal::graceful_exit::ProcIdentity;
@@ -957,8 +957,52 @@ fn continue_nudge(subagents: &[CarriedSubagent]) -> String {
 /// `initial_prompt` through the SAME bounded, stand-down-on-busy watcher
 /// instead of growing a second one that would drift from it. `label` only
 /// names the caller in the log lines.
+///
+/// The prompt lives only in this task's memory, so a runner restart drops it.
+/// It is therefore registered in [`crate::quiet_barrier::pending`] for the
+/// task's WHOLE life (registered before the spawn returns, cleared when the
+/// task ends for any reason): under a `runner-restart` quiet barrier the
+/// session is a `pending_autonomous_prompt` straggler, so the restart waits
+/// for the prompt (delivered after release) or the operator sees it.
 pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
-    tauri::async_runtime::spawn(prompt_when_idle(terminal_id, prompt, label));
+    let pending = crate::quiet_barrier::pending::guard(
+        &terminal_id,
+        &pending_key(label),
+        "account-migration prompt-when-idle watcher",
+    );
+    tauri::async_runtime::spawn(async move {
+        let _pending = pending;
+        prompt_when_idle(terminal_id, prompt, label).await;
+    });
+}
+
+/// The [`crate::quiet_barrier::pending`] key a prompt-when-idle watcher
+/// registers under.
+fn pending_key(label: &str) -> String {
+    format!("account_migration:{label}")
+}
+
+/// How long one idle watch waits for the resumed CLI's idle prompt.
+const PROMPT_WHEN_IDLE_WINDOW: std::time::Duration = IDLE_WATCH_DEADLINE;
+
+/// The hard bound on how long a quiet-barrier deferral may keep the watcher
+/// alive: past a `runner-restart` barrier's 1 h cap and the 2 h corrupt-file
+/// window, so a deferral never outlives every barrier that could cause it.
+const PROMPT_WHEN_IDLE_DEFERRAL_CAP: std::time::Duration =
+    std::time::Duration::from_secs(3 * 60 * 60);
+
+/// PURE: when `err` is a quiet-barrier deferral, the watcher's extended
+/// deadline — a fresh [`PROMPT_WHEN_IDLE_WINDOW`] from `now`, never past
+/// `started + PROMPT_WHEN_IDLE_DEFERRAL_CAP`. `None` for any other error (the
+/// watcher gives up as before) and once the cap is reached.
+fn deferred_deadline(
+    err: &str,
+    started: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    crate::quiet_barrier::deferred_barrier_id(err)?;
+    let cap = started + PROMPT_WHEN_IDLE_DEFERRAL_CAP;
+    (now < cap).then(|| (now + PROMPT_WHEN_IDLE_WINDOW).min(cap))
 }
 
 /// The idle watcher's read cadence and bound.
@@ -1027,66 +1071,81 @@ where
 /// future is first polled.
 async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
     use tauri::Manager;
-    let session_now = || {
-        let app = crate::tauri_app_handle::current()?;
-        let tm = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?;
-        tm.get(&terminal_id)
-    };
-    let end = watch_for_idle_prompt(
-        || {
-            let session = session_now()?;
-            Some(super::respawn_liveness::PaneReading {
-                exited: (!session.is_alive()).then(|| session.exit_code()),
-                screen: session.grid_screen(),
-            })
-        },
-        IDLE_WATCH_POLL,
-        IDLE_WATCH_DEADLINE,
-    )
-    .await;
-    match end {
-        IdleWatchEnd::Gone => info!(
-            terminal_id,
-            label, "prompt-when-idle: terminal gone — standing down"
-        ),
-        IdleWatchEnd::ChildExited(exit_code) => warn!(
-            terminal_id,
-            label,
-            ?exit_code,
-            "prompt-when-idle: the pane's child exited before painting its idle prompt — standing down"
-        ),
-        IdleWatchEnd::Busy => info!(
-            terminal_id,
-            label, "prompt-when-idle: session already working — no prompt needed"
-        ),
-        IdleWatchEnd::Ready => {
-            let Some(session) = session_now() else {
-                info!(
-                    terminal_id,
-                    label, "prompt-when-idle: terminal gone — standing down"
-                );
-                return;
-            };
-            // Composes both sides of the 2026-08-29 rebase: OUR generalized
-            // `prompt`/`label` seam (one impl for the migration nudge and the
-            // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
-            // returning `()` in fee48d4c, which now reports the neutralized body.
-            match session.submit_prompt(
-                &prompt,
-                crate::terminal::session::PtyWriteCaller::AccountMigration,
-            ) {
-                Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
-                Err(e) => {
-                    warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+    let started = std::time::Instant::now();
+    // A quiet-barrier deferral re-runs the whole watch (busy/ready re-judged)
+    // after a fresh window, bounded by PROMPT_WHEN_IDLE_DEFERRAL_CAP.
+    'watch: loop {
+        let session_now = || {
+            let app = crate::tauri_app_handle::current()?;
+            let tm = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?;
+            tm.get(&terminal_id)
+        };
+        let end = watch_for_idle_prompt(
+            || {
+                let session = session_now()?;
+                Some(super::respawn_liveness::PaneReading {
+                    exited: (!session.is_alive()).then(|| session.exit_code()),
+                    screen: session.grid_screen(),
+                })
+            },
+            IDLE_WATCH_POLL,
+            IDLE_WATCH_DEADLINE,
+        )
+        .await;
+        match end {
+            IdleWatchEnd::Gone => info!(
+                terminal_id,
+                label, "prompt-when-idle: terminal gone — standing down"
+            ),
+            IdleWatchEnd::ChildExited(exit_code) => warn!(
+                terminal_id,
+                label,
+                ?exit_code,
+                "prompt-when-idle: the pane's child exited before painting its idle prompt — standing down"
+            ),
+            IdleWatchEnd::Busy => info!(
+                terminal_id,
+                label, "prompt-when-idle: session already working — no prompt needed"
+            ),
+            IdleWatchEnd::Ready => {
+                let Some(session) = session_now() else {
+                    info!(
+                        terminal_id,
+                        label, "prompt-when-idle: terminal gone — standing down"
+                    );
+                    return;
+                };
+                // Composes both sides of the 2026-08-29 rebase: OUR generalized
+                // `prompt`/`label` seam (one impl for the migration nudge and the
+                // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
+                // returning `()` in fee48d4c, which now reports the neutralized body.
+                match session.submit_prompt(
+                    &prompt,
+                    crate::terminal::session::PtyWriteCaller::AccountMigration,
+                ) {
+                    Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
+                    Err(e) => {
+                        if deferred_deadline(&e, started, std::time::Instant::now()).is_some() {
+                            debug!(
+                                terminal_id,
+                                label,
+                                error = %e,
+                                "prompt-when-idle: deferred by a quiet barrier — will retry"
+                            );
+                            continue 'watch;
+                        }
+                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+                    }
                 }
             }
+            IdleWatchEnd::GaveUp(last_refusal) => warn!(
+                terminal_id,
+                label,
+                %last_refusal,
+                "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
+            ),
         }
-        IdleWatchEnd::GaveUp(last_refusal) => warn!(
-            terminal_id,
-            label,
-            %last_refusal,
-            "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
-        ),
+        break 'watch;
     }
 }
 
@@ -3386,6 +3445,58 @@ mod tests {
         );
         assert_eq!(
             pane_claude_anchor(&npm_look(RegistryWitness::unreadable("test")), 5),
+            None
+        );
+    }
+
+    /// Item 5: the in-memory prompt is a registered pending deferral for the
+    /// watcher's whole life — present the moment the watcher is spawned, gone
+    /// once it ends (here: no app handle in a unit test, so it stands down on
+    /// its first tick).
+    #[test]
+    fn the_watcher_is_a_pending_autonomous_prompt_for_its_whole_life() {
+        let tid = "term-account-migration-pending-test";
+        spawn_prompt_when_idle(tid.to_string(), "continue".to_string(), "continue-nudge");
+        let pending = crate::quiet_barrier::pending::for_session(tid);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(
+            pending[0].starts_with("account_migration:continue-nudge"),
+            "{pending:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !crate::quiet_barrier::pending::for_session(tid).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the entry must clear when the watcher ends"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// A quiet-barrier deferral keeps the idle watcher alive (bounded), so the
+    /// migration nudge is re-evaluated after release instead of lost; any other
+    /// refusal still gives up.
+    #[test]
+    fn a_barrier_deferral_extends_the_watch_and_other_errors_do_not() {
+        let started = std::time::Instant::now();
+        let deferred = crate::quiet_barrier::deferred_error("rr-1", "account_migration", "t", "x");
+        let now = started + std::time::Duration::from_secs(170);
+        assert_eq!(
+            deferred_deadline(&deferred, started, now),
+            Some(now + PROMPT_WHEN_IDLE_WINDOW)
+        );
+        assert_eq!(
+            deferred_deadline("TERMINAL_EXITED: gone", started, now),
+            None
+        );
+        // Bounded: never past the cap, and nothing once the cap has passed.
+        let near_cap = started + PROMPT_WHEN_IDLE_DEFERRAL_CAP - std::time::Duration::from_secs(10);
+        assert_eq!(
+            deferred_deadline(&deferred, started, near_cap),
+            Some(started + PROMPT_WHEN_IDLE_DEFERRAL_CAP)
+        );
+        assert_eq!(
+            deferred_deadline(&deferred, started, started + PROMPT_WHEN_IDLE_DEFERRAL_CAP),
             None
         );
     }

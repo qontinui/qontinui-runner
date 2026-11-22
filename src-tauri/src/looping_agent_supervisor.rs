@@ -921,6 +921,26 @@ async fn supervise_one(
         }
     }
 
+    // Quiet barrier (plan `2026-09-29-quiet-on-demand-…`, D4). While a
+    // `runner-restart` barrier is open — or the barrier store is unknown — the
+    // supervisor starts nothing and continues nothing, exactly as under a
+    // drain: a nudge would wake a session the restart is waiting to find idle,
+    // and a relaunch would close one. The nudge's PTY write is also gated at
+    // the funnel; this rewrite keeps the supervisor from even trying, and from
+    // counting a cycle it did not start. The first tick after release decides
+    // afresh.
+    let barrier_hold = crate::quiet_barrier::autonomous_wakes_held();
+    let unbarriered = action;
+    let action = barrier_rewrite(unbarriered, barrier_hold.as_deref());
+    if action != unbarriered {
+        debug!(
+            agent = %rec.def.id,
+            suppressed = ?unbarriered,
+            barrier_id = barrier_hold.as_deref().unwrap_or_default(),
+            "looping_agent_supervisor: action held by a quiet barrier"
+        );
+    }
+
     // Phase 4c action gate. Applied AFTER `policy::decide` so a refusal cannot
     // reach `Action::Relaunch`, which CLOSES the live tab before respawning —
     // a refusal discovered inside `do_spawn` would kill a running agent and
@@ -1303,6 +1323,21 @@ async fn release_handed_over_slot(app: &tauri::AppHandle, agent_id: &str) {
          closed lane — a runner on an open device may take it"
     );
     crate::looping_agent_coord::release_slot(&slot.resource_key, &machine_id, agent_id).await;
+}
+
+/// PURE: the quiet-barrier rewrite of one tick's action. `barrier` is the id
+/// of the barrier holding autonomous wakes, if any; while one holds, every
+/// action that starts or continues work becomes `None`, as [`drain_rewrite`]
+/// does for a drain.
+fn barrier_rewrite(action: Action, barrier: Option<&str>) -> Action {
+    if barrier.is_none() {
+        return action;
+    }
+    match action {
+        Action::Spawn(_) | Action::Relaunch(_) | Action::Nudge => Action::None,
+        // Neither starts nor continues work: a retire closes a tab.
+        Action::None | Action::Retire => action,
+    }
 }
 
 /// Build the spawn prompt: the playbook + config + the one-cycle contract;
@@ -2842,6 +2877,22 @@ mod drain_rewrite_tests {
     fn an_allowing_drain_leaves_every_action_untouched() {
         for action in ACTIONS {
             assert_eq!(drain_rewrite(action, &DrainGate::Allow), action);
+        }
+    }
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: a quiet barrier holds the
+    /// nudge (and spawn / relaunch) exactly as a drain does; with no barrier
+    /// every action passes — the nudge is delivered on the first tick after
+    /// release.
+    #[test]
+    fn a_quiet_barrier_holds_every_action_and_release_restores_them() {
+        for action in ACTIONS {
+            assert_eq!(
+                barrier_rewrite(action, Some("rr-20260929T101500Z-a1b2c3")),
+                Action::None,
+                "{action:?}"
+            );
+            assert_eq!(barrier_rewrite(action, None), action, "{action:?}");
         }
     }
 }
