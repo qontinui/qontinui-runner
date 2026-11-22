@@ -23,7 +23,7 @@ pub mod proptest_strategies;
 pub use evaluator::{
     evaluate, evaluate_batch, evaluate_with_identity, evaluate_with_identity_and_validation,
 };
-pub use fetch::{wrap_snapshot, SnapshotFetchError};
+pub use fetch::{snapshot_telemetry_hash, wrap_snapshot, SnapshotFetchError};
 pub use policy::apply_policy;
 pub use result_migration::deserialize_result_with_migration;
 pub use snapshot::IndexedSnapshot;
