@@ -1165,7 +1165,8 @@ pub(super) fn newest_artifact_age(target_root: &Path) -> Option<Duration> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SizeMeasurement {
     /// APPARENT size: the sum of every regular file's length, a hardlinked
-    /// file counted once per link. What `du --apparent-size` would say.
+    /// file counted once per link. What `du --apparent-size --count-links`
+    /// would say (plain `du` counts each inode once).
     pub bytes: u64,
     /// Sub-directories whose `read_dir` failed. `> 0` ⇒ `bytes` is a LOWER
     /// BOUND, and the caller must say so rather than present it as exact.
@@ -1174,7 +1175,8 @@ pub struct SizeMeasurement {
     /// once, and an inode that is still linked from outside the directory
     /// counted not at all (a pnpm `node_modules` hardlinks its packages from
     /// the content-addressed store, so its apparent size is mostly the
-    /// store's). `None` = UNKNOWN: off unix there is no link count to read,
+    /// store's). `None` = UNKNOWN: off unix the directory record carries no
+    /// link count and the walk does not open files to read one,
     /// and a walk that hit an unreadable sub-directory (`unreadable_dirs > 0`)
     /// cannot tell an outside link from one hidden in the unread part.
     /// Plan `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
@@ -1237,6 +1239,11 @@ fn measure_dir_size_walk(
         // an lstat, which already carries dev/ino/nlink — no extra syscall.
         let meta = match entry.metadata() {
             Ok(meta) => meta,
+            // Removed between `readdir` and `lstat` (a `target/` mid-build,
+            // an install in progress): it is no longer there to free, and
+            // counting it unreadable would make the whole tree's exclusivity
+            // UNKNOWN for a file that does not exist.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
                 m.unreadable_dirs += 1;
                 continue;
@@ -5572,6 +5579,7 @@ mod tests {",
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         if readable_anyway {
             // Running as root: permissions do not bind, nothing to observe.
+            eprintln!("SKIP a_partial_walk_reports_exclusive_bytes_as_unknown: permissions do not bind for this user");
             return;
         }
         let m = m.expect("root is readable");
