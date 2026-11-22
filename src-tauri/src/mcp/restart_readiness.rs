@@ -1803,7 +1803,8 @@ async fn gather_resume(
         let descendants = if snapshot.parent_map.is_empty() {
             Descendants::Unknown("the process table is unreadable".to_string())
         } else {
-            let sigs = resolve_mcp_servers(cmdlines.get(&p.pid).map(String::as_str), p.cwd.as_deref());
+            let sigs =
+                resolve_mcp_servers(cmdlines.get(&p.pid).map(String::as_str), p.cwd.as_deref());
             classify_descendants(p.pid, &snapshot.parent_map, &cmdlines, sigs.as_deref())
         };
         let pending_autonomous = terminal_id
@@ -1945,7 +1946,13 @@ pub(crate) fn resume_block_from(
             "unknown: the process census did not resolve, so no live session could be \
              classified",
         ));
-        return build_block(&barrier.id, &[], others, expected_restore_set, wake_paths_gated);
+        return build_block(
+            &barrier.id,
+            &[],
+            others,
+            expected_restore_set,
+            wake_paths_gated,
+        );
     };
     for p in &pass.report.headless_exempt {
         others.push(Straggler::other(
@@ -2001,7 +2008,10 @@ pub(crate) fn resume_block_from(
                 // one census, never a parallel idle heuristic.
                 activity: process_activity(p, activity),
                 record: record_waiting_read(p, activity),
-                is_requester: p.session_id.as_deref().is_some_and(|sid| barrier.exempts(sid)),
+                is_requester: p
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|sid| barrier.exempts(sid)),
                 pending_autonomous,
                 sideband,
                 descendants,
@@ -2010,7 +2020,13 @@ pub(crate) fn resume_block_from(
         })
         .collect();
 
-    build_block(&barrier.id, &sessions, others, expected_restore_set, wake_paths_gated)
+    build_block(
+        &barrier.id,
+        &sessions,
+        others,
+        expected_restore_set,
+        wake_paths_gated,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4099,7 +4115,10 @@ mod tests {
         assert_eq!(p4.pid, 4);
         assert_eq!(process_activity(p4, &evidence), Activity::Idle);
         use crate::quiet_barrier::resume::RecordWaitingRead;
-        assert_eq!(record_waiting_read(p4, &evidence), RecordWaitingRead::Waiting);
+        assert_eq!(
+            record_waiting_read(p4, &evidence),
+            RecordWaitingRead::Waiting
+        );
         assert_eq!(
             record_waiting_read(&report.terminal_hosted[1], &evidence),
             RecordWaitingRead::NotWaiting
@@ -4513,13 +4532,6 @@ mod tests {
             9
         );
     }
-
-            &[],
-            Some(ai_plane_from(&[], &[], now_ms)),
-            vec![],
-            idle_drain(),
-            fresh_census(now_ms),
-            now_ms,
     // ------------------------------------------------------------------
     // Phase 2 of `2026-09-07-health-database-reachable-is-a-connect-probe-
     // not-a-schema-probe`: the AI/task-run plane is reported as unobtainable
@@ -4932,12 +4944,11 @@ mod tests {
                 .collect(),
             now_ms,
         };
-        let restorable: Result<HashMap<String, bool>, String> = Ok([
-            "s-ok", "s-fin", "s-req", "s-pend", "s-norec",
-        ]
-        .into_iter()
-        .map(|s| (s.to_string(), true))
-        .collect());
+        let restorable: Result<HashMap<String, bool>, String> =
+            Ok(["s-ok", "s-fin", "s-req", "s-pend", "s-norec"]
+                .into_iter()
+                .map(|s| (s.to_string(), true))
+                .collect());
         let probe = |p: &LiveClaudeProcess| ResumeProbe {
             terminal_id: Some(format!("term-{}", p.pid)),
             sideband: SidebandRead::Reported("finished".to_string()),
@@ -5020,7 +5031,10 @@ mod tests {
             .filter(|s| s.session_id.is_none() && s.pid.is_none())
             .map(|s| s.class)
             .collect();
-        assert!(classes.contains(&"pending_autonomous_prompt"), "{classes:?}");
+        assert!(
+            classes.contains(&"pending_autonomous_prompt"),
+            "{classes:?}"
+        );
         assert!(classes.contains(&"ai_session"), "{classes:?}");
 
         // A session the manager cannot resolve is `unknown`, never "no pending".
@@ -5067,7 +5081,10 @@ mod tests {
         assert_eq!(missing.resumable_count, 0);
         assert_eq!(missing.blocking_count, 1);
         assert_eq!(missing.stragglers[0].class, "unknown");
-        assert!(missing.stragglers[0].reason.contains("census"), "{missing:?}");
+        assert!(
+            missing.stragglers[0].reason.contains("census"),
+            "{missing:?}"
+        );
     }
 
     /// Under an open barrier the `resume` block serializes with its exact wire
@@ -5109,7 +5126,10 @@ mod tests {
             ]
         );
         assert_eq!(resume["barrier_id"], "rr-20260929T101500Z-a1b2c3");
-        assert_eq!(resume["expected_restore_set"], serde_json::json!(["sess-a"]));
+        assert_eq!(
+            resume["expected_restore_set"],
+            serde_json::json!(["sess-a"])
+        );
 
         let mut v = idle_verdict();
         let block = build_block(
@@ -5130,7 +5150,10 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["class", "pid", "reason", "session_id", "terminal_id"]);
+        assert_eq!(
+            keys,
+            ["class", "pid", "reason", "session_id", "terminal_id"]
+        );
         assert_eq!(straggler["pid"], 42);
         assert_eq!(json["resume"]["blocking_count"], 1);
     }

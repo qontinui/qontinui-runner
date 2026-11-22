@@ -280,13 +280,18 @@ pub fn parse_record(bytes: &[u8], mtime: Option<DateTime<Utc>>) -> FileRecord {
     if !schema.is_some_and(schema_is_one) {
         return corrupt(format!(
             "unknown schema {}",
-            schema.map(|v| v.to_string()).unwrap_or_else(|| "None".into())
+            schema
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "None".into())
         ));
     }
     let scope_raw = rec.get("scope").and_then(|v| v.as_str());
     let id = rec.get("id").and_then(|v| v.as_str());
     let state = rec.get("state").and_then(|v| v.as_str());
-    let opened_at = rec.get("opened_at").and_then(|v| v.as_str()).and_then(parse_ts);
+    let opened_at = rec
+        .get("opened_at")
+        .and_then(|v| v.as_str())
+        .and_then(parse_ts);
     let (Some(scope_raw), Some(id), Some(state @ ("open" | "released")), Some(opened_at)) =
         (scope_raw, id, state, opened_at)
     else {
@@ -315,7 +320,10 @@ pub fn parse_record(bytes: &[u8], mtime: Option<DateTime<Utc>>) -> FileRecord {
     FileRecord::Recorded(Barrier {
         id: id.to_string(),
         scope,
-        purpose: rec.get("purpose").and_then(|v| v.as_str()).map(str::to_string),
+        purpose: rec
+            .get("purpose")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         requester_session_id,
         opened_at,
         until: until.min(max_until),
@@ -607,7 +615,10 @@ pub enum WakeDecision {
     Allow,
     /// Deferred, not dropped: the caller must keep the work and retry after
     /// the barrier is released or expires.
-    Defer { barrier_id: String, reason: String },
+    Defer {
+        barrier_id: String,
+        reason: String,
+    },
 }
 
 /// PURE: the wake decision for `class` against `state`, for a write into a
@@ -912,7 +923,9 @@ pub mod pending {
 /// supervisor, the auto-responder's scan) rather than meet the funnel's
 /// refusal. Not requester-aware: those producers have no single target.
 pub fn autonomous_wakes_held() -> Option<String> {
-    runner_restart_barrier_open().barrier_id().map(str::to_string)
+    runner_restart_barrier_open()
+        .barrier_id()
+        .map(str::to_string)
 }
 
 /// The refusal string for a deferred write. Shape:
@@ -1051,7 +1064,10 @@ mod tests {
 
     #[test]
     fn fixture_corrupt_is_unknown_while_young_and_ignored_when_old() {
-        assert!(matches!(verdict_of("corrupt.json"), FileVerdict::Unknown(_)));
+        assert!(matches!(
+            verdict_of("corrupt.json"),
+            FileVerdict::Unknown(_)
+        ));
         let old = Some(fixed_now() - chrono::Duration::hours(3));
         assert!(matches!(
             parse_record(fixture("corrupt.json"), old).verdict(fixed_now()),
@@ -1085,13 +1101,21 @@ mod tests {
         let FileRecord::Recorded(b) = parse_record(rec, None) else {
             panic!()
         };
-        assert_eq!(b.until, parse_ts("2026-09-29T11:00:00Z").unwrap(), "1 h cap");
+        assert_eq!(
+            b.until,
+            parse_ts("2026-09-29T11:00:00Z").unwrap(),
+            "1 h cap"
+        );
 
         let rec = br#"{"schema":1,"id":"repo-z","scope":"repo:x","opened_at":"2026-09-29T10:00:00Z","until":"2026-09-29T15:00:00Z","state":"open"}"#;
         let FileRecord::Recorded(b) = parse_record(rec, None) else {
             panic!()
         };
-        assert_eq!(b.until, parse_ts("2026-09-29T12:00:00Z").unwrap(), "2 h cap");
+        assert_eq!(
+            b.until,
+            parse_ts("2026-09-29T12:00:00Z").unwrap(),
+            "2 h cap"
+        );
     }
 
     /// Mirrors the reference reader: a scope outside the grammar is kept (it
@@ -1203,7 +1227,10 @@ mod tests {
                 *mtime = Some(open_now - chrono::Duration::minutes(1));
             }
         }
-        let scan = Scan { files, dir_error: None };
+        let scan = Scan {
+            files,
+            dir_error: None,
+        };
         let state = scan.runner_restart_state(open_now);
         let BarrierState::Unknown(why) = &state else {
             panic!("expected unknown, got {state:?}");
@@ -1269,7 +1296,10 @@ mod tests {
         for caller in [HttpSessionMessage, ConductorReprompt, SessionMessagePoller] {
             let err = sdk_wake_refusal(caller, &open, "task-run-1", &["task-run-1".to_string()])
                 .unwrap_or_else(|| panic!("{caller:?} must be deferred"));
-            assert_eq!(deferred_barrier_id(&err), Some("rr-20260929T101500Z-a1b2c3"));
+            assert_eq!(
+                deferred_barrier_id(&err),
+                Some("rr-20260929T101500Z-a1b2c3")
+            );
             assert!(err.contains(caller.tag()), "{err}");
             let (status, body) = http_conflict(&err).expect("409");
             assert_eq!(status, axum::http::StatusCode::CONFLICT);
@@ -1296,18 +1326,17 @@ mod tests {
             HttpTaskRunMessage,
             ExecutorFirstMessage,
         ] {
-            assert_eq!(sdk_wake_refusal(caller, &open, "t", &[]), None, "{caller:?}");
+            assert_eq!(
+                sdk_wake_refusal(caller, &open, "t", &[]),
+                None,
+                "{caller:?}"
+            );
             assert_eq!(
                 with_test_state(open.clone(), || sdk_wake_gate(caller, "t", &[])),
                 Ok(())
             );
         }
-        assert!(with_test_state(open, || sdk_wake_gate(
-            ConductorReprompt,
-            "t",
-            &[]
-        ))
-        .is_err());
+        assert!(with_test_state(open, || sdk_wake_gate(ConductorReprompt, "t", &[])).is_err());
         assert!(http_conflict("TERMINAL_EXITED: gone").is_none());
     }
 
@@ -1323,8 +1352,12 @@ mod tests {
 
     #[test]
     fn autonomous_wakes_deferred_under_reads_the_gate() {
-        assert!(autonomous_wakes_deferred_under(&open_rr_with_requester("r")));
-        assert!(autonomous_wakes_deferred_under(&BarrierState::Unknown("x".into())));
+        assert!(autonomous_wakes_deferred_under(&open_rr_with_requester(
+            "r"
+        )));
+        assert!(autonomous_wakes_deferred_under(&BarrierState::Unknown(
+            "x".into()
+        )));
         assert!(!autonomous_wakes_deferred_under(&BarrierState::Absent));
     }
 
@@ -1396,12 +1429,14 @@ mod tests {
         );
         // A zero-TTL reader sees the release immediately.
         let fresh = BarrierReader::new(Some(tmp.path().to_path_buf()), Duration::ZERO);
-        assert_eq!(fresh.runner_restart_state(fixed_now()), BarrierState::Absent);
+        assert_eq!(
+            fresh.runner_restart_state(fixed_now()),
+            BarrierState::Absent
+        );
     }
 
     fn open_barrier(requester: Option<&str>) -> BarrierState {
-        let FileRecord::Recorded(mut b) =
-            parse_record(fixture("open-runner-restart.json"), None)
+        let FileRecord::Recorded(mut b) = parse_record(fixture("open-runner-restart.json"), None)
         else {
             panic!()
         };

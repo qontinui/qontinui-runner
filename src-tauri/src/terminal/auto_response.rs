@@ -1776,7 +1776,10 @@ mod tests {
         }
 
         scheduler::settle_with(tid, rid, SubmitOutcome::Deferred, t0, true);
-        assert!(!scheduler::is_pending(tid, rid), "release_deferred freed the pair");
+        assert!(
+            !scheduler::is_pending(tid, rid),
+            "release_deferred freed the pair"
+        );
         {
             let edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(
@@ -1785,18 +1788,28 @@ mod tests {
                 "rearm_edge reset the consumed edge"
             );
         }
-        assert!(crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key(rid)
+        ));
         // No attempt consumed: the next schedule is at attempt 0's delay.
         assert_eq!(
-            scheduler::register_match(tid, rid, &cfg, t0).unwrap().as_secs(),
+            scheduler::register_match(tid, rid, &cfg, t0)
+                .unwrap()
+                .as_secs(),
             60
         );
 
         // Delivered after release: backoff grows, entry cleared.
         scheduler::settle_with(tid, rid, SubmitOutcome::Submitted, t0, true);
-        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(!crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key(rid)
+        ));
         assert_eq!(
-            scheduler::register_match(tid, rid, &cfg, t0).unwrap().as_secs(),
+            scheduler::register_match(tid, rid, &cfg, t0)
+                .unwrap()
+                .as_secs(),
             120
         );
 
@@ -1812,7 +1825,10 @@ mod tests {
         );
         scheduler::release_deferred(tid, rid);
         clear_unwanted_pending(tid, rid);
-        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(!crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key(rid)
+        ));
     }
 
     /// W3: a deferred fire on an UNCHANGED screen is re-evaluated by the first
@@ -1827,7 +1843,13 @@ mod tests {
             assert!(g.should_scan(tid, 7));
             assert!(!g.should_scan(tid, 7), "unchanged: skipped");
         }
-        scheduler::settle_with(tid, "rule-unchanged", SubmitOutcome::Deferred, Instant::now(), true);
+        scheduler::settle_with(
+            tid,
+            "rule-unchanged",
+            SubmitOutcome::Deferred,
+            Instant::now(),
+            true,
+        );
         let mut gate = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             gate.as_mut().unwrap().should_scan(tid, 7),
@@ -1846,12 +1868,18 @@ mod tests {
         assert!(scheduler::register_match(tid, rid, &cfg, Instant::now()).is_some());
         crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
         scheduler::settle_with(tid, rid, SubmitOutcome::Deferred, Instant::now(), false);
-        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(!crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key(rid)
+        ));
         assert!(!scheduler::is_pending(tid, rid));
         // `settle` itself reads the live rule set: this id is not loaded.
         crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
         scheduler::settle(tid, rid, SubmitOutcome::Deferred, Instant::now());
-        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(!crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key(rid)
+        ));
     }
 
     /// W3: removing a rule, or deactivating every rule, drops its deferred
@@ -1863,8 +1891,14 @@ mod tests {
         crate::quiet_barrier::pending::mark(tid, &pending_key("gone"), "deferred");
         let live: std::collections::HashSet<String> = ["kept".to_string()].into();
         prune_pending_for_rules(&live);
-        assert!(crate::quiet_barrier::pending::contains(tid, &pending_key("kept")));
-        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key("gone")));
+        assert!(crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key("kept")
+        ));
+        assert!(!crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key("gone")
+        ));
         // Deactivated: no rules at all.
         prune_pending_for_rules(&std::collections::HashSet::new());
         assert!(crate::quiet_barrier::pending::for_session(tid).is_empty());
@@ -1885,13 +1919,22 @@ mod tests {
         })
         .join();
         assert!(joined.is_err());
-        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
-        assert!(!scheduler::is_pending(tid, rid), "the pair can schedule again");
+        assert!(!crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key(rid)
+        ));
+        assert!(
+            !scheduler::is_pending(tid, rid),
+            "the pair can schedule again"
+        );
 
         // A disarmed guard (the task reached `settle`) leaves the entry alone.
         crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
         scheduler::FireGuard::new(tid, rid).disarm();
-        assert!(crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(crate::quiet_barrier::pending::contains(
+            tid,
+            &pending_key(rid)
+        ));
         crate::quiet_barrier::pending::clear(tid, &pending_key(rid));
     }
 

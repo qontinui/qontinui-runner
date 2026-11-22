@@ -271,10 +271,7 @@ pub fn drain_one(
         return None;
     }
     let next = take_next_sendable(&mut q, gate);
-    let key = next
-        .as_ref()
-        .or(q.front())
-        .map(|m| m.registry_key.clone());
+    let key = next.as_ref().or(q.front()).map(|m| m.registry_key.clone());
     let out = match next {
         Some(m) => {
             let r = sink.write_turn(&m);
@@ -325,7 +322,13 @@ mod tests {
     use std::sync::Arc;
 
     fn msg(text: &str, caller: SdkMessageCaller) -> QueuedMessage {
-        QueuedMessage::new(text, caller, "sdk-sess", vec!["sdk-sess".to_string()], "sdk-sess#t")
+        QueuedMessage::new(
+            text,
+            caller,
+            "sdk-sess",
+            vec!["sdk-sess".to_string()],
+            "sdk-sess#t",
+        )
     }
 
     /// A recorder sink: `Ready` until a turn is written, then `Processing`
@@ -391,7 +394,10 @@ mod tests {
 
         let first = take_next_sendable(&mut q, &defer).expect("the operator entry drains");
         assert_eq!(first.text, "typed");
-        assert!(take_next_sendable(&mut q, &defer).is_none(), "autonomous entries are held");
+        assert!(
+            take_next_sendable(&mut q, &defer).is_none(),
+            "autonomous entries are held"
+        );
         assert_eq!(q.len(), 2, "held, not dropped");
 
         assert_eq!(take_next_sendable(&mut q, &allow).unwrap().text, "poller");
@@ -441,16 +447,29 @@ mod tests {
         let queue: Mutex<VecDeque<QueuedMessage>> = Mutex::new(VecDeque::new());
         let sink = Recorder::default();
         assert_eq!(
-            submit(&queue, msg("first", SdkMessageCaller::HttpSessionMessage), 10, &sink, &allow),
+            submit(
+                &queue,
+                msg("first", SdkMessageCaller::HttpSessionMessage),
+                10,
+                &sink,
+                &allow
+            ),
             Ok(Submitted::Now)
         );
         let held = msg("held", SdkMessageCaller::SessionMessagePoller);
-        assert_eq!(submit(&queue, held, 10, &sink, &defer), Ok(Submitted::Queued));
+        assert_eq!(
+            submit(&queue, held, 10, &sink, &defer),
+            Ok(Submitted::Queued)
+        );
         sink.end_turn();
         let typed = msg("typed", SdkMessageCaller::TauriAiSessionMessage);
         assert_eq!(submit(&queue, typed, 10, &sink, &defer), Ok(Submitted::Now));
         assert_eq!(sink.written(), vec!["first", "typed"]);
-        assert_eq!(queue.lock().unwrap().len(), 1, "the held entry is still queued");
+        assert_eq!(
+            queue.lock().unwrap().len(),
+            1,
+            "the held entry is still queued"
+        );
         sink.assert_no_double_send();
     }
 
@@ -478,7 +497,10 @@ mod tests {
         assert!(err.contains("queue full"), "{err}");
         let q = queue.lock().unwrap();
         assert_eq!(q.len(), 10);
-        assert!(q.iter().all(|m| m.text != "extra"), "the refused message is not queued");
+        assert!(
+            q.iter().all(|m| m.text != "extra"),
+            "the refused message is not queued"
+        );
         sink.assert_no_double_send();
     }
 
@@ -495,11 +517,17 @@ mod tests {
 
         // Another message won the race: mid-turn → refused, nothing written.
         let err = submit_initial(&queue, first("brief-2"), &sink).expect_err("not ready");
-        assert!(err.contains("initial-prompt race") && err.contains("NOT written"), "{err}");
+        assert!(
+            err.contains("initial-prompt race") && err.contains("NOT written"),
+            "{err}"
+        );
 
         // Ready but something is queued → refused, queue untouched.
         let queued = msg("poller", SdkMessageCaller::SessionMessagePoller);
-        assert_eq!(submit(&queue, queued, 10, &sink, &allow), Ok(Submitted::Queued));
+        assert_eq!(
+            submit(&queue, queued, 10, &sink, &allow),
+            Ok(Submitted::Queued)
+        );
         sink.end_turn();
         let err = submit_initial(&queue, first("brief-3"), &sink).expect_err("queued");
         assert!(err.contains("already queued"), "{err}");
@@ -524,7 +552,10 @@ mod tests {
         let sink = Recorder::default();
         assert_eq!(submit_initial(&queue, first("brief"), &sink), Ok(()));
         // — registered here; a peer reaches it immediately —
-        assert_eq!(submit(&queue, peer(), 10, &sink, &allow), Ok(Submitted::Queued));
+        assert_eq!(
+            submit(&queue, peer(), 10, &sink, &allow),
+            Ok(Submitted::Queued)
+        );
         sink.end_turn();
         assert!(drain_one(&queue, &sink, &allow).is_some());
         assert_eq!(sink.written(), vec!["brief", "peer"]);
@@ -533,7 +564,10 @@ mod tests {
         // Old order: registered first, the peer wins, the brief is refused.
         let queue: Mutex<VecDeque<QueuedMessage>> = Mutex::new(VecDeque::new());
         let sink = Recorder::default();
-        assert_eq!(submit(&queue, peer(), 10, &sink, &allow), Ok(Submitted::Now));
+        assert_eq!(
+            submit(&queue, peer(), 10, &sink, &allow),
+            Ok(Submitted::Now)
+        );
         assert!(submit_initial(&queue, first("brief"), &sink).is_err());
         assert_eq!(sink.written(), vec!["peer"], "the brief never went out");
     }
@@ -589,7 +623,10 @@ mod tests {
                     Ok(_) => break,
                     // Retry ONLY on queue-full; any other error is a failure.
                     Err(e) if e.contains("queue full") => {
-                        assert!(std::time::Instant::now() < deadline, "submit never got room");
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "submit never got room"
+                        );
                         std::thread::yield_now();
                     }
                     Err(e) => panic!("submit failed: {e}"),
@@ -606,10 +643,17 @@ mod tests {
         for d in drainers {
             d.join().unwrap();
         }
-        assert!(!queue.is_poisoned(), "a drainer panicked under the queue lock");
+        assert!(
+            !queue.is_poisoned(),
+            "a drainer panicked under the queue lock"
+        );
         sink.assert_no_double_send();
         let written = sink.written();
-        assert_eq!(written.len(), N, "everything was written before the deadline");
+        assert_eq!(
+            written.len(),
+            N,
+            "everything was written before the deadline"
+        );
         let mut sorted = written.clone();
         sorted.sort();
         assert_eq!(written, sorted, "autonomous messages are written FIFO");
@@ -632,7 +676,10 @@ mod tests {
             take_next_sendable(&mut q, &live_gate)
         });
         assert!(held.is_none());
-        assert_eq!(take_next_sendable(&mut q, &live_gate).unwrap().text, "poller");
+        assert_eq!(
+            take_next_sendable(&mut q, &live_gate).unwrap().text,
+            "poller"
+        );
     }
 
     /// The registry tracks queued AUTONOMOUS entries only, per instance key.
@@ -673,7 +720,10 @@ mod tests {
         sync_pending(&new_key, &new_q);
         let old_queue: Mutex<VecDeque<QueuedMessage>> = Mutex::new(VecDeque::new());
         discard_all(&old_queue, &old_key);
-        assert_eq!(crate::quiet_barrier::pending::for_session(&new_key).len(), 1);
+        assert_eq!(
+            crate::quiet_barrier::pending::for_session(&new_key).len(),
+            1
+        );
         let new_queue = Mutex::new(new_q);
         discard_all(&new_queue, &new_key);
         assert!(crate::quiet_barrier::pending::for_session(&new_key).is_empty());

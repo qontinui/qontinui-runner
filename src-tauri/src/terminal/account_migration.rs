@@ -1071,10 +1071,10 @@ where
 /// future is first polled.
 async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
     use tauri::Manager;
-        let started = std::time::Instant::now();
-        // A quiet-barrier deferral re-runs the whole watch (busy/ready re-judged)
-        // after a fresh window, bounded by PROMPT_WHEN_IDLE_DEFERRAL_CAP.
-        'watch: loop {
+    let started = std::time::Instant::now();
+    // A quiet-barrier deferral re-runs the whole watch (busy/ready re-judged)
+    // after a fresh window, bounded by PROMPT_WHEN_IDLE_DEFERRAL_CAP.
+    'watch: loop {
         let session_now = || {
             let app = crate::tauri_app_handle::current()?;
             let tm = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?;
@@ -1145,7 +1145,7 @@ async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static s
                 "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
             ),
         }
-    break 'watch;
+        break 'watch;
     }
 }
 
@@ -3459,7 +3459,10 @@ mod tests {
         spawn_prompt_when_idle(tid.to_string(), "continue".to_string(), "continue-nudge");
         let pending = crate::quiet_barrier::pending::for_session(tid);
         assert_eq!(pending.len(), 1, "{pending:?}");
-        assert!(pending[0].starts_with("account_migration:continue-nudge"), "{pending:?}");
+        assert!(
+            pending[0].starts_with("account_migration:continue-nudge"),
+            "{pending:?}"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !crate::quiet_barrier::pending::for_session(tid).is_empty() {
             assert!(

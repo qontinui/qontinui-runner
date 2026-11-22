@@ -2059,7 +2059,7 @@ fn transcript_coverage_body(
 mod tests {
     use super::*;
 
-    // ==================================================================    }
+    // =========================================================================
 
     // POST /sessions/{id}/finish — the response contract
     //
@@ -2288,7 +2288,8 @@ mod tests {
         assert_eq!(read["session"]["finishSynced"], true, "{read}");
         assert_eq!(read["coord"]["reason"], "not_requeued");
         assert_eq!(read["session"]["finishedAt"], again_at);
-=======
+    }
+
     /// Plan `2026-09-29-quiet-on-demand-…`, D4: `POST /sessions/{id}/message`
     /// maps a quiet-barrier deferral to `409 QUIET_BARRIER_DEFERRED` naming the
     /// barrier, and leaves every other refusal a `500`.
