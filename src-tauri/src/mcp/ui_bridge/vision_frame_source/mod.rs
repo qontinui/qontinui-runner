@@ -317,33 +317,38 @@ impl DeviceScreenshotSource {
             // - UNCODED, only off a gateway status: at 502/503/504 a proxy may
             //   answer in the runner's own `{success:false, error}` shape, so
             //   an uncoded envelope there stays the transport's.
+            // At a gateway status a code counts only when it was SENT as a
+            // non-blank string (top level, or inside an object `error`): a
+            // numeric code there is most likely a proxy echoing its status.
+            let string_coded = body.as_ref().is_some_and(has_string_code);
             let refusal_message = match body
                 .as_ref()
                 .and_then(|b| device_refusal(&url, status.as_u16(), b))
             {
-                Some(refusal @ FrameSourceError::CaptureFailed { code: Some(_), .. }) => {
+                Some(refusal @ FrameSourceError::CaptureFailed { code: Some(_), .. })
+                    if !gateway || string_coded =>
+                {
                     return Err(refusal)
                 }
                 Some(refusal) if !gateway => return Err(refusal),
-                // An uncoded envelope at a gateway status: classified as the
+                // An envelope at a gateway status with no string code: the
                 // transport's below, but its parsed message (a string or an
-                // object `error`) is kept — only when it actually carried an
-                // `error`, so a bare `{success:false}` adds no placeholder.
-                Some(refusal)
-                    if body
-                        .as_ref()
-                        .is_some_and(|b| b.get("error").is_some_and(|e| !e.is_null())) =>
-                {
+                // object `error`) is kept — only when it actually carried a
+                // non-blank `error`, so a bare `{success:false}` or a blank
+                // `error` adds no placeholder and no trailing `: `.
+                Some(refusal) if body.as_ref().is_some_and(carries_error) => {
                     Some(refusal.to_string())
                 }
                 Some(_) | None => None,
             };
-            // Anything else may still carry an `error` string; keep it.
+            // Anything else may still carry a non-blank `error` string; keep it.
             let message = refusal_message.unwrap_or_else(|| {
-                match body
-                    .as_ref()
-                    .and_then(|b| b.get("error")?.as_str().map(str::to_string))
-                {
+                match body.as_ref().and_then(|b| {
+                    b.get("error")?
+                        .as_str()
+                        .filter(|e| !e.trim().is_empty())
+                        .map(str::to_string)
+                }) {
                     Some(reason) => {
                         format!("device screenshot {url} returned HTTP {status}: {reason}")
                     }
@@ -391,6 +396,30 @@ impl FrameProvider for DeviceScreenshotSource {
 
     fn source_label(&self) -> &'static str {
         "device_http"
+    }
+}
+
+/// Whether `body` sent its code as a non-blank STRING: a top-level
+/// `code`/`errorCode`, or one inside an object `error`, both read by the
+/// shared [`crate::mcp::app_dispatch::top_level_code`]. A numeric code (which
+/// `WrapperFailure::from_wire` does read inside an object `error`) is not.
+fn has_string_code(body: &serde_json::Value) -> bool {
+    use crate::mcp::app_dispatch::top_level_code;
+    top_level_code(body).is_some()
+        || body
+            .get("error")
+            .filter(|e| e.is_object())
+            .and_then(top_level_code)
+            .is_some()
+}
+
+/// Whether `body` carries an `error` worth appending: anything but absent,
+/// `null` or a blank string.
+fn carries_error(body: &serde_json::Value) -> bool {
+    match body.get("error") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(e)) => !e.trim().is_empty(),
+        Some(_) => true,
     }
 }
 
@@ -1056,6 +1085,57 @@ mod tests {
         assert_eq!(
             err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
             "transport"
+        );
+    }
+
+    /// A NUMERIC code inside an object `error` at a gateway status is a
+    /// proxy echoing its status, not a device refusal: transport, message kept.
+    #[tokio::test]
+    async fn a_nested_numeric_code_at_a_gateway_status_is_unreachable() {
+        let body = serde_json::json!({
+            "success": false,
+            "error": {"code": 502, "message": "Bad Gateway"},
+        });
+        let err =
+            fetch_from(answering(axum::http::StatusCode::BAD_GATEWAY, Some(body)).await).await;
+        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+        assert_eq!(
+            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+            "transport"
+        );
+        assert!(err.to_string().ends_with(": Bad Gateway"), "{err}");
+    }
+
+    /// Off a gateway status a numeric code inside an object `error` is still
+    /// honoured (`WrapperFailure::from_wire` reads it as a string).
+    #[tokio::test]
+    async fn a_nested_numeric_code_off_a_gateway_status_is_honoured() {
+        let body = serde_json::json!({
+            "success": false,
+            "error": {"code": 7, "message": "renderer crashed"},
+        });
+        let err =
+            fetch_from(answering(axum::http::StatusCode::INTERNAL_SERVER_ERROR, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "7", "{err:?}");
+        assert_eq!(
+            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+            "app"
+        );
+    }
+
+    /// A blank string `error` at a gateway status adds no `: ` suffix.
+    #[tokio::test]
+    async fn a_blank_error_at_a_gateway_status_adds_no_suffix() {
+        let body = serde_json::json!({"success": false, "error": ""});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.ends_with("returned HTTP 503 Service Unavailable"),
+            "{text}"
         );
     }
 
