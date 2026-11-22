@@ -352,6 +352,25 @@ jobs:
         # changed lines; `-fail-on-error=true` makes those diff findings fail
         # THIS (advisory, non-required) check only.
         #
+        # reviewdog's exit 1 is ALSO what it returns when it fails to create or
+        # post its check run, and GitHub has answered the PATCH of a run created
+        # seconds earlier with `404 Not Found` (job 135103311891 of run
+        # 44389597385 on qontinui-runner#3025, coord finding
+        # 2f3d3b96-7bd6-420e-aff3-f20d29544b74; c58cd00f-7651-4dde-bd3d-d69fcc59f291
+        # on qontinui-coord#4159). That red parked #3025 ~45 h exactly as a
+        # lint finding would. So reviewdog runs through `rso_run_retrying`,
+        # which re-runs it from the same clippy-report.json (no recompile) when
+        # an attempt fails AND its stderr says it did not finish its run (the
+        # completion step's own markers), at most twice, 5 s then 10 s apart.
+        # A findings exit has no such line and is never retried. Whenever a
+        # retry happens, a `retry outcome:` notice in this job's annotations
+        # says whether it recovered (the measure of whether retrying helps
+        # against GitHub's lag at all). When every
+        # attempt still fails to post, the job stays red -- reviewdog's last
+        # rc -- and says, in the `(not a verdict on this PR)` phrase coord's
+        # repair classifier (author_feedback.rs is_no_verdict_annotation)
+        # matches, that this red is GitHub's, not the diff's.
+        #
         # Outputs whenever this shell exits (a normal end, a death under
         # `set -e`, a SIGTERM/SIGINT from a cancel; not a SIGKILL or a runner
         # death, which write nothing and read as unknown, while a helper that
@@ -367,8 +386,9 @@ jobs:
         # by the sourced helper .github/scripts/reviewdog-step-outputs.sh,
         # whose header is the contract and whose test checks every output read
         # below; it is vendored from qontinui-coord and pinned with the other
-        # copies (see the completion step). The step still exits with
-        # reviewdog's status, so its pass/fail is unchanged.
+        # copies (see the completion step). The step exits with the LAST
+        # reviewdog attempt's status: a failed post that a retry recovers
+        # passes, and a diff finding still fails.
         env:
           CARGO_BUILD_JOBS: 1
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -384,17 +404,21 @@ jobs:
           rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
           cargo clippy --message-format=json > clippy-report.json 2>/dev/null || true
-          # rso_run marks the window's start, captures reviewdog's stderr for
-          # the completion step and replays it into this log (after reviewdog
-          # returns, not interleaved), and sets rc only once reviewdog has
-          # returned -- a cancel mid-reviewdog leaves `unknown`, never a pass.
-          rso_run reviewdog \
+          # rso_run_retrying marks the window's start ONCE, before the first
+          # attempt, appends every attempt's stderr to the log the completion
+          # step reads (so each failed attempt's `check-runs/<id>` reaches it)
+          # and replays each attempt's stderr into this log once it returns,
+          # and sets rc only once the last attempt has returned -- a cancel
+          # mid-attempt or mid-retry leaves `unknown`, never a pass.
+          rso_run_retrying clippy-report.json reviewdog \
             -f=clippy \
             -name="clippy-diff" \
             -filter-mode=diff_context \
             -reporter=github-pr-check \
-            -fail-on-error=true \
-            < clippy-report.json
+            -fail-on-error=true
+          if [ "${RSO_POST_FAILED:-0}" = 1 ]; then
+            echo "::error title=Clippy diff-scoped (advisory): reviewdog could not post its check run (not a verdict on this PR)::reviewdog reported a failed check create or post on all ${RSO_ATTEMPTS} attempt(s), last exit ${rc}, so no lint verdict reached this diff. That is a GitHub API failure, not a clippy finding: re-run this job."
+          fi
           exit "$rc"
         shell: bash
 
@@ -415,7 +439,12 @@ jobs:
       # Phase 2b). Here a reviewdog failure already reds THIS job, so this step
       # only completes the orphaned run as `neutral` -- with a summary naming
       # reviewdog's rc and this job -- and leaves the job's own red to report
-      # the failure. It acts only when reviewdog itself reported that it did
+      # the failure. Since the step above retries a failed post, the job can
+      # be GREEN while an earlier attempt's run is still `in_progress`: the
+      # stderr log holds every attempt, so that run's id is still read here,
+      # and when a later attempt may have left a run no line names (a failed
+      # create, or a cancel mid-attempt) the script lists the window as well
+      # (its header, WHICH RUNS 1). It acts only when reviewdog itself reported that it did
       # not finish its run (`failed to create check` / `failed to post` /
       # `check-runs/<id>` in its stderr), or when the step ended before
       # reviewdog returned: a clean reviewdog exit -- 0, or 1 for diff
@@ -487,7 +516,12 @@ jobs:
       # The vendored scripts' own fixture tests, byte-identical to coord's
       # (canonical: qontinui-coord .github/scripts/test-complete-orphaned-check-runs.sh
       # and test-reviewdog-step-outputs.sh; the second also checks that every
-      # steps.clippy.outputs.* read in this file is one the helper writes).
+      # steps.clippy.outputs.* read in this file is one the helper writes),
+      # then this repo's own test-clippy-diff-step.sh (NOT vendored or
+      # pinned), which runs the `clippy` step's `run:` block above with stub
+      # cargo/reviewdog/curl: a failed post then success is green, a finding
+      # is red, and a post that keeps failing is red and says it is not a
+      # verdict.
       # Hermetic (a stub gh and curl, an injected sleep), seconds on this
       # existing hosted job. All four files are checked against
       # complete-orphaned-check-runs.sha256 (see the step above for what that
@@ -505,6 +539,7 @@ jobs:
             || { echo "::error title=complete-orphaned-check-runs pin mismatch::a vendored copy was changed without updating .github/scripts/complete-orphaned-check-runs.sha256; copy the files from qontinui-coord and regenerate that file."; exit 1; }
           bash .github/scripts/test-complete-orphaned-check-runs.sh
           bash .github/scripts/test-reviewdog-step-outputs.sh
+          bash .github/scripts/test-clippy-diff-step.sh
 
       # A setup death is NOT a verdict on this PR (plan
       # 2026-11-05-repair-classifier-reads-why-a-check-failed, Phase 3). When a
@@ -514,7 +549,9 @@ jobs:
       # phrase "(not a verdict on this PR)" -- coord's repair classifier
       # (author_feedback.rs is_no_verdict_annotation) matches it byte-exact and
       # re-runs instead of blaming the PR's code. Emits nothing when the
-      # reviewdog step itself failed (that IS a verdict) or no setup step did.
+      # reviewdog step itself failed (a diff finding IS a verdict; a post
+      # failure that outlasts the retries declares itself not one, in that
+      # step) or no setup step did.
       # Outcomes arrive via env only; step names below are static literals.
       - name: Declare a setup death (not a verdict on this PR)
         if: failure()
