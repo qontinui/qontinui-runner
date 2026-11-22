@@ -327,9 +327,16 @@ impl DeviceScreenshotSource {
                 Some(refusal) if !gateway => return Err(refusal),
                 // An uncoded envelope at a gateway status: classified as the
                 // transport's below, but its parsed message (a string or an
-                // object `error`) is kept.
-                Some(refusal) => Some(refusal.to_string()),
-                None => None,
+                // object `error`) is kept — only when it actually carried an
+                // `error`, so a bare `{success:false}` adds no placeholder.
+                Some(refusal)
+                    if body
+                        .as_ref()
+                        .is_some_and(|b| b.get("error").is_some_and(|e| !e.is_null())) =>
+                {
+                    Some(refusal.to_string())
+                }
+                Some(_) | None => None,
             };
             // Anything else may still carry an `error` string; keep it.
             let message = refusal_message.unwrap_or_else(|| {
@@ -1036,6 +1043,37 @@ mod tests {
         assert_eq!(hint["failure_origin"], "app");
         assert_eq!(hint["retryable"], true, "{err:?}");
         assert!(err.to_string().contains("renderer crashed"), "{err}");
+    }
+
+    /// A proxy echoing its own status as a numeric `code` is not an app code:
+    /// a 502 `{success:false, error, code: 502}` stays the transport's.
+    #[tokio::test]
+    async fn a_numeric_code_at_a_gateway_status_is_unreachable() {
+        let body = serde_json::json!({"success": false, "error": "bad gateway", "code": 502});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::BAD_GATEWAY, Some(body)).await).await;
+        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+        assert_eq!(
+            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+            "transport"
+        );
+    }
+
+    /// A bare `{success:false}` at a gateway status carries no message: the
+    /// error reads just the status, with no "Unknown error" placeholder.
+    #[tokio::test]
+    async fn a_bare_failure_envelope_at_a_gateway_status_adds_no_placeholder() {
+        let body = serde_json::json!({"success": false});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.ends_with("returned HTTP 503 Service Unavailable"),
+            "{text}"
+        );
+        assert!(!text.contains("Unknown error"), "{text}");
     }
 
     /// An uncoded envelope at a gateway status stays the transport's, but

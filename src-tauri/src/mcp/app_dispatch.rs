@@ -148,10 +148,11 @@ pub enum DispatchError {
 /// the message, and the wrapper's object shape `{code, message, retryable}`
 /// gives its message, code and retry verdict. A top-level `code` (else
 /// `errorCode`) wins over the object's, and a top-level boolean `retryable`
-/// wins over the object's. A blank code is no code, per key
-/// ([`top_level_code`]): `{"code":"","errorCode":"X"}` reads `X`, as
-/// `WrapperFailure::from_wire` reads an object `error`, and a blank top-level
-/// code never shadows the object's own.
+/// wins over the object's. A top-level code is read only as a non-blank
+/// STRING, per key ([`top_level_code`]): `{"code":"","errorCode":"X"}` reads
+/// `X`, a numeric top-level `code` is skipped, and a blank or non-string
+/// top-level code never shadows the object's own. (`from_wire` is broader
+/// inside an object `error`: it also reads a numeric code there.)
 pub(crate) fn app_answered_failure(
     url: &str,
     status: u16,
@@ -185,20 +186,20 @@ pub(crate) fn app_answered_failure(
     })
 }
 
-/// A body's top-level machine-readable code: `code`, else `errorCode`. Each
-/// key is read the way `WrapperFailure::from_wire` reads an object `error`'s:
-/// a non-blank string, or a number stringified (`503` → `"503"`); anything
-/// else, a blank string included, is skipped (never a code of `""`). The one
+/// A body's top-level machine-readable code: `code`, else `errorCode`, each
+/// read ONLY as a non-blank string. A blank string, a number (e.g. a proxy
+/// echoing its HTTP status) or any other value is skipped per key — never a
+/// code of `""`, and never a status mistaken for an app code. The one
 /// top-level reader [`app_answered_failure`] and the vision device arm share.
 pub(crate) fn top_level_code(json: &serde_json::Value) -> Option<String> {
-    use serde_json::Value;
     ["code", "errorCode"]
         .into_iter()
-        .find_map(|k| match json.get(k) {
-            Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
-            Some(Value::Number(n)) => Some(n.to_string()),
-            _ => None,
+        .find_map(|k| {
+            json.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|c| !c.trim().is_empty())
         })
+        .map(String::from)
 }
 
 impl DispatchError {
@@ -1223,18 +1224,20 @@ mod tests {
         );
     }
 
-    /// A numeric code reads stringified, at the top level as inside an object
-    /// `error` (`from_wire`), so both shapes classify the same.
+    /// A top-level code is read only as a non-blank STRING: a numeric
+    /// `code` (a proxy echoing its status) is skipped per key, so a string
+    /// `errorCode` beside it is the code.
     #[test]
-    fn app_answered_failure_reads_a_numeric_code_at_either_level() {
+    fn app_answered_failure_skips_a_numeric_top_level_code() {
         assert_eq!(
-            answered(json!({"success": false, "error": "x", "code": 503})).and_then(|(_, c)| c),
-            Some("503".to_string())
+            answered(json!({"success": false, "code": 0, "errorCode": "PAIRING_UNAVAILABLE"}))
+                .and_then(|(_, c)| c),
+            Some("PAIRING_UNAVAILABLE".to_string())
         );
         assert_eq!(
-            answered(json!({"success": false, "error": {"code": 503, "message": "m"}}))
+            answered(json!({"success": false, "error": "bad gateway", "code": 502}))
                 .and_then(|(_, c)| c),
-            Some("503".to_string())
+            None
         );
     }
 
