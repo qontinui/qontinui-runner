@@ -195,8 +195,9 @@ fn a_cwd_that_declares_coord_mcp_keeps_its_own_entry() {
 
 /// No bound port: nothing can be provisioned, so the session starts STRICT —
 /// with every non-coord server it would otherwise have had (local over the
-/// nearest project file over user) and no coord-mcp from anywhere — and the
-/// NOT PROVISIONED breadcrumb names why.
+/// nearest project file over user; a project server only when the account
+/// approved it for this project) and no coord-mcp from anywhere — and the NOT
+/// PROVISIONED breadcrumb names why.
 #[test]
 fn no_port_fails_closed_to_a_strict_carry_through_with_no_coord_mcp() {
     let amb = crate::test_env::isolated_ambient();
@@ -204,12 +205,15 @@ fn no_port_fails_closed_to_a_strict_carry_through_with_no_coord_mcp() {
     write_parent_mcp_json(&amb.root());
     let (wd, key) = (worktree_under(&amb.root()), key());
     // The cwd's own file, with no coord-mcp: it overrides the parent's
-    // `parent-tool` (nearest wins) and adds one of its own.
+    // `parent-tool` (nearest wins) and adds one of its own, one the account
+    // declined and one it never approved.
     std::fs::write(
         Path::new(&wd).join(".mcp.json"),
         serde_json::json!({ "mcpServers": {
             "parent-tool": { "command": "parent-tool-from-cwd" },
-            "cwd-tool": { "command": "cwd-tool" }
+            "cwd-tool": { "command": "cwd-tool" },
+            "declined-tool": { "command": "declined-tool" },
+            "unapproved-tool": { "command": "unapproved-tool" }
         }})
         .to_string(),
     )
@@ -220,10 +224,14 @@ fn no_port_fails_closed_to_a_strict_carry_through_with_no_coord_mcp() {
     let mut projects = serde_json::Map::new();
     projects.insert(
         project,
-        serde_json::json!({ "mcpServers": {
-            "local-tool": { "command": "local-tool" },
-            "cwd-tool": { "command": "cwd-tool-local-scope" }
-        }}),
+        serde_json::json!({
+            "mcpServers": {
+                "local-tool": { "command": "local-tool" },
+                "cwd-tool": { "command": "cwd-tool-local-scope" }
+            },
+            "enabledMcpjsonServers": ["parent-tool", "cwd-tool", "declined-tool"],
+            "disabledMcpjsonServers": ["declined-tool"]
+        }),
     );
     std::fs::write(
         account.join(".claude.json"),
@@ -251,7 +259,7 @@ fn no_port_fails_closed_to_a_strict_carry_through_with_no_coord_mcp() {
     assert_eq!(
         names,
         vec!["cwd-tool", "local-tool", "parent-tool", "user-tool"],
-        "every non-coord server, and no coord-mcp from any scope"
+        "every approved non-coord server, and no coord-mcp from any scope"
     );
     assert_eq!(servers["parent-tool"]["command"], "parent-tool-from-cwd");
     assert_eq!(servers["cwd-tool"]["command"], "cwd-tool-local-scope");
@@ -260,6 +268,66 @@ fn no_port_fails_closed_to_a_strict_carry_through_with_no_coord_mcp() {
         std::fs::read_to_string(Path::new(&wd).join(crate::coord_mcp::COORD_MCP_STATUS_FILE))
             .expect("the NOT PROVISIONED breadcrumb");
     assert!(breadcrumb.contains("NOT PROVISIONED"), "{breadcrumb}");
+}
+
+/// The account's per-project approval state decides which `.mcp.json` servers
+/// the strict file carries: `enableAllProjectMcpServers` admits every project
+/// server except a disabled one; with no approval state at all, none. Local-
+/// and user-scope servers need no approval.
+#[test]
+fn carry_through_respects_the_accounts_project_server_approvals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(
+        cwd.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": {
+            "a": { "command": "a" },
+            "b": { "command": "b" },
+            "coord-mcp": { "command": "never" }
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let project = crate::claude_session::workspace_trust::project_key(&cwd).unwrap();
+    let account_file = tmp.path().join(".claude.json");
+    let write_account = |entry: serde_json::Value| {
+        let mut projects = serde_json::Map::new();
+        projects.insert(project.clone(), entry);
+        std::fs::write(
+            &account_file,
+            serde_json::json!({
+                "mcpServers": { "user-tool": { "command": "u" } },
+                "projects": projects,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let names = || {
+        let mut n: Vec<String> = carry_through_servers(&cwd, Some(&account_file))
+            .keys()
+            .cloned()
+            .collect();
+        n.sort();
+        n
+    };
+
+    write_account(serde_json::json!({
+        "enableAllProjectMcpServers": true,
+        "disabledMcpjsonServers": ["b"]
+    }));
+    assert_eq!(names(), vec!["a", "user-tool"]);
+
+    write_account(serde_json::json!({}));
+    assert_eq!(
+        names(),
+        vec!["user-tool"],
+        "an unapproved project server never loads"
+    );
+
+    write_account(serde_json::json!({ "enabledMcpjsonServers": ["b"] }));
+    assert_eq!(names(), vec!["b", "user-tool"]);
 }
 
 /// Two sessions in one cwd get two files and two live nonces — never one

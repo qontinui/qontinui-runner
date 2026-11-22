@@ -558,10 +558,29 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                     // By NAME, whatever the spelling: `--mcp-config=/x` from a
                     // template is the same flag as the caller's spaced one.
                     if provided.contains(flag_name_only(&unit.name)) {
-                        tracing::warn!(
-                            flag = %flag_name_only(&unit.name),
-                            "launch template flag dropped: the caller supplies the same flag"
-                        );
+                        if flag_name_only(&unit.name) == "--mcp-config" {
+                            // The runner's coord-mcp is authoritative (plan
+                            // 2026-11-21-…-acts-as-the-default-tenant D1). A
+                            // config path is not a secret; name what was lost.
+                            let dropped = unit
+                                .name
+                                .split_once('=')
+                                .map(|(_, v)| v.to_string())
+                                .or_else(|| unit.values.first().cloned())
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                dropped_mcp_config = %dropped,
+                                "launch template --mcp-config dropped: the runner supplies this \
+                                 session's own coord-mcp config, which is authoritative"
+                            );
+                        } else {
+                            tracing::warn!(
+                                flag = %flag_name_only(&unit.name),
+                                "launch template flag dropped from the argv: the caller supplies \
+                                 the same flag (a caller that composes it — the stream-json \
+                                 spawn's --settings — folds the template's value in first)"
+                            );
+                        }
                     } else {
                         other_units.push(unit);
                     }
@@ -789,6 +808,36 @@ fn is_permitted_under_allow_list(token: &str) -> bool {
             | "--exclude-dynamic-system-prompt-sections"
             | "--ide"
     )
+}
+
+/// The value every occurrence of one of `names` (spaced or `=`-attached) carries
+/// in the operator template that [`compose_flags`] layers in for `cfg`, in
+/// order, as `(flag name, value)`.
+///
+/// For a caller that SUPPLIES such a flag itself and therefore has the
+/// template's copy dropped from the argv, but must not lose what it said: the
+/// stream-json spawn folds a template `--settings` into its one merged settings
+/// file and a template append prompt into its one prompt carrier. Read-only —
+/// the composed argv is unaffected.
+pub(crate) fn template_flag_values(cfg: &LaunchConfig, names: &[&str]) -> Vec<(String, String)> {
+    let Some(template) = claude_template(cfg) else {
+        return Vec::new();
+    };
+    let tokens = shell_tokenize(&template.replace(SESSION_ID_PLACEHOLDER, ""));
+    parse_units(tokens.get(1..).unwrap_or(&[]))
+        .into_iter()
+        .filter_map(|unit| {
+            let name = flag_name_only(&unit.name).to_string();
+            if !names.contains(&name.as_str()) {
+                return None;
+            }
+            let value = match unit.name.split_once('=') {
+                Some((_, v)) => Some(v.to_string()),
+                None => unit.values.first().cloned(),
+            }?;
+            Some((name, value))
+        })
+        .collect()
 }
 
 /// A template flag's NAME for a log line: the part before an attached `=value`
@@ -1029,6 +1078,32 @@ mod tests {
                 "{template}: {argv:?}"
             );
         }
+    }
+
+    /// What a template says for flags a caller supplies itself, in either
+    /// spelling and in order — and nothing for flags it does not carry.
+    #[test]
+    fn template_flag_values_reads_both_spellings_in_order() {
+        let cfg = tmpl(
+            "claude --settings /op/a.json --append-system-prompt \"be terse\" \
+             --settings=/op/b.json --verbose",
+        );
+        assert_eq!(
+            template_flag_values(&cfg, &["--settings"]),
+            vec![
+                ("--settings".to_string(), "/op/a.json".to_string()),
+                ("--settings".to_string(), "/op/b.json".to_string()),
+            ]
+        );
+        assert_eq!(
+            template_flag_values(
+                &cfg,
+                &["--append-system-prompt", "--append-system-prompt-file"]
+            ),
+            vec![("--append-system-prompt".to_string(), "be terse".to_string())]
+        );
+        assert!(template_flag_values(&cfg, &["--mcp-config"]).is_empty());
+        assert!(template_flag_values(&LaunchConfig::default(), &["--settings"]).is_empty());
     }
 
     /// The same rule holds for every flag, not only `--mcp-config`: a caller's

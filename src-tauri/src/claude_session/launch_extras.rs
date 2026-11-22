@@ -51,6 +51,14 @@ pub(crate) struct LaunchExtrasInputs<'a> {
     pub(crate) hook_settings: Option<PathBuf>,
     /// Where a merged settings file is written.
     pub(crate) scratch_dir: &'a Path,
+    /// The operator launch config the spawn renders with. Its template's own
+    /// `--settings` and append-prompt flags are dropped from the argv because
+    /// this tail supplies both, so they are FOLDED IN here instead of lost: a
+    /// template settings file into the one merged settings file (runner keys
+    /// win), a template prompt after the runner's in the one carrier. A
+    /// template `--mcp-config` stays dropped — the runner's coord-mcp is
+    /// authoritative (plan D1).
+    pub(crate) launch_cfg: &'a super::launch_spec::LaunchConfig,
 }
 
 /// What a stream-json spawn adds to its launch.
@@ -108,14 +116,27 @@ pub(crate) fn compose_launch_extras(
         }
         None => None,
     };
+    let template_settings: Vec<String> =
+        super::launch_spec::template_flag_values(inputs.launch_cfg, &["--settings"])
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
     extra_required.extend(settings_args(
         inputs.hook_settings.as_deref(),
         tool_policy_settings.as_deref(),
+        &template_settings,
         inputs.scratch_dir,
         inputs.session_id,
     )?);
 
-    let prompt_carrier = prompt(coord_mcp.delivery());
+    let template_prompts = super::launch_spec::template_flag_values(
+        inputs.launch_cfg,
+        &[
+            crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FLAG,
+            crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FILE_FLAG,
+        ],
+    );
+    let prompt_carrier = fold_template_prompts(prompt(coord_mcp.delivery()), &template_prompts);
     if let Some(carrier) = &prompt_carrier {
         extra_required.extend(carrier.argv());
     }
@@ -130,20 +151,44 @@ pub(crate) fn compose_launch_extras(
 }
 
 /// The ONE `--settings` pair: the hook carrier alone, or — when the tool policy
-/// has a settings block — a file merging both. Empty when there is neither.
+/// has a settings block or the operator template carries its own `--settings`
+/// — a file merging them. Empty when there is none of the three.
+///
+/// Merge order is lowest precedence first: the template's settings, then the
+/// hook carrier, then the tool policy — so on a key the runner sets, the
+/// runner's value wins, while arrays (hook lists, deny rules) are unioned and
+/// keep every layer's entries.
 fn settings_args(
     hook_settings: Option<&Path>,
     tool_policy_settings: Option<&str>,
+    template_settings: &[String],
     scratch_dir: &Path,
     session_id: &str,
 ) -> Result<Vec<String>, String> {
-    let Some(tool_policy_settings) = tool_policy_settings else {
+    let template_docs: Vec<(String, serde_json::Value)> = template_settings
+        .iter()
+        .filter_map(|value| match read_settings_value(value) {
+            Ok(doc) => Some((settings_source(value), doc)),
+            Err(e) => {
+                let value = settings_source(value);
+                warn!(
+                    "launch template --settings {value} unreadable ({e}) — not merged; the \
+                     session runs without it"
+                );
+                None
+            }
+        })
+        .collect();
+    if tool_policy_settings.is_none() && template_docs.is_empty() {
         return Ok(hook_settings
             .map(|p| vec!["--settings".to_string(), p.to_string_lossy().into_owned()])
             .unwrap_or_default());
-    };
-    let tool: serde_json::Value = serde_json::from_str(tool_policy_settings)
-        .map_err(|e| format!("tool-policy settings are not JSON: {e}"))?;
+    }
+    let tool: Option<serde_json::Value> = tool_policy_settings
+        .map(|t| {
+            serde_json::from_str(t).map_err(|e| format!("tool-policy settings are not JSON: {e}"))
+        })
+        .transpose()?;
     let hooks = hook_settings.and_then(|path| {
         let parsed = std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
@@ -153,20 +198,36 @@ fn settings_args(
             Err(e) => {
                 warn!(
                     "hook-carrier settings {} unreadable ({e}) — the merged settings carry the \
-                     tool policy only, so this session has no SessionStart hook",
+                     other layers only, so this session has no SessionStart hook",
                     path.display()
                 );
                 None
             }
         }
     });
-    let mut merged = hooks.unwrap_or_else(|| serde_json::json!({}));
-    merge_settings(&mut merged, tool);
+    let mut merged = serde_json::json!({});
+    for (source, doc) in template_docs {
+        let keys: Vec<String> = doc
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        info!(
+            "merging launch template --settings {source} (keys {keys:?}) into interactive session \
+             {session_id}'s settings; the runner's own keys win on a conflict"
+        );
+        merge_settings(&mut merged, doc);
+    }
+    if let Some(hooks) = hooks {
+        merge_settings(&mut merged, hooks);
+    }
+    if let Some(tool) = tool {
+        merge_settings(&mut merged, tool);
+    }
     let file = scratch_dir.join(format!("claude_session_settings_{session_id}.json"));
     std::fs::write(&file, merged.to_string())
-        .map_err(|e| format!("Failed to write tool-policy settings file: {e}"))?;
+        .map_err(|e| format!("Failed to write the merged settings file: {e}"))?;
     info!(
-        "Applied merged hook-carrier + tool-policy settings for interactive session {} at {}",
+        "Applied merged settings for interactive session {} at {}",
         session_id,
         file.display()
     );
@@ -174,6 +235,107 @@ fn settings_args(
         "--settings".to_string(),
         file.to_string_lossy().into_owned(),
     ])
+}
+
+/// How a template `--settings` value is named in a log line: its path, or
+/// `<inline JSON>` — an inline object may carry a secret and is never logged.
+fn settings_source(value: &str) -> String {
+    if value.trim_start().starts_with('{') {
+        "<inline JSON>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// A `--settings` value as Claude Code reads it: an inline JSON object, or a
+/// path to a JSON file.
+fn read_settings_value(value: &str) -> Result<serde_json::Value, String> {
+    let text = if value.trim_start().starts_with('{') {
+        value.to_string()
+    } else {
+        std::fs::read_to_string(value).map_err(|e| e.to_string())?
+    };
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if doc.is_object() {
+        Ok(doc)
+    } else {
+        Err("not a JSON object".to_string())
+    }
+}
+
+/// Fold an operator template's append prompts into the ONE carrier, after the
+/// runner's composed text: Claude Code refuses two append flags, and the
+/// launch seam drops the template's because this tail supplies one, so without
+/// this an operator's configured prompt would silently vanish.
+///
+/// `--append-system-prompt <text>` contributes its text and
+/// `--append-system-prompt-file <path>` the file's. A file carrier is
+/// re-composed into a sibling content-addressed file; its policy SHA is
+/// unchanged, because the policy body it delivers is unchanged.
+fn fold_template_prompts(
+    carrier: Option<SystemPromptCarrier>,
+    template_prompts: &[(String, String)],
+) -> Option<SystemPromptCarrier> {
+    let texts: Vec<String> = template_prompts
+        .iter()
+        .filter_map(|(flag, value)| {
+            if flag == crate::session::spawn_prompt::APPEND_SYSTEM_PROMPT_FILE_FLAG {
+                match std::fs::read_to_string(value) {
+                    Ok(text) => Some(text),
+                    Err(e) => {
+                        warn!(
+                            "launch template {flag} {value} unreadable ({e}) — its prompt is \
+                             not appended"
+                        );
+                        None
+                    }
+                }
+            } else {
+                Some(value.clone())
+            }
+        })
+        .filter(|t| !t.trim().is_empty())
+        .collect();
+    if texts.is_empty() {
+        return carrier;
+    }
+    let appended = texts.join("\n\n");
+    info!(
+        "appending {} launch template prompt(s) after the runner's system prompt",
+        texts.len()
+    );
+    match carrier {
+        None => Some(SystemPromptCarrier::Inline(appended)),
+        Some(SystemPromptCarrier::Inline(text)) => Some(SystemPromptCarrier::Inline(format!(
+            "{}\n\n{appended}",
+            text.trim_end()
+        ))),
+        Some(SystemPromptCarrier::File { path, policy_sha }) => {
+            let folded = std::fs::read_to_string(&path).and_then(|composed| {
+                let content = format!("{}\n\n{appended}", composed.trim_end());
+                let dir = path.parent().unwrap_or_else(|| Path::new("."));
+                let folded = dir.join(crate::session::spawn_prompt::spawn_prompt_file_name(
+                    &content,
+                ));
+                crate::session::spawn_prompt::write_atomic(&folded, content.as_bytes())?;
+                Ok(folded)
+            });
+            match folded {
+                Ok(folded) => Some(SystemPromptCarrier::File {
+                    path: folded,
+                    policy_sha,
+                }),
+                Err(e) => {
+                    warn!(
+                        "could not append the launch template's prompt to {} ({e}) — the \
+                         session gets the runner's prompt without it",
+                        path.display()
+                    );
+                    Some(SystemPromptCarrier::File { path, policy_sha })
+                }
+            }
+        }
+    }
 }
 
 /// Merge `overlay` into `base`: objects key by key, recursively; arrays are

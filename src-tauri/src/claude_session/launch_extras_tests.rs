@@ -66,7 +66,14 @@ fn inputs<'a>(
         api_port: 4321,
         hook_settings,
         scratch_dir: scratch,
+        launch_cfg: no_template(),
     }
+}
+
+/// The launch config with no operator template.
+fn no_template() -> &'static LaunchConfig {
+    static CFG: std::sync::OnceLock<LaunchConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(LaunchConfig::default)
 }
 
 fn flag_values<'a>(argv: &'a [String], flag: &str) -> Vec<&'a str> {
@@ -360,4 +367,190 @@ async fn the_route_addressed_by_the_exported_id_refuses_an_unbound_declared_tena
         PolicyTenantDecision::DefaultSlot
     );
     drop(extras);
+}
+
+/// An operator template's `--settings` is not lost: the launch seam drops it
+/// from the argv (this tail supplies the one `--settings`), so its keys are
+/// MERGED into that one file — the runner's hooks and the tool policy win on a
+/// conflict, list entries are kept from every layer, and the template's own
+/// keys survive.
+#[test]
+fn a_template_settings_file_is_merged_into_the_one_settings_and_the_runner_wins() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    let hooks_dir = tempfile::tempdir().unwrap();
+    let hook_settings = crate::session::claude_hook::materialize(hooks_dir.path()).unwrap();
+    let hook_doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_settings).unwrap()).unwrap();
+    let operator = scratch.path().join("operator-settings.json");
+    std::fs::write(
+        &operator,
+        serde_json::json!({
+            "model": "operator-model",
+            "permissions": { "deny": ["Read(./secrets/**)"] },
+            "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "operator-hook" }] }] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some(format!("claude --settings {}", operator.display())),
+        ..Default::default()
+    };
+    let policy = deny_policy();
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(
+        &wd,
+        &session_id,
+        Some(&policy),
+        Some(hook_settings),
+        scratch.path(),
+    );
+    input.launch_cfg = &cfg;
+
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+
+    let spec = LaunchSpec {
+        permission: PermissionMode::BypassPermissions,
+        extra_required: extras.extra_required.clone(),
+        ..Default::default()
+    };
+    let argv = render_argv(&spec, &cfg, "claude");
+    let settings = flag_values(&argv, "--settings");
+    assert_eq!(settings.len(), 1, "{argv:?}");
+    assert_ne!(settings[0], operator.to_string_lossy().as_ref());
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings[0]).unwrap()).unwrap();
+    assert_eq!(
+        doc["model"], "operator-model",
+        "the template's own key survives"
+    );
+    let deny = doc["permissions"]["deny"].as_array().unwrap();
+    assert!(
+        deny.contains(&serde_json::json!("Read(./secrets/**)")),
+        "{doc}"
+    );
+    assert!(
+        deny.contains(&serde_json::json!("Bash(git push --force:*)")),
+        "{doc}"
+    );
+    let session_start = doc["hooks"]["SessionStart"].as_array().unwrap();
+    assert!(
+        session_start.to_string().contains("operator-hook"),
+        "the template's hook is kept beside the runner's: {doc}"
+    );
+    for entry in hook_doc["hooks"]["SessionStart"].as_array().unwrap() {
+        assert!(
+            session_start.contains(entry),
+            "the runner's hook is kept: {doc}"
+        );
+    }
+}
+
+/// A template append prompt (text or file) is appended AFTER the runner's
+/// prompt in the one carrier instead of being dropped — on an inline carrier,
+/// on a composed-file carrier (whose policy SHA is unchanged), and on a spawn
+/// that had no carrier of its own.
+#[test]
+fn a_template_append_prompt_is_appended_after_the_runners_in_the_one_carrier() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    let operator_file = scratch.path().join("operator-prompt.md");
+    std::fs::write(&operator_file, "from the operator file").unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some(format!(
+            "claude --append-system-prompt-file {}",
+            operator_file.display()
+        )),
+        ..Default::default()
+    };
+    let compose = |carrier: Option<SystemPromptCarrier>| {
+        let session_id = format!("ai-{}", Uuid::new_v4());
+        let mut input = inputs(&wd, &session_id, None, None, scratch.path());
+        input.launch_cfg = &cfg;
+        let extras = compose_launch_extras(input, move |_| carrier).unwrap();
+        let spec = LaunchSpec {
+            permission: PermissionMode::BypassPermissions,
+            extra_required: extras.extra_required.clone(),
+            ..Default::default()
+        };
+        (extras, render_argv(&spec, &cfg, "claude"))
+    };
+
+    // Inline: one append flag, the runner's text first.
+    let (extras, argv) = compose(Some(SystemPromptCarrier::Inline("the briefing".into())));
+    assert_eq!(
+        flag_values(&argv, "--append-system-prompt"),
+        vec!["the briefing\n\nfrom the operator file"]
+    );
+    assert!(
+        flag_values(&argv, "--append-system-prompt-file").is_empty(),
+        "{argv:?}"
+    );
+    drop(extras);
+
+    // A composed file: re-composed with the template text appended.
+    let composed_dir = scratch.path().join("spawn-prompts");
+    std::fs::create_dir_all(&composed_dir).unwrap();
+    let composed = composed_dir.join("spawn-composed.md");
+    std::fs::write(&composed, "briefing\n\npolicy body").unwrap();
+    let (extras, argv) = compose(Some(SystemPromptCarrier::File {
+        path: composed.clone(),
+        policy_sha: "abc".to_string(),
+    }));
+    let files = flag_values(&argv, "--append-system-prompt-file");
+    assert_eq!(files.len(), 1, "{argv:?}");
+    assert!(
+        flag_values(&argv, "--append-system-prompt").is_empty(),
+        "{argv:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(files[0]).unwrap(),
+        "briefing\n\npolicy body\n\nfrom the operator file"
+    );
+    assert_eq!(
+        extras.prompt_carrier.as_ref().and_then(|c| c.policy_sha()),
+        Some("abc"),
+        "the delivered policy body, and so its SHA, is unchanged"
+    );
+    drop(extras);
+
+    // No carrier of the runner's: the template's prompt alone.
+    let (extras, argv) = compose(None);
+    assert_eq!(
+        flag_values(&argv, "--append-system-prompt"),
+        vec!["from the operator file"]
+    );
+    drop(extras);
+}
+
+/// A template `--mcp-config` stays dropped: the runner's coord-mcp config is
+/// the only one the spawn passes (plan D1).
+#[test]
+fn a_template_mcp_config_stays_dropped_beside_the_runners() {
+    let amb = crate::test_env::isolated_ambient();
+    amb.write_active_tenant_id(tenant_a());
+    let wd = worktree_under(&amb.root());
+    let scratch = tempfile::tempdir().unwrap();
+    let cfg = LaunchConfig {
+        default_template: Some("claude --mcp-config /operator/mcp.json".to_string()),
+        ..Default::default()
+    };
+    let session_id = format!("ai-{}", Uuid::new_v4());
+    let mut input = inputs(&wd, &session_id, None, None, scratch.path());
+    input.launch_cfg = &cfg;
+    let extras = compose_launch_extras(input, |_| None).unwrap();
+    let spec = LaunchSpec {
+        permission: PermissionMode::BypassPermissions,
+        extra_required: extras.extra_required.clone(),
+        ..Default::default()
+    };
+    let argv = render_argv(&spec, &cfg, "claude");
+    let configs = flag_values(&argv, "--mcp-config");
+    assert_eq!(configs.len(), 1, "{argv:?}");
+    assert_ne!(configs[0], "/operator/mcp.json");
 }

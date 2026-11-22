@@ -357,6 +357,12 @@ impl ClaudeSession {
         // before any child exists, and the lease it returns retires what it
         // minted on every later error by being dropped.
         let api_port = crate::terminal::spawn_seam_api_port();
+        // Read BEFORE the tail is composed: the template's own `--settings` and
+        // append prompt are folded into the tail's (the launch seam drops them
+        // from the argv because the tail supplies both).
+        let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+            effective_config_dir.as_deref(),
+        );
         let extras = crate::claude_session::launch_extras::compose_launch_extras(
             crate::claude_session::launch_extras::LaunchExtrasInputs {
                 working_dir,
@@ -369,6 +375,7 @@ impl ClaudeSession {
                     &crate::session::claude_hook::session_restore_dir(),
                 ),
                 scratch_dir: &std::env::temp_dir(),
+                launch_cfg: &launch_cfg,
             },
             |delivery| {
                 // WHOSE policy body: the tenant a new session in this cwd
@@ -411,9 +418,6 @@ impl ClaudeSession {
             extra_required,
             ..Default::default()
         };
-        let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
-            effective_config_dir.as_deref(),
-        );
         let (program, cli_args) =
             crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
         // The delivered-policy marker, withheld when an operator template added

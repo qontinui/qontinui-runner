@@ -767,7 +767,10 @@ pub(crate) async fn close_ai_session_in(
 ///    child's exit being observed.
 /// 3. Session-automation Phase 0 (R5): emit the coord `closed` event and evict
 ///    the R4 index, so coord.sessions doesn't leak a ghost row. Best-effort.
-/// 4. Mark the task run `stopped`, and emit the closed state.
+/// 4. Only when a live session was closed: mark the task run `stopped` and
+///    emit the closed state. A repeat close (or a close of a session whose
+///    child already ended) writes and emits nothing, so it cannot overwrite a
+///    terminal status the run reached on its own, or announce a close twice.
 pub(crate) async fn close_ai_session_with(
     session_manager: &SessionManager,
     registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -790,10 +793,12 @@ pub(crate) async fn close_ai_session_with(
     if let Some(registrar) = registrar {
         registrar.close_session(task_run_id);
     }
-    if let Some(pg) = pg {
-        let _ = pg.update_task_run_status(task_run_id, "stopped").await;
+    if was_live {
+        if let Some(pg) = pg {
+            let _ = pg.update_task_run_status(task_run_id, "stopped").await;
+        }
+        emit_closed(task_run_id);
     }
-    emit_closed(task_run_id);
     AiSessionClose {
         was_live,
         coord_mcp_retired,

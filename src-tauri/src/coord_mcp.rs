@@ -13166,7 +13166,7 @@ fn provision_coord_mcp_config_file(
     terminal_id: Option<&str>,
     spawn_tenant: Option<Uuid>,
     bound_port: Option<u16>,
-) -> Result<Option<std::path::PathBuf>, SpawnTenantRefusal> {
+) -> Result<Option<(std::path::PathBuf, String)>, SpawnTenantRefusal> {
     if let Some(t) = spawn_tenant {
         validate_spawn_tenant(t)?;
     }
@@ -13176,7 +13176,8 @@ fn provision_coord_mcp_config_file(
     };
     // The shared mint core (§2): a DEVICE, cwd-bound, persistent nonce — the
     // runner-spawn class — pinned to the spawn tenant when there is one.
-    let mcp_config = mint_device_proxy_config(workdir, terminal_id, spawn_tenant, bound_port);
+    let (mcp_config, nonce) =
+        mint_device_proxy_config(workdir, terminal_id, spawn_tenant, bound_port);
     let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(
@@ -13184,6 +13185,10 @@ fn provision_coord_mcp_config_file(
              --mcp-config delivery off for {workdir} (session simply has no coord-mcp)",
             dir.display()
         );
+        // No file will ever carry the key just minted, and its (workdir,
+        // terminal) key may never be minted again to evict it — so it would
+        // stay a live, persisted credential nothing presents.
+        revoke_proxy_nonce(&nonce);
         return Ok(None);
     }
     // Restrict the directory BEFORE writing, so the credential is never even
@@ -13222,7 +13227,7 @@ fn provision_coord_mcp_config_file(
                 &key,
                 "app-data --mcp-config file materialized (proxy shape)",
             );
-            Ok(Some(file))
+            Ok(Some((file, nonce)))
         }
         Err(e) => {
             warn!(
@@ -13230,6 +13235,8 @@ fn provision_coord_mcp_config_file(
                  --mcp-config delivery off for {workdir}",
                 file.display()
             );
+            // As for the dir failure above: revoke the key no file carries.
+            revoke_proxy_nonce(&nonce);
             Ok(None)
         }
     }
@@ -13262,18 +13269,18 @@ fn mint_device_proxy_config(
     terminal_id: Option<&str>,
     spawn_tenant: Option<Uuid>,
     bound_port: u16,
-) -> serde_json::Value {
+) -> (serde_json::Value, String) {
     let nonce = register_proxy_nonce(workdir, terminal_id, spawn_tenant);
-    coord_mcp_proxy_config_json(
+    let config = coord_mcp_proxy_config_json(
         bound_port,
         &nonce,
         ProxyConfigIdentity::device(workdir, terminal_id),
-    )
+    );
+    (config, nonce)
 }
 
 /// What the coord-mcp delivery gave one session (a terminal's, or an AI
-/// session's).
-#[derive(Debug)]
+/// session's). `Debug` is hand-written so [`Self::nonce`] never reaches a log.
 pub(crate) struct SessionCoordMcp {
     /// The per-session outcome the briefing is gated on.
     pub(crate) delivery: CoordMcpDelivery,
@@ -13296,6 +13303,23 @@ pub(crate) struct SessionCoordMcp {
     pub(crate) strict: bool,
     /// Which delivery this was ([`forget_session_coord_mcp_delivery`]).
     pub(crate) generation: u64,
+    /// The nonce THIS delivery minted (the one [`Self::config_path`] carries),
+    /// returned by the mint rather than re-read from the file, so whoever owns
+    /// the session's lifetime always knows exactly what to revoke. `None` on
+    /// every arm that minted nothing.
+    pub(crate) nonce: Option<String>,
+}
+
+impl std::fmt::Debug for SessionCoordMcp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionCoordMcp")
+            .field("delivery", &self.delivery)
+            .field("config_path", &self.config_path)
+            .field("strict", &self.strict)
+            .field("generation", &self.generation)
+            .field("nonce", &self.nonce.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The coord-mcp delivery for one session the runner spawns, keyed by
@@ -13333,14 +13357,16 @@ pub(crate) fn deliver_session_coord_mcp(
     spawn_tenant: Option<Uuid>,
     bound_port: Option<u16>,
 ) -> Result<SessionCoordMcp, SpawnTenantRefusal> {
-    let (delivery, config_path) =
+    let (delivery, provisioned) =
         deliver_session_coord_mcp_unrecorded(cwd, session_key, spawn_tenant, bound_port)?;
     let generation = record_session_coord_mcp_delivery(session_key, delivery);
+    let (config_path, nonce) = provisioned.unzip();
     Ok(SessionCoordMcp {
         delivery,
         config_path,
         strict: delivery == CoordMcpDelivery::Unprovisioned,
         generation,
+        nonce,
     })
 }
 
@@ -13350,7 +13376,7 @@ fn deliver_session_coord_mcp_unrecorded(
     session_key: &str,
     spawn_tenant: Option<Uuid>,
     bound_port: Option<u16>,
-) -> Result<(CoordMcpDelivery, Option<std::path::PathBuf>), SpawnTenantRefusal> {
+) -> Result<(CoordMcpDelivery, Option<(std::path::PathBuf, String)>), SpawnTenantRefusal> {
     let credential_tenant = credential_spawn_tenant(spawn_tenant);
     if workdir_declares_coord_mcp(cwd) {
         match credential_tenant {
@@ -13385,11 +13411,11 @@ fn deliver_session_coord_mcp_unrecorded(
         return Ok((CoordMcpDelivery::WorkdirDeclared, None));
     }
     match provision_coord_mcp_config_file(cwd, Some(session_key), credential_tenant, bound_port)? {
-        Some(config_path) => {
+        Some(provisioned) => {
             // This cwd HAS coord-mcp now — retire any breadcrumb a previous
             // un-provisioned spawn left behind.
             clear_degraded_breadcrumb(cwd);
-            Ok((CoordMcpDelivery::Provisioned, Some(config_path)))
+            Ok((CoordMcpDelivery::Provisioned, Some(provisioned)))
         }
         None => {
             // Provisioning was ATTEMPTED and produced nothing: the fail-closed
@@ -26327,10 +26353,12 @@ mod spawn_tenant_credential_tests {
         pair(tenant_b());
         let (wd, term) = (workdir(&amb, "pin"), terminal());
 
-        let path = provision_coord_mcp_config_file(&wd, Some(&term), Some(tenant_b()), Some(PORT))
-            .expect("a paired spawn tenant is admitted")
-            .expect("a bound port provisions a config file");
+        let (path, minted) =
+            provision_coord_mcp_config_file(&wd, Some(&term), Some(tenant_b()), Some(PORT))
+                .expect("a paired spawn tenant is admitted")
+                .expect("a bound port provisions a config file");
         let nonce = read_proxy_nonce(&path).expect("the config carries the proxy nonce");
+        assert_eq!(minted, nonce, "the mint returns the nonce the file carries");
 
         assert_eq!(
             proxy_session_pin_for_nonce(&nonce),
@@ -26338,13 +26366,37 @@ mod spawn_tenant_credential_tests {
         );
         assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
         // The machine pin is untouched for a spawn that chose nothing.
-        let unchosen = provision_coord_mcp_config_file(&wd, Some(&terminal()), None, Some(PORT))
-            .unwrap()
-            .unwrap();
+        let (unchosen, _) =
+            provision_coord_mcp_config_file(&wd, Some(&terminal()), None, Some(PORT))
+                .unwrap()
+                .unwrap();
         let unchosen = read_proxy_nonce(&unchosen).unwrap();
         assert_eq!(
             session_tenant_or_refuse(Some(&unchosen)),
             Ok(Some(tenant_a()))
+        );
+    }
+
+    /// A provision whose app-data write fails leaves no live key behind: the
+    /// nonce it minted is revoked, because no file carries it and its
+    /// (workdir, terminal) key may never be minted again to evict it.
+    #[test]
+    fn a_failed_config_write_revokes_the_nonce_it_minted() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let (wd, term) = (workdir(&amb, "write-fails"), terminal());
+        // A FILE where the app-data dir must go, so `create_dir_all` fails.
+        let restore = crate::session::claude_hook::session_restore_dir();
+        std::fs::create_dir_all(&restore).unwrap();
+        std::fs::write(restore.join("coord-mcp"), b"not a directory").unwrap();
+
+        let provisioned = provision_coord_mcp_config_file(&wd, Some(&term), None, Some(PORT))
+            .expect("no tenant to refuse");
+
+        assert!(provisioned.is_none(), "no file could be written");
+        assert!(
+            !terminal_has_nonce(&term),
+            "the minted nonce must be revoked when no file carries it"
         );
     }
 
@@ -26567,7 +26619,7 @@ mod spawn_tenant_credential_tests {
             detail: None,
         };
 
-        let b_path =
+        let (b_path, _) =
             provision_coord_mcp_config_file(&wd, Some(&terminal()), Some(tenant_b()), Some(PORT))
                 .unwrap()
                 .unwrap();
@@ -26579,7 +26631,7 @@ mod spawn_tenant_credential_tests {
             "a Pinned(B) session must forward past A's dead slot"
         );
 
-        let a_path = provision_coord_mcp_config_file(&wd, Some(&terminal()), None, Some(PORT))
+        let (a_path, _) = provision_coord_mcp_config_file(&wd, Some(&terminal()), None, Some(PORT))
             .unwrap()
             .unwrap();
         let a_nonce = read_proxy_nonce(&a_path).unwrap();

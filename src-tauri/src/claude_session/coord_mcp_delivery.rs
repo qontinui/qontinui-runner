@@ -42,6 +42,13 @@
 //! exists (the lease is dropped). Every retire is idempotent and touches only
 //! what THIS delivery minted, so a successor delivered under the same key (a
 //! rate-limit restart) is never retired by its predecessor.
+//!
+//! ## What this does not reach yet
+//!
+//! Until Phase 4 of the plan lands (`qontinui-pr` reads `QONTINUI_MCP_CONFIG`
+//! before any walk-up), the shell-side doors that find a credential by walking
+//! up for a `.mcp.json` — `qontinui-pr`, `coord-revive.sh` — still present the
+//! ancestor's key from inside such a session, whatever its own coord-mcp is.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -159,7 +166,9 @@ pub(crate) fn deliver_for_ai_session(
     let (argv, config_file) = match (delivered.delivery, delivered.config_path) {
         (CoordMcpDelivery::WorkdirDeclared, _) => (Vec::new(), None),
         (_, Some(path)) if !delivered.strict => {
-            record.nonce = read_config_nonce(&path);
+            // The nonce the mint returned — never re-read from the file, which a
+            // successor under the same key may already have rewritten.
+            record.nonce = delivered.nonce.clone();
             record.runner_config = Some(path.clone());
             (
                 vec![
@@ -252,8 +261,9 @@ pub(crate) fn retire_session_coord_mcp(session_key: &str) -> bool {
 // The lease
 // ===========================================================================
 
-/// What one delivery minted and wrote, so it can be undone exactly.
-#[derive(Debug, Clone)]
+/// What one delivery minted and wrote, so it can be undone exactly. `Debug` is
+/// hand-written so the nonce never reaches a log line.
+#[derive(Clone)]
 struct LeaseRecord {
     generation: u64,
     cwd: String,
@@ -263,6 +273,18 @@ struct LeaseRecord {
     runner_config: Option<PathBuf>,
     /// The unprovisioned arm's carry-through file.
     strict_config: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for LeaseRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseRecord")
+            .field("generation", &self.generation)
+            .field("cwd", &self.cwd)
+            .field("nonce", &self.nonce.as_ref().map(|_| "<redacted>"))
+            .field("runner_config", &self.runner_config)
+            .field("strict_config", &self.strict_config)
+            .finish()
+    }
 }
 
 /// The live deliveries, by session key. One entry per live AI session.
@@ -341,16 +363,27 @@ fn retire(key: &str, record: &LeaseRecord) {
     if let Some(nonce) = &record.nonce {
         crate::coord_mcp::revoke_proxy_nonce(nonce);
     }
-    if let Some(path) = &record.runner_config {
-        if record.nonce.is_some() && read_config_nonce(path) == record.nonce {
-            remove_quietly(path);
-        }
-    }
     if let Some(path) = &record.strict_config {
         remove_quietly(path);
     }
     let forgot = crate::coord_mcp::forget_session_coord_mcp_delivery(key, record.generation);
     let mut leases = leases().lock().unwrap_or_else(|e| e.into_inner());
+    // The runner file's compare-and-remove runs under the lease lock, and only
+    // while no successor's lease is registered under this key: a successor in
+    // the same cwd rewrites the SAME path, so once its lease exists the file is
+    // its own. The window this cannot close: a successor's delivery writes the
+    // file BEFORE it registers its lease (the write happens inside
+    // `coord_mcp::deliver_session_coord_mcp`, outside this lock), so a retire
+    // landing between that write and that registration still reads the
+    // successor's nonce, sees a mismatch, and keeps the file — the safe side.
+    if let (Some(path), Some(nonce)) = (&record.runner_config, &record.nonce) {
+        let successor_owns_path = leases.get(key).is_some_and(|r| {
+            r.generation != record.generation && r.runner_config.as_ref() == Some(path)
+        });
+        if !successor_owns_path && read_config_nonce(path).as_deref() == Some(nonce.as_str()) {
+            remove_quietly(path);
+        }
+    }
     if leases
         .get(key)
         .is_some_and(|r| r.generation == record.generation)
@@ -448,32 +481,90 @@ fn carry_through_servers(
     let account: Option<serde_json::Value> = user_config
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok());
-    let mut take = |servers: Option<&serde_json::Value>| {
+    let keys = local_scope_keys(cwd);
+    let projects = account
+        .as_ref()
+        .and_then(|a| a.get(super::workspace_trust::PROJECTS_KEY));
+    // This project's entry: what local-scope servers it adds, and which
+    // project-scope (`.mcp.json`) servers the account approved for it.
+    let project = projects.and_then(|p| keys.iter().find_map(|k| p.get(k)));
+    let approval = ProjectApproval::of(project);
+    let mut take = |servers: Option<&serde_json::Value>, admit: &dyn Fn(&str) -> bool| {
         let Some(servers) = servers.and_then(|v| v.as_object()) else {
             return;
         };
         for (name, entry) in servers {
-            if name != COORD_MCP_SERVER && !out.contains_key(name) {
+            if name != COORD_MCP_SERVER && !out.contains_key(name) && admit(name) {
                 out.insert(name.clone(), entry.clone());
             }
         }
     };
-    if let Some(projects) = account
-        .as_ref()
-        .and_then(|a| a.get(super::workspace_trust::PROJECTS_KEY))
-    {
-        for key in local_scope_keys(cwd) {
-            take(projects.get(&key).and_then(|p| p.get("mcpServers")));
+    if let Some(projects) = projects {
+        for key in &keys {
+            take(
+                projects.get(key).and_then(|p| p.get("mcpServers")),
+                &|_: &str| true,
+            );
         }
     }
     for dir in cwd.ancestors() {
         let doc: Option<serde_json::Value> = std::fs::read_to_string(dir.join(".mcp.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok());
-        take(doc.as_ref().and_then(|d| d.get("mcpServers")));
+        take(
+            doc.as_ref().and_then(|d| d.get("mcpServers")),
+            &|name: &str| approval.admits(name),
+        );
     }
-    take(account.as_ref().and_then(|a| a.get("mcpServers")));
+    take(
+        account.as_ref().and_then(|a| a.get("mcpServers")),
+        &|_: &str| true,
+    );
     out
+}
+
+/// The account's approval state for one project's `.mcp.json` servers, from
+/// `projects[<key>]` in the account config: a server named in
+/// `disabledMcpjsonServers` never loads; otherwise it loads only when
+/// `enableAllProjectMcpServers` is true or it is named in
+/// `enabledMcpjsonServers`. The strict file carries exactly what the account
+/// approved — never a project server the operator declined, nor one never
+/// approved.
+struct ProjectApproval {
+    enable_all: bool,
+    enabled: Vec<String>,
+    disabled: Vec<String>,
+}
+
+impl ProjectApproval {
+    fn of(project: Option<&serde_json::Value>) -> Self {
+        let names = |key: &str| -> Vec<String> {
+            project
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            enable_all: project
+                .and_then(|p| p.get("enableAllProjectMcpServers"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            enabled: names("enabledMcpjsonServers"),
+            disabled: names("disabledMcpjsonServers"),
+        }
+    }
+
+    fn admits(&self, name: &str) -> bool {
+        if self.disabled.iter().any(|d| d == name) {
+            return false;
+        }
+        self.enable_all || self.enabled.iter().any(|e| e == name)
+    }
 }
 
 /// The `projects` keys a local-scope server for `cwd` can sit under: the key
