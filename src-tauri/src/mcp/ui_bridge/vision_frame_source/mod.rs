@@ -317,7 +317,7 @@ impl DeviceScreenshotSource {
             // - UNCODED, only off a gateway status: at 502/503/504 a proxy may
             //   answer in the runner's own `{success:false, error}` shape, so
             //   an uncoded envelope there stays the transport's.
-            match body
+            let refusal_message = match body
                 .as_ref()
                 .and_then(|b| device_refusal(&url, status.as_u16(), b))
             {
@@ -325,16 +325,24 @@ impl DeviceScreenshotSource {
                     return Err(refusal)
                 }
                 Some(refusal) if !gateway => return Err(refusal),
-                _ => {}
-            }
-            // Anything else may still carry an `error` string; keep it.
-            let reason = body
-                .as_ref()
-                .and_then(|b| b.get("error")?.as_str().map(str::to_string));
-            let message = match reason {
-                Some(reason) => format!("device screenshot {url} returned HTTP {status}: {reason}"),
-                None => format!("device screenshot {url} returned HTTP {status}"),
+                // An uncoded envelope at a gateway status: classified as the
+                // transport's below, but its parsed message (a string or an
+                // object `error`) is kept.
+                Some(refusal) => Some(refusal.to_string()),
+                None => None,
             };
+            // Anything else may still carry an `error` string; keep it.
+            let message = refusal_message.unwrap_or_else(|| {
+                match body
+                    .as_ref()
+                    .and_then(|b| b.get("error")?.as_str().map(str::to_string))
+                {
+                    Some(reason) => {
+                        format!("device screenshot {url} returned HTTP {status}: {reason}")
+                    }
+                    None => format!("device screenshot {url} returned HTTP {status}"),
+                }
+            });
             return Err(if gateway {
                 // Even a proxy's own JSON error with a `code` (no
                 // `success:false`) is the transport's failure here.
@@ -401,13 +409,14 @@ fn device_refusal(url: &str, status: u16, body: &serde_json::Value) -> Option<Fr
             retryable,
         }),
         other => {
-            // `app_answered_failure` builds only `AppAnswered`; any other
-            // variant is a change to it that this reader must be taught.
+            // `app_answered_failure` builds only `AppAnswered`; reaching here
+            // means it changed and this reader must be taught the new variant.
+            // Loud in debug builds, logged in release builds.
+            tracing::error!(
+                "device_refusal: app_answered_failure returned {other:?}, not AppAnswered"
+            );
             debug_assert!(
-                matches!(
-                    other,
-                    crate::mcp::app_dispatch::DispatchError::AppAnswered { .. }
-                ),
+                false,
                 "app_answered_failure returned {other:?}, not AppAnswered"
             );
             None
@@ -1011,16 +1020,34 @@ mod tests {
     /// failed capture, its message kept.
     #[tokio::test]
     async fn an_uncoded_envelope_off_a_gateway_status_is_the_apps_failure() {
-        let body = serde_json::json!({"success": false, "error": "renderer crashed"});
+        // An OBJECT error with no code and a retry verdict: only the
+        // envelope reader carries `retryable` (the generic fallthrough sets
+        // it to None) and reads the object's message.
+        let body = serde_json::json!({
+            "success": false,
+            "error": {"message": "renderer crashed"},
+            "retryable": true,
+        });
         let err =
             fetch_from(answering(axum::http::StatusCode::INTERNAL_SERVER_ERROR, Some(body)).await)
                 .await;
         assert_eq!(err.code(), "APP_CAPTURE_FAILED", "{err:?}");
-        assert_eq!(
-            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
-            "app"
-        );
+        let hint = err.to_json_err().1 .0.hint.expect("hint");
+        assert_eq!(hint["failure_origin"], "app");
+        assert_eq!(hint["retryable"], true, "{err:?}");
         assert!(err.to_string().contains("renderer crashed"), "{err}");
+    }
+
+    /// An uncoded envelope at a gateway status stays the transport's, but
+    /// keeps the message the envelope reader parsed out of an object `error`.
+    #[tokio::test]
+    async fn an_uncoded_gateway_envelope_keeps_its_parsed_message() {
+        let body = serde_json::json!({"success": false, "error": {"message": "upstream gone"}});
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+        assert!(err.to_string().contains("upstream gone"), "{err}");
     }
 
     /// Off a gateway status a top-level `code` is kept even without

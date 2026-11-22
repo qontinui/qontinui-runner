@@ -185,19 +185,20 @@ pub(crate) fn app_answered_failure(
     })
 }
 
-/// A body's top-level machine-readable code: `code`, else `errorCode`, each
-/// key skipped when it is not a non-blank string (never a code of `""`). The
-/// one top-level reader [`app_answered_failure`] and the vision device arm
-/// share.
+/// A body's top-level machine-readable code: `code`, else `errorCode`. Each
+/// key is read the way `WrapperFailure::from_wire` reads an object `error`'s:
+/// a non-blank string, or a number stringified (`503` → `"503"`); anything
+/// else, a blank string included, is skipped (never a code of `""`). The one
+/// top-level reader [`app_answered_failure`] and the vision device arm share.
 pub(crate) fn top_level_code(json: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
     ["code", "errorCode"]
         .into_iter()
-        .find_map(|k| {
-            json.get(k)
-                .and_then(|v| v.as_str())
-                .filter(|c| !c.trim().is_empty())
+        .find_map(|k| match json.get(k) {
+            Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
         })
-        .map(String::from)
 }
 
 impl DispatchError {
@@ -1219,6 +1220,21 @@ mod tests {
         assert_eq!(
             answered(json!({"success": false, "error": "x", "code": ""})).and_then(|(_, c)| c),
             None
+        );
+    }
+
+    /// A numeric code reads stringified, at the top level as inside an object
+    /// `error` (`from_wire`), so both shapes classify the same.
+    #[test]
+    fn app_answered_failure_reads_a_numeric_code_at_either_level() {
+        assert_eq!(
+            answered(json!({"success": false, "error": "x", "code": 503})).and_then(|(_, c)| c),
+            Some("503".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "error": {"code": 503, "message": "m"}}))
+                .and_then(|(_, c)| c),
+            Some("503".to_string())
         );
     }
 
