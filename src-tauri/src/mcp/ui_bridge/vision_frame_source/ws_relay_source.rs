@@ -57,8 +57,15 @@ impl FrameProvider for WsRelayScreenshotSource {
 ///
 /// The row is READ AGAIN right before every dispatch, and the
 /// [`SCREENSHOT_CAPABILITY`] re-checked on it: a capability-less client that
-/// re-registered under the same id after resolution is refused (422), never
-/// sent `getScreenshot` blind. A registration that turned HTTP is fetched over
+/// re-registered under the same id after resolution is refused (422) rather
+/// than sent `getScreenshot` blind. That NARROWS the window, it does not close
+/// it: [`AppDispatcher::dispatch_websocket`] re-reads the row itself, and
+/// [`crate::mcp::command_relay::CommandRelay::dispatch`] then routes by app id
+/// to whichever connection holds it at send time, so a capability-less client
+/// that re-registers in the microseconds between this check and the send can
+/// still receive the command — it answers `NO_HANDLER`, which surfaces as
+/// `CaptureFailed`. Closing it needs a relay dispatch pinned to the checked
+/// `websocket_conn_id`. A registration that turned HTTP is fetched over
 /// HTTP. A flip to HTTP between that read and the dispatch
 /// ([`DispatchError::NotWebsocket`]) is re-resolved ONCE; a second flip is
 /// [`FrameSourceError::Unreachable`]. A row that is gone was live when the
@@ -92,6 +99,10 @@ pub(crate) async fn capture_over_relay(
             }
         }
     }
+    // Reached only if attempt 1 ALSO hit `NotWebsocket` — impossible as the
+    // loop is written (the `if attempt == 0` guard sends attempt 1's result to
+    // `decode`), but the compiler cannot see that, and if the guard ever
+    // changes this is the honest answer: the row flipped transport twice.
     Err(from_dispatch_error(
         app_id,
         DispatchError::NotWebsocket(app_id.to_string()),
@@ -400,10 +411,12 @@ mod tests {
         }
     }
 
-    /// A3: a capability-less client that re-registered under the same id after
-    /// resolution is refused at dispatch time (422) and sent no frame.
+    /// Pins the CAPTURE-TIME capability re-check: a row that carries no
+    /// `screenshot` capability when the capture runs (a client that
+    /// re-registered under the same id after resolution) is refused (422) and
+    /// sent no frame, independently of the resolver's own check.
     #[tokio::test]
-    async fn a_capability_less_re_registration_is_refused_not_sent_blind() {
+    async fn the_capture_time_capability_recheck_refuses_a_capability_less_row() {
         let (dispatcher, registry, _relay, _conn_id, mut rx) =
             ws_app("wapp", &["control"], Duration::from_secs(5)).await;
         let err = capture_over_relay(&dispatcher, &registry, "wapp")

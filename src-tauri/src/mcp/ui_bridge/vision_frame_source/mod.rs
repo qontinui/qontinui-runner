@@ -301,33 +301,41 @@ impl DeviceScreenshotSource {
                     ),
                 });
             }
-            // A gateway in front of the device answered for it (bad gateway,
-            // unavailable, gateway timeout): the device itself was never
-            // reached, so this is the transport's failure, not the app's.
+            // Read the body FIRST: a UI Bridge envelope carrying a `code` means
+            // the device itself answered — e.g. ui-bridge-native's own 503
+            // `PAIRING_UNAVAILABLE` refusal — so it is the app's failure,
+            // with its code, whatever the status.
+            let body = resp.json::<serde_json::Value>().await.ok();
+            // A pairing refusal's `error` says what to do; keep it.
+            let reason = body
+                .as_ref()
+                .and_then(|b| b.get("error")?.as_str().map(str::to_string));
+            let app_code = body.as_ref().and_then(envelope_code);
+            let message = match reason {
+                Some(reason) => format!("device screenshot {url} returned HTTP {status}: {reason}"),
+                None => format!("device screenshot {url} returned HTTP {status}"),
+            };
+            // With no such envelope, a gateway status (bad gateway,
+            // unavailable, gateway timeout) is most likely a proxy answering
+            // for a device it could not reach: the transport's failure.
             let gateway = matches!(
                 status,
                 reqwest::StatusCode::BAD_GATEWAY
                     | reqwest::StatusCode::SERVICE_UNAVAILABLE
                     | reqwest::StatusCode::GATEWAY_TIMEOUT
             );
-            // A pairing refusal's `error` says what to do; keep it.
-            let reason = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|body| body.get("error")?.as_str().map(str::to_string));
-            let message = match reason {
-                Some(reason) => format!("device screenshot {url} returned HTTP {status}: {reason}"),
-                None => format!("device screenshot {url} returned HTTP {status}"),
-            };
-            return Err(if gateway {
-                unreachable(message, None)
-            } else {
-                FrameSourceError::CaptureFailed {
+            return Err(match app_code {
+                Some(code) => FrameSourceError::CaptureFailed {
+                    message,
+                    code: Some(code),
+                    retryable: body.as_ref().and_then(|b| b.get("retryable")?.as_bool()),
+                },
+                None if gateway => unreachable(message, None),
+                None => FrameSourceError::CaptureFailed {
                     message,
                     code: None,
                     retryable: None,
-                }
+                },
             });
         }
         let body: serde_json::Value =
@@ -356,6 +364,20 @@ impl FrameProvider for DeviceScreenshotSource {
     fn source_label(&self) -> &'static str {
         "device_http"
     }
+}
+
+/// The machine-readable code of a UI Bridge `{success:false, error, code}`
+/// envelope (`code`, else `errorCode`; at the top level or inside an object
+/// `error`), when the body is one. `None` for any other body.
+fn envelope_code(body: &serde_json::Value) -> Option<String> {
+    let text = |v: &serde_json::Value| {
+        ["code", "errorCode"]
+            .into_iter()
+            .find_map(|k| v.get(k)?.as_str())
+            .filter(|c| !c.trim().is_empty())
+            .map(str::to_string)
+    };
+    text(body).or_else(|| body.get("error").filter(|e| e.is_object()).and_then(text))
 }
 
 /// Decode a `control/screenshot` JSON body into a [`Frame`]. Pure (no I/O) so
@@ -844,31 +866,82 @@ mod tests {
         assert!(text.contains("screenshotProvider"), "{text}");
     }
 
-    /// A7: a gateway status in front of the device is the transport's failure.
-    #[tokio::test]
-    async fn a_gateway_status_from_the_device_is_unreachable() {
+    /// A device screenshot server answering every request with `status` and
+    /// `body` (`None` = an empty body). Returns its base url.
+    async fn answering(status: axum::http::StatusCode, body: Option<serde_json::Value>) -> String {
         let app = axum::Router::new().route(
             "/ui-bridge/control/screenshot",
-            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    match body {
+                        Some(b) => (status, axum::Json(b)).into_response(),
+                        None => status.into_response(),
+                    }
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let err = DeviceScreenshotSource {
+        base
+    }
+
+    async fn fetch_from(base: String) -> FrameSourceError {
+        DeviceScreenshotSource {
             base_url: base,
             phone: false,
             target: "proxied".into(),
         }
         .fetch()
         .await
-        .expect_err("a 503 is not a frame");
-        assert_eq!(err.code(), "APP_UNREACHABLE", "{err:?}");
+        .expect_err("an error status is not a frame")
+    }
+
+    /// A bare gateway status (502/503/504, no UI Bridge envelope) is the
+    /// transport's failure; a bare 500 stays the app's failed capture.
+    #[tokio::test]
+    async fn a_bare_gateway_status_from_the_device_is_unreachable() {
+        use axum::http::StatusCode as S;
+        for status in [S::BAD_GATEWAY, S::SERVICE_UNAVAILABLE, S::GATEWAY_TIMEOUT] {
+            let err = fetch_from(answering(status, None).await).await;
+            assert_eq!(err.code(), "APP_UNREACHABLE", "{status}: {err:?}");
+            assert_eq!(
+                err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+                "transport",
+                "{status}"
+            );
+        }
+        let err = fetch_from(answering(S::INTERNAL_SERVER_ERROR, None).await).await;
+        assert_eq!(err.code(), "APP_CAPTURE_FAILED", "{err:?}");
         assert_eq!(
             err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
-            "transport"
+            "app"
         );
+    }
+
+    /// The native device's OWN 503 refusal (`PAIRING_UNAVAILABLE` envelope)
+    /// is a reached device refusing — the app's failure, code kept.
+    #[tokio::test]
+    async fn a_503_carrying_a_ui_bridge_code_stays_the_apps_refusal() {
+        let body = serde_json::json!({
+            "success": false,
+            "error": "The pairing store is not available yet. Try again.",
+            "code": "PAIRING_UNAVAILABLE",
+        });
+        let err =
+            fetch_from(answering(axum::http::StatusCode::SERVICE_UNAVAILABLE, Some(body)).await)
+                .await;
+        assert_eq!(err.code(), "PAIRING_UNAVAILABLE", "{err:?}");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.to_json_err().1 .0.hint.expect("hint")["failure_origin"],
+            "app"
+        );
+        assert!(err.to_string().contains("pairing store"), "{err}");
     }
 
     #[test]
