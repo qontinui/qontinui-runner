@@ -3059,6 +3059,9 @@ impl Default for HelperTasksSettings {
 /// [`crate::ci_node::settings_directive`]. The remote door re-validates every
 /// field locally and can only ever write values a hand-edit could also write —
 /// notably it CANNOT write a wildcard allowlist or a `min_free_disk_gb` of 0.
+/// Coord also stores the latest directive, and the runner fetches it on every
+/// `device_ci` connect (`ci_node::directive_fetch`), so a directive sent while
+/// the device was offline applies when it comes back.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CiNodeSettings {
     /// Master opt-in. Default FALSE — the runner never advertises CI
@@ -3109,6 +3112,67 @@ pub struct CiNodeSettings {
     /// means "do not touch my toolchains", not "ignore the declaration".
     #[serde(default)]
     pub canonical_converge: bool,
+    /// The coord-minted id of the last settings directive this device applied
+    /// (plan `2026-11-22-ci-node-directive-replays-on-connect`, D2). A
+    /// directive carrying this same id — the fetched-on-connect copy of a
+    /// directive already applied live, or a second fetch — is a no-op replay.
+    ///
+    /// Bookkeeping, not a setting: no form edits it, and only
+    /// [`crate::ci_node::settings_directive`] writes it. `None` (omitted on
+    /// disk, per the rollback rule on `max_concurrent_builds`) = no
+    /// identified directive was ever applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_directive_id: Option<uuid::Uuid>,
+    /// Coord's `requested_at` for [`Self::last_directive_id`] — COORD's clock.
+    /// A directive is applied only when its own `requested_at` is strictly
+    /// newer, so the live copy and the fetched copy of directives can arrive in
+    /// either order and the newest still wins. Coord clock against coord clock,
+    /// so the box's own clock skew never enters this comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_directive_requested_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the owner last saved this section through the runner's own
+    /// settings panel — THIS BOX's clock. A FETCHED directive older than this
+    /// is not applied: the owner's most recent statement wins, and a replay of
+    /// a directive sent before a local edit is not a more recent statement.
+    /// Stamped by the local save only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_edited_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Serializes every read-modify-write of [`Settings::ci_node`] in this process:
+/// the coord settings directive (live and fetched-on-connect,
+/// [`crate::ci_node::settings_directive`]) and the local Tauri save
+/// (`commands::resource_guard_settings`). Each writer takes it and then does
+/// its whole compare-and-write inside ONE [`update_settings_if`] closure,
+/// both through [`update_ci_node_settings`], the only door that takes it. So
+/// the directive's newest-wins compare and the local save's `local_edited_at`
+/// stamp cannot interleave and drop one another (`update_settings` holds no
+/// lock of its own). Plan `2026-11-22-ci-node-directive-replays-on-connect`, D2.
+///
+/// Scope: `ci_node` writers only. A writer of ANOTHER section still reads and
+/// saves the whole document unlocked, so a concurrent unrelated save can still
+/// write back a `ci_node` section read just before a directive landed — the
+/// pre-existing whole-document race every `update_settings` caller shares,
+/// which this lock narrows for `ci_node` but does not close.
+static CI_NODE_SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`CI_NODE_SETTINGS_WRITE_LOCK`], poison-tolerant: a panic in another
+/// writer leaves no partial state behind it (the save itself is atomic on
+/// disk).
+fn lock_ci_node_settings_writes() -> std::sync::MutexGuard<'static, ()> {
+    CI_NODE_SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test probe: is [`CI_NODE_SETTINGS_WRITE_LOCK`] held right now? Lets a test
+/// prove [`update_ci_node_settings`] holds it across its closure.
+#[cfg(test)]
+pub(crate) fn ci_node_settings_write_lock_is_held() -> bool {
+    matches!(
+        CI_NODE_SETTINGS_WRITE_LOCK.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
 }
 
 fn default_ci_node_min_free_disk_gb() -> u64 {
@@ -3192,6 +3256,9 @@ impl Default for CiNodeSettings {
             repo_allowlist: Vec::new(),
             min_free_disk_gb: default_ci_node_min_free_disk_gb(),
             canonical_converge: false,
+            last_directive_id: None,
+            last_directive_requested_at: None,
+            local_edited_at: None,
         }
     }
 }
@@ -5450,6 +5517,31 @@ pub fn update_settings<F>(mutate: F) -> Result<(), String>
 where
     F: FnOnce(&mut Settings),
 {
+    update_settings_if(|settings| {
+        mutate(settings);
+        SettingsWrite::Persist(())
+    })
+}
+
+/// What an [`update_settings_if`] closure decided.
+pub enum SettingsWrite<R> {
+    /// Save the (mutated) document.
+    Persist(R),
+    /// Write nothing — the file, and its mtime, are left exactly as they were.
+    /// Any mutation the closure made to its copy is discarded.
+    Skip(R),
+}
+
+/// [`update_settings`] for a writer that decides, from the on-disk document,
+/// whether to write at all — a compare-and-write whose "no" must leave the file
+/// untouched (the settings directive's no-op replay, plan
+/// `2026-11-22-ci-node-directive-replays-on-connect`). Same guarantees as
+/// [`update_settings`]: the closure sees the RAW persisted document, and a
+/// non-authoritative base is refused before the closure runs.
+pub fn update_settings_if<F, R>(decide: F) -> Result<R, String>
+where
+    F: FnOnce(&mut Settings) -> SettingsWrite<R>,
+{
     // Gated before the read, so a refused update neither reads nor writes
     // ([`qontinui_runner_lib::env_write_gate`]).
     qontinui_runner_lib::env_write_gate::check(
@@ -5463,8 +5555,13 @@ where
         return Err(msg);
     }
     let mut settings = loaded.settings;
-    mutate(&mut settings);
-    save_settings(&settings)
+    match decide(&mut settings) {
+        SettingsWrite::Persist(r) => {
+            save_settings(&settings)?;
+            Ok(r)
+        }
+        SettingsWrite::Skip(r) => Ok(r),
+    }
 }
 
 /// Tri-state runner tier: a settings-read failure means the tier is UNKNOWN,
@@ -6157,28 +6254,38 @@ pub fn get_ai_settings() -> AiSettings {
 /// Get the current CI-node settings (plan
 /// `2026-07-15-runner-as-ci-node-migration`). The heartbeat, budget publish,
 /// and `ci_node` executor all read it at the moment they need it, so a write
-/// through [`save_ci_node_settings`] is visible to the next reader without a
+/// through [`update_ci_node_settings`] is visible to the next reader without a
 /// restart.
 pub fn get_ci_node_settings() -> CiNodeSettings {
     load_settings().ci_node
 }
 
-/// Persist CI-node settings.
+/// Compare-and-write the CI-node settings.
 ///
-/// THE ONLY writer for `ci_node`, and deliberately built on [`update_settings`]
-/// rather than a bespoke one: that path starts from the RAW on-disk document
-/// (never the env-overlaid view), refuses to write at all when the existing
-/// file could not be read or parsed, writes atomically, and drops the parse
-/// cache afterwards. Hand-rolling a second writer here would have reintroduced
-/// exactly the bug that comment describes — a secondary runner persisting its
-/// in-memory overlays over the primary's document as a side effect of an
-/// unrelated save.
+/// THE ONLY writer for `ci_node`, and deliberately built on
+/// [`update_settings_if`] rather than a bespoke one: that path starts from the
+/// RAW on-disk document (never the env-overlaid view), refuses to write at all
+/// when the existing file could not be read or parsed, writes atomically, and
+/// drops the parse cache afterwards. Hand-rolling a second writer here would
+/// have reintroduced exactly the bug that comment describes — a secondary
+/// runner persisting its in-memory overlays over the primary's document as a
+/// side effect of an unrelated save.
 ///
-/// Callers: the qontinui-web configuration directive
-/// (`ci_node::settings_directive::apply`). The values are validated BEFORE they
-/// reach this function — this is a writer, not a gate.
-pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
-    update_settings(|settings| settings.ci_node = ci_node)
+/// It holds [`CI_NODE_SETTINGS_WRITE_LOCK`] across the read, the closure and
+/// the write, so the closure's decision is made against the document it
+/// writes over: no other `ci_node` writer in this process can land between
+/// the two (plan `2026-11-22-ci-node-directive-replays-on-connect`, D2).
+///
+/// Callers: the coord settings directive (`ci_node::settings_directive`, live
+/// and fetched) and the local Tauri save
+/// (`commands::resource_guard_settings`). Values are validated BEFORE they
+/// reach the closure — this is a writer, not a gate.
+pub fn update_ci_node_settings<F, R>(decide: F) -> Result<R, String>
+where
+    F: FnOnce(&mut CiNodeSettings) -> SettingsWrite<R>,
+{
+    let _guard = lock_ci_node_settings_writes();
+    update_settings_if(|settings| decide(&mut settings.ci_node))
 }
 
 /// Persist AI settings WITHOUT the write lock — private on purpose: every
@@ -6965,7 +7072,7 @@ pub fn get_transcript_watcher_settings() -> TranscriptWatcherSettings {
 /// Persist the live-session protection floors.
 ///
 /// Built on [`update_settings`] for the same reason
-/// [`save_ci_node_settings`] is: that path starts from the RAW on-disk
+/// [`update_ci_node_settings`] is: that path starts from the RAW on-disk
 /// document rather than the env-overlaid view, refuses to write at all when the
 /// existing file could not be read or parsed, writes atomically, and drops the
 /// parse cache afterwards. A secondary runner must never persist its in-memory

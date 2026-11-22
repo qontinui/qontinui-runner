@@ -8239,6 +8239,9 @@ mod tests {",
             repo_allowlist: Vec::new(),
             min_free_disk_gb: 50,
             canonical_converge: false,
+            last_directive_id: None,
+            last_directive_requested_at: None,
+            local_edited_at: None,
         }
     }
 

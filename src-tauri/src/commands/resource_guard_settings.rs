@@ -353,7 +353,7 @@ pub fn get_ci_node_settings() -> Result<CommandResponse, String> {
 }
 
 /// Internal implementation of [`save_ci_node_settings`].
-fn save_ci_node_settings_impl(
+pub(crate) fn save_ci_node_settings_impl(
     enabled: bool,
     max_concurrent_builds: Option<u32>,
     repo_allowlist: Vec<String>,
@@ -400,31 +400,63 @@ fn save_ci_node_settings_impl(
         ));
     }
 
-    let ci_node = CiNodeSettings {
-        enabled,
-        max_concurrent_builds,
-        repo_allowlist: repo_allowlist
-            .into_iter()
-            .map(|r| r.trim().to_string())
-            .filter(|r| !r.is_empty())
-            .collect(),
-        min_free_disk_gb,
-        // This form has no field for `canonical_converge`, so it must not
-        // DECIDE it. Struct-update carries the persisted value through, which
-        // means an unrelated save here (toggling `enabled`, editing the
-        // allowlist) cannot silently revoke a convergence grant the owner made
-        // through the audited web/coord directive — nor, in the other
-        // direction, invent one: the only writer that can set it true is that
-        // directive. The same rule protects any field added here later.
-        ..settings::get_ci_node_settings()
-    };
-    settings::save_ci_node_settings(ci_node).map_err(AppError::ConfigError)?;
+    let repo_allowlist: Vec<String> = repo_allowlist
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    // Under `CI_NODE_SETTINGS_WRITE_LOCK`, in ONE closure over the on-disk
+    // document (plan `2026-11-22-ci-node-directive-replays-on-connect`, D2):
+    // the coord directive's newest-wins compare and this stamp can then never
+    // interleave, so a directive applied between a read and a save here is not
+    // silently overwritten, and this edit's `local_edited_at` is never lost.
+    let edited_at = chrono::Utc::now();
+    settings::update_ci_node_settings(|ci| {
+        apply_local_edit(
+            ci,
+            enabled,
+            max_concurrent_builds,
+            repo_allowlist,
+            min_free_disk_gb,
+            edited_at,
+        );
+        settings::SettingsWrite::Persist(())
+    })
+    .map_err(AppError::ConfigError)?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("CI-node settings saved".to_string()),
         data: None,
     })
+}
+
+/// Write one local panel save into the persisted section.
+///
+/// Only the four fields this form has are written. Everything else is carried
+/// through: `canonical_converge` (this form has no field for it, so it must not
+/// DECIDE it — an unrelated save here cannot silently revoke a convergence
+/// grant the owner made through the audited web/coord directive, nor invent
+/// one; the same rule protects any field added later) and the coord
+/// directive's bookkeeping (`last_directive_id` / `last_directive_requested_at`,
+/// which only `ci_node::settings_directive` writes).
+///
+/// `local_edited_at` is stamped with the box's clock: a coord directive FETCHED
+/// on a later connect that was sent before this edit is then not applied over
+/// it (`settings_directive`, D2's local-edit branch).
+pub(crate) fn apply_local_edit(
+    ci: &mut CiNodeSettings,
+    enabled: bool,
+    max_concurrent_builds: Option<u32>,
+    repo_allowlist: Vec<String>,
+    min_free_disk_gb: u64,
+    edited_at: chrono::DateTime<chrono::Utc>,
+) {
+    ci.enabled = enabled;
+    ci.max_concurrent_builds = max_concurrent_builds;
+    ci.repo_allowlist = repo_allowlist;
+    ci.min_free_disk_gb = min_free_disk_gb;
+    ci.local_edited_at = Some(edited_at);
 }
 
 /// Save the CI-node admission floors.

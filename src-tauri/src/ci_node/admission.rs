@@ -2972,6 +2972,9 @@ mod tests {
             repo_allowlist: allow.iter().map(|s| s.to_string()).collect(),
             min_free_disk_gb: 20,
             canonical_converge: false,
+            last_directive_id: None,
+            last_directive_requested_at: None,
+            local_edited_at: None,
         }
     }
 

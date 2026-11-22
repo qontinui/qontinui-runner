@@ -42,6 +42,14 @@
 //! `ci_node.enabled` per dispatch, so a disabled device that receives a
 //! `build_requested` frame refuses it. The socket is a mailbox, not a
 //! capability.
+//!
+//! # Replaying what was missed while offline
+//!
+//! A `settings_requested` frame published while this device had no socket is
+//! not redelivered. Coord stores the latest directive per device, and the pump
+//! fetches it on coord's `_control`/`subscribed` frame (and, against a coord
+//! that never sends one, at connect and again shortly after) — see
+//! [`super::directive_fetch`].
 
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -205,12 +213,31 @@ async fn connect_and_pump_ci(
     // systemd `READY=1` waits on this (plan 2026-10-19 Phase 2b).
     crate::sd_notify::mark_ci_subscription_up();
 
+    // Replay what was missed while offline (plan
+    // `2026-11-22-ci-node-directive-replays-on-connect`, D2). The fetch that
+    // closes the race is the one on coord's `subscribed` frame; the connect
+    // fetch and the deadline re-fetch serve a coord that never sends it. Each
+    // fetch is spawned, so the pump never waits on HTTP.
+    let mut replay = super::directive_fetch::ReplaySchedule::default();
+    if replay.on_connect() {
+        super::directive_fetch::spawn_fetch(device_id, "connect");
+    }
+    let legacy_refetch = tokio::time::sleep(super::directive_fetch::LEGACY_REFETCH_AFTER);
+    tokio::pin!(legacy_refetch);
+    let mut legacy_refetch_pending = true;
+
     let mut keepalive = tokio::time::interval(Duration::from_secs(CI_KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
     keepalive.tick().await; // skip the immediate first tick
 
     loop {
         tokio::select! {
+            _ = &mut legacy_refetch, if legacy_refetch_pending => {
+                legacy_refetch_pending = false;
+                if replay.on_legacy_deadline() {
+                    super::directive_fetch::spawn_fetch(device_id, "legacy re-fetch");
+                }
+            }
             _ = keepalive.tick() => {
                 if let Err(e) = ws.send(Message::Ping(Bytes::new())).await {
                     warn!("ci_node: WS keepalive ping send failed: {e:#}");
@@ -236,33 +263,64 @@ async fn connect_and_pump_ci(
                     }
                     Message::Frame(_) => continue,
                 };
-                if let Err(e) = handle_ci_message(&txt, device_id) {
-                    warn!("ci_node: handle_ci_message error (continuing): {e:#}");
+                match handle_ci_message(&txt, device_id) {
+                    Ok(CiFrame::Subscribed) => {
+                        if replay.on_subscribed() {
+                            super::directive_fetch::spawn_fetch(device_id, "subscribed");
+                        }
+                    }
+                    Ok(CiFrame::Other) => {}
+                    Err(e) => warn!("ci_node: handle_ci_message error (continuing): {e:#}"),
                 }
             }
         }
     }
 }
 
+/// What [`handle_ci_message`] saw, as far as the pump needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiFrame {
+    /// Coord's `{"channel":"_control","type":"subscribed"}`: its PSUBSCRIBE is
+    /// live, so every directive published from here on arrives on this socket.
+    /// The pump fetches the stored directive on it
+    /// ([`super::directive_fetch`]).
+    Subscribed,
+    /// Anything else — handled (or ignored) in place.
+    Other,
+}
+
+/// Coord's subscription-generic control channel. Not a Redis channel: coord
+/// writes it itself, once, after PSUBSCRIBE and before forwarding any event.
+const CONTROL_CHANNEL: &str = "_control";
+
 /// Parse + route one inbound frame. A malformed or foreign frame logs and
 /// returns `Ok` — it must never kill the subscribe loop.
-fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
+fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<CiFrame> {
     let value: serde_json::Value = serde_json::from_str(txt)?;
     let Some(channel) = value.get("channel").and_then(|c| c.as_str()) else {
         // No envelope — not coord's fanout shape; ignore.
-        return Ok(());
+        return Ok(CiFrame::Other);
     };
+    if channel == CONTROL_CHANNEL {
+        return Ok(
+            if value.get("type").and_then(|t| t.as_str()) == Some("subscribed") {
+                CiFrame::Subscribed
+            } else {
+                CiFrame::Other
+            },
+        );
+    }
     let Some(kind) = route_ci_channel(channel, device_id) else {
-        return Ok(());
+        return Ok(CiFrame::Other);
     };
     // Dark by default: an ops frame is dropped before it is even parsed.
     if kind == CiChannel::OpsTaskRequested && !super::ops::enabled() {
         debug!("ci_node: ops task frame dropped (QONTINUI_OPS_TASKS_ENABLED is off)");
-        return Ok(());
+        return Ok(CiFrame::Other);
     }
     let Some(inner) = parse_envelope_json(&value) else {
         warn!("ci_node: envelope on {channel} had no parseable payload/body");
-        return Ok(());
+        return Ok(CiFrame::Other);
     };
     match kind {
         CiChannel::BuildRequested => match serde_json::from_value::<CiDispatchPayload>(inner) {
@@ -276,12 +334,14 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
         CiChannel::OpsTaskRequested => super::ops::handle(inner),
         CiChannel::SettingsRequested => {
             match serde_json::from_value::<super::settings_directive::CiSettingsDirective>(inner) {
-                Ok(directive) => super::settings_directive::apply(directive),
+                Ok(directive) => {
+                    super::settings_directive::apply_live(directive);
+                }
                 Err(e) => warn!("ci_node: settings_requested payload did not parse: {e}"),
             }
         }
     }
-    Ok(())
+    Ok(CiFrame::Other)
 }
 
 #[cfg(test)]
@@ -425,6 +485,30 @@ mod tests {
                 route_ci_channel(&near, device),
                 None,
                 "{near} must not route to the settings arm"
+            );
+        }
+    }
+
+    /// Coord's `subscribed` control frame is recognised — it is what triggers
+    /// the replay fetch that closes the offline-directive race — and nothing
+    /// else on `_control`, or on any real channel, is mistaken for it.
+    #[test]
+    fn the_subscribed_control_frame_is_recognised_and_nothing_else_is() {
+        let device = uuid::Uuid::now_v7();
+        assert_eq!(
+            handle_ci_message(r#"{"channel":"_control","type":"subscribed"}"#, device).unwrap(),
+            CiFrame::Subscribed
+        );
+        for other in [
+            r#"{"channel":"_control","type":"unsubscribed"}"#.to_string(),
+            r#"{"channel":"_control"}"#.to_string(),
+            r#"{"type":"subscribed"}"#.to_string(),
+            format!(r#"{{"channel":"events.ci.build_paused.{device}","type":"subscribed"}}"#),
+        ] {
+            assert_eq!(
+                handle_ci_message(&other, device).unwrap(),
+                CiFrame::Other,
+                "{other}"
             );
         }
     }
