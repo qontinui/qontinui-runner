@@ -175,6 +175,9 @@ export const CREATE_PLAIN_TERMINAL_SIGNATURE = spawnSignature(
 export const LIST_TERMINALS_SIGNATURE = readSignature("terminal-page.list-terminals");
 export const GET_ZONE_VIEW_STATE_SIGNATURE = readSignature("terminal-page.get-zone-view-state");
 export const LIST_RUNNER_WINDOWS_SIGNATURE = readSignature("terminal-page.list-runner-windows");
+export const GET_ROSTER_RESYNC_STATS_SIGNATURE = readSignature(
+  "terminal-page.get-roster-resync-stats",
+);
 
 /**
  * `open-terminal-window` — opens an EMPTY pop-out OS window. The new window is

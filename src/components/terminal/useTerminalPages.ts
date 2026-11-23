@@ -10,8 +10,11 @@ import { MAIN_WINDOW_LABEL, readWindowLabel } from "@/lib/windowLabel";
 import {
   broadcastRosterSaved,
   listenRosterSaved,
+  markResyncLogSince,
+  recordResync,
   rosterDigest,
   rosterEqual,
+  type ResyncOutcome,
 } from "./terminalPagesSync";
 import {
   PAGES_VERSION,
@@ -143,8 +146,23 @@ function readPersistedPages(): TerminalPageConfig[] | null {
  * apart, for the roster another window announced (see the resync effect in
  * `useTerminalPages`).
  */
-const ROSTER_RESYNC_RETRIES = 5;
-const ROSTER_RESYNC_RETRY_MS = 50;
+export const ROSTER_RESYNC_RETRIES = 5;
+export const ROSTER_RESYNC_RETRY_MS = 50;
+/**
+ * After the retries run out without a match, ONE more re-read this long later
+ * (plan 2026-11-23-runner-terminal-page-popout-ui-bridge-and-resync-lag, D4):
+ * a store that catches up after the retry budget is then shown instead of
+ * staying stale until the next save anywhere. 4x the retry budget, unmeasured
+ * (that plan's Phase 4 measures the real lag and may resize it).
+ */
+export const ROSTER_RESYNC_FINAL_REREAD_MS = 1000;
+
+/** The resync budget, as `get-roster-resync-stats` reports it. */
+export const ROSTER_RESYNC_BUDGET = {
+  retries: ROSTER_RESYNC_RETRIES,
+  retryMs: ROSTER_RESYNC_RETRY_MS,
+  finalRereadMs: ROSTER_RESYNC_FINAL_REREAD_MS,
+} as const;
 
 /** Persist the active page id; a full store leaves the previous one (best effort). */
 function persistActivePage(id: string) {
@@ -769,9 +787,14 @@ export function useTerminalPages() {
   // is retried until the stored roster's digest is the one the sender saved;
   // after the last retry, when any read returned a roster, the store is re-read
   // and applied (a newer write that displaced the digest sends its own event).
-  // A write that becomes visible only after the retry budget (5 x 50 ms) is not
-  // re-read: this window shows the older roster, with a warning, until the
-  // next save anywhere.
+  // A write that becomes visible only after the retry budget (5 x 50 ms) is
+  // caught by ONE delayed final re-read (`ROSTER_RESYNC_FINAL_REREAD_MS`
+  // later), so a lagging store bounds the stale display by a known delay
+  // instead of leaving it until the next save anywhere.
+  //
+  // Every foreign event records exactly one resync entry (`recordResync`) on
+  // the branch that ends it: matched, matched-late, exhausted, unreadable,
+  // own-save, or superseded by a newer event. An unmount records nothing.
   //
   // Once the listener is registered, the store is read once to catch up on a
   // save another window made between this window's mount and that moment.
@@ -804,45 +827,106 @@ export function useTerminalPages() {
     // not warned about. A store still holding an own save made BEFORE the event
     // is indistinguishable from a lag (the other window may have built on it),
     // so that case IS warned about: honest about what this window cannot tell.
-    const unlisten = listenRosterSaved(({ source, digest }) => {
-      if (source === windowLabel) return;
-      // A newer foreign event supersedes a read still waiting on an older digest.
-      if (retryTimer) clearTimeout(retryTimer);
-      retryTimer = null;
-      let retries = 0;
-      let lastRead: TerminalPageConfig[] | null = null;
-      const ownSavesAtEvent = ownSaveCountRef.current;
-      const attempt = () => {
+    // Ends the in-flight foreign read with an outcome; null when none is in
+    // flight. A newer event ends the older one as `superseded`.
+    let settlePending: ((outcome: ResyncOutcome) => void) | null = null;
+
+    const unlisten = listenRosterSaved(
+      ({ source, digest }) => {
+        if (source === windowLabel) return;
+        // A newer foreign event supersedes a read still waiting on an older
+        // digest (a retry or the final re-read): cancel it and record why.
+        if (retryTimer) clearTimeout(retryTimer);
         retryTimer = null;
-        if (disposed) return;
-        const stored = readPersistedPages();
-        if (stored) lastRead = stored;
-        if (stored && rosterDigest(stored) === digest) {
+        settlePending?.("superseded");
+        const startedAt = Date.now();
+        let attempts = 0;
+        let retries = 0;
+        let lastRead: TerminalPageConfig[] | null = null;
+        const ownSavesAtEvent = ownSaveCountRef.current;
+        const settle = (outcome: ResyncOutcome) => {
+          if (settlePending !== settle) return; // exactly one entry per event
+          settlePending = null;
+          recordResync({
+            source,
+            receiver: windowLabel,
+            digest,
+            startedAt,
+            elapsedMs: Date.now() - startedAt,
+            attempts,
+            outcome,
+          });
+        };
+        settlePending = settle;
+        const finalReread = () => {
+          retryTimer = null;
+          if (disposed) return;
+          attempts++;
+          const stored = readPersistedPages();
+          // Applies the store as it now reads (unchanged when equal, kept when
+          // empty), whether or not the announced digest arrived.
           apply();
-          return;
-        }
-        if (retries < ROSTER_RESYNC_RETRIES) {
-          retries++;
-          retryTimer = setTimeout(attempt, ROSTER_RESYNC_RETRY_MS);
-          return;
-        }
-        if (lastRead) {
+          if (stored && rosterDigest(stored) === digest) {
+            settle("matched-late");
+            return;
+          }
+          // This window saved during the wait and the store holds that save:
+          // an ordinary overwrite, labelled as the retry branch labels it, so
+          // the telemetry does not report it as a lag.
+          const ownSaveDuringWait =
+            stored !== null &&
+            ownSaveCountRef.current !== ownSavesAtEvent &&
+            rosterDigest(stored) === lastOwnSavedDigestRef.current;
+          settle(ownSaveDuringWait ? "own-save" : "exhausted");
+        };
+        const attempt = () => {
+          retryTimer = null;
+          if (disposed) return;
+          attempts++;
+          const stored = readPersistedPages();
+          if (stored) lastRead = stored;
+          if (stored && rosterDigest(stored) === digest) {
+            apply();
+            settle("matched");
+            return;
+          }
+          if (retries < ROSTER_RESYNC_RETRIES) {
+            retries++;
+            retryTimer = setTimeout(attempt, ROSTER_RESYNC_RETRY_MS);
+            return;
+          }
+          if (!lastRead) {
+            // Every read found an empty or unreadable store: nothing to apply.
+            settle("unreadable");
+            return;
+          }
           const ownSaveDuringRead =
             ownSaveCountRef.current !== ownSavesAtEvent &&
             rosterDigest(lastRead) === lastOwnSavedDigestRef.current;
-          if (!ownSaveDuringRead) {
-            console.warn(
-              `[terminal-pages] the stored roster never matched ${source}'s save; re-reading the store`,
-            );
+          if (ownSaveDuringRead) {
+            // An ordinary overwrite, not a lag: no warning, no final re-read.
+            apply();
+            settle("own-save");
+            return;
           }
+          console.warn(
+            `[terminal-pages] the stored roster never matched ${source}'s save; re-reading the store`,
+          );
           apply();
-        }
-      };
-      attempt();
-    }, apply);
+          retryTimer = setTimeout(finalReread, ROSTER_RESYNC_FINAL_REREAD_MS);
+        };
+        attempt();
+      },
+      () => {
+        markResyncLogSince();
+        apply();
+      },
+    );
 
     return () => {
       disposed = true;
+      // An unmount records nothing: the read was cut short, not answered.
+      settlePending = null;
       if (retryTimer) clearTimeout(retryTimer);
       unlisten();
     };

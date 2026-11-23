@@ -52,6 +52,7 @@ import {
   buildCreatePlainTerminalAction,
   CREATE_PLAIN_TERMINAL_ACTION_ID,
 } from "@/components/terminal/createPlainTerminalAction";
+import { buildRosterResyncStatsAction } from "@/components/terminal/rosterResyncAction";
 import { buildTerminalLaunchMenuActions } from "@/components/terminal/terminalLaunchMenuActions";
 import * as pageSignatures from "@/components/terminal/terminalPageSignatures";
 import type { ZoneViewFacts } from "@/components/terminal/terminalPageSignatures";
@@ -631,6 +632,8 @@ describe("component-action signature coverage (terminal page)", () => {
     }
     const plain = buildCreatePlainTerminalAction(async () => "tab-1");
     expect(plain.signature?.id).toBe(componentSignatureId("terminal-page", plain.id));
+    const resync = buildRosterResyncStatsAction(() => "main");
+    expect(resync.signature?.id).toBe(componentSignatureId("terminal-page", resync.id));
   });
 
   it("every signature agrees with its declared `effect` (the SDK's authoring lint)", () => {

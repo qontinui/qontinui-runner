@@ -66,8 +66,24 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { setPageBindings } from "@/lib/pageBindings";
-import { TERMINAL_PAGES_SAVED_EVENT, rosterDigest, rosterEqual } from "./terminalPagesSync";
-import { PAGES_STORAGE_KEY, useTerminalPages, type TerminalPageConfig } from "./useTerminalPages";
+import {
+  RESYNC_LOG_CAPACITY,
+  TERMINAL_PAGES_SAVED_EVENT,
+  markResyncLogSince,
+  readResyncLog,
+  recordResync,
+  resetResyncLogForTest,
+  rosterDigest,
+  rosterEqual,
+} from "./terminalPagesSync";
+import {
+  PAGES_STORAGE_KEY,
+  ROSTER_RESYNC_FINAL_REREAD_MS,
+  ROSTER_RESYNC_RETRIES,
+  ROSTER_RESYNC_RETRY_MS,
+  useTerminalPages,
+  type TerminalPageConfig,
+} from "./useTerminalPages";
 
 type Hook = ReturnType<typeof useTerminalPages>;
 
@@ -174,6 +190,7 @@ beforeEach(() => {
   bus.deferEvent = null;
   bus.release.length = 0;
   windowLabel.current = "main";
+  resetResyncLogForTest();
   instanceStorage.setJSON(PAGES_STORAGE_KEY, ROSTER);
   instanceStorage.setItem("qontinui-terminal-active-page", "p1");
 });
@@ -666,5 +683,258 @@ describe("the receiver's branches", () => {
     vi.useRealTimers();
 
     expect(names(main.hook().allPages)).toEqual(["Alpha", "Late", "Gamma"]);
+  });
+});
+
+// ── Resync telemetry and the delayed final re-read (plan
+// 2026-11-23-runner-terminal-page-popout-ui-bridge-and-resync-lag, D3 + D4) ──
+
+/** The resync entries the window `receiver` recorded, oldest first. */
+const logOf = (receiver: string) => readResyncLog().entries.filter((e) => e.receiver === receiver);
+const outcomesOf = (receiver: string) => logOf(receiver).map((e) => e.outcome);
+
+/** When the retry budget is spent (the last retry read has run). */
+const BUDGET_MS = ROSTER_RESYNC_RETRIES * ROSTER_RESYNC_RETRY_MS;
+const NEVER = [ROSTER[0]];
+const THEIRS = [ROSTER[0], { ...ROSTER[1], name: "Theirs" }, ROSTER[2]];
+
+describe("resync telemetry", () => {
+  it("before any foreign event: since is the listener's mount time and entries are []", async () => {
+    expect(readResyncLog()).toEqual({ since: null, entries: [] });
+    const before = Date.now();
+    await mountWindow("main");
+    const { since, entries } = readResyncLog();
+    expect(since).not.toBeNull();
+    expect(since!).toBeGreaterThanOrEqual(before);
+    expect(since!).toBeLessThanOrEqual(Date.now());
+    expect(entries).toEqual([]);
+  });
+
+  it("a match on the first read records one `matched` entry, and the sender records none", async () => {
+    await mountWindow("main");
+    const pop = await mountWindow("term-2");
+
+    act(() => void pop.hook().renamePage("p2", "Renamed"));
+
+    expect(logOf("main")).toEqual([
+      expect.objectContaining({
+        source: "term-2",
+        receiver: "main",
+        digest: rosterDigest(persisted()),
+        attempts: 1,
+        outcome: "matched",
+      }),
+    ]);
+    // Own echo: the sender ignores it and records nothing.
+    expect(logOf("term-2")).toEqual([]);
+  });
+
+  it("a store that lags the event: `matched` with the attempts and the elapsed time", async () => {
+    const main = await mountWindow("main");
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(THEIRS));
+    act(() => void vi.advanceTimersByTime(2 * ROSTER_RESYNC_RETRY_MS));
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, THEIRS);
+    act(() => void vi.advanceTimersByTime(ROSTER_RESYNC_RETRY_MS));
+    vi.useRealTimers();
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Theirs", "Gamma"]);
+    expect(logOf("main")).toEqual([
+      expect.objectContaining({
+        outcome: "matched",
+        attempts: 4,
+        elapsedMs: 3 * ROSTER_RESYNC_RETRY_MS,
+      }),
+    ]);
+  });
+
+  it("every read empty: one `unreadable` entry, nothing applied, no final re-read", async () => {
+    const main = await mountWindow("main");
+    const before = main.hook().allPages;
+    localStorage.clear();
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(NEVER));
+    act(() => void vi.advanceTimersByTime(BUDGET_MS));
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+
+    expect(main.hook().allPages).toBe(before);
+    expect(logOf("main")).toEqual([
+      expect.objectContaining({ outcome: "unreadable", attempts: ROSTER_RESYNC_RETRIES + 1 }),
+    ]);
+  });
+
+  it("an own save during the read: one `own-save` entry and no final re-read", async () => {
+    const main = await mountWindow("main");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(NEVER));
+    act(() => void main.hook().renamePage("p2", "Own"));
+    act(() => void vi.advanceTimersByTime(BUDGET_MS));
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => void vi.advanceTimersByTime(2 * ROSTER_RESYNC_FINAL_REREAD_MS));
+    vi.useRealTimers();
+
+    expect(outcomesOf("main")).toEqual(["own-save"]);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Own", "Gamma"]);
+  });
+
+  it("an own save during the final wait: `own-save`, not `exhausted`", async () => {
+    const main = await mountWindow("main");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(NEVER));
+    act(() => void vi.advanceTimersByTime(BUDGET_MS));
+    // The retries ran out on the old roster: the final re-read is pending.
+    expect(outcomesOf("main")).toEqual([]);
+    act(() => void main.hook().renamePage("p2", "OwnLate"));
+    act(() => void vi.advanceTimersByTime(ROSTER_RESYNC_FINAL_REREAD_MS));
+    vi.useRealTimers();
+
+    expect(outcomesOf("main")).toEqual(["own-save"]);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "OwnLate", "Gamma"]);
+  });
+
+  it("an entry recorded before the listener is ready still sets `since`", () => {
+    expect(readResyncLog().since).toBeNull();
+    recordResync({
+      source: "term-2",
+      receiver: "main",
+      digest: "d",
+      startedAt: 1234,
+      elapsedMs: 0,
+      attempts: 1,
+      outcome: "matched",
+    });
+    expect(readResyncLog().since).toBe(1234);
+    // A later ready mark does not move it.
+    markResyncLogSince(9999);
+    expect(readResyncLog().since).toBe(1234);
+  });
+
+  it("a superseded read records `superseded`, and its successor records its own outcome", async () => {
+    const main = await mountWindow("main");
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(NEVER));
+    act(() => void vi.advanceTimersByTime(ROSTER_RESYNC_RETRY_MS));
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, THEIRS);
+    receiveFrom("term-3", rosterDigest(THEIRS));
+    act(() => void vi.advanceTimersByTime(2 * ROSTER_RESYNC_FINAL_REREAD_MS));
+    vi.useRealTimers();
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Theirs", "Gamma"]);
+    expect(logOf("main")).toEqual([
+      expect.objectContaining({
+        source: "term-2",
+        outcome: "superseded",
+        attempts: 2,
+        elapsedMs: ROSTER_RESYNC_RETRY_MS,
+      }),
+      expect.objectContaining({ source: "term-3", outcome: "matched", attempts: 1 }),
+    ]);
+  });
+
+  it(`the ring keeps exactly the last ${RESYNC_LOG_CAPACITY} entries, oldest first`, async () => {
+    await mountWindow("main");
+    const total = RESYNC_LOG_CAPACITY + 5;
+    for (let i = 0; i < total; i++) receiveFrom(`term-${i}`, rosterDigest(ROSTER));
+
+    const sources = logOf("main").map((e) => e.source);
+    expect(sources).toHaveLength(RESYNC_LOG_CAPACITY);
+    expect(sources[0]).toBe("term-5");
+    expect(sources[RESYNC_LOG_CAPACITY - 1]).toBe(`term-${total - 1}`);
+  });
+});
+
+describe("the delayed final re-read after the retry budget", () => {
+  it("a store that catches up after the budget: the receiver ends on it, `matched-late`", async () => {
+    const main = await mountWindow("main");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(THEIRS));
+    act(() => void vi.advanceTimersByTime(BUDGET_MS));
+    // Exhausted: warned, the stale store applied, nothing recorded yet.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(logOf("main")).toEqual([]);
+    // The write becomes visible after the budget, before the final re-read.
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, THEIRS);
+    act(() => void vi.advanceTimersByTime(ROSTER_RESYNC_FINAL_REREAD_MS));
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Theirs", "Gamma"]);
+    expect(logOf("main")).toEqual([
+      expect.objectContaining({
+        outcome: "matched-late",
+        attempts: ROSTER_RESYNC_RETRIES + 2,
+        elapsedMs: BUDGET_MS + ROSTER_RESYNC_FINAL_REREAD_MS,
+      }),
+    ]);
+  });
+
+  it("a store that never catches up: one `exhausted` entry, one warn, the roster kept", async () => {
+    const main = await mountWindow("main");
+    const before = main.hook().allPages;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(NEVER));
+    act(() => void vi.advanceTimersByTime(BUDGET_MS + ROSTER_RESYNC_FINAL_REREAD_MS));
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => void vi.advanceTimersByTime(10 * ROSTER_RESYNC_FINAL_REREAD_MS));
+    vi.useRealTimers();
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(main.hook().allPages).toBe(before);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(logOf("main")).toEqual([
+      expect.objectContaining({ outcome: "exhausted", attempts: ROSTER_RESYNC_RETRIES + 2 }),
+    ]);
+  });
+
+  it("a newer event during the wait cancels the final re-read; the newer roster wins", async () => {
+    const main = await mountWindow("main");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(NEVER));
+    act(() => void vi.advanceTimersByTime(BUDGET_MS));
+    expect(vi.getTimerCount()).toBe(1); // the pending final re-read
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, THEIRS);
+    receiveFrom("term-3", rosterDigest(THEIRS));
+    // The newer event matched at once; the older final re-read must never
+    // read the store again.
+    const rosterReads = vi.spyOn(instanceStorage, "getJSON");
+    const readsOfRoster = () =>
+      rosterReads.mock.calls.filter(([storageKey]) => storageKey === PAGES_STORAGE_KEY).length;
+    act(() => void vi.advanceTimersByTime(2 * ROSTER_RESYNC_FINAL_REREAD_MS));
+    vi.useRealTimers();
+    expect(readsOfRoster()).toBe(0);
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Theirs", "Gamma"]);
+    expect(logOf("main")).toEqual([
+      expect.objectContaining({ source: "term-2", outcome: "superseded" }),
+      expect.objectContaining({ source: "term-3", outcome: "matched" }),
+    ]);
+  });
+
+  it("an unmount during the wait: no re-read, no state update, nothing recorded", async () => {
+    const main = await mountWindow("main");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest(THEIRS));
+    act(() => void vi.advanceTimersByTime(BUDGET_MS));
+    expect(vi.getTimerCount()).toBe(1);
+    const renders = main.renders();
+    main.unmount();
+    mounted.splice(mounted.indexOf(main), 1);
+    expect(vi.getTimerCount()).toBe(0);
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, THEIRS);
+    act(() => void vi.advanceTimersByTime(2 * ROSTER_RESYNC_FINAL_REREAD_MS));
+    vi.useRealTimers();
+
+    expect(main.renders()).toBe(renders);
+    expect(logOf("main")).toEqual([]);
+    expect(error).not.toHaveBeenCalled();
   });
 });
