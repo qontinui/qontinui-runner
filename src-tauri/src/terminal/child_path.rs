@@ -12,8 +12,9 @@
 //! The fix lives at the composer's INPUT rather than inside a spawn path:
 //!
 //! - [`compose_child_path`] — strips foreign shim dirs and prepends this
-//!   runner's own seam dirs onto a base. Unchanged from its old home in
-//!   `session.rs`.
+//!   runner's own seam dirs onto a base. Moved from `session.rs`; it now
+//!   compares entries with [`same_entry`], which on Windows also reads `/` as
+//!   `\`.
 //! - [`child_base_path`] — that base: the runner's own PATH, with each user
 //!   toolchain dir not already on it appended AFTER the inherited entries, so
 //!   an inherited entry keeps its order and still wins a lookup.
@@ -265,13 +266,30 @@ fn toolchain_dirs() -> Vec<PathBuf> {
     )
 }
 
-/// The same entry comparison [`compose_child_path`] uses: trailing `/` and `\`
-/// trimmed, ASCII case folded on Windows.
+/// The one PATH-entry comparison every seam here uses, [`compose_child_path`]
+/// included: trailing `/` and `\` trimmed, and on Windows `/` read as `\` and
+/// ASCII case folded, because Windows takes both as separators and compares
+/// paths case-insensitively. Without the separator fold `<home>\.cargo/bin`
+/// (a `join` of a `/`-spelled suffix, or an entry a POSIX-style shell wrote)
+/// and the fallback's `<home>\.cargo\bin` were two entries for one directory.
 fn same_entry(a: &str, b: &str) -> bool {
+    same_entry_on(cfg!(windows), a, b)
+}
+
+/// [`same_entry`] with the platform passed in, so both arms are tested on
+/// every platform.
+fn same_entry_on(windows: bool, a: &str, b: &str) -> bool {
     let a = a.trim_end_matches(['/', '\\']);
     let b = b.trim_end_matches(['/', '\\']);
-    if cfg!(windows) {
-        a.eq_ignore_ascii_case(b)
+    if windows {
+        let fold = |c: char| {
+            if c == '/' {
+                '\\'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        };
+        a.chars().map(fold).eq(b.chars().map(fold))
     } else {
         a == b
     }
@@ -341,9 +359,10 @@ pub(crate) fn appended_toolchain_dirs() -> Vec<PathBuf> {
 ///    and discarded the identity seam's prepend. Both seams now build through
 ///    here, the install seam passing `[identity_dir, install_dir]`.
 ///
-/// An entry equal to one of `own_dirs` is dropped from the tail as well, since
-/// it is already at the head. Every other entry keeps its position and its
-/// spelling, empty entries included. The separator is the platform's.
+/// An entry equal to one of `own_dirs` (by [`same_entry`]) is dropped from the
+/// tail as well, since it is already at the head. Every other entry keeps its
+/// position and its spelling, empty entries included. The separator is the
+/// platform's.
 ///
 /// Every caller passes [`child_base_path`] as `runner_path`, so the toolchain
 /// dirs it appends survive both seams.
@@ -352,22 +371,11 @@ pub(crate) fn compose_child_path(
     own_dirs: &[&std::path::Path],
 ) -> String {
     let sep = if cfg!(windows) { ';' } else { ':' };
-    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
     let own: Vec<String> = own_dirs
         .iter()
         .map(|d| d.to_string_lossy().into_owned())
         .collect();
-    let own_trimmed: Vec<String> = own.iter().map(|d| trim(d)).collect();
-    let is_own = |entry: &str| {
-        let entry = trim(entry);
-        own_trimmed.iter().any(|o| {
-            if cfg!(windows) {
-                o.eq_ignore_ascii_case(&entry)
-            } else {
-                *o == entry
-            }
-        })
-    };
+    let is_own = |entry: &str| own.iter().any(|o| same_entry(o, entry));
     let mut parts: Vec<&str> = own.iter().map(String::as_str).collect();
     if let Some(path) = runner_path.filter(|p| !p.is_empty()) {
         for entry in path.split(sep) {
@@ -494,6 +502,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_reads_both_separators_as_one_entry() {
+        // The windows-latest red on qontinui-runner#2909: `<home>\.cargo/bin`
+        // and `<home>\.cargo\bin` name one directory.
+        assert!(same_entry_on(
+            true,
+            r"C:\Users\u\.cargo/bin",
+            r"C:\Users\u\.cargo\bin"
+        ));
+        assert!(same_entry_on(
+            true,
+            r"C:\Users\U\.CARGO\bin\",
+            "c:/users/u/.cargo/bin"
+        ));
+        assert!(!same_entry_on(
+            true,
+            r"C:\Users\u\.cargo\bin",
+            r"C:\Users\u\.cargo\bin2"
+        ));
+        // Off Windows `\` is an ordinary filename byte and case is significant.
+        assert!(!same_entry_on(false, r"/h/.cargo\bin", "/h/.cargo/bin"));
+        assert!(!same_entry_on(false, "/h/Bin", "/h/bin"));
+        assert!(same_entry_on(false, "/h/bin/", "/h/bin"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_case_variant_is_already_on_path() {
@@ -502,6 +535,18 @@ mod tests {
         let upper = cargo.to_string_lossy().to_ascii_uppercase();
         let runner = format!("{upper};C:\\Windows");
         assert_eq!(base_path_from(Some(&runner), &[cargo]).unwrap(), runner);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn compose_drops_an_own_dir_spelled_with_forward_slashes() {
+        // Not a shim-dir name, so only the own-dir comparison can drop it.
+        let own = Path::new(r"C:\tools\own-seam");
+        let runner = r"c:/tools/own-seam;C:\Windows";
+        assert_eq!(
+            compose_child_path(Some(runner), &[own]),
+            r"C:\tools\own-seam;C:\Windows"
+        );
     }
 
     #[test]
