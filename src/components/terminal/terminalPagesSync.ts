@@ -6,9 +6,10 @@ import { emit, listen } from "@tauri-apps/api/event";
  *
  * Every window of one runner process (main and each pop-out) mounts
  * `useTerminalPages`, each with its own in-memory copy of the roster. Writes
- * already build on the PERSISTED roster, so they are correct across windows;
- * this module carries the signal that lets the OTHER windows refresh what they
- * DISPLAY after a write.
+ * build on the PERSISTED roster as this window's store can see it, so they keep
+ * every other window's change except one made inside the cross-webview storage
+ * lag (last writer wins on what that store held). This module carries the
+ * signal that lets the OTHER windows refresh what they DISPLAY after a write.
  *
  * The signal is a Tauri event, not the `window` `storage` event: Tauri v2
  * `emit` reaches every webview of the process (the sender included), while
@@ -91,9 +92,17 @@ function isRosterSavedPayload(p: unknown): p is RosterSavedPayload {
 /**
  * Subscribe to roster-saved events from every window (this one included —
  * the caller filters its own echo). Returns the unsubscribe; one called
- * before `listen` resolves unlistens as soon as it does.
+ * before `listen` resolves unlistens as soon as it does (and `onReady` is then
+ * never called).
+ *
+ * `onReady` runs once the listener is registered (`listen` resolves
+ * asynchronously), so the caller can catch up on a save another window made
+ * before then, which no event will report.
  */
-export function listenRosterSaved(onSaved: (payload: RosterSavedPayload) => void): () => void {
+export function listenRosterSaved(
+  onSaved: (payload: RosterSavedPayload) => void,
+  onReady?: () => void,
+): () => void {
   let disposed = false;
   let unlisten: (() => void) | null = null;
   listen<RosterSavedPayload>(TERMINAL_PAGES_SAVED_EVENT, (event) => {
@@ -104,6 +113,7 @@ export function listenRosterSaved(onSaved: (payload: RosterSavedPayload) => void
         fn();
       } else {
         unlisten = fn;
+        onReady?.();
       }
     })
     .catch((err: unknown) => {
