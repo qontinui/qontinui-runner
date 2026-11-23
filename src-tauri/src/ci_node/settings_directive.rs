@@ -3,11 +3,38 @@
 //! `2026-08-07-runner-local-ci-parity-and-web-configuration`, Phase 4).
 //!
 //! The write path is: web `PUT /devenv/machines/{id}/ci-node` saves the desired
-//! config on the machine row → coord `POST /devenv/ci-node-dispatch` proves the
-//! device belongs to the caller's tenant and publishes the directive → THIS
-//! module validates it again and persists it into `settings.json` through
-//! [`crate::settings::save_ci_node_settings`], the one settings writer (atomic
-//! write + parse-cache invalidation). There is no second writer and no poll.
+//! config on the machine row → coord `POST /devenv/ci-node-dispatch` (or its
+//! agent twin) proves the device belongs to the caller's tenant, STORES the
+//! directive as this device's latest, and publishes it → THIS module validates
+//! it again and persists it into `settings.json` through
+//! [`crate::settings::update_ci_node_settings`], the one `ci_node` writer
+//! (atomic write + parse-cache invalidation, under
+//! `CI_NODE_SETTINGS_WRITE_LOCK`).
+//!
+//! # Two arrivals, one gate: live and fetched
+//!
+//! Plan `2026-11-22-ci-node-directive-replays-on-connect`. A directive reaches
+//! this module two ways. [`apply_live`] takes the frame on the `device_ci`
+//! socket. [`apply_fetched`] takes the copy [`super::directive_fetch`] reads
+//! from coord's store on every connect, which is how a directive sent while
+//! this device was OFFLINE (coord's publish had no subscriber) still applies.
+//! Both go through [`validate`], the single gate, and both do ONE
+//! compare-and-write inside the settings writer's closure:
+//!
+//! 1. A directive whose coord-minted `directive_id` equals the last applied one
+//!    is a no-op replay — checked FIRST, and nothing is written.
+//! 2. Otherwise it applies only when its `requested_at` (coord's clock) is
+//!    STRICTLY newer than the last applied one's, so the live and fetched
+//!    copies of different directives can arrive in either order and the newest
+//!    still wins. Coord clock against coord clock: box skew never enters.
+//! 3. A FETCHED directive older than the owner's last local panel save
+//!    (`local_edited_at`, this box's clock) is not applied — see [`decide`]
+//!    for the skew this one cross-clock comparison carries. A LIVE frame
+//!    always counts as newer than a local edit: the owner just acted.
+//! 4. A directive with no `directive_id` comes from a coord that predates the
+//!    store. Live, it applies unconditionally (the pre-store behaviour);
+//!    fetched, it cannot be ordered and is skipped (such a coord has no store
+//!    to fetch from anyway).
 //!
 //! # Why this module re-validates everything coord already validated
 //!
@@ -47,10 +74,12 @@
 //! * `enabled` — consulted by `admission::submit` per dispatch, so DISABLING is
 //!   effective immediately for admission purposes.
 
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Deserializer};
 use tracing::{info, warn};
+use uuid::Uuid;
 
-use crate::settings::CiNodeSettings;
+use crate::settings::{CiNodeSettings, SettingsWrite};
 
 /// Upper bound on `repo_allowlist` length (mirrors the web schema).
 const MAX_ALLOWLIST_ENTRIES: usize = 100;
@@ -98,10 +127,41 @@ pub(crate) struct CiSettingsDirective {
     /// dashboard, and grants nothing.
     #[serde(default)]
     pub machine_id: Option<String>,
+    /// Coord's id for this directive, minted once per accepted directive and
+    /// identical on the live frame and the stored (fetched) copy. Absent on a
+    /// coord that predates the directive store. Parsed leniently: a malformed
+    /// value reads as absent rather than refusing an otherwise-valid frame.
+    #[serde(default, deserialize_with = "lenient_uuid")]
+    pub directive_id: Option<Uuid>,
+    /// Coord's clock at accept time (truncated to microseconds, so the live
+    /// copy and the `timestamptz`-round-tripped fetched copy compare equal).
+    /// Older coords send it too, uncompared. Parsed leniently, like
+    /// `directive_id`.
+    #[serde(default, deserialize_with = "lenient_rfc3339")]
+    pub requested_at: Option<DateTime<Utc>>,
 }
 
 fn default_min_free_disk_gb() -> u64 {
     20
+}
+
+/// `directive_id`: a string that parses as a UUID, else `None`.
+fn lenient_uuid<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Uuid>, D::Error> {
+    let raw = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok()))
+}
+
+/// `requested_at`: an RFC 3339 string, else `None`.
+fn lenient_rfc3339<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+    let raw = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc)))
 }
 
 /// Why a directive was refused. Typed so the tests assert the DECISION rather
@@ -243,48 +303,224 @@ pub(crate) fn validate(
         // guarantees, and for it to be un-settable from a repo, which it is:
         // this struct is only ever built from an owner-authored directive.
         canonical_converge: directive.canonical_converge,
+        // Bookkeeping is the writer's, not the gate's: `validate` decides only
+        // the settings fields. `apply` fills these from the directive and the
+        // on-disk document inside the compare-and-write.
+        last_directive_id: None,
+        last_directive_requested_at: None,
+        local_edited_at: None,
     })
 }
 
-/// Validate, then persist. Called from the WS frame handler.
+/// Which door a directive arrived through. Logged as `source=live|fetched`,
+/// and it decides the local-edit branch of [`decide`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectiveSource {
+    /// The `settings_requested` frame on the `device_ci` socket.
+    Live,
+    /// The copy read from coord's store on connect ([`super::directive_fetch`]).
+    Fetched,
+}
+
+impl DirectiveSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Fetched => "fetched",
+        }
+    }
+
+    /// The parenthetical in the applied line — `(fetched on connect)` is the
+    /// string the plan's arming probe reads in `runner-tauri.log`.
+    fn arrival(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Fetched => "fetched on connect",
+        }
+    }
+}
+
+/// What one `apply_*` call did. Typed so the tests assert the DECISION rather
+/// than a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    /// Validated and persisted.
+    Applied,
+    /// [`validate`] refused it; nothing was written.
+    Refused(DirectiveRejection),
+    /// Its `directive_id` is the last one applied — a replay; nothing written.
+    AlreadyApplied,
+    /// Its `requested_at` is not strictly newer than the last applied
+    /// directive's — a newer one already won; nothing written.
+    Superseded,
+    /// FETCHED, and older than the owner's last local panel save; nothing
+    /// written.
+    SupersededByLocal,
+    /// FETCHED with no `directive_id` / `requested_at`, so it cannot be
+    /// ordered against what is on disk; nothing written.
+    Unordered,
+    /// Validated and chosen, but `settings.json` could not be written (or its
+    /// base could not be read); the previous settings stand.
+    PersistFailed(String),
+}
+
+/// PURE: should `directive` (already validated) replace what `current` holds?
+/// `None` = apply; `Some(outcome)` = skip with that reason.
 ///
-/// Never panics and never propagates: a refused or unpersistable directive
-/// leaves the existing settings exactly as they were and logs why. There is no
-/// ack channel back to coord — the owner's evidence is this log line plus the
-/// device's subsequent behaviour, which the web surface is careful never to
-/// present as a confirmed apply.
-pub(crate) fn apply(directive: CiSettingsDirective) {
+/// Order matters and is pinned by tests: id equality FIRST (so a replay is a
+/// no-op even when its timestamp would also lose), then newest-wins on coord's
+/// clock, then — fetched only — the local-edit branch.
+///
+/// **Clock skew in the local-edit branch.** `local_edited_at` is this box's
+/// clock and `requested_at` is coord's, and no tolerance is added: the
+/// comparison is direct, so the window in which it can misorder equals this
+/// box's clock error against coord. A box running N seconds AHEAD treats a
+/// fetched directive sent up to N s after a local edit as older (skipped until
+/// a newer one arrives); a box running N s BEHIND lets a fetched directive sent
+/// up to N s before a local edit through. Both other comparisons are
+/// coord-vs-coord.
+pub(crate) fn decide(
+    current: &CiNodeSettings,
+    directive: &CiSettingsDirective,
+    source: DirectiveSource,
+) -> Option<ApplyOutcome> {
+    // Without identity (a coord that predates the store) only the live frame
+    // applies, unconditionally; a fetched copy cannot be ordered.
+    let unidentified = match source {
+        DirectiveSource::Live => None,
+        DirectiveSource::Fetched => Some(ApplyOutcome::Unordered),
+    };
+    let Some(id) = directive.directive_id else {
+        return unidentified;
+    };
+    if current.last_directive_id == Some(id) {
+        return Some(ApplyOutcome::AlreadyApplied);
+    }
+    let Some(at) = directive.requested_at else {
+        return unidentified;
+    };
+    if current
+        .last_directive_requested_at
+        .is_some_and(|last| at <= last)
+    {
+        return Some(ApplyOutcome::Superseded);
+    }
+    if source == DirectiveSource::Fetched && current.local_edited_at.is_some_and(|local| at < local)
+    {
+        return Some(ApplyOutcome::SupersededByLocal);
+    }
+    None
+}
+
+/// A live `settings_requested` frame. See [`apply`].
+pub(crate) fn apply_live(directive: CiSettingsDirective) -> ApplyOutcome {
+    apply(directive, DirectiveSource::Live)
+}
+
+/// The copy fetched from coord's store on connect. See [`apply`].
+pub(crate) fn apply_fetched(directive: CiSettingsDirective) -> ApplyOutcome {
+    apply(directive, DirectiveSource::Fetched)
+}
+
+/// Validate, then ONE compare-and-write under `CI_NODE_SETTINGS_WRITE_LOCK`
+/// ([`crate::settings::update_ci_node_settings`]): read the on-disk
+/// bookkeeping, [`decide`], and either write the validated fields plus the
+/// directive's id and `requested_at` — carrying `local_edited_at` through — or
+/// write nothing at all.
+///
+/// Never panics and never propagates: a refused, skipped or unpersistable
+/// directive leaves the existing settings exactly as they were and logs why.
+/// There is no ack channel back to coord — the owner's evidence is this log
+/// line plus the device's subsequent behaviour, which the web surface is
+/// careful never to present as a confirmed apply.
+fn apply(directive: CiSettingsDirective, source: DirectiveSource) -> ApplyOutcome {
     let machine = directive.machine_id.clone();
-    let settings = match validate(&directive) {
+    let id = directive
+        .directive_id
+        .map_or_else(|| "none".to_string(), |u| u.to_string());
+    let at = directive
+        .requested_at
+        .map_or_else(|| "none".to_string(), |t| t.to_rfc3339());
+    let src = source.label();
+    let validated = match validate(&directive) {
         Ok(s) => s,
         Err(rejection) => {
             warn!(
-                "ci_node: REFUSED settings directive (machine_id={machine:?}): {}",
+                "ci_node: REFUSED settings directive (source={src}, directive_id={id}, \
+                 machine_id={machine:?}): {}",
                 rejection.reason()
             );
-            return;
+            return ApplyOutcome::Refused(rejection);
         }
     };
 
     let summary = format!(
         "enabled={} repos={} concurrency={} min_free_disk_gb={}",
-        settings.enabled,
-        settings.repo_allowlist.len(),
-        settings
+        validated.enabled,
+        validated.repo_allowlist.len(),
+        validated
             .max_concurrent_builds
             .map_or_else(|| "suggested".to_string(), |n| n.to_string()),
-        settings.min_free_disk_gb,
+        validated.min_free_disk_gb,
     );
-    match crate::settings::save_ci_node_settings(settings) {
-        Ok(()) => info!(
-            "ci_node: applied settings directive (machine_id={machine:?}): {summary} \
-             — persisted to settings.json; governs the next dispatch"
+    let outcome = crate::settings::update_ci_node_settings(|ci| {
+        if let Some(skip) = decide(ci, &directive, source) {
+            return SettingsWrite::Skip(skip);
+        }
+        // The high-water mark only moves forward. A live frame from a coord
+        // that predates the store (no id) — or one whose `requested_at` is
+        // absent — still applies (`decide`), but must not erase or rewind the
+        // recorded mark, or a later replay of an older stored directive would
+        // win newest-wins against nothing.
+        *ci = CiNodeSettings {
+            last_directive_id: directive.directive_id.or(ci.last_directive_id),
+            last_directive_requested_at: directive.requested_at.max(ci.last_directive_requested_at),
+            local_edited_at: ci.local_edited_at,
+            ..validated
+        };
+        SettingsWrite::Persist(ApplyOutcome::Applied)
+    })
+    .unwrap_or_else(ApplyOutcome::PersistFailed);
+
+    match &outcome {
+        ApplyOutcome::Applied => info!(
+            "ci_node: applied settings directive ({}) source={src} directive_id={id} \
+             requested_at={at} machine_id={machine:?}: {summary} \
+             — persisted to settings.json; governs the next dispatch",
+            source.arrival()
         ),
-        Err(e) => warn!(
+        ApplyOutcome::AlreadyApplied => info!(
+            "ci_node: settings directive already applied, no-op replay \
+             (source={src}, directive_id={id})"
+        ),
+        // A LIVE frame losing newest-wins means coord's clock is not
+        // monotonic (a step back across a redeploy, or instances disagreeing):
+        // a genuinely new owner statement was dropped, so it is a warning.
+        ApplyOutcome::Superseded if source == DirectiveSource::Live => warn!(
+            "ci_node: LIVE settings directive is not newer than the last applied one, not \
+             applied (source={src}, directive_id={id}, requested_at={at}); coord's clock may \
+             have stepped back. Re-send the directive to apply it"
+        ),
+        ApplyOutcome::Superseded => info!(
+            "ci_node: settings directive superseded by a newer applied directive, not applied \
+             (source={src}, directive_id={id}, requested_at={at})"
+        ),
+        ApplyOutcome::SupersededByLocal => info!(
+            "ci_node: settings directive superseded-by-local: older than the owner's last \
+             local edit, not applied (source={src}, directive_id={id}, requested_at={at})"
+        ),
+        ApplyOutcome::Unordered => warn!(
+            "ci_node: settings directive SKIPPED: it carries no directive_id/requested_at, so \
+             it cannot be ordered against the applied one (source={src}, machine_id={machine:?})"
+        ),
+        ApplyOutcome::PersistFailed(e) => warn!(
             "ci_node: settings directive validated but could NOT be persisted \
-             (machine_id={machine:?}): {e} — previous settings still in force"
+             (source={src}, directive_id={id}, machine_id={machine:?}): {e} \
+             — previous settings still in force"
         ),
+        ApplyOutcome::Refused(_) => {}
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -299,6 +535,8 @@ mod tests {
             min_free_disk_gb: 20,
             canonical_converge: false,
             machine_id: None,
+            directive_id: None,
+            requested_at: None,
         }
     }
 
@@ -570,5 +808,288 @@ mod tests {
             validate(&d).is_err(),
             "no CiNodeSettings may be produced from a wildcard directive"
         );
+    }
+
+    // ---- Live vs fetched ordering (plan 2026-11-22-ci-node-directive-replays-on-connect, D2) ----
+
+    /// A settings.json carrying a known, non-default `ci_node` section.
+    const SEEDED: &str =
+        r#"{"ci_node":{"enabled":false,"repo_allowlist":["seed/repo"],"min_free_disk_gb":33}}"#;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// An identified directive, as coord now mints them.
+    fn identified(id: Uuid, requested_at: &str, enabled: bool, repo: &str) -> CiSettingsDirective {
+        CiSettingsDirective {
+            enabled,
+            repo_allowlist: vec![repo.to_string()],
+            directive_id: Some(id),
+            requested_at: Some(at(requested_at)),
+            ..directive()
+        }
+    }
+
+    fn on_disk() -> CiNodeSettings {
+        crate::settings::get_ci_node_settings()
+    }
+
+    /// (b) The fetched copy of the directive already applied live is a no-op:
+    /// NO write at all, so the bytes and the mtime are unchanged.
+    #[test]
+    fn a_fetched_copy_of_the_applied_directive_writes_nothing() {
+        let amb = crate::test_env::isolated_ambient();
+        let path = amb.write_settings_json(SEEDED);
+        let id = Uuid::now_v7();
+        let d = identified(id, "2026-11-22T10:00:00.123456Z", true, "a/one");
+        assert_eq!(apply_live(d.clone()), ApplyOutcome::Applied);
+        let bytes = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Let a write, if one happened, land on a later mtime tick.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        assert_eq!(apply_fetched(d), ApplyOutcome::AlreadyApplied);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    /// Id equality runs BEFORE the timestamp compare: a replay whose timestamp
+    /// also loses is reported as the replay it is.
+    #[test]
+    fn id_equality_is_checked_before_newest_wins() {
+        let id = Uuid::now_v7();
+        let current = CiNodeSettings {
+            last_directive_id: Some(id),
+            last_directive_requested_at: Some(at("2026-11-22T10:00:00Z")),
+            ..CiNodeSettings::default()
+        };
+        let replay = identified(id, "2026-11-22T10:00:00Z", true, "a/one");
+        assert_eq!(
+            decide(&current, &replay, DirectiveSource::Fetched),
+            Some(ApplyOutcome::AlreadyApplied)
+        );
+        assert_eq!(
+            decide(&current, &replay, DirectiveSource::Live),
+            Some(ApplyOutcome::AlreadyApplied)
+        );
+    }
+
+    /// (c) A fetched OLDER directive arriving after a newer live one is
+    /// skipped, and the newer one's settings stand.
+    #[test]
+    fn a_fetched_older_directive_after_a_newer_live_one_is_skipped() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_settings_json(SEEDED);
+        let newer = identified(Uuid::now_v7(), "2026-11-22T10:00:05Z", true, "a/newer");
+        let older = identified(Uuid::now_v7(), "2026-11-22T10:00:01Z", false, "a/older");
+        assert_eq!(apply_live(newer.clone()), ApplyOutcome::Applied);
+
+        assert_eq!(apply_fetched(older), ApplyOutcome::Superseded);
+        let ci = on_disk();
+        assert!(ci.enabled);
+        assert_eq!(ci.repo_allowlist, vec!["a/newer"]);
+        assert_eq!(ci.last_directive_id, newer.directive_id);
+        assert_eq!(ci.last_directive_requested_at, newer.requested_at);
+    }
+
+    /// Strictly newer: an equal `requested_at` under a different id does not
+    /// win (the first applied stands).
+    #[test]
+    fn an_equal_requested_at_is_not_newer() {
+        let current = CiNodeSettings {
+            last_directive_id: Some(Uuid::now_v7()),
+            last_directive_requested_at: Some(at("2026-11-22T10:00:00Z")),
+            ..CiNodeSettings::default()
+        };
+        let tie = identified(Uuid::now_v7(), "2026-11-22T10:00:00Z", true, "a/one");
+        assert_eq!(
+            decide(&current, &tie, DirectiveSource::Live),
+            Some(ApplyOutcome::Superseded)
+        );
+    }
+
+    /// (d) A live directive after a fetched one applies when newer, and
+    /// records its own identity.
+    #[test]
+    fn a_newer_live_directive_after_a_fetched_one_applies() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_settings_json(SEEDED);
+        let fetched = identified(Uuid::now_v7(), "2026-11-22T10:00:01Z", true, "a/fetched");
+        let live = identified(Uuid::now_v7(), "2026-11-22T10:00:02Z", false, "a/live");
+        assert_eq!(apply_fetched(fetched), ApplyOutcome::Applied);
+
+        assert_eq!(apply_live(live.clone()), ApplyOutcome::Applied);
+        let ci = on_disk();
+        assert!(!ci.enabled);
+        assert_eq!(ci.repo_allowlist, vec!["a/live"]);
+        assert_eq!(ci.last_directive_id, live.directive_id);
+        assert_eq!(ci.last_directive_requested_at, live.requested_at);
+    }
+
+    /// (e) A FETCHED directive older than the owner's last local edit is
+    /// skipped (and logged as superseded-by-local); the local edit stands. A
+    /// LIVE frame of the same age still applies, because the owner just acted.
+    #[test]
+    fn a_fetched_directive_older_than_a_local_edit_is_skipped() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_settings_json(SEEDED);
+        crate::settings::update_ci_node_settings(|ci| {
+            crate::commands::resource_guard_settings::apply_local_edit(
+                ci,
+                false,
+                None,
+                vec!["local/edit".to_string()],
+                40,
+                at("2026-11-22T10:00:10Z"),
+            );
+            SettingsWrite::Persist(())
+        })
+        .unwrap();
+        let before = on_disk();
+        let stale = identified(Uuid::now_v7(), "2026-11-22T10:00:09Z", true, "a/stale");
+
+        assert_eq!(
+            apply_fetched(stale.clone()),
+            ApplyOutcome::SupersededByLocal
+        );
+        assert_eq!(on_disk(), before, "the local edit must stand");
+
+        assert_eq!(apply_live(stale), ApplyOutcome::Applied);
+        let ci = on_disk();
+        assert!(ci.enabled);
+        assert_eq!(
+            ci.local_edited_at,
+            Some(at("2026-11-22T10:00:10Z")),
+            "an applied directive carries local_edited_at through"
+        );
+    }
+
+    /// (f) A refused (wildcard) fetched directive writes nothing, the same as
+    /// live: `validate` is the single gate for both doors.
+    #[test]
+    fn a_refused_fetched_directive_writes_nothing() {
+        let amb = crate::test_env::isolated_ambient();
+        let path = amb.write_settings_json(SEEDED);
+        let before = std::fs::read(&path).unwrap();
+        for source in [DirectiveSource::Fetched, DirectiveSource::Live] {
+            let mut d = identified(Uuid::now_v7(), "2026-11-22T10:00:00Z", true, "a/one");
+            d.repo_allowlist = vec!["*".to_string()];
+            let got = match source {
+                DirectiveSource::Fetched => apply_fetched(d),
+                DirectiveSource::Live => apply_live(d),
+            };
+            assert_eq!(
+                got,
+                ApplyOutcome::Refused(DirectiveRejection::Wildcard("*".to_string())),
+                "{source:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{source:?}");
+        }
+    }
+
+    /// (h) A live frame with no `directive_id` (a coord that predates the
+    /// store) still applies, even over a newer recorded directive, which is
+    /// the pre-store behaviour; a fetched one without identity cannot be
+    /// ordered and is skipped.
+    #[test]
+    fn a_live_frame_without_directive_id_still_applies() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_settings_json(SEEDED);
+        let recorded = identified(Uuid::now_v7(), "2026-11-22T10:00:05Z", false, "a/recorded");
+        assert_eq!(apply_live(recorded.clone()), ApplyOutcome::Applied);
+
+        // The pinned wire shape an older coord sends: requested_at, no id.
+        let legacy: CiSettingsDirective = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "repo_allowlist": ["a/legacy"],
+            "min_free_disk_gb": 20,
+            "machine_id": "m-1",
+            "requested_at": "2026-08-07T12:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(legacy.directive_id, None);
+        assert_eq!(apply_fetched(legacy.clone()), ApplyOutcome::Unordered);
+        assert_eq!(apply_live(legacy), ApplyOutcome::Applied);
+        let ci = on_disk();
+        assert!(ci.enabled);
+        assert_eq!(ci.repo_allowlist, vec!["a/legacy"]);
+        // ...without rewinding the recorded high-water mark: the legacy frame's
+        // older `requested_at` and missing id do not replace it, so a replay of
+        // an older stored directive still loses newest-wins.
+        assert_eq!(ci.last_directive_id, recorded.directive_id);
+        assert_eq!(ci.last_directive_requested_at, recorded.requested_at);
+        let older = identified(Uuid::now_v7(), "2026-11-22T10:00:03Z", false, "a/older");
+        assert_eq!(apply_fetched(older), ApplyOutcome::Superseded);
+    }
+
+    /// The new wire keys parse, and a malformed value reads as absent rather
+    /// than refusing an otherwise-valid frame.
+    #[test]
+    fn directive_identity_parses_leniently() {
+        let id = Uuid::now_v7();
+        let d: CiSettingsDirective = serde_json::from_value(serde_json::json!({
+            "directive_id": id.to_string(),
+            "requested_at": "2026-11-22T10:00:00.123456Z",
+        }))
+        .unwrap();
+        assert_eq!(d.directive_id, Some(id));
+        assert_eq!(d.requested_at, Some(at("2026-11-22T10:00:00.123456Z")));
+        let bad: CiSettingsDirective = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "directive_id": "not-a-uuid",
+            "requested_at": 12,
+        }))
+        .expect("a malformed identity must not refuse the frame");
+        assert_eq!((bad.directive_id, bad.requested_at), (None, None));
+        assert!(bad.enabled);
+    }
+
+    /// (j) The local save and a directive apply never lose each other's
+    /// writes: both go through the one compare-and-write door, which holds
+    /// `CI_NODE_SETTINGS_WRITE_LOCK` for the whole read-decide-write, and each
+    /// carries the other's fields through.
+    #[test]
+    fn a_local_save_and_a_directive_apply_never_lose_each_other() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_settings_json(SEEDED);
+
+        // The door holds the lock while the closure decides: no other writer
+        // could land between its read and its write.
+        crate::settings::update_ci_node_settings(|_| {
+            assert!(
+                crate::settings::ci_node_settings_write_lock_is_held(),
+                "update_ci_node_settings must hold the write lock across its closure"
+            );
+            SettingsWrite::Skip(())
+        })
+        .unwrap();
+
+        let directive = identified(Uuid::now_v7(), "2026-11-22T10:00:05Z", true, "a/remote");
+        assert_eq!(apply_live(directive.clone()), ApplyOutcome::Applied);
+
+        // A local save after the directive keeps the directive's bookkeeping.
+        crate::commands::resource_guard_settings::save_ci_node_settings_impl(
+            false,
+            None,
+            vec!["local/edit".to_string()],
+            20,
+            directive.directive_id.map(|u| u.to_string()),
+        )
+        .expect("a valid local save");
+        let ci = on_disk();
+        assert_eq!(ci.repo_allowlist, vec!["local/edit"]);
+        assert_eq!(ci.last_directive_id, directive.directive_id);
+        assert_eq!(ci.last_directive_requested_at, directive.requested_at);
+        let stamped = ci
+            .local_edited_at
+            .expect("the local save stamps local_edited_at");
+
+        // A newer directive after the local save keeps the stamp.
+        let newer = identified(Uuid::now_v7(), "2999-01-01T00:00:00Z", true, "a/newer");
+        assert_eq!(apply_fetched(newer.clone()), ApplyOutcome::Applied);
+        let ci = on_disk();
+        assert_eq!(ci.local_edited_at, Some(stamped));
+        assert_eq!(ci.last_directive_id, newer.directive_id);
     }
 }

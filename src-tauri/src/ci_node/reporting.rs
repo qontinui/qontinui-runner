@@ -127,7 +127,7 @@ fn parse_response_state(body: &str) -> Option<String> {
 /// first, then the bounded kick-and-wait remint. `None` (rare — an unpaired
 /// or auth-wedged device) makes the caller treat the POST as failed so the
 /// retry machinery keeps the payload.
-async fn device_bearer() -> Option<String> {
+pub(super) async fn device_bearer() -> Option<String> {
     if let Some(t) = crate::coord_mcp::read_usable_device_jwt().await {
         return Some(t);
     }

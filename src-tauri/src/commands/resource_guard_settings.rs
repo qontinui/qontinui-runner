@@ -353,11 +353,12 @@ pub fn get_ci_node_settings() -> Result<CommandResponse, String> {
 }
 
 /// Internal implementation of [`save_ci_node_settings`].
-fn save_ci_node_settings_impl(
+pub(crate) fn save_ci_node_settings_impl(
     enabled: bool,
     max_concurrent_builds: Option<u32>,
     repo_allowlist: Vec<String>,
     min_free_disk_gb: u64,
+    expected_last_directive_id: Option<String>,
 ) -> Result<CommandResponse, AppError> {
     info!(
         "Saving CI-node settings: enabled={}, max_concurrent_builds={:?} (None = host suggestion), \
@@ -400,31 +401,100 @@ fn save_ci_node_settings_impl(
         ));
     }
 
-    let ci_node = CiNodeSettings {
-        enabled,
-        max_concurrent_builds,
-        repo_allowlist: repo_allowlist
-            .into_iter()
-            .map(|r| r.trim().to_string())
-            .filter(|r| !r.is_empty())
-            .collect(),
-        min_free_disk_gb,
-        // This form has no field for `canonical_converge`, so it must not
-        // DECIDE it. Struct-update carries the persisted value through, which
-        // means an unrelated save here (toggling `enabled`, editing the
-        // allowlist) cannot silently revoke a convergence grant the owner made
-        // through the audited web/coord directive — nor, in the other
-        // direction, invent one: the only writer that can set it true is that
-        // directive. The same rule protects any field added here later.
-        ..settings::get_ci_node_settings()
+    let expected = match expected_last_directive_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|e| {
+            AppError::ConfigError(format!(
+                "expected_last_directive_id {raw:?} is not a UUID: {e}"
+            ))
+        })?),
     };
-    settings::save_ci_node_settings(ci_node).map_err(AppError::ConfigError)?;
+    let repo_allowlist: Vec<String> = repo_allowlist
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    // Under `CI_NODE_SETTINGS_WRITE_LOCK`, in ONE closure over the on-disk
+    // document (plan `2026-11-22-ci-node-directive-replays-on-connect`, D2):
+    // the coord directive's compare-and-write and this stamp cannot interleave
+    // in the backend's read-to-write window.
+    //
+    // That lock does not cover the PANEL's read, which happened when it
+    // mounted: a directive applied while the panel was open would be reverted
+    // by a Save that resubmits the values loaded before it. So the panel sends
+    // the `last_directive_id` it loaded, and a save whose id no longer matches
+    // the document is refused unwritten, telling the owner to reload.
+    let edited_at = chrono::Utc::now();
+    settings::update_ci_node_settings(|ci| {
+        if let Some(stale) = stale_panel_refusal(ci, expected) {
+            return settings::SettingsWrite::Skip(Err(stale));
+        }
+        apply_local_edit(
+            ci,
+            enabled,
+            max_concurrent_builds,
+            repo_allowlist,
+            min_free_disk_gb,
+            edited_at,
+        );
+        settings::SettingsWrite::Persist(Ok(()))
+    })
+    .map_err(AppError::ConfigError)?
+    .map_err(AppError::ConfigError)?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("CI-node settings saved".to_string()),
         data: None,
     })
+}
+
+/// PURE: the refusal for a panel save made against a stale read, if it is one.
+/// `expected` is the `last_directive_id` the panel loaded; a remote directive
+/// applied since then moved the document's id, and resubmitting the panel's
+/// older values would silently revert it.
+pub(crate) fn stale_panel_refusal(
+    current: &CiNodeSettings,
+    expected: Option<uuid::Uuid>,
+) -> Option<String> {
+    (current.last_directive_id != expected).then(|| {
+        format!(
+            "a remote configuration directive changed the CI-node settings after this panel \
+             loaded them (directive {}); reload the panel and save again so it is not \
+             overwritten",
+            current
+                .last_directive_id
+                .map_or_else(|| "none".to_string(), |u| u.to_string())
+        )
+    })
+}
+
+/// Write one local panel save into the persisted section.
+///
+/// Only the four fields this form has are written. Everything else is carried
+/// through: `canonical_converge` (this form has no field for it, so it must not
+/// DECIDE it — an unrelated save here cannot silently revoke a convergence
+/// grant the owner made through the audited web/coord directive, nor invent
+/// one; the same rule protects any field added later) and the coord
+/// directive's bookkeeping (`last_directive_id` / `last_directive_requested_at`,
+/// which only `ci_node::settings_directive` writes).
+///
+/// `local_edited_at` is stamped with the box's clock: a coord directive FETCHED
+/// on a later connect that was sent before this edit is then not applied over
+/// it (`settings_directive`, D2's local-edit branch).
+pub(crate) fn apply_local_edit(
+    ci: &mut CiNodeSettings,
+    enabled: bool,
+    max_concurrent_builds: Option<u32>,
+    repo_allowlist: Vec<String>,
+    min_free_disk_gb: u64,
+    edited_at: chrono::DateTime<chrono::Utc>,
+) {
+    ci.enabled = enabled;
+    ci.max_concurrent_builds = max_concurrent_builds;
+    ci.repo_allowlist = repo_allowlist;
+    ci.min_free_disk_gb = min_free_disk_gb;
+    ci.local_edited_at = Some(edited_at);
 }
 
 /// Save the CI-node admission floors.
@@ -434,12 +504,14 @@ pub fn save_ci_node_settings(
     max_concurrent_builds: Option<u32>,
     repo_allowlist: Vec<String>,
     min_free_disk_gb: u64,
+    expected_last_directive_id: Option<String>,
 ) -> Result<CommandResponse, String> {
     save_ci_node_settings_impl(
         enabled,
         max_concurrent_builds,
         repo_allowlist,
         min_free_disk_gb,
+        expected_last_directive_id,
     )
     .map_err(String::from)
 }
@@ -579,15 +651,51 @@ mod tests {
             "qontinui/qontinui-runner".to_string()
         ]));
 
-        let err = save_ci_node_settings_impl(true, Some(1), vec!["*".to_string()], 20)
+        let err = save_ci_node_settings_impl(true, Some(1), vec!["*".to_string()], 20, None)
             .expect_err("a wildcard allowlist must not persist");
         assert!(String::from(err).contains("allowlist"));
+    }
+
+    /// A panel save made against a stale read (a remote directive applied
+    /// after the panel loaded) is refused unwritten; a save whose loaded id
+    /// still matches goes through.
+    #[test]
+    fn a_save_from_a_stale_panel_is_refused_unwritten() {
+        let amb = crate::test_env::isolated_ambient();
+        let id = uuid::Uuid::now_v7();
+        let path = amb.write_settings_json(&format!(
+            r#"{{"ci_node":{{"enabled":true,"repo_allowlist":["remote/repo"],"min_free_disk_gb":20,"last_directive_id":"{id}"}}}}"#
+        ));
+        let before = std::fs::read(&path).unwrap();
+
+        // The panel loaded before the directive: it saw no id.
+        let err = save_ci_node_settings_impl(false, None, vec!["old/repo".to_string()], 20, None)
+            .expect_err("a stale panel must not revert the directive");
+        let msg = String::from(err);
+        assert!(msg.contains("reload"), "{msg}");
+        // ResourceGuardSettings.tsx keys its automatic re-read on this exact
+        // phrase; rewording it silently disables that reload.
+        assert!(msg.contains("remote configuration directive"), "{msg}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A panel that loaded after it saves normally.
+        save_ci_node_settings_impl(
+            false,
+            None,
+            vec!["new/repo".to_string()],
+            20,
+            Some(id.to_string()),
+        )
+        .expect("a current panel saves");
+        let ci = crate::settings::get_ci_node_settings();
+        assert_eq!(ci.repo_allowlist, vec!["new/repo"]);
+        assert!(ci.local_edited_at.is_some());
     }
 
     /// A zero disk floor disables the guard it names, so it is refused.
     #[test]
     fn zero_disk_floor_is_refused() {
-        let err = save_ci_node_settings_impl(true, Some(1), Vec::new(), 0)
+        let err = save_ci_node_settings_impl(true, Some(1), Vec::new(), 0, None)
             .expect_err("a 0 GiB disk floor must not persist");
         assert!(String::from(err).contains("disk"));
     }
@@ -597,7 +705,7 @@ mod tests {
     #[test]
     fn out_of_range_concurrency_is_refused() {
         for n in [0, 65] {
-            let err = save_ci_node_settings_impl(true, Some(n), Vec::new(), 20)
+            let err = save_ci_node_settings_impl(true, Some(n), Vec::new(), 20, None)
                 .expect_err("out-of-range concurrency must not persist");
             assert!(String::from(err).contains("concurrent"), "n={n}");
         }

@@ -3873,18 +3873,49 @@ MemAvailable:   15335424 kB
             .blocking_lanes
             .as_ref()
             .expect("the host lane must publish a blocking_lanes map");
-        assert_eq!(
-            published.get(SPAWNER).copied(),
-            Some(1),
-            "the fixture's own in-flight body did not appear in the published \
-             breakdown: {published:?}"
-        );
+        // WHICH lane the body is charged to is a property of the whole test
+        // binary, not of this code: the global table has
+        // `MAX_BLOCKING_LANES` named lanes, claimed first-come by thread name
+        // and never released, and under `cargo test` the names are TEST names.
+        // When earlier tests have taken every named lane, this fixture's
+        // spawner lands in `<other-threads>` — the documented degradation,
+        // which keeps the total honest. Asserting the named key alone made
+        // this test go red whenever any PR added a test that charges a lane
+        // (the same class as qontinui/qontinui-runner#1447, which moved the
+        // wedge_diagnostics lane tests onto private tables). So the assertion
+        // is on the lane the body was actually charged to: its own name when
+        // a lane was free, else the overflow lane — and an always-None or
+        // always-empty field still fails, because neither key is then present.
+        // The lane is read from the live accessor (the source of truth), never
+        // from the published map under test, so a wire map that dropped the
+        // named lane cannot steer this onto the overflow arm.
+        use qontinui_runner_lib::wedge_diagnostics::OVERFLOW_LANE_NAME;
+        let charged = if tracked_blocking_by_thread().contains_key(SPAWNER) {
+            SPAWNER
+        } else {
+            OVERFLOW_LANE_NAME
+        };
+        let count = published.get(charged).copied();
+        if charged == SPAWNER {
+            assert_eq!(
+                count,
+                Some(1),
+                "the fixture's own lane must count exactly its one in-flight body: \
+                 {published:?}"
+            );
+        } else {
+            assert!(
+                count.is_some_and(|n| n >= 1),
+                "the fixture's in-flight body did not appear in the published \
+                 breakdown under its own name or the overflow lane: {published:?}"
+            );
+        }
         // Cross-checks the live accessor directly, not just the wire struct —
         // the same key this fixture's body is charged to on the source of
         // truth `collect_host_lane` reads from.
         assert!(
             tracked_blocking_by_thread()
-                .get(SPAWNER)
+                .get(charged)
                 .copied()
                 .is_some_and(|n| n >= 1),
             "the fixture's body must still be tracked while it is in flight"
