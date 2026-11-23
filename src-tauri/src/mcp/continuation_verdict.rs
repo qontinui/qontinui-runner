@@ -769,14 +769,14 @@ fn build_rules_get(
 /// resolution (`session_work_status::CREDENTIAL_TIMEOUT`) and the GET
 /// (`session_work_status::FETCH_TIMEOUT`) together. A read that has not
 /// answered is UNKNOWN, which allows.
-const STATUS_READ_BUDGET: Duration = Duration::from_millis(2500);
+const STATUS_READ_BUDGET: Duration = Duration::from_secs(2);
 
 /// The Stop path's bound on the continuation-rules GET, tighter than the
 /// shared [`http_client`]'s 4 s: it runs last, after everything else the hook
 /// waits for, and after its own credential build
 /// ([`policy_tenant::CREDENTIAL_BUILD_TIMEOUT`]). A slow fetch falls back to the
 /// built-in default.
-const RULES_FETCH_TIMEOUT: Duration = Duration::from_millis(1500);
+const RULES_FETCH_TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn fetch_continuation_rules_uncached(base: &str, target: PolicyTarget) -> Option<RulesDoc> {
     let client = http_client().ok()?;
@@ -1114,8 +1114,9 @@ pub async fn continuation_verdict(
     };
 
     let (prompt, rules_version) = if verdict.decision == "block" {
-        cap_registry().record(session_key, now);
         let rules = fetch_continuation_rules(&tenant).await;
+        // Counted once the prompt is in hand, at the stamp the cap check read.
+        cap_registry().record(session_key, now);
         (Some(rules.text), rules.version)
     } else {
         (None, None)
