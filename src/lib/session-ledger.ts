@@ -266,7 +266,8 @@ export interface FinishNets {
  * The operator-facing line a Finish/Unfinish result owes, or `null` when it
  * owes none: an unretired or UNKNOWN net on a finish (it may still dispatch a
  * duplicate /implement-plan), and — on an unfinish, only when the earlier
- * finish withdrew a net (`earlierFinishWithdrew`) — the not-re-armed note.
+ * finish withdrew or cancelled a net (`earlierFinishWithdrew`) — the
+ * not-re-armed note.
  */
 export function finishNetsNotice(
   nets: FinishNets | null | undefined,
@@ -304,8 +305,8 @@ export function finishNetsNotice(
  * `FinishOutcome::response_json`). It is NOT a failure to retry — re-read the
  * roster to see which. `notice` is {@link finishNetsNotice} of the body's
  * `nets` (pass `earlierFinishWithdrew` on an unfinish); `withdrew` says a
- * finish withdrew (or cancelled the continuation of) at least one net, for the caller to remember until an
- * Unfinish.
+ * finish withdrew or cancelled at least one net, for the caller to remember
+ * until an Unfinish.
  */
 export async function setSessionFinished(
   claudeSessionId: string,

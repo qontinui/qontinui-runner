@@ -73,8 +73,8 @@ const MAX_GATE_PAGES: usize = 5;
 /// variant name still matches (/vet-imp Step 5's rule).
 pub const NET_PHASE_PREFIX: &str = "implement\u{2192}ship safety net";
 
-/// What an unmark answers under `nets.rearm`: a withdrawn net is never
-/// re-armed by an unfinish.
+/// What an unmark answers under `nets.rearm`: a net the finish withdrew or
+/// cancelled is never re-armed by an unfinish.
 pub const REARM_NOTE: &str = "not restored — /implement-plan Step 0.5 re-arms";
 
 // ===========================================================================
@@ -244,6 +244,24 @@ impl NetsReport {
 pub trait FinishNetRetirer: Send + Sync {
     /// Retire within `budget`; past it the outcome is UNKNOWN.
     async fn retire(&self, claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome;
+
+    /// Retire several sessions' nets at once, within ONE `budget` (the relay's
+    /// tick). The default runs [`Self::retire`] for each concurrently;
+    /// [`CoordNetRetirer`] overrides it to read the device context and the
+    /// claims list ONCE and share them across the sessions.
+    async fn retire_many(
+        &self,
+        claude_session_ids: &[String],
+        by: &str,
+        budget: Duration,
+    ) -> Vec<NetsOutcome> {
+        futures::future::join_all(
+            claude_session_ids
+                .iter()
+                .map(|id| self.retire(id, by, budget)),
+        )
+        .await
+    }
 }
 
 /// The production retirer: [`retire_nets_for_finish`].
@@ -253,6 +271,15 @@ pub struct CoordNetRetirer;
 impl FinishNetRetirer for CoordNetRetirer {
     async fn retire(&self, claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome {
         retire_nets_for_finish(claude_session_id, by, budget).await
+    }
+
+    async fn retire_many(
+        &self,
+        claude_session_ids: &[String],
+        by: &str,
+        budget: Duration,
+    ) -> Vec<NetsOutcome> {
+        retire_many_for_finish(claude_session_ids, by, budget).await
     }
 }
 
@@ -273,21 +300,84 @@ pub async fn retire_before_finish(
     by: &str,
     budget: Duration,
 ) -> NetsReport {
+    if let Some(skip) = no_retire(
+        store,
+        claude_session_id,
+        finished,
+        reason,
+        only_if_unfinished,
+    ) {
+        return skip;
+    }
+    NetsReport::Ran(retirer.retire(claude_session_id, by, budget).await)
+}
+
+/// [`retire_before_finish`] for a batch of CONDITIONAL finishes (the relay's
+/// `set_finished_if_unfinished`): one [`FinishNetRetirer::retire_many`] call
+/// for every session that will be marked, within one `budget`. The reports
+/// come back in `claude_session_ids` order; the caller writes the marks only
+/// after this returns.
+pub async fn retire_before_conditional_finishes(
+    store: &SessionLifecycleStore,
+    retirer: &dyn FinishNetRetirer,
+    claude_session_ids: &[String],
+    by: &str,
+    budget: Duration,
+) -> Vec<NetsReport> {
+    let skips: Vec<Option<NetsReport>> = claude_session_ids
+        .iter()
+        .map(|id| no_retire(store, id, true, None, true))
+        .collect();
+    let run: Vec<String> = claude_session_ids
+        .iter()
+        .zip(&skips)
+        .filter(|(_, skip)| skip.is_none())
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut ran = if run.is_empty() {
+        Vec::new()
+    } else {
+        retirer.retire_many(&run, by, budget).await
+    }
+    .into_iter();
+    skips
+        .into_iter()
+        .map(|skip| {
+            skip.unwrap_or_else(|| {
+                ran.next().map(NetsReport::Ran).unwrap_or_else(|| {
+                    NetsReport::Ran(NetsOutcome::unknown("the batch retire answered no outcome"))
+                })
+            })
+        })
+        .collect()
+}
+
+/// `Some(report)` when a finish door must NOT run the retire: an unmark, an
+/// unknown id, or a finish that writes no mark.
+fn no_retire(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    finished: bool,
+    reason: Option<&str>,
+    only_if_unfinished: bool,
+) -> Option<NetsReport> {
     if !finished {
-        return NetsReport::Unmark;
+        return Some(NetsReport::Unmark);
     }
     let Some(record) = store.get(claude_session_id) else {
-        return NetsReport::Skipped("the session is unknown to the lifecycle registry");
+        return Some(NetsReport::Skipped(
+            "the session is unknown to the lifecycle registry",
+        ));
     };
     // The store's own rule (`non_empty`): a blank or whitespace reason is no
     // reason, so a `{"reason":""}` re-finish is a read-back, not a restamp.
     let reason_given = reason.is_some_and(|r| !r.trim().is_empty());
     if record.finished_at.is_some() && (only_if_unfinished || !reason_given) {
-        return NetsReport::Skipped(
+        return Some(NetsReport::Skipped(
             "the mark is already set and this call writes none; nets are retired when a finish writes the mark",
-        );
+        ));
     }
-    NetsReport::Ran(retirer.retire(claude_session_id, by, budget).await)
+    None
 }
 
 // ===========================================================================
@@ -755,11 +845,17 @@ async fn settle_cleared(
             format!("the net already cleared and its continuation is still live after the cancel ({why})"),
         ),
         Ok(Some(_)) => out.cancelled.push(id),
-        Ok(None) => out.unreadable(stem, Some(&id), "the cancel's read-back found no row"),
+        Ok(None) => out.unreadable(
+            stem,
+            Some(&id),
+            format!("the net already cleared; the cancel's read-back found no row after {why}"),
+        ),
         Err(e) => out.unreadable(
             stem,
             Some(&id),
-            format!("the net already cleared; the cancel's read-back could not be made ({e})"),
+            format!(
+                "the net already cleared; the cancel's read-back could not be made ({e}) after {why}"
+            ),
         ),
     }
 }
@@ -993,15 +1089,33 @@ pub async fn retire_nets_for_finish(
     by: &str,
     budget: Duration,
 ) -> NetsOutcome {
+    retire_many_for_finish(&[claude_session_id.to_string()], by, budget)
+        .await
+        .pop()
+        .unwrap_or_else(|| NetsOutcome::unknown("the retire answered no outcome"))
+}
+
+/// [`retire_nets_for_finish`] for several sessions within ONE `budget`: the
+/// device context, the HTTP client and the claims list are read once and
+/// shared; each session's gate reads and writes run concurrently.
+pub async fn retire_many_for_finish(
+    claude_session_ids: &[String],
+    by: &str,
+    budget: Duration,
+) -> Vec<NetsOutcome> {
     let started = Instant::now();
+    let all_unknown = |why: String| {
+        claude_session_ids
+            .iter()
+            .map(|_| NetsOutcome::unknown(why.clone()))
+            .collect()
+    };
     let (ctx, jwt, base) =
         match tokio::time::timeout(budget, tokio::task::spawn_blocking(read_context)).await {
             Ok(Ok(parts)) => parts,
-            Ok(Err(e)) => {
-                return NetsOutcome::unknown(format!("the device context read panicked: {e}"))
-            }
+            Ok(Err(e)) => return all_unknown(format!("the device context read panicked: {e}")),
             Err(_) => {
-                return NetsOutcome::unknown(format!(
+                return all_unknown(format!(
                     "the device context read outlived the retire budget ({}s)",
                     budget.as_secs()
                 ))
@@ -1010,31 +1124,89 @@ pub async fn retire_nets_for_finish(
     // No client-level timeout: every request carries its own [`CALL_CAP`].
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
-        Err(e) => return NetsOutcome::unknown(format!("no HTTP client: {e}")),
+        Err(e) => return all_unknown(format!("no HTTP client: {e}")),
     };
     let io = HttpNetsCoord { base, jwt, client };
     let left = budget.saturating_sub(started.elapsed());
-    let out = retire_nets_with(&io, &ctx, claude_session_id, by, left).await;
-    let verdict = out.verdict();
-    if matches!(verdict, NetsVerdict::NetUnretired | NetsVerdict::Unknown) {
-        warn!(
-            claude_session_id,
-            by,
-            verdict = verdict.as_str(),
-            nets = %out.to_json(),
-            "finish_net_retire: an implement→ship net was NOT retired before the finish mark"
-        );
-    } else {
-        info!(
-            claude_session_id,
-            by,
-            verdict = verdict.as_str(),
-            withdrawn = ?out.withdrawn,
-            cancelled = ?out.cancelled,
-            "finish_net_retire: nets retired before the finish mark"
-        );
+    let outs = retire_many_with(&io, &ctx, claude_session_ids, by, left).await;
+    for (claude_session_id, out) in claude_session_ids.iter().zip(&outs) {
+        let verdict = out.verdict();
+        if matches!(verdict, NetsVerdict::NetUnretired | NetsVerdict::Unknown) {
+            warn!(
+                claude_session_id = %claude_session_id,
+                by,
+                verdict = verdict.as_str(),
+                nets = %out.to_json(),
+                "finish_net_retire: an implement→ship net was NOT retired before the finish mark"
+            );
+        } else {
+            info!(
+                claude_session_id = %claude_session_id,
+                by,
+                verdict = verdict.as_str(),
+                withdrawn = ?out.withdrawn,
+                cancelled = ?out.cancelled,
+                "finish_net_retire: nets retired before the finish mark"
+            );
+        }
     }
-    out
+    outs
+}
+
+/// The claims list read ONCE for a batch, served to every session's run;
+/// gate reads and writes go to the wrapped door.
+struct SharedReserves<'a> {
+    inner: &'a dyn NetsCoord,
+    page: Result<ReservePage, String>,
+}
+
+#[async_trait::async_trait]
+impl NetsCoord for SharedReserves<'_> {
+    async fn list_plan_reserves(&self) -> Result<ReservePage, String> {
+        self.page.clone()
+    }
+    async fn list_gates(&self, stem: &str) -> Result<Vec<GateRow>, String> {
+        self.inner.list_gates(stem).await
+    }
+    async fn read_gate(&self, gate_id: &str) -> Result<Option<GateRow>, String> {
+        self.inner.read_gate(gate_id).await
+    }
+    async fn write(
+        &self,
+        verb: GateWrite,
+        gate_id: &str,
+        reason: &str,
+    ) -> Result<WriteAnswer, String> {
+        self.inner.write(verb, gate_id, reason).await
+    }
+}
+
+/// [`retire_nets_with`] for several sessions within ONE `budget`: the claims
+/// list is read once (under the same per-call cap) and shared, then every
+/// session's run proceeds concurrently on what is left.
+pub async fn retire_many_with(
+    io: &dyn NetsCoord,
+    ctx: &RetireContext,
+    claude_session_ids: &[String],
+    by: &str,
+    budget: Duration,
+) -> Vec<NetsOutcome> {
+    let started = Instant::now();
+    let shared = Budget {
+        deadline: started + budget,
+        total: budget,
+    };
+    let page = shared
+        .call("GET /coord/claims/list", io.list_plan_reserves())
+        .await;
+    let io = SharedReserves { inner: io, page };
+    let left = budget.saturating_sub(started.elapsed());
+    futures::future::join_all(
+        claude_session_ids
+            .iter()
+            .map(|id| retire_nets_with(&io, ctx, id, by, left)),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1070,12 +1242,17 @@ pub(crate) mod tests {
         pub withdraw_answer: Option<WriteAnswer>,
         /// The cancel lands on coord but its answer is lost (a timeout).
         pub cancel_lands_unanswered: bool,
+        /// The cancel is never answered AND never lands.
+        pub cancel_lost_unanswered: bool,
         pub writes: Mutex<Vec<(GateWrite, String)>>,
+        /// How many times the claims list was read.
+        pub list_calls: Mutex<usize>,
     }
 
     #[async_trait::async_trait]
     impl NetsCoord for FakeCoord {
         async fn list_plan_reserves(&self) -> Result<ReservePage, String> {
+            *self.list_calls.lock().unwrap() += 1;
             self.reserves
                 .clone()
                 .ok_or_else(|| "unreachable".to_string())
@@ -1108,6 +1285,9 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .push((verb, gate_id.to_string()));
+            if verb == GateWrite::CancelContinuation && self.cancel_lost_unanswered {
+                return Err("timed out".to_string());
+            }
             let answer = match verb {
                 GateWrite::Withdraw => self.withdraw_answer.clone().unwrap_or(WriteAnswer::Ok),
                 GateWrite::CancelContinuation => WriteAnswer::Ok,
@@ -1317,6 +1497,91 @@ pub(crate) mod tests {
         let out = run(&io, &single()).await;
         assert_eq!(out.cancelled, vec!["g1".to_string()]);
         assert!(out.unretired.is_empty(), "{:?}", out.unretired);
+        assert_eq!(out.verdict(), NetsVerdict::Retired);
+        assert_eq!(
+            *io.writes.lock().unwrap(),
+            vec![(GateWrite::CancelContinuation, "g1".to_string())]
+        );
+    }
+
+    /// A batch reads the claims list ONCE and retires every session's nets.
+    #[tokio::test]
+    async fn a_batch_reads_the_claims_list_once_and_retires_each_sessions_nets() {
+        let io = FakeCoord {
+            reserves: page(vec![reserve("p1", "s1"), reserve("p2", "s2")]),
+            gates: Mutex::new(vec![net("g1", "open", ME)]),
+            ..Default::default()
+        };
+        let ids = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
+        let outs = retire_many_with(&io, &single(), &ids, "test", DOOR_BUDGET).await;
+        assert_eq!(
+            *io.list_calls.lock().unwrap(),
+            1,
+            "the claims list is shared"
+        );
+        assert_eq!(outs.len(), 3);
+        assert_eq!(outs[0].stems, vec!["p1".to_string()]);
+        assert_eq!(outs[1].stems, vec!["p2".to_string()]);
+        assert_eq!(outs[2].verdict(), NetsVerdict::None);
+        // The fake serves one gate set for every plan: the first run to reach
+        // g1 withdraws it, the other then reads it back as already retired.
+        let withdrawn: usize = outs.iter().map(|o| o.withdrawn.len()).sum();
+        assert_eq!(withdrawn, 1);
+        assert!(
+            outs[..2]
+                .iter()
+                .all(|o| o.verdict() == NetsVerdict::Retired),
+            "{outs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_an_unreadable_claims_list_is_unknown_for_every_session() {
+        let io = FakeCoord::default();
+        let ids = vec!["s1".to_string(), "s2".to_string()];
+        let outs = retire_many_with(&io, &single(), &ids, "test", DOOR_BUDGET).await;
+        assert_eq!(*io.list_calls.lock().unwrap(), 1);
+        assert!(outs.iter().all(|o| o.verdict() == NetsVerdict::Unknown));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_cancel_that_did_not_land_is_net_unretired() {
+        let io = FakeCoord {
+            reserves: page(vec![reserve("p1", TARGET)]),
+            gates: Mutex::new(vec![net("g1", "cleared", ME)]),
+            cancel_lost_unanswered: true,
+            ..Default::default()
+        };
+        let out = run(&io, &single()).await;
+        assert!(out.cancelled.is_empty());
+        assert_eq!(out.verdict(), NetsVerdict::NetUnretired);
+        assert_eq!(out.unretired[0].gate_id.as_deref(), Some("g1"));
+        assert!(
+            out.unretired[0].why.contains("the cancel was not answered"),
+            "{:?}",
+            out.unretired
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_cancel_whose_read_back_fails_is_unknown_and_names_both() {
+        let io = FakeCoord {
+            reserves: page(vec![reserve("p1", TARGET)]),
+            gates: Mutex::new(vec![net("g1", "cleared", ME)]),
+            cancel_lands_unanswered: true,
+            read_back_fails: true,
+            ..Default::default()
+        };
+        let out = run(&io, &single()).await;
+        assert_eq!(out.verdict(), NetsVerdict::Unknown);
+        let u = &out.unretired[0];
+        assert!(u.unreadable);
+        assert!(u.why.contains("could not be made (HTTP 503)"), "{}", u.why);
+        assert!(
+            u.why.contains("after the cancel was not answered"),
+            "{}",
+            u.why
+        );
     }
 
     #[tokio::test]

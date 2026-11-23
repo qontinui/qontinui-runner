@@ -631,13 +631,15 @@ struct RelayItem {
 }
 
 /// Relay a tick's decisions: every candidate's implement→ship nets are retired
-/// CONCURRENTLY (each bounded by [`DOOR_BUDGET`], so the whole batch is bounded
-/// by one budget), and only then is each conditional mark written. Retire
+/// in ONE batch ([`FinishNetRetirer::retire_many`] — the device context and the
+/// claims list read once and shared, the per-session gate work concurrent, all
+/// within one [`DOOR_BUDGET`]), and only then is each conditional mark written. Retire
 /// before mark holds per session; the mark stays conditional
 /// (`set_finished_if_unfinished`), so a session that finished itself during
 /// the retire keeps its own mark.
 ///
 /// [`DOOR_BUDGET`]: crate::session::finish_net_retire::DOOR_BUDGET
+/// [`FinishNetRetirer::retire_many`]: crate::session::finish_net_retire::FinishNetRetirer::retire_many
 async fn relay_batch(
     store: &SessionLifecycleStore,
     retirer: &dyn crate::session::finish_net_retire::FinishNetRetirer,
@@ -646,22 +648,20 @@ async fn relay_batch(
     if due.is_empty() {
         return;
     }
-    let reasons: Vec<String> = due
+    // ONE batch retire for the tick: the device context and the claims list
+    // are read once and shared, each session's gate reads and writes run
+    // concurrently, all within one DOOR_BUDGET; every mark waits for it.
+    let ids: Vec<String> = due
         .iter()
-        .map(|item| format!("{REASON_PREFIX}{}", item.token))
+        .map(|item| item.claude_session_id.clone())
         .collect();
-    let nets = futures::future::join_all(due.iter().zip(&reasons).map(|(item, reason)| {
-        crate::session::finish_net_retire::retire_before_finish(
-            store,
-            retirer,
-            &item.claude_session_id,
-            true,
-            Some(reason.as_str()),
-            true,
-            "the continuation finish relay",
-            crate::session::finish_net_retire::DOOR_BUDGET,
-        )
-    }))
+    let nets = crate::session::finish_net_retire::retire_before_conditional_finishes(
+        store,
+        retirer,
+        &ids,
+        "the continuation finish relay",
+        crate::session::finish_net_retire::DOOR_BUDGET,
+    )
     .await;
     for (item, nets) in due.iter().zip(nets) {
         debug!(
@@ -824,6 +824,92 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(400)).await;
             crate::session::finish_net_retire::NetsOutcome::default()
         }
+    }
+
+    /// Records each `retire_many` call, and whether any of its sessions was
+    /// already marked when it ran. `retire` must not be used by the relay.
+    struct BatchProbe {
+        store: Arc<SessionLifecycleStore>,
+        calls: std::sync::Mutex<Vec<(Vec<String>, bool)>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::session::finish_net_retire::FinishNetRetirer for BatchProbe {
+        async fn retire(
+            &self,
+            _: &str,
+            _: &str,
+            _: Duration,
+        ) -> crate::session::finish_net_retire::NetsOutcome {
+            panic!("the relay retires a tick in ONE batch, never per session");
+        }
+        async fn retire_many(
+            &self,
+            ids: &[String],
+            _: &str,
+            budget: Duration,
+        ) -> Vec<crate::session::finish_net_retire::NetsOutcome> {
+            assert_eq!(budget, crate::session::finish_net_retire::DOOR_BUDGET);
+            let any_marked = ids
+                .iter()
+                .any(|id| self.store.get(id).is_some_and(|r| r.finished_at.is_some()));
+            self.calls.lock().unwrap().push((ids.to_vec(), any_marked));
+            ids.iter()
+                .map(|_| crate::session::finish_net_retire::NetsOutcome::default())
+                .collect()
+        }
+    }
+
+    /// A tick's sessions are retired in ONE batch call, before any mark; a
+    /// session already finished is left out of the batch.
+    #[tokio::test]
+    async fn a_tick_retires_its_sessions_in_one_batch_before_any_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        let ids = ["b1", "b2", "done"];
+        for id in ids {
+            store.record_open(
+                serde_json::from_value(json!({
+                    "claudeSessionId": id,
+                    "pageId": "default",
+                    "zoneIndex": 0,
+                    "terminalId": format!("term-{id}"),
+                    "openedAt": 0,
+                    "lastSeenAt": 0,
+                    "state": "open",
+                }))
+                .unwrap(),
+            );
+        }
+        store
+            .set_finished("done", true, Some("own".to_string()))
+            .unwrap();
+        let probe = BatchProbe {
+            store: store.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let due = ids
+            .iter()
+            .map(|id| RelayItem {
+                terminal_id: format!("term-{id}"),
+                gate_id: uuid::Uuid::nil(),
+                claude_session_id: id.to_string(),
+                token: "work_completed",
+            })
+            .collect();
+        relay_batch(&store, &probe, due).await;
+        assert_eq!(
+            *probe.calls.lock().unwrap(),
+            vec![(vec!["b1".to_string(), "b2".to_string()], false)],
+            "one batch, the already-finished session left out, before any mark"
+        );
+        assert!(store.get("b1").unwrap().finished_at.is_some());
+        assert!(store.get("b2").unwrap().finished_at.is_some());
+        assert_eq!(
+            store.get("done").unwrap().finish_reason.as_deref(),
+            Some("own")
+        );
     }
 
     /// A tick's retires run CONCURRENTLY, so one dark coord costs the tick one

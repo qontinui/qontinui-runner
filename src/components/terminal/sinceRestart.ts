@@ -647,7 +647,14 @@ export interface FinishButtonModel {
  * roster. Pending shows the transition and disables the button; a failed op
  * keeps the roster's truth and says why, so a retry is the same click.
  */
-export function finishButtonModel(finished: boolean, op: FinishOp | undefined): FinishButtonModel {
+export function finishButtonModel(
+  finished: boolean,
+  rawOp: FinishOp | undefined,
+): FinishButtonModel {
+  // A settled notice speaks about the state ITS op set. Once the roster says
+  // the row is in the other state (changed through another door), the notice
+  // is stale: drop it.
+  const op = rawOp?.phase === "settled" && rawOp.to !== finished ? undefined : rawOp;
   if (op?.phase === "pending") {
     return {
       label: op.to ? "Finishing…" : "Unfinishing…",
