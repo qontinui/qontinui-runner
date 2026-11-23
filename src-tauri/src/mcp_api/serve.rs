@@ -579,7 +579,7 @@ pub async fn start_server(
                 // `app_state`) injects the CORRECT loopback port for
                 // secondary/temp runners — plan §6's #1 live-verification
                 // footgun. Set HERE, the same place app_state.api_port lands.
-                crate::install_effects_producer::intercept::set_bound_port(try_port);
+                crate::mcp::types::set_bound_port(try_port);
 
                 // Rotate this runner start's SAME-USER loopback handshake key at
                 // the BOUND port's path (`~/.qontinui/runner-loopback-key-<port>`)
