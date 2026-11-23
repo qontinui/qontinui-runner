@@ -1181,7 +1181,8 @@ fn transcript_bind_env(
         session_host: Box::new(move |csid| {
             let store = lifecycle.as_ref().ok_or("lifecycle_store_unavailable")?;
             Ok(store
-                .try_get(csid)?
+                .get_checked(csid)
+                .map_err(|_| "lifecycle_store_unreadable")?
                 .filter(|rec| rec.state == "open" && !rec.terminal_id.trim().is_empty())
                 .map(|rec| SessionHost {
                     terminal_id: rec.terminal_id,
@@ -3755,10 +3756,11 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{v}");
         }
 
-        /// T12 through the production route: a runner with NO lifecycle store
-        /// refuses with the UNKNOWN detail rather than reading every session as
-        /// unhosted. The control: with a store that holds no record for the
-        /// session, the same request is the cwd arm's and binds.
+        /// T12 through the production route: a runner with NO lifecycle store,
+        /// or one whose store lock is poisoned, refuses with the UNKNOWN detail
+        /// rather than reading every session as unhosted. The control: with a
+        /// store that holds no record for the session, the same request is the
+        /// cwd arm's and binds.
         #[tokio::test]
         async fn t12_a_runner_with_no_lifecycle_store_refuses_through_the_route() {
             use crate::session::session_lifecycle_store::SessionLifecycleStore;
@@ -3778,6 +3780,19 @@ mod tests {
             let (status, v) = call_route(&t, None, &watched, &bearer(&key), &body(&csid)).await;
             let detail = refused(status, &v, &outbox, &[wd.as_str(), bound.as_str()]);
             assert!(detail.contains("lifecycle_store_unavailable"), "{detail}");
+            assert!(detail.contains("UNKNOWN"), "{detail}");
+
+            // A store whose lock is poisoned is UNKNOWN too, through the
+            // production closure's `get_checked` read — never "not hosted".
+            let poisoned = Arc::new(
+                SessionLifecycleStore::open(state_dir.join("poisoned-terminal-sessions.json"))
+                    .unwrap(),
+            );
+            poisoned.poison_for_test();
+            let (status, v) =
+                call_route(&t, Some(&poisoned), &watched, &bearer(&key), &body(&csid)).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str(), bound.as_str()]);
+            assert!(detail.contains("lifecycle_store_unreadable"), "{detail}");
             assert!(detail.contains("UNKNOWN"), "{detail}");
 
             let store = Arc::new(

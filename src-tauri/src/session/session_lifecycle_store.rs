@@ -4509,19 +4509,20 @@ impl SessionLifecycleStore {
     }
 
     /// [`Self::get`] for a caller that must tell "no record" from "the store
-    /// could not be read": `Err` when the lock is poisoned, where `get` answers
-    /// `None`. An authorization decision reads this one (`POST
-    /// /sessions/transcript-bind`'s hosting check), so an unreadable store
-    /// refuses instead of reading as "no terminal hosts this session".
-    pub fn try_get(
+    /// could not be read": a poisoned lock is `Err(RegistryUnavailable)`, where
+    /// `get` answers `None` — the same contract as
+    /// [`Self::all_records_checked`]. An authorization decision reads this one
+    /// (`POST /sessions/transcript-bind`'s hosting check), so an unreadable
+    /// store refuses instead of reading as "no terminal hosts this session".
+    pub fn get_checked(
         &self,
         claude_session_id: &str,
-    ) -> Result<Option<TerminalSessionRecord>, &'static str> {
+    ) -> Result<Option<TerminalSessionRecord>, RegistryUnavailable> {
         match self.map.lock() {
             Ok(m) => Ok(m.get(claude_session_id).cloned()),
             Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on try_get");
-                Err("lifecycle_store_unreadable")
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on get_checked");
+                Err(RegistryUnavailable)
             }
         }
     }
@@ -7088,35 +7089,28 @@ mod tests {
         std::fs::write(path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
     }
 
-    /// `try_get` keeps apart what `get` collapses: a record, no record, and a
-    /// store that cannot be read (a poisoned lock). The third is never
+    /// `get_checked` keeps apart what `get` collapses: a record, no record,
+    /// and a store that cannot be read (a poisoned lock). The third is never
     /// `Ok(None)`, so the transcript-bind door refuses on it rather than
     /// reading the session as unhosted.
     #[test]
-    fn try_get_tells_an_unreadable_store_from_a_missing_record() {
+    fn get_checked_tells_an_unreadable_store_from_a_missing_record() {
         let dir = tempdir().unwrap();
-        let store = std::sync::Arc::new(
-            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
-        );
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         store.record_open(rec("present"));
         assert_eq!(
             store
-                .try_get("present")
+                .get_checked("present")
                 .unwrap()
                 .map(|r| r.claude_session_id),
             Some("present".to_string())
         );
-        assert!(store.try_get("absent").unwrap().is_none());
+        assert!(store.get_checked("absent").unwrap().is_none());
 
-        let poisoner = store.clone();
-        let _ = std::thread::spawn(move || {
-            let _held = poisoner.map.lock().unwrap();
-            panic!("poison the lifecycle map (test)");
-        })
-        .join();
+        store.poison_for_test();
         assert_eq!(
-            store.try_get("present").unwrap_err(),
-            "lifecycle_store_unreadable"
+            store.get_checked("present").unwrap_err(),
+            RegistryUnavailable
         );
         assert!(
             store.get("present").is_none(),
