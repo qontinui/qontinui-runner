@@ -386,6 +386,23 @@ pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str
     }
 }
 
+/// The value to re-export as [`MCP_CONFIG_ENV`] after a self-provisioned mint,
+/// or `None` to leave the inherited value untouched. Only a mint that
+/// [`identity_mcp_config_args`] would actually pass to `claude` (claude, an
+/// existing file, a UTF-8 path) is exported, so every consumer of the variable
+/// in the child tree reads the config `claude` was given. `qontinui-pr` takes
+/// the variable as authoritative and refuses a set-but-missing file rather than
+/// walking up to an ancestor `.mcp.json`; without this export a self-provisioned
+/// session would have a working coord-mcp while its `qontinui-pr` refused (or
+/// read a stale value). A failed mint changes nothing.
+fn minted_mcp_config_export(tool: IdentityTool, minted: Option<&Path>) -> Option<String> {
+    let path = minted?.to_str()?;
+    if identity_mcp_config_args(tool, Some(path)).is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 /// Does the per-machine opt-in marker (`~/.qontinui/allow-session-coord-identity`)
 /// exist? This is the SAME file the runner-side mint route's gate requires. The
 /// runner-side gate (`coord_mcp::session_identity_gate`) lives in the runner BIN
@@ -631,6 +648,9 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     };
     if let Some(path) = minted_config.as_ref() {
         mcp_config = identity_mcp_config_args(tool, path.to_str());
+    }
+    if let Some(export) = minted_mcp_config_export(tool, minted_config.as_deref()) {
+        env::set_var(MCP_CONFIG_ENV, export);
     }
 
     // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
@@ -2608,6 +2628,30 @@ mod tests {
         assert!(identity_mcp_config_args(IdentityTool::Claude, Some("")).is_empty());
         assert!(identity_mcp_config_args(IdentityTool::Claude, Some("  ")).is_empty());
         assert!(identity_mcp_config_args(IdentityTool::Claude, None).is_empty());
+    }
+
+    /// The self-provisioned config is re-exported only when `claude` is given
+    /// it; a failed mint (no path, a missing file) or gemini leaves the
+    /// inherited variable alone.
+    #[test]
+    fn minted_mcp_config_export_only_for_a_config_claude_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("minted.json");
+        std::fs::write(&file, b"{}").unwrap();
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Claude, Some(&file)),
+            Some(file.to_string_lossy().into_owned())
+        );
+        assert_eq!(minted_mcp_config_export(IdentityTool::Claude, None), None);
+        let missing = tmp.path().join("gone.json");
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Claude, Some(&missing)),
+            None
+        );
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Gemini, Some(&file)),
+            None
+        );
     }
 
     /// §5 fail-open: gemini has no `--mcp-config` flag, so the fallback must
