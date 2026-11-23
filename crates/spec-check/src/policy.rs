@@ -154,11 +154,16 @@ fn match_outcome_rank(outcome: MatchOutcome) -> u8 {
 /// The decided failures and the unknowns in a conjunct's scope, counted
 /// apart (plan `2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass`
 /// D4). An `Unknown` is "could not look", never "looked and failed", so a
-/// rule may not count it as a failure — and it may not count it as a pass
-/// either. Each rule decides at conjunct grain: `Fail` when the decided
-/// failures alone break it, `Pass` when it holds even with every unknown
-/// counted failed, otherwise `Indeterminate`. An unknown is therefore never
-/// treated worse than a failure, and never better than one.
+/// count-based rule (`AllPass`, `MaxFailures`, `FailureRateBelow`) may not
+/// count it as a failure — and it may not count it as a pass either. Each
+/// such rule decides at conjunct grain: `Fail` when the decided failures
+/// alone break it, `Pass` when it holds even with every unknown counted
+/// failed, otherwise `Indeterminate`. An unknown is therefore never treated
+/// worse than a failure, and never better than one. The rate and outcome
+/// rules (`StateMatchRateAtLeast`, `AnyStateMatchRateAtLeast`,
+/// `MatchOutcomeAtLeast`) do not use this tally: they read the result's
+/// pass-only `match_rate` / `match_outcome`, so an unknown counts there as
+/// not matched (the plan's census class (e)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VerdictTally {
     total: usize,
