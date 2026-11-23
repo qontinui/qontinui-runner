@@ -1027,7 +1027,7 @@ mod tests {
         match err {
             CommandRelayError::Displaced(reason) => {
                 assert!(
-                    reason.contains(&format!("replaced by connection {new}")),
+                    reason.contains(&format!("held by connection {new}")),
                     "{reason}"
                 )
             }

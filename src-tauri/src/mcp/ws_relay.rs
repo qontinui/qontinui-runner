@@ -1142,10 +1142,12 @@ mod tests {
         let m2 = m.clone();
         let pending =
             tokio::spawn(async move { m2.send_text_if_current("app", conn, "last".into()).await });
-        // Let the spawned send run BEFORE draining, so it meets a full channel
-        // and parks in the `TrySendError::Full` arm. On this single-threaded
-        // runtime, draining first would let it take the `try_send` Ok path and
-        // the arm this test is named after would never run.
+        // Yield BEFORE draining so the spawned send runs while the channel is
+        // full: on this single-threaded runtime the yields hand it the thread,
+        // and it then takes the `TrySendError::Full` arm. Draining first would
+        // let it take the `try_send` Ok path instead. The two assertions below
+        // show it has not completed or enqueued; they cannot by themselves
+        // prove it was polled.
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
