@@ -1125,8 +1125,8 @@ enum ManifestMode {
     Json,
     /// `--capability-manifest-doc` — the GENERATED roster checked in at
     /// `docs/runner-capabilities.md`. A pure function of `CAPABILITY_SPECS`
-    /// and `Rung::ALL`, carrying no runtime value, which is what lets
-    /// `.github/workflows/capability-manifest-fresh.yml` gate it.
+    /// and `Rung::ALL`, carrying no runtime value, which is what lets the test
+    /// `the_checked_in_capability_doc_matches_a_fresh_render` gate it.
     Doc,
 }
 

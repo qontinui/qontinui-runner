@@ -2163,9 +2163,9 @@ pub fn render_manifest_doc() -> String {
          --capability-manifest-doc > docs/runner-capabilities.md`. NOT from PowerShell, \
          whose `>` writes UTF-16 or a BOM that `include_str!` cannot read at all. The \
          source of truth is `CAPABILITY_SPECS` in \
-         `src-tauri/src/capability_manifest.rs`, and \
-         `.github/workflows/capability-manifest-fresh.yml` fails any PR whose checked-in \
-         copy differs from a fresh render. -->\n\n",
+         `src-tauri/src/capability_manifest.rs`, and the runner test \
+         `the_checked_in_capability_doc_matches_a_fresh_render` (in `src-tauri/src/main.rs`) \
+         fails any change whose checked-in copy differs from a fresh render. -->\n\n",
     );
     out.push_str(&format!("Manifest schema version: `{SCHEMA_VERSION}`.\n\n"));
 
