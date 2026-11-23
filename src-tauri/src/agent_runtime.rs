@@ -252,6 +252,15 @@ pub struct GateContinuationPayload {
     /// The gate anchor that cleared (for logging / correlation).
     #[serde(default)]
     pub anchor_key: Option<String>,
+    /// Lowercase sha256 hex of the normalized skill + args of the work this
+    /// continuation carries (coord computes it; never of the hint). The
+    /// duplicate-anchor guard keys on `(anchor_key, work_identity)` so two
+    /// gates sharing a `(unit, phase)` anchor but carrying DIFFERENT work both
+    /// spawn. Absent on a coord that predates it - that frame alone falls back
+    /// to anchor-only dedup, and its deferral stamp says so
+    /// ([`duplicate_anchor_stamp_reason`]).
+    #[serde(default)]
+    pub work_identity: Option<String>,
     /// Intent-derived display name coord stamps for this spawn (e.g.
     /// `post-merge-runner#1863`). Becomes `claude --name`, the tab title and the
     /// commit `Session-Name` trailer. Absent on a coord that predates it.
@@ -3428,6 +3437,10 @@ struct ContinuationSession {
     /// row. Anything that needs to address a gate uses [`Self::gate_id`], which
     /// is CARRIED rather than derived.
     anchor_key: Option<String>,
+    /// The work identity the continuation was spawned with (see
+    /// [`GateContinuationPayload::work_identity`]); with `anchor_key` it is the
+    /// dedup slot ([`AnchorSlot`]). `None` = an old coord's frame.
+    work_identity: Option<String>,
     /// The `coord.gates` row this continuation reports its outcome to, when
     /// there is one — carried from `payload.gate_id` at spawn so the exit hook
     /// can POST the terminal outcome without a lookup that does not exist.
@@ -3561,7 +3574,7 @@ struct ContinuationRegistry {
     /// to take a THIRD dispatch's, and putting two sessions on one anchor by
     /// the other route. Carrying the token makes every removal a no-op unless
     /// the remover holds the entry it names.
-    pending_anchors: std::collections::HashMap<String, AnchorReservationToken>,
+    pending_anchors: std::collections::HashMap<AnchorSlot, AnchorReservationToken>,
     /// How many continuations have passed [`evaluate_continuation_guard`] with
     /// `Proceed` and are not yet registered (or given up): each is charged
     /// against the resource lanes as a PROJECTED cost
@@ -3610,6 +3623,7 @@ impl ContinuationRegistry {
         &mut self,
         terminal_id: String,
         anchor_key: Option<String>,
+        work_identity: Option<String>,
         gate_id: Option<uuid::Uuid>,
         consuming_device_id: Option<uuid::Uuid>,
         shell_hosted: bool,
@@ -3619,6 +3633,7 @@ impl ContinuationRegistry {
             ContinuationSession {
                 terminal_id,
                 anchor_key,
+                work_identity,
                 gate_id,
                 registered_at: std::time::Instant::now(),
                 consuming_device_id,
@@ -3700,11 +3715,12 @@ impl ContinuationRegistry {
         // never assigned over a live permit, whose `Drop` would re-lock the
         // non-reentrant mutex this borrow already holds (the hazard
         // `evaluate_continuation_guard` documents at length).
-        let reservation = match session.anchor_key.as_deref() {
-            Some(anchor) => match self.pending_anchors.entry(anchor.to_string()) {
-                std::collections::hash_map::Entry::Occupied(_) => {
+        let reservation = match session.slot() {
+            Some(slot) => match self.pending_slot_holder(&slot) {
+                Some(_) => {
                     tracing::warn!(
-                        anchor = %anchor,
+                        anchor = %slot.anchor,
+                        work_identity = ?slot.work_identity,
                         terminal_id = %terminal_id,
                         "continuation lift found the anchor already reserved by another holder — \
                          leaving that reservation intact and carrying no permit across the hop. \
@@ -3715,10 +3731,10 @@ impl ContinuationRegistry {
                     );
                     AnchorReservation::none()
                 }
-                std::collections::hash_map::Entry::Vacant(slot) => {
+                None => {
                     let token = next_anchor_reservation_token();
-                    slot.insert(token);
-                    AnchorReservation::owning(anchor.to_string(), token)
+                    self.pending_anchors.insert(slot.clone(), token);
+                    AnchorReservation::owning(slot, token)
                 }
             },
             // An anchor-less continuation holds nothing to hold.
@@ -3745,10 +3761,72 @@ impl ContinuationRegistry {
     /// what keeps any future remover from becoming one. One comparison means
     /// `stale_reservation_drop_cannot_steal_a_foreign_reservation` covers both
     /// paths, and making it unconditional fails that test.
-    fn release_owned(&mut self, anchor: &str, token: AnchorReservationToken) {
-        if self.pending_anchors.get(anchor) == Some(&token) {
-            self.pending_anchors.remove(anchor);
+    fn release_owned(&mut self, slot: &AnchorSlot, token: AnchorReservationToken) {
+        if self.pending_anchors.get(slot) == Some(&token) {
+            self.pending_anchors.remove(slot);
         }
+    }
+
+    /// The live session whose slot conflicts with `slot`, if any
+    /// ([`AnchorSlot::conflicts_with`]).
+    fn live_slot_holder(&self, slot: &AnchorSlot) -> Option<&ContinuationSession> {
+        self.live
+            .values()
+            .find(|s| s.slot().is_some_and(|held| held.conflicts_with(slot)))
+    }
+
+    /// The pending reservation whose slot conflicts with `slot`, if any.
+    fn pending_slot_holder(&self, slot: &AnchorSlot) -> Option<AnchorReservationToken> {
+        self.pending_anchors
+            .iter()
+            .find(|(held, _)| held.conflicts_with(slot))
+            .map(|(_, token)| *token)
+    }
+}
+
+impl ContinuationSession {
+    /// This session's dedup slot, or `None` for an anchor-less continuation.
+    fn slot(&self) -> Option<AnchorSlot> {
+        self.anchor_key.as_ref().map(|anchor| AnchorSlot {
+            anchor: anchor.clone(),
+            work_identity: self.work_identity.clone(),
+        })
+    }
+}
+
+/// The duplicate-anchor dedup key: the gate anchor AND the identity of the work
+/// the continuation carries. An anchor is one-to-many over gates, and two gates
+/// on one `(unit, phase)` anchor may carry different work (different skill or
+/// args) - keyed on the anchor alone the second was refused as a duplicate of
+/// work it does not duplicate. There is deliberately no anchor-only form: a
+/// frame from a coord that sends no `work_identity` is the slot with
+/// `work_identity: None`, which [`Self::conflicts_with`] treats as "identity
+/// unknown, so assume the same work" - the old behaviour, for that frame only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AnchorSlot {
+    anchor: String,
+    work_identity: Option<String>,
+}
+
+impl AnchorSlot {
+    /// Build a slot from a frame's `anchor_key` and `work_identity`; `None`
+    /// when the frame has no anchor (nothing to dedup).
+    fn new(anchor_key: Option<&str>, work_identity: Option<&str>) -> Option<Self> {
+        anchor_key.map(|anchor| Self {
+            anchor: anchor.to_string(),
+            work_identity: work_identity.map(str::to_string),
+        })
+    }
+
+    /// Two slots are the same work when the anchors match and the identities
+    /// match; an unknown identity on either side (an old coord) cannot prove
+    /// the work differs, so it conflicts with any identity on that anchor.
+    fn conflicts_with(&self, other: &Self) -> bool {
+        self.anchor == other.anchor
+            && match (&self.work_identity, &other.work_identity) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
     }
 }
 
@@ -4093,6 +4171,7 @@ enum ContinuationGuard {
 /// different trip points, chosen by the caller that bears the cost.
 fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
+    work_identity: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
     load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
 ) -> (ContinuationGuard, AnchorReservation) {
@@ -4122,13 +4201,10 @@ fn evaluate_continuation_guard(
     let reservation = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
 
-        if let Some(anchor) = anchor_key {
-            // P3: a LIVE session already exists for this anchor_key → dedup.
-            if let Some(existing) = registry
-                .live
-                .values()
-                .find(|s| s.anchor_key.as_deref() == Some(anchor))
-            {
+        if let Some(slot) = AnchorSlot::new(anchor_key, work_identity) {
+            // P3: a LIVE session already holds this (anchor_key, work_identity)
+            // slot -> dedup.
+            if let Some(existing) = registry.live_slot_holder(&slot) {
                 return (
                     ContinuationGuard::DuplicateAnchor(AnchorHolder::Live(
                         existing.terminal_id.clone(),
@@ -4142,23 +4218,19 @@ fn evaluate_continuation_guard(
             // BEFORE the lock drops, so a second evaluation racing this one
             // cannot also read the anchor as free. `AnchorReservation` carries
             // it from here.
-            match registry.pending_anchors.entry(anchor.to_string()) {
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    return (
-                        ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
-                        AnchorReservation::none(),
-                    );
-                }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    let token = next_anchor_reservation_token();
-                    slot.insert(token);
-                    // The permit leaves this critical section as an owned RAII
-                    // value. Nothing else can mint one for this anchor, and
-                    // nothing else can remove the entry it names (see
-                    // `ContinuationRegistry::pending_anchors`).
-                    AnchorReservation::owning(anchor.to_string(), token)
-                }
+            if registry.pending_slot_holder(&slot).is_some() {
+                return (
+                    ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
+                    AnchorReservation::none(),
+                );
             }
+            let token = next_anchor_reservation_token();
+            registry.pending_anchors.insert(slot.clone(), token);
+            // The permit leaves this critical section as an owned RAII
+            // value. Nothing else can mint one for this slot, and
+            // nothing else can remove the entry it names (see
+            // `ContinuationRegistry::pending_anchors`).
+            AnchorReservation::owning(slot, token)
         } else {
             // An anchor-less continuation reserves nothing and releases
             // nothing — a permit over no anchor, whose drop is a no-op
@@ -4334,10 +4406,12 @@ pub(crate) fn launch_admission(
 /// [`crate::health_monitor::THREAD_READING_TTL`].
 fn evaluate_continuation_guard_live(
     anchor_key: Option<&str>,
+    work_identity: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
 ) -> (ContinuationGuard, AnchorReservation) {
     evaluate_continuation_guard(
         anchor_key,
+        work_identity,
         is_live,
         &crate::resource_guard::AdmissionReading::live,
     )
@@ -4495,7 +4569,7 @@ fn register_continuation_session(
     anchor_key: Option<String>,
     gate_id: Option<uuid::Uuid>,
 ) {
-    register_continuation_session_with_device(terminal_id, anchor_key, gate_id, None);
+    register_continuation_session_with_device(terminal_id, anchor_key, None, gate_id, None);
 }
 
 /// The production registration path (the test-only `register_continuation_session` wraps it), carrying the continuation's CONSUMING
@@ -4505,12 +4579,14 @@ fn register_continuation_session(
 fn register_continuation_session_with_device(
     terminal_id: String,
     anchor_key: Option<String>,
+    work_identity: Option<String>,
     gate_id: Option<uuid::Uuid>,
     consuming_device_id: Option<uuid::Uuid>,
 ) {
     register_continuation_session_hosted(
         terminal_id,
         anchor_key,
+        work_identity,
         gate_id,
         consuming_device_id,
         false,
@@ -4522,6 +4598,7 @@ fn register_continuation_session_with_device(
 fn register_continuation_session_hosted(
     terminal_id: String,
     anchor_key: Option<String>,
+    work_identity: Option<String>,
     gate_id: Option<uuid::Uuid>,
     consuming_device_id: Option<uuid::Uuid>,
     shell_hosted: bool,
@@ -4529,6 +4606,7 @@ fn register_continuation_session_hosted(
     lock_recover(continuation_sessions(), "continuation_sessions").insert_live(
         terminal_id,
         anchor_key,
+        work_identity,
         gate_id,
         consuming_device_id,
         shell_hosted,
@@ -4545,7 +4623,7 @@ fn register_continuation_session_hosted(
 /// the one the caller took (see [`ContinuationRegistry::pending_anchors`]). It
 /// is not written here — it is [`ContinuationRegistry::release_owned`], the
 /// single comparison this path shares with the hand-over.
-fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
+fn release_anchor_reservation(held: Option<(&AnchorSlot, AnchorReservationToken)>) {
     let Some((anchor, token)) = held else {
         return;
     };
@@ -4598,7 +4676,7 @@ pub(crate) struct AnchorReservation {
     /// The anchor this reservation owns, with the token that proves the
     /// ownership. `None` holds nothing: an anchor-less continuation, or an
     /// evaluation that took no permit.
-    held: Option<(String, AnchorReservationToken)>,
+    held: Option<(AnchorSlot, AnchorReservationToken)>,
     /// Whether this permit holds one [`ContinuationRegistry::reserved_spawns`]
     /// unit, given back exactly once when the permit settles. Set only by
     /// [`evaluate_continuation_guard`] on `Proceed`, in the critical section
@@ -4620,9 +4698,9 @@ impl AnchorReservation {
     /// dispatch path, [`ContinuationRegistry::take_live_reserving_anchor`] on
     /// the migration lift. Minted with the entry and never from a
     /// key alone, which is what makes ownership checkable.
-    fn owning(anchor_key: String, token: AnchorReservationToken) -> Self {
+    fn owning(slot: AnchorSlot, token: AnchorReservationToken) -> Self {
         Self {
-            held: Some((anchor_key, token)),
+            held: Some((slot, token)),
             counted: false,
         }
     }
@@ -4648,9 +4726,19 @@ impl AnchorReservation {
         // is a no-op: one removal, not two.
         let held = self.held.take();
         let counted = std::mem::take(&mut self.counted);
-        let anchor_key = held.as_ref().map(|(anchor, _)| anchor.clone());
+        let anchor_key = held.as_ref().map(|(slot, _)| slot.anchor.clone());
+        let work_identity = held
+            .as_ref()
+            .and_then(|(slot, _)| slot.work_identity.clone());
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
-        registry.insert_live(terminal_id, anchor_key, gate_id, consuming_device_id, false);
+        registry.insert_live(
+            terminal_id,
+            anchor_key,
+            work_identity,
+            gate_id,
+            consuming_device_id,
+            false,
+        );
         if let Some((anchor, token)) = held {
             // Owner-checked like every other removal, through the SAME
             // comparison — `release_owned` is the only remover there is, so
@@ -4685,7 +4773,7 @@ impl Drop for AnchorReservation {
         release_anchor_reservation(
             self.held
                 .as_ref()
-                .map(|(anchor, token)| (anchor.as_str(), *token)),
+                .map(|(slot, token)| (slot, *token)),
         );
     }
 }
@@ -5078,6 +5166,7 @@ pub(crate) fn register_restored_continuation(
     register_continuation_session_hosted(
         terminal_id,
         None,
+        None,
         Some(gate_id),
         consuming_device_id,
         true,
@@ -5169,6 +5258,8 @@ fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSessi
 pub(crate) struct CarriedContinuation {
     /// The anchor this continuation was spawned for (P3 dedup key).
     pub anchor_key: Option<String>,
+    /// The work identity it was spawned with (the second half of the dedup slot).
+    pub work_identity: Option<String>,
     /// The gate it reports its work outcome to, if any.
     pub gate_id: Option<uuid::Uuid>,
     /// The device that claimed that gate, when it may not be this boot's (a
@@ -5222,6 +5313,7 @@ pub(crate) fn take_continuation_registration(
         (
             CarriedContinuation {
                 anchor_key: session.anchor_key,
+                work_identity: session.work_identity,
                 gate_id: session.gate_id,
                 consuming_device_id: session.consuming_device_id,
                 shell_hosted: session.shell_hosted,
@@ -5278,11 +5370,15 @@ pub(crate) fn restore_continuation_registration(
     // take `migration_lift_does_not_displace_a_foreign_reservation` down with
     // it. The claim checked here is "IF a permit came back, its anchor is this
     // session's" — never "a permit always came back".
-    if let Some((held_anchor, _)) = reservation.held.as_ref() {
+    if let Some((held_slot, _)) = reservation.held.as_ref() {
         debug_assert_eq!(
-            Some(held_anchor.as_str()),
+            Some(held_slot.anchor.as_str()),
             carried.anchor_key.as_deref(),
             "the permit's anchor must be the one the lift took off this terminal",
+        );
+        debug_assert_eq!(
+            held_slot.work_identity, carried.work_identity,
+            "the permit's work identity must be the one the lift took off this terminal",
         );
     }
     if reservation.held.is_some() {
@@ -5300,6 +5396,7 @@ pub(crate) fn restore_continuation_registration(
         register_continuation_session_hosted(
             terminal_id,
             carried.anchor_key,
+            carried.work_identity,
             carried.gate_id,
             carried.consuming_device_id,
             carried.shell_hosted,
@@ -6812,14 +6909,23 @@ struct ContinuationDeferredBody {
 /// one mirrored a string that had already been inlined into a `warn!`, and so
 /// pinned the wording of a log line while advertising itself as a wire
 /// contract). Each arm below calls one of these; the test calls the same ones.
-fn duplicate_anchor_stamp_reason(holder: &AnchorHolder) -> String {
+fn duplicate_anchor_stamp_reason(holder: &AnchorHolder, work_identity: Option<&str>) -> String {
+    // The detail names WHICH work holds the anchor. A slot conflicts only on the
+    // same identity, or when either side's identity is unknown, so the deferred
+    // frame's own identity is the contested one. A frame from a coord that sends
+    // none was deduped on the anchor alone, and the stamp says so rather than
+    // letting the missing field read as "different work".
+    let work = match work_identity {
+        Some(id) => format!("work_identity={}", id.chars().take(12).collect::<String>()),
+        None => "work_identity=none:anchor_only".to_string(),
+    };
     match holder {
         AnchorHolder::Live(existing_terminal_id) => {
-            format!("duplicate_anchor:{existing_terminal_id}")
+            format!("duplicate_anchor:{existing_terminal_id}:{work}")
         }
         // A reservation has no terminal id; the detail names the holder's
         // kind instead so the class parser still finds a non-empty detail.
-        AnchorHolder::Reserved => "duplicate_anchor:reserved".to_string(),
+        AnchorHolder::Reserved => format!("duplicate_anchor:reserved:{work}"),
     }
 }
 
@@ -7054,7 +7160,7 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 ///
 /// | reason | stamped by | constructor |
 /// |---|---|---|
-/// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
+/// | `duplicate_anchor:<terminal_id>:work_identity=<first 12 hex or none:anchor_only>` \| `duplicate_anchor:reserved:work_identity=...` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
 /// | `commit_pressure:<severity>:<observed>_under_<limit>` | the machine is short of free memory (bytes of free commit; `MemAvailable` off Windows) | [`commit_pressure_stamp_reason`] |
 /// | `device_drain:<class>` | coord holds this device drained | [`drain_stamp_reason`] |
@@ -7225,7 +7331,7 @@ fn first_line(msg: &str) -> String {
 ///
 /// `reason` is the machine-matchable stamp string, built by one of the
 /// constructors in [`post_continuation_deferred`]'s table — never spelled
-/// inline. All follow `<class>:<detail>` (`duplicate_anchor:<tid>`,
+/// inline. All follow `<class>:<detail>` (`duplicate_anchor:<tid>:work_identity=...`,
 /// `thread_pressure:<severity>:<observed>_over_<limit>`,
 /// `commit_pressure:<severity>:<observed>_under_<limit>`, `device_drain:<class>`)
 /// except `spawn_authorization_<label>`, which predates the grammar. Callers log their own
@@ -7376,7 +7482,11 @@ async fn run_gate_continuation_inner(
     // back. The
     // two spawn successes disarm it explicitly inside the presentation fns.
     let (guard_verdict, reservation) =
-        evaluate_continuation_guard_live(payload.anchor_key.as_deref(), &live_terminal_predicate());
+        evaluate_continuation_guard_live(
+        payload.anchor_key.as_deref(),
+        payload.work_identity.as_deref(),
+        &live_terminal_predicate(),
+    );
     match guard_verdict {
         ContinuationGuard::Proceed => {}
         ContinuationGuard::DuplicateAnchor(holder) => {
@@ -7419,7 +7529,7 @@ async fn run_gate_continuation_inner(
             defer_continuation_unclaimed(
                 consume_target,
                 device_id,
-                duplicate_anchor_stamp_reason(&holder),
+                duplicate_anchor_stamp_reason(&holder, payload.work_identity.as_deref()),
             )
             .await;
             return Ok(());
@@ -18968,6 +19078,7 @@ mod tests {
             presentation: Presentation::Terminal,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: Some("anchor-z".to_string()),
+            work_identity: None,
             session_name: None,
             gate_id: None,
             dispatch_id: None,
@@ -21098,7 +21209,7 @@ mod tests {
         is_live: &dyn Fn(&str) -> bool,
         load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
     ) -> ContinuationGuard {
-        evaluate_continuation_guard(anchor_key, is_live, load_reading).0
+        evaluate_continuation_guard(anchor_key, None, is_live, load_reading).0
     }
 
     /// The REAL thread verdict for an injected reading, folded through the same
@@ -21216,6 +21327,193 @@ mod tests {
         );
     }
 
+    // ---- (anchor_key, work_identity) dedup slot (plan
+    // `2026-11-23-a-deferred-plan-continuation-duplicates-work-its-re-arm-already-holds`
+    // Phase 4, runner half) ----
+
+    const WORK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const WORK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Two gates on ONE `(unit, phase)` anchor carrying DIFFERENT work both
+    /// spawn; the same work is deferred as `duplicate_anchor:<tid>`. Reverting
+    /// the guard to key on the anchor alone fails the first assertion.
+    #[test]
+    fn same_anchor_different_work_identity_both_spawn_same_identity_defers() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let anchor = "unit:u-wi:phase-1";
+
+        // First gate: spawns and registers live.
+        let (v1, p1) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_A), &live_all, &calm_reading);
+        assert_eq!(v1, ContinuationGuard::Proceed);
+        p1.handed_to_registry("term-a".to_string(), None, None);
+
+        // Second gate, same anchor, DIFFERENT work: also spawns (live holder
+        // does not block it) and registers live.
+        let (v2, p2) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_B), &live_all, &calm_reading);
+        assert_eq!(
+            v2,
+            ContinuationGuard::Proceed,
+            "different work on the same anchor must not be refused as a duplicate"
+        );
+        // While it is only RESERVED (not yet live), a third gate with ITS
+        // identity is refused as Reserved, and another identity proceeds.
+        let (v3, p3) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_B), &live_all, &calm_reading);
+        assert_eq!(
+            v3,
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved)
+        );
+        drop(p3);
+        p2.handed_to_registry("term-b".to_string(), None, None);
+
+        // Same identity as a live holder: deferred, naming that terminal.
+        let (v4, _p4) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_A), &live_all, &calm_reading);
+        let holder = match v4 {
+            ContinuationGuard::DuplicateAnchor(h) => h,
+            other => panic!("same work identity must defer, got {other:?}"),
+        };
+        assert_eq!(holder, AnchorHolder::Live("term-a".to_string()));
+        let stamp = duplicate_anchor_stamp_reason(&holder, Some(WORK_A));
+        assert!(stamp.starts_with("duplicate_anchor:term-a:"), "{stamp}");
+        assert!(stamp.contains("work_identity=aaaaaaaaaaaa"), "{stamp}");
+
+        clear_continuation_registry();
+    }
+
+    /// A frame with no `work_identity` (an old coord) keeps anchor-only dedup
+    /// for that frame, in both directions, and its stamp says so.
+    #[test]
+    fn frame_without_work_identity_falls_back_to_anchor_only_and_says_so() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let anchor = "unit:u-wi:phase-legacy";
+
+        let (v1, p1) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_A), &live_all, &calm_reading);
+        assert_eq!(v1, ContinuationGuard::Proceed);
+        p1.handed_to_registry("term-a".to_string(), None, None);
+
+        // Identity-less frame vs an identified holder: deduped on the anchor.
+        let (v2, _p2) = evaluate_continuation_guard(Some(anchor), None, &live_all, &calm_reading);
+        let holder = match v2 {
+            ContinuationGuard::DuplicateAnchor(h) => h,
+            other => panic!("identity-less frame must dedup on the anchor, got {other:?}"),
+        };
+        assert_eq!(holder, AnchorHolder::Live("term-a".to_string()));
+        assert_eq!(
+            duplicate_anchor_stamp_reason(&holder, None),
+            "duplicate_anchor:term-a:work_identity=none:anchor_only",
+            "the stamp must say the dedup fell back to the anchor alone"
+        );
+
+        // And an identity-less HOLDER blocks an identified frame the same way.
+        clear_continuation_registry();
+        register_continuation_session("term-old".to_string(), Some(anchor.into()), None);
+        assert_eq!(
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-old".to_string()))
+        );
+        let (v3, _p3) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_B), &live_all, &calm_reading);
+        assert_eq!(
+            v3,
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-old".to_string())),
+            "an unknown holder identity cannot prove the work differs"
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// The migration hop carries the work identity: the lifted slot holds only
+    /// THAT work, different work on the anchor proceeds, and the re-pin keeps
+    /// the identity on the live row.
+    #[test]
+    fn migration_hop_holds_the_slot_with_its_work_identity() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let anchor = "claim:pr:qontinui/x#wi";
+
+        register_continuation_session_with_device(
+            "term-old".to_string(),
+            Some(anchor.into()),
+            Some(WORK_A.into()),
+            None,
+            None,
+        );
+        let (carried, permit) =
+            take_continuation_registration("term-old").expect("the live entry must be liftable");
+        assert_eq!(carried.work_identity.as_deref(), Some(WORK_A));
+
+        let (same, _hold) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_A), &live_all, &calm_reading);
+        assert_eq!(
+            same,
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
+            "same work inside the migration window is deferred"
+        );
+        let (other, other_permit) =
+            evaluate_continuation_guard(Some(anchor), Some(WORK_B), &live_all, &calm_reading);
+        assert_eq!(
+            other,
+            ContinuationGuard::Proceed,
+            "different work is not held by the migrating session's slot"
+        );
+        drop(other_permit);
+
+        restore_continuation_registration("term-new".to_string(), carried, permit);
+        let registry = continuation_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let live = registry.live.get("term-new").expect("re-pinned");
+        assert_eq!(live.work_identity.as_deref(), Some(WORK_A));
+        assert_eq!(live.anchor_key.as_deref(), Some(anchor));
+        drop(registry);
+
+        clear_continuation_registry();
+    }
+
+    /// The stamp truncates an untrusted wire string by characters, never bytes:
+    /// a multi-byte identity must not panic the deferral arm.
+    #[test]
+    fn stamp_truncation_survives_a_multibyte_work_identity() {
+        let reason = duplicate_anchor_stamp_reason(
+            &AnchorHolder::Reserved,
+            Some("ééééééééééééééééé"),
+        );
+        assert_eq!(reason, "duplicate_anchor:reserved:work_identity=éééééééééééé");
+    }
+
+    /// `work_identity` is an optional wire field: present parses, absent (an
+    /// old coord) is `None`.
+    #[test]
+    fn work_identity_is_an_optional_wire_field() {
+        let base = serde_json::json!({
+            "target_device_id": uuid::Uuid::now_v7(),
+            "initial_prompt": "go",
+            "source": "gate_continuation",
+            "anchor_key": "unit:u:phase-1",
+        });
+        let old: GateContinuationPayload = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(old.work_identity, None);
+        let mut with = base;
+        with["work_identity"] = serde_json::json!(WORK_A);
+        let new: GateContinuationPayload = serde_json::from_value(with).unwrap();
+        assert_eq!(new.work_identity.as_deref(), Some(WORK_A));
+    }
+
     /// P3: a live continuation for an anchor_key dedups a second dispatch with
     /// the SAME anchor_key (the re-cleared-gate / legacy-no-gate_id case the
     /// gate_id set can't catch). A different anchor proceeds. The guard prunes
@@ -21288,7 +21586,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .pending_anchors
-            .contains_key(anchor)
+            .keys()
+            .any(|slot| slot.anchor == anchor)
     }
 
     /// Phase 4 of plan
@@ -21308,7 +21607,7 @@ mod tests {
         let live_all = |_id: &str| true;
 
         let (verdict, _held) =
-            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm_reading);
+            evaluate_continuation_guard(Some("unit:u1:phase-2"), None, &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved("unit:u1:phase-2"),
@@ -21351,7 +21650,7 @@ mod tests {
         // 1. Proceed reserves; the twin is deduped; the dispatch gives up
         //    (worktree failure, claim refused, …) → its reservation drops.
         let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+            evaluate_continuation_guard(Some(anchor), None, &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -21369,7 +21668,7 @@ mod tests {
 
         // 2. The third evaluation — a re-delivery — proceeds again.
         let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+            evaluate_continuation_guard(Some(anchor), None, &live_all, &calm_reading);
         assert_eq!(
             verdict,
             ContinuationGuard::Proceed,
@@ -21395,7 +21694,7 @@ mod tests {
         //    remove this entry anyway — see
         //    `stale_reservation_drop_cannot_steal_a_foreign_reservation`).
         let x1_dead = |id: &str| id != "term-x1";
-        let (verdict, later) = evaluate_continuation_guard(Some(anchor), &x1_dead, &calm_reading);
+        let (verdict, later) = evaluate_continuation_guard(Some(anchor), None, &x1_dead, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -21432,7 +21731,7 @@ mod tests {
 
         // A continuation is live on the anchor — the session about to migrate.
         let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+            evaluate_continuation_guard(Some(anchor), None, &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         reservation.handed_to_registry("term-old".to_string(), Some(gate), None);
 
@@ -21464,7 +21763,7 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner());
             registry
                 .pending_anchors
-                .insert(anchor.to_string(), foreign_token);
+                .insert(AnchorSlot::new(Some(anchor), None).unwrap(), foreign_token);
         }
 
         // The respawn lands and the migration re-pins, settling ITS permit.
@@ -21479,7 +21778,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .pending_anchors
-                .get(anchor)
+                .get(&AnchorSlot::new(Some(anchor), None).unwrap())
                 .copied(),
             Some(foreign_token),
             "the entry left behind must be the FOREIGN one, untouched"
@@ -21656,7 +21955,7 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner());
             registry
                 .pending_anchors
-                .insert(anchor.to_string(), foreign_token);
+                .insert(AnchorSlot::new(Some(anchor), None).unwrap(), foreign_token);
         }
 
         let (carried, permit) =
@@ -21666,7 +21965,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .pending_anchors
-                .get(anchor)
+                .get(&AnchorSlot::new(Some(anchor), None).unwrap())
                 .copied(),
             Some(foreign_token),
             "the lift must not overwrite a reservation another holder owns"
@@ -21684,7 +21983,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .pending_anchors
-                .get(anchor)
+                .get(&AnchorSlot::new(Some(anchor), None).unwrap())
                 .copied(),
             Some(foreign_token),
             "and the re-pin still removes nothing it does not own"
@@ -21706,7 +22005,7 @@ mod tests {
         let live_all = |_id: &str| true;
         let anchor = "unit:u9:phase-1";
 
-        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), None, &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
 
         // Force the state the token exists for: this anchor's entry now belongs
@@ -21719,7 +22018,7 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner());
             registry
                 .pending_anchors
-                .insert(anchor.to_string(), foreign_token);
+                .insert(AnchorSlot::new(Some(anchor), None).unwrap(), foreign_token);
         }
 
         drop(stale);
@@ -21762,7 +22061,7 @@ mod tests {
                 // registry is read with the permit still alive, which is exactly
                 // the state `run_gate_continuation_inner`'s load arm is in while
                 // it awaits `defer_continuation_unclaimed`'s network POST.
-                let (verdict, held) = evaluate_continuation_guard(Some(anchor), &live_all, loaded);
+                let (verdict, held) = evaluate_continuation_guard(Some(anchor), None, &live_all, loaded);
                 assert!(
                     matches!(verdict, ContinuationGuard::LoadPressure { .. }),
                     "a loaded machine must defer on every evaluation, got {verdict:?}"
@@ -22078,7 +22377,7 @@ mod tests {
         let mut deferred = 0;
         for i in 0..20 {
             let anchor = format!("burst-{i}");
-            let (verdict, permit) = evaluate_continuation_guard(Some(&anchor), &live_all, &reading);
+            let (verdict, permit) = evaluate_continuation_guard(Some(&anchor), None, &live_all, &reading);
             match verdict {
                 ContinuationGuard::Proceed => held.push(permit),
                 ContinuationGuard::LoadPressure { observation, .. } => {
@@ -22119,7 +22418,7 @@ mod tests {
         // 200 graded threads, 256 warn ceiling, 10 threads per projected
         // session: pending 0..=5 project <= 250; pending 6 projects 260 > 256.
         let held: Vec<_> = (0..20)
-            .map(|_| evaluate_continuation_guard(None, &live_all, &reading))
+            .map(|_| evaluate_continuation_guard(None, None, &live_all, &reading))
             .filter(|(v, _)| *v == ContinuationGuard::Proceed)
             .map(|(_, permit)| permit)
             .collect();
@@ -22149,7 +22448,7 @@ mod tests {
                     let reading = || commit_reading(free_with_headroom_for(3));
                     barrier.wait();
                     let anchor = format!("concurrent-{i}");
-                    evaluate_continuation_guard(Some(&anchor), &live_all, &reading)
+                    evaluate_continuation_guard(Some(&anchor), None, &live_all, &reading)
                 })
             })
             .collect();
@@ -22183,9 +22482,9 @@ mod tests {
         let live_all = |_id: &str| true;
 
         let (v1, terminal) =
-            evaluate_continuation_guard(Some("settle-a"), &live_all, &calm_reading);
-        let (v2, headless) = evaluate_continuation_guard(None, &live_all, &calm_reading);
-        let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), &live_all, &calm_reading);
+            evaluate_continuation_guard(Some("settle-a"), None, &live_all, &calm_reading);
+        let (v2, headless) = evaluate_continuation_guard(None, None, &live_all, &calm_reading);
+        let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), None, &live_all, &calm_reading);
         assert_eq!(
             (v1, v2, v3),
             (
@@ -22221,7 +22520,7 @@ mod tests {
         );
 
         let (refused, permit) =
-            evaluate_continuation_guard(Some("settle-d"), &live_all, &|| commit_reading(GIB));
+            evaluate_continuation_guard(Some("settle-d"), None, &live_all, &|| commit_reading(GIB));
         assert!(matches!(refused, ContinuationGuard::LoadPressure { .. }));
         assert_eq!(
             reserved_spawns_now(),
@@ -22255,7 +22554,7 @@ mod tests {
         );
         let held: Vec<_> = (0..2)
             .map(|i| {
-                evaluate_continuation_guard(Some(&format!("launch-{i}")), &live_all, &reading).1
+                evaluate_continuation_guard(Some(&format!("launch-{i}")), None, &live_all, &reading).1
             })
             .collect();
         assert_eq!(reserved_spawns_now(), 2);
@@ -22911,6 +23210,7 @@ mod tests {
                 presentation: Presentation::Terminal,
                 source: GATE_CONTINUATION_SOURCE.to_string(),
                 anchor_key: Some("unit:00000000-0000-0000-0000-000000000000:phase-1".to_string()),
+                work_identity: None,
                 session_name: None,
                 gate_id,
                 dispatch_id,
@@ -23287,6 +23587,7 @@ mod tests {
         let mut s = ContinuationSession {
             terminal_id: "t".into(),
             anchor_key: None,
+            work_identity: None,
             gate_id: Some(uuid::Uuid::now_v7()),
             registered_at: std::time::Instant::now(),
             consuming_device_id: Some(claimer),
@@ -23308,6 +23609,7 @@ mod tests {
         let mut s = ContinuationSession {
             terminal_id: "t".into(),
             anchor_key: None,
+            work_identity: None,
             gate_id: Some(uuid::Uuid::now_v7()),
             registered_at: std::time::Instant::now(),
             consuming_device_id: None,
@@ -23350,7 +23652,7 @@ mod tests {
         clear_continuation_registry();
         let gate = uuid::Uuid::now_v7();
         register_restored_continuation("term-restored-sh".into(), gate, None);
-        register_continuation_session_with_device("term-direct-sh".into(), None, Some(gate), None);
+        register_continuation_session_with_device("term-direct-sh".into(), None, None, Some(gate), None);
         let reg = lock_recover(continuation_sessions(), "continuation_sessions");
         assert!(
             reg.live
@@ -23818,12 +24120,12 @@ mod tests {
         // 1. Dedup: the class, then the terminal id that won the anchor — or
         //    `reserved` when the winner is a dispatch that has not spawned yet.
         assert_eq!(
-            duplicate_anchor_stamp_reason(&AnchorHolder::Live("term-tid-1".to_string())),
-            "duplicate_anchor:term-tid-1"
+            duplicate_anchor_stamp_reason(&AnchorHolder::Live("term-tid-1".to_string()), None),
+            "duplicate_anchor:term-tid-1:work_identity=none:anchor_only"
         );
         assert_eq!(
-            duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
-            "duplicate_anchor:reserved"
+            duplicate_anchor_stamp_reason(&AnchorHolder::Reserved, Some("0123456789abcdef")),
+            "duplicate_anchor:reserved:work_identity=0123456789ab"
         );
 
         // 2. Thread pressure: class, severity, and the REAL numbers. Built from
@@ -23905,8 +24207,8 @@ mod tests {
         // The `<class>:<detail>` reasons share the grammar: exactly one leading
         // class, split on the first colon, and a non-empty detail after it.
         for reason in [
-            duplicate_anchor_stamp_reason(&AnchorHolder::Live("t1".to_string())),
-            duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
+            duplicate_anchor_stamp_reason(&AnchorHolder::Live("t1".to_string()), None),
+            duplicate_anchor_stamp_reason(&AnchorHolder::Reserved, Some("0123456789abcdef")),
             thread_pressure_stamp_reason(severity, observation),
             commit_pressure_stamp_reason(mem_severity, mem_observation),
         ] {
