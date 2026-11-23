@@ -581,7 +581,7 @@ pub async fn start_server(
                 // `app_state`) injects the CORRECT loopback port for
                 // secondary/temp runners — plan §6's #1 live-verification
                 // footgun. Set HERE, the same place app_state.api_port lands.
-                crate::install_effects_producer::intercept::set_bound_port(try_port);
+                crate::mcp::types::set_bound_port(try_port);
                 crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiListenerBound);
                 // Bind latency from the process clock, logged on every start so
                 // the never-answered grace can be sized (and re-derived) from
