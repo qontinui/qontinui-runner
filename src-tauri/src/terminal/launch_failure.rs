@@ -386,6 +386,9 @@ fn closed_session(outcome: &CloseOutcome) -> Option<&str> {
         // respawn replays it later through its own close, whose outcome is
         // the one that says what closed.
         | CloseOutcome::HeldInFlight { .. }
+        // A handed-off terminal's process lives on in its PTY holder: the
+        // close was refused, nothing closed.
+        | CloseOutcome::TerminalHandedOff { .. }
         | CloseOutcome::NotFound { .. } => None,
     }
 }
