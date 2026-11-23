@@ -403,7 +403,8 @@ pub const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// The loop runs under the panic supervisor, so a panic — `cleanup_stale` reads
 /// Postgres — is logged, counted on `/health` and the loop rebuilt after a
 /// backoff; it ticks its heartbeat once per sweep. A rebuilt run holds the same
-/// registry and database handles and keeps no state of its own.
+/// registry and database handles and keeps no state of its own; it re-applies
+/// `start_delay` after the backoff, which only postpones the next sweep.
 pub fn spawn_stale_sweep(
     registry: Arc<FileRegistryManager>,
     db: Arc<crate::database::pg::PgDb>,

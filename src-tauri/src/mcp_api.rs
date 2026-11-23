@@ -13304,9 +13304,10 @@ pub fn create_router(
 
     // mDNS LAN discovery (if enabled)
     // Discovers UI Bridge instances advertising themselves on the local network
-    // and registers each as a LAN transport. The event drain is supervised (a
-    // panic restarts it, draining the same receiver); the browse thread
-    // `scanner.start` spawns is a bare std::thread.
+    // and registers each as a LAN transport. The closure below runs once, in
+    // the event loop's first run after its start delay; the drain is
+    // supervised (a panic restarts it, draining the same receiver at once),
+    // while the browse thread `scanner.start` spawns is a bare std::thread.
     crate::mcp::discovery::mdns_scanner::spawn_event_loop(
         api_state.physical_device_registry.clone(),
         &crate::settings::get_mobile_settings(),
@@ -23411,7 +23412,7 @@ mod supervised_workers_health_tests {
                 Site::Call,
                 "crate::mcp::discovery::mdns_scanner::spawn_event_loop(",
                 "mcp/discovery/mdns_scanner.rs",
-                "pub fn spawn_event_loop(",
+                "pub fn spawn_event_loop<S, G>(",
                 "mdns_scanner.events",
             ),
             (
@@ -23775,7 +23776,7 @@ mod supervised_workers_health_tests {
             let fn_name = signature
                 .trim_start_matches("pub fn ")
                 .trim_start_matches("pub(crate) fn ")
-                .split('(')
+                .split(['(', '<'])
                 .next()
                 .unwrap_or_default();
             if !needle.ends_with(&format!("{fn_name}(")) {

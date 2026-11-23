@@ -55,7 +55,9 @@ const CURSOR_OVERLAP_SECS: i64 = 2;
 /// Start the poll loop: wait `start_delay` ([`POLL_START_DELAY`] in
 /// production), then tick every `interval` ([`POLL_INTERVAL`]) for the life of
 /// the process. Every failure mode of a tick is contained inside it; a panic is
-/// the supervisor's, and its heartbeat ticks once per pass.
+/// the supervisor's, and its heartbeat ticks once per pass. A supervisor
+/// restart re-applies `start_delay` after the backoff (a few seconds more
+/// before the next tick; nothing is lost, since the cursor is on disk).
 pub fn spawn_poller(start_delay: Duration, interval: Duration) -> tokio::task::JoinHandle<()> {
     crate::worker_supervisor::spawn_supervised_with_heartbeat(POLLER_WORKER, move |hb| async move {
         tokio::time::sleep(start_delay).await;
