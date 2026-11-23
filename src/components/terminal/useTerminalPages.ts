@@ -693,6 +693,12 @@ export function useTerminalPages() {
    * rather than reading this write's own first save, while React re-running
    * the update on a rebased `prev` (after an update it skipped) reads again,
    * and so builds on what the skipped write saved.
+   *
+   * A rebase can therefore re-run `mutate` on a base that already holds this
+   * update's own earlier save (React re-runs an update that committed in a
+   * higher-priority render after the lower-priority ones it skipped), so
+   * every `mutate` must be idempotent on its own result: an add checks for
+   * its id first.
    */
   const updatePages = useCallback(
     (mutate: (base: TerminalPageConfig[]) => TerminalPageConfig[]) => {
@@ -805,22 +811,33 @@ export function useTerminalPages() {
     // write in its state while the store keeps it (and its own echo is
     // filtered, so nothing would correct it). The ref follows on commit via
     // the `allPagesRef` sync effect above.
-    const apply = (read: TerminalPageConfig[]) => {
+    const apply = () => {
       setPages((prev) => {
         if (lastSaveRefusedRef.current) return prev;
-        const target = readPersistedPages() ?? read;
+        // An empty or unreadable store keeps this window's copy.
+        const target = readPersistedPages();
+        if (!target) return prev;
         return rosterEqual(prev, target) ? prev : target;
       });
     };
 
+    // Set when this window saves while a foreign read is still retrying. The
+    // retries go on, because nothing orders the two writes: the foreign one
+    // may still be the store's last commit and must then be shown. But a read
+    // that never matches is then the ordinary result of this window's own
+    // overwrite, not a lag, so it is not warned about.
+    let ownSaveDuringRead = false;
+
     const unlisten = listenRosterSaved(({ source, digest }) => {
-      // A newer event supersedes a read still waiting on an older digest, and
-      // so does this window's own save (its echo): either way the pending
-      // digest can no longer match, and the retries would only end in a
-      // misleading "never matched" warning.
+      if (source === windowLabel) {
+        if (retryTimer) ownSaveDuringRead = true;
+        return;
+      }
+      if (lastSaveRefusedRef.current) return;
+      // A newer foreign event supersedes a read still waiting on an older digest.
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = null;
-      if (source === windowLabel || lastSaveRefusedRef.current) return;
+      ownSaveDuringRead = false;
       let retries = 0;
       let lastRead: TerminalPageConfig[] | null = null;
       const attempt = () => {
@@ -829,7 +846,8 @@ export function useTerminalPages() {
         const stored = readPersistedPages();
         if (stored) lastRead = stored;
         if (stored && rosterDigest(stored) === digest) {
-          apply(stored);
+          ownSaveDuringRead = false;
+          apply();
           return;
         }
         if (retries < ROSTER_RESYNC_RETRIES) {
@@ -838,10 +856,13 @@ export function useTerminalPages() {
           return;
         }
         if (lastRead) {
-          console.warn(
-            `[terminal-pages] the stored roster never matched ${source}'s save; applying the store as read`,
-          );
-          apply(lastRead);
+          if (!ownSaveDuringRead) {
+            console.warn(
+              `[terminal-pages] the stored roster never matched ${source}'s save; applying the store as read`,
+            );
+          }
+          ownSaveDuringRead = false;
+          apply();
         }
       };
       attempt();
@@ -909,6 +930,8 @@ export function useTerminalPages() {
       closedPageIdsRef.current.delete(id);
       const createdAt = Date.now();
       updatePages((base) => {
+        // Already added: a rebase re-running this update (see `updatePages`).
+        if (base.some((p) => p.id === id)) return base;
         const newPage: TerminalPageConfig = {
           id,
           name: name === undefined ? nextAutoPageName(base) : uniquePageName(name, base),
