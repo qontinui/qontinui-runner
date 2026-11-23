@@ -1193,6 +1193,7 @@ async fn publish_budget_with(
                 "fleet::publish_budget: ~/.qontinui/machine.json missing — \
                  run `qontinui_profile device init` to register identity. Skipping budget publish."
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
@@ -1203,6 +1204,7 @@ async fn publish_budget_with(
             warn!(
                 "fleet::publish_budget: machine.json device_id is not a valid UUID ({e}). Skipping."
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
@@ -1241,6 +1243,7 @@ async fn publish_budget_with(
             warn!(
                 "fleet::publish_budget: active profile has no coord_url; skipping budget publish (cache written)"
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
@@ -1267,6 +1270,17 @@ async fn publish_budget_with(
                 body.disk_total_gb,
                 body.max_concurrent_agents,
                 body.max_concurrent_ci_jobs
+            );
+            Ok(())
+        }
+        // A one-attempt change publish fails again on every sample tick until
+        // coord takes it (its value stays unrecorded), so it logs at debug:
+        // warning per tick would flood the log while coord is down. The
+        // retried boot publish and the periodic re-assert keep the warning.
+        Err(e) if delivery == BudgetDelivery::Once => {
+            tracing::debug!(
+                "fleet::publish_budget: one-attempt change publish failed ({e}); \
+                 next sample tick retries, payload cached at ~/.qontinui/last_budget.json"
             );
             Ok(())
         }
@@ -1305,11 +1319,29 @@ fn budget_republish_secs() -> u64 {
 }
 
 /// The `max_concurrent_ci_jobs` the last SUCCESSFUL budget publish carried;
-/// `-1` = none yet in this process.
-static ADVERTISED_CI_JOBS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+/// [`CI_JOBS_NEVER_PUBLISHED`] = none yet in this process,
+/// [`CI_JOBS_UNPUBLISHABLE`] = none, because a publish found nothing to
+/// publish to.
+static ADVERTISED_CI_JOBS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(CI_JOBS_NEVER_PUBLISHED);
+const CI_JOBS_NEVER_PUBLISHED: i64 = -1;
+const CI_JOBS_UNPUBLISHABLE: i64 = -2;
 
 fn record_advertised_ci_jobs(jobs: i32) {
     ADVERTISED_CI_JOBS.store(i64::from(jobs), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A publish returned without POSTing (no device identity, no coord base):
+/// mark "never published" as unpublishable, so [`ci_jobs_publish_owed`] does
+/// not re-run a publish that has nowhere to go on every sample tick. A value a
+/// successful publish recorded is left alone.
+fn note_ci_jobs_unpublishable() {
+    let _ = ADVERTISED_CI_JOBS.compare_exchange(
+        CI_JOBS_NEVER_PUBLISHED,
+        CI_JOBS_UNPUBLISHABLE,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Has the CI node's capacity moved off what the last successful budget
@@ -1327,7 +1359,28 @@ fn advertised_ci_jobs_changed() -> bool {
         0
     };
     let advertised = ADVERTISED_CI_JOBS.load(std::sync::atomic::Ordering::Relaxed);
-    advertised >= 0 && advertised != i64::from(now.min(i32::MAX as u32))
+    ci_jobs_publish_owed(advertised, now, ci.enabled)
+}
+
+/// Is a CI-capacity publish owed, given what the last successful publish
+/// advertised ([`ADVERTISED_CI_JOBS`]), the capacity `now`, and whether the
+/// node is enabled? A changed capacity is owed. So is an enabled node's
+/// capacity that NO publish has carried yet: a failed boot publish leaves
+/// nothing recorded, and without this its CI capacity waited a full budget
+/// period for the re-assert (review round 5 on qontinui-runner#2921). A
+/// disabled node with nothing recorded owes nothing here, and neither does a
+/// box with nowhere to publish to: the periodic re-assert covers both. If the
+/// boot publish is still on its retry ladder, the tick's one attempt overlaps
+/// it, and should the older boot body land last, the recorded value differs
+/// from `now` and the next tick corrects it. PURE.
+fn ci_jobs_publish_owed(advertised: i64, now: u32, ci_enabled: bool) -> bool {
+    if advertised == CI_JOBS_NEVER_PUBLISHED {
+        return ci_enabled;
+    }
+    if advertised < 0 {
+        return false;
+    }
+    advertised != i64::from(now.min(i32::MAX as u32))
 }
 
 /// Periodically re-assert this device's budget, so a clobbered or stale
@@ -1393,7 +1446,9 @@ fn advertised_ci_jobs_changed() -> bool {
 /// [`advertised_ci_jobs_changed`]), the budget is published on that tick with
 /// ONE attempt ([`BudgetDelivery::Once`]), so a failing budget route costs a
 /// tick at most one request timeout and never the retry ladder; a failure
-/// leaves the advertised value unrecorded, so the next tick tries again.
+/// leaves the advertised value unrecorded, so the next tick tries again. An
+/// enabled CI node whose boot publish failed counts as changed too
+/// ([`ci_jobs_publish_owed`]), so its capacity reaches coord on the next tick.
 pub fn spawn_budget_republisher(role: MachineRole) {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
@@ -8099,6 +8154,21 @@ mod tests {",
             "an enabled ci_node configured to 0 is an OPINION of zero and must \
              reach the wire — omission would make capacity un-withdrawable"
         );
+    }
+
+    /// Review round 5 on qontinui-runner#2921: a failed boot publish records
+    /// nothing (`-1`), and an ENABLED node then owes its capacity on the next
+    /// tick instead of waiting a budget period; a disabled one does not.
+    #[test]
+    fn a_failed_boot_publish_is_owed_on_the_next_tick_for_an_enabled_node() {
+        assert!(ci_jobs_publish_owed(CI_JOBS_NEVER_PUBLISHED, 4, true));
+        assert!(!ci_jobs_publish_owed(CI_JOBS_NEVER_PUBLISHED, 0, false));
+        // Nowhere to publish to: not re-run every tick.
+        assert!(!ci_jobs_publish_owed(CI_JOBS_UNPUBLISHABLE, 4, true));
+        assert!(!ci_jobs_publish_owed(4, 4, true));
+        assert!(ci_jobs_publish_owed(4, 5, true));
+        assert!(ci_jobs_publish_owed(4, 0, false), "disabling is a change");
+        assert!(!ci_jobs_publish_owed(i64::from(i32::MAX), u32::MAX, true));
     }
 
     /// Plan `2026-09-22-ci-capacity-is-hand-typed-...` Phase 2: an enabled

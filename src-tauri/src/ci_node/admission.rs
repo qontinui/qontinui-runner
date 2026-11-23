@@ -640,7 +640,8 @@ pub(crate) fn commit_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
 /// by subtracting from an [`Instant`] (on Windows `Instant`'s epoch is boot,
 /// and a subtraction reaching below it had to be clamped to a wrong answer).
 ///
-/// - `queued_since`: when it FIRST entered this device's queue (for logs).
+/// - `queued_since`: when it FIRST entered this device's queue. It orders the
+///   queue (a re-queue returns to its arrival position) and is logged.
 /// - `release_at`: the queue deadline — arrival + [`queue_release_after`], or
 ///   coord's `queued_renewal_deadline` less [`QUEUE_RELEASE_MARGIN`] when that
 ///   is sooner. Past it the dispatch is released as
@@ -1018,6 +1019,16 @@ fn take_expired(
     expired
 }
 
+/// Queue `entry` behind every dispatch that first queued no later than it did.
+/// A fresh arrival lands at the tail; a RE-queue (a drained dispatch deferred
+/// again, which keeps its stamp) returns to its arrival position instead of
+/// the tail, so a dispatch re-tested by a cap-rise drain or a finished build
+/// does not lose its place to ones that arrived after it. PURE over the queue.
+fn insert_in_arrival_order(queue: &mut VecDeque<QueuedDispatch>, entry: QueuedDispatch) {
+    let at = queue.partition_point(|q| q.stamp.queued_since <= entry.stamp.queued_since);
+    queue.insert(at, entry);
+}
+
 /// Push a deferred dispatch and arm the queue-keeper if none is running.
 /// `stamp` is `Some` for a RE-queue, which keeps both of its deadlines; `None`
 /// stamps it on arrival. Returns `(queue depth, newly minted keeper
@@ -1030,7 +1041,7 @@ fn enqueue_locked(
 ) -> (usize, Option<u64>) {
     let stamp = stamp
         .unwrap_or_else(|| QueueStamp::on_arrival(&payload, Instant::now(), chrono::Utc::now()));
-    state.queued.push_back(QueuedDispatch { payload, stamp });
+    insert_in_arrival_order(&mut state.queued, QueuedDispatch { payload, stamp });
     let minted = if state.keeper_arm.is_none() {
         state.keeper_generation = state.keeper_generation.wrapping_add(1);
         state.keeper_arm = Some(state.keeper_generation);
@@ -1380,22 +1391,44 @@ fn room_opened(last_cap: u32, cap: u32, running: usize, queued: usize) -> usize 
 }
 
 /// The cap the last republisher tick saw, LOWERED by every deferral to the
-/// cap that deferral was decided at ([`note_deferred_at_cap`]). A cap that dips
-/// and recovers between two ticks (a build finishes, lowering the model's cap
-/// and the running count together, and the next read restores the cap) is then
-/// still seen as a rise by the next tick, so the dispatch deferred at the dip
-/// is drained rather than waiting for the running set to empty.
-static LAST_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// cap that deferral was decided at ([`CapRiseTracker::note_deferred`]). A cap
+/// that dips and recovers between two ticks (a build finishes, lowering the
+/// model's cap and the running count together, and the next read restores the
+/// cap) is then still seen as a rise by the next tick, so the dispatch
+/// deferred at the dip is drained rather than waiting for the running set to
+/// empty. A type rather than a bare atomic so its tick/deferral sequence is
+/// tested on an instance of its own ([`LAST_CAP`] is the process's one).
+struct CapRiseTracker(std::sync::atomic::AtomicU32);
 
-/// Record that a dispatch was deferred while the cap read `cap` — at the cap,
-/// or for headroom, or a drained re-submit deferring again — so the next
-/// cap-rise drain measures its rise from there ([`LAST_CAP`]). A deferral at a
-/// cap the next tick does not exceed drains nothing; one the tick exceeds is
-/// re-tested, which admission re-checks, so a wobbling cap costs a re-queue,
-/// never an over-admission. Call it under `ci_state`'s lock, in the same
-/// critical section as the `push_back`.
+impl CapRiseTracker {
+    /// No tick has run yet: the first tick never reads as a rise.
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(u32::MAX))
+    }
+
+    /// Record that a dispatch was deferred while the cap read `cap` — at the
+    /// cap, or for headroom, or a drained re-submit deferring again — so the
+    /// next tick measures its rise from there. A deferral at a cap the next
+    /// tick does not exceed drains nothing; one the tick exceeds is re-tested,
+    /// which admission re-checks, so a wobbling cap costs a re-queue, never an
+    /// over-admission. Call it under `ci_state`'s lock, in the same critical
+    /// section as the enqueue.
+    fn note_deferred(&self, cap: u32) {
+        self.0.fetch_min(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A tick read `cap`: returns the cap to measure its rise from, and makes
+    /// `cap` the next tick's baseline.
+    fn tick(&self, cap: u32) -> u32 {
+        self.0.swap(cap, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+static LAST_CAP: CapRiseTracker = CapRiseTracker::new();
+
+/// [`CapRiseTracker::note_deferred`] on the process's [`LAST_CAP`].
 fn note_deferred_at_cap(cap: u32) {
-    LAST_CAP.fetch_min(cap, std::sync::atomic::Ordering::Relaxed);
+    LAST_CAP.note_deferred(cap);
 }
 
 /// Re-admit deferred dispatches when the node's cap ROSE. The capacity model
@@ -1411,7 +1444,7 @@ pub(crate) fn drain_deferred_on_cap_rise() {
         return;
     }
     let cap = settings.effective_max_concurrent_builds_for(super::host_sizing::probe());
-    let last_cap = LAST_CAP.swap(cap, std::sync::atomic::Ordering::Relaxed);
+    let last_cap = LAST_CAP.tick(cap);
     let ready: Vec<QueuedDispatch> = {
         let mut state = ci_state().lock().unwrap();
         let n = room_opened(last_cap, cap, state.running.len(), state.queued.len());
@@ -2956,7 +2989,11 @@ mod tests {
         assert_eq!(state.queued[0].stamp, first);
         let (depth, armed) = enqueue_locked(&mut state, queued_payload("b"), None);
         assert_eq!((depth, armed), (2, None), "one keeper, ever");
-        let fresh = state.queued[1].stamp;
+        // The fresh stamp is earlier than the carried "future" one, so the
+        // arrival-order insert puts it first, and the carried stamp is intact.
+        assert_eq!(state.queued[0].payload.dispatch_id, "b");
+        assert_eq!(state.queued[1].stamp, first);
+        let fresh = state.queued[0].stamp;
         assert!(
             fresh.queued_since < first.queued_since
                 && fresh.renew_by == fresh.queued_since + UNRENEWED_HOLD
@@ -3831,5 +3868,57 @@ mod tests {
                 DiskGate::Ok => panic!("1 GiB free is below the {FLOOR} GiB floor"),
             }
         }
+    }
+
+    /// A re-queued dispatch keeps its stamp and returns to its arrival
+    /// position, not the tail (review round 5 on qontinui-runner#2921).
+    #[test]
+    fn a_requeue_returns_to_its_arrival_position_not_the_tail() {
+        let base = Instant::now();
+        let mut q: VecDeque<QueuedDispatch> = VecDeque::new();
+        for (id, secs) in [("a", 0), ("c", 20), ("d", 30)] {
+            insert_in_arrival_order(
+                &mut q,
+                queued_at(queued_payload(id), base + Duration::from_secs(secs)),
+            );
+        }
+        // "b" arrived between "a" and "c", was drained and deferred again.
+        insert_in_arrival_order(
+            &mut q,
+            queued_at(queued_payload("b"), base + Duration::from_secs(10)),
+        );
+        // A fresh arrival still lands at the tail, and an equal stamp keeps
+        // FIFO among equals.
+        insert_in_arrival_order(
+            &mut q,
+            queued_at(queued_payload("e"), base + Duration::from_secs(30)),
+        );
+        let order: Vec<&str> = q.iter().map(|e| e.payload.dispatch_id.as_str()).collect();
+        assert_eq!(order, ["a", "b", "c", "d", "e"]);
+    }
+
+    /// The tick/deferral SEQUENCE, on an instance of its own (review round 5
+    /// on qontinui-runner#2921): a dip between ticks still drains, a deferral
+    /// at the cap the next tick reads drains nothing, and the first tick is
+    /// never a rise.
+    #[test]
+    fn the_cap_rise_tracker_drains_a_dip_between_ticks() {
+        let t = CapRiseTracker::new();
+        // First tick: baseline u32::MAX, so no rise whatever the cap.
+        let last = t.tick(4);
+        assert_eq!(room_opened(last, 4, 0, 3), 0);
+        // Deferred at 4 with 4 running; the next tick still reads 4.
+        t.note_deferred(4);
+        let last = t.tick(4);
+        assert_eq!(room_opened(last, 4, 4, 1), 0, "no rise, nothing drains");
+        // A build finishes: the cap dips to 3 and a dispatch is deferred at 3;
+        // before the next tick the cap recovers to 4. The tick sees a rise.
+        t.note_deferred(3);
+        let last = t.tick(4);
+        assert_eq!(last, 3);
+        assert_eq!(room_opened(last, 4, 3, 1), 1, "the dip's deferral drains");
+        // A deferral ABOVE the tick's baseline cannot raise it.
+        t.note_deferred(9);
+        assert_eq!(t.tick(4), 4);
     }
 }
