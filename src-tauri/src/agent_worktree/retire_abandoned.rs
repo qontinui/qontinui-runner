@@ -612,8 +612,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_loop_stops_on_a_typed_refusal() {
-        let _amb = super::super::test_coord::isolate();
-        let coord = super::super::test_coord::ScriptedCoord::start(vec![(
+        let _amb = crate::test_coord::isolate();
+        let coord = crate::test_coord::ScriptedCoord::start(vec![(
             "/coord/worktree-done/",
             vec![
                 (503, "{}".to_string()),
@@ -661,8 +661,8 @@ mod tests {
                 Some("census_silent_for_device: coord cannot establish that this device's census was published"),
             ),
         ] {
-            let _amb = super::super::test_coord::isolate();
-            let coord = super::super::test_coord::ScriptedCoord::start(vec![(
+            let _amb = crate::test_coord::isolate();
+            let coord = crate::test_coord::ScriptedCoord::start(vec![(
                 "/coord/worktree-done/",
                 vec![(200, first.clone()), (200, coord_answer(1, None))],
             )])
@@ -696,8 +696,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_loop_stops_on_its_budget() {
-        let _amb = super::super::test_coord::isolate();
-        let coord = super::super::test_coord::ScriptedCoord::start(vec![(
+        let _amb = crate::test_coord::isolate();
+        let coord = crate::test_coord::ScriptedCoord::start(vec![(
             "/coord/worktree-done/",
             vec![(503, "{}".to_string())],
         )])

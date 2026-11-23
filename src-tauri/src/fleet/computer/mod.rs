@@ -723,6 +723,12 @@ pub(crate) struct Reporter {
     access: Access,
     #[cfg(target_os = "linux")]
     watcher: services::linux::Watcher,
+    /// Test seam: when set, [`Reporter::scan_host_services`] answers this scan
+    /// instead of reading the host, so a test entering through
+    /// [`Reporter::tick`] can feed service rows (and change them between
+    /// ticks) on a box that hosts none.
+    #[cfg(test)]
+    scan_override: Option<ServiceScan>,
 }
 
 impl Default for Reporter {
@@ -758,6 +764,8 @@ impl Reporter {
             access: Access::default(),
             #[cfg(target_os = "linux")]
             watcher: services::linux::Watcher::default(),
+            #[cfg(test)]
+            scan_override: None,
         }
     }
 
@@ -787,6 +795,10 @@ impl Reporter {
     }
 
     async fn scan_host_services(&mut self) -> ServiceScan {
+        #[cfg(test)]
+        if let Some(scan) = self.scan_override.clone() {
+            return scan;
+        }
         #[cfg(target_os = "linux")]
         {
             self.watcher.scan().await
@@ -901,7 +913,14 @@ impl Reporter {
                         && s.computers.get(id).and_then(|c| c.kind.as_deref()) == Some("wsl_guest")
                 })
             });
-            if full || guest_pending {
+            // A test feeding host rows through `scan_override` is not asking
+            // about this box's WSL guests; probing them would make it
+            // host-dependent.
+            #[cfg(test)]
+            let probe_guests = self.scan_override.is_none();
+            #[cfg(not(test))]
+            let probe_guests = true;
+            if probe_guests && (full || guest_pending) {
                 for g in wsl_guest::probe::collect().await {
                     observed.push(guest_observed(&g, &host_id));
                 }
@@ -1322,6 +1341,9 @@ impl Reporter {
         }
     }
 }
+
+#[cfg(test)]
+mod tick_tests;
 
 #[cfg(test)]
 mod tests {

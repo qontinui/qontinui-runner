@@ -1224,6 +1224,15 @@ fn read_cpu_package_temp_c(sys_root: &std::path::Path) -> Option<f64> {
         .fold(None, |m, c| max_of(m, Some(c)))
 }
 
+/// The wire form of the per-spawner blocking breakdown: each lane's in-flight
+/// count, saturated into the `u32` coord stores.
+fn blocking_lanes_field(by_thread: BTreeMap<String, usize>) -> BTreeMap<String, u32> {
+    by_thread
+        .into_iter()
+        .map(|(k, v)| (k, u32::try_from(v).unwrap_or(u32::MAX)))
+        .collect()
+}
+
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
 /// callers run it on a blocking pool.
 ///
@@ -1369,12 +1378,7 @@ fn collect_host_lane() -> ResourceSample {
         memory.map(|m| m.phys_available),
     )));
 
-    s.blocking_lanes = Some(
-        tracked_blocking_by_thread()
-            .into_iter()
-            .map(|(k, v)| (k, v.min(u32::MAX as usize) as u32))
-            .collect(),
-    );
+    s.blocking_lanes = Some(blocking_lanes_field(tracked_blocking_by_thread()));
 
     // The saturation axis — the third one, and the one the 2026-08-27 incident
     // sat at 99.3% of while every field above it read healthy.
@@ -2053,14 +2057,17 @@ pub(crate) async fn collect() -> Vec<ResourceSample> {
 /// deliberately reachable only from inside it. Re-checking would restate the
 /// rule in a second place; the whole lesson of the 2026-07-28 outage is that a
 /// rule keyed in one place is the one that survives the next mechanism.
-pub(crate) async fn publish_once() {
+///
+/// Returns what the attempt established ([`PublishOutcome`]); the sampler loop
+/// discards it, and the log lines are unchanged by it.
+pub(crate) async fn publish_once() -> PublishOutcome {
     let Some(device) = crate::fleet::load_device_file() else {
         debug!("fleet::resource_sample: no ~/.qontinui/machine.json — skipping");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoDevice);
     };
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         debug!("fleet::resource_sample: no coord base configured — skipping");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoCoordBase);
     };
 
     // Bearer BEFORE the probes: the door is device-keyed (coord binds the path
@@ -2071,13 +2078,13 @@ pub(crate) async fn publish_once() {
     // `wsl.exe` twice a minute forever for a POST that can never be sent.
     let Some(bearer) = crate::coord_mcp::read_usable_device_jwt().await else {
         debug!("fleet::resource_sample: no usable device JWT — skipping this tick");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoBearer);
     };
 
     let samples = collect().await;
     if samples.is_empty() {
         debug!("fleet::resource_sample: no lane produced a sample this tick");
-        return;
+        return PublishOutcome::Skipped(SkipReason::NoSamples);
     }
 
     let body = ResourceSampleReq {
@@ -2097,7 +2104,7 @@ pub(crate) async fn publish_once() {
         Ok(c) => c,
         Err(e) => {
             debug!("fleet::resource_sample: http client build failed: {e}");
-            return;
+            return PublishOutcome::Skipped(SkipReason::ClientBuild);
         }
     };
 
@@ -2115,20 +2122,50 @@ pub(crate) async fn publish_once() {
             // A 200 is not "stored": coord drops invalid items and unknown
             // fields INSIDE a 200 and says so only in the body.
             let text = resp.text().await.ok();
-            log_sample_ack(sample_ack(text.as_deref(), body.samples.len()));
+            let ack = sample_ack(text.as_deref(), body.samples.len());
+            log_sample_ack(ack.clone());
+            PublishOutcome::Acked(ack)
         }
         Ok(resp) => {
             let status = resp.status();
-            warn_once(
-                &http_failure_class(status.as_u16()),
-                format!("POST {url} -> HTTP {status}"),
-            );
+            let class = http_failure_class(status.as_u16());
+            warn_once(&class, format!("POST {url} -> HTTP {status}"));
+            PublishOutcome::HttpFailure(class)
         }
-        Err(e) => warn_once(
-            transport_failure_class(e.is_connect(), e.is_timeout()),
-            format!("POST {url} failed: {e}"),
-        ),
+        Err(e) => {
+            let class = transport_failure_class(e.is_connect(), e.is_timeout());
+            warn_once(class, format!("POST {url} failed: {e}"));
+            PublishOutcome::TransportFailure(class)
+        }
     }
+}
+
+/// Why [`publish_once`] sent nothing this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipReason {
+    /// No readable `machine.json` naming both a device id and a hostname.
+    NoDevice,
+    /// No connected coord base is configured.
+    NoCoordBase,
+    /// No usable (present, unexpired) device JWT.
+    NoBearer,
+    /// No lane produced a sample.
+    NoSamples,
+    /// The HTTP client could not be built.
+    ClientBuild,
+}
+
+/// What one [`publish_once`] attempt established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    /// Nothing was sent, for this reason.
+    Skipped(SkipReason),
+    /// coord answered 2xx; the body classified by [`sample_ack`].
+    Acked(SampleAck),
+    /// coord answered non-2xx: the [`http_failure_class`].
+    HttpFailure(String),
+    /// The request got no answer: the [`transport_failure_class`].
+    TransportFailure(&'static str),
 }
 
 /// The one line logged for a 2xx body that is not coord's documented outcome.
@@ -2420,6 +2457,10 @@ fn warn_once(class: &str, msg: String) {
         debug!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
     }
 }
+
+#[cfg(test)]
+#[path = "resource_sample_publish_tests.rs"]
+mod publish_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3825,73 +3866,66 @@ MemAvailable:   15335424 kB
     /// `only_the_host_lane_carries_the_spawn_pressure_pair` above guards
     /// against for `thread_count`.
     ///
-    /// Puts one tracked body in flight on a thread this fixture names, so the
-    /// expected lane key is a constant rather than whatever the test harness
-    /// happened to call the running thread — same technique
-    /// `wedge_diagnostics`'s own
-    /// `assert_a_body_is_charged_to_its_spawner` fixture uses. `spawn_blocking_tracked`
-    /// charges the GLOBAL lane table (there is no way to hand it a private
-    /// one from outside `wedge_diagnostics`), so this asserts presence and the
-    /// fixture's own count rather than an exact whole-map equality against a
-    /// second, separately-timed read — the same "asserted on presence, not
-    /// equality" call the spawn-pressure test above makes, and for the same
-    /// reason: the global table is shared with whatever else this test binary
-    /// is doing concurrently.
+    /// Asserted in two halves, neither of which asserts on the contents of the
+    /// process-global lane table. That table's 15 lanes are first-come and never released, and
+    /// under `cargo test` the test names that reach `spawn_blocking_tracked`
+    /// first take them — so an assertion on a named lane there is an assertion
+    /// about this binary's test population, and it reddened whenever a new
+    /// test elsewhere filled the table (see `wedge_diagnostics::LaneTable`).
+    /// The lane table's own charging is covered by `wedge_diagnostics`'s
+    /// private-table tests; what this module owns is the mapping and the wiring.
     #[test]
     fn the_host_lane_carries_the_blocking_lane_breakdown() {
-        const SPAWNER: &str = "resource-sample-blocking-fixture";
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let fixture = std::thread::Builder::new()
-            .name(SPAWNER.to_string())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .expect("runtime");
-                let _guard = rt.enter();
-                let jh = spawn_blocking_tracked(move || {
-                    let _ = entered_tx.send(());
-                    let _ = release_rx.recv();
-                });
-                rt.block_on(jh).expect("join the tracked body");
-            })
-            .expect("spawn the named fixture thread");
+        // The mapping: every lane kept, its count unchanged, an over-range
+        // count saturated rather than wrapped.
+        let by_thread = BTreeMap::from([
+            ("fleet-pub-rt".to_string(), 3usize),
+            ("<other-threads>".to_string(), 1usize),
+            // One past u32::MAX: a wrapping `v as u32` would publish 0. On a
+            // 32-bit target no `usize` exceeds u32::MAX, so this entry
+            // takes `edge`'s value there and only the 64-bit run can catch a
+            // wrapping cast.
+            (
+                "huge".to_string(),
+                usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX),
+            ),
+            ("edge".to_string(), u32::MAX as usize),
+            // Just under the boundary must pass through unchanged, which an
+            // early-saturating mapping would not.
+            ("under".to_string(), (u32::MAX - 1) as usize),
+        ]);
+        assert_eq!(
+            blocking_lanes_field(by_thread),
+            BTreeMap::from([
+                ("fleet-pub-rt".to_string(), 3u32),
+                ("<other-threads>".to_string(), 1u32),
+                ("huge".to_string(), u32::MAX),
+                ("edge".to_string(), u32::MAX),
+                ("under".to_string(), u32::MAX - 1),
+            ])
+        );
+        assert!(blocking_lanes_field(BTreeMap::new()).is_empty());
 
-        entered_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the tracked body must start running");
+        // The wiring: the host collector publishes the live global table
+        // through that mapping, unconditionally.
+        let body = collect_host_lane_src();
+        assert!(
+            body.contains(
+                "s.blocking_lanes = Some(blocking_lanes_field(tracked_blocking_by_thread()));"
+            ),
+            "collect_host_lane must publish the live lane table through blocking_lanes_field"
+        );
+        assert_eq!(
+            body.matches("s.blocking_lanes").count(),
+            1,
+            "nothing else in collect_host_lane may mention `s.blocking_lanes` (checked by a \
+             substring count of `s.blocking_lanes` in its source, not a parse)"
+        );
 
-        // A non-host lane must never see this — same placement argument as
-        // `only_the_host_lane_carries_the_spawn_pressure_pair`.
+        // And it is only the host lane's: a non-host lane never carries it.
         let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
         assert_eq!(wsl.blocking_lanes, None);
-
-        let host = collect_host_lane();
-        let published = host
-            .blocking_lanes
-            .as_ref()
-            .expect("the host lane must publish a blocking_lanes map");
-        assert_eq!(
-            published.get(SPAWNER).copied(),
-            Some(1),
-            "the fixture's own in-flight body did not appear in the published \
-             breakdown: {published:?}"
-        );
-        // Cross-checks the live accessor directly, not just the wire struct —
-        // the same key this fixture's body is charged to on the source of
-        // truth `collect_host_lane` reads from.
-        assert!(
-            tracked_blocking_by_thread()
-                .get(SPAWNER)
-                .copied()
-                .is_some_and(|n| n >= 1),
-            "the fixture's body must still be tracked while it is in flight"
-        );
-
-        let _ = release_tx.send(());
-        fixture.join().expect("fixture thread");
+        assert!(collect_host_lane().blocking_lanes.is_some());
     }
 
     /// The socket census's wire names, pinned for the same reason the
