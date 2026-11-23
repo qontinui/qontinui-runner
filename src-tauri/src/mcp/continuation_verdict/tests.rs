@@ -162,6 +162,12 @@ fn the_last_cap_slot_goes_to_one_block_and_the_other_is_downgraded() {
     let second = claim_or_downgrade(&reg, "race", now, cap, blocked(), exhausted);
     assert_eq!(second.decision, "allow");
     assert!(second.would_block, "{}", second.reason);
+    // The downgraded Stop recorded nothing: exactly `cap` stamps are held.
+    assert!(reg.would_exceed("race", now, cap));
+    assert!(
+        !reg.would_exceed("race", now, cap + 1),
+        "the downgrade double-counted"
+    );
     // An allow claims nothing.
     let reg = CapRegistry::new();
     let allow = decide(Mode::On, false, &reachable(Some("finished")), false);
@@ -174,10 +180,16 @@ fn the_last_cap_slot_goes_to_one_block_and_the_other_is_downgraded() {
 fn a_released_claim_frees_its_slot() {
     let reg = CapRegistry::new();
     let now = Instant::now();
-    assert!(reg.try_claim("rel", now, 1));
-    assert!(!reg.try_claim("rel", now, 1));
+    assert!(reg.try_claim("rel", now, 2));
+    assert!(reg.try_claim("rel", now, 2));
+    assert!(!reg.try_claim("rel", now, 2));
+    // One release frees exactly one slot, not every stamp for the key.
     reg.release("rel", now);
-    assert!(reg.try_claim("rel", now, 1));
+    assert!(reg.try_claim("rel", now, 2));
+    assert!(
+        !reg.try_claim("rel", now, 2),
+        "release freed more than one slot"
+    );
 }
 
 #[test]
@@ -796,6 +808,12 @@ fn a_session_already_nudged_is_not_nudged_again() {
     ));
     assert!(
         deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On, &test_tenant()).is_none()
+    );
+    // Review round 6 A1: losing `mark_nudged` gives the claimed cap slot
+    // back, so the lost delivery leaves no stamp behind.
+    assert!(
+        !cap_registry().would_exceed(&format!("compliance:{key}"), Instant::now(), 1),
+        "a delivery that lost mark_nudged must release its cap slot"
     );
 }
 

@@ -646,11 +646,7 @@ impl TerminalManager {
             {
                 store.update_identity_by_terminal(
                     &info.id,
-                    &crate::session::session_lifecycle_store::SessionIdentityUpdate {
-                        bypass_permissions: Some(bypass_permissions),
-                        tenant_id: spawn_tenant_stamp(spawn_tenant),
-                        ..Default::default()
-                    },
+                    &spawn_identity_update(bypass_permissions, spawn_tenant),
                 );
                 // W-B (plan 2026-09-10-spawn-tenant-never-reaches-the-session-
                 // coord-credential): the device default the identity seam read
@@ -1436,6 +1432,21 @@ fn spawn_tenant_stamp(spawn_tenant: Option<uuid::Uuid>) -> Option<String> {
     spawn_tenant.map(|t| t.to_string())
 }
 
+/// The identity update the spawn writes onto its lifecycle record. A pure
+/// function of the spawn inputs, so the writer's tenant rule is testable
+/// without spawning a terminal: the record's `tenant_id` comes from
+/// [`spawn_tenant_stamp`] and from nothing else.
+fn spawn_identity_update(
+    bypass_permissions: bool,
+    spawn_tenant: Option<uuid::Uuid>,
+) -> crate::session::session_lifecycle_store::SessionIdentityUpdate {
+    crate::session::session_lifecycle_store::SessionIdentityUpdate {
+        bypass_permissions: Some(bypass_permissions),
+        tenant_id: spawn_tenant_stamp(spawn_tenant),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// No tenant chosen records no tenant: the stamp is never a default.
@@ -1444,6 +1455,22 @@ mod tests {
         assert_eq!(super::spawn_tenant_stamp(None), None);
         let t = uuid::Uuid::from_bytes([7; 16]);
         assert_eq!(super::spawn_tenant_stamp(Some(t)), Some(t.to_string()));
+    }
+
+    /// Review round 6 A2: the update the spawn WRITES carries no tenant when
+    /// the caller chose none, and exactly the chosen one otherwise. This is
+    /// the value the writer passes to `update_identity_by_terminal`, so a
+    /// writer that went back to stamping a resolved or default tenant fails
+    /// here.
+    #[test]
+    fn the_spawn_identity_update_carries_only_the_chosen_tenant() {
+        let none = super::spawn_identity_update(true, None);
+        assert_eq!(none.tenant_id, None);
+        assert_eq!(none.bypass_permissions, Some(true));
+        let t = uuid::Uuid::from_bytes([9; 16]);
+        let chosen = super::spawn_identity_update(false, Some(t));
+        assert_eq!(chosen.tenant_id, Some(t.to_string()));
+        assert_eq!(chosen.bypass_permissions, Some(false));
     }
 
     /// The `terminal-created` wire shape the frontend reads: `surface` sits
