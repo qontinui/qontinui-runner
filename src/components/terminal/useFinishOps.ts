@@ -1,5 +1,5 @@
 import { describeThrown } from "@/lib/utils";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { setSessionFinished } from "@/lib/session-ledger";
 import type { FinishOp } from "./sinceRestart";
 
@@ -20,11 +20,21 @@ export function useFinishOps(onSettled: () => void): {
   setFinished: (claudeSessionId: string, finished: boolean) => void;
 } {
   const [ops, setOps] = useState<Map<string, FinishOp>>(new Map());
+  // Per session: did its last Finish (through this view, this app run)
+  // withdraw an implement→ship net? Only then does an Unfinish owe the
+  // not-re-armed line (plan item 4). Unknown after a reload, so no line.
+  const withdrewRef = useRef<Map<string, boolean>>(new Map());
   const setFinished = useCallback(
     (id: string, finished: boolean) => {
       setOps((prev) => new Map(prev).set(id, { phase: "pending", to: finished }));
-      setSessionFinished(id, finished)
-        .then(({ notice }) =>
+      const earlierFinishWithdrew = !finished && withdrewRef.current.get(id) === true;
+      setSessionFinished(id, finished, undefined, earlierFinishWithdrew)
+        .then(({ notice, withdrew }) => {
+          if (finished) withdrewRef.current.set(id, withdrew);
+          else withdrewRef.current.delete(id);
+          return notice;
+        })
+        .then((notice) =>
           setOps((prev) => {
             const next = new Map(prev);
             // A result the operator is owed (an implement→ship net left

@@ -840,13 +840,36 @@ async fn finish_session(
             "session lifecycle store unavailable".to_string(),
         ))?;
 
-    let (outcome, nets) = apply_finish_with_nets(
+    let registrar = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
+    let port = registrar
+        .as_ref()
+        .map(|r| r.inner().as_ref() as &dyn crate::session::finish_heal::HealPort);
+    let body = finish_door_body(
         store.inner(),
         &crate::session::finish_net_retire::CoordNetRetirer,
+        port,
         &id,
         req,
     )
     .await?;
+    Ok(Json(body))
+}
+
+/// Everything [`finish_session`] does once it holds the store: retire the
+/// session's implement→ship nets, write (or unmark) the mark, attach `nets`,
+/// and — on a read-back — observe coord and heal. Taking the retirer and the
+/// heal port as arguments is what lets the door test run the REAL handler
+/// path: bypassing the retire or dropping the `nets` attach fails it.
+async fn finish_door_body(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    retirer: &dyn crate::session::finish_net_retire::FinishNetRetirer,
+    heal_port: Option<&dyn crate::session::finish_heal::HealPort>,
+    id: &str,
+    req: FinishSessionRequest,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let (outcome, nets) = apply_finish_with_nets(store, retirer, id, req).await?;
     let mut body = outcome.response_json();
     nets.attach(&mut body);
     // The READ-BACK (a reason-less re-finish of a finished mark) observes
@@ -855,18 +878,14 @@ async fn finish_session(
     // withdrawn and the finish re-sent (plan
     // 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-
     // status, Phase 5). Bounded by the work-status read's own ≈4 s worst case.
+    // A read-back never runs the net retire (retire_before_finish skips it),
+    // so the two bounds never add up inside one call.
     if is_finish_read_back(&outcome) {
         use crate::session::finish_heal;
-        let registrar = state
-            .app_handle
-            .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
-        let port = registrar
-            .as_ref()
-            .map(|r| r.inner().as_ref() as &dyn finish_heal::HealPort);
-        let rb = finish_heal::read_back(store.inner(), port, &id).await;
-        finish_heal::decorate_read_back(&mut body, &rb, store.get(&id).as_ref());
+        let rb = finish_heal::read_back(store, heal_port, id).await;
+        finish_heal::decorate_read_back(&mut body, &rb, store.get(id).as_ref());
     }
-    Ok(Json(body))
+    Ok(body)
 }
 
 /// Whether a finish outcome is the READ-BACK: a re-finish that wrote nothing
@@ -911,6 +930,7 @@ async fn apply_finish_with_nets(
         req.reason.as_deref(),
         false,
         "POST /sessions/{id}/finish",
+        crate::session::finish_net_retire::DOOR_BUDGET,
     )
     .await;
     let outcome = apply_finish_outcome(store, id, req)?;
@@ -2097,12 +2117,11 @@ mod tests {
                         reason: None,
                         finished: Some(finished),
                     };
-                    let (outcome, nets) = apply_finish_with_nets(&store, retirer.as_ref(), id, req)
-                        .await
-                        .expect("a known id answers");
-                    let mut body = outcome.response_json();
-                    nets.attach(&mut body);
-                    Some(body)
+                    Some(
+                        finish_door_body(&store, retirer.as_ref(), None, id, req)
+                            .await
+                            .expect("a known id answers"),
+                    )
                 })
             },
             true,

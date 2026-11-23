@@ -265,16 +265,18 @@ export interface FinishNets {
 /**
  * The operator-facing line a Finish/Unfinish result owes, or `null` when it
  * owes none: an unretired or UNKNOWN net on a finish (it may still dispatch a
- * duplicate /implement-plan), and the not-re-armed note on an unfinish.
+ * duplicate /implement-plan), and — on an unfinish, only when the earlier
+ * finish withdrew a net (`earlierFinishWithdrew`) — the not-re-armed note.
  */
 export function finishNetsNotice(
   nets: FinishNets | null | undefined,
   finished: boolean,
+  earlierFinishWithdrew = false,
 ): string | null {
   if (!nets) return null;
   if (!finished) {
-    return nets.rearm
-      ? `Any implement→ship net the finish withdrew is ${nets.rearm}`
+    return nets.rearm && earlierFinishWithdrew
+      ? `The implement→ship net the finish withdrew is ${nets.rearm}`
       : null;
   }
   const items = (nets.unretired ?? []).map(
@@ -301,13 +303,21 @@ export function finishNetsNotice(
  * with `data.changed: "none"` — the backend answers the finish route's body,
  * `FinishOutcome::response_json`). It is NOT a failure to retry — re-read the
  * roster to see which. `notice` is {@link finishNetsNotice} of the body's
- * `nets`.
+ * `nets` (pass `earlierFinishWithdrew` on an unfinish); `withdrew` says a
+ * finish withdrew at least one net, for the caller to remember until an
+ * Unfinish.
  */
 export async function setSessionFinished(
   claudeSessionId: string,
   finished: boolean,
   reason?: string,
-): Promise<{ changed: boolean; message: string | null; notice: string | null }> {
+  earlierFinishWithdrew = false,
+): Promise<{
+  changed: boolean;
+  message: string | null;
+  notice: string | null;
+  withdrew: boolean;
+}> {
   const res = await invoke<{
     success: boolean;
     message?: string | null;
@@ -318,6 +328,8 @@ export async function setSessionFinished(
     reason: reason ?? null,
   });
   const changed = res.success && res.data?.changed !== "none";
-  const notice = res.success ? finishNetsNotice(res.data?.nets, finished) : null;
-  return { changed, message: res.message ?? null, notice };
+  const nets = res.success ? res.data?.nets : null;
+  const notice = finishNetsNotice(nets, finished, earlierFinishWithdrew);
+  const withdrew = finished && (nets?.withdrawn?.length ?? 0) > 0;
+  return { changed, message: res.message ?? null, notice, withdrew };
 }

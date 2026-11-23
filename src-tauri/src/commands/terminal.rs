@@ -1764,6 +1764,7 @@ pub(crate) async fn set_finished_command(
         reason.as_deref(),
         false,
         "the runner UI (terminal_session_set_finished)",
+        crate::session::finish_net_retire::DOOR_BUDGET,
     )
     .await;
     match store.set_finished(claude_session_id, finished, reason) {

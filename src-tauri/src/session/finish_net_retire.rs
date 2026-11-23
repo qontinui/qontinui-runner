@@ -43,7 +43,7 @@
 //!
 //! **Never blocks the mark.** Whatever this answers, the door writes the mark;
 //! the outcome rides the door's response as `nets` so an unretired net is on
-//! the record. The whole run is bounded ([`RETIRE_BUDGET`]) and runs outside
+//! the record. The whole run is bounded (the doors pass [`DOOR_BUDGET`]) and runs outside
 //! every store lock — never from the finish observer, which holds
 //! `finish_forward` across `set_finished_inner`.
 //!
@@ -56,15 +56,16 @@ use tracing::{info, warn};
 
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
 
-/// The whole retire run's budget (the release script's
-/// `PLAN_RESERVE_RELEASE_RETIRE_BUDGET` default).
-pub const RETIRE_BUDGET: Duration = Duration::from_secs(60);
+/// A finish door's whole retire budget. The doors answer callers that bound
+/// their own wait (`/finish-session` curls with `-m 15`), so the retire must
+/// end well inside that even when coord is dark; past it the outcome is
+/// UNKNOWN and the mark is written anyway.
+pub const DOOR_BUDGET: Duration = Duration::from_secs(10);
 /// A call starts only while at least this much budget is left.
 const CALL_FLOOR: Duration = Duration::from_secs(3);
-/// Per-call cap for a gate read or write (the script's HTTP gate cap).
-const GATE_CALL_CAP: Duration = Duration::from_secs(15);
-/// Per-call cap for the claims list (the script's `curl -m 25`).
-const LIST_CALL_CAP: Duration = Duration::from_secs(25);
+/// Per-call cap for every coord call (a gate read of all its pages counts as
+/// one call), applied per request and again by the run's [`Budget`].
+const CALL_CAP: Duration = Duration::from_secs(5);
 /// Gate pages read per plan before the read is called short (5 × 100).
 const MAX_GATE_PAGES: usize = 5;
 
@@ -241,7 +242,8 @@ impl NetsReport {
 /// retire-before-mark order at each door.
 #[async_trait::async_trait]
 pub trait FinishNetRetirer: Send + Sync {
-    async fn retire(&self, claude_session_id: &str, by: &str) -> NetsOutcome;
+    /// Retire within `budget`; past it the outcome is UNKNOWN.
+    async fn retire(&self, claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome;
 }
 
 /// The production retirer: [`retire_nets_for_finish`].
@@ -249,8 +251,8 @@ pub struct CoordNetRetirer;
 
 #[async_trait::async_trait]
 impl FinishNetRetirer for CoordNetRetirer {
-    async fn retire(&self, claude_session_id: &str, by: &str) -> NetsOutcome {
-        retire_nets_for_finish(claude_session_id, by).await
+    async fn retire(&self, claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome {
+        retire_nets_for_finish(claude_session_id, by, budget).await
     }
 }
 
@@ -269,6 +271,7 @@ pub async fn retire_before_finish(
     reason: Option<&str>,
     only_if_unfinished: bool,
     by: &str,
+    budget: Duration,
 ) -> NetsReport {
     if !finished {
         return NetsReport::Unmark;
@@ -281,7 +284,7 @@ pub async fn retire_before_finish(
             "the mark is already set and this call writes none; nets are retired when a finish writes the mark",
         );
     }
-    NetsReport::Ran(retirer.retire(claude_session_id, by).await)
+    NetsReport::Ran(retirer.retire(claude_session_id, by, budget).await)
 }
 
 // ===========================================================================
@@ -421,6 +424,7 @@ pub struct RetireContext {
 /// The run's deadline.
 struct Budget {
     deadline: Instant,
+    total: Duration,
 }
 
 impl Budget {
@@ -428,15 +432,17 @@ impl Budget {
     /// [`CALL_FLOOR`] is left.
     async fn call<T>(
         &self,
-        cap: Duration,
         what: &str,
         fut: impl std::future::Future<Output = Result<T, String>>,
     ) -> Result<T, String> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left < CALL_FLOOR {
-            return Err(format!("the retire budget ({}s) is spent before {what}", RETIRE_BUDGET.as_secs()));
+            return Err(format!(
+                "the retire budget ({}s) is spent before {what}",
+                self.total.as_secs()
+            ));
         }
-        let lim = cap.min(left);
+        let lim = CALL_CAP.min(left);
         match tokio::time::timeout(lim, fut).await {
             Ok(r) => r,
             Err(_) => Err(format!("{what} timed out after {}s", lim.as_secs())),
@@ -467,12 +473,13 @@ pub async fn retire_nets_with(
 ) -> NetsOutcome {
     let budget = Budget {
         deadline: Instant::now() + budget,
+        total: budget,
     };
     let target = claude_session_id.trim().to_ascii_lowercase();
 
     // 1. The target's reserves.
     let page = match budget
-        .call(LIST_CALL_CAP, "GET /coord/claims/list", io.list_plan_reserves())
+        .call("GET /coord/claims/list", io.list_plan_reserves())
         .await
     {
         Ok(p) => p,
@@ -486,10 +493,18 @@ pub async fn retire_nets_with(
                 .as_deref()
                 .is_some_and(|s| s.trim().eq_ignore_ascii_case(&target))
         })
-        .filter_map(|h| plan_stem(&h.resource_key).map(str::to_string))
+        .filter(|h| h.resource_key.starts_with("plan:"))
+        .map(|h| h.resource_key.clone())
         .collect();
     stems.sort();
     stems.dedup();
+    // A reserve the target holds whose key is not a stem this run can name
+    // is still a reserve whose net may fire: UNKNOWN, never dropped to NONE.
+    let (stems, odd): (Vec<String>, Vec<String>) = stems.into_iter().partition(|k| plan_stem(k).is_some());
+    let stems: Vec<String> = stems
+        .into_iter()
+        .filter_map(|k| plan_stem(&k).map(str::to_string))
+        .collect();
 
     let mut out = NetsOutcome {
         stems: stems.clone(),
@@ -500,6 +515,13 @@ pub async fn retire_nets_with(
             "the claims list was truncated: {} plan reserve(s) handled, others may remain",
             stems.len()
         ));
+    }
+    for key in &odd {
+        out.unreadable(
+            key,
+            None,
+            "the target holds this reserve, but its key is not a plan stem this run can read gates for",
+        );
     }
     if stems.is_empty() {
         return out;
@@ -530,7 +552,7 @@ pub async fn retire_nets_with(
     // 3-4. Each plan's nets.
     for stem in &stems {
         let rows = match budget
-            .call(GATE_CALL_CAP * MAX_GATE_PAGES as u32, "GET /coord/agent-gates", io.list_gates(stem))
+            .call("GET /coord/agent-gates", io.list_gates(stem))
             .await
         {
             Ok(r) => r,
@@ -582,7 +604,7 @@ async fn retire_one(
     }
 
     let withdraw = budget
-        .call(GATE_CALL_CAP, "the withdraw", io.write(GateWrite::Withdraw, &id, reason))
+        .call("the withdraw", io.write(GateWrite::Withdraw, &id, reason))
         .await;
     let mut not_registrant = false;
     let mut cancel_text = String::new();
@@ -593,9 +615,7 @@ async fn retire_one(
             // Never mute: a muted gate is skipped by the sweep and stays open
             // for ever (served coordination `gate-lifecycle-end`).
             cancel_text = match budget
-                .call(
-                    GATE_CALL_CAP,
-                    "the continuation cancel",
+                .call("the continuation cancel",
                     io.write(GateWrite::CancelContinuation, &id, reason),
                 )
                 .await
@@ -611,7 +631,7 @@ async fn retire_one(
     };
 
     let back = match budget
-        .call(GATE_CALL_CAP, "the read-back", io.read_gate(&id))
+        .call("the read-back", io.read_gate(&id))
         .await
     {
         Ok(Some(b)) => b,
@@ -678,9 +698,7 @@ async fn settle_cleared(
         return out.inert(stem, &id, "verdict=cleared, continuation not live: nothing left to dispatch");
     }
     let why = match budget
-        .call(
-            GATE_CALL_CAP,
-            "the continuation cancel",
+        .call("the continuation cancel",
             io.write(GateWrite::CancelContinuation, &id, reason),
         )
         .await
@@ -696,7 +714,7 @@ async fn settle_cleared(
         }
     };
     match budget
-        .call(GATE_CALL_CAP, "the read-back", io.read_gate(&id))
+        .call("the read-back", io.read_gate(&id))
         .await
     {
         Ok(Some(back)) if back.consumed => out.inert(
@@ -749,6 +767,7 @@ impl HttpNetsCoord {
         let resp = self
             .client
             .get(&url)
+            .timeout(CALL_CAP)
             .bearer_auth(self.bearer()?)
             .send()
             .await
@@ -788,6 +807,7 @@ impl NetsCoord for HttpNetsCoord {
         let resp = self
             .client
             .get(&url)
+            .timeout(CALL_CAP)
             .send()
             .await
             .map_err(|e| format!("GET /coord/claims/list: {e}"))?;
@@ -858,6 +878,7 @@ impl NetsCoord for HttpNetsCoord {
         let resp = self
             .client
             .post(format!("{}{path}", self.base))
+            .timeout(CALL_CAP)
             .bearer_auth(self.bearer()?)
             .json(&serde_json::json!({ "reason": reason }))
             .send()
@@ -907,18 +928,29 @@ fn read_context() -> (RetireContext, Option<String>, String) {
 
 /// Retire the implement→ship nets of every plan reserve `claude_session_id`
 /// holds, before a runner finish door writes its mark. Bounded by
-/// [`RETIRE_BUDGET`]; never fails — every failure is in the outcome.
-pub async fn retire_nets_for_finish(claude_session_id: &str, by: &str) -> NetsOutcome {
-    let (ctx, jwt, base) = match tokio::task::spawn_blocking(read_context).await {
-        Ok(parts) => parts,
-        Err(e) => return NetsOutcome::unknown(format!("the device context read panicked: {e}")),
+/// `budget` (the doors pass [`DOOR_BUDGET`]), the device-context read
+/// included; never fails — every failure, the budget running out among them,
+/// is in the outcome (UNKNOWN), and the caller writes the mark regardless.
+pub async fn retire_nets_for_finish(claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome {
+    let started = Instant::now();
+    let (ctx, jwt, base) = match tokio::time::timeout(budget, tokio::task::spawn_blocking(read_context)).await {
+        Ok(Ok(parts)) => parts,
+        Ok(Err(e)) => return NetsOutcome::unknown(format!("the device context read panicked: {e}")),
+        Err(_) => {
+            return NetsOutcome::unknown(format!(
+                "the device context read outlived the retire budget ({}s)",
+                budget.as_secs()
+            ))
+        }
     };
-    let client = match reqwest::Client::builder().timeout(GATE_CALL_CAP).build() {
+    // No client-level timeout: every request carries its own [`CALL_CAP`].
+    let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => return NetsOutcome::unknown(format!("no HTTP client: {e}")),
     };
     let io = HttpNetsCoord { base, jwt, client };
-    let out = retire_nets_with(&io, &ctx, claude_session_id, by, RETIRE_BUDGET).await;
+    let left = budget.saturating_sub(started.elapsed());
+    let out = retire_nets_with(&io, &ctx, claude_session_id, by, left).await;
     let verdict = out.verdict();
     if matches!(verdict, NetsVerdict::NetUnretired | NetsVerdict::Unknown) {
         warn!(
@@ -1025,7 +1057,7 @@ pub(crate) mod tests {
     }
 
     async fn run(io: &FakeCoord, ctx: &RetireContext) -> NetsOutcome {
-        retire_nets_with(io, ctx, TARGET, "test", RETIRE_BUDGET).await
+        retire_nets_with(io, ctx, TARGET, "test", DOOR_BUDGET).await
     }
 
     fn page(holders: Vec<ReserveRow>) -> Option<ReservePage> {
@@ -1198,6 +1230,204 @@ pub(crate) mod tests {
         assert_eq!(row.gate_id, "96e61cde-4092-455b-83b8-94ea4f1b6b95");
     }
 
+    #[tokio::test]
+    async fn a_held_reserve_whose_key_is_not_a_stem_is_unknown_not_none() {
+        let io = FakeCoord {
+            reserves: page(vec![ReserveRow {
+                resource_key: "plan:a/b".to_string(),
+                session_id: Some(TARGET.to_string()),
+            }]),
+            ..Default::default()
+        };
+        let out = run(&io, &single()).await;
+        assert_eq!(out.verdict(), NetsVerdict::Unknown);
+        assert_eq!(out.unretired[0].stem, "plan:a/b");
+        assert!(io.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_is_unknown_and_writes_nothing() {
+        let io = FakeCoord {
+            reserves: page(vec![reserve("p1", TARGET)]),
+            gates: Mutex::new(vec![net("g1", "open", ME)]),
+            ..Default::default()
+        };
+        // Below the per-call floor: no call starts at all.
+        let out = retire_nets_with(&io, &single(), TARGET, "test", Duration::from_secs(1)).await;
+        assert_eq!(out.verdict(), NetsVerdict::Unknown);
+        assert!(io.writes.lock().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpNetsCoord against a stub coord on 127.0.0.1:0
+    // -----------------------------------------------------------------------
+
+    /// What the stub coord holds and saw.
+    #[derive(Default)]
+    struct StubCoord {
+        /// Gate rows in `GET /coord/agent-gates`' flat shape.
+        gates: Mutex<Vec<serde_json::Value>>,
+        /// Every `METHOD path?query` it answered.
+        seen: Mutex<Vec<String>>,
+        claims_truncated: bool,
+        /// Serve the plan's gates as two pages (offset 0 truncated, 100 not).
+        two_pages: bool,
+    }
+
+    fn stub_gate(id: &str, verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "gate_id": id,
+            "verdict": verdict,
+            "phase_name": NET_PHASE_PREFIX,
+            "registered_by": ME,
+            "predicate": {"kind": "claim_terminal"},
+            "continuation_will_dispatch": true,
+            "continuation_consumed_at": null,
+            "continuation_cancelled_at": null,
+            "continuation_spawn": {"kind": "run_skill"},
+        })
+    }
+
+    async fn stub_handler(
+        axum::extract::State(st): axum::extract::State<Arc<StubCoord>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let path = uri.path().to_string();
+        let query = uri.query().unwrap_or("").to_string();
+        st.seen.lock().unwrap().push(format!("{method} {path}?{query}"));
+        let json = |code: StatusCode, v: serde_json::Value| (code, axum::Json(v)).into_response();
+        let param = |k: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(&format!("{k}=")).map(str::to_string))
+        };
+        if path == "/coord/claims/list" {
+            return json(
+                StatusCode::OK,
+                serde_json::json!({
+                    "holders": [{"resource_key": "plan:p1", "session_id": TARGET.to_lowercase()}],
+                    "truncated": st.claims_truncated,
+                }),
+            );
+        }
+        if path == "/coord/agent-gates" {
+            let gates = st.gates.lock().unwrap().clone();
+            if let Some(id) = param("gate_id") {
+                let rows: Vec<_> = gates.into_iter().filter(|g| g["gate_id"] == id.as_str()).collect();
+                return json(StatusCode::OK, serde_json::json!({"gates": rows, "truncated": false}));
+            }
+            if st.two_pages {
+                let first = param("offset").as_deref() == Some("0");
+                let row = if first { gates[0].clone() } else { gates[1].clone() };
+                return json(StatusCode::OK, serde_json::json!({"gates": [row], "truncated": first}));
+            }
+            return json(StatusCode::OK, serde_json::json!({"gates": gates, "truncated": false}));
+        }
+        if let Some(rest) = path.strip_prefix("/coord/gates/") {
+            let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
+            match (id, action) {
+                ("g403", "withdraw") => return json(StatusCode::FORBIDDEN, serde_json::json!({"error": "not_registrant"})),
+                ("g409", "withdraw") => return json(StatusCode::CONFLICT, serde_json::json!({"error": "already_consumed"})),
+                ("g500", "withdraw") => return json(StatusCode::BAD_GATEWAY, serde_json::json!({"error": "upstream"})),
+                (_, "withdraw") | (_, "agent/continuation-cancel") => {
+                    let mut gates = st.gates.lock().unwrap();
+                    if let Some(g) = gates.iter_mut().find(|g| g["gate_id"] == id) {
+                        if action == "withdraw" {
+                            g["verdict"] = "withdrawn".into();
+                        } else {
+                            g["continuation_will_dispatch"] = false.into();
+                            g["continuation_cancelled_at"] = "2026-11-23T00:00:00Z".into();
+                        }
+                    }
+                    return json(StatusCode::OK, serde_json::json!({"ok": true}));
+                }
+                _ => {}
+            }
+        }
+        json(StatusCode::NOT_FOUND, serde_json::json!({"error": "no route"}))
+    }
+
+    async fn serve_stub(st: Arc<StubCoord>) -> HttpNetsCoord {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(stub_handler).with_state(st);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        HttpNetsCoord {
+            base: format!("http://{addr}"),
+            jwt: Some("test-jwt".to_string()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_claims_list_carries_the_truncated_flag() {
+        let st = Arc::new(StubCoord {
+            claims_truncated: true,
+            ..Default::default()
+        });
+        let io = serve_stub(st.clone()).await;
+        let page = io.list_plan_reserves().await.unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.holders, vec![reserve("p1", &TARGET.to_lowercase())]);
+        assert!(st.seen.lock().unwrap()[0]
+            .contains("kind=semantic_resource&prefix=plan%3A&limit=500"));
+    }
+
+    #[tokio::test]
+    async fn http_gate_read_walks_pages_until_not_truncated() {
+        let st = Arc::new(StubCoord {
+            two_pages: true,
+            gates: Mutex::new(vec![stub_gate("g1", "open"), stub_gate("g2", "cleared")]),
+            ..Default::default()
+        });
+        let io = serve_stub(st.clone()).await;
+        let rows = io.list_gates("p1").await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.gate_id.as_str()).collect::<Vec<_>>(), ["g1", "g2"]);
+        let seen = st.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].contains("work_unit_slug=p1&limit=100&offset=0"));
+        assert!(seen[1].contains("offset=100"));
+        assert!(seen.iter().all(|q| !q.contains("open_only")), "the route refuses unknown keys");
+    }
+
+    #[tokio::test]
+    async fn http_withdraw_403_falls_back_to_cancel_and_never_mutes() {
+        let st = Arc::new(StubCoord {
+            gates: Mutex::new(vec![stub_gate("g403", "open")]),
+            ..Default::default()
+        });
+        let io = serve_stub(st.clone()).await;
+        assert!(matches!(
+            io.write(GateWrite::Withdraw, "g403", "r").await,
+            Ok(WriteAnswer::NotRegistrant(_))
+        ));
+        let out = retire_nets_with(&io, &single(), TARGET, "test", DOOR_BUDGET).await;
+        assert_eq!(out.cancelled, vec!["g403".to_string()], "{:?}", out);
+        assert_eq!(out.verdict(), NetsVerdict::Retired);
+        let seen = st.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|q| q.starts_with("POST /coord/gates/g403/agent/continuation-cancel")));
+        assert!(seen.iter().all(|q| !q.contains("mute")));
+    }
+
+    #[tokio::test]
+    async fn http_write_answers_map_409_and_5xx() {
+        let io = serve_stub(Arc::new(StubCoord::default())).await;
+        assert!(matches!(
+            io.write(GateWrite::Withdraw, "g409", "r").await,
+            Ok(WriteAnswer::Consumed(_))
+        ));
+        assert!(io.write(GateWrite::Withdraw, "g500", "r").await.is_err(), "a 5xx is unanswered");
+        assert_eq!(
+            io.write(GateWrite::Withdraw, "g1", "r").await,
+            Ok(WriteAnswer::Ok)
+        );
+    }
+
     #[test]
     fn plan_stems_follow_the_release_scripts_grammar() {
         assert_eq!(plan_stem("plan:2026-11-23-a.b_c"), Some("2026-11-23-a.b_c"));
@@ -1224,13 +1454,13 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl FinishNetRetirer for OrderProbe {
-        async fn retire(&self, claude_session_id: &str, by: &str) -> NetsOutcome {
+        async fn retire(&self, claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome {
             let at_call = self.store.get(claude_session_id).and_then(|r| r.finished_at);
             self.calls
                 .lock()
                 .unwrap()
                 .push((claude_session_id.to_string(), at_call));
-            retire_nets_with(&self.coord, &single(), claude_session_id, by, RETIRE_BUDGET).await
+            retire_nets_with(&self.coord, &single(), claude_session_id, by, budget).await
         }
     }
 

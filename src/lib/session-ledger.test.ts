@@ -195,6 +195,7 @@ describe("invoke wrappers", () => {
       changed: true,
       message: null,
       notice: null,
+      withdrew: false,
     });
     expect(invokeMock).toHaveBeenCalledWith("terminal_session_set_finished", {
       claudeSessionId: "aaaa-1111",
@@ -208,6 +209,7 @@ describe("invoke wrappers", () => {
       changed: false,
       message: null,
       notice: null,
+      withdrew: false,
     });
     invokeMock.mockResolvedValue({
       success: false,
@@ -218,6 +220,7 @@ describe("invoke wrappers", () => {
       changed: false,
       message: "no such session in the lifecycle registry",
       notice: null,
+      withdrew: false,
     });
   });
 
@@ -261,6 +264,18 @@ describe("invoke wrappers", () => {
     // An older build answers no `nets` at all: no line, never a guess.
     expect(finishNetsNotice(undefined, true)).toBeNull();
 
+    // A finish that withdrew a net says so, for the Unfinish to remember.
+    invokeMock.mockResolvedValue({
+      success: true,
+      message: null,
+      data: { changed: "marker", nets: { verdict: "RETIRED", withdrawn: ["g1"], unretired: [] } },
+    });
+    const retired = await setSessionFinished("aaaa-1111", true);
+    expect(retired.withdrew).toBe(true);
+    expect(retired.notice).toBeNull();
+
+    // The runner always sends `rearm` on an unmark; the line shows only when
+    // the earlier finish withdrew a net.
     invokeMock.mockResolvedValue({
       success: true,
       message: null,
@@ -269,9 +284,12 @@ describe("invoke wrappers", () => {
         nets: { rearm: "not restored — /implement-plan Step 0.5 re-arms" },
       },
     });
-    expect((await setSessionFinished("aaaa-1111", false)).notice).toBe(
-      "Any implement→ship net the finish withdrew is not restored — /implement-plan Step 0.5 re-arms",
+    expect((await setSessionFinished("aaaa-1111", false, undefined, true)).notice).toBe(
+      "The implement→ship net the finish withdrew is not restored — /implement-plan Step 0.5 re-arms",
     );
+    const quiet = await setSessionFinished("aaaa-1111", false);
+    expect(quiet.notice).toBeNull();
+    expect(quiet.withdrew).toBe(false);
   });
 
   it("propagates a refusal rather than resolving an empty report", async () => {
