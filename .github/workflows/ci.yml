@@ -2365,6 +2365,8 @@ jobs:
   # carrying syntax this matcher does not translate (`[`, `]`, `{`, `}`, `\`)
   # selects BOTH arms rather than being guessed at, so a glob added to either
   # list later can over-select Windows but never silently under-select it.
+  # A changed file that matches NO target's `observes` also selects both
+  # arms: the map's own semantics say such a file touches every target.
   #
   # WHAT "CHANGED" MEANS, per event:
   #   pull_request         the merge commit against its first parent (the
@@ -2458,21 +2460,28 @@ jobs:
                       out += "."; i += 1
                   else:
                       out += re.escape(glob[i]); i += 1
-              return re.compile(out + r"\Z")
+              # re.S: globset sets dot_matches_new_line, so `.` crosses `\n` too.
+              return re.compile(out + r"\Z", re.S)
           try:
               with open(".qontinui/ci-targets.toml", "rb") as f:
                   m = tomllib.load(f)
               target = [t for t in m["targets"] if t["name"] == "holder-crates"]
               globs = list(m["global"]) + list(target[0]["observes"])
+              # The map`s own rule: a file matching NO target`s observes
+              # touches every target, holder-crates included.
+              mapped = [g for t in m["targets"] for g in t["observes"]]
           except Exception as e:
               print("both map unreadable: %s" % e); sys.exit(0)
-          odd = [g for g in globs if any(c in g for c in "[]{}\\")]
+          odd = [g for g in globs + mapped if any(c in g for c in "[]{}\\")]
           if odd:
               print("both untranslated glob syntax in %s" % odd); sys.exit(0)
           pats = [rx(g) for g in globs]
+          any_target = [rx(g) for g in mapped]
           for path in sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\0"):
               if path and any(p.match(path) for p in pats):
                   print("both %s reaches holder-crates" % path); sys.exit(0)
+              if path and not any(p.match(path) for p in any_target):
+                  print("both %s is mapped by no target" % path); sys.exit(0)
           print("ubuntu no changed file reaches holder-crates")
           ')" || emit "$both" "selector failed"
           case "$verdict" in
