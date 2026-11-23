@@ -732,6 +732,21 @@ fn path_recently_touched(path: &Path, window: Duration) -> bool {
     }
 }
 
+/// True iff a live `cargo` invocation holds a `.cargo-lock` under any profile
+/// dir of `target_dir` (`debug`, `release`, and every first-level child —
+/// custom profiles and per-triple dirs).
+///
+/// **Linux:** read from `/proc/locks` ([`super::cargo_locks::target_lock_state`]).
+/// cargo's lock there is an advisory `flock`, so the Windows probe below — a
+/// write-open that FAILS — always succeeds and could never see a build. A read
+/// the answer depends on that fails reads as held: G6 would rather skip a
+/// worktree than reclaim one it could not reason about.
+#[cfg(target_os = "linux")]
+fn cargo_lock_held(target_dir: &Path) -> bool {
+    use super::cargo_locks::{target_lock_state, TargetLockState};
+    target_lock_state(target_dir) != TargetLockState::Free
+}
+
 /// True iff a `.cargo-lock` under any profile dir of `target_dir` cannot be
 /// opened with write share-mode — i.e. a live `cargo` invocation holds it.
 ///
@@ -739,6 +754,7 @@ fn path_recently_touched(path: &Path, window: Duration) -> bool {
 /// directory one level deep (covers custom profiles + per-triple dirs). A
 /// `.cargo-lock` that opens cleanly (or is absent) → not building; a
 /// sharing/permission failure → building.
+#[cfg(not(target_os = "linux"))]
 fn cargo_lock_held(target_dir: &Path) -> bool {
     // Collect candidate profile dirs: the two well-known ones plus any
     // first-level subdir of `target/`.
@@ -793,20 +809,204 @@ pub(super) fn probe_building(worktree: &Path) -> bool {
 /// every allocate `Wait`-ed and sessions fell back to the shared root. Phase 2
 /// of `plans/2026-06-08-coord-build-slot-budget-saturation-fix.md`; coord's
 /// building-freshness TTL is the backstop for any flag that still goes stale.
-pub(super) fn probe_building_for_census(worktree: &Path) -> bool {
-    cargo_lock_held(&worktree.join("target"))
+///
+/// **Linux observes the build instead of predicting it** (plan
+/// `2026-11-19-coord-prices-every-building-linux-agent-worktree-as-a-dedicated-target`
+/// D1). A wrapper build in a linked worktree (cargo-guard, cargo-verify) locks
+/// the PRIMARY's shared target, not `<worktree>/target`, so a probe of the
+/// worktree's own target cannot see it even once it can see a flock. The
+/// census instead takes every build process with a `/proc/locks` row
+/// ([`super::cargo_locks::build_snapshot`], reused for
+/// [`CENSUS_BUILD_SNAPSHOT_MAX_AGE`] across the walk's rows) and attributes
+/// each `.cargo-lock` holder to the checkout it builds ([`attribute_build`]);
+/// the row then reports `building = Some(true)` AND the target root that
+/// build actually locks, which is what coord prices it against.
+pub(super) fn probe_building_for_census(worktree: &Path) -> CensusBuild {
+    #[cfg(target_os = "linux")]
+    {
+        let snap = super::cargo_locks::build_snapshot(CENSUS_BUILD_SNAPSHOT_MAX_AGE);
+        let wt = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let mut observed = attribute_build(&wt, snap.as_deref(), &is_checkout_root);
+        observed.target_dir = observed
+            .target_dir
+            .map(|dir| relexicalize(&dir, &wt, worktree));
+        observed
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        CensusBuild {
+            building: Some(cargo_lock_held(&worktree.join("target"))),
+            target_dir: None,
+        }
+    }
 }
 
-/// G6: is this worktree currently being built? Either signal → skip.
+/// How long one build snapshot serves the census walk's rows. A walk visits
+/// ~1250 worktrees; re-reading `/proc` for every row would cost one read per
+/// lock-holding process per row. A build older than this is still seen; one
+/// that starts or ends inside the window is reported one window late — or
+/// sooner, since any fresher reading (the G6 guard always reads fresh)
+/// replaces the cached one.
+#[cfg(target_os = "linux")]
+const CENSUS_BUILD_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// What the census observed about one worktree's in-flight build.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CensusBuild {
+    /// `Some(true)` a build is in flight, `Some(false)` observed idle, `None`
+    /// UNKNOWN (Linux: `/proc/locks` could not be read, or a build process
+    /// that may be this worktree's could not be attributed).
+    pub building: Option<bool>,
+    /// The target root the observed build locks. Set only when `building` is
+    /// `Some(true)` on Linux; `None` leaves the census to its predicted target
+    /// dir ([`super::census::resolve_build_target`]).
+    pub target_dir: Option<PathBuf>,
+}
+
+/// A directory that is the root of a git checkout of its own (`.git` dir or
+/// file) — a nested checkout's builds are not its enclosing checkout's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_checkout_root(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(".git")).is_ok()
+}
+
+/// Re-express a canonical path inside `canonical_wt` in the worktree's own
+/// (lexical) spelling, so an observed in-tree `build_target_dir` stays inside
+/// the row's `path` when the workspace is reached through a symlink. A path
+/// outside the worktree is returned unchanged.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn relexicalize(path: &Path, canonical_wt: &Path, lexical_wt: &Path) -> PathBuf {
+    path.strip_prefix(canonical_wt)
+        .map_or_else(|_| path.to_path_buf(), |rel| lexical_wt.join(rel))
+}
+
+/// Pure: does a build of `build_dir` belong to `checkout`? `build_dir` must
+/// lie inside `checkout`, and no directory from `build_dir` up to (excluding)
+/// `checkout` may itself be a checkout root — a worktree nested inside
+/// another checkout (`<repo>/.claude/worktrees/x`) owns its own builds.
+/// Both paths must already be canonical.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn build_dir_belongs_to_checkout(
+    build_dir: &Path,
+    checkout: &Path,
+    is_checkout_root: &dyn Fn(&Path) -> bool,
+) -> bool {
+    if !build_dir.starts_with(checkout) {
+        return false;
+    }
+    let mut cur = build_dir;
+    while cur != checkout {
+        if is_checkout_root(cur) {
+            return false;
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Pure: the census answer for `worktree` (canonical) from a build snapshot.
+///
+/// - No snapshot → UNKNOWN.
+/// - A `.cargo-lock` holder building this worktree → `Some(true)` and its
+///   target root. When several roots are locked, one inside the worktree wins
+///   (those bytes land in the worktree and coord prices it dedicated), else
+///   the lexically first, so the choice is stable across ticks.
+/// - A holder building this worktree whose fds could not be read, or any
+///   build process whose build dir could not be read (it may be this
+///   worktree's) → UNKNOWN: the census cannot name a target, and cannot say
+///   the worktree is idle.
+/// - Otherwise observed idle. A waiter — a cargo queued on a target lock —
+///   is not yet building and does not make the census row `building`; the G6
+///   guard counts it ([`g6_build_in`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn attribute_build(
+    worktree: &Path,
+    snapshot: Option<&super::cargo_locks::BuildSnapshot>,
+    is_checkout_root: &dyn Fn(&Path) -> bool,
+) -> CensusBuild {
+    let Some(snapshot) = snapshot else {
+        return CensusBuild::default();
+    };
+    let mut roots: Vec<&Path> = Vec::new();
+    let mut unknown = false;
+    for p in &snapshot.procs {
+        let Some(dir) = p.build_dir.as_deref() else {
+            unknown = true;
+            continue;
+        };
+        if !p.holder || !build_dir_belongs_to_checkout(dir, worktree, is_checkout_root) {
+            continue;
+        }
+        match p.held_roots.as_deref() {
+            Some(held) => roots.extend(held.iter().map(PathBuf::as_path)),
+            None => unknown = true,
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    let chosen = roots
+        .iter()
+        .find(|r| r.starts_with(worktree))
+        .or(roots.first())
+        .map(|r| r.to_path_buf());
+    match chosen {
+        Some(dir) => CensusBuild {
+            building: Some(true),
+            target_dir: Some(dir),
+        },
+        None if unknown => CensusBuild::default(),
+        None => CensusBuild {
+            building: Some(false),
+            target_dir: None,
+        },
+    }
+}
+
+/// Pure: the G6 answer for `worktree` (canonical) — may a build be running in
+/// it? True when there is no snapshot, when any build process's dir could not
+/// be read, or when any build process — holder or waiter, whatever lock it
+/// holds or waits on — builds this worktree. The reclaim executor deletes on
+/// `false`, so every unattributable reading is `true`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn g6_build_in(
+    worktree: &Path,
+    snapshot: Option<&super::cargo_locks::BuildSnapshot>,
+    is_checkout_root: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+    snapshot.procs.iter().any(|p| match p.build_dir.as_deref() {
+        None => true,
+        Some(dir) => build_dir_belongs_to_checkout(dir, worktree, is_checkout_root),
+    })
+}
+
+/// G6: is this worktree currently being built? Any signal → skip.
 /// Injectable (takes the worktree root) so tests drive it with tempdirs.
 ///
 ///   (a) a held `.cargo-lock` under `<worktree>/target/`, or
-///   (b) `target/`, `node_modules/`, or the worktree root touched within
+///   (b) (Linux) a build process — holding or queued on a lock — building this
+///       worktree, whatever target it locks; or one that could not be
+///       attributed; or the snapshot could not be read ([`g6_build_in`],
+///       always read fresh), or
+///   (c) `target/`, `node_modules/`, or the worktree root touched within
 ///       `window`.
 fn worktree_is_building(worktree: &Path, window: Duration) -> bool {
     let target = worktree.join("target");
     if cargo_lock_held(&target) {
         return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let snap = super::cargo_locks::build_snapshot(Duration::ZERO);
+        let wt = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        if g6_build_in(&wt, snap.as_deref(), &is_checkout_root) {
+            return true;
+        }
     }
     // Recent-activity window across the sink top-levels + the root.
     path_recently_touched(&target, window)
@@ -2747,6 +2947,220 @@ pub(in crate::agent_worktree) mod tests {
         std::fs::create_dir_all(&release).unwrap();
         std::fs::write(release.join(".cargo-lock"), b"").unwrap();
         assert!(!worktree_is_building(dir.path(), Duration::from_secs(0)));
+    }
+
+    /// (c) Linux: cargo's lock is an advisory `flock`, so the write-open probe
+    /// could never see it. A held flock on `<target>/debug/.cargo-lock` reads
+    /// as held, and released it reads free.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g6_cargo_lock_held_sees_a_linux_flock() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let lock = target.join("debug").join(".cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        // SAFETY: valid fd owned by `f` for the duration of the calls.
+        assert_eq!(
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(cargo_lock_held(&target), "a held flock must read as held");
+        assert!(
+            worktree_is_building(dir.path(), Duration::from_secs(0)),
+            "and G6 must skip the worktree"
+        );
+        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert!(!cargo_lock_held(&target), "released → not held");
+        assert!(!worktree_is_building(dir.path(), Duration::from_secs(0)));
+    }
+
+    /// Linux: a wrapper build in a worktree locks the PRIMARY's shared target,
+    /// not `<worktree>/target`. G6 must still see the worktree as building.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g6_sees_a_build_in_the_worktree_that_locks_a_shared_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let shared = base.join("primary").join("target-agent").join("debug");
+        std::fs::create_dir_all(&shared).unwrap();
+        let lock = shared.join(".cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+        let wt = base.join("wt");
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let fake = super::super::cargo_locks::tests::spawn_fake_build(&lock, &wt.join("src-tauri"));
+        assert!(
+            worktree_is_building(&wt, Duration::from_secs(0)),
+            "the worktree the build runs in is building"
+        );
+        assert!(
+            !worktree_is_building(&other, Duration::from_secs(0)),
+            "a worktree the build does not run in is not"
+        );
+        drop(fake);
+        assert!(!worktree_is_building(&wt, Duration::from_secs(0)));
+    }
+
+    /// (d) The pure build-dir → checkout attribution.
+    #[test]
+    fn a_build_belongs_to_the_innermost_checkout_its_dir_is_in() {
+        let roots = [
+            PathBuf::from("/w/repo"),
+            PathBuf::from("/w/repo/.claude/worktrees/x"),
+            PathBuf::from("/w/agent/1/qontinui-runner"),
+        ];
+        let is_root = |p: &Path| roots.iter().any(|r| r == p);
+        let belongs = |dir: &str, wt: &str| {
+            build_dir_belongs_to_checkout(Path::new(dir), Path::new(wt), &is_root)
+        };
+        // Inside, including a non-checkout subdir.
+        assert!(belongs(
+            "/w/agent/1/qontinui-runner/src-tauri",
+            "/w/agent/1/qontinui-runner"
+        ));
+        assert!(belongs(
+            "/w/agent/1/qontinui-runner",
+            "/w/agent/1/qontinui-runner"
+        ));
+        // A nested checkout owns its builds; its enclosing checkout does not.
+        assert!(belongs(
+            "/w/repo/.claude/worktrees/x/sub",
+            "/w/repo/.claude/worktrees/x"
+        ));
+        assert!(!belongs("/w/repo/.claude/worktrees/x/sub", "/w/repo"));
+        assert!(!belongs("/w/repo/.claude/worktrees/x", "/w/repo"));
+        // A dir in no worktree, and a mere name prefix, belong to nothing.
+        assert!(!belongs("/w/elsewhere", "/w/repo"));
+        assert!(!belongs("/w/repo-other/src", "/w/repo"));
+    }
+
+    use super::super::cargo_locks::{BuildProc, BuildSnapshot};
+
+    fn build_proc(dir: Option<&str>, holder: bool, roots: Option<&[&str]>) -> BuildProc {
+        BuildProc {
+            pid: 1,
+            build_dir: dir.map(PathBuf::from),
+            holder,
+            held_roots: roots.map(|r| r.iter().map(PathBuf::from).collect()),
+        }
+    }
+
+    fn snapshot(procs: Vec<BuildProc>) -> BuildSnapshot {
+        BuildSnapshot { procs }
+    }
+
+    #[test]
+    fn attribute_build_reports_the_locked_target_and_every_unknown() {
+        let never = |_: &Path| false;
+        let wt = Path::new("/w/agent/1/qontinui-runner");
+        let idle = CensusBuild {
+            building: Some(false),
+            target_dir: None,
+        };
+        // Unreadable snapshot → UNKNOWN, never idle.
+        assert_eq!(attribute_build(wt, None, &never), CensusBuild::default());
+        // No build here → observed idle; a queued cargo here is not building yet.
+        let elsewhere = snapshot(vec![
+            build_proc(Some("/w/x"), true, Some(&["/w/x/target"])),
+            build_proc(Some("/w/agent/1/qontinui-runner"), false, Some(&[])),
+        ]);
+        assert_eq!(attribute_build(wt, Some(&elsewhere), &never), idle);
+        // A wrapper build reports the shared target it locks.
+        let shared = build_proc(
+            Some("/w/agent/1/qontinui-runner/src-tauri"),
+            true,
+            Some(&["/w/qontinui-runner/target-agent"]),
+        );
+        assert_eq!(
+            attribute_build(wt, Some(&snapshot(vec![shared.clone()])), &never),
+            CensusBuild {
+                building: Some(true),
+                target_dir: Some(PathBuf::from("/w/qontinui-runner/target-agent"))
+            }
+        );
+        // An in-tree build wins over a shared one.
+        let both = snapshot(vec![
+            shared.clone(),
+            build_proc(
+                Some("/w/agent/1/qontinui-runner"),
+                true,
+                Some(&["/w/agent/1/qontinui-runner/target"]),
+            ),
+        ]);
+        assert_eq!(
+            attribute_build(wt, Some(&both), &never).target_dir,
+            Some(PathBuf::from("/w/agent/1/qontinui-runner/target"))
+        );
+        // A holder here whose fds could not be read → UNKNOWN.
+        let blind_fds = snapshot(vec![build_proc(
+            Some("/w/agent/1/qontinui-runner"),
+            true,
+            None,
+        )]);
+        assert_eq!(
+            attribute_build(wt, Some(&blind_fds), &never),
+            CensusBuild::default()
+        );
+        // A build whose dir could not be read may be this worktree's → UNKNOWN,
+        // unless a confirmed build here already answers it.
+        let blind_dir = snapshot(vec![build_proc(None, true, Some(&["/w/y/target"]))]);
+        assert_eq!(
+            attribute_build(wt, Some(&blind_dir), &never),
+            CensusBuild::default()
+        );
+        let mut answered = blind_dir.clone();
+        answered.procs.push(shared);
+        assert_eq!(
+            attribute_build(wt, Some(&answered), &never).building,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn g6_counts_waiters_and_every_unattributable_build_as_building() {
+        let never = |_: &Path| false;
+        let wt = Path::new("/w/agent/1/qontinui-runner");
+        assert!(g6_build_in(wt, None, &never), "no snapshot → skip");
+        let queued = snapshot(vec![build_proc(
+            Some("/w/agent/1/qontinui-runner/src-tauri"),
+            false,
+            Some(&[]),
+        )]);
+        assert!(
+            g6_build_in(wt, Some(&queued), &never),
+            "a queued cargo here"
+        );
+        let blind = snapshot(vec![build_proc(None, true, Some(&[]))]);
+        assert!(
+            g6_build_in(wt, Some(&blind), &never),
+            "an unreadable build dir"
+        );
+        let elsewhere = snapshot(vec![build_proc(Some("/w/x"), true, None)]);
+        assert!(!g6_build_in(wt, Some(&elsewhere), &never));
+        assert!(!g6_build_in(wt, Some(&snapshot(vec![])), &never));
+    }
+
+    #[test]
+    fn an_observed_in_tree_target_keeps_the_worktrees_own_spelling() {
+        let canon = Path::new("/real/agent/1/r");
+        let lexical = Path::new("/link/agent/1/r");
+        assert_eq!(
+            relexicalize(Path::new("/real/agent/1/r/target"), canon, lexical),
+            PathBuf::from("/link/agent/1/r/target")
+        );
+        assert_eq!(
+            relexicalize(Path::new("/real/r/target-agent"), canon, lexical),
+            PathBuf::from("/real/r/target-agent")
+        );
     }
 
     // -----------------------------------------------------------------
