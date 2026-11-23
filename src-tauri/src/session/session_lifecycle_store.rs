@@ -499,10 +499,14 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
-/// How far past `now` [`restamp_at`] will date a mark to keep it clear of
-/// the session's earlier stamps. A burst of finishes inside a few
-/// milliseconds stays inside it; a clock stepped back further than this is
-/// taken as is rather than dating the finish into the future.
+/// How far past `now` a mark may be dated (to stay clear of the session's
+/// earlier stamps, see [`restamp_at`]) before
+/// [`SessionLifecycleStore::set_finished`] logs a warning. A burst of
+/// finishes inside a few milliseconds stays inside it; past it is the
+/// pathological case — a long burst of re-marks of one session, or a clock
+/// stepped back further than this — and the stamp is still dated past the
+/// high, because uniqueness is what the ACK matcher depends on. It is a
+/// warning threshold, not a cap.
 const RESTAMP_MAX_LEAD_MS: i64 = 100;
 
 /// The `finished_at` a mark gets ([`SessionLifecycleStore::set_finished`])
@@ -511,20 +515,16 @@ const RESTAMP_MAX_LEAD_MS: i64 = 100;
 /// `high` is the largest stamp the session's marks have carried.
 ///
 /// `now`, unless that is not past `high` (finishes inside one millisecond,
-/// or a chain of them: mark, unmark, re-mark, unmark, re-mark), in which case
-/// one past `high` — so the new stamp differs from every earlier one, not
-/// only the latest, unless the clock stepped back by more than
-/// [`RESTAMP_MAX_LEAD_MS`] (see below). The ACK matcher
-/// ([`SessionLifecycleStore::mark_finish_synced`]) needs exactly that: a
-/// late ACK of any older row can never sync the new mark. A `now` more than
-/// [`RESTAMP_MAX_LEAD_MS`] behind `high` (a clock stepped backwards) is
-/// taken as is, so the new finish is never dated far into the future. Pure.
+/// a chain of them — mark, unmark, re-mark, unmark, re-mark — or a clock
+/// stepped back), in which case one past `high`. So the new stamp differs
+/// from every earlier one, not only the latest, whatever the clock does. The
+/// ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) needs exactly
+/// that: a late ACK of any older row can never sync the new mark. The price
+/// is that a stamp may be dated ahead of the clock; how far is bounded by
+/// how far the session's stamps have already run ahead, and
+/// [`RESTAMP_MAX_LEAD_MS`] is where the caller warns about it. Pure.
 fn restamp_at(high: i64, now: i64) -> i64 {
-    if now <= high && high - now <= RESTAMP_MAX_LEAD_MS {
-        high.saturating_add(1)
-    } else {
-        now
-    }
+    now.max(high.saturating_add(1))
 }
 
 /// Best-effort identity overlay for an existing record — the D1 "who is this
@@ -3408,7 +3408,19 @@ impl SessionLifecycleStore {
                 .chain(rec.finished_at)
                 .max();
             let at = high.map_or(now, |h| restamp_at(h, now));
-            forward.insert(claude_session_id.to_string(), at);
+            if at - now > RESTAMP_MAX_LEAD_MS {
+                warn!(
+                    claude_session_id = %claude_session_id,
+                    lead_ms = at - now,
+                    "session_lifecycle_store: finish dated ahead of the clock to stay unique \
+                     (a long burst of re-marks, or a clock stepped back)"
+                );
+            }
+            // Never lower the remembered high: a stamp below it could repeat
+            // one an earlier mark carried. (`restamp_at` already dates `at`
+            // past it; the `max` keeps that true by construction.)
+            let stored = forward.entry(claude_session_id.to_string()).or_insert(at);
+            *stored = (*stored).max(at);
             rec.finished_at = Some(at);
             // A fresh or restamped mark is unsynced by definition — the outbox
             // owes coord a write, and the boot reconcile must not revert it
@@ -9515,12 +9527,13 @@ mod tests {
         );
     }
 
-    /// A restamp only has to DIFFER from the old stamp (that is all the ACK
-    /// matcher needs): two finishes inside one millisecond still differ, and a
-    /// clock stepped backwards dates the new finish at `now` rather than
-    /// pushing it past the old one into the future.
+    /// A restamp must clear EVERY earlier stamp (that is what the ACK matcher
+    /// needs): two finishes inside one millisecond, a chain of them, a burst
+    /// that has run past [`RESTAMP_MAX_LEAD_MS`], and a clock stepped
+    /// backwards all date the new finish one past the high. Only a later
+    /// clock is taken as is.
     #[test]
-    fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
+    fn a_restamp_always_clears_every_earlier_stamp() {
         assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
         assert_eq!(
             restamp_at(1_001, 1_000),
@@ -9534,11 +9547,22 @@ mod tests {
         );
         assert_eq!(
             restamp_at(1_000, 400),
-            400,
-            "a clock stepped back is not pushed into the future"
+            1_001,
+            "a clock stepped back still clears the high: uniqueness over the clock"
         );
-        for (prev, now) in [(1_000, 1_000), (1_001, 1_000), (1_000, 5_000), (1_000, 400)] {
-            assert_ne!(restamp_at(prev, now), prev);
+        assert_eq!(
+            restamp_at(1_000 + RESTAMP_MAX_LEAD_MS + 1, 1_000),
+            1_000 + RESTAMP_MAX_LEAD_MS + 2,
+            "a burst past the lead threshold still clears the high, never falls back to now"
+        );
+        for (high, now) in [
+            (1_000, 1_000),
+            (1_001, 1_000),
+            (1_000, 5_000),
+            (1_000, 400),
+            (1_000 + RESTAMP_MAX_LEAD_MS + 1, 1_000),
+        ] {
+            assert!(restamp_at(high, now) > high, "({high}, {now})");
         }
     }
 
@@ -9548,18 +9572,14 @@ mod tests {
     /// from. Otherwise a late ACK of the first mark's write would sync the
     /// second before its own write drained. No stamp may ever repeat across
     /// the whole chain. The same-millisecond rule itself is pinned
-    /// deterministically by `a_restamp_always_differs_and_never_runs_ahead_of_the_clock`;
+    /// deterministically by `a_restamp_always_clears_every_earlier_stamp`;
     /// this exercises it through the store whenever the clock collides.
     ///
-    /// The chain is bounded to stay inside the uniqueness guarantee: each
-    /// iteration issues two stamps, and a loop that issues stamps faster than
-    /// the clock advances builds a lead (stamps issued minus milliseconds
-    /// elapsed). Once that lead exceeds [`RESTAMP_MAX_LEAD_MS`],
-    /// [`restamp_at`] deliberately falls back to `now` (its
-    /// clock-stepped-back arm) and so may repeat a stamp. Two stamps per
-    /// iteration over `RESTAMP_MAX_LEAD_MS / 2` iterations keeps the lead at
-    /// most `RESTAMP_MAX_LEAD_MS - 1` however fast the loop runs (barring a
-    /// wall-clock step back mid-test); 200 iterations repeated a stamp on CI.
+    /// Its 400 stamps may run the session's lead past [`RESTAMP_MAX_LEAD_MS`]
+    /// when the loop outpaces the clock (timing-dependent: each call
+    /// persists). On CI that once made the store fall back to `now` and
+    /// repeat a stamp; the deterministic pin for that case is
+    /// `a_re_mark_clears_a_stamp_far_ahead_of_the_clock_and_never_lowers_the_high`.
     #[test]
     fn a_re_mark_after_an_unmark_never_reuses_the_unmarked_stamp() {
         let dir = tempdir().unwrap();
@@ -9567,7 +9587,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("s"));
         let mut seen = HashSet::new();
-        for _ in 0..(RESTAMP_MAX_LEAD_MS / 2) {
+        for _ in 0..200 {
             let old = store
                 .set_finished("s", true, None)
                 .unwrap()
@@ -9589,6 +9609,53 @@ mod tests {
             assert!(!store.get("s").unwrap().finish_synced);
             store.set_finished("s", false, None).unwrap();
         }
+    }
+
+    /// A mark loaded from disk with a stamp far ahead of the clock (a clock
+    /// stepped back past [`RESTAMP_MAX_LEAD_MS`]) is unmarked and re-marked:
+    /// the re-mark must still clear that stamp, and so must the next one —
+    /// the remembered high is never lowered to `now`. Deterministic: the gap
+    /// is ten minutes, so no clock reading during the test can close it.
+    /// Before uniqueness-over-cap the re-mark took `now` and lowered the high.
+    #[test]
+    fn a_re_mark_clears_a_stamp_far_ahead_of_the_clock_and_never_lowers_the_high() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let ahead = now + 10 * 60_000;
+        let mut done = fixture_rec("s", "open", now, None, None);
+        done.finished_at = Some(ahead);
+        write_fixture(&path, vec![done]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(store.get("s").unwrap().finished_at, Some(ahead));
+
+        store.set_finished("s", false, None).unwrap();
+        let first = store
+            .set_finished("s", true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        assert!(
+            first > ahead,
+            "the re-mark fell back below the loaded stamp: {first}"
+        );
+
+        store.set_finished("s", false, None).unwrap();
+        let second = store
+            .set_finished("s", true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        assert!(
+            second > first,
+            "the high was lowered: {second} after {first}"
+        );
+        // A late ACK of either earlier mark must not sync the newest.
+        store.mark_finish_synced("s", Some(ahead));
+        store.mark_finish_synced("s", Some(first));
+        assert!(!store.get("s").unwrap().finish_synced);
     }
 
     /// Review (adoption) L1, as amended by the restamp: a blank reason on an
