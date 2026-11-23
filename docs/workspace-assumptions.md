@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 66 | 79 | 54 | 10 | 2 | 0 |
+| `repo_layout` | 66 | 79 | 51 | 13 | 2 | 0 |
 | `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -81,9 +81,9 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/provenance.rs` | `const CANONICAL_REPO` | `const CANONICAL_REPO: &str = "qontinui-claude-config";` | 1 | fallback_correct — The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk. | — (no CAPABILITY_SPECS row) |
 | `src/reflection/workflow.rs` | `build_ui_bridge_completion_steps` | `- Write the full plan to 'qontinui-dev-notes/ui-bridge-implementation-plan.md'` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/routing/q_router.rs` | `Domain::from_domain_tags` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/slash_commands.rs` | `find_commands_directory_reported` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | unreviewed | `slash_commands` |
-| `src/slash_commands.rs` | `find_commands_directory_reported` | `"this device has no qontinui-claude-config checkout, and this import has \` | 1 | unreviewed | `slash_commands` |
-| `src/slash_commands.rs` | `find_commands_directory_reported` | `.join("qontinui-claude-config")` | 1 | unreviewed | `slash_commands` |
+| `src/slash_commands.rs` | `commands_directory_in` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | fallback_correct — The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856). | `slash_commands` |
+| `src/slash_commands.rs` | `commands_directory_in` | `"this device has no qontinui-claude-config checkout, and this import has \` | 1 | fallback_correct — The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856). | `slash_commands` |
+| `src/slash_commands.rs` | `const COMMANDS_SIBLING` | `const COMMANDS_SIBLING: &str = "qontinui-claude-config";` | 1 | fallback_correct — The sibling checkout name the slash-command import reads from and names in its sibling_checkout_absent refusal; its absence is handled by commands_directory_in's typed refusal (runner#3129). | `slash_commands` |
 | `src/ui_bridge_plugin.rs` | `init` | `Builder::new("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workflow_generation/generator.rs` | `generate_workflow` | `\|\| stage_json.contains("ui-bridge");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | dev_only_surface — The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3. | `workspace_root` |

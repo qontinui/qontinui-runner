@@ -9,6 +9,20 @@
  * - `session-account-migration-skipped` when exhaustion was confirmed but no
  *   migration happened (no usable target / cap reached / mechanics failed) —
  *   surfaced as an error so the operator knows the session is stranded.
+ * - `session-limit-parked` when a session that stopped at a usage limit was
+ *   parked until its reset (backend `terminal::limit_reset`, plan 2026-11-05
+ *   Phase 2). Not an error: nothing failed. The scan loop hands the session
+ *   back to the usage-limit handler at its due time (plan Phase 3). A restart
+ *   can park ~100 sessions at once, so parks are coalesced into one info toast
+ *   per burst. A `continue-retry` park (a continue attempt that did not reach
+ *   the pane, retried shortly) and a `migration-nudge-wait` park (a migrated
+ *   session looked at again once its own continue nudge is done) raise no
+ *   toast.
+ * - `session-limit-reset-continued` when such a session was continued in
+ *   place after its reset — coalesced the same way.
+ * - `session-limit-reset-continue-gave-up` when the runner stopped trying to
+ *   continue such a session (its continue never reached the pane) — a
+ *   coalesced error toast, since the session now needs the operator.
  *
  * Mount once at App level, next to `useErrorNotifications`.
  */
@@ -165,6 +179,139 @@ export function migratedToast(p: MigratedPayload): { message: string; type: Toas
   };
 }
 
+/** `session-limit-parked` — `limit_reset::parked_event` in the backend. */
+export interface LimitParkedPayload {
+  claudeSessionId?: string;
+  configDir?: string;
+  /** When the session is handed back, ms since the epoch. */
+  dueAtMs?: number;
+  /** `not-yet-reset`, `probe-unknown`, `no-usable-target`, … */
+  reason?: string;
+}
+
+/** `session-limit-reset-continued` — `limit_reset::continued_event`. */
+export interface LimitContinuedPayload {
+  claudeSessionId?: string;
+  configDir?: string;
+  terminalId?: string;
+  entryUuid?: string;
+}
+
+/** `session-limit-reset-continue-gave-up` — `limit_reset::gave_up_event`. */
+export interface LimitGaveUpPayload {
+  claudeSessionId?: string;
+  configDir?: string;
+  terminalId?: string;
+  attempts?: number;
+}
+
+/** "Session 0c4e3025" for one burst member, "N sessions" for several. */
+function burstSubject(items: { claudeSessionId?: string }[]): string {
+  if (items.length !== 1) return `${items.length} sessions`;
+  const id = (items[0].claudeSessionId ?? "").slice(0, 8);
+  return id ? `Session ${id}` : "A session";
+}
+
+/** Events arriving within this window of a burst's first one share its toast. */
+export const LIMIT_BURST_MS = 2000;
+
+/** `HH:MM` in the operator's locale, 24-hour. */
+function clockTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+}
+
+/**
+ * When a park is due: `HH:MM` today, else prefixed with the short weekday and
+ * date, since a weekly limit can park a session for days.
+ */
+export function formatDue(ms: number, nowMs: number = Date.now()): string {
+  const due = new Date(ms);
+  if (due.toDateString() === new Date(nowMs).toDateString()) return clockTime(ms);
+  const day = due.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+  return `${day} ${clockTime(ms)}`;
+}
+
+/** The one toast for a burst of parks. */
+export function parkedBurstToast(
+  parks: LimitParkedPayload[],
+  formatTime: (ms: number) => string = formatDue,
+): { message: string; type: ToastType } {
+  const dues = parks.map((p) => p.dueAtMs).filter((d): d is number => typeof d === "number");
+  let until = "";
+  if (dues.length > 0) {
+    const first = formatTime(Math.min(...dues));
+    const last = formatTime(Math.max(...dues));
+    until = first === last ? ` until ${first}` : ` until ${first}–${last}`;
+  }
+  return {
+    message: `${burstSubject(parks)} parked at a usage limit${until}`,
+    type: "info",
+  };
+}
+
+/** The one toast for a burst of reset-continues. */
+export function continuedBurstToast(continued: LimitContinuedPayload[]): {
+  message: string;
+  type: ToastType;
+} {
+  return {
+    message: `${burstSubject(continued)} continued after the usage limit reset`,
+    type: "info",
+  };
+}
+
+/** The one toast for a burst of reset-continues the runner gave up on. */
+export function gaveUpBurstToast(gaveUp: LimitGaveUpPayload[]): {
+  message: string;
+  type: ToastType;
+} {
+  const one = gaveUp.length === 1;
+  return {
+    message: `${burstSubject(gaveUp)} stopped at a usage limit that has reset, but the runner could not continue ${
+      one ? "it; it needs" : "them; they need"
+    } a prompt by hand`,
+    type: "error",
+  };
+}
+
+/** Whether a park is worth a toast: not the runner's own short retry. */
+export function parkIsToasted(p: LimitParkedPayload): boolean {
+  return p.reason !== "continue-retry" && p.reason !== "migration-nudge-wait";
+}
+
+/**
+ * Collects items for `windowMs` after the first one, then hands the whole
+ * burst to `flush` once. `cancel` drops a pending burst (unmount).
+ */
+export function createBurstCoalescer<T>(
+  windowMs: number,
+  flush: (items: T[]) => void,
+): { push: (item: T) => void; cancel: () => void } {
+  let pending: T[] = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return {
+    push(item: T) {
+      pending.push(item);
+      if (timer !== null) return;
+      timer = setTimeout(() => {
+        const burst = pending;
+        pending = [];
+        timer = null;
+        flush(burst);
+      }, windowMs);
+    },
+    cancel() {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      pending = [];
+    },
+  };
+}
+
 export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
     const unlistenMigrated = listen<MigratedPayload>("session-account-migrated", (event) => {
@@ -180,9 +327,43 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
         "error",
       );
     });
+    const parked = createBurstCoalescer<LimitParkedPayload>(LIMIT_BURST_MS, (burst) => {
+      const toast = parkedBurstToast(burst);
+      showToast(toast.message, toast.type);
+    });
+    const continued = createBurstCoalescer<LimitContinuedPayload>(LIMIT_BURST_MS, (burst) => {
+      const toast = continuedBurstToast(burst);
+      showToast(toast.message, toast.type);
+    });
+    const gaveUp = createBurstCoalescer<LimitGaveUpPayload>(LIMIT_BURST_MS, (burst) => {
+      const toast = gaveUpBurstToast(burst);
+      showToast(toast.message, toast.type);
+    });
+    const unlistenGaveUp = listen<LimitGaveUpPayload>(
+      "session-limit-reset-continue-gave-up",
+      (event) => {
+        gaveUp.push(event.payload ?? {});
+      },
+    );
+    const unlistenParked = listen<LimitParkedPayload>("session-limit-parked", (event) => {
+      const payload = event.payload ?? {};
+      if (parkIsToasted(payload)) parked.push(payload);
+    });
+    const unlistenContinued = listen<LimitContinuedPayload>(
+      "session-limit-reset-continued",
+      (event) => {
+        continued.push(event.payload ?? {});
+      },
+    );
     return () => {
       unlistenMigrated.then((fn) => fn());
       unlistenSkipped.then((fn) => fn());
+      unlistenParked.then((fn) => fn());
+      unlistenContinued.then((fn) => fn());
+      unlistenGaveUp.then((fn) => fn());
+      parked.cancel();
+      continued.cancel();
+      gaveUp.cancel();
     };
   }, [showToast]);
 }
