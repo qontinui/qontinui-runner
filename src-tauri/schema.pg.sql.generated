@@ -3791,7 +3791,13 @@ CREATE TABLE coord.condition_runs (
     agent_id uuid,
     results jsonb,
     summary text,
-    report_token text
+    report_token text,
+    claimed_status text,
+    coverage jsonb,
+    unknown_reason text,
+    unknown_detail text,
+    plan jsonb,
+    plan_committed_at timestamp with time zone
 );
 
 
