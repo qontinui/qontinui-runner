@@ -361,6 +361,7 @@ Each assertion is a tagged-JSON object:
 | `salience_order` | `{"type":"salience_order","cta_id":"cta-signup"}` — the CTA is the most salient interactive or media element. Reads the frame. |
 | `image_sharpness_at_least` | `{"type":"image_sharpness_at_least","element":"hero","min_sharpness":50}` — variance of the Laplacian at the rendered scale. Reads the frame. |
 | `image_blockiness_within` | `{"type":"image_blockiness_within","element":"hero","max_blockiness":1.5}` — compression blockiness (~1.0 is clean). Reads the frame. |
+| `text_over_image_contrast` | `{"type":"text_over_image_contrast","min_ratio":4.5,"percentile":5}` (`percentile` defaults to 5; 0 gates on the minimum) — every text element laid over an image, measured on real pixels from frame A and its text-hidden twin. FAILS only when even the best case the pixels admit (`percentileRatio`) is below `min_ratio`, PASSES only when even the worst case (`percentileRatioWorstCase`) reaches it, and is `unknown` in between, with a detail naming what widened the bracket. Needs a frame B: see below. |
 | `image_loaded` | `{"type":"image_loaded"}` (or `"element":"hero"`) — the image finished loading and painted. A failed load fails; still loading is `unknown`. Page-wide, an off-screen lazy image has not been asked to load and is left out. |
 | `image_resolution_sufficient` | `{"type":"image_resolution_sufficient","min_effective":1}` — source pixels per device pixel reach `min_effective`. Vectors, CSS backgrounds and `role=img` are left out. An `img` whose `format` names no raster may be a vector, so where it would fail it answers `unknown`. |
 | `image_not_distorted` | `{"type":"image_not_distorted","max_aspect_delta":0.02}` — only `object-fit: fill` can fail. `contain`, `cover`, `none` and `scale-down` hold without reading a size, so a non-uniform `transform` on one goes unseen. The rendered size is the border box after transforms, so under `fill` a transform, padding, a border or a rotation can read as distortion: set `max_aspect_delta` to suit. |
@@ -429,6 +430,24 @@ unreadable — never silently skipped — when, for example (the full rules are
 An image that paints nothing (zero-area, or reported `hidden` / `no-layout`)
 is left out instead, and CSS backgrounds are left out of the page-wide checks
 with a disclosed count (a slot placeholder marker on one still fails).
+
+### Frame B: what `text_over_image_contrast` reads
+
+Text over an image is read from two frames of one page: frame A as rendered, and
+frame B with every glyph hidden by the SDK's dev control, `control/text-visibility`.
+The glyphs are where the two differ. Without a frame B the assertion, and the image
+analyzer's per-image `textContrast`, answer `unknown{needs_multi_frame_input}`.
+
+| Surface | How frame B gets there |
+|---|---|
+| `/verify-web` | Automatically, per capture, when its inject-cli and pinned analyzer can both do it; `--no-text-hidden` opts out. The verdict's `textHidden` says whether they did and, per capture, why not. |
+| `vision-audit analyze\|assert` | `--frame-text-hidden <png>` beside `--frame` and `--scale-factor`. `--text-hidden-ids <file>`, a JSON array, optionally names the elements the producer hid. |
+| `POST /ui-bridge/vision/analyze\|assert`, the runner's own window | `"captureTextHidden": true` with a `snapshot`: the runner hides, captures and restores inside the request, and `textVisibility` in the response says how that went. |
+| `POST /ui-bridge/vision/analyze\|assert`, a frame you captured | `"textHiddenFrame": {"pngBase64": "…"}` (or `"sha256"`), and optionally `"textHiddenIds"`. Exclusive with `captureTextHidden`. |
+
+Only text the snapshot holds is measured: a text with no row is read by no check.
+Capture frames losslessly: on a noisy capture ordinary text reads `unknown`, by
+design.
 
 ### Example: audit the page for the kinds of bugs Phase 6 was designed to catch
 
