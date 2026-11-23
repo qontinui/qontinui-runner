@@ -5954,6 +5954,133 @@ pub(crate) async fn refresh_tenant_slots(
     outcomes
 }
 
+/// The refusal a failed `machine-credential/exchange` names, read from web's
+/// 4xx body.
+///
+/// Since qontinui-web#2156 web keeps its own `code` (`coord_mint_rejected` when
+/// coord refused the mint) and adds coord's refusal as `coord_code` and
+/// `coord_reason`. Web's deployed error handler spreads those `detail` fields
+/// to the TOP level of the body. A FastAPI app without that handler nests them
+/// under `detail`. Both shapes are read, the top level first.
+///
+/// Only a code-shaped value (`[a-z][a-z0-9_]{0,63}`) is kept, so an upstream
+/// sentence or a proxy's HTML page never reaches the log as a code.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ExchangeRefusal {
+    /// Web's own refusal code (`coord_mint_rejected`, `device_credential_revoked`,
+    /// ...), from `code`, else from `error`.
+    pub(crate) code: Option<String>,
+    /// Coord's refusal code, when web relayed one (`owner_not_member`, ...).
+    pub(crate) coord_code: Option<String>,
+    /// Coord's refusal reason, when web relayed one (`no_membership`, ...).
+    pub(crate) coord_reason: Option<String>,
+}
+
+/// A body larger than this is not a refusal envelope; it is not parsed.
+const EXCHANGE_REFUSAL_BODY_MAX: usize = 16 * 1024;
+
+fn is_refusal_code(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// Read an [`ExchangeRefusal`] from a failed exchange's body. A body that is
+/// not JSON, too large, or carries no code-shaped field yields the default
+/// (every field `None`), never an error.
+pub(crate) fn parse_exchange_refusal(body: &str) -> ExchangeRefusal {
+    if body.len() > EXCHANGE_REFUSAL_BODY_MAX {
+        return ExchangeRefusal::default();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ExchangeRefusal::default();
+    };
+    let objects: Vec<&serde_json::Map<String, serde_json::Value>> = [
+        value.as_object(),
+        value.get("detail").and_then(|d| d.as_object()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let field = |name: &str| {
+        objects.iter().find_map(|o| {
+            o.get(name)
+                .and_then(|v| v.as_str())
+                .filter(|v| is_refusal_code(v))
+                .map(str::to_owned)
+        })
+    };
+    ExchangeRefusal {
+        // `error` carries the same code on every web refusal; a body whose
+        // `detail` was a plain string (a 503) has only `error`.
+        code: field("code").or_else(|| field("error")),
+        coord_code: field("coord_code"),
+        coord_reason: field("coord_reason"),
+    }
+}
+
+/// The log line for a failed exchange: `(is_warning, message)`.
+///
+/// `owner_not_member` is a WARNING with its remedy, because it cannot be
+/// repaired from this device: coord refuses to mint for a device whose owner
+/// is no longer a member of its tenant. Every other refusal is INFO, as
+/// before, with whichever codes the body named.
+pub(crate) fn exchange_refusal_log(
+    status: reqwest::StatusCode,
+    refusal: &ExchangeRefusal,
+) -> (bool, String) {
+    let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_owned());
+    if refusal.coord_code.as_deref() == Some("owner_not_member") {
+        (
+            true,
+            format!(
+                "device_jwt_refresher: dmk exchange got HTTP {status} (code={}, \
+                 coord_code=owner_not_member, coord_reason={}) — the device owner is no \
+                 longer a member of this device's tenant; a tenant admin must restore that \
+                 membership (existing JWT preserved)",
+                shown(&refusal.code),
+                shown(&refusal.coord_reason),
+            ),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "device_jwt_refresher: dmk exchange got HTTP {status} (code={}, coord_code={}, \
+                 coord_reason={}) — no recovery this path (existing JWT preserved)",
+                shown(&refusal.code),
+                shown(&refusal.coord_code),
+                shown(&refusal.coord_reason),
+            ),
+        )
+    }
+}
+
+/// Read a failed exchange's body, at most [`EXCHANGE_REFUSAL_BODY_MAX`] + 1
+/// bytes, so a misbehaving upstream cannot make the runner buffer an
+/// unbounded body. An over-cap or unreadable body comes back as `""`, which
+/// [`parse_exchange_refusal`] reads as no refusal codes.
+async fn read_exchange_refusal_body(mut resp: reqwest::Response) -> String {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > EXCHANGE_REFUSAL_BODY_MAX as u64)
+    {
+        return String::new();
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        buf.extend_from_slice(&chunk);
+        if buf.len() > EXCHANGE_REFUSAL_BODY_MAX {
+            return String::new();
+        }
+    }
+    String::from_utf8(buf).unwrap_or_default()
+}
+
 /// `POST {web_base}/api/v1/devices/{device_id}/machine-credential/exchange`
 /// (header `X-Device-Machine-Key: <dmk_>`, no body). This is what lets a
 /// runner offline longer than BOTH the device-JWT TTL (so 4a self-refresh is
@@ -6033,12 +6160,15 @@ pub(crate) async fn try_device_machine_key_exchange(
     if !resp.status().is_success() {
         // 401/403 (revoked/expired/mismatch), 503 (web COORD_ADMIN_SECRET
         // unset), anything else → no recovery this path. REPLACE-not-REVOKE:
-        // the existing JWT is left untouched.
-        info!(
-            "device_jwt_refresher: dmk exchange got HTTP {} — no recovery this path \
-             (existing JWT preserved)",
-            resp.status()
-        );
+        // the existing JWT is left untouched. The body names WHICH refusal it
+        // was (web's `code`, and coord's `coord_code` / `coord_reason` when
+        // coord refused the mint), and the remedies differ, so log them.
+        let status = resp.status();
+        let refusal = parse_exchange_refusal(&read_exchange_refusal_body(resp).await);
+        match exchange_refusal_log(status, &refusal) {
+            (true, line) => warn!("{line}"),
+            (false, line) => info!("{line}"),
+        }
         return None;
     }
     let body: DeviceRefreshResponse = match resp.json().await {
@@ -14303,6 +14433,157 @@ mod device_machine_key_exchange_tests {
             mgr.get_access_token().unwrap(),
             existing,
             "REPLACE-not-REVOKE: existing JWT must be UNCHANGED after a 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_owner_not_member_returns_none_and_preserves_jwt() {
+        // qontinui-web#2156: coord's `owner_not_member` refusal reaches the
+        // runner in the body. The exchange still fails closed: None, and the
+        // existing JWT is untouched. The body is in web's deployed shape, with
+        // the `detail` fields spread to the top level.
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        let mgr = setup("dmk_owner_not_member", Some("dmk_live"), Some(&existing));
+        let body = serde_json::json!({
+            "error": "coord_mint_rejected",
+            "code": "coord_mint_rejected",
+            "coord_code": "owner_not_member",
+            "coord_reason": "no_membership",
+            "message": "The device owner is not a member of the device's tenant.",
+        })
+        .to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::FORBIDDEN, body);
+
+        let got = try_device_machine_key_exchange(&mgr, &base, DID, None).await;
+        assert!(got.is_none(), "owner_not_member → None");
+        assert_eq!(*cap.hits.lock().unwrap(), 1, "attempted exactly once");
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "REPLACE-not-REVOKE: existing JWT must be UNCHANGED after owner_not_member"
+        );
+    }
+
+    #[test]
+    fn refusal_reads_web_spread_top_level_shape() {
+        let body = r#"{"error":"coord_mint_rejected","code":"coord_mint_rejected","coord_code":"owner_not_member","coord_reason":"no_membership","message":"x","timestamp":1.0,"path":"/p"}"#;
+        assert_eq!(
+            parse_exchange_refusal(body),
+            ExchangeRefusal {
+                code: Some("coord_mint_rejected".into()),
+                coord_code: Some("owner_not_member".into()),
+                coord_reason: Some("no_membership".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_reads_nested_detail_shape() {
+        let body = r#"{"detail":{"error":"coord_mint_rejected","code":"coord_mint_rejected","coord_code":"revoked"}}"#;
+        assert_eq!(
+            parse_exchange_refusal(body),
+            ExchangeRefusal {
+                code: Some("coord_mint_rejected".into()),
+                coord_code: Some("revoked".into()),
+                coord_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_reads_web_own_code_without_coord_fields() {
+        let body = r#"{"error":"device_credential_revoked","code":"device_credential_revoked","message":"Revoked."}"#;
+        assert_eq!(
+            parse_exchange_refusal(body),
+            ExchangeRefusal {
+                code: Some("device_credential_revoked".into()),
+                coord_code: None,
+                coord_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_drops_values_that_are_not_code_shaped() {
+        // A sentence, an upper-case token, an over-long token and a non-string
+        // are never logged as a code.
+        let long = "a".repeat(65);
+        let body = serde_json::json!({
+            "code": "Coord rejected the mint.",
+            "coord_code": long,
+            "coord_reason": 42,
+            "detail": { "coord_code": "NOT_A_CODE" },
+        })
+        .to_string();
+        assert_eq!(parse_exchange_refusal(&body), ExchangeRefusal::default());
+    }
+
+    #[test]
+    fn refusal_of_a_non_json_or_oversized_body_is_empty() {
+        assert_eq!(
+            parse_exchange_refusal("<html>502 Bad Gateway</html>"),
+            ExchangeRefusal::default()
+        );
+        assert_eq!(parse_exchange_refusal(""), ExchangeRefusal::default());
+        let oversized = format!(
+            r#"{{"code":"coord_mint_rejected","pad":"{}"}}"#,
+            "x".repeat(EXCHANGE_REFUSAL_BODY_MAX)
+        );
+        assert_eq!(
+            parse_exchange_refusal(&oversized),
+            ExchangeRefusal::default()
+        );
+    }
+
+    #[test]
+    fn owner_not_member_logs_a_warning_naming_the_remedy() {
+        let refusal = ExchangeRefusal {
+            code: Some("coord_mint_rejected".into()),
+            coord_code: Some("owner_not_member".into()),
+            coord_reason: Some("no_membership".into()),
+        };
+        let (warn, line) = exchange_refusal_log(StatusCode::FORBIDDEN, &refusal);
+        assert!(warn, "owner_not_member is a warning");
+        assert!(line.contains("HTTP 403"), "{line}");
+        assert!(line.contains("code=coord_mint_rejected"), "{line}");
+        assert!(line.contains("coord_reason=no_membership"), "{line}");
+        assert!(
+            line.contains("a tenant admin must restore that membership"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn other_refusals_log_info_with_their_codes() {
+        let refusal = ExchangeRefusal {
+            code: Some("coord_mint_rejected".into()),
+            coord_code: Some("revoked".into()),
+            coord_reason: None,
+        };
+        let (warn, line) = exchange_refusal_log(StatusCode::FORBIDDEN, &refusal);
+        assert!(!warn, "a revoked refusal stays info");
+        assert!(
+            line.contains("code=coord_mint_rejected, coord_code=revoked, coord_reason=-"),
+            "{line}"
+        );
+        assert!(!line.contains("tenant admin"), "{line}");
+
+        let (warn, line) =
+            exchange_refusal_log(StatusCode::SERVICE_UNAVAILABLE, &ExchangeRefusal::default());
+        assert!(!warn);
+        assert!(
+            line.contains("HTTP 503") && line.contains("code=-, coord_code=-, coord_reason=-"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn refusal_code_falls_back_to_error() {
+        // A 503 whose `detail` was a plain string carries only `error`.
+        let body = r#"{"error":"service_unavailable","message":"Coord bridge disabled."}"#;
+        assert_eq!(
+            parse_exchange_refusal(body).code.as_deref(),
+            Some("service_unavailable")
         );
     }
 
