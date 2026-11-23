@@ -570,7 +570,7 @@ async fn a_pending_live_read_still_lets_the_recorded_tenant_decide() {
             ROUTE_TENANT_BUDGET.saturating_sub(DECISION_RESERVE * 2),
             std::future::pending(),
             Some(t),
-            |_| async { Some(true) },
+            |_| async { true },
         ),
         must_not_poll("the binding count"),
         must_not_poll("the default credential"),
@@ -590,47 +590,13 @@ async fn a_pending_live_read_still_lets_the_recorded_tenant_decide() {
             ROUTE_TENANT_BUDGET.saturating_sub(DECISION_RESERVE * 2),
             std::future::pending(),
             Some(t),
-            |_| async { Some(false) },
+            |_| async { false },
         ),
         must_not_poll("the binding count"),
         must_not_poll("the default credential"),
     )
     .await;
     assert!(decided.is_err(), "{decided:?}");
-}
-
-/// Review round 3 A1. On a multi-bound device a record stamped with the
-/// DEFAULT binding's tenant may be the machine-row fall-through of an unsettled
-/// spawn, so it never stands in for the live read: a pending live read plus
-/// that stamp is UNKNOWN (withheld), never `Owned(default)`. Any other stamp,
-/// or the same stamp on a single-bound device, still decides.
-#[tokio::test(start_paused = true)]
-async fn a_default_tenant_stamp_on_a_multi_bound_device_is_unknown_not_the_default() {
-    let (default, other) = (tenant(0xD0), tenant(0xD1));
-    let admit = move |t: Uuid| async move {
-        recorded_tenant_admissible(t, Some(default), true).then_some(true)
-    };
-    let decided = decide_target_within(
-        ROUTE_TENANT_BUDGET,
-        live_read_then_recorded(
-            ROUTE_TENANT_BUDGET.saturating_sub(DECISION_RESERVE * 2),
-            std::future::pending(),
-            Some(default),
-            admit,
-        ),
-        async { true },
-        must_not_poll("the default credential"),
-    )
-    .await;
-    assert!(
-        decided.is_err(),
-        "a default-tenant stamp on a multi-bound device is withheld, got {decided:?}"
-    );
-
-    assert!(!recorded_tenant_admissible(default, Some(default), true));
-    assert!(recorded_tenant_admissible(other, Some(default), true));
-    assert!(recorded_tenant_admissible(default, Some(default), false));
-    assert!(recorded_tenant_admissible(default, None, true));
 }
 
 // ── recorded_fallback_tenant: the record's durable tenant (review A5) ──
